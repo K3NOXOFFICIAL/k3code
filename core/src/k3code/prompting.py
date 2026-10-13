@@ -63,14 +63,19 @@ def build_system_prompt(
     # What background writers change (a re-scan of the stack, the daily distill of USER.md, an accepted gotcha, the
     # optimizer) is taken once per session when ``frozen`` is given: from any other session, one of them rewrote this
     # session's prompt and with it the provider's cache of the whole conversation.
-    def once(key: str, make: Any) -> str:
+    def once(key: str, make: Any, *, empty_ok: bool = True) -> str:
         if frozen is None:
             return make()
         if key not in frozen:
-            frozen[key] = make()
+            value = make()
+            if value or empty_ok:
+                frozen[key] = value
+            return value
         return frozen[key]
 
-    if facts := once("facts", lambda: facts_prompt(cwd)):  # the stored stack scan
+    # no facts yet is not frozen: the scan of a new project stores its result a moment after the session starts, and an
+    # empty value kept for the whole session left it without them (nothing a background writer rewrites mid-session)
+    if facts := once("facts", lambda: facts_prompt(cwd), empty_ok=False):  # the stored stack scan
         parts.append(facts)
     mem_limit = int(ctx.get("memory_chars", MAX_MEMORY_CHARS))
     if mem := memory_prompt(cwd, limit=mem_limit, learned=learned, frozen=frozen):

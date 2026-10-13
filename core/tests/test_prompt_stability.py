@@ -112,6 +112,25 @@ async def test_what_other_sessions_and_background_writers_change_does_not_reach_
     await server.close()
 
 
+async def test_a_user_memory_line_added_with_the_command_reaches_the_live_prompt(tmp_path, monkeypatch):
+    from k3code import memory as memory_mod
+    from m1cmd_helpers import cmd
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    user_file = memory_mod.user_memory_path()
+    user_file.parent.mkdir(parents=True, exist_ok=True)
+    user_file.write_text("- I like short answers\n")
+    assert "I like short answers" in server._system_prompt_for(live)  # the session has seen the file
+    await cmd(server, "/memory add --user always answer in French", sid)
+    await cmd(server, "/memory add the tests live in tests/unit", sid)
+    prompt = server._system_prompt_for(live)
+    assert "always answer in French" in prompt, "the user-scope line is the user's own: it applies at once"
+    assert "the tests live in tests/unit" in prompt and "I like short answers" in prompt
+    await server.close()
+
+
 async def test_clear_shows_the_notes_learned_since_the_prompt_was_built(tmp_path, monkeypatch):
     from m1cmd_helpers import rpc
 

@@ -303,6 +303,10 @@ def test_superseded_todo_lists_are_elided_but_the_newest_stays():
     assert isinstance(args[-1], list), "the newest list is the one the model works from"
 
 
+def _heredoc(first: str, tag: str = "EOF", rest: str = "") -> str:
+    return f"{first}\n" + "print(1)\n" * 60 + f"{tag}\n{rest}"
+
+
 @pytest.mark.parametrize(
     ("command", "elided"),
     [
@@ -312,6 +316,20 @@ def test_superseded_todo_lists_are_elided_but_the_newest_stays():
         ("python - <<'EOF'\n" + "print(1)\n" * 60 + "EOF", False),  # a script that is not on disk
         ("python - <<'EOF' 2>/dev/null\n" + "print(1)\n" * 60 + "EOF", False),
         ("cat > app.py <<'EOF'\nprint(1)\nEOF", False),  # small
+        (_heredoc("cat <<'EOF' | tee notes.md"), True),
+        (_heredoc("tee -a notes.md <<'EOF'"), True),
+        (_heredoc("cd src && cat > app.py <<'EOF'", rest="python app.py\n"), True),
+        (_heredoc("cat <<-EOF > app.py").replace("\nEOF", "\n\tEOF"), True),  # <<- takes a tab-indented terminator
+        # the heredoc is the input of a command whose output, not the script, goes to the file
+        (_heredoc("python3 - <<'PY' > out.json", "PY"), False),
+        (_heredoc("python3 - <<'PY' | tee run.log", "PY"), False),
+        (_heredoc("ls > before.txt; python3 - <<'PY'", "PY"), False),
+        (_heredoc("echo $((1 << 3)) > n.txt", "3"), False),
+        (_heredoc("ssh host 'cat > app.conf' <<'EOF'"), False),  # the file is on another machine
+        # /tmp (and the home) may be private to the one sandboxed bash call that wrote the file
+        (_heredoc("cat > /tmp/helper.py <<'EOF'"), False),
+        (_heredoc("tee ~/notes.md <<'EOF'"), False),
+        ("cat > app.py <<'EOF'\n" + "print(1)\n" * 60, False),  # no terminator line: where the text ends is unknown
     ],
 )
 def test_heredoc_text_a_bash_command_wrote_to_a_file_is_elided_from_old_calls(command, elided):
@@ -325,6 +343,130 @@ def test_heredoc_text_a_bash_command_wrote_to_a_file_is_elided_from_old_calls(co
     assert first != command if elided else first == command
     if elided:
         assert first.splitlines()[0] == command.splitlines()[0] and "they are in the file now" in first
+        assert first.splitlines()[-1] == command.splitlines()[-1], "the terminator and what follows stay"
+        assert "print(1)" not in first and "line\n" not in first
+
+
+def test_the_commands_after_a_heredocs_terminator_are_not_elided_with_its_text():
+    from k3code.context_budget import elide_old_results
+
+    body = "".join(f"echo 'step {i}'\n" for i in range(30))
+    after = f"EOF\nchmod +x build.sh && ./build.sh\ncat > notes.txt <<'EOF'\n{body}EOF\ngit push --force origin main\n"
+    command = f"cat > build.sh <<'EOF'\n{body}{after}"
+    msgs: list[Message] = []
+    for i in range(9):
+        msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
+    shown = elide_old_results(msgs, over=True, elided=set(), window=None)[0].tool_calls[0].arguments["command"]
+    assert shown == (
+        f"cat > build.sh <<'EOF'\n[{len(body) - 1} chars of text elided: they are in the file now — read it]\n{after}"
+    )
+
+
+def test_a_long_first_line_is_not_searched_for_a_heredoc():
+    """Two patterns tried every position of a here-string payload or a long path-like word: 3 s for 16k characters,
+    on every request past the threshold."""
+    import time
+
+    from k3code.context_budget import elide_old_results
+
+    command = "xxd -r -p <<< " + "ab" * 8_000 + " | tar x\nls\n"
+    msgs: list[Message] = []
+    for i in range(9):
+        msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
+    started = time.perf_counter()
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    assert time.perf_counter() - started < 0.5
+    assert out[0].tool_calls[0].arguments["command"] == command
+
+
+def _todos(tag: str, n: int = 12) -> dict:
+    return {"todos": [{"content": f"{tag} item {i} " + "d" * 40, "status": "pending"} for i in range(n)]}
+
+
+def _todo_history(*steps: Message) -> list[Message]:
+    """``steps`` (todo calls and their results), then ten reads that make them old."""
+    msgs = list(steps)
+    for i in range(100, 110):
+        msgs += [_call_message(i, "read", {"path": f"f{i}"}), _result(i, "read", "x" * 400)]
+    return msgs
+
+
+def test_of_two_todo_calls_in_one_reply_the_second_holds_the_live_list():
+    from k3code.context_budget import elide_old_results
+
+    calls = [ToolCall(id=f"k{i}", name="todo", arguments=_todos(tag)) for i, tag in enumerate(("OLD", "NEW"))]
+    msgs = _todo_history(
+        Message(role="assistant", content=None, tool_calls=calls),
+        *(_result(i, "todo", "Todos updated (0/12 done).") for i in range(2)),
+    )
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    first, second = out[0].tool_calls
+    assert isinstance(first.arguments["todos"], str) and "replaced by a later todo call" in first.arguments["todos"]
+    assert second.arguments["todos"] == _todos("NEW")["todos"], "the list the tool holds is shown whole"
+
+
+def test_a_later_todo_call_that_failed_does_not_replace_the_list_before_it():
+    from k3code.context_budget import elide_old_results
+
+    bad = {"todos": [{"content": "x" * 50, "status": "in_progress"}] * 12}
+    msgs = _todo_history(
+        _call_message(0, "todo", _todos("LIVE")),
+        _result(0, "todo", "Todos updated (0/12 done)."),
+        _call_message(1, "todo", bad),
+        _result(1, "todo", "Error: at most one todo may be in_progress"),
+    )
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    assert out[0].tool_calls[0].arguments["todos"] == _todos("LIVE")["todos"], "the only list that took effect"
+    assert out[2].tool_calls[0].arguments["todos"] == bad["todos"], "and the rejected one is not 'replaced' by anything"
+
+
+def test_the_text_of_an_elided_call_stays_elided_when_a_larger_window_keeps_its_result_whole():
+    from k3code.context_budget import elide_old_results
+
+    msgs: list[Message] = []
+    for i in range(10):
+        msgs += [
+            _call_message(i, "write", {"path": f"f{i}", "content": "w" * 2000}),
+            _result(i, "write", f"Wrote f{i} " + "o" * 4000),
+        ]
+    elided: set[str] = set()
+    elide_old_results(msgs, over=True, elided=elided, window=8_000)  # keeps one result whole
+    big = elide_old_results(msgs, over=False, elided=elided, window=200_000)  # the same session, a bigger model
+    texts = [c.arguments["content"] for m in big if m.role == "assistant" for c in m.tool_calls]
+    assert [t.startswith("[2000 chars elided") for t in texts].count(True) == 9, texts[:6]
+    assert texts[-1] == "w" * 2000  # the one call whose result was whole all along
+
+
+def test_a_reused_call_id_does_not_elide_the_result_the_model_has_not_seen_yet():
+    from k3code.context_budget import elide_old_results
+
+    def step(i: int) -> list[Message]:
+        call = ToolCall(id="0", name="read", arguments={"path": f"f{i}"})
+        return [
+            Message(role="assistant", content=None, tool_calls=[call]),
+            Message(role="tool", content=f"file {i} " + "o" * 4000, tool_call_id="0", name="read"),
+        ]
+
+    elided = {"0"}  # an earlier result with this id was elided
+    msgs = [Message(role="user", content="go"), *(m for i in range(3) for m in step(i))]
+    out = elide_old_results(msgs, over=False, elided=elided, window=200_000)
+    tools = [m.content for m in out if m.role == "tool"]
+    assert tools[-1] == msgs[-1].content, "the newest result is the model's first look at it"
+    assert all(t.startswith("[earlier read result elided") for t in tools[:-1])
+
+
+async def test_a_provider_that_reuses_call_ids_still_shows_the_model_each_new_result(tmp_path):
+    """Servers that number every call "0" (and the repo's own scripted provider, call_1 on each reply)."""
+    import dataclasses
+
+    calls = [dataclasses.replace(c, id="0") for c in reads_of(tmp_path, 14)]
+    provider = Recorder([*(tool_reply(c) for c in calls), text_reply("done")])
+    loop = make_loop(tmp_path, provider, window=8_000)
+    async for _ in loop.run("read them all"):
+        pass
+    for k, (request, _) in enumerate(provider.requests[1:], start=1):
+        newest = [m for m in request if m.role == "tool"][-1]
+        assert f"file {k - 1}\n" in newest.content, (k, newest.content[:80])
 
 
 def test_at_most_six_of_the_newest_results_are_protected_whatever_the_window():

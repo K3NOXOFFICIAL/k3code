@@ -61,6 +61,11 @@ class MemoryCommand(CommandDef):
             if not text:
                 return reply("Usage: /memory add <text> [--user]")
             append_memory(target, text)
+            live = ctx.sessions.get(session_id) if session_id and hasattr(ctx, "sessions") else None
+            if user and live is not None:
+                # the session's prompt holds the user file as it first saw it, against the daily distill's rewrites;
+                # this line is the user's own, written to take effect now
+                live.prompt_frozen.pop("user_memory", None)
             return reply(f"Added to {target}", path=str(target))
         if sub == "edit":
             return reply(f"Edit {target} (the CLI opens $EDITOR; here, open it yourself).", path=str(target))

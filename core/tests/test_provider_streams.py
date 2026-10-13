@@ -272,6 +272,67 @@ async def test_an_attempt_that_died_before_any_text_is_charged_when_the_retry_st
     assert provider.calls == 3 and spent(loop) == 700 + 700 + 705
 
 
+async def test_an_attempt_that_only_counted_its_prompt_does_not_clear_the_text_of_the_earlier_steps(tmp_path):
+    from k3code.providers.types import StreamEvent, ToolCall, Usage
+
+    class Scripted:
+        """Step 1 narrates and calls a tool; step 2 dies right after its prompt was counted, then answers."""
+
+        name, base_url = "scripted", "https://scripted.test"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            self.calls += 1
+            yield StreamEvent(type="partial_usage", usage=Usage(prompt_tokens=700))
+            if self.calls == 2:
+                raise ProviderError("peer closed connection", status_code=502)
+            usage = Usage(prompt_tokens=700, completion_tokens=5)
+            if self.calls == 1:
+                yield StreamEvent(type="text_delta", text="Let me check. ")
+                call = ToolCall(id="t1", name="bash", arguments={"command": "echo one"})
+                msg = Message(role="assistant", content="Let me check. ", tool_calls=[call], usage=usage)
+            else:
+                yield StreamEvent(type="text_delta", text="all done")
+                msg = Message(role="assistant", content="all done", usage=usage)
+            yield StreamEvent(type="done", message=msg, usage=usage)
+
+        async def aclose(self):
+            pass
+
+    provider = Scripted()
+    loop = flaky_loop(tmp_path, provider)
+    resets, shown = [], []
+
+    async def on_reset() -> None:
+        resets.append(1)
+        shown.clear()  # what the CLI and the gateway do with it
+
+    async def on_delta(text: str) -> None:
+        shown.append(text)
+
+    loop.on_text_reset, loop.on_text_delta = on_reset, on_delta
+    events = [e async for e in loop.run("go")]
+    assert provider.calls == 3 and spent(loop) == 705 + 700 + 705, "the dead attempt's prompt is still charged"
+    assert not resets and not any(e.type == "reset" for e in events), "nothing of that attempt was streamed to discard"
+    assert "".join(shown) == "Let me check. all done"
+
+
+async def test_an_attempt_that_streamed_text_before_dying_still_clears_it(tmp_path):
+    provider = Flaky(dies=1, text_before_dying=True)
+    loop = flaky_loop(tmp_path, provider)
+    resets = []
+
+    async def on_reset() -> None:
+        resets.append(1)
+
+    loop.on_text_reset = on_reset
+    events = [e async for e in loop.run("go")]
+    assert provider.calls == 2 and spent(loop) == 700 + 705
+    assert len(resets) == 1 and sum(e.type == "reset" for e in events) == 1
+
+
 async def test_an_attempt_that_died_is_charged_when_the_failover_provider_counts_nothing_up_front(tmp_path):
     from k3code.agent.loop import AgentLoop
     from k3code.providers.types import StreamEvent, Usage

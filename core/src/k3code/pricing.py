@@ -100,7 +100,9 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     model = str(getattr(usage, "model", "") or "")
     name = model.lower()
     dashed = name.replace(".", "-")
-    if "haiku-5" in dashed and prompt > LONG_PROMPT_TOKENS and not _configured_price(config, model):
+    # the card is per request: an aggregated row (a sub-agent run's calls added up) is not one long prompt
+    long_prompt = prompt > LONG_PROMPT_TOKENS and not getattr(usage, "aggregated", False)
+    if "haiku-5" in dashed and long_prompt and not _configured_price(config, model):
         price_in, price_out = HAIKU_5_LONG_PROMPT
     if any(n in name for n in CLAUDE_NAMES):
         read_x = next((x for needle, x in CLAUDE_CACHE_READ_MULTIPLES if needle in dashed), CACHE_READ_MULTIPLE)

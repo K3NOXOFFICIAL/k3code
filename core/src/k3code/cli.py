@@ -391,6 +391,25 @@ class _HeadlessUsage:
                 self.db.close()
 
 
+def _carried(messages: list[Any]) -> list[Any]:
+    """The conversation a turn leaves for the next one, as ``LiveSession.history`` has it: without the system prompt
+    (the loop builds that afresh), but with a later system message (the loop guard's note) at its place, or the next
+    request would differ from the one the provider cached from there on."""
+    out: list[Any] = []
+    for m in messages:
+        if m.role == "system" and (not out or not m.content):
+            continue
+        out.append(m)
+    return out
+
+
+def _trim_history(history: list[Any]) -> list[Any]:
+    """``history`` without its older part (the first message at least), cut at a user message so that no tool result
+    is left without the call it answers."""
+    start = next((i for i in range(max(1, len(history) // 2), len(history)) if history[i].role == "user"), len(history))
+    return history[start:]
+
+
 async def _run_repl(
     *,
     model: str | None,
@@ -452,13 +471,17 @@ async def _run_repl(
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
+
     # the conversation: every run starts from the messages the one before ended with (each prompt used to be a new
     # conversation), and keeps which results were elided / which files were read, as a gateway session does
-    history: list[Any] = []
-    loop.share_elision(set(), {})
-    loop.share_reads({}, set())
+    def start_over() -> list[Any]:
+        loop.share_elision(set(), {})
+        loop.share_reads({}, set())
+        return []
 
-    print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
+    history = start_over()
+
+    print("k3code REPL (type /exit to quit, /clear to start over, /model <name> to switch, /stop to cancel a turn)")
     print(f"Permission mode: {permission_mode.value}")
     if model:
         print(f"Model override: {model}")
@@ -483,6 +506,10 @@ async def _run_repl(
             # the REPL is single-threaded, so /stop mainly guards the next turn).
             reliability.cancel()
             print("Stop requested.")
+            continue
+        if user_input == "/clear":
+            history = start_over()
+            print("Conversation cleared.")
             continue
         if user_input.startswith("/model "):
             if err := _use_model_key(config, user_input[7:].strip()):
@@ -510,6 +537,7 @@ async def _run_repl(
         loop.on_text_delta = on_text_delta
         loop.on_text_reset = on_text_reset
 
+        ran = overflowed = False
         try:
             run_input = user_input
             if loop.hooks:
@@ -524,11 +552,11 @@ async def _run_repl(
                 extra_parts.append(submitted.context_text())
                 if extra := "\n".join(c for c in extra_parts if c):
                     run_input = f"{user_input}\n\n" + fenced("context from the user's hooks:", extra)
+            ran = True
             async for _ in loop.run(
                 run_input, max_tokens=config.max_tokens, temperature=config.temperature, history=history
             ):
                 pass
-            history = [m for m in loop.turn_messages if m.role != "system"]
             if loop.hooks:
                 await loop.hooks.run("Stop", {"stop_hook_active": False})
             print()  # newline after streaming
@@ -537,6 +565,7 @@ async def _run_repl(
         except ChainExhausted as e:
             print(f"\n[Error] Chain exhausted: {e}")
         except ContextOverflow as e:
+            overflowed = True
             print(f"\n[Error] Context overflow: {e}")
         except TurnCancelled as e:
             print(f"\n[Stopped] {e}")
@@ -551,6 +580,15 @@ async def _run_repl(
         except Exception as e:
             logger.exception("REPL turn failed")
             print(f"\n[Error] {e}")
+        if ran:
+            # what a turn did before it failed stays in the conversation (a command that ran, its result), as in a
+            # gateway session; one that failed before the model answered anything left only its prompt, sent again
+            carried = _carried(loop.turn_messages)
+            if carried and carried[-1].role != "user":
+                history = carried
+            if overflowed:  # the same prompt would only fail again
+                history = _trim_history(history)
+                print("[k3code] the older part of the conversation was dropped to make room: send your prompt again")
     await _reap_jobs(loop.session_id)
     await reliability.stop()
     await _close_providers(providers)

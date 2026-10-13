@@ -250,6 +250,22 @@ async def test_facts_section_is_injected_without_memory_and_is_stable(tmp_path):
     assert facts in one and one == two
 
 
+async def test_facts_that_the_scan_had_not_stored_at_the_first_prompt_still_reach_the_session(tmp_path):
+    from k3code.config import Settings
+    from k3code.prompting import build_system_prompt
+
+    repo = make(tmp_path / "repo", {**MONOREPO, ".git/HEAD": ""})
+    frozen: dict = {}  # a session's: the prompt keeps what a background writer changed after it was first built
+    first = build_system_prompt("BASE", cwd=repo / "api", config=Settings(), frozen=frozen)
+    assert "## Project facts" not in first, "the scan of this new project has not stored its result yet"
+    await projectprep.prepare(repo, store=ProposalStore(tmp_path / "home"))
+    second = build_system_prompt("BASE", cwd=repo / "api", config=Settings(), frozen=frozen)
+    assert "## Project facts" in second, "an empty answer is not kept for the whole session"
+    projectstate.update(repo, lambda state: state.update(stacks=[]))  # a later re-scan finds something else
+    assert projectprep.facts_prompt(repo) == ""
+    assert build_system_prompt("BASE", cwd=repo / "api", config=Settings(), frozen=frozen) == second, "taken once"
+
+
 def test_facts_section_is_capped(tmp_path):
     many = {f"svc{i:02d}/go.mod": "module x\n" for i in range(40)}
     repo = make(tmp_path / "repo", {".git/HEAD": "", **many})

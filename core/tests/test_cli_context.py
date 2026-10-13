@@ -223,3 +223,127 @@ def test_a_headless_run_that_repeats_one_call_ends_as_a_loop_guard_stop(tmp_path
     )
     assert result is not None and result.get("error") == "loop_guard", result
     assert n < 10, "the guard ended it long before max_turns"
+
+
+# ── what the REPL carries from one prompt to the next ──
+
+
+class Scripted(Provider):
+    """Answers each request with ``script(messages)``: a Message, or raises what it returns; records every request."""
+
+    def __init__(self, script) -> None:
+        self.name, self.base_url, self.api_key = "scripted", "fake://", ""
+        self.script, self.requests = script, []
+
+    async def aclose(self) -> None:
+        return None
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        self.requests.append([m for m in messages if m.role != "system" or m.content.startswith("[")])
+        reply = self.script(messages)
+        if isinstance(reply, Exception):
+            raise reply
+        if reply.content:
+            yield StreamEvent(type="text_delta", text=reply.content)
+        yield StreamEvent(type="done", message=reply, usage=Usage())
+
+
+def _repl(monkeypatch, tmp_path, provider, prompts, **settings):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    import k3code.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [provider])
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default", **settings)
+    inputs = iter([*prompts, "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
+
+
+def _read_call(n: int, path: Path) -> Message:
+    return Message(
+        role="assistant", content=None, tool_calls=[ToolCall(id=f"c{n}", name="read", arguments={"path": str(path)})]
+    )
+
+
+def test_the_repl_drops_its_older_turns_when_the_conversation_outgrows_the_window(tmp_path, monkeypatch, capsys):
+    from k3code.errors import ContextOverflow
+
+    outcomes: list[str] = []
+    starts: list[str] = []
+
+    def script(messages):
+        body = [m for m in messages if m.role != "system"]
+        starts.append(body[0].role)
+        if sum(len(str(m.content or "")) for m in body) > 6_000:
+            outcomes.append("overflow")
+            return ContextOverflow("prompt is too long")
+        outcomes.append("answered")
+        return Message(role="assistant", content="ok")
+
+    provider = Scripted(script)
+    _repl(monkeypatch, tmp_path, provider, [f"question {i}: " + "word " * 100 for i in range(30)])
+    assert set(starts) == {"user"}, "a trimmed history starts at a user message, not at a tool result"
+    assert "overflow" in outcomes, "the conversation did outgrow the window"
+    assert "overflow" not in [a for a, b in zip(outcomes, outcomes[1:], strict=False) if a == b], outcomes
+    assert outcomes[-1] == "answered" and "dropped" in capsys.readouterr().out
+
+
+def test_the_repl_clear_starts_the_conversation_over(tmp_path, monkeypatch):
+    provider = Scripted(lambda messages: Message(role="assistant", content="ok"))
+    _repl(monkeypatch, tmp_path, provider, ["first", "/clear", "second"])
+    assert [m.content for m in provider.requests[1]] == ["second"], "nothing of the first prompt is carried"
+
+
+def test_a_repl_turn_that_failed_after_running_a_tool_keeps_what_it_did(tmp_path, monkeypatch):
+    from k3code.providers.base import ProviderError
+
+    note = tmp_path / "note.txt"
+    note.write_text("made by the first turn\n")
+
+    def script(messages):
+        users = [m for m in messages if m.role == "user"]
+        results = [m for m in messages if m.role == "tool"]
+        if len(users) == 1 and not results:
+            return _read_call(1, note)
+        if len(users) == 1:
+            return ProviderError("the server fell over", status_code=400)  # the turn dies after the tool ran
+        return Message(role="assistant", content="ok")
+
+    provider = Scripted(script)
+    _repl(monkeypatch, tmp_path, provider, ["read note.txt", "what did you do?"])
+    last = provider.requests[-1]
+    assert [m.role for m in last] == ["user", "assistant", "tool", "user"], [m.role for m in last]
+    assert "made by the first turn" in str(last[2].content)
+
+
+def test_a_repl_turn_that_failed_before_the_model_answered_leaves_no_trace(tmp_path, monkeypatch):
+    from k3code.providers.base import ProviderError
+
+    fail = [True]
+
+    def script(messages):
+        if fail.pop() if fail else False:
+            return ProviderError("the server fell over", status_code=400)
+        return Message(role="assistant", content="ok")
+
+    provider = Scripted(script)
+    _repl(monkeypatch, tmp_path, provider, ["first try", "first try"])
+    assert [m.content for m in provider.requests[-1]] == ["first try"], "the prompt it was sent again is not doubled"
+
+
+def test_the_repl_keeps_the_loop_guards_note_in_the_conversation(tmp_path, monkeypatch):
+    note = tmp_path / "same.txt"
+    note.write_text("x\n")
+
+    def script(messages):
+        calls = sum(1 for m in messages if m.role == "assistant" and m.tool_calls)
+        if sum(1 for m in messages if m.role == "user") == 1 and calls < 5:
+            return _read_call(calls, note)
+        return Message(role="assistant", content="done")
+
+    provider = Scripted(script)
+    _repl(monkeypatch, tmp_path, provider, ["go", "thanks"])
+    first_of_second = next(r for r in provider.requests if sum(m.role == "user" for m in r) == 2)
+    assert any(m.role == "system" and m.content.startswith("[loop guard]") for m in first_of_second)

@@ -70,6 +70,27 @@ def test_tool_call_arguments_are_counted_once_by_the_compaction_estimator():
     assert abs(_estimate_tokens(parsed_only) - 1000) < 30, "about 4000 chars / 4, not double"
 
 
+def test_the_estimate_counts_a_cut_off_call_as_the_start_the_model_is_sent():
+    from k3code.context_budget import message_tokens, shrink_cut_calls
+
+    raw = "x" * 30_000
+    for stored_raw in (raw, None):  # both forms a stored cut-off call can have
+        call = {"id": "c1", "name": "write", "arguments": {"_unparsed": raw}, "raw_arguments": stored_raw}
+        stored = [{"role": "assistant", "content": None, "tool_calls": [call]}]
+        sent = shrink_cut_calls(
+            [
+                Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ToolCall(id="c1", name="write", arguments={"_unparsed": raw}, raw_arguments=stored_raw)
+                    ],
+                )
+            ]
+        )
+        assert _estimate_tokens(stored) == message_tokens(sent) < 200, "not the ~7.5k tokens of the stored text"
+
+
 async def test_a_prompt_larger_than_the_window_does_not_brick_the_session(tmp_path, monkeypatch):
     provider = Recording(overflow_over=6000)
     server, live = await seed(

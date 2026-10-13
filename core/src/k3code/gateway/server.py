@@ -60,6 +60,7 @@ from k3code.context_budget import (
     autocompact_policy,
     compact_threshold,
     context_window,
+    cut_call_text,
     elide_marker,
     overhead_tokens,
     router_window,
@@ -576,6 +577,8 @@ def _estimate_tokens(
             # the name and the arguments once, as context_budget.message_tokens counts them (the whole call dict carried
             # the arguments twice when both the parsed and the raw form were stored)
             args = tc.get("raw_arguments") or json.dumps(tc.get("arguments") or {}, ensure_ascii=False)
+            if (short := cut_call_text(tc.get("arguments"))) is not None:  # a cut-off call is sent as its start only
+                args = json.dumps({"_unparsed": short}, ensure_ascii=False)
             if f"args:{tc.get('id')}" in elided and len(args) > ELIDE_MIN_CHARS:
                 args = args[: ELIDE_MIN_CHARS // 4] + " " * 40  # the text of the call is a marker of about this size
             tokens += text_tokens(str(tc.get("name") or "") + args)
@@ -2113,7 +2116,8 @@ class GatewayServer:
         loop = AgentLoop(
             router,
             system_prompt=self._system_prompt_for(session),
-            max_turns=max(1, self.config.max_turns - session.turns_carried) if self.config.max_turns else 0,
+            max_turns=self.config.max_turns,
+            turns_carried=session.turns_carried,
             headless=False,
             on_event=self._on_router_event,
             cwd=session.perms.cwd,
@@ -2407,6 +2411,7 @@ class GatewayServer:
                     self.store.save(session.stored)
                 elif fan is not None:
                     prompt = fan.escalation_prompt(text)  # the parent finishes what the children could not
+                    noted = []  # this prompt does not carry the note: it is shown on the next turn
             if not gate.proceed:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})
@@ -2418,7 +2423,13 @@ class GatewayServer:
                     history=history,
                 ):
                     self._on_stream_event(session, event)
-                    answered = event.type == "done" and event.message is not None and event.message.role == "assistant"
+                    # a reply the window cut short is dropped for an overflow rerun: the note it carried did not arrive
+                    answered = (
+                        event.type == "done"
+                        and event.message is not None
+                        and event.message.role == "assistant"
+                        and event.message.stop_reason != "model_context_window_exceeded"
+                    )
                     if noted and answered:
                         for h in noted:
                             h.reported = True

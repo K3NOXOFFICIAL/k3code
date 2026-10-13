@@ -5,6 +5,7 @@ from __future__ import annotations
 from k3code.autonomy.proposals import ProposalStore
 from k3code.learning import distiller
 from k3code.learning.decisions import DecisionLog
+from k3code.memory import user_memory_path
 from test_learning_gateway import make_server
 from test_permissions_gateway import bash, call, run_turn
 
@@ -76,3 +77,23 @@ async def test_distill_makes_the_proposal_and_accepting_it_writes_user_md(tmp_pa
     assert text.index("- for `npm` commands: use pnpm, not npm") < text.index("## Learned preferences (auto)")
     distiller.write_auto_section(user_md, [])
     assert "- for `npm` commands: use pnpm, not npm" in user_md.read_text(encoding="utf-8")
+
+
+async def test_an_accepted_preference_card_reaches_the_prompt_of_the_session_that_accepted_it(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sess = await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.live[sess["session_id"]]
+    for cmd in ("npm install a", "npm ci"):
+        _deny(server.learning.log, cmd, "use pnpm, not npm")
+    user_md = user_memory_path()  # under the k3code home, where a session reads it from
+    user_md.parent.mkdir(parents=True, exist_ok=True)
+    user_md.write_text("# me\n\n- I like short answers\n", encoding="utf-8")
+    await distiller.distill(
+        server.learning.log, home=server.learning.home, user_md=user_md, proposals=server.learning.store
+    )
+    (p,) = [p for p in server.learning.store.all() if p.kind == "preference"]
+    assert "I like short answers" in server._system_prompt_for(live)  # the session has seen the file
+    await call(
+        server, "command.dispatch", {"name": "proposals", "arg": f"accept {p.id}", "session_id": sess["session_id"]}
+    )
+    assert "use pnpm, not npm" in server._system_prompt_for(live), "the user accepted it: it applies to this session"

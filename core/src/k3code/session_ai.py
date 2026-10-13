@@ -27,6 +27,10 @@ SUMMARY_MAX_TOKENS = 1_000
 TASK_ANCHOR_CHARS = 12_000
 #: Of the anchor, the summary model reads this many characters (the anchor itself is kept whole in the result).
 ANCHOR_SUMMARY_CHARS = 2_500
+#: An anchor over TASK_ANCHOR_CHARS is kept as its first ANCHOR_HEAD_CHARS and its last ANCHOR_TAIL_CHARS characters
+#: (room for the note in between); what lies between them is only in the summary.
+ANCHOR_TAIL_CHARS = TASK_ANCHOR_CHARS // 3
+ANCHOR_HEAD_CHARS = TASK_ANCHOR_CHARS - ANCHOR_TAIL_CHARS - 48
 #: What the summary model sees of one folded message: a tool result keeps its start and its end (it used to see the
 #: first 3000 characters of everything, which is 11-18% of a long session and none of a test run's last line), a user
 #: message up to the anchor's size (a plan or a requirement sent later), an earlier summary whole.
@@ -88,8 +92,13 @@ def head_and_tail(text: str, limit: int, head: int) -> str:
 
 
 def _anchor_gist(content: str) -> str:
+    """What the summary model reads of the task statement the result keeps verbatim: its start and end. Of one the
+    result clips (over TASK_ANCHOR_CHARS) it reads the clipped middle instead: only the summary can carry that."""
     if len(content) <= ANCHOR_SUMMARY_CHARS:
         return content
+    if len(content) > TASK_ANCHOR_CHARS:
+        note = "[the start and the end of this message are kept verbatim; the middle, which is not, follows]\n"
+        return note + content[ANCHOR_HEAD_CHARS : len(content) - ANCHOR_TAIL_CHARS][: TASK_ANCHOR_CHARS - len(note)]
     head = ANCHOR_SUMMARY_CHARS * 3 // 4
     return (
         f"{content[:head]}\n…[the rest of this message is kept verbatim]…\n{content[-(ANCHOR_SUMMARY_CHARS - head) :]}"
@@ -165,9 +174,8 @@ async def compact_messages(
         if len(content) > TASK_ANCHOR_CHARS:
             # head and tail inside the same budget: a requirement written after a long paste is at its end. The result
             # stays within the budget, so a later compaction leaves it alone (no growing "omitted" count)
-            tail = TASK_ANCHOR_CHARS // 3
-            head = TASK_ANCHOR_CHARS - tail - 48  # room for the note
-            content = f"{content[:head]}\n…[{len(content) - head - tail:,} chars omitted]…\n{content[-tail:]}"
+            omitted = len(content) - ANCHOR_HEAD_CHARS - ANCHOR_TAIL_CHARS
+            content = f"{content[:ANCHOR_HEAD_CHARS]}\n…[{omitted:,} chars omitted]…\n{content[-ANCHOR_TAIL_CHARS:]}"
         kept = [{**anchor, "content": content}]
     return [*system, *kept, summary, *_without_dangling_pointers(messages[cut:])], cut
 

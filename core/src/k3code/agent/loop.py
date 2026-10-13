@@ -84,6 +84,7 @@ class AgentLoop:
         system_prompt: str,
         system_suffix: str = "",
         max_turns: int = 0,
+        turns_carried: int = 0,
         permission_mode: str = "ask",
         headless: bool = True,
         on_event: Callable[[RouterEvent], None] | None = None,
@@ -157,6 +158,9 @@ class AgentLoop:
         #: Model calls one run() may make; 0 (the default) = no cap: a task runs until the model answers without a
         #: tool call. A cap that is reached ends the run with a message saying so (it used to end silently).
         self.max_turns = max_turns
+        #: Model calls the same task already made before a compaction in its middle restarted it: they count against
+        #: ``max_turns``, which stays the configured cap (a stop message names it).
+        self.turns_carried = turns_carried
         #: end a max_turns stop with an assistant message (off for the planning loop, whose last text is the plan)
         self.max_turns_stop_message = True
         self.cwd = cwd or Path.cwd()
@@ -315,12 +319,12 @@ class AgentLoop:
         self.reliability.save_transcript(messages)
 
         for turn in itertools.count():
-            if 0 < self.max_turns <= turn:
+            if self.max_turns > 0 and turn >= max(1, self.max_turns - self.turns_carried):
                 break
             if self.interrupted:
                 logger.info("Turn %d interrupted before start", turn + 1)
                 return
-            logger.info("Turn %d%s", turn + 1, f"/{self.max_turns}" if self.max_turns > 0 else "")
+            logger.info("Turn %d%s", turn + 1 + self.turns_carried, f"/{self.max_turns}" if self.max_turns > 0 else "")
             self._drain_steer(messages)
             # M2: disk guard + budget check before starting new work.
             self._check_disk_guard()
@@ -539,8 +543,9 @@ class AgentLoop:
         logger.warning("Max turns (%d) reached", self.max_turns)
         self.escalation_reason = "max_turns"
         if self.max_turns_stop_message:
+            made = turn + self.turns_carried
             text = (
-                f"I stopped after {self.max_turns} model calls: the configured `max_turns` cap ({self.max_turns}) "
+                f"I stopped after {made} model calls: the configured `max_turns` cap ({self.max_turns}) "
                 "was reached before the task was finished. Reply to continue where I left off, or raise "
                 "`max_turns` in the config (0 = no limit)."
             )
@@ -870,6 +875,7 @@ class AgentLoop:
         connection dropped and the router retried, an error, /stop closing the stream) was billed for that prompt all
         the same, and it is charged to the budgets here."""
         pending: Usage | None = None
+        streamed = False  # this attempt yielded something other than its prompt count: the consumer holds its output
         try:
             async for event in stream:
                 if event.type == "partial_usage":
@@ -877,11 +883,19 @@ class AgentLoop:
                         self.reliability.record_usage(pending)
                     pending = event.usage
                     continue
-                if event.type == "reset" and pending is not None:
-                    self.reliability.record_usage(pending)
-                    pending = None
-                elif event.type == "done":
-                    pending = None
+                if event.type == "reset":
+                    if pending is not None:
+                        self.reliability.record_usage(pending)
+                        pending = None
+                    if not streamed:
+                        # the attempt only counted its prompt: the consumer has nothing of it to discard, and a reset
+                        # would clear the text of the turn's earlier steps as well
+                        continue
+                    streamed = False
+                else:
+                    streamed = True
+                    if event.type == "done":
+                        pending = None
                 yield event
         finally:
             if pending is not None:

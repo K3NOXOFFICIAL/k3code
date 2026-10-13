@@ -78,6 +78,18 @@ def test_cached_prompt_tokens_and_only_model_call_rows_count_in_the_log_totals(t
     assert usd == pytest.approx(4.0 * 0.05 + 2.0 * 1.25)
 
 
+def test_a_subagent_row_that_adds_up_many_calls_is_not_priced_as_one_long_prompt(tmp_path):
+    db = UsageDB(tmp_path / "usage.db")
+    # ten 15k-token requests of a Haiku-5 sub-agent: each is far below the long-prompt card, whatever they add up to
+    db.record("subagent", model="test-haiku-5", tokens_in=150_000, tokens_out=5_000)
+    _, usd = day_loader(db, Settings())(today())
+    assert usd == pytest.approx(150_000 * 0.10 / 1e6 + 5_000 * 0.50 / 1e6)
+    # a single call of that size is one long request, and keeps the card (0.50 in, 2.50 out)
+    db.record("call", model="test-haiku-5", tokens_in=150_000, tokens_out=5_000)
+    _, usd = day_loader(db, Settings())(today())
+    assert usd == pytest.approx(150_000 * 0.10 / 1e6 + 5_000 * 0.50 / 1e6 + 150_000 * 0.50 / 1e6 + 5_000 * 2.50 / 1e6)
+
+
 def test_a_governor_with_an_empty_ledger_and_a_day_budget_is_quiet():
     gov = Governor(day_ledger=_DayLedger())
     gov.add_budget(Budget(scope="day", tokens=1))

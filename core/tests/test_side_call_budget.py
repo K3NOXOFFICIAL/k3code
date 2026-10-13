@@ -187,3 +187,82 @@ async def test_an_advisor_call_that_thought_its_whole_cap_away_is_asked_again_wi
         assert len(seen) == 1 and res.text == ""
     finally:
         effort_mod.REASONING_EFFORT.reset(token)
+
+
+def _empty_then(second, *, model: str, kind: str, first_tokens=(300, 40)):
+    """A caller whose router answers empty first (as served by provider "p" of ``kind``), then with ``second``."""
+    from types import SimpleNamespace
+
+    from k3code.routing.caller import ModelCaller, attempt_holder
+
+    calls: list[int] = []
+
+    def usage(tokens):
+        return SimpleNamespace(
+            prompt_tokens=tokens[0], completion_tokens=tokens[1], cost_usd=None, model=model, cache_read_tokens=0
+        )
+
+    class Router:
+        async def complete(self, messages, tools, **kw):
+            calls.append(1)
+            attempt_holder.get().append(("p", model))  # what the gateway's router-event callback does
+            if len(calls) == 1:
+                return SimpleNamespace(content="", usage=usage(first_tokens))
+            if isinstance(second, Exception):
+                raise second
+            return SimpleNamespace(content=second, usage=usage((300, 20)))
+
+    class Routers:
+        def get(self, tier):
+            return Router()
+
+    config = SimpleNamespace(task_tiers=None, providers=[SimpleNamespace(name="p", kind=kind)])
+    return ModelCaller(lambda: Routers(), config, None), calls
+
+
+@pytest.mark.parametrize(
+    ("kind", "model", "asked"),
+    [
+        ("openai", "plain-model", 1),  # this model never got the effort: the same request again would be identical
+        ("anthropic", "plain-model", 1),
+        ("openai", "o3-test", 2),  # a reasoning model that got it and thought its cap away
+        ("claude-cli", "plain-model", 2),  # the CLI passes --effort whatever the model
+    ],
+)
+async def test_an_empty_reply_is_asked_again_only_when_the_effort_reached_the_model(kind, model, asked):
+    from k3code.providers import effort as effort_mod
+
+    caller, calls = _empty_then("VERDICT: pass", model=model, kind=kind)
+    token = effort_mod.REASONING_EFFORT.set("high")
+    try:
+        await caller.complete(TaskKind.ADVISOR, [Message(role="user", content="x")], max_tokens=500)
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)
+    assert len(calls) == asked
+
+
+async def test_a_retry_reports_the_tokens_of_both_calls():
+    from k3code.providers import effort as effort_mod
+
+    caller, calls = _empty_then("VERDICT: pass", model="o3-test", kind="openai")
+    token = effort_mod.REASONING_EFFORT.set("high")
+    try:
+        res = await caller.complete(TaskKind.ADVISOR, [Message(role="user", content="x")], max_tokens=500)
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)
+    assert len(calls) == 2 and res.text == "VERDICT: pass"
+    assert (res.prompt_tokens, res.completion_tokens) == (600, 60), "the caller adds these to its own cap"
+
+
+async def test_a_retry_that_fails_leaves_the_first_answer_in_place():
+    from k3code.errors import ChainExhausted
+    from k3code.providers import effort as effort_mod
+
+    caller, calls = _empty_then(ChainExhausted("all providers rate-limited"), model="o3-test", kind="openai")
+    token = effort_mod.REASONING_EFFORT.set("high")
+    try:
+        res = await caller.complete(TaskKind.REVIEW, [Message(role="user", content="x")], max_tokens=500)
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)
+    assert len(calls) == 2 and res.text == "", "the empty answer stands: the failed retry does not raise or climb"
+    assert (res.prompt_tokens, res.completion_tokens) == (300, 40)

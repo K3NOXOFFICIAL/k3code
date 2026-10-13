@@ -197,14 +197,32 @@ class ModelCaller:
             and not retried
             and kind not in NO_EFFORT_KINDS
             and effort_mod.REASONING_EFFORT.get()
+            and self._effort_reached(provider, model)
         ):
             # a thinking model spent the whole cap on reasoning (a 500-token verdict at /effort max) and wrote nothing:
             # the call above is billed and logged; ask once more without the effort rather than return an empty answer
             quiet = effort_mod.REASONING_EFFORT.set(None)
             try:
-                return await self._once(
+                again = await self._once(
                     routers, kind, tier, messages, session_id, tools, max_tokens, timeout, router, retried=True
                 )
+            except Exception:  # noqa: BLE001 - the first answer was valid, if empty: the retry must not replace it
+                logger.debug("the retry without the effort failed; keeping the first answer", exc_info=True)
+                return result
             finally:
                 effort_mod.REASONING_EFFORT.reset(quiet)
+            # both calls are billed: the caller adds these to its own cap
+            again.prompt_tokens += pt
+            again.completion_tokens += ct
+            return again
         return result
+
+    def _effort_reached(self, provider: str, model: str) -> bool:
+        """Whether the session's effort was part of the request the served model got: a retry without it is a different
+        request only then. What cannot be judged (no model id, an unknown provider kind) counts as yes."""
+        kind = next((p.kind for p in getattr(self.config, "providers", None) or () if p.name == provider), "")
+        if kind == "claude-cli":  # passes --effort to whatever model it runs
+            return True
+        # a provider no router event named is judged by the model id alone, under either kind
+        kinds = (kind,) if kind else ("anthropic", "openai")
+        return any(effort_mod.takes_effort(model, k) is not False for k in kinds)

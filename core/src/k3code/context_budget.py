@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 from k3code.providers.types import Message, ToolCall, ToolSpec
@@ -291,21 +291,23 @@ def elide_old_results(
     kept = kept_calls(messages, window)
     old = set(tool_idx[:-kept]) if len(tool_idx) > kept else set()
     old_calls = {messages[i].tool_call_id for i in old}
-    newest_todo = next(
-        (tc.id for m in reversed(messages) if m.role == "assistant" for tc in m.tool_calls if tc.name == "todo"), None
-    )
+    superseded = _superseded_todos(messages)
+    # the latest step's results are new to the model whatever their id says
+    latest = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "assistant"), -1)
     out: list[Message] = []
     for i, m in enumerate(messages):
         # a result once elided stays elided wherever it now sits: a larger window (a /model switch) keeps more of the
-        # newest results whole, but must not show the ones the session already elided again
-        candidate = (i in old or m.tool_call_id in elided) and m.tool_call_id not in keep and bool(m.content)
+        # newest results whole, but must not show the ones the session already elided again. Not the latest step's: a
+        # provider or relay that reuses call ids would have the result the model just asked for elided before it saw it
+        shortcut = m.tool_call_id in elided and i < latest
+        candidate = (i in old or shortcut) and m.tool_call_id not in keep and bool(m.content)
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
             marker = elide_marker(m.name, len(m.content or ""))
             note = (notes or {}).get(m.tool_call_id or "")
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         elif m.role == "assistant" and m.tool_calls:
-            m = _elide_written_text(m, old_calls, over=over, elided=elided, newest_todo=newest_todo)
+            m = _elide_written_text(m, old_calls, over=over, elided=elided, superseded=superseded)
         out.append(m)
     return out
 
@@ -316,6 +318,15 @@ _FILE_TEXT_ARGS = {"write": ("content",), "edit": ("old_string", "new_string")}
 
 #: Of the arguments of a call cut off at the output limit (they never parsed), the model is sent this many characters.
 CUT_CALL_KEEP_CHARS = 200
+
+
+def cut_call_text(arguments: Any) -> str | None:
+    """What shrink_cut_calls sends of a cut-off call's ``_unparsed`` text (its start and how long it was), or None when
+    the call is sent as it is."""
+    raw = arguments.get("_unparsed") if isinstance(arguments, dict) else None
+    if isinstance(raw, str) and len(raw) > 2 * CUT_CALL_KEEP_CHARS:
+        return f"{raw[:CUT_CALL_KEEP_CHARS]}…[cut off: {len(raw)} chars]"
+    return None
 
 
 def shrink_cut_calls(messages: list[Message]) -> list[Message]:
@@ -329,9 +340,7 @@ def shrink_cut_calls(messages: list[Message]) -> list[Message]:
             continue
         calls, changed = [], False
         for tc in m.tool_calls:
-            raw = tc.arguments.get("_unparsed") if isinstance(tc.arguments, dict) else None
-            if isinstance(raw, str) and len(raw) > 2 * CUT_CALL_KEEP_CHARS:
-                short = f"{raw[:CUT_CALL_KEEP_CHARS]}…[cut off: {len(raw)} chars]"
+            if (short := cut_call_text(tc.arguments)) is not None:
                 tc, changed = dataclasses.replace(tc, arguments={"_unparsed": short}, raw_arguments=None), True
             calls.append(tc)
         if changed:
@@ -345,24 +354,62 @@ def _call_chars(tc: ToolCall) -> int:
     return sum(len(str(tc.arguments.get(k) or "")) for k in _FILE_TEXT_ARGS.get(tc.name, ()))
 
 
-#: A shell command that writes the text of a heredoc to a file: the first line has ``<<`` and a redirect (or tee) to a
-#: path that is not /dev/ or an fd. A ``python - <<EOF`` script is not on disk, so it is not matched.
-_HEREDOC_TO_FILE = re.compile(r"<<-?\s*['\"]?\w+['\"]?.*?(?:>>?|\btee\b(?:\s+-a)?)\s*(?!/dev/|&)[\w./~$\"'-]+")
-_HEREDOC_TO_FILE_BEFORE = re.compile(r"(?:>>?|\btee\b(?:\s+-a)?)\s*(?!/dev/|&)[\w./~$\"'-]+.*?<<-?\s*['\"]?\w+['\"]?")
+#: The heredoc operator, not a here-string (``<<<``): group 1 is ``-`` when the terminator may be tab-indented, 3 the
+#: tag.
+_HEREDOC_OP = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*(['\"]?)(\w+)\2")
+#: The first line is not looked at past this: a here-string payload or a one-line page can be tens of kilobytes.
+_HEREDOC_LINE_MAX = 1000
+#: The command that owns a heredoc (the text between its separators) is cat or tee: any other command, such as an
+#: interpreter reading a script, only has the heredoc as its input, and a redirect on it holds that command's output.
+_HEREDOC_WRITER = re.compile(r"[ \t]*(?:sudo[ \t]+)?(?:cat|tee)\b")
+_COMMAND_END = re.compile(r"[;&|()`]")
+#: A file target of ``>``, ``>>`` or ``tee``. Not /dev/, an fd (``>&2``) or a stderr redirect (``2>``); and not /tmp, ~
+#: or $HOME: bash in a sandboxed session gets a private /tmp and home, so the text may be on no disk by now.
+_FILE_TARGET = r"""(?!["']?(?:/dev/|/tmp/|/var/tmp/|~|\$\{?HOME|-)|&)[\w./$"'-]+"""
+_FILE_WRITE = re.compile(rf"(?<![0-9&])>>?[ \t]*{_FILE_TARGET}|\btee\b(?:[ \t]+-[a-z]+)*[ \t]+{_FILE_TARGET}")
+#: ``cat <<EOF | tee f``: the pipeline that follows the heredoc goes straight into tee.
+_PIPE_TO_TEE = re.compile(rf"[^;&()`|]*\|[ \t]*(?:sudo[ \t]+)?tee\b(?:[ \t]+-[a-z]+)*[ \t]+{_FILE_TARGET}")
 
 
-def _heredoc_first_line(command: str) -> str | None:
-    """The first line of ``command`` when it writes a heredoc to a file (the rest is the file's text), else None."""
-    first, sep, _ = command.partition("\n")
-    if not sep or not (_HEREDOC_TO_FILE.search(first) or _HEREDOC_TO_FILE_BEFORE.search(first)):
+def _heredoc_text(command: str) -> tuple[str, str, str] | None:
+    """``(first line, heredoc text, the rest from its terminator line on)`` of a ``command`` whose first line writes a
+    heredoc to a file (``cat > f <<EOF``, ``cat <<EOF >> f``, ``tee f <<'EOF'``), else None. The terminator and every
+    command after it stay: they are not in the file. A command with no terminator line is left alone."""
+    first, sep, rest = command.partition("\n")
+    if not sep or len(first) > _HEREDOC_LINE_MAX:
         return None
-    return first
+    for op in _HEREDOC_OP.finditer(first):
+        before = _COMMAND_END.split(first[: op.start()])[-1]
+        after = first[op.end() :]
+        if not (
+            _HEREDOC_WRITER.match(before)
+            and (_FILE_WRITE.search(f"{before} {_COMMAND_END.split(after, 1)[0]}") or _PIPE_TO_TEE.match(after))
+        ):
+            continue
+        lines = rest.split("\n")
+        for k, line in enumerate(lines):
+            if (line.lstrip("\t") if op.group(1) else line) == op.group(3):
+                return first, "\n".join(lines[:k]), "\n".join(lines[k:])
+    return None
 
 
-def _shrunk_arguments(tc: ToolCall, newest_todo: str | None) -> dict[str, Any] | None:
+def _superseded_todos(messages: Sequence[Message]) -> set[str]:
+    """Ids of the ``todo`` calls that a later one replaced. The tool takes the whole list every time and applies the
+    calls of a reply in order, so the newest call that took effect (not cut off, not answered with an error) holds the
+    live list and every call before it is out of date. Later calls that failed are not "replaced" by anything."""
+    failed = {m.tool_call_id for m in messages if m.role == "tool" and (m.content or "").startswith("Error:")}
+    calls = [tc for m in messages if m.role == "assistant" for tc in m.tool_calls if tc.name == "todo"]
+    live = next(
+        (i for i in reversed(range(len(calls))) if "_unparsed" not in calls[i].arguments and calls[i].id not in failed),
+        None,
+    )
+    return {tc.id for tc in calls[:live]} if live is not None else set()
+
+
+def _shrunk_arguments(tc: ToolCall, superseded: Collection[str]) -> dict[str, Any] | None:
     """``tc``'s arguments with the text that is elsewhere by now replaced by a marker, or None when there is none worth
     replacing: the file text of a ``write``/``edit``, the text of a heredoc a ``bash`` command wrote to a file, and a
-    ``todo`` list a later call replaced (the tool takes the whole list every time)."""
+    ``todo`` list a later call replaced (``superseded``: see _superseded_todos)."""
     args = tc.arguments
     if keys := _FILE_TEXT_ARGS.get(tc.name):
         if _call_chars(tc) <= ELIDE_MIN_CHARS:
@@ -373,35 +420,38 @@ def _shrunk_arguments(tc: ToolCall, newest_todo: str | None) -> dict[str, Any] |
             )
             for k, v in args.items()
         }
-    if tc.name == "todo" and tc.id != newest_todo:
+    if tc.name == "todo" and tc.id in superseded:
         todos = args.get("todos")
         if isinstance(todos, list) and len(json.dumps(todos)) > ELIDE_MIN_CHARS:
             return {**args, "todos": f"[a list of {len(todos)} items, replaced by a later todo call]"}
     command = args.get("command") if tc.name == "bash" else None
-    first = _heredoc_first_line(command) if isinstance(command, str) and len(command) > ELIDE_MIN_CHARS else None
-    if first is not None:
-        left = len(str(command)) - len(first)
-        return {**args, "command": f"{first}\n[{left} chars of text elided: they are in the file now — read it]"}
+    heredoc = _heredoc_text(command) if isinstance(command, str) and len(command) > ELIDE_MIN_CHARS else None
+    if heredoc is not None and len(heredoc[1]) > ELIDE_MIN_CHARS:
+        first, text, tail = heredoc
+        return {
+            **args,
+            "command": f"{first}\n[{len(text)} chars of text elided: they are in the file now — read it]\n{tail}",
+        }
     return None
 
 
 def _elide_written_text(
-    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], newest_todo: str | None = None
+    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], superseded: Collection[str] = ()
 ) -> Message:
     """``m`` with the text of its old calls replaced by a marker where it is somewhere else by now (see
     _shrunk_arguments). The whole file stayed in the request as the call's argument long after the result was elided
     (ten writes of an 8 KB file: 22 000 tokens, resent every step); it is on disk and the model can read it again.
     Decided together with the results above, so the request changes at the same moments, and a call once elided stays
-    elided."""
+    elided, also when a larger window keeps its result whole."""
     calls = list(m.tool_calls)
     changed = False
     for j, tc in enumerate(calls):
-        if tc.id not in old_calls:
-            continue
         key = f"args:{tc.id}"  # not the id itself: that one marks the call's *result* as elided
+        if tc.id not in old_calls and key not in elided:
+            continue
         if key not in elided and not over:
             continue
-        if (args := _shrunk_arguments(tc, newest_todo)) is None:
+        if (args := _shrunk_arguments(tc, superseded)) is None:
             continue
         calls[j] = dataclasses.replace(tc, arguments=args, raw_arguments=None)
         elided.add(key)

@@ -191,6 +191,23 @@ async def test_accepting_an_auto_learned_card_puts_the_line_in_the_system_prompt
     assert "## Known pitfalls in this project" in prompt and f"```\n{line}\n```" in prompt
 
 
+async def test_an_accepted_gotcha_reaches_the_prompt_of_the_session_that_accepted_it(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sess = await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.live[sess["session_id"]]
+    hub = server.learning
+    s = _session(server, tmp_path)
+    _fail(hub, s, "python x.py", "sh: 1: python: not found")
+    _ok(hub, s, "python3 x.py")
+    _fail(hub, s, "python y.py", "sh: 1: python: not found")
+    (p,) = [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    assert "python: not found" not in server._system_prompt_for(live)  # the prompt is built, and keeps its gotchas
+    await call(
+        server, "command.dispatch", {"name": "proposals", "arg": f"accept {p.id}", "session_id": sess["session_id"]}
+    )
+    assert "python: not found" in server._system_prompt_for(live), "the user accepted it: it applies to this session"
+
+
 async def test_a_hintless_recurring_failure_still_waits_for_the_card(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     hub = server.learning

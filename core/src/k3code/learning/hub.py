@@ -62,6 +62,14 @@ def _slim_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _unfreeze(session: Any, *keys: str) -> None:
+    """Let the session's prompt read ``keys`` afresh at its next turn: the user accepted a proposal that writes them,
+    and it should apply to this conversation, not wait for a compaction (background writers stay frozen out)."""
+    frozen = getattr(session, "prompt_frozen", None)
+    for key in keys if frozen is not None else ():
+        frozen.pop(key, None)
+
+
 class LearningHub:
     def __init__(self, server: Any, store: ProposalStore, clock: Callable[[], float] = time.time) -> None:
         self.server = server
@@ -382,11 +390,13 @@ class LearningHub:
             path = gotchas.gotchas_path(str(payload["project"]), self.home)
             gotchas.append_gotcha(path, str(payload["line"]))
             gotchas.promote_if_shared(self.home, str(payload["line"]))  # accepted in PROMOTE_PROJECTS projects
+            _unfreeze(session, "gotchas", "machine_gotchas")
             return f"added to the known pitfalls of this project ({path})"
         if p.kind == "preference" and payload.get("text"):
             from k3code.memory import user_memory_path
 
             distiller.add_user_line(user_memory_path(), str(payload["text"]))
+            _unfreeze(session, "user_memory")
             return f"remembered in {user_memory_path()}"
         if p.kind == "optimizer":
             if "task_tiers" in payload:

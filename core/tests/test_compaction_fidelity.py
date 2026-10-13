@@ -77,6 +77,19 @@ async def test_a_long_first_prompt_does_not_push_the_earlier_summary_out_of_the_
     assert len(seen) < 60_000 + 200
 
 
+async def test_a_requirement_in_the_clipped_middle_of_a_long_first_prompt_reaches_the_summary_model():
+    """The kept copy of a first prompt over TASK_ANCHOR_CHARS drops its middle; the summary model used to be shown only
+    the start and the end of it, 'the rest kept verbatim', so a requirement there was in neither."""
+    first = "spec " + "a" * 9_990 + " MID REQUIREMENT: the export must be idempotent. " + "b" * 10_000
+    msgs = [{"role": "user", "content": first}, *filler(12)]
+    caller = FakeCaller("the work so far")
+    new, folded = await compact_messages(caller, msgs, keep=4)
+    assert folded > 0 and "MID REQUIREMENT" not in new[0]["content"]
+    seen = caller.calls[0][1].content
+    assert "MID REQUIREMENT: the export must be idempotent." in seen
+    assert "the rest of this message is kept verbatim" not in seen, "the note must not say what is not true"
+
+
 # ── the todo list ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 TODOS = [
