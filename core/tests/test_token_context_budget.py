@@ -110,8 +110,7 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
         assert f"file {i}" in sent[f"r{i}"] and len(sent[f"r{i}"]) > 3000
     stored = [m.content for m in loop.turn_messages if m.role == "tool"]
     assert all(len(c) > 3000 for c in stored)  # the conversation itself keeps every result
-    transcript = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
-    assert all(len(c) > 3000 for c in transcript)
+    assert loop.reliability.load_transcript() is None  # a finished turn leaves no checkpoint behind
 
 
 async def test_elision_runs_in_batches_so_the_request_prefix_rarely_changes(tmp_path):

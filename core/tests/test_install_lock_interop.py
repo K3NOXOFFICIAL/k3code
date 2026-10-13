@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -93,3 +94,12 @@ def test_k3code_update_takes_over_the_lock_of_a_killed_install_sh(
     with upd.install_lock():
         assert (lock / "pid").read_text().strip() == str(os.getpid())
     assert not lock.exists()
+
+
+def test_both_sides_clean_the_temp_kinds_install_sh_records() -> None:
+    # a kind install.sh records but one side does not clean would leak again, quietly
+    text = INSTALL.read_text()
+    cleaned = re.search(r"for kind in ([a-z ]+); do", text)
+    assert cleaned is not None
+    recorded = set(re.findall(r"^\s+record_tmp (\w+) ", text, re.MULTILINE))
+    assert recorded == set(cleaned.group(1).split()) == set(upd.RECORDED_TMP_KINDS)

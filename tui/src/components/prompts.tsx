@@ -20,8 +20,48 @@ const LABELS = {
   session: "Allow this session",
 } as const;
 const CMD_PREVIEW_LINES = 10;
+/** Rows of an edit/write diff shown at once; `[` and `]` page through the rest. */
+export const DIFF_VIEW_LINES = 16;
 
 type ApprovalChoice = "always" | "deny" | "once" | "session";
+
+/**
+ * The rows of an approval's change preview (a unified diff) to show from
+ * `offset`: clamped so the window never runs past the end. Pure, for tests.
+ */
+export function previewWindow(
+  preview: string,
+  offset: number,
+  height: number = DIFF_VIEW_LINES,
+): { lines: string[]; offset: number; total: number } {
+  const all = preview.split("\n");
+  const start = Math.max(0, Math.min(offset, all.length - height));
+
+  return {
+    lines: all.slice(start, start + height),
+    offset: start,
+    total: all.length,
+  };
+}
+
+/** How a diff row is drawn: added, removed, hunk header or context. */
+export function diffLineKind(
+  line: string,
+): "add" | "context" | "del" | "file" | "hunk" {
+  if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+    return "file";
+  }
+
+  if (line.startsWith("@@")) {
+    return "hunk";
+  }
+
+  if (line.startsWith("+")) {
+    return "add";
+  }
+
+  return line.startsWith("-") ? "del" : "context";
+}
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   if (req.choices) {
@@ -52,7 +92,8 @@ type ApprovalAction =
   | { kind: "choose"; choice: ApprovalChoice }
   | { kind: "disarm" }
   | { kind: "move"; delta: -1 | 1 }
-  | { kind: "noop" };
+  | { kind: "noop" }
+  | { kind: "scroll"; delta: -1 | 1 };
 
 // Any character outside the C0/C1 control ranges.
 // eslint-disable-next-line no-control-regex
@@ -68,12 +109,14 @@ const TEXT_RE = /[^\x00-\x1f\x7f-\x9f]/;
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
  * for approvals).  One typed digit 1..opts.length picks the labelled choice.
  * Enter confirms the current selection.  ↑/↓ moves the selection within
- * bounds.
+ * bounds.  `[` / `]` page the change preview of an edit/write (PgUp/PgDn
+ * already scroll the transcript while a prompt is open).
  *
  * The prompt takes every key while it is open, so text typed for the
  * composer lands here.  Any other text, a paste or a typing burst ("3 tests
  * failed" arrives as one string) disarms the prompt: until ↑/↓ re-arm it,
- * Enter and the allow digits do nothing and only deny answers.
+ * Enter and the allow digits do nothing and only deny answers.  A scroll
+ * neither arms nor disarms.
  */
 export function approvalAction(
   ch: string,
@@ -84,6 +127,10 @@ export function approvalAction(
 ): ApprovalAction {
   if (key.escape) {
     return { kind: "choose", choice: "deny" };
+  }
+
+  if (!key.isPasted && (ch === "[" || ch === "]")) {
+    return { kind: "scroll", delta: ch === "[" ? -1 : 1 };
   }
 
   const n = !key.isPasted && /^\d$/.test(ch) ? Number(ch) : NaN;
@@ -133,7 +180,11 @@ export function ApprovalPrompt({
   // see the prompt already disarmed, ↓ then Enter the moved selection.
   const live = useRef(view);
   const { disarmed, sel } = view;
+  const [diffTop, setDiffTop] = useState(0);
   const opts = approvalOptions(req);
+  const diff = req.preview
+    ? previewWindow(req.preview, diffTop, DIFF_VIEW_LINES)
+    : null;
 
   useInput((ch, key, event) => {
     const cur = live.current;
@@ -148,6 +199,17 @@ export function ApprovalPrompt({
 
     if (action.kind === "choose") {
       onChoice(action.choice);
+
+      return;
+    }
+
+    if (action.kind === "scroll") {
+      if (diff) {
+        // a page minus one row of overlap; previewWindow clamps the end
+        const step = Math.max(1, DIFF_VIEW_LINES - 1) * action.delta;
+
+        setDiffTop(previewWindow(req.preview!, diff.offset + step).offset);
+      }
 
       return;
     }
@@ -201,6 +263,54 @@ export function ApprovalPrompt({
           </Text>
         ) : null}
       </Box>
+
+      {diff ? (
+        <Box
+          borderColor={t.color.muted}
+          borderStyle="single"
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+        >
+          {diff.lines.map((line, i) => {
+            const kind = diffLineKind(line);
+
+            return (
+              <Text
+                backgroundColor={
+                  kind === "add"
+                    ? t.color.diffAdded
+                    : kind === "del"
+                      ? t.color.diffRemoved
+                      : undefined
+                }
+                bold={kind === "file"}
+                color={
+                  kind === "add"
+                    ? t.color.diffAddedWord
+                    : kind === "del"
+                      ? t.color.diffRemovedWord
+                      : kind === "hunk"
+                        ? t.color.muted
+                        : t.color.text
+                }
+                dimColor={kind === "context"}
+                key={diff.offset + i}
+                wrap="truncate-end"
+              >
+                {line || " "}
+              </Text>
+            );
+          })}
+
+          {diff.total > DIFF_VIEW_LINES ? (
+            <Text color={t.color.muted}>
+              lines {diff.offset + 1}–{diff.offset + diff.lines.length} of{" "}
+              {diff.total} · [ / ] scroll
+            </Text>
+          ) : null}
+        </Box>
+      ) : null}
 
       <Text />
 

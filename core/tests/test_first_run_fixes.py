@@ -17,6 +17,26 @@ def test_empty_api_key_is_a_clear_auth_error() -> None:
     assert classify_api_error(err).reason is FailoverReason.auth
 
 
+async def test_first_turn_missing_key_error_keeps_its_whole_fix() -> None:
+    """The router caps an entry's error at 160 characters; the fix (`k3code onboard`) must fit under it."""
+    from k3code.errors import ChainExhausted
+    from k3code.providers.openai_compat import OpenAICompatProvider
+    from k3code.providers.types import Message
+    from k3code.router import CooldownStore, Router, build_chain
+
+    provider = OpenAICompatProvider(name="p", base_url="https://api.test.com", api_key="")
+    router = Router(build_chain([provider], [["m"]]), cooldowns=CooldownStore())
+    try:
+        with pytest.raises(ChainExhausted) as raised:
+            await router.complete([Message(role="user", content="hi")], [])
+    finally:
+        await provider.aclose()
+    message = str(raised.value)
+    assert "No API key configured" in message
+    assert "`k3code onboard`" in message
+    assert "…" not in message  # the 160-character cap did not cut the hint
+
+
 def test_omniroute_daily_quota_400_is_quota() -> None:
     err = ProviderError(
         "This API key reached its daily usage quota (100%). Resets in 13h 48m.",

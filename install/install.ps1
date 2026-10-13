@@ -1,7 +1,9 @@
 <#
 k3code installer for Windows. k3code runs in WSL (Windows Subsystem for Linux): this script runs
-install/install.sh inside a WSL distribution and adds k3code.cmd and k3.cmd to Windows, so `k3code`
-works from PowerShell and cmd and opens in the current directory. When WSL has no Linux distribution yet,
+install/install.sh inside a WSL distribution and adds k3code.exe and k3.exe to Windows, so `k3code`
+works from PowerShell and cmd and opens in the current directory. The two are a small launcher (install/k3launch.cs)
+built here with the .NET Framework compiler every Windows has; without it, k3code.cmd and k3.cmd are written instead
+(cmd.exe re-reads their arguments: & | < > ^ inside quotes break them). When WSL has no Linux distribution yet,
 it runs `wsl --install -d Ubuntu` first (Windows asks for administrator approval once). Everything else
 k3code needs inside WSL (uv, Python, Node, Go) is fetched by install.sh without root.
 
@@ -99,12 +101,90 @@ function Set-UserPath([string]$Value) {
   [Environment]::SetEnvironmentVariable('K3CODE_PATH_REFRESH', $null, 'User')
 }
 
-function Write-Shim([string]$Dir, [string]$Name, [string]$Target) {
+# Is DIR one of the ';'-separated entries of LIST? An entry counts when Windows would read it as the same directory:
+# the user PATH holds unexpanded %VARIABLES%, may end in a backslash and ignores case, and a plain string match would
+# add the directory a second time.
+function Test-OnPath([string]$List, [string]$Dir) {
+  $want = [Environment]::ExpandEnvironmentVariables($Dir).TrimEnd('\')
+  foreach ($entry in ($List -split ';')) {
+    if ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $want) { return $true }
+  }
+  return $false
+}
+
+function Write-CmdShim([string]$Dir, [string]$Name, [string]$Target) {
   # cmd passes %* to wsl.exe, which splits it with the Windows rules; sh then gets each argument as "$@".
   # wsl.exe starts in the Linux path of the current Windows directory by itself (no --cd: Windows 10's WSL lacks it).
+  # Only the fallback for a Windows without the .NET Framework compiler (and the tests, off Windows): cmd re-parses
+  # %*, so & | < > ^ inside quotes in an argument cut it short and run the rest as a cmd command (issue #142).
   $body = "@echo off`r`n" +
   "wsl.exe -d $($script:Distro) --exec sh -lc `"exec $Target \`"`$@\`"`" $Name %*`r`n"
   Set-Content -Path (Join-Path $Dir "$Name.cmd") -Value $body -NoNewline -Encoding Ascii
+}
+
+function Get-Csc { # the .NET Framework 4 C# compiler every Windows 10 and 11 has, or $null
+  if ($env:OS -ne 'Windows_NT' -or -not $env:WINDIR) { return $null }
+  foreach ($fw in @('Framework64', 'Framework')) {
+    $csc = Join-Path $env:WINDIR "Microsoft.NET\$fw\v4.0.30319\csc.exe"
+    if (Test-Path $csc) { return $csc }
+  }
+  return $null
+}
+
+function Get-LauncherSource { # install/k3launch.cs: from this checkout, else next to install.sh on GitHub; or $null
+  $here = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'k3launch.cs' } else { '' }
+  if ($here -and (Test-Path $here)) { return $here }
+  $file = Join-Path ([IO.Path]::GetTempPath()) "k3launch-$([guid]::NewGuid().ToString('N')).cs"
+  try { Invoke-WebRequest -UseBasicParsing -Uri ($RawUrl -replace 'install\.sh$', 'k3launch.cs') -OutFile $file }
+  catch { return $null }
+  return $file
+}
+
+# k3code.exe / k3.exe: install/k3launch.cs compiled with the Windows .NET Framework compiler and the distribution, the
+# Linux command and its name baked in. It hands wsl.exe the arguments exactly as given (no cmd.exe in between) and
+# returns the exit code. Returns $false when it could not be built; the caller writes the .cmd shim then.
+function Write-Launcher([string]$Dir, [string]$Name, [string]$Target, [string]$Source) {
+  $csc = Get-Csc
+  if (-not $csc -or -not $Source) { return $false }
+  $ErrorActionPreference = 'Continue' # csc prints its errors; a failed build falls back to the .cmd shim
+  $tmp = Join-Path ([IO.Path]::GetTempPath()) "k3launch-$([guid]::NewGuid().ToString('N'))"
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  try {
+    $lit = { param([string]$s) '@"' + ($s -replace '"', '""') + '"' } # a C# verbatim string
+    $config = "static class Config`r`n{`r`n" +
+    "    public const string Distro = $(& $lit $script:Distro);`r`n" +
+    "    public const string Target = $(& $lit $Target);`r`n" +
+    "    public const string Name = $(& $lit $Name);`r`n}`r`n"
+    $configFile = Join-Path $tmp 'config.cs'
+    Set-Content -Path $configFile -Value $config -Encoding UTF8
+    $exe = Join-Path $tmp "$Name.exe"
+    $out = & $csc /nologo /target:exe /platform:anycpu /optimize+ "/out:$exe" $Source $configFile
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
+      Say "could not build $Name.exe ($(($out | Out-String).Trim()))"
+      return $false
+    }
+    $dest = Join-Path $Dir "$Name.exe"
+    if (Test-Path $dest) { # a running k3code.exe cannot be replaced, but it can be renamed out of the way
+      Rename-Item -Path $dest -NewName "$Name.exe.old-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    }
+    Move-Item -Path $exe -Destination $dest
+    Get-ChildItem -Path $Dir -Filter "$Name.exe.old-*" | Remove-Item -Force -ErrorAction SilentlyContinue
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Dir "$Name.cmd") # the .exe wins anyway; no stale shim
+    return $true
+  } catch {
+    Say "could not build $Name.exe: $($_.Exception.Message)"
+    return $false
+  } finally {
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
+  }
+}
+
+function Write-Shim([string]$Dir, [string]$Name, [string]$Target, [string]$Source) {
+  if (Write-Launcher $Dir $Name $Target $Source) { return }
+  Write-CmdShim $Dir $Name $Target
+  if ($env:OS -eq 'Windows_NT') {
+    Say "WARNING: wrote $Name.cmd instead of $Name.exe: cmd.exe re-reads its arguments, so do not put & | < > ^ inside quotes in a $Name argument"
+  }
 }
 
 if ($Help) {
@@ -194,20 +274,25 @@ $binWsl = "$prefix/bin"
 if (-not $env:LOCALAPPDATA) { Die 'LOCALAPPDATA is not set' }
 $shimDir = Join-Path $env:LOCALAPPDATA 'k3code\bin'
 New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
-Write-Shim $shimDir 'k3code' "$binWsl/k3code"
+$launcher = if (Get-Csc) { Get-LauncherSource } else { $null } # off Windows (the tests) the .cmd shims are written
+Write-Shim $shimDir 'k3code' "$binWsl/k3code" $launcher
 $a = Get-ShArgs "test -e $(Quote-Sh "$binWsl/k3")"
 & $Wsl @a
 if ($LASTEXITCODE -eq 0) {
-  Write-Shim $shimDir 'k3' "$binWsl/k3"
+  Write-Shim $shimDir 'k3' "$binWsl/k3" $launcher
 } else {
-  Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir 'k3.cmd')
+  foreach ($n in @('k3.cmd', 'k3.exe')) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir $n) }
+}
+# downloaded (also when piped into iex, where $PSScriptRoot is empty): a temp file
+if ($launcher -and -not ($PSScriptRoot -and $launcher.StartsWith($PSScriptRoot))) {
+  Remove-Item -Force -ErrorAction SilentlyContinue $launcher
 }
 [pscustomobject]@{ distro = $script:Distro; prefix = $prefix } | ConvertTo-Json |
   Set-Content -Path (Join-Path $env:LOCALAPPDATA 'k3code\wsl.json') -Encoding Ascii
 Say "Windows commands in $shimDir run k3code in $($script:Distro)"
 
 $userPath = Get-UserPath
-$onPath = $userPath -and (($userPath -split ';') -contains $shimDir)
+$onPath = Test-OnPath $userPath $shimDir
 if (-not $onPath) {
   if ($NoModifyPath) {
     Say "Add $shimDir to your PATH to run k3code from PowerShell and cmd"

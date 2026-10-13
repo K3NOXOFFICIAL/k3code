@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from k3code.config import ProviderEntry
 from k3code.providers.anthropic import AnthropicProvider
 from k3code.providers.base import Provider
 from k3code.providers.claude_cli import ClaudeCliProvider
 from k3code.providers.fake import FakeProvider, fake_provider_requested, load_fake_steps
 from k3code.providers.openai_compat import OpenAICompatProvider
+
+
+def provider_signature(entry: ProviderEntry) -> dict[str, Any]:
+    """What of a config entry is baked into its provider instance (endpoint, key, claude-cli options).
+
+    The model lists are left out: the routers read them from the config, so editing them never needs a new provider.
+    A field added to ``ProviderEntry`` is part of the signature until it is excluded here.
+    """
+    return entry.model_dump(exclude={"models", "descriptions", "tiers"})
 
 
 def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
@@ -29,6 +40,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     name=entry.name,
                     base_url=entry.base_url,
                     api_key=entry.api_key,
+                    keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
                 )
             )
@@ -38,6 +50,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     name=entry.name,
                     base_url=entry.base_url,
                     api_key=entry.api_key,
+                    keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
                 )
             )
@@ -58,6 +71,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
 
 __all__ = [
     "make_providers",
+    "provider_signature",
     "Provider",
     "OpenAICompatProvider",
     "AnthropicProvider",

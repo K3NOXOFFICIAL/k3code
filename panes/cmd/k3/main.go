@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -32,7 +33,7 @@ var (
 
 const helpText = `k3 - TUIOS with the k3 modal keymap (full reference: panes/docs/k3-keymap.md in the k3code repo)
 
-Usage: k3 [-h|--help]
+Usage: k3 [-h|--help] [--version]
 
 Keys: ctrl+g opens the Chooser: p panes, t tabs, s sessions, r resize,
 / search, a agents, ? help. esc returns to typing.
@@ -49,12 +50,31 @@ to the Inbox when its pane is not in front of you. In a tuios daemon session
 k3code can open /bg --pane and /fork --pane sessions in new panes.
 `
 
-func main() {
-	for _, a := range os.Args[1:] {
-		if a == "-h" || a == "--help" {
-			fmt.Print(helpText)
-			return
+// handleArgs answers the command line before anything touches the terminal.
+// k3 takes no arguments but -h/--help and --version, so any other argument is
+// an error: it must not fall through to the full-screen TUI, which needs a tty
+// and, on one, waits forever. handled is false when there is nothing to answer
+// and the TUI should start.
+func handleArgs(args []string, stdout, stderr io.Writer) (code int, handled bool) {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			fmt.Fprint(stdout, helpText)
+			return 0, true
+		case "--version":
+			fmt.Fprintf(stdout, "k3 %s (commit %s)\n", version, commit)
+			return 0, true
+		default:
+			fmt.Fprintf(stderr, "k3: unknown argument %q\nUsage: k3 [-h|--help] [--version]\n", a)
+			return 2, true
 		}
+	}
+	return 0, false
+}
+
+func main() {
+	if code, handled := handleArgs(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(code)
 	}
 
 	// The build identity, handed to internal/app before anything can crash.

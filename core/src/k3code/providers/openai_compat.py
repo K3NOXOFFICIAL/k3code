@@ -10,6 +10,7 @@ import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
 from k3code.providers.effort import openai_effort
+from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     Message,
     StreamEvent,
@@ -31,10 +32,16 @@ class OpenAICompatProvider(Provider):
         name: str,
         base_url: str,
         api_key: str,
+        keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        first_event_timeout: float | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
         self.name = name
+        #: stall limits in seconds (see stall.py); None = the defaults for the model
+        self._first_event_timeout = first_event_timeout
+        self._idle_timeout = idle_timeout
         self.base_url = base_url.rstrip("/")
         #: Anthropic-style cache_control inside messages for Claude model ids. "auto" sends it to every endpoint but
         #: OpenAI's own (which caches by itself): a Claude id there means a relay to Anthropic (OpenRouter, LiteLLM,
@@ -44,6 +51,7 @@ class OpenAICompatProvider(Provider):
             self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
         )
         self.api_key = api_key
+        self.keyless = keyless  # api_key_env "": the endpoint takes no key (Ollama), send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
 
@@ -104,11 +112,14 @@ class OpenAICompatProvider(Provider):
             request = self._client.build_request(
                 "POST",
                 self._url(),
-                headers=request_headers("openai", self.api_key),
+                headers=request_headers("openai", self.api_key, keyless=self.keyless),
                 json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
             )
+            watchdog = StreamWatchdog.for_model(
+                "openai", model, first_event=self._first_event_timeout, idle=self._idle_timeout
+            )
             try:
-                response = await self._client.send(request, stream=True)
+                response = await watchdog.guard(self._client.send(request, stream=True))
             except httpx.HTTPError as exc:
                 raise to_provider_error(exc, kind="openai") from exc
             if response.status_code < 400:
@@ -126,7 +137,7 @@ class OpenAICompatProvider(Provider):
             usage = None
             complete = False  # [DONE] or a finish_reason arrived: the answer is whole
             finish_reason: str | None = None
-            async for line in response.aiter_lines():
+            async for line in watchdog.lines(response):
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -141,6 +152,8 @@ class OpenAICompatProvider(Provider):
                     "error"
                 ):  # also OpenRouter's error + finish_reason "error" shape
                     raise _inband_error(chunk)  # the upstream failed after answering 200
+                if _made_progress(chunk):
+                    watchdog.progress()
                 choices = chunk.get("choices") or []
                 if choices:
                     if choices[0].get("finish_reason"):
@@ -206,6 +219,22 @@ async def _error_from_response(response: httpx.Response) -> ProviderError:
     return ProviderError(message=message, status_code=response.status_code, headers=headers, body=body)
 
 
+#: Delta fields that carry the model's output; reasoning_content/reasoning are what reasoning models stream first.
+_OUTPUT_FIELDS = ("content", "reasoning_content", "reasoning", "refusal", "tool_calls", "function_call")
+
+
+def _made_progress(chunk: dict[str, Any]) -> bool:
+    """Whether a data chunk holds model output, a finish reason or usage; an empty delta (the opening role chunk, a
+    relay's keepalive) holds none of them."""
+    if chunk.get("usage"):
+        return True
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or {}
+        if choice.get("finish_reason") or any(delta.get(field) for field in _OUTPUT_FIELDS):
+            return True
+    return False
+
+
 def _inband_error(chunk: dict[str, Any]) -> ProviderError:
     """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands."""
     err = chunk.get("error")
@@ -251,14 +280,22 @@ def _parse_usage(chunk_usage: dict[str, Any]) -> Any:
     from k3code.providers.types import Usage
 
     details = chunk_usage.get("prompt_tokens_details") or {}
+    cache_creation = int(
+        details.get("cache_write_tokens")
+        or details.get("cache_creation_tokens")
+        or chunk_usage.get("cache_creation_input_tokens")
+        or 0
+    )
+    prompt_tokens = int(chunk_usage.get("prompt_tokens") or 0)
+    # OmniRoute leaves cache writes out of prompt_tokens and says so; Usage counts them in
+    if details.get("cache_creation_in_prompt") is False:
+        prompt_tokens += cache_creation
     return Usage(
-        prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
+        prompt_tokens=prompt_tokens,
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
         # OpenAI reports cache hits in prompt_tokens_details; relays to Anthropic pass its own fields on
         cache_read_tokens=int(details.get("cached_tokens") or chunk_usage.get("cache_read_input_tokens") or 0),
-        cache_creation_tokens=int(
-            details.get("cache_write_tokens") or chunk_usage.get("cache_creation_input_tokens") or 0
-        ),
+        cache_creation_tokens=cache_creation,
     )
 
 
