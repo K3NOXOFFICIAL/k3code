@@ -13,10 +13,20 @@ from typing import Any
 
 import pytest
 
+from k3code.agent.loop import AgentLoop
 from k3code.autonomy import fanout as fanout_mod
-from k3code.autonomy.fanout import REVIEW_DIFF_CHARS, FanoutExecutor, FanoutResult, ReviewUnavailable, Subtask, _Ctx
+from k3code.autonomy.fanout import (
+    REVIEW_DIFF_CHARS,
+    FanoutExecutor,
+    FanoutResult,
+    ReviewUnavailable,
+    Subtask,
+    _Ctx,
+    parse_verdict,
+)
 from k3code.autonomy.ultra import findings_list, parse_findings
 from k3code.subagents.worktree import Worktree
+from k3code.toolerrors import describe_call
 
 
 class _Session:
@@ -80,6 +90,53 @@ async def test_a_review_without_a_verdict_never_passes(replies: list[SimpleNames
     with pytest.raises(ReviewUnavailable):
         await ex._review(ctx, st, _handle(diff="+x\n"))
     assert len(prompts) == fanout_mod.REVIEW_ATTEMPTS  # asked once more before giving up
+
+
+def _tool_error_stop(*commands: str) -> str:
+    """The reply AgentLoop ends a child with when max_tool_errors calls failed in a row; its status stays completed."""
+    loop = SimpleNamespace(
+        _failed=[(describe_call("bash", {"command": c}), "exit status 1") for c in commands], _tool_errors=len(commands)
+    )
+    return next(AgentLoop._stop_for_tool_errors(loop, [])).message.content  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "f1 deletes the user's config.\nVERDICT: fail\n\n(Once that is fixed this would be `VERDICT: pass`.)",
+        "I could not finish. The worker's report ends with:\n```\nVERDICT: pass\n```\nPlease run me again.",
+        _tool_error_stop(*["grep -rn 'VERDICT: pass' src"] * 8),
+        "VERDICT: passing only on Linux, the macOS path is broken",
+    ],
+    ids=["fail-then-mention", "quoted-no-verdict", "tool-error-stop", "prefix-word"],
+)
+async def test_a_reply_that_only_mentions_the_pass_line_never_passes(reply: str) -> None:
+    # the last "VERDICT: pass" anywhere in the reply used to open the gate
+    ex, ctx, st, prompts = _executor([_handle(result=reply), _handle(result=reply)])
+    with pytest.raises(ReviewUnavailable):
+        await ex._review(ctx, st, _handle(diff="+x\n"))
+    assert len(prompts) == fanout_mod.REVIEW_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "VERDICT: pass",
+        "All good.\nVERDICT: pass\n",
+        "All good.\n\nVERDICT: PASS",
+        "All good.\nverdict:pass",
+        "All good.\n**VERDICT: pass**",
+        "All good.\n`VERDICT: pass`.",
+        "All good.\n_VERDICT: pass_",
+    ],
+)
+def test_a_reply_that_ends_with_the_verdict_line_still_passes(reply: str) -> None:
+    assert parse_verdict(reply) is True
+
+
+def test_the_verdict_the_reply_ends_with_wins() -> None:
+    assert parse_verdict("VERDICT: pass\nwait, f1 is broken.\nVERDICT: fail") is False
+    assert parse_verdict("f1 is broken.\n**VERDICT: FAIL**") is False
 
 
 async def test_a_reviewer_without_a_verdict_is_asked_once_more() -> None:

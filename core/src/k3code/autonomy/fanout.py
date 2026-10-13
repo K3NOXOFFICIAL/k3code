@@ -30,7 +30,9 @@ logger = logging.getLogger(__name__)
 
 MAX_SUBTASKS = 8
 IO_HEAVY_RE = re.compile(r"\b(install|build|compile|download|bundle|docker|index|crawl|migrat\w+)\b", re.I)
-VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)", re.I)
+#: The verdict the reply ends with (markdown emphasis and a full stop may follow): a mention earlier in the reply,
+#: a quote of the pass line or a word such as "passing" is no verdict.
+VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)[\s*_`.]*\Z", re.I)
 #: Diff characters a reviewer prompt carries; past it the reviewer is told so and pointed at the worktree.
 REVIEW_DIFF_CHARS = 20000
 #: Reviewer runs per review before it counts as unavailable (a crash, a stop or a reply without a verdict).
@@ -98,9 +100,9 @@ async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bo
 
 
 def parse_verdict(text: str) -> bool | None:
-    """True = pass, False = fail, None = the reviewer gave no verdict."""
-    found = VERDICT_RE.findall(text or "")
-    return None if not found else found[-1].lower() == "pass"
+    """True = pass, False = fail, None = the reply does not end with a verdict."""
+    m = VERDICT_RE.search(text or "")
+    return None if m is None else m.group(1).lower() == "pass"
 
 
 @dataclass
