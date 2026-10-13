@@ -224,7 +224,8 @@ _SUBSTITUTION = re.compile(r"\$\(|`")
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(
     r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
-    r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)"
+    r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)",
+    re.IGNORECASE,  # drvfs (/mnt/c) and macOS resolve .SSH and .ENV to the same files
 )
 
 
@@ -373,16 +374,20 @@ def _worse(a: str | None, b: str | None) -> str | None:
 
 
 def _dotenv_name(name: str) -> bool:
+    """A dotenv file (not a committed template). Compared case-insensitively: ``.ENV`` is the same file on drvfs
+    (``/mnt/c``) and macOS."""
+    name = name.lower()
     return name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES))
 
 
 def _sensitive_name(text: str) -> bool:
     """``text`` (a path with its unknown parts removed) names a credential: a dotenv file, an ssh key, a secrets dir,
     a process environment."""
-    parts = [p for p in text.split("/") if p]
+    lowered = text.lower()  # case-insensitive file systems (drvfs, macOS): .SSH/ID_RSA is ~/.ssh/id_rsa
+    parts = [p for p in lowered.split("/") if p]
     if not parts:
         return False
-    if any(p in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{text}/":
+    if any(p in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{lowered}/":
         return True
     base = parts[-1]
     return _dotenv_name(base) or base in _KEY_NAMES or base == "environ" or base.endswith((".pem", ".key"))
@@ -390,12 +395,13 @@ def _sensitive_name(text: str) -> bool:
 
 def _glob_match(pattern: str, path: str) -> bool:
     """Shell-style match of an absolute glob against an absolute path: component by component (``*`` never crosses a
-    ``/``) and a wildcard never matches a leading dot (``cat *`` does not read ``.env``)."""
+    ``/``) and a wildcard never matches a leading dot (``cat *`` does not read ``.env``). Case-insensitive, as on drvfs
+    and macOS (``cat .EN?`` reads ``.env`` there)."""
     pat, parts = pattern.split("/"), path.split("/")
     if len(pat) != len(parts):
         return False
     return all(
-        fnmatch.fnmatchcase(name, comp) and (comp.startswith(".") or not name.startswith("."))
+        fnmatch.fnmatchcase(name.lower(), comp.lower()) and (comp.startswith(".") or not name.startswith("."))
         for comp, name in zip(pat, parts, strict=True)
     )
 
@@ -789,14 +795,15 @@ def _secret_dirs() -> list[str]:
 def sensitive_path(path: str) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
-    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks)."""
+    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks), and
+    case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files."""
     dirs = [os.path.normpath(d) for d in _secret_dirs()]
-    dirs += [os.path.realpath(d) for d in dirs]
+    dirs = [d.lower() for d in dict.fromkeys(dirs + [os.path.realpath(d) for d in dirs])]
     for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
-        if _PROC_ENVIRON.match(p) or any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs):
+        folded = p.lower()
+        if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in dirs):
             return True
-        name = os.path.basename(p)
-        if name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES)):
+        if _dotenv_name(os.path.basename(p)):
             return True
     return False
 
