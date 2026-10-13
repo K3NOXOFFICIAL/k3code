@@ -1,13 +1,15 @@
 #!/bin/sh
 # Remove a k3code install: its versions, the private Node and Go, the k3code/k3 links, the systemd unit, and what
 # presetup added under the install root (the Chromium location $DATA/browsers and the $DATA/presetup markers).
-# Your data (~/.k3code, ~/.config/k3code) is kept unless you pass --purge, which asks you to type yes on a terminal
-# (--yes answers it; without a terminal and without --yes, --purge is refused). uv is shared, so it stays.
+# Your data (~/.k3code, ~/.config/k3code, and ~/.config/tuios, where the k3 binary writes its config on its first
+# start) is kept unless you pass --purge, which asks you to type yes on a terminal (--yes answers it; without a
+# terminal and without --yes, --purge is refused). uv and the caches that uv and npm fill are shared, so they stay;
+# the output names the ones that are there.
 #   sh uninstall.sh [--prefix DIR] [--purge [--yes]]
 set -eu
 
 usage() {
-  echo "usage: uninstall.sh [--prefix DIR] [--purge [--yes]]   (--purge also deletes ~/.k3code and ~/.config/k3code)"
+  echo "usage: uninstall.sh [--prefix DIR] [--purge [--yes]]   (--purge also deletes ~/.k3code, ~/.config/k3code and ~/.config/tuios)"
   exit 0
 }
 
@@ -38,7 +40,8 @@ main() {
   case "$PREFIX" in /*) ;; *) PREFIX="$(pwd)/$PREFIX" ;; esac
   DATA="${K3CODE_DATA:-$PREFIX/share/k3code}"
   BIN="${K3_BIN_DIR:-$PREFIX/bin}"
-  user_data="${K3CODE_HOME:-$HOME/.k3code} and ${XDG_CONFIG_HOME:-$HOME/.config}/k3code"
+  config="${XDG_CONFIG_HOME:-$HOME/.config}"
+  user_data="${K3CODE_HOME:-$HOME/.k3code}, $config/k3code and $config/tuios" # tuios: the k3 pane binary's config
   # Decided before anything is removed: the user data holds keys and sessions that no reinstall brings back.
   if [ "$PURGE" = 1 ] && [ "$YES" != 1 ]; then
     if ! (: </dev/tty) 2>/dev/null; then
@@ -89,11 +92,18 @@ main() {
   fi
 
   if [ "$PURGE" = 1 ]; then
-    rm -rf "${K3CODE_HOME:-$HOME/.k3code}" "${XDG_CONFIG_HOME:-$HOME/.config}/k3code"
+    rm -rf "${K3CODE_HOME:-$HOME/.k3code}" "$config/k3code" "$config/tuios"
     echo "purged user data"
   else
     echo "kept $user_data (use --purge to delete)"
   fi
+  # What uv and npm cached while installing is shared with every other project, so it stays; say where it is.
+  shared=""
+  uv_cache="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+  npm_cache="${npm_config_cache:-$HOME/.npm}"
+  if [ -d "$uv_cache" ]; then shared="$uv_cache (uv cache clean)"; fi
+  if [ -d "$npm_cache" ]; then shared="${shared:+$shared, }$npm_cache (npm cache clean --force)"; fi
+  if [ -n "$shared" ]; then echo "left in place, shared with other projects: $shared"; fi
   echo "k3code uninstalled (system packages such as bubblewrap were left alone)"
 }
 

@@ -490,7 +490,19 @@ version_ge() { # version_ge A B: dotted version A is B or newer (three numeric p
   }'
 }
 
-go_version_of() { GOTOOLCHAIN=local "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'; }
+# go_isolate GO: in a subshell, keeps a Go fetched into $DATA inside $DATA (uninstall.sh removes it all): the module
+# cache (dropped after the build), the build cache, and the config dir where the go command keeps its telemetry. That
+# leaves ~/go, ~/.cache/go-build and ~/.config/go untouched. A Go from PATH is the user's own and is left alone.
+go_isolate() {
+  case "$1" in
+    "$DATA"/*) export GOPATH="$DATA/go/path" GOCACHE="$DATA/go/cache" XDG_CONFIG_HOME="$DATA/go/config" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;;
+  esac
+}
+go_version_of() ( # `go version` writes telemetry counters too
+  export GOTOOLCHAIN=local
+  go_isolate "$1"
+  "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'
+)
 
 go_wanted() { # the Go release panes/go.mod asks for, named the way go.dev names it (go 1.22 is go1.22.0)
   v=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" 2>/dev/null | head -n 1)
@@ -919,11 +931,7 @@ build_panes() {
     return 0
   fi
   log "building the k3 pane binary"
-  case "$GO" in
-    "$DATA"/*) set -- env GOPATH="$DATA/go/path" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;; # keep ~/go untouched
-    *) set -- env ;;
-  esac
-  if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+  if ! (cd "$SRC_ROOT/panes" && go_isolate "$GO" && CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
   fi
   if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
