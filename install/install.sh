@@ -819,6 +819,7 @@ tree_id() {
 }
 
 acquire_source() {
+  COMMIT_TIME="" # the committer time of the commit built (recorded as .committed, so a later install can tell which is older)
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
     if [ -n "$d" ] && [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ]; then
@@ -843,6 +844,7 @@ acquire_source() {
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi
+    if [ -n "$SHA" ]; then COMMIT_TIME=$(src_git log -1 --format=%ct HEAD 2>/dev/null || true); fi
     if [ -z "$SHA" ]; then
       id=$(tree_id)
       # without a checksum tool the name would be a bare X.Y.Z-src.tree and a second checkout would look installed
@@ -885,6 +887,7 @@ acquire_source() {
       if git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
         git -C "$SRC_ROOT" checkout -q FETCH_HEAD
         SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+        COMMIT_TIME=$(git -C "$SRC_ROOT" log -1 --format=%ct HEAD 2>/dev/null || true)
         fetched=1
       fi
     fi
@@ -1029,6 +1032,7 @@ install_version() {
     printf '%s\n' "$REF" >"$VERDIR/.ref"
     plain_url "$GIT_URL" >"$VERDIR/.url" # `k3code update` follows the same remote (a fork or mirror, not upstream)
   fi
+  if [ -n "${COMMIT_TIME:-}" ]; then printf '%s\n' "$COMMIT_TIME" >"$VERDIR/.committed"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
@@ -1125,6 +1129,32 @@ restart_daemon() { # a running daemon keeps executing the old version until it r
   return 0
 }
 
+# lt, gt or eq: how the X.Y.Z that starts version name A compares with B's. eq too when either is not dotted numbers.
+version_order() {
+  awk -v a="${1%%-*}" -v b="${2%%-*}" 'BEGIN {
+    if (a !~ /^[0-9]+(\.[0-9]+)*$/ || b !~ /^[0-9]+(\.[0-9]+)*$/) { print "eq"; exit }
+    n = split(a, x, "."); m = split(b, y, ".")
+    for (i = 1; i <= (n > m ? n : m); i++) {
+      if (x[i] + 0 != y[i] + 0) { print (x[i] + 0 < y[i] + 0 ? "lt" : "gt"); exit }
+    }
+    print "eq"
+  }'
+}
+
+# Is VER older than the installed version CUR? A lower X.Y.Z says so; at the same X.Y.Z the commit times recorded at
+# build do. An install from before they were recorded, or a build without git, cannot be compared: not older.
+older_than_installed() {
+  case $(version_order "$VER" "$1") in
+    lt) return 0 ;;
+    gt) return 1 ;;
+  esac
+  new=$(cat "$VERDIR/.committed" 2>/dev/null || true)
+  old=$(cat "$DATA/versions/$1/.committed" 2>/dev/null || true)
+  case "$new" in '' | *[!0-9]*) return 1 ;; esac
+  case "$old" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$new" -lt "$old" ]
+}
+
 activate() {
   cur=""
   if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
@@ -1132,6 +1162,9 @@ activate() {
     if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
     set_current "$VERDIR"
     log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
+    if [ -n "$cur" ] && older_than_installed "$cur"; then
+      log "this is older than the installed version $cur: activated anyway; k3code update --rollback returns to $cur"
+    fi
   fi
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
   link_bin k3code "$DATA/current/venv/bin/k3code"

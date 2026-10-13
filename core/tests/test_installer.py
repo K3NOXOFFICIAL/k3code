@@ -1362,6 +1362,81 @@ def test_the_recorded_remote_keeps_no_credentials(tmp_path: Path) -> None:
     assert fake not in "".join(p.read_text() for p in (home / DATA_REL).rglob(".url"))
 
 
+OLDER_NOTICE = "this is older than the installed version"
+
+
+def _commit_at(src: Path, when: str, message: str, version: str | None = None) -> str:
+    """Commit in ``src`` with the committer date ``when`` (ISO 8601), optionally after setting VERSION; its SHA."""
+    if version is not None:
+        (src / "VERSION").write_text(f"{version}\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"GIT_COMMITTER_DATE": when}
+    cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src)]
+    subprocess.run([*cmd, "commit", "-q", "-a", "--allow-empty", "-m", message, "--date", when], check=True, env=env)
+    return _git(src, "rev-parse", "HEAD")
+
+
+def test_activating_an_older_commit_says_so_and_still_does_it(tmp_path: Path) -> None:
+    # install.sh --ref <older> over a newer install of the same X.Y.Z switched `current` with only the generic
+    # "current -> ..." line: nothing said it was a downgrade
+    src = _source_repo(tmp_path)
+    first = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+
+    def install(ref: str) -> str:
+        r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r.stderr
+
+    assert OLDER_NOTICE not in install(tip)  # the first install has nothing to be older than
+    newer = (data / "current").resolve().name
+    err = install(first)
+    assert OLDER_NOTICE in err and newer in err
+    assert (data / "current").resolve().name != newer  # still allowed: the older commit is now current
+    assert (data / "previous").read_text().strip() == newer  # and the newer one is what a rollback returns to
+    assert OLDER_NOTICE not in install(tip)  # going forward again is not a downgrade
+    assert OLDER_NOTICE not in install(tip)  # nor is re-running the current version
+
+
+def test_activating_a_lower_version_says_so_without_commit_times(tmp_path: Path) -> None:
+    # the lower X.Y.Z is older whatever the commit dates say, and an install made before commit times were
+    # recorded (no .committed file) can still be compared by its version
+    src = _source_repo(tmp_path)
+    old_tag = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2000-01-01T00:00:00Z", "newer version, older timestamp", version="0.0.2")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", tip, "--minimal")
+    assert r.returncode == 0, r.stderr
+    (data / "current" / ".committed").unlink(missing_ok=True)
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", old_tag, "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+    assert (data / "current").resolve().name.startswith("0.0.1-src.")
+
+
+def test_a_newer_checkout_over_an_older_install_gets_no_downgrade_notice(tmp_path: Path) -> None:
+    src, git = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE not in r.stderr
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "previous:" in r.stderr and OLDER_NOTICE not in r.stderr
+    subprocess.run([*git, "checkout", "-q", "HEAD~1"], check=True)  # a checkout of the older commit
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+
+
 def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
     (src / "VERSION").write_text("0.0.2\n")
