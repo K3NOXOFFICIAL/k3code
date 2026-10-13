@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from k3code import confio
 from k3code.autonomy.proposals import ProposalStore
 from k3code.config import Settings
@@ -235,6 +237,75 @@ def test_rollback_of_a_key_that_was_absent_resets_the_live_value_to_its_default(
     assert live.context == {"compact_input_chars": 9000}
     xp.rollback("x1", config_path=cfg)
     assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
+
+
+def test_a_patch_on_a_key_an_active_experiment_changed_is_refused(tmp_path):
+    from k3code.learning.updateconfig import PatchRejected
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("router:\n  max_inline_wait: 20\n")
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start({"title": "x1", "patch": {"router": {"max_inline_wait": 40}}}, metrics_for(0.1), config_path=cfg)
+    # suggest() doubles the live value, so the next run proposes 40 -> 80 while x1 is still being judged
+    with pytest.raises(PatchRejected, match=r"router\.max_inline_wait.*x1"):
+        xp.start({"title": "x2", "patch": {"router": {"max_inline_wait": 80}}}, metrics_for(0.1), config_path=cfg)
+    assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 40
+    assert [x["id"] for x in xp.all()] == ["x1"]
+    # other keys, and sibling keys under one table, stay free
+    xp.start({"title": "x2", "patch": {"task_tiers": {"title": "main"}}}, metrics_for(0.1), config_path=cfg)
+    xp.start({"title": "x3", "patch": {"task_tiers": {"classification": "main"}}}, metrics_for(0.1), config_path=cfg)
+    assert [x["id"] for x in xp.active()] == ["x1", "x2", "x3"]
+
+
+def test_a_key_is_free_again_once_its_experiment_is_judged(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "x1", "patch": patch}, metrics_for(0.5), sessions=1, config_path=cfg)
+    xp.session_done(lambda since: metrics_for(0.9), config_path=cfg)  # worse: rolled back
+    assert xp.get("x1")["status"] == "rolled_back"
+    xp.start({"title": "x2", "patch": patch}, metrics_for(0.5), sessions=1, config_path=cfg)
+    assert xp.get("x2")["status"] == "active"
+
+
+@pytest.mark.parametrize(("initial", "before_x1"), [("router:\n  max_inline_wait: 20\n", 20), ("", None)])
+def test_rolling_back_an_earlier_experiment_leaves_the_value_a_later_one_owns(tmp_path, initial, before_x1):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(initial)
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch1, patch2 = {"router": {"max_inline_wait": 40}}, {"router": {"max_inline_wait": 80}}
+    xp.start({"title": "x1", "patch": patch1}, metrics_for(0.5), sessions=1, config_path=cfg)
+    xp.session_done(lambda since: metrics_for(0.1), config_path=cfg)  # better: kept, so x2 may build on it
+    xp.start({"title": "x2", "patch": patch2}, metrics_for(0.1), config_path=cfg)
+
+    assert xp.rollback("x1", config_path=cfg)
+    assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 80  # x2 still owns the key
+    assert xp.rollback("x2", config_path=cfg)
+    # x2 goes back to what the key held before x1, not to the value x1 had set
+    assert (confio.read_yaml(cfg).get("router") or {}).get("max_inline_wait") == before_x1
+
+
+def test_rolling_back_in_the_other_order_restores_each_step(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("router:\n  max_inline_wait: 20\n")
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start(
+        {"title": "x1", "patch": {"router": {"max_inline_wait": 40}}}, metrics_for(0.5), sessions=1, config_path=cfg
+    )
+    xp.session_done(lambda since: metrics_for(0.1), config_path=cfg)
+    xp.start({"title": "x2", "patch": {"router": {"max_inline_wait": 80}}}, metrics_for(0.1), config_path=cfg)
+    assert xp.rollback("x2", config_path=cfg) and confio.read_yaml(cfg)["router"]["max_inline_wait"] == 40
+    assert xp.rollback("x1", config_path=cfg) and confio.read_yaml(cfg)["router"]["max_inline_wait"] == 20
+
+
+def test_rollback_keeps_a_value_that_was_changed_by_hand_since(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("router:\n  max_inline_wait: 20\n")
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start({"title": "x1", "patch": {"router": {"max_inline_wait": 40}}}, metrics_for(0.1), config_path=cfg)
+    cfg.write_text("router:\n  max_inline_wait: 55\n")
+    assert xp.rollback("x1", config_path=cfg)
+    assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 55 and xp.get("x1")["status"] == "rolled_back"
 
 
 async def test_a_key_removed_from_the_config_file_is_reset_on_reload(tmp_path, monkeypatch):
