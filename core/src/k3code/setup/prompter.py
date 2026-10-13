@@ -25,7 +25,7 @@ _TYPES: dict[str, tuple[type, ...]] = {
 #: A field ``*`` takes any name (a provider or an environment variable). The keys come from the setup steps and
 #: ``k3code onboard``; test_answers_validation.py fails when a step reads a key that is not listed here.
 ANSWER_KEYS: dict[str, dict[str, str] | str] = {
-    "onboard": dict.fromkeys(("mode", "provider", "endpoint", "key", "keep_key", "model"), VALUE),
+    "onboard": dict.fromkeys(("mode", "provider", "endpoint", "key", "keep_key", "save_env_key", "model"), VALUE),
     "welcome": {"mode": VALUE, "bundle": VALUE, "accept": MAP},
     "about": dict.fromkeys(("name", "language", "experience", "verbosity"), VALUE),
     "system": {
