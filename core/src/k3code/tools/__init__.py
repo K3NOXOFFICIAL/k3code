@@ -701,12 +701,15 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 cmd += ["-g", f"!{exc}"]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", str(path)]
+        # rg anchors a -g glob that holds a slash at its working directory: run it where the search starts
+        root = path if path.is_dir() else path.parent
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_env(),
+            cwd=root if root.is_dir() else None,
         )
         assert proc.stdout is not None and proc.stderr is not None
         lines: list[str] = []
@@ -751,9 +754,17 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if withheld:
             _note_withheld(result, f"{withheld} matching line(s) in credential files (.env, keys) not shown")
         return result
-    except (FileNotFoundError, RuntimeError):
-        # Python fallback (no rg): off the event loop, same tree rules as glob, capped
-        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+    except (FileNotFoundError, RuntimeError) as rg_failure:
+        # Python fallback (no rg, or a pattern rg refuses such as look-around): off the event loop, same tree rules as
+        # glob, capped
+        import re
+
+        try:
+            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+        except re.error:
+            if isinstance(rg_failure, RuntimeError):  # a pattern neither engine takes: rg's message names the fault
+                raise rg_failure from None
+            raise
 
 
 #: Directories glob and the grep fallback never enter, even inside a git work tree where .gitignore may not list
@@ -972,6 +983,16 @@ def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> It
             yield f"{fp}:{number}:{line}"
 
 
+def _search_glob_match(rel: str, pattern: str) -> bool:
+    """rg ``-g`` semantics: a glob without a slash matches the file name at any depth, one with a slash is anchored at
+    the searched directory (``tests/*.py`` is not ``pkg/tests/x.py``; ``**/tests/*.py`` is)."""
+    import fnmatch
+
+    if "/" not in pattern:
+        return fnmatch.fnmatchcase(rel.rpartition("/")[2], pattern)
+    return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
+
+
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
 
@@ -994,9 +1015,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if is_dir:
             continue
         fp = base / rel
-        if includes and not any(Path(fp.name).match(p) for p in includes):
+        if includes and not any(_search_glob_match(rel, p) for p in includes):
             continue
-        if excludes and any(Path(fp.name).match(p) for p in excludes):
+        if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
         if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1
