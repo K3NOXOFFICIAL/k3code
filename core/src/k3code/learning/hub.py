@@ -485,6 +485,8 @@ class LearningHub:
         return done
 
     async def run_optimizer(self, session: Any = None) -> list[Proposal]:
+        """Analyse the week and propose changes. Only while ``learning.optimizer.enabled`` is on are gate-approved
+        candidates applied by themselves; while it is off (the default) they become proposals for a human."""
         m = self.metrics(since=self.clock() - WEEK)
         if m["sessions"] < int(self.cfg["optimizer"]["min_sessions"]):
             return []
@@ -497,7 +499,7 @@ class LearningHub:
         # a candidate the A/B window already judged worse and rolled back is never auto-applied again: it goes to
         # the proposal store, whose dedup key latches it for the human path
         for c in cands:
-            if c["auto_ok"] and self._rolled_back_before(c["patch"]):
+            if c["auto_ok"] and (not self.cfg["optimizer"]["enabled"] or self._rolled_back_before(c["patch"])):
                 c["auto_ok"] = False
         for c in cands:
             if c["auto_ok"] and not self._already_in_effect(c["patch"]):

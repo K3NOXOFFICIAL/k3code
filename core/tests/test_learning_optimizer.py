@@ -407,6 +407,64 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
     await server.close()
 
 
+def seed_a_week_with_a_gate_passing_candidate(server):
+    """Six sessions this week, and replay records in which one large turn makes ``tool_output_chars: 6000`` pass."""
+    from test_learning_replay import turn
+
+    for i in range(6):
+        server.usage.record(
+            "call",
+            session=f"s{i}",
+            tokens_in=100,
+            tokens_out=10,
+            tier="main",
+            task_kind="interactive_turn",
+            turn=f"u{i}",
+        )
+    for rec in [turn(i) for i in range(300)] + [turn(1000, tool_chars=60_000, tools=5)]:
+        assert server.learning.replays.append(rec)
+
+
+async def test_optimizer_run_is_analysis_only_while_the_optimizer_is_off(tmp_path, monkeypatch):
+    """`/optimizer status` says "off (opt in: ...)", but `run` auto-applied the gate-approved candidate and rewrote
+    config.yaml anyway."""
+    from k3code.paths import user_config_path
+    from test_permissions_gateway import call, make_server
+
+    server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"min_sessions": 5}})
+    assert server.learning.cfg["optimizer"]["enabled"] is False
+    cfg = user_config_path()
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("max_turns: 77\n", encoding="utf-8")
+    seed_a_week_with_a_gate_passing_candidate(server)
+
+    out = (await call(server, "command.dispatch", {"name": "optimizer", "arg": "run"}))["output"]
+
+    assert cfg.read_text(encoding="utf-8") == "max_turns: 77\n"  # the user's config is untouched
+    assert server.config.context == Settings().context  # and so is the running one
+    assert server.learning.experiments.all() == []
+    assert server.learning.log.query("auto_apply", since=0, actor=None) == []
+    assert "off" in out and "nothing was applied" in out
+    (p,) = [x for x in server.learning.store.all() if x.kind == "optimizer"]  # the candidate waits for a human
+    assert p.payload["overlay"]["patch"] == {"context": {"tool_output_chars": 6000}}
+    await server.close()
+
+
+async def test_optimizer_run_reports_what_it_applied_automatically(tmp_path, monkeypatch):
+    from test_permissions_gateway import call, make_server
+
+    server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
+    seed_a_week_with_a_gate_passing_candidate(server)
+
+    out = (await call(server, "command.dispatch", {"name": "optimizer", "arg": "run"}))["output"]
+
+    (exp,) = server.learning.experiments.all()
+    assert server.config.context == {"tool_output_chars": 6000}
+    assert "applied automatically" in out.lower() and exp["id"] in out and exp["title"] in out
+    assert f"/optimizer rollback {exp['id']}" in out
+    await server.close()
+
+
 def test_a_replayed_candidate_that_fails_the_gate_becomes_a_proposal_for_a_human(tmp_path):
     from k3code.autonomy.proposals import ProposalStore
 
