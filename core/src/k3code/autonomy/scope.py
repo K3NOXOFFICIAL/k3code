@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import private_file
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -307,8 +308,7 @@ class ScopeLog:
         self.path = Path(home) / "scope_log.jsonl"
 
     def _append(self, rec: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        with private_file(self.path).open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def verdict(self, prompt: str, verdict: ScopeVerdict, session_id: str = "") -> str:

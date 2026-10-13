@@ -14,7 +14,7 @@ from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import distiller
 from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
 from k3code.memory import clean_fact
-from k3code.paths import home
+from k3code.paths import ensure_private_dir, home, private_file
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
@@ -77,8 +77,8 @@ def parse(text: str) -> dict[str, Any]:
 
 def write_draft(name: str, description: str, body: str) -> Path:
     d = home() / "skills" / "_drafts" / name
-    d.mkdir(parents=True, exist_ok=True)
-    md = d / "SKILL.md"
+    ensure_private_dir(d)  # a draft is written from the session: 0700/0600, and it keeps both when accepted
+    md = private_file(d / "SKILL.md")
     md.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n", encoding="utf-8")
     return md
 

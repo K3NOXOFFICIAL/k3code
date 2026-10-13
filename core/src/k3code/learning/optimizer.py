@@ -13,7 +13,7 @@ from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import learning_cfg
 from k3code.learning.decisions import DecisionLog
 from k3code.learning.updateconfig import PatchRejected, check_patch, merge_patch
-from k3code.paths import home, user_config_path
+from k3code.paths import ensure_private_dir, home, private_file, user_config_path
 
 ROLLBACK_MARGIN = 0.02
 #: Scope outcomes that are verifier results: "done" passed, "error" failed. "outage" (providers unreachable),
@@ -336,8 +336,8 @@ class Experiments:
             return []
 
     def _save(self, items: list[dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(items, indent=1), encoding="utf-8")
+        ensure_private_dir(self.path.parent)
+        private_file(self.path).write_text(json.dumps(items, indent=1), encoding="utf-8")
 
     def get(self, xid: str) -> dict[str, Any] | None:
         return next((x for x in self.all() if x["id"] == xid), None)
@@ -380,8 +380,8 @@ class Experiments:
             self._sync_live(merged, overlay["patch"])
         else:
             exp.update(kind="prompt", name=overlay["name"])
-            self.overlays.mkdir(parents=True, exist_ok=True)
-            (self.overlays / f"{xid}-{overlay['name']}.md").write_text(
+            ensure_private_dir(self.overlays)
+            private_file(self.overlays / f"{xid}-{overlay['name']}.md").write_text(
                 overlay["prompt"].strip() + "\n", encoding="utf-8"
             )
         items.append(exp)

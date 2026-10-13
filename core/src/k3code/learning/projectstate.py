@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import ensure_private_dir, private_file
+
 STATE_FILE = "project.json"
 RULES_FILE = "rules.yaml"
 MCP_FILE = "mcp.json"
@@ -63,8 +65,8 @@ def load(cwd: str | Path) -> dict[str, Any]:
 
 def save(cwd: str | Path, state: dict[str, Any]) -> Path:
     path = state_path(cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    ensure_private_dir(path.parent)
+    tmp = private_file(path.with_name(path.name + ".tmp"))
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
@@ -105,8 +107,8 @@ def add_mcp_server(cwd: str | Path, name: str, spec: dict[str, Any]) -> Path:
     data = _read_json(path)
     servers = data.get("servers") if isinstance(data.get("servers"), dict) else {}
     servers[name] = spec
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    ensure_private_dir(path.parent)
+    tmp = private_file(path.with_name(path.name + ".tmp"))
     tmp.write_text(json.dumps({"servers": servers}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path

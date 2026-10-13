@@ -18,10 +18,15 @@ def home() -> Path:
 
 def ensure_private_dir(path: Path) -> Path:
     """Create ``path`` as 0700, or tighten an existing one we own to 0700. Refuses a directory another user owns.
+    Every missing ancestor is created 0700 too (``mkdir(parents=True)`` would give those the umask's mode); an
+    existing ancestor is left as it is.
 
     k3code's private state (sessions, journals, the gateway token, learned notes) gets its mode here and in
     :func:`private_file`, never from the umask: the service unit runs with the user's umask (0022)."""
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for d in reversed([p for p in path.parents if not p.exists()]):
+        d.mkdir(mode=0o700, exist_ok=True)
+        d.chmod(0o700)
+    path.mkdir(mode=0o700, exist_ok=True)
     st = path.stat()
     if st.st_uid != os.getuid():
         raise RuntimeError(f"{path} is owned by another user; k3code keeps private state there")
@@ -38,7 +43,7 @@ def private_file(path: Path) -> Path:
     import stat
 
     if not path.parent.is_dir():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_private_dir(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
