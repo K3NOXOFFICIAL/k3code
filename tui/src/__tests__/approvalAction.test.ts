@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { approvalAction, approvalOptions } from "../components/prompts.js";
+import {
+  approvalAction,
+  approvalOptions,
+  DIFF_VIEW_LINES,
+  diffLineKind,
+  previewWindow,
+} from "../components/prompts.js";
 
 describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
   it("maps Esc to deny — parity with global Ctrl+C cancellation", () => {
@@ -190,5 +196,63 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
         description: "blocked",
       }),
     ).toEqual(["once", "deny"]);
+  });
+
+  it("pages the change preview with [ and ] without touching the choice", () => {
+    expect(approvalAction("[", {}, 1)).toEqual({ kind: "scroll", delta: -1 });
+    expect(approvalAction("]", {}, 1)).toEqual({ kind: "scroll", delta: 1 });
+  });
+
+  it("scrolls while disarmed, but a pasted [ or ] disarms", () => {
+    expect(approvalAction("]", {}, 0, undefined, true)).toEqual({
+      kind: "scroll",
+      delta: 1,
+    });
+    expect(approvalAction("[", { isPasted: true }, 0)).toEqual({
+      kind: "disarm",
+    });
+    expect(approvalAction("[x] done", {}, 0)).toEqual({ kind: "disarm" });
+  });
+});
+
+describe("change preview of an edit/write approval (issue #131)", () => {
+  const diff = [
+    "--- a/app.py",
+    "+++ b/app.py",
+    "@@ -1,3 +1,3 @@",
+    " import os",
+    "-x = 1",
+    "+x = 2",
+    " print(x)",
+  ].join("\n");
+
+  it("classifies diff rows for colouring", () => {
+    expect(diff.split("\n").map(diffLineKind)).toEqual([
+      "file",
+      "file",
+      "hunk",
+      "context",
+      "del",
+      "add",
+      "context",
+    ]);
+  });
+
+  it("shows the whole preview when it fits", () => {
+    expect(previewWindow(diff, 0)).toEqual({
+      lines: diff.split("\n"),
+      offset: 0,
+      total: 7,
+    });
+  });
+
+  it("windows a long preview and clamps at both ends", () => {
+    const long = Array.from({ length: 50 }, (_, i) => `+line ${i}`).join("\n");
+
+    expect(previewWindow(long, 0).lines).toHaveLength(DIFF_VIEW_LINES);
+    expect(previewWindow(long, -5).offset).toBe(0);
+    expect(previewWindow(long, 1000).offset).toBe(50 - DIFF_VIEW_LINES);
+    expect(previewWindow(long, 1000).lines.at(-1)).toBe("+line 49");
+    expect(previewWindow(long, 20, 10).lines[0]).toBe("+line 20");
   });
 });
