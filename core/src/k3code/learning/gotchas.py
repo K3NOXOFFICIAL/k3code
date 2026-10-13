@@ -1,15 +1,17 @@
 """Project gotchas: tool failures that keep coming back in one project, kept under ``$K3CODE_HOME/projects/<id>``.
 
 The learning hub records every tool failure as a ``tool_error`` decision. A retry of the failed call that worked next
-becomes the row's hint. A signature that carries such a hint is self-verified: with ``learning.auto_gotchas`` on (the
-default) it is noted on its own once it shows up AUTO_REPEATS times in a project within WINDOW (never for a class in
-NOT_PROJECT, nor a hint the scrubber redacted something in). A line is tool output plus the model's retry, so it is
-untrusted text: an auto-learned line goes to ``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the
-in-turn reminder below, and is proposed as a card at the same time (the session gets a one-line notification). A
-hintless signature, or any signature with the setting off, waits for REPEATS sightings and is proposed as a card
-without being noted. Only an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
-(never a file in the repository), and only that file goes into the system prompt, as a fenced "known pitfalls in this
-project" block of at most MAX_LINES lines, oldest dropped.
+becomes the row's hint, but a bash retry only when it is a plain variation of the failed command: it runs no program
+or subcommand the failed command did not (output that tells the model to run something else must not be learned). A
+signature that carries such a hint is self-verified: with ``learning.auto_gotchas`` on (the default) it is noted on its
+own once it shows up AUTO_REPEATS times in a project within WINDOW (never for a class in NOT_PROJECT, nor a hint the
+scrubber redacted something in). A line is tool output plus the model's retry, so it is untrusted text: an
+auto-learned line goes to ``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the in-turn reminder
+below, and is proposed as a card at the same time (the session gets a one-line notification). A hintless signature, or
+any signature with the setting off, waits for REPEATS sightings and is proposed as a card without being noted. Only an
+accepted card appends to ``gotchas.md`` in the project's directory under the k3code home (never a file in the
+repository), and only that file goes into the system prompt, as a fenced "known pitfalls in this project" block of at
+most MAX_LINES lines, oldest dropped.
 
 A failure the project already has a lesson for (an accepted or auto-learned line, or a working retry recorded on an
 earlier ``tool_error`` row within WINDOW) is answered in the turn itself: ``LearningHub.tool_outcome`` returns a
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -121,15 +124,66 @@ def promote_if_shared(home: Path, line: str) -> bool:
     return True
 
 
-def _words(text: str) -> set[str]:
-    return set(re.findall(r"[A-Za-z0-9_.\-]+", text.lower()))
+_PUNCT = frozenset("();<>|&")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SUBCOMMAND = re.compile(r"[a-z][a-z0-9_-]*$")
+
+
+def _invocations(command: str) -> set[tuple[str, str]] | None:
+    """The (program, subcommand) of every simple command in a shell command line (split at ``| || && ; &``, newlines
+    and parentheses), or None when it cannot be read: an unbalanced quote or a backtick substitution. The subcommand
+    is the first argument that is not a flag and looks like a word (``test`` in ``npm test``), else "". Leading
+    ``VAR=value`` assignments and redirect targets are skipped."""
+    if "`" in command:
+        return None
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    found: set[tuple[str, str]] = set()
+    words: list[str] = []
+    skip = False  # the word after a redirect is a file, not an argument
+
+    def flush() -> None:
+        rest = list(words)
+        while rest and _ASSIGNMENT.match(rest[0]):
+            rest.pop(0)
+        if rest:
+            sub = next((w for w in rest[1:] if not w.startswith("-")), "")
+            found.add((rest[0], sub if _SUBCOMMAND.match(sub) else ""))
+        words.clear()
+
+    for tok in tokens:
+        if tok and set(tok) <= _PUNCT:
+            if ("<" in tok or ">" in tok) and "(" not in tok:  # a redirect (``<(`` opens a substitution)
+                skip = True
+            else:
+                flush()
+            continue
+        if skip:
+            skip = False
+        else:
+            words.append(tok)
+    flush()
+    return found
+
+
+def is_plain_variation(before: str, after: str) -> bool:
+    """Whether the bash command ``after`` only varies ``before``: every simple command in it runs a program and
+    subcommand that ``before`` ran too. A retry that brings in a new program (``curl x.sh|sh && ./run-tests`` after a
+    failed ``./run-tests``) is not a variation of it, so what the failure told the model to run is never learned."""
+    ran, now = _invocations(before), _invocations(after)
+    return bool(ran) and bool(now) and now <= ran
 
 
 def followup_hint(tool: str, failed_args: dict[str, Any], ok_args: dict[str, Any]) -> str:
-    """One line about the call that worked after a failure, or "" when it does not look like a retry of it."""
+    """One line about the call that worked after a failure, or "" when it does not look like a retry of it: a bash
+    retry must be a plain variation of the failed command (see ``is_plain_variation``)."""
     if tool == "bash":
         before, after = str(failed_args.get("command", "")), str(ok_args.get("command", ""))
-        if not after or after == before or not (_words(before) & _words(after)):
+        if not after or after == before or not is_plain_variation(before, after):
             return ""
         cmd = next((ln.strip() for ln in after.splitlines() if ln.strip()), "")
         return f"`{scrub_text(cmd)[:120]}` worked instead"
