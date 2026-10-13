@@ -18,6 +18,7 @@ from k3code.autonomy.proposals import ProposalStore, propose
 from k3code.autonomy.scope import ScopeLog, ScopeVerdict
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
+from k3code.prompting import build_system_prompt
 from k3code.routing.tiers import TaskKind, Tier
 
 logger = logging.getLogger(__name__)
@@ -236,9 +237,19 @@ class PlanFirst:
             return None
 
         perms = PermissionState(mode=PermissionMode.PLAN, cwd=session.perms.cwd, add_dirs=list(session.perms.add_dirs))
+        # The same composed prompt as the session's normal loop (project memory, facts, gotchas, style, overlay), so
+        # the plan follows the rules the execution turn runs under. No skills index or MCP names: this loop has
+        # neither tool.
+        base = build_system_prompt(
+            session.system_prompt,
+            cwd=session.perms.cwd,
+            config=server.config,
+            session_meta=session.stored.meta,
+            skills=False,
+        )
         loop = AgentLoop(
             router,
-            system_prompt=session.system_prompt + PLAN_ADDENDUM,
+            system_prompt=base + PLAN_ADDENDUM,
             max_turns=8,
             headless=False,
             on_event=server._on_router_event,
