@@ -542,23 +542,27 @@ def check_browser() -> Check:
     location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
     has_chromium = location.is_dir() and any(location.glob("chromium*"))
     if has_playwright and has_chromium:
-        # a directory is not a browser: look for the executable (never launched here)
+        # a directory is not a browser: look for the executable (never launched here); Playwright 1.63's headless
+        # shell is chrome-headless-shell, older builds named it headless_shell
+        names = ("chrome-headless-shell", "chrome-headless-shell.exe", "chrome", "headless_shell", "chrome.exe")
         binary = next(
             (
                 p
                 for d in location.glob("chromium*")
-                for name in ("chrome", "headless_shell", "chrome.exe")
+                for name in names
                 for p in d.rglob(name)
                 if p.is_file() and os.access(p, os.X_OK)
             ),
             None,
         )
         if binary is None:
+            # the installer and a plain `playwright install` both skip a directory they already installed into
             return Check(
                 "browser",
                 WARN,
                 f"Chromium directory at {location} has no executable browser; the browser tool is off",
-                "re-run the installer without --minimal",
+                f"PLAYWRIGHT_BROWSERS_PATH={location} {sys.executable} -m playwright install"
+                " --force --only-shell chromium",
             )
         return Check(
             "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}

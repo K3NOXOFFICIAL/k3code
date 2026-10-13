@@ -99,6 +99,28 @@ def test_browser_check_reports_playwright_and_chromium(monkeypatch, tmp_path):
     assert chk.status == doctor.OK and "Playwright and Chromium" in chk.detail
 
 
+def test_browser_check_finds_the_headless_shell_playwright_installs(monkeypatch, tmp_path):
+    """#104: Playwright 1.63 names the binary chrome-headless-shell; the check only knew chrome and headless_shell, so
+    every fresh install warned 'no executable browser' and told the user to re-run an installer that skips Chromium."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1243" / "chrome-headless-shell-linux64"
+    shell_dir.mkdir(parents=True)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "re-run the installer" not in chk.fix  # the installer keeps the directory
+    assert "playwright install --force --only-shell chromium" in chk.fix
+    binary = shell_dir / "chrome-headless-shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.OK and chk.data["exe"] == str(binary)
+
+
 def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
     from k3code import doctor
 
