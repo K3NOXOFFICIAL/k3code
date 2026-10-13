@@ -292,18 +292,64 @@ describe("upsert", () => {
 });
 
 describe("capTranscriptHistory", () => {
-  it("keeps the intro and the newest bounded display rows", () => {
-    const intro = { kind: "intro" as const, role: "system" as const, text: "" };
-    const rows = Array.from({ length: 1_005 }, (_, index) => ({
+  const intro = { kind: "intro" as const, role: "system" as const, text: "" };
+
+  const userRows = (count: number, from = 0) =>
+    Array.from({ length: count }, (_, index) => ({
       role: "user" as const,
-      text: `m${index}`,
+      text: `m${from + index}`,
     }));
+
+  it("leaves a transcript at or under the cap untouched", () => {
+    const items = [intro, ...userRows(MAX_HISTORY - 1)];
+
+    expect(capTranscriptHistory(items)).toBe(items);
+  });
+
+  it("keeps the intro and the newest rows and says how many were dropped (#150)", () => {
+    const rows = userRows(1_005);
     const capped = capTranscriptHistory([intro, ...rows]);
 
     expect(capped).toHaveLength(MAX_HISTORY);
     expect(capped[0]).toBe(intro);
-    expect(capped[1]?.text).toBe(`m${rows.length - (MAX_HISTORY - 1)}`);
+    expect(capped[1]).toMatchObject({
+      hiddenRows: 1_005 - (MAX_HISTORY - 2),
+      kind: "event",
+      role: "system",
+      text: `${1_005 - (MAX_HISTORY - 2)} earlier rows not shown`,
+    });
+    expect(capped[2]?.text).toBe(`m${rows.length - (MAX_HISTORY - 2)}`);
     expect(capped.at(-1)?.text).toBe("m1004");
+  });
+
+  it("accumulates the dropped count across repeated trims instead of stacking markers", () => {
+    let items = capTranscriptHistory([intro, ...userRows(MAX_HISTORY + 10)]);
+    const firstHidden = items[1]?.hiddenRows ?? 0;
+
+    items = capTranscriptHistory([...items, ...userRows(7, 10_000)]);
+
+    expect(items).toHaveLength(MAX_HISTORY);
+    expect(items.filter((m) => m.hiddenRows !== undefined)).toHaveLength(1);
+    expect(items[1]?.hiddenRows).toBe(firstHidden + 7);
+    expect(items[1]?.text).toBe(`${firstHidden + 7} earlier rows not shown`);
+    expect(items.at(-1)?.text).toBe("m10006");
+  });
+
+  it("marks a transcript with no intro row too (resumed session)", () => {
+    const capped = capTranscriptHistory(userRows(MAX_HISTORY + 3));
+
+    expect(capped).toHaveLength(MAX_HISTORY);
+    expect(capped[0]).toMatchObject({ hiddenRows: 4, kind: "event" });
+    expect(capped[0]?.text).toBe("4 earlier rows not shown");
+    expect(capped.at(-1)?.text).toBe(`m${MAX_HISTORY + 2}`);
+  });
+
+  it("does not rebuild a marked transcript that is still at the cap", () => {
+    const capped = capTranscriptHistory([intro, ...userRows(MAX_HISTORY)]);
+
+    expect(capped).toHaveLength(MAX_HISTORY);
+    expect(capped[1]?.hiddenRows).toBe(2);
+    expect(capTranscriptHistory(capped)).toBe(capped);
   });
 });
 
