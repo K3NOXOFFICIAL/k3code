@@ -220,6 +220,49 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
     assert not (appdata / "k3code").exists()
 
 
+SHIM_DIR = "C:\\Users\\k\\AppData\\Local\\k3code\\bin"
+LOCAL_APPDATA = "C:\\Users\\k\\AppData\\Local"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(
+    ("user_path", "expected"),
+    [
+        (f"C:\\Windows;{SHIM_DIR}", True),
+        (f"C:\\Windows;{SHIM_DIR}\\", True),  # the finding: a trailing backslash was added a second time
+        (f"C:\\Windows;{SHIM_DIR}\\\\", True),
+        ("C:\\Windows;c:\\users\\K\\APPDATA\\local\\K3CODE\\Bin", True),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code\\bin", True),  # the registry value keeps %VARIABLES% unexpanded
+        ("%LOCALAPPDATA%\\K3CODE\\BIN\\;C:\\Windows", True),
+        (f"C:\\Windows;;{SHIM_DIR};", True),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code\\bin2", False),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code", False),
+        (f"C:\\Windows;{SHIM_DIR}\\sub", False),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code", False),
+        ("C:\\Windows;;", False),
+        ("", False),
+    ],
+)
+def test_install_ps1_path_check_ignores_how_the_entry_is_spelled(user_path: str, expected: bool) -> None:
+    # The user PATH is read unexpanded from the registry. An entry that differs from the shim directory only by a
+    # trailing backslash, case or %VARIABLE% spelling is the same directory and must not be appended again. The check
+    # is one function: only that function is loaded from the script (the script itself needs Windows and WSL to run).
+    script = REPO / "install" / "install.ps1"
+    command = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script}', [ref]$null, [ref]$null); "
+        "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+        "-and $n.Name -eq 'Test-OnPath' }, $true); "
+        "if (-not $fn) { [Console]::Error.WriteLine('no function Test-OnPath in install.ps1'); exit 2 }; "
+        "Invoke-Expression $fn.Extent.Text; "
+        f"[Console]::Out.Write((Test-OnPath '{user_path}' '{SHIM_DIR}'))"
+    )
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"), "LOCALAPPDATA": LOCAL_APPDATA}
+    cmd = ["pwsh", "-NoProfile", "-Command", command]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ("True" if expected else "False"), user_path
+
+
 def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_STUB_VENV": "1", "K3_SKIP_TUI": "1"}
     env |= {"K3_SKIP_GO": "1", "K3_NO_DOWNLOAD": "1"}
