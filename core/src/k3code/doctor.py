@@ -86,8 +86,8 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             *(
                 _noop_probe()
                 if p.kind == "claude-cli"
-                else _probe_key(p)
-                if p.api_key or (p.api_key_env and os.environ.get(p.api_key_env))
+                else _probe_key(p)  # a keyless entry (api_key_env "") lists its models without a key
+                if p.api_key or not p.api_key_env or os.environ.get(p.api_key_env)
                 else _probe_provider(p.base_url)
                 for p in config.providers
             )
@@ -114,7 +114,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         if ok and not keyless:
             # the key answered: an auth cooldown armed by an earlier rejection is stale (the key was fixed in place)
             clear_auth_cooldowns(k3_home() / "cooldowns.json", provider=p.name)
-        if ok and keyless:
+        if ok and keyless and p.api_key_env:
             # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
             checks.append(
                 Check(
@@ -197,14 +197,18 @@ def check_keys(config: Settings) -> Check:
     missing = [
         p.api_key_env
         for p in config.providers
-        if p.kind != "claude-cli" and not (p.api_key or os.environ.get(p.api_key_env))
+        # claude-cli uses the local login, and an entry with api_key_env "" (Ollama) declares that it takes no key
+        if p.kind != "claude-cli" and p.api_key_env and not (p.api_key or os.environ.get(p.api_key_env))
     ]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
         fake = bool(os.environ.get("K3CODE_FAKE_PROVIDER"))
         # FAIL only when no chain entry can run: a keyless fallback behind a working entry is a warning
-        usable = any(p.kind == "claude-cli" or p.api_key or os.environ.get(p.api_key_env) for p in config.providers)
+        usable = any(
+            p.kind == "claude-cli" or not p.api_key_env or p.api_key or os.environ.get(p.api_key_env)
+            for p in config.providers
+        )
         return Check(
             "api-keys",
             WARN if fake or usable else FAIL,
@@ -212,7 +216,7 @@ def check_keys(config: Settings) -> Check:
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
         )
-    keyed = sum(1 for p in config.providers if p.kind != "claude-cli")  # claude-cli uses the local login, no key
+    keyed = sum(1 for p in config.providers if p.kind != "claude-cli" and p.api_key_env)  # claude-cli, keyless: none
     return Check("api-keys", OK, f"{keyed} key env var(s) present" if keyed else "no provider needs a key")
 
 
@@ -413,29 +417,22 @@ def find_repo_root() -> Path | None:
 
 
 def check_tui() -> Check:
-    from k3code.paths import find_node
+    from k3code.paths import MIN_NODE_MAJOR, NODE_ENV, resolve_node
 
-    node = find_node()
+    choice = resolve_node()
     root = find_repo_root()
     entry = root / "tui" / "dist" / "entry.js" if root else None
-    version = ""
-    if node:
-        r = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
-        version = r.stdout.strip()
-    if not node:
-        return Check("tui", FAIL, "node not found", "install Node.js >= 20")
-    major = int(version.lstrip("v").split(".")[0] or 0) if version else 0
+    fix = f"install Node.js >= {MIN_NODE_MAJOR}, run the k3code installer, or set {NODE_ENV}"
+    if not choice.path:
+        status = WARN if choice.old else FAIL
+        return Check("tui", status, choice.reason, fix, {"node": choice.old.split(" ")[0]} if choice.old else {})
+    used = f"node {choice.version} ({choice.reason}: {choice.path})"
+    data = {"node": choice.version, "path": choice.path, "source": choice.source}
     if entry is None or not entry.is_file():
-        return Check(
-            "tui",
-            WARN,
-            f"node {version}, TUI build missing",
-            "cd tui && npm install && npm run build",
-            {"node": version},
-        )
-    if major < 20:
-        return Check("tui", WARN, f"node {version} is old", "upgrade to Node.js >= 20", {"node": version})
-    return Check("tui", OK, f"node {version}, tui/dist/entry.js present", data={"node": version})
+        return Check("tui", WARN, f"{used}, TUI build missing", "cd tui && npm install && npm run build", data)
+    if choice.major < MIN_NODE_MAJOR:  # only K3CODE_NODE can name a node that old
+        return Check("tui", WARN, f"{used} is old", f"use Node.js >= {MIN_NODE_MAJOR} (or unset {NODE_ENV})", data)
+    return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
 
 
 def check_home(home: Path) -> Check:
@@ -501,6 +498,17 @@ def check_sandbox(probe: bool = True) -> Check:
                 "interactive auto/yolo bash runs unsandboxed",
                 "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
             )
+        # bwrap starting is not enough either: a resolver file the sandbox cannot read means no host name resolves
+        hidden = sandbox.hidden_name_lookup_files() if probe else []
+        if hidden:
+            return Check(
+                "sandbox",
+                WARN,
+                f"bubblewrap at {path}, but sandboxed commands cannot read {', '.join(hidden)}: host name lookups "
+                "there may fail (git fetch, pip/npm install, curl)",
+                f"see where it links to (ls -l {hidden[0]}); the sandbox never shows a file under $HOME or the "
+                "k3code home",
+            )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
         "sandbox",
@@ -538,23 +546,27 @@ def check_browser() -> Check:
     location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
     has_chromium = location.is_dir() and any(location.glob("chromium*"))
     if has_playwright and has_chromium:
-        # a directory is not a browser: look for the executable (never launched here)
+        # a directory is not a browser: look for the executable (never launched here); Playwright 1.63's headless
+        # shell is chrome-headless-shell, older builds named it headless_shell
+        names = ("chrome-headless-shell", "chrome-headless-shell.exe", "chrome", "headless_shell", "chrome.exe")
         binary = next(
             (
                 p
                 for d in location.glob("chromium*")
-                for name in ("chrome", "headless_shell", "chrome.exe")
+                for name in names
                 for p in d.rglob(name)
                 if p.is_file() and os.access(p, os.X_OK)
             ),
             None,
         )
         if binary is None:
+            # the installer and a plain `playwright install` both skip a directory they already installed into
             return Check(
                 "browser",
                 WARN,
                 f"Chromium directory at {location} has no executable browser; the browser tool is off",
-                "re-run the installer without --minimal",
+                f"PLAYWRIGHT_BROWSERS_PATH={location} {sys.executable} -m playwright install"
+                " --force --only-shell chromium",
             )
         return Check(
             "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}

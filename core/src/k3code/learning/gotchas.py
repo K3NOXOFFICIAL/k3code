@@ -7,7 +7,8 @@ NOT_PROJECT, nor a hint the scrubber redacted something in). A line is tool outp
 untrusted text: an auto-learned line goes to ``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the
 in-turn reminder below, and is proposed as a card at the same time (the session gets a one-line notification). A
 hintless signature, or any signature with the setting off, waits for REPEATS sightings and is proposed as a card
-without being noted. Only an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
+without being noted. Dismissing a card forgets its auto-learned line and ends the reminders for that signature. Only
+an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
 (never a file in the repository), and only that file goes into the system prompt, as a fenced "known pitfalls in this
 project" block of at most MAX_LINES lines, oldest dropped.
 
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.learning.decisions import project_id
+from k3code.paths import ensure_private_dir, private_file
 from k3code.paths import home as k3code_home
 from k3code.redact import REDACTED, scrub_text
 
@@ -43,8 +45,8 @@ HEADING = "## Known pitfalls in this project"
 MACHINE_HEADING = "## Known pitfalls on this machine"
 #: projects an identical auto-learned line must be in before it goes to the user-level gotchas
 PROMOTE_PROJECTS = 2
-#: failure classes that say nothing about the project: a user's denial (E6 learns from its reason) and a call the
-#: model got wrong (its schema says so)
+#: failure classes that say nothing about the project: a denial (a user's, whose reason E6 learns from, or the
+#: policy's: hardline, auto-mode roots, plan mode, a hook) and a call the model got wrong (its schema says so)
 NOT_PROJECT = frozenset({"denied", "invalid_arguments"})
 
 
@@ -75,8 +77,22 @@ def append_gotcha(path: Path, line: str) -> None:
     """Add ``- line`` to ``path``, keeping the newest MAX_LINES entries."""
     entry = "- " + " ".join(scrub_text(line).split())
     entries = [e for e in _entries(path) if e != entry] + [entry]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+    ensure_private_dir(path.parent)
+    private_file(path).write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+
+
+def remove_gotcha(path: Path, line: str) -> bool:
+    """Drop the entry ``line`` was appended as from ``path`` (the file goes with its last one); True if it was there."""
+    entry = "- " + " ".join(scrub_text(line).split())
+    entries = _entries(path)
+    kept = [e for e in entries if e != entry]
+    if len(kept) == len(entries):
+        return False
+    if kept:
+        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+    return True
 
 
 def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:

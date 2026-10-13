@@ -90,6 +90,43 @@ def test_cli_refuses_an_unpinned_release_and_passes_the_override(data: Path, mon
     assert r.exit_code == 0 and seen == [True], r.output
 
 
+def _failing_uv(tmp_path: Path, step: str) -> str:
+    """A ``uv`` whose ``step`` (``venv`` or ``pip``) prints twelve lines of its own output to stderr and exits 2."""
+    exe = tmp_path / "bin" / "uv"
+    exe.parent.mkdir(exist_ok=True)
+    exe.write_text(
+        '#!/bin/sh\nif [ "$1" = venv ]; then mkdir -p "$4/bin"; fi\n'
+        f'if [ "$1" = {step} ]; then\n'
+        '  i=1; while [ $i -le 12 ]; do echo "uv says line $i" >&2; i=$((i+1)); done\n'
+        "  exit 2\nfi\n"
+    )
+    exe.chmod(0o755)
+    return str(exe)
+
+
+@pytest.mark.parametrize(("step", "what"), [("venv", "uv venv"), ("pip", "uv pip install")])
+def test_a_failing_uv_step_reports_the_end_of_its_output(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, what: str
+) -> None:
+    uv = _failing_uv(tmp_path, step)
+    with pytest.raises(upd.ReleaseBuildError) as e:
+        upd.install_release(_release(monkeypatch, [WHEEL, REQS]), None, uv=uv)
+    msg = str(e.value)
+    assert msg.startswith(f"{what} failed (exit 2):")
+    assert all(f"uv says line {n}" in msg for n in range(5, 13)), msg  # the last 8 lines, where the cause is
+    assert "uv says line 4" not in msg  # and only those
+    assert not (data / "versions" / "9.0.0").exists()  # nothing half-built is left behind
+
+
+def test_cli_update_shows_why_uv_failed(data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: _release(monkeypatch, [WHEEL, REQS]))
+    monkeypatch.setattr(upd, "uv_path", lambda: _failing_uv(tmp_path, "pip"))
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 1, r.output
+    assert "uv says line 12" in r.output and "returned non-zero exit status" not in r.output, r.output
+    assert "Nothing was activated" in r.output and "Traceback" not in r.output
+
+
 def _venv(data: Path, ver: str, playwright: str | None) -> Path:
     """A version dir whose ``python`` answers the Playwright probe: the version if installed, else an import error."""
     d = data / "versions" / ver

@@ -201,8 +201,8 @@ async def prepare(
     prev = _previous(root)
     if prev.get("fingerprint") == scan.fingerprint:
         return []
-    if not scan.stacks and not (root / ".git").exists():
-        return []  # not a project (empty or scratch directory): nothing to prepare
+    if not scan.stacks:
+        return []  # no stack detected (an empty, scratch or bare `git init` directory): nothing to prepare
     info = stacks.legacy_info(scan, root)
     risks = await asyncio.to_thread(scan_risks, root, info)
     skills = await asyncio.to_thread(_skills, root, skill_roots)

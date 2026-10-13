@@ -547,6 +547,43 @@ def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
     assert "node 18" not in r.stderr
 
 
+def _check_without_node(tmp_path: Path, ldd_says: str, loader_file_exists: bool) -> str:
+    """--check on a Linux host with no node, a network tool, an `ldd` that prints LDD_SAYS and, when
+    LOADER_FILE_EXISTS, a /lib/ld-musl-* file (what Debian/Ubuntu's musl package puts on a glibc system)."""
+    real_ls = shutil.which("ls")
+    stub_bin(tmp_path, "ldd", f"cat <<'EOF'\n{ldd_says}\nEOF\nexit 1\n")
+    stub_bin(
+        tmp_path,
+        "ls",
+        f'case "$*" in */ld-musl-*) exit {0 if loader_file_exists else 2} ;; esac\nexec {real_ls} "$@"\n',
+    )
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--check",
+        env_extra={"PATH": _path_without(tmp_path, "node")},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=tmp_path / "stubbin",
+    )
+    assert r.returncode == 0, r.stderr
+    (line,) = [ln for ln in r.stderr.splitlines() if "node 20+ with npm" in ln]
+    return line
+
+
+@linux_only
+def test_a_glibc_host_with_the_musl_package_still_gets_a_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(tmp_path, "ldd (Debian GLIBC 2.36-9+deb12u10) 2.36", loader_file_exists=True)
+    assert "a private Node 22 is fetched" in line
+
+
+@linux_only
+def test_a_musl_host_gets_no_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(
+        tmp_path, "musl libc (x86_64)\nVersion 1.2.5\nDynamic Program Loader", loader_file_exists=False
+    )
+    assert "optional: builds the TUI" in line
+
+
 def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
     data = tmp_path / ".local" / "share" / "k3code"
@@ -1075,6 +1112,173 @@ def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path
     assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
 
 
+def fake_install_root(tmp_path: Path) -> Path:
+    """An install root as uninstall.sh recognises one (versions/ and a current link) with no real install in it."""
+    data = tmp_path / DATA_REL
+    (data / "versions" / "v1" / "bin").mkdir(parents=True)
+    (data / "current").symlink_to(data / "versions" / "v1")
+    return data
+
+
+def start_k3code_process(program: Path, *, ignore_term: bool = False) -> subprocess.Popen[bytes]:
+    """A long-running `sh <program>`, so the install's script path is argv[1] like a venv's `python .../bin/k3code`."""
+    trap = "trap '' TERM" if ignore_term else "trap 'kill $!; exit 0' TERM"
+    program.write_text(f"#!/bin/sh\n{trap}\nsleep 60 &\nwait $!\n")
+    proc = subprocess.Popen(
+        ["sh", str(program)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+    )
+    deadline = time.monotonic() + 5
+    while str(program).encode() not in Path(f"/proc/{proc.pid}/cmdline").read_bytes():  # fork has not exec'd yet
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    return proc
+
+
+@linux_only
+def test_uninstall_refuses_to_delete_the_tree_under_a_running_k3code(tmp_path: Path) -> None:
+    # A daemon or TUI started by hand is not a systemd unit; deleting its install root left it running on a deleted tree
+    # (and with --purge it recreated ~/.k3code). Without --yes and a terminal to ask on, uninstall lists it and stops.
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode != 0
+        assert str(proc.pid) in r.stderr and "versions/v1/bin/k3code" in r.stderr
+        assert "--yes" in r.stderr
+        assert (data / "current").is_symlink()  # nothing was removed
+        assert proc.poll() is None  # and nothing was killed
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_stops_the_processes_running_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes")
+        assert r.returncode == 0, r.stderr
+        assert str(proc.pid) in r.stderr
+        assert proc.wait(timeout=5) is not None  # stopped before the tree went
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_kills_a_process_that_ignores_term(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code", ignore_term=True)
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes", env_extra={"K3_UNINSTALL_STOP_WAIT": "1"})
+        assert r.returncode == 0, r.stderr
+        assert proc.wait(timeout=5) == -9
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_uninstall_asks_on_the_terminal_before_stopping_a_running_k3code(tmp_path: Path, answer: str) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / ".config")}
+    master, slave = os.openpty()
+    try:
+        # setsid --ctty: a new session whose controlling terminal is the pty, so uninstall.sh can open /dev/tty
+        uninstall = subprocess.Popen(
+            ["setsid", "--ctty", "sh", str(UNINSTALL)], stdin=slave, stdout=slave, stderr=slave, env=env
+        )
+        os.close(slave)
+        slave = -1
+        out, answered = b"", False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: every writer to the terminal is gone
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if not answered and b"Type yes" in out:
+                    os.write(master, answer.encode() + b"\n")
+                    answered = True
+            elif uninstall.poll() is not None:
+                break
+        if uninstall.poll() is None:
+            uninstall.kill()
+        rc = uninstall.wait()
+        text = out.decode(errors="replace")
+        assert str(proc.pid) in text
+        if answer == "yes":
+            assert rc == 0, text
+            assert proc.wait(timeout=5) is not None
+            assert not data.exists()
+        else:
+            assert rc != 0, text
+            assert proc.poll() is None  # declined: still running, and the install is still there
+            assert (data / "current").is_symlink()
+    finally:
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_leaves_alone_a_process_that_is_not_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    proc = start_k3code_process(tmp_path / "elsewhere" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode == 0, r.stderr
+        assert not data.exists()
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("linger", ["yes", "no"])
+def test_uninstall_says_to_undo_linger_only_when_it_is_on(tmp_path: Path, linger: str) -> None:
+    # `k3code service install` advises `loginctl enable-linger`; uninstalling the unit leaves that setting behind
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    (units / "k3code.service").write_text("[Unit]\n")
+    stubs = stub_bin(tmp_path, "systemctl", "exit 0\n")
+    stub_bin(tmp_path, "loginctl", f'echo "Linger={linger}"\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert ("loginctl disable-linger" in r.stderr) == (linger == "yes")
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+def test_uninstall_ps1_names_windowsonly_when_the_distro_is_gone(tmp_path: Path) -> None:
+    # The WSL distribution was unregistered: uninstall.sh cannot run, and the failure had to say how to still clean up
+    wsl = tmp_path / "wsl"
+    wsl.write_text("#!/bin/sh\necho 'There is no distribution with the supplied name.' >&2\nexit 1\n")
+    wsl.chmod(0o755)
+    appdata = tmp_path / "appdata"
+    (appdata / "k3code").mkdir(parents=True)
+    (appdata / "k3code" / "wsl.json").write_text(f'{{"distro": "Gone", "prefix": "{tmp_path}/.local"}}')
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "LOCALAPPDATA": str(appdata), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{REPO / 'install' / 'uninstall.ps1'}'; exit $LASTEXITCODE"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode != 0
+    assert "-WindowsOnly" in r.stderr
+    assert (appdata / "k3code" / "wsl.json").is_file()  # nothing on the Windows side was touched
+
+
 def _git(src: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]
@@ -1093,6 +1297,28 @@ def test_stable_channel_skips_pre_release_tags(tmp_path: Path) -> None:
     assert (home / DATA_REL / "current" / ".ref").read_text().strip() == "v0.0.1"
 
 
+def test_a_git_install_records_the_remote_it_was_made_from(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == f"file://{src}"
+
+
+def test_the_recorded_remote_keeps_no_credentials(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake = "fake-" + "token-" + str(os.getpid())  # built at run time: not a real credential
+    url = f"https://builder:{fake}@mirror.invalid/k3code.git"
+    (home / ".gitconfig").write_text(f'[url "file://{src}"]\n\tinsteadOf = {url}\n')
+    r = run(home, INSTALL, "--from-git", url, "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == "https://mirror.invalid/k3code.git"
+    assert fake not in "".join(p.read_text() for p in (home / DATA_REL).rglob(".url"))
+
+
 def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
     (src / "VERSION").write_text("0.0.2\n")
@@ -1109,6 +1335,34 @@ def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     old = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", middle[:9], "--minimal")
     assert old.returncode != 0
     assert "full 40-character SHA" in old.stderr
+
+
+def test_reinstalling_a_built_commit_rewrites_its_ref(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    sha = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    ref_file = home / DATA_REL / "current" / ".ref"
+
+    def install(ref: str) -> subprocess.CompletedProcess[str]:
+        r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r
+
+    install(sha)
+    assert ref_file.read_text().strip() == sha  # an install of a full SHA is pinned
+
+    # main is the same commit: the build is reused, but the install now follows the branch (update --check stops
+    # saying "pinned")
+    again = install("main")
+    assert "already installed" in again.stderr
+    assert ref_file.read_text().strip() == "main"
+
+    # and the other way round: asking for a commit pins an install that followed a branch
+    pinned = install(sha)
+    assert "already installed" in pinned.stderr
+    assert ref_file.read_text().strip() == sha
+    assert not list(ref_file.parent.glob(".ref.*"))  # no temp file left behind
 
 
 def _download_stub(root: Path, files: dict[str, bytes]) -> tuple[Path, Path]:
@@ -1262,6 +1516,85 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert (tmp_path / DATA_REL / "current" / "tui" / "dist" / "entry.js").read_text() == "built\n"
     assert not (src / "tui" / "node_modules").exists()
     assert not (src / "tui" / "dist").exists()
+
+
+def _checkout_with_a_failing_tui(tmp_path: Path) -> tuple[Path, Path]:
+    """A checkout whose TUI cannot build (npm cannot reach the registry), and the PATH dir with the node/npm stubs."""
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(tmp_path, "npm", 'echo "npm ERR! network request to https://registry.npmjs.org/ failed" >&2\nexit 1\n')
+    return src, tools
+
+
+def test_a_failed_tui_build_is_a_warning_for_an_install(tmp_path: Path) -> None:
+    """A fresh install without a working npm still gets k3code, on the line REPL."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_TUI",), path_front=tools
+    )
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: the TUI did not build" in r.stderr
+    current = tmp_path / DATA_REL / "current"
+    assert (current / ".complete").is_file() and not (current / "tui" / "dist").exists()
+
+
+def test_k3_require_tui_fails_the_build_when_the_tui_does_not_build(tmp_path: Path) -> None:
+    """`k3code update` sets K3_REQUIRE_TUI: its build is staged with --no-activate, and a version without the TUI used
+    to be staged, switched to and reported as updated (exit 0) when the npm registry was unreachable."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    args = ("--from-source", "--yes", "--minimal", "--no-activate", "--print-version")
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        *args,
+        env_extra={"K3_REQUIRE_TUI": "1"},
+        drop=("K3_SKIP_TUI",),
+        path_front=tools,
+    )
+    assert r.returncode != 0
+    assert "npm ERR! network request" in r.stderr and "ERROR: the TUI did not build" in r.stderr
+    assert "line REPL" not in r.stderr  # the fallback is not taken, so it is not announced (and the tail is short)
+    assert not r.stdout.strip()  # no version name: nothing to activate
+    versions = tmp_path / DATA_REL / "versions"
+    assert not versions.exists() or list(versions.iterdir()) == []  # the half-built version is gone, no .complete
+
+
+def test_k3_require_tui_does_not_fail_a_build_that_skips_the_tui(tmp_path: Path) -> None:
+    """No node (or K3_SKIP_TUI) is a skip, not a failed build: a machine without node keeps updating."""
+    src, _tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--yes",
+        "--minimal",
+        "--no-activate",
+        "--print-version",
+        env_extra={"K3_REQUIRE_TUI": "1"},  # K3_SKIP_TUI=1 is the run() default
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().startswith("9.9.9-src")
+
+
+@pytest.mark.parametrize("builds", [True, False])
+def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: bool) -> None:
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    build = 'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    fail = 'build) echo "go: module lookup disabled by GOPROXY=off" >&2; exit 1 ;; esac\n'
+    go = stub_bin(tmp_path, "go", 'case "$1" in ' + (build if builds else fail))
+    r = run(tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_GO",), path_front=go)
+    assert r.returncode == 0, r.stderr  # k3 is optional: the install goes on
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".complete").is_file()
+    if builds:
+        assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+    else:
+        assert "WARNING: the k3 pane binary did not build" in r.stderr
+        assert not (current / "bin" / "k3").exists()
+        assert (current / ".degraded").read_text().startswith("k3:")
 
 
 def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:

@@ -21,7 +21,7 @@ async def _git_install(url: str, ref: str, cur: str, apply: bool) -> str:
     if upd.is_commit_sha(ref):
         return (
             f"current: {cur}\nThis install is pinned to commit {ref[:12]}: there is nothing to update. "
-            "Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
+            f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
         )
     head_line = f"current: {cur}\nlatest:  {head[:7]} ({ref})"
     have = upd.installed_sha()

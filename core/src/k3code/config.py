@@ -23,7 +23,7 @@ class ProviderEntry(BaseModel):
     name: str
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
-    api_key_env: str = ""  # required for "openai" / "anthropic"
+    api_key_env: str = ""  # required for "openai" / "anthropic"; "" = the endpoint takes no key (Ollama)
     #: populated by load_config() from the api_key_env var; never set this directly. Not in repr: a logged or
     #: printed config must not carry the key.
     api_key: str = Field(default="", repr=False)
@@ -263,9 +263,15 @@ class Settings(BaseModel):
         return {**dict.fromkeys(CONFIG_KEYS, True), **v}
 
 
-#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
-#: learning decisions (days).
-RETENTION_DEFAULTS: dict[str, int] = {"usage_days": 180, "journal_days": 30, "debug_bundles": 10, "decisions_days": 365}
+#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), the journal directory's size
+#: cap (MB; the oldest closed files go first), debug bundles kept (count), learning decisions (days).
+RETENTION_DEFAULTS: dict[str, int] = {
+    "usage_days": 180,
+    "journal_days": 30,
+    "journal_mb": 512,
+    "debug_bundles": 10,
+    "decisions_days": 365,
+}
 
 
 def retention(config: Any) -> dict[str, int]:

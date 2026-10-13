@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, redact, redact_session_json
+from k3code.redact import REDACTED, drop_values, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -42,8 +42,9 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession) -> dict[str, Any]:
-    return redact_session_json(asdict(s))
+def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
+    return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
 def _known_secrets(config: Any, cwd: Path) -> list[str]:
@@ -58,19 +59,6 @@ def _known_secrets(config: Any, cwd: Path) -> list[str]:
         except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
             config = None
     return secret_values(config)
-
-
-def _drop_values(obj: Any, secrets: list[str]) -> Any:
-    """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
-    if isinstance(obj, dict):
-        return {k: _drop_values(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_drop_values(v, secrets) for v in obj]
-    if isinstance(obj, str):
-        for s in secrets:
-            if s in obj:
-                obj = obj.replace(s, REDACTED)
-    return obj
 
 
 def write_bundle(
@@ -89,14 +77,14 @@ def write_bundle(
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = _drop_values(redact(confio.read_yaml(src)), secrets)
+                data = redact(drop_values(confio.read_yaml(src), secrets))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = _drop_values(session_to_dict(stored), secrets)
+        session = session_to_dict(stored, secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
@@ -176,11 +164,12 @@ def read_bundle(path: Path) -> Bundle:
 
 
 def _strip_redacted(obj: Any) -> Any:
-    """Drop ``<redacted>`` placeholders anywhere inside ``obj`` (they must never be written to config)."""
+    """Drop ``<redacted>`` values from the dicts inside ``obj``. A list keeps the marker in place: without it every
+    later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
     if isinstance(obj, dict):
         return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
     if isinstance(obj, list):
-        return [_strip_redacted(v) for v in obj if v != REDACTED]
+        return [_strip_redacted(v) for v in obj]
     return obj
 
 

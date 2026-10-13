@@ -700,6 +700,31 @@ def _run_gateway() -> None:
         asyncio.run(_serve())
 
 
+# The TUI's own reset (tui/src/lib/terminalModes.ts TERMINAL_MODE_RESET, kept equal by a test), minus the default
+# colours it only restores when it painted them: mouse and locator reporting, focus events, bracketed paste, the
+# alternate screen, the kitty keyboard and modifyOtherKeys modes, attributes, and last the cursor.
+_TERMINAL_RESET = (
+    "\x1b[0'z\x1b[0'{"
+    "\x1b[?2029l\x1b[?1016l\x1b[?1015l\x1b[?1006l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+    "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[<u\x1b[>4m\x1b[0m\x1b[?25h"
+)
+
+
+def _restore_terminal() -> None:
+    """Put the terminal back after a TUI that exited abnormally (OOM kill, crash): the shell would otherwise stay in
+    the alternate screen with mouse tracking and bracketed paste on and the cursor hidden. Harmless after a TUI that
+    did reset. Nothing is written when stdout is not a terminal."""
+    with contextlib.suppress(OSError, ValueError):
+        if sys.stdout.isatty():
+            sys.stdout.write(_TERMINAL_RESET)
+            sys.stdout.flush()
+
+
+def _exit_status(returncode: int) -> int:
+    """A child killed by signal N has returncode -N (``sys.exit(-9)`` gives 247): report 128 + N, as a shell does."""
+    return 128 - returncode if returncode < 0 else returncode
+
+
 def _launch_tui(
     *,
     model: str | None = None,
@@ -714,16 +739,17 @@ def _launch_tui(
     project config the user was asked to trust) reach the spawned gateway through K3CODE_PERMISSION_MODE and
     K3CODE_PROJECT_DIR.
     """
-    from k3code.paths import find_node
+    from k3code.paths import find_node, node_problem
 
     node = find_node()
     repo_root = _find_repo_root()
     entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
     if node is None or entry is None or not entry.is_file():
+        why = node_problem() if node is None else "need tui/dist/entry.js"
         if require:
-            click.echo("The TUI is not available (need node + tui/dist/entry.js).", err=True)
+            click.echo(f"The TUI is not available ({why}).", err=True)
             sys.exit(1)
-        logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
+        logger.warning("TUI not available (%s); falling back to REPL", why)
         import asyncio
 
         from k3code.config import load_config
@@ -754,7 +780,9 @@ def _launch_tui(
         env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
     result = subprocess.run([node, str(entry)], env=env, check=False)
-    sys.exit(result.returncode)
+    if result.returncode != 0:
+        _restore_terminal()  # a TUI that died on a signal never ran its own exit reset
+    sys.exit(_exit_status(result.returncode))
 
 
 def _find_repo_root() -> Path | None:
@@ -1077,6 +1105,16 @@ def _confirm_item(item: Any) -> bool:
     return click.confirm(f"Apply {item.key}?", default=False)
 
 
+def _answers_prompter(path: Path) -> Any:
+    """The prompter for an answers file; a file that is not valid is a usage error naming it, not a traceback."""
+    from k3code.setup.prompter import AnswerPrompter, AnswersError
+
+    try:
+        return AnswerPrompter.from_file(path)
+    except AnswersError as e:
+        raise click.UsageError(f"{path}: {e}") from None
+
+
 @cli.command("setup")
 @click.option("--step", "step", help="Re-run a single step (welcome, about, system, usage, providers, tiers, ...)")
 @click.option("--non-interactive", is_flag=True, help="Take every answer from --answers")
@@ -1085,17 +1123,19 @@ def _confirm_item(item: Any) -> bool:
 @click.option("--no-probe", is_flag=True, help="Skip live provider/integration tests")
 def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, restart: bool, no_probe: bool) -> None:
     """Guided, resumable first-run setup."""
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter
     from k3code.setup.wizard import run_setup
 
     if non_interactive:
         if answers is None:
             raise click.UsageError("--non-interactive needs --answers FILE")
-        p: Any = AnswerPrompter.from_file(answers)
+        p: Any = _answers_prompter(answers)
     else:
-        p = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+        p = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_setup(p, only_step=step, restart=restart, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
@@ -1111,18 +1151,29 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
 def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
     """Guided first-run setup: fast (API endpoint + key) or full. Run it any time."""
     from k3code.setup.onboard import run_onboarding
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter, Prompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter, Prompter
 
     if answers is None and not _is_interactive():
         raise click.UsageError("`k3code onboard` needs a terminal; pass --answers FILE to run it without prompts")
-    p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    p: Prompter = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_onboarding(p, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
         click.echo("\nInterrupted. Run `k3code onboard` again to finish.")
         raise SystemExit(130) from None
+
+
+def _unusable_source(src: Path) -> str:
+    """Why the recorded source checkout cannot be updated from: the path, and what is wrong with it."""
+    why = "does not exist (moved or deleted?)" if not src.exists() else "is not a git checkout (it has no .git)"
+    return (
+        f"this install is built from {src}, which {why}. Put the checkout back there, or set update.source in "
+        "config.yaml to where it is now"
+    )
 
 
 @cli.command("update")
@@ -1184,12 +1235,14 @@ def update_cmd(
                     f"{denied or 'No release has been published yet'}.\n"
                     f"This install was made from git ({git_ref} of {cfg['url']}): checking it."
                 )
+            elif src is not None:  # recorded, but gone: say where it was expected, not only why no release came
+                raise click.ClickException(f"{_unusable_source(src)}{f' ({denied})' if denied else ''}")
             else:
                 raise click.ClickException(
                     denied
                     or "no releases found on this channel, and this install keeps no checkout or git ref to update "
-                    "from. Reinstall with `sh install.sh --from-git` (it can update itself from then on), or set "
-                    "update.source in config.yaml to a k3code checkout"
+                    f"from. Reinstall with {upd.installer_command('--from-git')} (it can update itself from then on), "
+                    "or set update.source in config.yaml to a k3code checkout"
                 )
     if git_ref is not None:
         try:
@@ -1199,7 +1252,7 @@ def update_cmd(
         if upd.is_commit_sha(git_ref):
             click.echo(
                 f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
-                f"Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
+                f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
             )
             return
         click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
@@ -1222,8 +1275,10 @@ def update_cmd(
             )
     elif from_source:
         src = upd.source_checkout()
-        if src is None or not (src / ".git").exists():
+        if src is None:
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
+        if not (src / ".git").exists():
+            raise click.ClickException(_unusable_source(src))
         click.echo(f"current: {cur}\nsource: {src}")
         if check:
             return
@@ -1249,12 +1304,20 @@ def update_cmd(
             upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
         except upd.IntegrityError as e:
             raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
-        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+        except upd.ReleaseBuildError as e:
+            raise click.ClickException(f"update failed: {e}\nNothing was activated.") from e
+        except (OSError, ValueError, httpx.HTTPError) as e:
             raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
+    try:
+        warnings = upd.vet_staged(ver)  # refuses a version that lost the TUI; nothing is switched or pruned then
+    except upd.SourceUpdateError as e:
+        raise click.ClickException(str(e)) from e
     res = upd.activate(ver)
     click.echo(res.message)
     if res.ok:
+        for line in warnings:
+            click.echo(line)
         upd.prune()
     raise SystemExit(0 if res.ok else 1)
 

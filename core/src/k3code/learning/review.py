@@ -14,10 +14,11 @@ from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import distiller
 from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
 from k3code.memory import clean_fact
-from k3code.paths import home
+from k3code.paths import ensure_private_dir, home, private_file
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
+from k3code.session_ai import SUMMARY_PREFIX
 
 #: The heading earlier versions wrote into the repo's K3CODE.md/AGENTS.md; facts now go to learned.md (k3code.memory).
 FACTS_HEADING = "## Learned project notes (auto)"
@@ -31,16 +32,37 @@ SYSTEM = (
 _NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 
+#: A compaction summary is the only record of the folded part of the conversation, so it is clipped less than a message.
+#: It is at most 700 tokens (``compact_messages``); ``transcript``'s limit leaves room for it next to the kept tail.
+SUMMARY_CLIP = 3000
+
+
 def user_turns(messages: list[dict[str, Any]]) -> int:
     return sum(1 for m in messages if m.get("role") == "user")
 
 
-def transcript(messages: list[dict[str, Any]], limit: int = 7000) -> str:
+def session_turns(meta: dict[str, Any], messages: list[dict[str, Any]]) -> int:
+    """User turns of the whole session, which the stored list stops telling once it is compacted.
+
+    Compaction replaces the list with the task anchor, a summary and the last messages, so its own user messages fall
+    from 60 to about 6. ``meta`` keeps how many user messages the list held when last asked and how many left it
+    since (compaction, ``/clear``), and the total never falls. It follows the list, not the calls: the hook runs late
+    and more than once per turn.
+    """
+    live = user_turns(messages)
+    seen = int(meta.get("turns_in_list", 0))
+    if live < seen:
+        meta["turns_dropped"] = int(meta.get("turns_dropped", 0)) + seen - live
+    meta["turns_in_list"] = live
+    return int(meta.get("turns_dropped", 0)) + live
+
+
+def transcript(messages: list[dict[str, Any]], limit: int = 9000) -> str:
     lines = []
     for m in messages:
         c = m.get("content")
         if isinstance(c, str) and m.get("role") in ("user", "assistant"):
-            lines.append(f"{m['role']}: {c[:600]}")
+            lines.append(f"{m['role']}: {c[: SUMMARY_CLIP if c.startswith(SUMMARY_PREFIX) else 600]}")
     return "\n".join(lines)[-limit:]
 
 
@@ -55,8 +77,8 @@ def parse(text: str) -> dict[str, Any]:
 
 def write_draft(name: str, description: str, body: str) -> Path:
     d = home() / "skills" / "_drafts" / name
-    d.mkdir(parents=True, exist_ok=True)
-    md = d / "SKILL.md"
+    ensure_private_dir(d)  # a draft is written from the session: 0700/0600, and it keeps both when accepted
+    md = private_file(d / "SKILL.md")
     md.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n", encoding="utf-8")
     return md
 
@@ -72,9 +94,14 @@ async def review_session(
     session_id: str = "",
     mem0_post: Any = None,
     project: str = "",
+    turns: int | None = None,
 ) -> dict[str, Any]:
-    """Returns {"skipped": bool, "facts": [...], "drafts": [paths], "proposals": [...]}."""
-    if user_turns(messages) <= min_turns:
+    """Returns {"skipped": bool, "facts": [...], "drafts": [paths], "proposals": [...]}.
+
+    ``turns`` is the user turns of the whole session (``session_turns``); ``messages`` may be a compacted list that is
+    shorter than the session.
+    """
+    if (user_turns(messages) if turns is None else turns) <= min_turns:
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
     try:
         res = await caller.complete(

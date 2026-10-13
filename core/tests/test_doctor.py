@@ -32,8 +32,22 @@ def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
 
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", lambda: True)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", lambda: [])
     chk = doctor.check_sandbox()
     assert chk.status == doctor.OK and "/usr/bin/bwrap" in chk.detail
+
+
+def test_sandbox_warns_when_names_cannot_resolve_inside_it(monkeypatch):
+    """#137: on WSL 2 bwrap started fine, so /doctor said OK, while /etc/resolv.conf was missing in the sandbox."""
+    from k3code import doctor
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", lambda: ["/etc/resolv.conf"])
+    chk = doctor.check_sandbox()
+    assert chk.status == doctor.WARN
+    assert "cannot read /etc/resolv.conf" in chk.detail and "ls -l /etc/resolv.conf" in chk.fix
 
 
 def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
@@ -45,6 +59,7 @@ def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
 
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", must_not_probe)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", must_not_probe)
     assert doctor.check_sandbox(probe=False).status == doctor.OK
 
 
@@ -82,6 +97,28 @@ def test_browser_check_reports_playwright_and_chromium(monkeypatch, tmp_path):
     binary.chmod(0o755)
     chk = doctor.check_browser()
     assert chk.status == doctor.OK and "Playwright and Chromium" in chk.detail
+
+
+def test_browser_check_finds_the_headless_shell_playwright_installs(monkeypatch, tmp_path):
+    """#104: Playwright 1.63 names the binary chrome-headless-shell; the check only knew chrome and headless_shell, so
+    every fresh install warned 'no executable browser' and told the user to re-run an installer that skips Chromium."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1243" / "chrome-headless-shell-linux64"
+    shell_dir.mkdir(parents=True)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "re-run the installer" not in chk.fix  # the installer keeps the directory
+    assert "playwright install --force --only-shell chromium" in chk.fix
+    binary = shell_dir / "chrome-headless-shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.OK and chk.data["exe"] == str(binary)
 
 
 def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
@@ -265,6 +302,27 @@ def test_project_check_reports_the_stacks_a_read_only_scan_finds(tmp_path):
     assert chk.detail.startswith("stacks: python (uv), node (pnpm); no project config")
     assert chk.data["stacks"] == ["python (uv)", "node (pnpm)"]
     assert not projectstate.state_path(tmp_path).exists()
+
+
+def test_doctor_project_check_survives_an_entry_the_filesystem_refuses_to_stat(tmp_path, monkeypatch):
+    """`k3code doctor` from a Windows drive root crashed on `/mnt/c/swapfile.sys` (#111)."""
+    from pathlib import Path
+
+    from k3code import doctor
+
+    (tmp_path / "swapfile.sys").write_text("")
+    (tmp_path / "go.mod").write_text("module demo\n")
+    real_is_dir = Path.is_dir
+
+    def is_dir(self, *args, **kwargs):
+        if self.name == "swapfile.sys":
+            raise PermissionError(13, "Permission denied", str(self))  # what Python 3.12 does on DrvFs
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    chk = doctor.check_project(tmp_path)
+    assert chk.status == doctor.OK
+    assert chk.data["stacks"] == ["go (go)"]
 
 
 def test_doctor_names_chain_models_whose_context_window_is_a_guess():

@@ -13,7 +13,7 @@ from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import learning_cfg
 from k3code.learning.decisions import DecisionLog
 from k3code.learning.updateconfig import PatchRejected, check_patch, merge_patch
-from k3code.paths import home, user_config_path
+from k3code.paths import ensure_private_dir, home, private_file, user_config_path
 
 ROLLBACK_MARGIN = 0.02
 #: Scope outcomes that are verifier results: "done" passed, "error" failed. "outage" (providers unreachable),
@@ -336,8 +336,8 @@ class Experiments:
             return []
 
     def _save(self, items: list[dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(items, indent=1), encoding="utf-8")
+        ensure_private_dir(self.path.parent)
+        private_file(self.path).write_text(json.dumps(items, indent=1), encoding="utf-8")
 
     def get(self, xid: str) -> dict[str, Any] | None:
         return next((x for x in self.all() if x["id"] == xid), None)
@@ -372,6 +372,7 @@ class Experiments:
             cur = confio.read_yaml(path)
             check_patch(overlay["patch"], cur)
             check_optimizer_patch(overlay["patch"])
+            _check_no_overlap(overlay["patch"], items)
             exp.update(kind="config", patch=overlay["patch"], prev=_prev_values(cur, overlay["patch"]))
             merged = merge_patch(cur, overlay["patch"])
             confio.validate(merged)
@@ -379,8 +380,8 @@ class Experiments:
             self._sync_live(merged, overlay["patch"])
         else:
             exp.update(kind="prompt", name=overlay["name"])
-            self.overlays.mkdir(parents=True, exist_ok=True)
-            (self.overlays / f"{xid}-{overlay['name']}.md").write_text(
+            ensure_private_dir(self.overlays)
+            private_file(self.overlays / f"{xid}-{overlay['name']}.md").write_text(
                 overlay["prompt"].strip() + "\n", encoding="utf-8"
             )
         items.append(exp)
@@ -394,7 +395,9 @@ class Experiments:
             return False
         if exp["kind"] == "config":
             path = config_path or user_config_path()
-            restored = _restore(confio.read_yaml(path), exp["patch"], exp["prev"])
+            cur = confio.read_yaml(path)
+            _hand_over(items, exp, cur)
+            restored = _restore(cur, exp["patch"], exp["prev"])
             confio.write_yaml(path, restored)
             self._sync_live(restored, exp["patch"])
             if self.on_config_rollback is not None:
@@ -492,6 +495,8 @@ def _prev_values(cur: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
 
 
 def _restore(cur: dict[str, Any], patch: dict[str, Any], prev: dict[str, Any]) -> dict[str, Any]:
+    """Undo ``patch`` in ``cur``. A leaf goes back to its ``prev`` value only while it still holds the patch's value:
+    any other value belongs to a later experiment or a hand edit, and is left alone."""
     out = dict(cur)
     for k, v in patch.items():
         old = prev.get(k)
@@ -501,11 +506,64 @@ def _restore(cur: dict[str, Any], patch: dict[str, Any], prev: dict[str, Any]) -
                 out[k] = sub
             else:
                 out.pop(k, None)
+        elif out.get(k) != v:
+            continue
         elif old is None:
             out.pop(k, None)
         else:
             out[k] = old
     return out
+
+
+def _paths_overlap(a: str, b: str) -> bool:
+    return a == b or a.startswith(b + ".") or b.startswith(a + ".")
+
+
+def _check_no_overlap(patch: dict[str, Any], items: list[dict[str, Any]]) -> None:
+    """Raise :class:`PatchRejected` when ``patch`` changes a setting that an active experiment is still judging.
+
+    Two live experiments on one key would each hold the other's value as the one to restore, so the later rollback
+    would write a value nobody wants any more.
+    """
+    for x in items:
+        if x.get("kind") != "config" or x["status"] != "active":
+            continue
+        for mine in _leaf_paths(patch):
+            for theirs in _leaf_paths(x["patch"]):
+                if _paths_overlap(mine, theirs):
+                    raise PatchRejected(
+                        f"{mine}: experiment {x['id']} is still judging {theirs}; wait for its A/B window or "
+                        f"roll it back first"
+                    )
+
+
+def _leaf_value(data: Any, path: str) -> Any:
+    for segment in path.split("."):
+        data = data.get(segment) if isinstance(data, dict) else None
+    return data
+
+
+def _hand_over(items: list[dict[str, Any]], exp: dict[str, Any], cur: dict[str, Any]) -> None:
+    """Pass what ``exp`` would restore on to the next experiment that changed the same setting again.
+
+    ``_restore`` leaves such a setting alone; when that experiment is rolled back it must restore what the setting
+    held before ``exp``, not the value ``exp`` set.
+    """
+    later = [
+        x for x in items[items.index(exp) + 1 :] if x.get("kind") == "config" and x["status"] in ("active", "kept")
+    ]
+    for path in _leaf_paths(exp["patch"]):
+        if _leaf_value(cur, path) == _leaf_value(exp["patch"], path):
+            continue
+        owner = next((x for x in later if path in _leaf_paths(x["patch"])), None)
+        if owner is None:
+            continue
+        *parents, leaf = path.split(".")
+        holder = owner["prev"]
+        for segment in parents:
+            holder = holder.get(segment) if isinstance(holder, dict) else None
+        if isinstance(holder, dict):
+            holder[leaf] = _leaf_value(exp["prev"], path)
 
 
 def check_optimizer_patch(patch: dict[str, Any]) -> None:

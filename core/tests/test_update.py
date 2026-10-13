@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from k3code import service
 from k3code import update as upd
 
 
@@ -54,9 +56,47 @@ def test_activate_success_restarts_daemon(data: Path) -> None:
     upd.switch_to("1.0.0")
     calls: list[str] = []
     res = upd.activate(
-        "1.1.0", restart=lambda: calls.append("restart"), daemon_installed=lambda: True, wait=lambda h: True
+        "1.1.0",
+        restart=lambda: calls.append("restart"),
+        daemon_installed=lambda: True,
+        daemon_stopped=lambda: False,
+        wait=lambda h: True,
     )
     assert res.ok and upd.current_version() == "1.1.0" and calls == ["restart"]
+    assert "not started" not in res.message
+
+
+def test_activate_leaves_a_stopped_daemon_stopped(data: Path) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    calls: list[str] = []
+    res = upd.activate(
+        "1.1.0",
+        restart=lambda: calls.append("restart"),
+        daemon_installed=lambda: True,
+        daemon_stopped=lambda: True,
+        wait=lambda h: calls.append("wait") or False,
+    )
+    assert res.ok and upd.current_version() == "1.1.0"
+    assert calls == []  # not restarted, and no health wait that would roll the update back
+    assert "daemon not running, not started" in res.message
+
+
+def test_activate_reads_the_daemon_state_before_it_switches(data: Path) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    seen: list[str | None] = []
+
+    def stopped() -> bool:
+        seen.append(upd.current_version())
+        return False
+
+    upd.activate(
+        "1.1.0", restart=lambda: None, daemon_installed=lambda: True, daemon_stopped=stopped, wait=lambda h: True
+    )
+    assert seen == ["1.0.0"]
 
 
 def test_smoke_failure_does_not_switch(data: Path) -> None:
@@ -73,7 +113,13 @@ def test_daemon_failure_rolls_back(data: Path) -> None:
     make_version(data, "1.1.0")
     upd.switch_to("1.0.0")
     calls: list[str] = []
-    res = upd.activate("1.1.0", restart=lambda: calls.append("r"), daemon_installed=lambda: True, wait=lambda h: False)
+    res = upd.activate(
+        "1.1.0",
+        restart=lambda: calls.append("r"),
+        daemon_installed=lambda: True,
+        daemon_stopped=lambda: False,
+        wait=lambda h: False,
+    )
     assert not res.ok and res.rolled_back
     assert upd.current_version() == "1.0.0"
     assert calls == ["r", "r"]  # restarted into the new version, then again after rollback
@@ -87,6 +133,114 @@ def test_manual_rollback_toggles(data: Path) -> None:
     res = upd.rollback(daemon_installed=lambda: False)
     assert res.ok and upd.current_version() == "1.0.0"
     assert upd.rollback(daemon_installed=lambda: False).ok and upd.current_version() == "1.1.0"
+
+
+def test_rollback_restarts_a_running_daemon(data: Path) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    upd.switch_to("1.1.0")
+    calls: list[str] = []
+    res = upd.rollback(
+        restart=lambda: calls.append("restart"), daemon_installed=lambda: True, daemon_stopped=lambda: False
+    )
+    assert res.ok and upd.current_version() == "1.0.0" and calls == ["restart"]
+    assert "not started" not in res.message
+
+
+def test_rollback_leaves_a_stopped_daemon_stopped(data: Path) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    upd.switch_to("1.1.0")
+    calls: list[str] = []
+    res = upd.rollback(
+        restart=lambda: calls.append("restart"), daemon_installed=lambda: True, daemon_stopped=lambda: True
+    )
+    assert res.ok and res.rolled_back and upd.current_version() == "1.0.0"
+    assert calls == []
+    assert "daemon not running, not started" in res.message
+
+
+class FakeSystemd:
+    """The unit file exists and ``systemctl --user`` answers ``is-active`` with ``state``; every call is recorded."""
+
+    def __init__(self, data: Path, monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(data / "xdg"))
+        service.unit_path().parent.mkdir(parents=True)
+        service.unit_path().write_text("[Service]\n")
+        monkeypatch.setattr(service.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(service, "_systemctl", self.run)
+        self.state = state
+        self.calls: list[str] = []
+
+    def run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args[0])
+        if args[0] == "is-active":
+            return subprocess.CompletedProcess(["systemctl", *args], 0 if self.state == "active" else 3, self.state, "")
+        return subprocess.CompletedProcess(["systemctl", *args], 0, "", "")
+
+
+def test_update_does_not_start_a_daemon_the_user_stopped(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    systemd = FakeSystemd(data, monkeypatch, "inactive")
+    res = upd.activate("1.1.0")
+    assert res.ok and upd.current_version() == "1.1.0"
+    assert "restart" not in systemd.calls and "start" not in systemd.calls
+    assert "daemon not running, not started" in res.message
+
+
+def test_update_restarts_a_running_daemon(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    systemd = FakeSystemd(data, monkeypatch, "active")
+    res = upd.activate("1.1.0", wait=lambda h: True)
+    assert res.ok and "restart" in systemd.calls
+    assert "not started" not in res.message
+
+
+def test_rollback_does_not_start_a_daemon_the_user_stopped(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    upd.switch_to("1.1.0")
+    systemd = FakeSystemd(data, monkeypatch, "inactive")
+    res = upd.rollback()
+    assert res.ok and upd.current_version() == "1.0.0"
+    assert "restart" not in systemd.calls and "start" not in systemd.calls
+    assert "daemon not running, not started" in res.message
+
+
+def test_rollback_restarts_a_running_daemon_through_systemd(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    make_version(data, "1.0.0")
+    make_version(data, "1.1.0")
+    upd.switch_to("1.0.0")
+    upd.switch_to("1.1.0")
+    systemd = FakeSystemd(data, monkeypatch, "active")
+    res = upd.rollback()
+    assert res.ok and "restart" in systemd.calls
+    assert "not started" not in res.message
+
+
+@pytest.mark.parametrize(
+    ("state", "stopped"),
+    [
+        ("inactive", True),  # what `systemctl --user stop` leaves
+        ("active", False),
+        ("activating", False),  # coming up or waiting out an automatic restart
+        ("failed", False),  # crashed, not stopped: the restart (with reset-failed) is what brings it back
+        ("unavailable", False),  # no systemd: restart() reports that, as before
+        ("Failed to connect to bus: No medium found", False),
+    ],
+)
+def test_daemon_is_stopped_only_when_systemd_says_inactive(
+    monkeypatch: pytest.MonkeyPatch, state: str, stopped: bool
+) -> None:
+    monkeypatch.setattr(service, "active_state", lambda: state)
+    assert upd.daemon_is_stopped() is stopped
 
 
 def test_rollback_without_previous(data: Path) -> None:
@@ -209,3 +363,54 @@ def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch:
     assert out.read_text().strip() == "update --yes sock=none"  # the daemon's socket is never handed to the child
     assert "updating" in upd.update_log_path().read_text()
     assert int(sid.read_text()) != os.getsid(0)
+
+
+def test_the_systemd_run_update_sees_the_daemons_install_root_home_and_keys(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient unit starts from the user manager's environment, not the daemon's. The daemon gets K3CODE_DATA and
+    K3CODE_HOME from `Environment=` lines and its keys from `EnvironmentFile=`, so an update started without them
+    updated ~/.local/share/k3code (a different install) and could not authenticate to a private repository."""
+    from k3code.setup.state import set_env_var
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    seen = tmp_path / "seen.txt"
+    # a stand-in for systemd-run: runs the command with the manager's environment plus only what the unit is given
+    runner = bin_dir / "systemd-run"
+    runner.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "env = {'PATH': '/usr/bin:/bin'}\n"
+        "args = sys.argv[1:]\n"
+        "while args[0].startswith('-'):\n"
+        "    opt = args.pop(0)\n"
+        "    if opt.startswith('--setenv='):\n"
+        "        name, eq, value = opt.removeprefix('--setenv=').partition('=')\n"
+        "        env[name] = value if eq else os.environ[name]\n"
+        "    elif opt.startswith('--property=EnvironmentFile=-'):\n"
+        "        path = opt.removeprefix('--property=EnvironmentFile=-')\n"
+        "        if os.path.exists(path):\n"
+        "            env.update(ln.split('=', 1) for ln in open(path).read().splitlines() if '=' in ln)\n"
+        "    elif opt not in ('--user', '--collect', '--quiet') and not opt.startswith('--unit='):\n"
+        "        sys.exit(f'unsupported option {opt}')\n"
+        "os.execve(args[0], args, env)\n"
+    )
+    runner.chmod(0o755)
+    exe = bin_dir / "k3code"
+    exe.write_text(
+        "#!/bin/sh\n"
+        f'echo "data=$K3CODE_DATA home=$K3CODE_HOME token=$GITHUB_TOKEN args=$*" > {shlex.quote(str(seen))}\n'
+    )
+    exe.chmod(0o755)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    fake_token = "fake-" + "token"
+    set_env_var("GITHUB_TOKEN", fake_token)  # where the setup wizard keeps it; the daemon reads it as EnvironmentFile
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(upd.shutil, "which", lambda name: str(bin_dir / name))
+
+    msg = upd.apply_detached(unit_installed=lambda: True)
+
+    assert "background" in msg
+    assert seen.read_text().strip() == f"data={data} home={data / 'home'} token={fake_token} args=update --yes"

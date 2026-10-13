@@ -20,8 +20,10 @@ from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import (
+    FILE_TOOLS,
     MAX_TOOL_RESULT_CHARS,
     SESSION_TOOLS,
+    FileStamps,
     build_registry,
     clip_tool_results,
     format_tool_result,
@@ -110,6 +112,9 @@ class AgentLoop:
         self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
         self._reads: dict[tuple[Any, ...], tuple[int, str]] = {}
         self._step = 0
+        #: What this loop's model has seen of each file; write and edit refuse one it has not, or that changed since.
+        #: Kept across run()s; the gateway hands every loop of a session the session's own (turns and tiers share it).
+        self.file_stamps = FileStamps()
         #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
         self.tool_output_chars = tool_output_chars
         #: M4a: what this loop is for (routes to a tier; tagged on usage rows).
@@ -355,6 +360,8 @@ class AgentLoop:
                     if self._guard_assistant("".join(text_parts), messages):
                         for stop_event in self._stop_for_input(messages):
                             yield stop_event
+                    else:
+                        self.reliability.clear_transcript()
                     return
             elif self.interrupted:
                 # Stream aborted without a final message (e.g. interrupt during
@@ -397,7 +404,6 @@ class AgentLoop:
                         name=tc.name,
                     )
                     messages.append(tool_msg)
-                    self.reliability.save_transcript(messages)
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes)
@@ -414,7 +420,12 @@ class AgentLoop:
                             for stop_event in self._stop_for_tool_errors(messages):
                                 yield stop_event
                         self.turn_messages = messages
+                        self.reliability.save_transcript(messages)
                         return
+
+                # one write per batch: rewriting the whole conversation after every result made N results cost N full
+                # serialisations of an ever-growing transcript
+                self.reliability.save_transcript(messages)
 
             messages.extend(notes)
             self.turn_messages = messages
@@ -502,6 +513,8 @@ class AgentLoop:
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+        if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
+            return {"error": f"Permission denied (unattended run): {decision.message}"}
         # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         if home_rooted:
@@ -536,6 +549,10 @@ class AgentLoop:
                 "content": f"[unchanged since the read at step {step} (call {call_id}): same path, size and "
                 "modification time; that result above still holds]"
             }
+        # after the approval (the user may have saved the file while it was open), never before it: a refusal there
+        # would tell the model whether a file outside the project exists without anyone being asked
+        if (stale := self._stale_file(tool_call.name, args)) is not None:
+            return {"error": stale}
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
@@ -559,6 +576,9 @@ class AgentLoop:
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
             self._reads[read_key] = (self._step if step is None else step, tool_call.id)
+        seen = (tool_call.name == "read" and "first" in result) or (tool_call.name in FILE_TOOLS and result.get("ok"))
+        if seen and (path := self._tool_path(args)) is not None:
+            self.file_stamps.record(path)
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
@@ -571,6 +591,21 @@ class AgentLoop:
         if not self.hooks:
             return HookOutcome()
         return await self.hooks.run(event, {"tool_name": tool, **payload}, tool_name=tool)
+
+    def _tool_path(self, args: dict[str, Any]) -> Path | None:
+        """The file a read, write or edit call names, resolved as the tool resolves it; None if it cannot be."""
+        from k3code.tools import _resolve_path
+
+        try:
+            return _resolve_path(str(args.get("path", "")), self.cwd)
+        except (OSError, ValueError):
+            return None
+
+    def _stale_file(self, name: str, args: dict[str, Any]) -> str | None:
+        """write/edit: why the file may not be changed now (see FileStamps), or None."""
+        if name not in FILE_TOOLS or (path := self._tool_path(args)) is None:
+            return None
+        return self.file_stamps.refusal(name, path)
 
     def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
         """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""

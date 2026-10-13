@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from k3code.confio import read_yaml
 from k3code.learning import projectstate
 from k3code.learning.decisions import DecisionLog
 from k3code.paths import user_config_path
+from k3code.skills import skills_prompt
 from test_permissions_gateway import bash, call, run_turn
 from test_permissions_gateway import make_server as _make_server
 
@@ -144,3 +146,21 @@ async def test_experiments_count_each_interactive_session_once(tmp_path, monkeyp
     await run_turn(server, "go", [])
     await hub.drain()
     assert hub.experiments.get("x1")["sessions_done"] == 1
+
+
+async def test_replay_record_lists_skills_at_the_configured_limit(tmp_path, monkeypatch):
+    """record_turn_replay sized the skills listing at the built-in limit, whatever context.skill_prompt_limit said:
+    the replay then judged a listing the prompt never had."""
+    roots = tmp_path / "skill-root"
+    for n in range(8):
+        (roots / f"skill-{n}").mkdir(parents=True)
+        (roots / f"skill-{n}" / "SKILL.md").write_text(f"---\nname: skill-{n}\ndescription: d\n---\nbody\n")
+    server, _ = make_server(
+        tmp_path, ["ok"], monkeypatch, skills={"roots": [str(roots)]}, context={"skill_prompt_limit": 3}
+    )
+    session = SimpleNamespace(perms=SimpleNamespace(cwd=str(tmp_path)), session_id="s1")
+    server.learning.record_turn_replay(session, [], "done", "main", "interactive_turn", "t1")
+    (record,) = server.learning.replays.load()
+    prompt = skills_prompt(str(tmp_path), [str(roots)], limit=3)  # what a turn at limit 3 puts in the system prompt
+    listed = [len(line) for line in prompt.splitlines() if line.startswith("- ")]
+    assert record["skill_lines"] == listed and len(listed) < 8

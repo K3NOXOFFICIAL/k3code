@@ -605,12 +605,18 @@ async def test_tool_results_checkpoint_the_turn_before_it_ends(tmp_path, monkeyp
     stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
     saved_sizes: list[int] = []
-    real_save = srv.store.save
-    srv.store.save = lambda s: (saved_sizes.append(len(s.messages)), real_save(s))[1]  # type: ignore[method-assign]
+    real_checkpoint = SessionStore.checkpoint
+
+    def spy(self, session_id, messages, model=""):
+        saved_sizes.append(len(messages))
+        real_checkpoint(self, session_id, messages, model)
+
+    monkeypatch.setattr(SessionStore, "checkpoint", spy)
     status, text = await srv._run_turn(live, "run echo")
     assert status == "done", (text, live.last_error)
     final = len(live.stored.messages)
     assert any(0 < n < final for n in saved_sizes), (saved_sizes, final)  # a checkpoint landed before the end
+    assert len(srv.store.get(live.session_id).messages) == final  # and the end of the turn wrote everything
 
 
 async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_path, monkeypatch):
@@ -663,7 +669,7 @@ async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path
     assert srv.providers is providers and srv.cooldowns is cooldowns
     assert srv.router is main and srv._chain_key == "default"
     assert len(srv._router_cache) == 2
-    # replacing the provider config (/config reload) does rebuild everything, once
+    # replacing the provider config (/config reload) rebuilds the routers, once (see test_gateway_provider_reload)
     srv.config.providers = [prov]
     srv._chain_key = None
     srv._ensure_router("default")

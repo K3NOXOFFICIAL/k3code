@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from k3code.agent.loop import AgentLoop
@@ -48,8 +51,31 @@ def test_write_edit_and_plain_errors_are_one_readable_line():
 def test_everything_else_is_unchanged():
     assert format_tool_result({"content": "line 1\nline 2", "lines": "1-2"}) == "line 1\nline 2"
     assert format_tool_result({"content": ""}) == ""
-    assert format_tool_result({"ok": True, "note": "n"}) == "{'ok': True, 'note': 'n'}"  # todo: not a known shape
-    assert format_tool_result({"error": "x", "extra": 1}) == "{'error': 'x', 'extra': 1}"
+    # an unknown shape is JSON, not a repr
+    assert format_tool_result({"ok": True, "note": "n"}) == '{"ok": true, "note": "n"}'
+    assert format_tool_result({"error": "x", "extra": 1}) == '{"error": "x", "extra": 1}'
+
+
+def test_unknown_shape_is_json_and_survives_non_serializable_values():
+    big = {"note": "é" * 10, "items": list(range(3)), "path": Path("/tmp/x")}
+    out = format_tool_result(big)
+    assert json.loads(out)["items"] == [0, 1, 2]
+    assert "é" * 10 in out  # not \u-escaped
+    assert "/tmp/x" in out
+
+
+def test_oversized_result_is_clipped_head_and_tail():
+    from k3code.tools import MAX_STORED_RESULT_CHARS
+
+    big = "H" * 600_000 + "M" * 600_000 + "T" * 600_000
+    out = format_tool_result({"stdout": big, "stderr": "", "exit_code": 0})
+    assert len(out) < MAX_STORED_RESULT_CHARS + 300
+    assert out.startswith("H") and out.endswith("T")
+    assert "truncated" in out
+
+
+def test_small_result_is_not_clipped():
+    assert format_tool_result({"content": "x" * 1000}) == "x" * 1000
 
 
 @pytest.mark.asyncio
