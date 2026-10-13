@@ -65,15 +65,20 @@ def _known_secrets(config: Any, cwd: Path) -> tuple[list[str], list[str]]:
 def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
     if not isinstance(rules, dict):  # `bash: ask`, or the hardline regexes
         return drop_values(rules, certain if tool == "hardline" else secrets)
-    return {drop_values(p, secrets if a == "allow" else certain): drop_values(a, secrets) for p, a in rules.items()}
+    # only an exact `deny` or `ask` is a rule that hiding a guessed value would break (rules.Rule rejects any other)
+    drop = {p: certain if a in ("deny", "ask") else secrets for p, a in rules.items()}
+    return {drop_values(p, drop[p]): drop_values(a, secrets) for p, a in rules.items()}
 
 
 def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]) -> dict[str, Any]:
     """``settings`` without the known secret values (``drop_values``). A deny or ask rule's pattern and a hardline
     regex lose only the ``certain`` ones: hiding a guessed value (an MCP root path, a region) there leaves a rule that
-    never matches, and the import then allows what it denied. An allow rule loses every known value (it asks again)."""
+    never matches, and the import then allows what it denied. Every other rule (allow, or an action no rule accepts)
+    and every key, tool names included, loses every known value: an allow rule then only asks again."""
     return {
-        drop_values(key, secrets): {tool: _drop_rules(tool, rules, secrets, certain) for tool, rules in value.items()}
+        drop_values(key, secrets): {
+            drop_values(tool, secrets): _drop_rules(tool, rules, secrets, certain) for tool, rules in value.items()
+        }
         if key == "permissions" and isinstance(value, dict)
         else drop_values(value, secrets)
         for key, value in settings.items()

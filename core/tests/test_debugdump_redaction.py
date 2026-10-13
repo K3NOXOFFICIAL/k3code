@@ -521,3 +521,34 @@ def test_an_allow_rule_still_loses_a_guessed_value_and_every_rule_a_named_secret
     with tarfile.open(out) as tar:
         blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
     assert guessed not in blob and named not in blob
+
+
+def test_a_known_secret_in_a_permission_tool_key_is_hidden(tmp_path, monkeypatch):
+    # K3NOX-495: the tool key (`web.<x>`, `mcp__<x>__run`) goes through the known-value pass like every other key
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    tok = "Dpl0y" + "ToolKey" + "Zq81xW"
+    monkeypatch.setenv("K3_TEST_DEPLOY_TOKEN", tok)
+    _write_user_config({"permissions": {f"web.{tok}": "deny", f"mcp__{tok}__run": {"*": "deny"}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert tok not in blob
+
+
+@pytest.mark.parametrize("action", ["Allow", "deny ", ["deny"], None])
+def test_a_rule_whose_action_is_not_deny_or_ask_loses_a_guessed_value(action, tmp_path):
+    # only an exact `deny`/`ask` keeps a guessed value; an action no rule accepts enforces nothing (K3NOX-497)
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    guessed = "Q1w2E3r4" + "T5y6U7i8"
+    server = {"command": "srv", "env": {"UPSTREAM": guessed}}
+    _write_user_config({"mcp": {"servers": {"s": server}}, "permissions": {"bash": {f"tool -x {guessed}": action}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert guessed not in blob
