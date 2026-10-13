@@ -297,20 +297,28 @@ def rollback(
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
 ) -> UpdateResult:
-    prev = previous_version()
-    cur = current_version()
-    if not prev:
-        return UpdateResult(False, cur or "", "no previous version to roll back to")
-    stopped = daemon_installed() and daemon_stopped()
-    switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
-    if stopped:
-        return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
-    if daemon_installed():
-        try:
-            restart()
-        except service.ServiceError as e:
-            return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
-    return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
+    """Switch back to the previous version, under the install lock: an update that is building (or install.sh) would
+    otherwise switch ``current`` again once it is done and silently undo the rollback.
+
+    A daemon that was stopped before the switch stays stopped."""
+    try:
+        with install_lock():
+            prev = previous_version()
+            cur = current_version()
+            if not prev:
+                return UpdateResult(False, cur or "", "no previous version to roll back to")
+            stopped = daemon_installed() and daemon_stopped()
+            switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
+            if stopped:
+                return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
+            if daemon_installed():
+                try:
+                    restart()
+                except service.ServiceError as e:
+                    return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
+            return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
+    except InstallLockHeld as e:
+        return UpdateResult(False, current_version() or "", f"an update is running, not rolling back: {e}")
 
 
 #: What shows that a version dir has the TUI (the file doctor's check_tui looks for) and the k3 multi-window binary.
