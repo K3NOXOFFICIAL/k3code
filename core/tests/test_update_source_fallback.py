@@ -246,6 +246,17 @@ async def test_slash_update_on_an_install_pinned_to_a_sha_has_nothing_to_update(
     assert applied == []
 
 
+async def test_slash_update_on_a_pinned_install_names_install_ps1_in_wsl(git_install, monkeypatch):
+    git_install(ref=OLD)
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: ref)
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    out = await _slash("")
+    assert "install.ps1 --from-git --ref Main`" in out and "`sh install.sh --from-git --ref Main`" in out
+    monkeypatch.setattr(upd, "_in_wsl", lambda: False)
+    out = await _slash("")
+    assert "`sh install.sh --from-git --ref Main`" in out and "install.ps1" not in out
+
+
 async def test_slash_update_without_release_checkout_or_git_ref_still_says_no_releases(tmp_path, monkeypatch):
     monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))

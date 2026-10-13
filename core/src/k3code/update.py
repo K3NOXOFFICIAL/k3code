@@ -713,6 +713,15 @@ def _in_wsl() -> bool:
         return False
 
 
+def installer_command(args: str) -> str:
+    """The installer command for a hint, in backticks. On Windows k3code runs in WSL, where the installer a user
+    starts from is `install.ps1` (there is no `sh` in PowerShell); `install.sh` still works inside WSL."""
+    sh = f"`sh install.sh {args}`"
+    if not _in_wsl():
+        return sh
+    return f"`powershell -ExecutionPolicy Bypass -File install\\install.ps1 {args}` or, inside WSL, {sh}"
+
+
 def git_pull_command(checkout: Path) -> list[str]:
     """The command that fast-forwards ``checkout``.
 
@@ -870,7 +879,7 @@ def remote_head(url: str, ref: str) -> str:
             return refs[name]
     raise SourceUpdateError(
         f"'{ref}' was not found on {url}: the branch or tag this install follows is gone. Reinstall from another "
-        f"one: `sh install.sh --from-git {url} --ref Main`"
+        f"one: {installer_command(f'--from-git {url} --ref Main')}"
     )
 
 

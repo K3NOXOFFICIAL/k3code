@@ -1188,8 +1188,8 @@ def update_cmd(
                 raise click.ClickException(
                     denied
                     or "no releases found on this channel, and this install keeps no checkout or git ref to update "
-                    "from. Reinstall with `sh install.sh --from-git` (it can update itself from then on), or set "
-                    "update.source in config.yaml to a k3code checkout"
+                    f"from. Reinstall with {upd.installer_command('--from-git')} (it can update itself from then on), "
+                    "or set update.source in config.yaml to a k3code checkout"
                 )
     if git_ref is not None:
         try:
@@ -1199,7 +1199,7 @@ def update_cmd(
         if upd.is_commit_sha(git_ref):
             click.echo(
                 f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
-                f"Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
+                f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
             )
             return
         click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
