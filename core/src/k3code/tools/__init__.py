@@ -15,6 +15,8 @@ from typing import Any
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
+    SIMILARITY_STRATEGIES,
+    STRATEGIES,
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
@@ -276,9 +278,18 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     plan = plan_edit(arguments, cwd=cwd)
     if isinstance(plan, dict):
         return plan
+    result: dict[str, Any] = {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    if plan.strategy in SIMILARITY_STRATEGIES:
+        # old_string only resembles what was replaced (a value the model misremembered): name the file's real text.
+        # Such a match is always unique, so the strategy finds the same one span again.
+        old_string = arguments["old_string"]
+        if plan.crlf:
+            old_string = old_string.replace("\r\n", "\n")  # plan.before has LF line ends, as plan_edit matched it
+        [(start, end)] = dict(STRATEGIES)[plan.strategy](plan.before, old_string)
+        result.update(replaced=plan.before[start:end], line=plan.before.count("\n", 0, start) + 1)
     new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
     _atomic_write(plan.path, new_content.encode("utf-8"))
-    return {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    return result
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
@@ -421,10 +432,19 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
-    if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
+    if result.keys() - {"replaced", "line"} == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
         n = result["replacements"]
         how = "" if result["strategy"] == "exact" else f" (matched by {result['strategy']}, not exactly)"
-        return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        text = f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        if "replaced" in result:  # a similarity match: the text it replaced is not old_string
+            first = result["line"]
+            last = first + result["replaced"].count("\n")
+            where = f"line {first}" if first == last else f"lines {first}-{last}"
+            text += (
+                f"\nold_string is not in the file; it replaced this similar text at {where}. "
+                f"Check it is what you meant:\n{result['replaced']}"
+            )
+        return text
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
     return str(result)
