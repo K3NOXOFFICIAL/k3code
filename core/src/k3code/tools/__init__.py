@@ -17,6 +17,8 @@ from k3code.permissions.engine import sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
+    SIMILARITY_STRATEGIES,
+    STRATEGIES,
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
@@ -276,6 +278,8 @@ class EditPlan:
     crlf: bool  # written back with CRLF line ends
     count: int
     strategy: str
+    replaced: str | None = None  # a similarity match only: the file's own text that old_string stood for
+    line: int = 0  # the first line of ``replaced``
 
 
 def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
@@ -307,7 +311,13 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
     if error:
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
-    return EditPlan(path, content, new_content, crlf, count, strategy)
+    replaced, line = None, 0
+    if strategy in SIMILARITY_STRATEGIES:
+        # old_string only resembles what is replaced (a value the model misremembered): name the file's real text.
+        # Such a match is always unique, so the strategy finds the same one span again.
+        [(start, end)] = dict(STRATEGIES)[strategy](content, old_string)
+        replaced, line = content[start:end], content.count("\n", 0, start) + 1
+    return EditPlan(path, content, new_content, crlf, count, strategy, replaced, line)
 
 
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -317,7 +327,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         return plan
     new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
     _atomic_write(plan.path, new_content.encode("utf-8"))
-    return {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    result = {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    if plan.replaced is not None:
+        result.update(replaced=plan.replaced, line=plan.line)
+    return result
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
@@ -473,10 +486,19 @@ def _format_tool_result(result: dict[str, Any]) -> Any:
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
-    if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
+    if result.keys() - {"replaced", "line"} == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
         n = result["replacements"]
         how = "" if result["strategy"] == "exact" else f" (matched by {result['strategy']}, not exactly)"
-        return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        text = f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        if "replaced" in result:  # a similarity match: the text it replaced is not old_string
+            first = result["line"]
+            last = first + result["replaced"].count("\n")
+            where = f"line {first}" if first == last else f"lines {first}-{last}"
+            text += (
+                f"\nold_string is not in the file; it replaced this similar text at {where}. "
+                f"Check it is what you meant:\n{result['replaced']}"
+            )
+        return text
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
     return json.dumps(result, ensure_ascii=False, default=str)
