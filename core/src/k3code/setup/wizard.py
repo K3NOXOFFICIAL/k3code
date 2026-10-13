@@ -21,7 +21,7 @@ def run_setup(
     """Run pending steps in order (or just ``only_step``). State is saved after every step."""
     if restart:
         clear_state()
-    state = load_state()
+    state = load_state(p.say)
     if state.get("done") and not only_step:  # a finished run: start a fresh one
         state = {"completed": [], "data": {}}
     ctx = Ctx(p=p, data=state["data"], do_probe=do_probe, cwd=cwd or Path.cwd())
