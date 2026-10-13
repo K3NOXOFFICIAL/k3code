@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.daemon import k3_home
-from k3code.redact import REDACTED, drop_values, redact
+from k3code.redact import REDACTED, drop_values, is_secret_key, looks_like_secret, redact, scrub_text, scrub_urls
 
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
 _SECRET_SHAPES = (
@@ -24,10 +24,38 @@ _SECRET_SHAPES = (
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}"),
     re.compile(r"(?i)(api[_-]?key|token|secret|password)(\"?\s*[:=]\s*\"?)[^\s\",}]{6,}"),
 )
+#: `Authorization: Bearer <token>`: the token alone is a secret too.
+_AUTH_SCHEME = re.compile(r"(?i)(?:bearer|basic|token|digest|negotiate|api-?key|sso-key)\s+(\S{6,})")
+#: Words and short numbers between `/ . :` (`127.0.0.1`, `https://api.github.com`, `Europe/Berlin`, `en_US.UTF-8`).
+_ORDINARY_PART = re.compile(r"[A-Z]?[a-z]+[0-9]{0,4}|[A-Z]+|[0-9]{1,5}")
+
+
+def _ordinary(value: str) -> bool:
+    """An MCP env/header value that is a word, path, address, locale or MIME type rather than a credential: hiding it
+    wherever it appears would break every setting that repeats it (`http://127.0.0.1:4000/v1`)."""
+    if value.isalpha() or value.startswith(("/", "~")):
+        return True
+    if not re.search(r"[/.:]", value) or looks_like_secret(value) or scrub_text(scrub_urls(value)) != value:
+        return False
+    return all(_ORDINARY_PART.fullmatch(p) for p in re.split(r"[/.:@?&=#_\-]+", value) if p)
+
+
+def _env_refs(obj: Any) -> set[str]:
+    """Names of the variables that ``*_env`` settings point at (``api_key_env``, ``bearer_env``): credentials."""
+    if isinstance(obj, dict):
+        names = {v for k, v in obj.items() if str(k).endswith("_env") and isinstance(v, str) and v}
+        return names.union(*(_env_refs(v) for v in obj.values()))
+    if isinstance(obj, list):
+        return set().union(*(_env_refs(v) for v in obj))
+    return set()
 
 
 def secret_values(config: Any = None) -> list[str]:
-    """Every secret value this process knows (env vars that look secret, provider keys), longest first."""
+    """Every secret value this process knows, longest first: env vars that look secret, provider keys, the variables
+    ``*_env`` settings name (``bearer_env``), and MCP env/header values that are secret by name or by shape. Each also
+    in its JSON-escaped form, for JSON text inside a tool result."""
+    from k3code.config import env_value
+
     values: set[str] = set()
     for name, value in os.environ.items():
         if value and len(value) >= 6 and _SECRET_NAME.search(name):
@@ -35,17 +63,21 @@ def secret_values(config: Any = None) -> list[str]:
     for p in getattr(config, "providers", None) or []:
         if getattr(p, "api_key", ""):
             values.add(p.api_key)
-        env_val = os.environ.get(getattr(p, "api_key_env", ""), "")
-        if env_val:
-            values.add(env_val)
-    # every value under an MCP server's env/headers is a secret by the redaction policy, whatever its name; plain words
-    # (production), paths and short flags are not worth hiding wherever they appear
+    dump = config.model_dump(mode="json") if hasattr(config, "model_dump") else {}
+    values.update(env_value(name) for name in _env_refs(dump))
+    # MCP env/headers are hidden in place whatever they hold; out of place only a value secret by name or not an
+    # ordinary word, path or address (an MCP `HOST=127.0.0.1` must not hide a provider's `http://127.0.0.1:4000/v1`)
     for server in getattr(getattr(config, "mcp", None), "servers", None) or {}:
         cfg = config.mcp.servers[server]
-        for value in [*(getattr(cfg, "env", None) or {}).values(), *(getattr(cfg, "headers", None) or {}).values()]:
-            if isinstance(value, str) and len(value) >= 8 and not value.isalpha() and not value.startswith(("/", "~")):
+        for name, value in [*(getattr(cfg, "env", None) or {}).items(), *(getattr(cfg, "headers", None) or {}).items()]:
+            if not isinstance(value, str):
+                continue
+            if _SECRET_NAME.search(name) or is_secret_key(name) or (len(value) >= 8 and not _ordinary(value)):
                 values.add(value)
-    return sorted((v for v in values if len(v) >= 6), key=len, reverse=True)
+            if m := _AUTH_SCHEME.fullmatch(value.strip()):
+                values.add(m.group(1))
+    out = {f for v in values if len(v) >= 6 for f in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1])}
+    return sorted(out, key=len, reverse=True)
 
 
 def redact_text(text: str, secrets: list[str]) -> str:
@@ -59,18 +91,19 @@ def redact_text(text: str, secrets: list[str]) -> str:
 
 
 def safe_config(config: Any, secrets: list[str] | None = None) -> dict[str, Any]:
-    """The config without credentials: k3code.redact by structure (key names, env/headers, URL parts, secret-flag
-    argv), then every known secret value wherever it still appears."""
-    return drop_values(redact(config.model_dump(mode="json")), secrets or [])
+    """The config without credentials: every known secret value wherever it appears, then k3code.redact by
+    structure (key names, env/headers, URL parts, secret-flag argv)."""
+    return redact(drop_values(config.model_dump(mode="json"), secrets or []))
 
 
 def scrub_json(body: str, secrets: list[str]) -> str:
-    """A JSON document through the same two passes (text that is not JSON gets the shape regexes only)."""
+    """A JSON document through the same two passes, known values first: a shape pass can cut a secret at a `,` or a
+    quote and leave its tail for the value pass to miss (text that is not JSON gets ``redact_text`` only)."""
     try:
         data = json.loads(body)
     except ValueError:
         return redact_text(body, secrets)
-    return json.dumps(drop_values(redact(data), secrets), indent=2, default=str)
+    return json.dumps(redact(drop_values(data, secrets)), indent=2, default=str)
 
 
 def versions() -> dict[str, str]:

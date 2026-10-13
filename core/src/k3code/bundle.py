@@ -42,8 +42,9 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession) -> dict[str, Any]:
-    return redact_session_json(asdict(s))
+def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
+    return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
 def _known_secrets(config: Any, cwd: Path) -> list[str]:
@@ -76,14 +77,14 @@ def write_bundle(
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = drop_values(redact(confio.read_yaml(src)), secrets)
+                data = redact(drop_values(confio.read_yaml(src), secrets))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = drop_values(session_to_dict(stored), secrets)
+        session = session_to_dict(stored, secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
@@ -163,11 +164,12 @@ def read_bundle(path: Path) -> Bundle:
 
 
 def _strip_redacted(obj: Any) -> Any:
-    """Drop ``<redacted>`` placeholders anywhere inside ``obj`` (they must never be written to config)."""
+    """Drop ``<redacted>`` values from the dicts inside ``obj``. A list keeps the marker in place: without it every
+    later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
     if isinstance(obj, dict):
         return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
     if isinstance(obj, list):
-        return [_strip_redacted(v) for v in obj if v != REDACTED]
+        return [_strip_redacted(v) for v in obj]
     return obj
 
 
