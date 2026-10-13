@@ -17,7 +17,7 @@ from k3code.paths import home, user_config_path
 from k3code.redact import scrub_text
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
-from k3code.setup.state import env_file_path, read_env_file
+from k3code.setup.state import env_file_path, read_env_file, set_env_var
 from k3code.setup.steps import (
     Ctx,
     _entry_from,
@@ -197,6 +197,20 @@ def _check_key(p: Prompter, entry: dict[str, Any], key: str, existing: str) -> t
             return key, []
 
 
+def _keep_env_key(p: Prompter, env_name: str, value: str) -> None:
+    """A key that exists only in this shell's environment: the daemon's unit and the Windows `wsl sh -lc` commands
+    never see it, so offer it to the 0600 env file (default yes) or say plainly that they will not."""
+    where = env_file_path()
+    if p.confirm("onboard.save_env_key", f"Copy {env_name} into {where} (0600) so the daemon sees it too?", True):
+        set_env_var(env_name, value)
+        p.say(f"  stored {env_name} in {where} (0600)")
+    else:
+        p.say(
+            f"  NOTE: {env_name} stays in this shell only; the daemon and the Windows commands will not see it."
+            f" Add it to {where} to change that."
+        )
+
+
 def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> tuple[dict[str, Any], str]:
     """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown).
 
@@ -220,7 +234,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
         spec["name"], spec["api_key_env"] = preset, known["api_key_env"]
     env_name = spec["api_key_env"]
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
-    where = "your environment" if os.environ.get(env_name) else f"the env file {env_file_path()}"
+    in_file = bool(read_env_file().get(env_name))  # the daemon reads the file, so it wins the message when both exist
+    where = f"the env file {env_file_path()}" if in_file else "your environment"
     key = clean_key(str(p.raw("onboard.key", "") or "")) if not p.interactive else ""
     question = f"Keep the {env_name} key from {where}?"
     shared = env_name == "K3CODE_API_KEY"  # every endpoint used to share it, so its key may be another vendor's (#114)
@@ -229,6 +244,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
     kept = bool(existing and not key and p.confirm("onboard.keep_key", question, not shared))
     if kept:
         p.say(f"  using {env_name} from {where}")
+        if not in_file:
+            _keep_env_key(p, env_name, existing)  # only this shell has it: the daemon would not see it (#237)
     elif preset != "local" and not key:
         key = p.text(
             "onboard.key",

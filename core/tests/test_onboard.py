@@ -25,6 +25,7 @@ from k3code.setup import onboard as ob
 from k3code.setup import probe
 from k3code.setup import prompter as prompter_mod
 from k3code.setup.prompter import AnswerPrompter
+from k3code.setup.state import read_env_file, set_env_var
 
 
 class Scripted(AnswerPrompter):
@@ -224,6 +225,40 @@ def test_fast_anthropic_uses_the_key_already_in_the_environment(root, monkeypatc
     prov = cfg.providers[0]
     assert (prov.name, prov.kind, prov.api_key_env) == ("anthropic", "anthropic", "ANTHROPIC_API_KEY")
     assert prov.models["default"] == "claude-sonnet-5-5" and prov.models["cheap"] == "claude-haiku-5-5"
+
+
+def test_fast_copies_a_key_found_only_in_the_environment_into_the_env_file(root, monkeypatch, capsys) -> None:
+    """The daemon's unit and `wsl sh -lc` do not see the shell's exports; the 0600 env file is what they read."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+    p = Scripted({"onboard": {"mode": "fast", "provider": "anthropic"}})
+    ob.run_fast(p, do_probe=False)
+    env_file = root / "xdg" / "k3code" / "env"
+    assert read_env_file(env_file) == {"ANTHROPIC_API_KEY": "sk-from-env"}
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    out = capsys.readouterr().out
+    assert f"stored ANTHROPIC_API_KEY in {env_file}" in out
+    assert "sk-from-env" not in out
+
+
+def test_fast_says_plainly_when_an_environment_only_key_is_not_copied(root, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+    p = Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "save_env_key": False}})
+    ob.run_fast(p, do_probe=False)
+    assert not (root / "xdg" / "k3code" / "env").exists()
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY stays in this shell only" in out
+    assert "daemon" in out and "Windows" in out
+
+
+def test_fast_leaves_a_key_that_is_already_in_the_env_file_alone(root, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-shell")
+    env_file = root / "xdg" / "k3code" / "env"
+    set_env_var("ANTHROPIC_API_KEY", "sk-from-file", env_file)
+    p = Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "save_env_key": True}})
+    ob.run_fast(p, do_probe=False)
+    assert read_env_file(env_file) == {"ANTHROPIC_API_KEY": "sk-from-file"}  # the file wins for the daemon
+    out = capsys.readouterr().out
+    assert f"using ANTHROPIC_API_KEY from the env file {env_file}" in out and "from your environment" not in out
 
 
 def test_detect_prefers_what_is_already_set_up(root, monkeypatch) -> None:
