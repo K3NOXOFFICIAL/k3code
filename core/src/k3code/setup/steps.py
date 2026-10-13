@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import shutil
@@ -53,6 +54,7 @@ class Ctx:
     data: dict[str, Any]  # results of previous steps
     do_probe: bool = True
     cwd: Path = field(default_factory=Path.cwd)
+    only_step: str | None = None  # set for `setup --step X`: the one step that runs
 
     def say(self, text: str = "") -> None:
         self.p.say(text)
@@ -217,6 +219,13 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
 
 
 def step_providers(c: Ctx) -> dict[str, Any]:
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    entries = confio.read_yaml(user_config_path()).get("providers") or []
+    chain = [str(p.get("name")) for p in entries if isinstance(p, dict)]
+    if chain:
+        c.say(f"  config.yaml has the provider chain {', '.join(chain)}; this step replaces it with the entries below.")
     labels = ["primary", "secondary", "tertiary"]
     specs = c.p.raw("providers.entries")
     entries: list[dict[str, Any]] = []
@@ -253,7 +262,8 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
     for e in providers:
         claude_cli = e.get("kind") == "claude-cli"
         live = c.do_probe and not claude_cli
-        ok, _ms, ids, _d = probe.list_models(e, os.environ.get(e["api_key_env"], "")) if live else (False, 0, [], "")
+        key = os.environ.get(e.get("api_key_env", ""), "")
+        ok, _ms, ids, _d = probe.list_models(e, key) if live else (False, 0, [], "")
         tiers: dict[str, str] = {}
         for t in TIERS:
             given = c.p.raw(f"tiers.{t}")
@@ -418,18 +428,31 @@ def step_tour(c: Ctx) -> dict[str, Any]:
     return {"shown": True}
 
 
+#: the ``models`` keys of a provider entry that the tiers step writes (main is stored as ``default``)
+_TIER_MODEL_KEYS = ("default", *(t for t in TIERS if t != "main"))
+
+
+def _tier_models(tiers: dict[str, Any]) -> dict[str, Any]:
+    models: dict[str, Any] = {}
+    if "main" in tiers:
+        models["default"] = tiers["main"]
+    models.update({k: v for k, v in tiers.items() if k != "main"})
+    return models
+
+
+def _with_tier_models(old: Any, new: dict[str, Any]) -> dict[str, Any]:
+    """The tier keys of an entry's ``models`` are replaced by ``new``; any other key of it is kept."""
+    kept = {k: v for k, v in dict(old or {}).items() if k not in _TIER_MODEL_KEYS}
+    return {**kept, **new}
+
+
 def build_config(data: dict[str, Any]) -> dict[str, Any]:
     """Assemble ``config.yaml`` content from the collected step data. No secrets, only ``api_key_env`` names."""
     usage = data.get("usage", {})
     providers = []
     models_by = data.get("tiers", {}).get("models", {})
     for e in data.get("providers", {}).get("entries", []):
-        t = models_by.get(e["name"], {})
-        models: dict[str, Any] = {}
-        if "main" in t:
-            models["default"] = t["main"]
-        models.update({k: v for k, v in t.items() if k != "main"})
-        providers.append({**e, "models": models})
+        providers.append({**e, "models": _tier_models(models_by.get(e["name"], {}))})
     perms = data.get("permissions", {})
     integ = data.get("integrations", {})
     theme = data.get("theme", {})
@@ -470,50 +493,138 @@ def user_md(data: dict[str, Any]) -> str:
         f"- System: {s.get('os', '')}, shell {s.get('shell', '')}, editor {s.get('editor', '')}, "
         f"toolchains {', '.join(s.get('toolchains', []))}, tailscale {s.get('tailscale', False)}",
     ]
-    return "\n".join(lines) + "\n"
+    # one line each, and nothing an answer says can close the block early
+    return "\n".join(" ".join(ln.replace("-->", "").replace("<!--", "").split()) for ln in lines) + "\n"
 
 
-#: config keys each step owns (single-step re-runs only touch these)
+#: config keys each step owns (single-step re-runs only touch these; a dotted path is a key inside a section)
 OWNS: dict[str, tuple[str, ...]] = {
-    "usage": ("output_style", "autonomy"),
+    "usage": ("output_style", "autonomy.plan_first", "autonomy.fanout.max_parallel"),
     "providers": ("providers",),
-    "tiers": ("providers", "tiers"),
-    "permissions": ("permission_mode", "permissions"),
-    "integrations": ("mcp", "skills", "mem0", "research"),
-    "theme": ("display", "panes"),
+    "tiers": ("providers",),  # the tier keys of ``models`` of the entries already in config.yaml, nothing else
+    "permissions": ("permission_mode", "permissions.hardline"),
+    "integrations": ("mcp.servers", "skills.roots", "mem0.url"),  # research.searxng_url is handled in write_config
+    "theme": ("display.theme", "display.focus_mode", "panes.keymap"),
 }
 
+USER_MD_BEGIN = "<!-- k3code:setup begin (k3code setup rewrites only the lines up to the end marker) -->"
+USER_MD_END = "<!-- k3code:setup end -->"
+_USER_MD_BLOCK = re.compile(r"^<!-- k3code:setup begin\b.*?-->\n.*?^<!-- k3code:setup end -->\n?", re.S | re.M)
+_USER_MD_MARKER = re.compile(r"^<!-- k3code:setup (?:begin\b.*?|end) -->\n", re.M)
+#: the lines the wizard wrote into USER.md before it had a block (an older file has them without markers)
+_USER_MD_OLD_LINE = re.compile(
+    r"^(?:- Name/handle: .*|- Language: .*; experience: .*; verbosity: .*|- Primary use: .*; languages: .*; "
+    r"frameworks: .*|- System: .*, shell .*, editor .*, toolchains .*, tailscale (?:True|False))\n",
+    re.M,
+)
 
-def write_user_md(data: dict[str, Any]) -> Path:
+
+def write_user_md(data: dict[str, Any], say: Callable[[str], None] | None = None) -> Path:
+    """Put the setup answers into USER.md inside a marked block; the user's own lines and the learned preferences
+    around it are never touched. A USER.md from before the block existed is backed up (``USER.md.bak-<ts>``) and
+    gets the block; its lines that setup itself wrote are replaced by the block, everything else stays."""
+    from k3code import confio
     from k3code.memory import user_memory_path
 
     mem = user_memory_path()
     ensure_private_dir(mem.parent)  # user memory is private state: 0600/0700 whatever the umask
-    private_file(mem).write_text("# About the user\n\n" + user_md(data), encoding="utf-8")
+    block = f"{USER_MD_BEGIN}\n{user_md(data)}{USER_MD_END}\n"
+    old = mem.read_text(encoding="utf-8") if mem.is_file() else None
+    if old is None:
+        new = "# About the user\n\n" + block
+    elif m := _USER_MD_BLOCK.search(old):
+        new = old[: m.start()] + block + old[m.end() :]
+    else:
+        if old.strip():
+            bak = confio.backup_path(mem)
+            private_file(bak).write_text(old, encoding="utf-8")
+            if say:
+                say(f"  {mem.name} had no setup block: saved a copy as {bak.name}; your own lines are kept.")
+        rest = _USER_MD_OLD_LINE.sub("", _USER_MD_MARKER.sub("", old if old.endswith("\n") else old + "\n"))
+        rest = re.sub(r"\A\s*# About the user[ \t]*\n", "", rest).strip("\n")
+        new = "# About the user\n\n" + block + (f"\n{rest}\n" if rest else "")
+    if new != old:
+        private_file(mem).write_text(new, encoding="utf-8")
     return mem
 
 
+_MISSING = object()
+
+
+def _get_path(d: dict[str, Any], dotted: str) -> Any:
+    for part in dotted.split("."):
+        if not isinstance(d, dict) or part not in d:
+            return _MISSING
+        d = d[part]
+    return d
+
+
+def _set_path(d: dict[str, Any], dotted: str, value: Any) -> None:
+    head, _, rest = dotted.partition(".")
+    if not rest:
+        d[head] = value
+        return
+    if not isinstance(d.get(head), dict):
+        d[head] = {}
+    _set_path(d[head], rest, value)
+
+
+def _drop_path(d: dict[str, Any], dotted: str) -> None:
+    """Remove the key; a section left empty by it goes too, but a section with other keys stays."""
+    head, _, rest = dotted.partition(".")
+    if not rest:
+        d.pop(head, None)
+    elif isinstance(d.get(head), dict):
+        _drop_path(d[head], rest)
+        if not d[head]:
+            del d[head]
+
+
 def write_config(data: dict[str, Any], only: str | None = None) -> Path:
-    """Write ``config.yaml`` from the step data. With ``only``, change just the keys that step owns."""
+    """Write ``config.yaml`` from the step data, merged into what is there. Only the keys the steps own (``OWNS``)
+    are written, each one inside its section, so the rest of the file (display settings, autonomy keys, permission
+    rules, ...) survives. With ``only``, just the keys that step owns; the provider chain comes from the file."""
     from k3code import confio
     from k3code.paths import user_config_path
 
     cfg = build_config(data)
     path = user_config_path()
     existing = confio.read_yaml(path)
-    if only is not None:
-        keys = OWNS.get(only, ())
-        cfg = {k: v for k, v in cfg.items() if k in keys}
-        if "providers" in cfg and "tiers" not in data:  # keep the models already configured
-            old = {p["name"]: p.get("models", {}) for p in existing.get("providers", [])}
-            cfg["providers"] = [{**p, "models": old.get(p["name"], {})} for p in cfg["providers"]]
-        # a key owned by the step but now empty (e.g. all MCP servers removed) is cleared
-        merged = {k: v for k, v in existing.items() if k not in keys or k in cfg}
-    else:
-        if not cfg["providers"]:  # e.g. imported bundle already carries them
-            cfg.pop("providers")
-        merged = existing
-    merged = {**merged, **cfg}
+    merged = copy.deepcopy(existing)
+    for key in tuple(k for ks in OWNS.values() for k in ks) if only is None else OWNS.get(only, ()):
+        if key == "providers":
+            continue
+        value = _get_path(cfg, key)
+        if value is not _MISSING:
+            _set_path(merged, key, value)
+        elif only is not None:  # owned but now empty (e.g. all MCP servers removed): cleared, its section's rest stays
+            _drop_path(merged, key)
+    if only in (None, "tiers"):
+        merged.setdefault("tiers", cfg["tiers"])  # the tier map is not asked about: a customised one stays
+    old_chain = [p for p in existing.get("providers") or [] if isinstance(p, dict)]
+    by_name = {p.get("name"): p for p in old_chain}
+    if only == "tiers":
+        # never rebuild the chain from the saved answers (they may be older than config.yaml, or absent after a fast
+        # onboarding): only the tier models of the entries that are in the file change
+        by_tier = (data.get("tiers") or {}).get("models") or {}
+        merged["providers"] = [
+            {**p, "models": _with_tier_models(p.get("models"), _tier_models(by_tier[p["name"]]))}
+            if by_tier.get(p.get("name"))  # a blank answer for an entry keeps the models it has
+            else p
+            for p in old_chain
+        ]
+        if not old_chain:
+            merged.pop("providers")
+    elif only in (None, "providers") and cfg["providers"]:  # nothing collected (e.g. an imported bundle): no change
+        keep_models = only == "providers" and "tiers" not in data  # models already configured stay
+        chain = []
+        for e in cfg["providers"]:
+            old = by_name.get(e["name"], {})
+            # no tier models collected for the entry (a summary-only run, a chain made elsewhere): the ones it has stay
+            keep = keep_models or not e["models"]
+            models = old.get("models", {}) if keep else _with_tier_models(old.get("models"), e["models"])
+            chain.append({**old, **{k: v for k, v in e.items() if k != "models"}, "models": models})
+        merged["providers"] = chain
     windows = (data.get("tiers") or {}).get("context_windows")
     if windows and only in (None, "tiers"):  # models.<id>.context_window: other keys of the id and other ids survive
         models = {k: dict(v) if isinstance(v, dict) else {} for k, v in dict(existing.get("models") or {}).items()}
@@ -532,7 +643,8 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
         else:
             merged.pop("research", None)
     confio.validate(merged)
-    confio.write_yaml(path, merged)
+    if merged != existing or not path.is_file():  # a re-run that changes nothing leaves the file alone
+        confio.write_yaml(path, merged)
     if only in (None, "providers"):
         # A provider was just (re)written, usually with a new key: an auth cooldown armed for the old one must
         # not keep the entry out of the chain.
@@ -548,10 +660,12 @@ def step_summary(c: Ctx) -> dict[str, Any]:
 
     from k3code import doctor
     from k3code.config import load_config
+    from k3code.paths import user_config_path
 
-    path = write_config(c.data)
-    mem = write_user_md(c.data)
-    c.say(f"Wrote {path} and {mem}")
+    # `--step summary` owns no config keys: config.yaml is left as it is. The end of a full run writes it.
+    path = user_config_path() if c.only_step else write_config(c.data)
+    mem = write_user_md(c.data, c.say)
+    c.say(f"Wrote {mem}" if c.only_step else f"Wrote {path} and {mem}")
     checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
     c.say(doctor.format_report(checks))
     return {"config": str(path)}
