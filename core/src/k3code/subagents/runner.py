@@ -421,7 +421,7 @@ class SubagentManager:
                 "change branches."
             )
         system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
-        router = server.tier_routers().get(Tier(h.tier))
+        router = server._ensure_router(parent.stored.model or None).get(Tier(h.tier))  # the parent's key (#130)
         loop = AgentLoop(
             router,
             system_prompt=system,
