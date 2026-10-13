@@ -272,7 +272,8 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
             if given is not None:
                 tiers[t] = str(given)
             elif ok and ids and c.p.interactive:
-                pick = c.p.select(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'", [*ids, "(type one)"])
+                choices = ["(type one)", *ids[: probe.MAX_MODEL_CHOICES]]
+                pick = c.p.select(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'", choices, ids[0])
                 tiers[t] = pick if pick != "(type one)" else c.p.text(f"tiers.{e['name']}.{t}.custom", "Model id")
             else:
                 fallback = CLAUDE_CLI_TIERS.get(t, "") if claude_cli else ""
