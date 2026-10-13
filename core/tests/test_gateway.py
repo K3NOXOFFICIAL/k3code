@@ -669,7 +669,7 @@ async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path
     assert srv.providers is providers and srv.cooldowns is cooldowns
     assert srv.router is main and srv._chain_key == "default"
     assert len(srv._router_cache) == 2
-    # replacing the provider config (/config reload) does rebuild everything, once
+    # replacing the provider config (/config reload) rebuilds the routers, once (see test_gateway_provider_reload)
     srv.config.providers = [prov]
     srv._chain_key = None
     srv._ensure_router("default")
