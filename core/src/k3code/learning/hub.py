@@ -167,6 +167,8 @@ class LearningHub:
         else the user-level one, else the working retry recorded on an earlier row in the window (``hint``). Small
         file reads, no model call."""
         pid = self.log.project_for(cwd)  # cached per cwd
+        if self._gotcha_dismissed(pid, tool, sig):
+            return None
         for path in (gotchas.gotchas_path(pid, self.home), gotchas.auto_gotchas_path(pid, self.home)):
             if (known := gotchas.lesson(path, tool, sig)) is not None:
                 return gotchas.reminder(tool, sig, known)
@@ -178,6 +180,8 @@ class LearningHub:
         """Learn or propose a gotcha for a recurring signature; returns the working retry seen for it in the window
         (its hint), or ""."""
         pid = self.log.project_for(cwd)
+        if self._gotcha_dismissed(pid, tool, sig):
+            return ""
         rows = [
             r
             for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
@@ -205,10 +209,18 @@ class LearningHub:
             session.session_id,
             payload={"project": pid, "line": line},
             project=pid,
-            key=dedup_key("project_gotcha", f"{pid} {tool} {sig}"),
+            key=self._gotcha_key(pid, tool, sig),
         )
         if p is not None:
             self.emit(session, [p])
+
+    @staticmethod
+    def _gotcha_key(pid: str, tool: str, sig: str) -> str:
+        return dedup_key("project_gotcha", f"{pid} {tool} {sig}")
+
+    def _gotcha_dismissed(self, pid: str, tool: str, sig: str) -> bool:
+        """Whether the card for this signature was dismissed: it is then neither reminded nor learned again."""
+        return self.store.dismissed(self._gotcha_key(pid, tool, sig))
 
     def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, hint: str, line: str) -> None:
         """Note a self-verified gotcha (a retry worked) for the in-turn reminders, propose its card and tell the
@@ -257,6 +269,10 @@ class LearningHub:
         return made
 
     def decide(self, p: Proposal, choice: str, session: Any = None) -> None:
+        if choice == "dismiss" and p.kind == "project_gotcha" and p.payload.get("project") and p.payload.get("line"):
+            # the card's line was also noted for reminders (``_auto_gotcha``): dismissing it forgets that line too
+            auto = gotchas.auto_gotchas_path(str(p.payload["project"]), self.home)
+            gotchas.remove_gotcha(auto, str(p.payload["line"]))
         self.record(
             "proposal",
             session,
