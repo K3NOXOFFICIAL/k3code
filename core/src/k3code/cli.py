@@ -1125,6 +1125,15 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
         raise SystemExit(130) from None
 
 
+def _unusable_source(src: Path) -> str:
+    """Why the recorded source checkout cannot be updated from: the path, and what is wrong with it."""
+    why = "does not exist (moved or deleted?)" if not src.exists() else "is not a git checkout (it has no .git)"
+    return (
+        f"this install is built from {src}, which {why}. Put the checkout back there, or set update.source in "
+        "config.yaml to where it is now"
+    )
+
+
 @cli.command("update")
 @click.option("--check", is_flag=True, help="Only report current and latest version")
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
@@ -1184,6 +1193,8 @@ def update_cmd(
                     f"{denied or 'No release has been published yet'}.\n"
                     f"This install was made from git ({git_ref} of {cfg['url']}): checking it."
                 )
+            elif src is not None:  # recorded, but gone: say where it was expected, not only why no release came
+                raise click.ClickException(f"{_unusable_source(src)}{f' ({denied})' if denied else ''}")
             else:
                 raise click.ClickException(
                     denied
@@ -1222,8 +1233,10 @@ def update_cmd(
             )
     elif from_source:
         src = upd.source_checkout()
-        if src is None or not (src / ".git").exists():
+        if src is None:
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
+        if not (src / ".git").exists():
+            raise click.ClickException(_unusable_source(src))
         click.echo(f"current: {cur}\nsource: {src}")
         if check:
             return
