@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict, run_tests
 from k3code.autonomy.scope import ScopeVerdict
 from m1cmd_helpers import git_repo
@@ -274,6 +276,61 @@ async def test_not_a_git_repo_runs_normally(tmp_path, monkeypatch):
     await run_turn(server, "do the big thing")
     assert not events(server, "fanout.plan")
     assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+
+
+@pytest.mark.parametrize("staged", [True, False])
+async def test_uncommitted_changes_skip_fanout_and_run_normally(tmp_path, monkeypatch, staged):
+    """#98: workers branch from HEAD and merge into the user's checkout. With a staged edit git refuses every merge
+    (with an unstaged one, every merge touching that file), after all the workers and a rework each were paid for."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("x = 2\n")
+    if staged:
+        git(repo, "add", "a.py")
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    assert not [h for h in server.subagents.handles.values() if h.agent_type == "worker"]
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert notes and "uncommitted changes" in notes[0] and "a.py" in notes[0], notes
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+    assert git(repo, "status", "--porcelain").startswith("M " if staged else " M")  # the user's edit is untouched
+
+
+async def test_checkout_dirtied_during_fanout_is_not_a_conflict_and_not_reworked(tmp_path, monkeypatch):
+    """#98: a merge git refuses to start (the checkout's own changes are in the way) was reported as a 'merge
+    conflict with what was already merged' and sent back to the worker, who cannot fix the user's checkout."""
+    from k3code.subagents import worktree as wt_mod
+
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        *steps_for(subs, sleep=0),
+        {"type": "text", "match": "--- REWORK ---", "text": "rework ran"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    real_trial = wt_mod.merge_trial
+
+    async def user_stages_an_edit_first(tree):
+        (repo / "a.py").write_text("x = 2\n")
+        git(repo, "add", "a.py")  # the user stages an edit while the workers run
+        return await real_trial(tree)
+
+    monkeypatch.setattr(wt_mod, "merge_trial", user_stages_an_edit_first)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 0 and done["escalated"] == 2, done["summary"]
+    prog = events(server, "fanout.progress")
+    assert "retrying" not in {p["state"] for p in prog}  # no rework agent spent on the checkout's problem
+    assert len([h for h in server.subagents.handles.values() if h.agent_type == "worker"]) == 2
+    details = [p["detail"] for p in prog if p["state"] == "escalated"]
+    assert all("merge conflict" not in d and "uncommitted changes" in d and "a.py" in d for d in details), details
+    assert git(repo, "diff", "--cached", "--name-only").split() == ["a.py"]  # the user's staged edit is untouched
+    assert "k3/" in git(repo, "branch")  # the work stays on its branch for the parent
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"
 
 
 async def test_fanout_disabled_by_config(tmp_path, monkeypatch):
