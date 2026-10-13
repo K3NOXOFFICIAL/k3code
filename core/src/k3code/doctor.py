@@ -617,6 +617,42 @@ def check_project(project_dir: Path) -> Check:
     return Check("project", OK, f"{detected}; {config} ({project_dir})", data={"stacks": found})
 
 
+async def check_worktrees(project_dir: Path) -> Check:
+    """Fan-out and sub-agent leftovers in this project's repo: worktrees whose process died and k3/* branches. A
+    gateway start reaps them (``subagents.worktree.reap``); this only lists them."""
+    from k3code.subagents import worktree
+
+    found = await worktree.scan(project_dir)
+    if found is None:
+        return Check("worktrees", OK, "not in a git repository")
+
+    def count(n: int, one: str, many: str) -> str:
+        return f"{n} {one if n == 1 else many}"
+
+    leftovers = [
+        count(len(found.worktrees), "orphaned worktree", "orphaned worktrees") if found.worktrees else "",
+        count(len(found.merged), "merged k3/* branch", "merged k3/* branches") if found.merged else "",
+        count(len(found.expired), "expired k3/* branch", "expired k3/* branches") if found.expired else "",
+    ]
+    kept = count(len(found.unmerged), "unmerged k3/* branch", "unmerged k3/* branches") + " kept"
+    data = {
+        "worktrees": [str(w.path) for w in found.worktrees],
+        "merged": found.merged,
+        "expired": [name for name, _ in found.expired],
+        "unmerged": found.unmerged,
+    }
+    if not any(leftovers):
+        return Check("worktrees", OK, kept if found.unmerged else "no fan-out leftovers", data=data)
+    detail = f"{', '.join(x for x in leftovers if x)} left by fan-out or sub-agents in {found.repo}"
+    return Check(
+        "worktrees",
+        WARN,
+        f"{detail}; {kept}" if found.unmerged else detail,
+        "restart the daemon (it reaps them at start), or: git worktree remove --force <path>; git branch -D <branch>",
+        data,
+    )
+
+
 def install_subset(home: Path | None = None) -> list[Check]:
     """What the installer prints after activation. Warnings only: no check here can fail an install.
 
@@ -653,6 +689,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
         await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
+        await check_worktrees(default_project_dir()),
     ]
     return checks
 
