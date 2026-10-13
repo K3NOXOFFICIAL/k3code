@@ -121,6 +121,89 @@ def test_browser_check_finds_the_headless_shell_playwright_installs(monkeypatch,
     assert chk.status == doctor.OK and chk.data["exe"] == str(binary)
 
 
+def _browser_with_tools(monkeypatch, tmp_path, ldd_out=None, apt=True, apt_knows=()):
+    """An executable Chromium binary (an old-layout name) and a PATH holding only fake tools: ``ldd`` printing
+    ``ldd_out`` (none when None), ``apt-get`` and ``apt-cache`` (knowing only the packages in ``apt_knows``)."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1" / "chrome-linux"
+    shell_dir.mkdir(parents=True)
+    binary = shell_dir / "headless_shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    tools = {}
+    if ldd_out is not None:
+        tools["ldd"] = "".join(f"echo '{ln}'\n" for ln in ldd_out)
+    if apt:
+        tools["apt-get"] = "exit 0\n"
+        tools["apt-cache"] = 'case "$2" in ' + "|".join(apt_knows or ("-",)) + ") exit 0 ;; *) exit 100 ;; esac\n"
+    for name, body in tools.items():
+        (bindir / name).write_text("#!/bin/sh\n" + body)
+        (bindir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    return doctor
+
+
+NSPR_NSS_ALSA_MISSING = (
+    "\tlinux-vdso.so.1 (0x00007ffd)",
+    "\tlibnspr4.so => not found",
+    "\tlibnss3.so => not found",
+    "\tlibnssutil3.so => not found",
+    "\tlibasound.so.2 => not found",
+    "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",
+)
+
+
+def test_browser_check_names_the_libraries_a_chromium_binary_cannot_load(monkeypatch, tmp_path):
+    """#113: the binary is there and executable but the loader cannot start it; the warning names the libraries
+    and the apt packages, and does not send the user to the installer, which cannot fix it."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt_knows=("libasound2t64",))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN
+    assert "cannot start" in chk.detail
+    for lib in ("libnspr4.so", "libnss3.so", "libnssutil3.so", "libasound.so.2"):
+        assert lib in chk.detail
+    assert chk.fix == "sudo apt-get install -y libnspr4 libnss3 libasound2t64"
+    assert "installer" not in chk.fix + chk.detail
+
+
+def test_browser_check_picks_the_alsa_package_this_release_has(monkeypatch, tmp_path):
+    """Ubuntu 24.04 renamed libasound2 to libasound2t64; older releases still ship libasound2."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibasound.so.2 => not found",))
+    assert doctor.check_browser().fix == "sudo apt-get install -y libasound2"
+
+
+def test_browser_check_sends_other_missing_libraries_to_playwright_install_deps(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibgbm.so.1 => not found", "\tlibnss3.so => not found"))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libgbm.so.1" in chk.detail
+    assert chk.fix.startswith("sudo ") and "-m playwright install-deps chromium-headless-shell" in chk.fix
+
+
+def test_browser_check_without_apt_names_the_libraries_only(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt=False)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libnspr4.so" in chk.detail
+    assert "package" in chk.fix and "libnss3.so" in chk.fix and "apt-get" not in chk.fix
+
+
+def test_browser_check_is_ok_when_ldd_finds_every_library(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",))
+    assert doctor.check_browser().status == doctor.OK
+
+
+def test_browser_check_without_ldd_cannot_tell_and_stays_ok(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path)
+    assert doctor.check_browser().status == doctor.OK
+
+
 def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
     from k3code import doctor
 
