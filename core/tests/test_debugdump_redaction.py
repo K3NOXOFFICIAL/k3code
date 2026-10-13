@@ -142,3 +142,154 @@ def test_known_secret_values_are_dropped_from_any_shape(monkeypatch):
 def test_secret_values_include_the_mcp_env_and_header_values():
     values = debugdump.secret_values(_config())
     assert EVENT_ONLY in values and HDR in values and PAT in values
+
+
+# K3NOX-306: the review of PR #186 (ordinary values stay readable, export -> import round-trips, the class of each gap)
+STD_B64 = "wJalr" + "XUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sort --key=2,2 data.csv",
+        "gpg --recv-key 0x1234ABCD99EF",
+        "psql --no-password dbname",
+        "aws s3api get-object --bucket b --key docs/a.txt out.txt",
+        "tool --sort-key name --primary-key id --cache-key build-1",
+    ],
+)
+def test_scrub_text_leaves_ordinary_key_flags_alone(text):
+    from k3code.redact import scrub_text
+
+    assert scrub_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ("tool --key=" + PW, PW),
+        ("tool --key " + FLAG_VALUE, FLAG_VALUE),
+        ("tool --license-key " + PW, PW),
+        ("tool --openai-api-key=" + PW, PW),
+        ("tool --aws-secret-key " + PW, PW),
+        ("tool --github-token " + PW, PW),
+    ],
+)
+def test_scrub_text_still_hides_credential_flags(text, secret):
+    from k3code.redact import scrub_text
+
+    assert secret not in scrub_text(text)
+
+
+def test_argv_flags_keep_their_name_and_only_a_token_value_is_hidden():
+    out = redact({"args": ["--transport=streamableHttp", f"--config={ARGV_TOKEN}", "--no-token", "server.js"]})["args"]
+    assert out == ["--transport=streamableHttp", f"--config={REDACTED}", "--no-token", "server.js"]
+
+
+@pytest.mark.parametrize("query", [STD_B64, STD_B64.replace("/", "%2F")])
+def test_a_base64_query_value_is_hidden_also_when_percent_encoded(query):
+    out = redact({"url": f"https://mcp.example.com/mcp?foo={query}&limit=5"})["url"]
+    assert "EXAMPLEKEY" not in out and "limit=5" in out
+
+
+@pytest.mark.parametrize("arg", ["src/components/Button", "docs/api/v2", "@scope/pkg", "./relative/dir"])
+def test_paths_with_slashes_are_not_base64(arg):
+    assert redact({"args": ["serve", arg]})["args"] == ["serve", arg]
+
+
+def test_a_token_in_a_url_dict_key_is_hidden():
+    out = redact({"web": {f"https://api.example.com/x?token={QUERY_TOKEN}": "allow"}})
+    assert QUERY_TOKEN not in json.dumps(out)
+
+
+def test_ordinary_mcp_env_and_header_values_are_not_known_secrets():
+    plain = ["127.0.0.1", "https://api.github.com", "Europe/Berlin", "en_US.UTF-8"]
+    plain += ["application/json", "localhost:11434"]
+    cfg = Settings(
+        mcp={
+            "servers": {
+                "s": McpServerConfig(
+                    command="srv",
+                    env={f"V{i}": v for i, v in enumerate(plain[:-2])},
+                    headers={"Accept": plain[-2], "X-Upstream": plain[-1]},
+                )
+            }
+        }
+    )
+    values = debugdump.secret_values(cfg)
+    assert not set(plain) & set(values)
+
+
+def test_secret_named_and_scheme_values_are_known_secrets(monkeypatch):
+    basic = "dXNlcjpw" + "YXNzd29yZA=="
+    monkeypatch.setenv("MEM_LLAT", EVENT_ONLY)
+    cfg = Settings(
+        mem0={"url": "https://mem.example.com", "api_key_env": "MEM_LLAT"},
+        mcp={
+            "servers": {
+                "s": McpServerConfig(
+                    url="https://mcp.example.com/mcp",
+                    env={"DB_PASSWORD": "a.b.c.d.e"},
+                    headers={"Authorization": "Basic " + basic},
+                )
+            }
+        },
+    )
+    values = debugdump.secret_values(cfg)
+    assert {EVENT_ONLY, "a.b.c.d.e", basic} <= set(values)
+
+
+def test_a_bearer_env_token_from_the_env_file_is_a_known_secret(tmp_path, monkeypatch):
+    from k3code.setup.state import env_file_path
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    env_file_path().parent.mkdir(parents=True)
+    env_file_path().write_text(f"HASS_LLAT={FLAG_VALUE}\n")
+    server = McpServerConfig(url="https://ha.example.com/api/mcp", bearer_env="HASS_LLAT")
+    cfg = Settings(mcp={"servers": {"ha": server}})
+    assert FLAG_VALUE in debugdump.secret_values(cfg)
+
+
+def _write_user_config(data: dict) -> None:
+    import yaml
+
+    from k3code.paths import user_config_path
+
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    user_config_path().write_text(yaml.safe_dump(data))
+
+
+def test_export_then_import_round_trips_ordinary_settings(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    args = ["--model", "claude-3-5-sonnet-20241022", "--max-old-space-size=4096", "--sort-key", "name"]
+    provider = {"name": "p", "kind": "openai", "base_url": "http://127.0.0.1:4000/v1", "api_key_env": "K3_X_KEY"}
+    server = {"command": "srv", "args": [*args, "--pat", PAT, "--port", "9000"], "env": {"HOST": "127.0.0.1"}}
+    _write_user_config({"providers": [provider], "mcp": {"servers": {"s": server}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    assert PAT not in json.dumps(bundle.read_bundle(out).settings)
+
+    merged = bundle.merge_settings({}, bundle.read_bundle(out).settings["user"])
+    assert merged["providers"] == [provider]
+    # the token stays a marker in its place, so `--port 9000` is still `--port 9000`
+    assert merged["mcp"]["servers"]["s"]["args"] == [*args, "--pat", REDACTED, "--port", "9000"]
+
+
+def test_export_drops_a_known_secret_before_the_shape_pass(tmp_path, monkeypatch):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    tail = "Tail" + "Part77zz"
+    monkeypatch.setenv("K3_TEST_API_TOKEN", "Tok" + "PartOne99," + tail)
+    _write_user_config({"hooks": {"pre": "export API_TOKEN=" + "Tok" + "PartOne99," + tail}})
+    store = SessionStore(tmp_path / "s.db")
+    sess = store.create(title="t")
+    sess.messages = [{"role": "tool", "content": "export API_TOKEN=" + "Tok" + "PartOne99," + tail}]
+    store.save(sess)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=tmp_path, session_ids=[sess.session_id])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert tail not in blob
