@@ -23,6 +23,8 @@
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
+# K3_REQUIRE_TUI=1 (set by `k3code update`): a TUI build that was tried and failed fails the run, so no version without
+# the TUI is staged for an update. Without it such a failure is a warning and k3code uses the line REPL.
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -883,6 +885,13 @@ acquire_source() {
 }
 
 # ---- build -----------------------------------------------------------------
+tui_failed() { # tui_failed WHY: the TUI was built and the build failed (a skipped one is not a failure)
+  # `k3code update` stages with --no-activate and must not switch to a version that lost the TUI because the npm
+  # registry was unreachable; the half-built version is removed on exit, so the next update builds it again
+  if [ "${K3_REQUIRE_TUI:-0}" = 1 ]; then die "$1; nothing was activated"; fi
+  log "WARNING: $1; k3code will use the line REPL"
+}
+
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
@@ -896,7 +905,7 @@ build_tui() {
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
     printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
-      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      tui_failed "could not copy the TUI sources to $TUI_TMP"
       return 0
     fi
     tui=$TUI_TMP/tui
@@ -907,7 +916,7 @@ build_tui() {
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
-    log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
+    tui_failed "the TUI did not build (output above)"
   fi
   return 0
 }
@@ -925,6 +934,7 @@ build_panes() {
   esac
   if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
+    printf 'k3: the go build failed\n' >"$VERDIR/.degraded" # k3code update reports it (k3 is optional: the version stays)
   fi
   if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
   return 0

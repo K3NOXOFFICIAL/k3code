@@ -290,10 +290,70 @@ def rollback(
     return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
 
 
+#: What shows that a version dir has the TUI (the file doctor's check_tui looks for) and the k3 multi-window binary.
+#: The installer builds both on a best-effort basis, so a version without one is complete, just poorer.
+TUI_ENTRY = Path("tui") / "dist" / "entry.js"
+K3_BINARY = Path("bin") / "k3"
+#: install.sh writes ``k3: <why>`` here when it tried to build the k3 binary and failed (a skip leaves nothing).
+DEGRADED_FILE = ".degraded"
+
+
+def has_file(version: str, rel: Path) -> bool:
+    return (versions_dir() / version / rel).is_file()
+
+
+def newest_first(versions: list[str]) -> list[str]:
+    """``versions`` by build time (``.complete``, else the dir), newest first.
+
+    Not by name: the ``-src.<sha>`` suffix of a git or source build compares as a plain string, which says nothing
+    about age (prune kept an old build and deleted a newer one). Equal times fall back to the version number."""
+
+    def built_at(version: str) -> float:
+        d = versions_dir() / version
+        for p in (d / ".complete", d):
+            with contextlib.suppress(OSError):
+                return p.stat().st_mtime
+        return 0.0
+
+    return sorted(versions, key=lambda v: (built_at(v), version_key(v)), reverse=True)
+
+
+def running_versions(proc: Path = Path("/proc")) -> set[str]:
+    """The ``versions/<name>`` dirs that a running process executes from or sits in (needs /proc: empty elsewhere).
+
+    A venv python's ``exe`` is the base interpreter, so the version shows in the command line (the script and the
+    shebang interpreter), as install.sh's daemon_version reads it; the TUI's node and gateway processes name it the
+    same way. What cannot be read (another user's process, one that just exited) is skipped."""
+    base = versions_dir()
+    prefixes = "|".join(re.escape(f"{p}/") for p in {str(base), str(base.resolve())})
+    name_after_prefix = re.compile(f"(?:{prefixes})([^/\\s]+)")
+    try:
+        pids = [p for p in proc.iterdir() if p.name.isdigit()]
+    except OSError:
+        return set()
+    found: set[str] = set()
+    for pid in pids:
+        texts: list[str] = []
+        for link in ("exe", "cwd"):
+            with contextlib.suppress(OSError):
+                texts.append(os.readlink(pid / link))
+        with contextlib.suppress(OSError):
+            texts.append((pid / "cmdline").read_bytes().replace(b"\0", b"\n").decode(errors="replace"))
+        found.update(m.group(1) for text in texts for m in name_after_prefix.finditer(text))
+    return found
+
+
 def prune(keep: int = KEEP_VERSIONS) -> list[str]:
-    """Delete the oldest version dirs beyond ``keep``, never the current or previous one."""
-    protected = {current_version(), previous_version()}
-    vers = sorted(installed_versions(), key=version_key, reverse=True)
+    """Delete the version dirs beyond the ``keep`` newest builds, oldest first by build time.
+
+    Never the current or previous one, one that a running process executes from (a daemon or TUI that lost its
+    directory fails on its next lazy import), nor, when the current version has no k3 binary, the newest version
+    that still has one (a rollback or a retried build needs it)."""
+    cur = current_version()
+    protected = {cur, previous_version(), *running_versions()}
+    vers = newest_first(installed_versions())
+    if cur and not has_file(cur, K3_BINARY):
+        protected.add(next((v for v in vers if has_file(v, K3_BINARY)), None))
     removed = []
     for v in vers[keep:]:
         if v not in protected:
@@ -746,13 +806,60 @@ def pull_checkout(checkout: Path) -> None:
     raise SourceUpdateError(f"git pull failed in {checkout}:\n{err[:600]}")
 
 
+#: How much of a failed installer's output an error shows. npm names its reason in the first lines of a stack trace
+#: of about thirty, so the last few lines alone would show only the trace.
+INSTALLER_TAIL_LINES = 40
+
+
 def _installer_env(**extra: str) -> dict[str, str]:
-    """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root. An
-    environment variable, unlike a flag, is ignored by an older installer."""
-    env = {**os.environ, **extra}
+    """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root, and a
+    TUI build that fails (npm unreachable) must fail the staging instead of leaving a version without the TUI to
+    switch to. An environment variable, unlike a flag, is ignored by an older installer (see vet_staged)."""
+    env = {**os.environ, "K3_REQUIRE_TUI": "1", **extra}
     if os.geteuid() == 0:
         env["K3_ALLOW_ROOT"] = "1"
     return env
+
+
+def vet_staged(version: str) -> list[str]:
+    """Compare ``version``, staged and not yet active, with the active one; the warning lines to show after the switch.
+
+    The installer builds the TUI and the k3 binary on a best-effort basis, so a build that lost one (npm or the Go
+    module proxy unreachable) is a complete version, and an update used to switch to it and report success.
+
+    A TUI that the active version has and ``version`` lacks refuses the update (``SourceUpdateError``): the staged dir
+    is removed, unless it is the previous version or one that a process runs from (the installer reuses an installed
+    build of the same commit), so that the next update builds it again instead of finding it installed. install.sh
+    fails that build itself under K3_REQUIRE_TUI; this covers a ref whose installer predates it and a TUI that was
+    skipped (Node could not be fetched). k3 is optional, so a missing one only warns."""
+    cur = current_version()
+    if not cur or cur == version:
+        return []
+    if has_file(cur, TUI_ENTRY) and not has_file(version, TUI_ENTRY):
+        if version not in {previous_version(), *running_versions()}:
+            shutil.rmtree(versions_dir() / version, ignore_errors=True)
+        raise SourceUpdateError(
+            f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's "
+            f"messages are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when "
+            "the TUI can build."
+        )
+    if has_file(version, K3_BINARY):
+        return []
+    try:
+        failed = any(
+            line.startswith("k3:") for line in (versions_dir() / version / DEGRADED_FILE).read_text().splitlines()
+        )
+    except OSError:
+        failed = False
+    holder = next((v for v in newest_first(installed_versions()) if v != version and has_file(v, K3_BINARY)), None)
+    if holder is None and not failed:
+        return []  # nothing was lost and nothing is known to have failed (no Go on this machine)
+    kept = "no installed version has it" if holder is None else f"{holder} still has it"
+    if holder == cur:
+        kept += "; `k3code update --rollback` goes back to it"
+    why = "its build failed" if failed else "it was not built"
+    log = data_dir() / "install.log"
+    return [f"warning: {version} has no k3 multi-window binary ({why}; the installer's messages are in {log}): {kept}"]
 
 
 def update_from_source(checkout: Path, *, pull: bool = True) -> str:
@@ -775,7 +882,7 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
         env=_installer_env(),
     )
     if r.returncode:
-        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
         raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
     return r.stdout.strip().splitlines()[-1]
 
@@ -910,7 +1017,7 @@ def update_from_git(url: str, ref: str) -> str:
             env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
         )
         if r.returncode or not r.stdout.strip():
-            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
             raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
         return r.stdout.strip().splitlines()[-1]
     finally:
