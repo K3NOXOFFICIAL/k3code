@@ -751,10 +751,14 @@ async def test_ultracode_refuses_a_checkout_with_uncommitted_changes_before_it_s
         tmp_path, monkeypatch, [*PLANNERS, JUDGE, *IN_PLACE, LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER], autonomy=cfg()
     )
     await call(server, "session.create", {"cwd": str(repo)})
-    await run_job(server, "ultracode add three files")
-    report = server.session.stored.messages[-1]["content"]
-    assert report.startswith("/ultracode not started: the checkout has uncommitted changes (a.py); commit or stash")
-    assert "No agent was spent" in report
+    # the command answers at once (no "started" line, no job); the pipeline repeats the check for a checkout that
+    # became dirty between the answer and its start, and for any other caller
+    out = (await call(server, "slash.exec", {"command": "ultracode add three files"}))["output"]
+    assert server.session.turn_task is None and server.session.stored.messages == []
+    report = await server.ultra.ultracode(server.session, "add three files")
+    for text in (out, report):
+        assert text.startswith("/ultracode not started: the checkout has uncommitted changes (a.py); commit or stash")
+        assert "No agent was spent" in text
     assert not server.subagents.handles and sum(len(p.log) for p in server.providers) == 0
     assert (repo / "a.py").read_text() == "x = 2  # the user's work in progress\n"
     assert not (repo / ".k3code" / "reports").exists() and not (repo / ".k3code" / "plans").exists()

@@ -736,6 +736,8 @@ def main(
                 sys.stdout.write("\n")  # the streamed answer: end it so the shell prompt starts on its own line
             if "error" in result:
                 click.echo(f"k3code: error: {result.get('message') or result['error']}", err=True)
+        if result and (note := _unanswered_note(result)):
+            click.echo(note, err=True)
         sys.exit(0 if result and "error" not in result else 1)
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
@@ -744,6 +746,22 @@ def main(
         if model and (err := _use_model_key(config, model)):
             raise click.ClickException(err)
         _launch_tui(model=model, permission_mode=permission_mode if permission else None, project_dir=project_dir)
+
+
+def _unanswered_note(result: dict[str, Any]) -> str:
+    """For a ``-p`` run whose tool calls were refused because nobody could be asked: the model sees the refusal and
+    usually reports it as its own failure, so the person who ran it hears the way out too. "" when none were."""
+    from k3code.permissions.engine import HEADLESS_ASK_DENIED
+
+    refused = [t for t in result.get("tools") or [] if HEADLESS_ASK_DENIED in str(t.get("result") or "")]
+    if not refused:
+        return ""
+    names = ", ".join(sorted({str(t.get("name")) for t in refused}))
+    return (
+        f"k3code: {len(refused)} tool call(s) ({names}) were refused: a -p run cannot ask for approval. "
+        "`--permission auto` allows them (bash in the sandbox; deny rules and the hardline list still refuse), or set "
+        "headless_permission in the config."
+    )
 
 
 def _is_interactive() -> bool:

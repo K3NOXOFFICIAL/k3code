@@ -20,6 +20,7 @@ export function shouldShowInFocusMode(event: GatewayEvent): boolean {
     // User messages are always essential
     case "message.start":
     case "message.delta":
+    case "message.reset":
     case "message.complete":
     case "message.interim":
       // Only the final assistant answer counts as essential in focus mode

@@ -129,6 +129,12 @@ class UltraCodeCommand(CommandDef):
         """``verdict``: the classifier's rating of the task, known only on the always-on mode path; it sizes the run."""
         if not arg:
             return reply("Usage: /ultracode <task>")
+        from k3code.autonomy import fanout  # not at module level: autonomy imports the command registry
+
+        if dirty := await fanout.dirty_checkout(Path(live.perms.cwd)):
+            # the pipeline refuses a checkout with uncommitted changes (the fan-out merges into it) and says so when it
+            # starts; refused here the user is told straight away instead of "started" followed by "not started"
+            return reply(f"/ultracode not started: {fanout.dirty_text(dirty)}. No agent was spent.")
         return JobSpec(
             f"/ultracode {arg}",
             lambda: ctx.ultra.ultracode(live, arg, context=context, verdict=verdict),

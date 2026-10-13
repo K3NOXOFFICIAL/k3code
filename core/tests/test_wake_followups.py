@@ -75,7 +75,7 @@ class _Recorder:
         return SimpleNamespace(report="r", path="r.md")
 
 
-async def test_commands_hand_the_pipeline_the_task_and_the_hook_context_apart():
+async def test_commands_hand_the_pipeline_the_task_and_the_hook_context_apart(tmp_path):
     rec = _Recorder()
 
     async def unavailable_reason() -> str:
@@ -87,7 +87,8 @@ async def test_commands_hand_the_pipeline_the_task_and_the_hook_context_apart():
             run=rec.run, tools=lambda: SimpleNamespace(name="t", unavailable_reason=unavailable_reason)
         ),
     )
-    spec = await UltraCodeCommand().prepare(ctx, object(), "fix the login form", context=HOOK_CTX)
+    live = SimpleNamespace(perms=SimpleNamespace(cwd=str(tmp_path)))  # not a repository: nothing to refuse
+    spec = await UltraCodeCommand().prepare(ctx, live, "fix the login form", context=HOOK_CTX)
     await spec.factory()
     spec = await UltraResearchCommand().prepare(ctx, object(), "--n 2 why is it slow?", context=HOOK_CTX)
     await spec.factory()

@@ -287,6 +287,10 @@ def decide(
     return _finish(dec, mode, headless)
 
 
+#: What a call that only needs a yes gets in a run nobody can ask (`-p`); `k3code -p` counts these for its closing note.
+HEADLESS_ASK_DENIED = "Permission denied: approval required but unavailable (headless mode)."
+
+
 def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     if dec.hardline is None and dec.action != "deny" and not dec.always_ask:
         if mode == PermissionMode.YOLO:
@@ -295,7 +299,7 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
             dec.action, dec.auto_allowed = "allow", True
     if dec.action == "ask" and headless:
         dec.action = "deny"
-        dec.message = dec.message or "Permission denied: approval required but unavailable (headless mode)."
+        dec.message = dec.message or HEADLESS_ASK_DENIED
     if dec.action == "deny" and not dec.message:
         dec.message = f"Denied by rule {dec.rule.tool}:{dec.rule.pattern}" if dec.rule else "Denied."
     return dec

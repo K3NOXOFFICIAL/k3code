@@ -395,6 +395,7 @@ Primary event types the client handles today:
 | `session.info`                 | session metadata for banner + tool/skill panels                          |
 | `message.start`                | start assistant streaming                                                |
 | `message.delta`                | `{ text, rendered? }`                                                    |
+| `message.reset`                | `{}` the attempt is retried: drop the reply text streamed so far         |
 | `message.complete`             | `{ text, rendered?, usage, status }`                                     |
 | `thinking.delta`               | `{ text }`                                                               |
 | `reasoning.delta`              | `{ text, verbose? }`                                                     |

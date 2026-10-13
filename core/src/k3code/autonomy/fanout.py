@@ -131,6 +131,8 @@ class Subtask:
     detail: str = ""
     review: str = ""
     worktree: wt_mod.Worktree | None = None
+    #: the worker ended without a change: its branch holds nothing to keep or to point anyone at
+    empty: bool = False
     #: agents of the budget already taken for this subtask's worker and first reviewer (see FanoutExecutor.run), and
     #: for its rework and the re-review once it is sent back (see _reserve_rework)
     prepaid: int = 0
@@ -178,7 +180,7 @@ class FanoutResult:
         """One line per subtask that was not merged: its state, why, and the branch that keeps its work."""
         out = []
         for s in self.by_state("escalated", "failed", "skipped", "queued", "running", "retrying"):
-            where = f"; its work is on branch {s.worktree.branch}" if s.worktree is not None else ""
+            where = f"; its work is on branch {s.worktree.branch}" if s.worktree is not None and not s.empty else ""
             out.append(f"- [{s.state}] {s.title}{' — ' + s.detail if s.detail else ''}{where}")
         return out
 
@@ -187,7 +189,7 @@ class FanoutResult:
         parts = [f"The task was split into parallel subtasks. {self.summary()}", ""]
         for s in bad:
             parts.append(f"Subtask '{s.title}' needs you ({s.state}): {s.detail}")
-            if s.worktree is not None:
+            if s.worktree is not None and not s.empty:
                 parts.append(f"  Its work is on branch {s.worktree.branch}.")
         parts.append(f"\nFinish the remaining work yourself so that the original task is complete: {task}")
         return "\n".join(parts)
@@ -468,6 +470,7 @@ class FanoutExecutor:
                     return
                 st.worktree = h.worktree
                 if h.merge == "no_changes":
+                    st.empty = True
                     self.progress(ctx, st, "failed", "the worker made no changes")
                     return
                 err = await self._review(ctx, st, h)
@@ -620,7 +623,7 @@ class FanoutExecutor:
             if st.worktree is None:
                 continue
             try:
-                await wt_mod.remove(st.worktree, keep_branch=st.state != "merged")
+                await wt_mod.remove(st.worktree, keep_branch=st.state != "merged" and not st.empty)
             except Exception:  # noqa: BLE001
                 logger.debug("worktree cleanup failed for %s", st.id, exc_info=True)
 

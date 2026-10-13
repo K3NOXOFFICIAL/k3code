@@ -18,6 +18,7 @@ from k3code.bundle import (
     merge_settings,
     read_bundle,
     sensitive_items,
+    session_to_dict,
     write_bundle,
 )
 from k3code.cli import cli
@@ -77,6 +78,34 @@ def test_importing_your_own_export_keeps_a_base_url_that_was_hidden_in_part(env,
     rep = apply_bundle(bundle, store=SessionStore(env / "t.db"), cwd=env, sessions=False, trust_bundle=trust)
     assert rep.skipped == []
     assert confio.read_yaml(user_config_path()) == config
+
+
+def test_importing_your_own_export_on_a_fresh_home_drops_the_provider_it_cannot_complete(env) -> None:
+    """The export hides a token-shaped URL whole; on a machine with no such provider the entry has no endpoint, which
+    `confio.validate` refused, and the refusal threw away the whole import (the other provider, the sessions)."""
+    bundle = _export(env, {"providers": [_provider("gw", CF_URL), _provider("other", "https://api.example.com/v1")]})
+    user_config_path().unlink()  # a fresh home
+    store = SessionStore(env / "t.db")
+    stored = store.create(model="m", cwd=str(env))
+    bundle.sessions = [session_to_dict(store.get(stored.session_id))]
+    store.delete(stored.session_id)
+    rep = apply_bundle(bundle, store=store, cwd=env, trust_bundle=True)
+    assert rep.incomplete == ["gw"] and "gw" in rep.describe() and "not imported" in rep.describe()
+    written = confio.read_yaml(user_config_path())
+    assert [p["name"] for p in written["providers"]] == ["other"]
+    assert len(rep.sessions) == 1  # the import went through to the end
+    # a provider this machine already has keeps its own endpoint, and nothing is dropped
+    confio.write_yaml(user_config_path(), {"providers": [_provider("gw", CF_URL)]})
+    rep = apply_bundle(bundle, store=store, cwd=env, sessions=False, trust_bundle=True)
+    assert rep.incomplete == []
+    assert {p["name"]: p["base_url"] for p in confio.read_yaml(user_config_path())["providers"]}["gw"] == CF_URL
+
+
+def test_a_config_error_on_import_names_whose_settings_they_were(env) -> None:
+    bundle = _export(env, {"providers": [_provider("a", "https://api.example.com/v1")]})
+    bundle.settings["user"]["retention"] = {"usage_days": "forever"}
+    with pytest.raises(ConfigError, match=r"the bundle's user settings, as merged into .*config\.yaml: retention"):
+        apply_bundle(bundle, store=SessionStore(env / "t.db"), cwd=env, sessions=False, trust_bundle=True)
 
 
 def test_a_hidden_url_does_not_hide_a_real_change_in_the_same_entry(env) -> None:

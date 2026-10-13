@@ -34,6 +34,15 @@ export const addStreamedText = (text: unknown) => {
   }
 };
 
+/** Take back `chars` of streamed text the gateway told us to discard
+ *  (`message.reset`): the attempt that produced it failed and is retried, so
+ *  the retry's text must not count on top of it. */
+export const discardStreamedText = (chars: number) => {
+  if (chars > 0) {
+    $streamedOutputChars.set(Math.max(0, $streamedOutputChars.get() - chars));
+  }
+};
+
 export const addOutputTokens = (count: number) => {
   if (Number.isFinite(count) && count > 0) {
     $sessionOutputTokens.set($sessionOutputTokens.get() + count);

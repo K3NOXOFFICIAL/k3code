@@ -13,6 +13,7 @@ describe("shouldShowInFocusMode (event type × importance)", () => {
   const table: [string, string | undefined, boolean][] = [
     ["message.complete", undefined, true],
     ["message.delta", undefined, false],
+    ["message.reset", undefined, false],
     ["message.interim", undefined, false],
     ["error", undefined, true],
     ["tool.start", undefined, false],

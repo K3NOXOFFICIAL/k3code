@@ -179,6 +179,21 @@ def compact_threshold(config: Any, model_id: str, policy: AutoCompact | None = N
     return int(context_window(config, model_id) * (policy.ratio or COMPACT_AT_RATIO))
 
 
+#: After a compaction that leaves the request at or above the limit (what it cannot fold, the system prompt, the tool
+#: schemas and the kept tail, already passes it), the next automatic one waits until the request has grown by this
+#: share of the limit.
+COMPACT_REGROWTH = 0.25
+
+
+def compact_resume_at(after_fold: int, threshold: int, window: int) -> int:
+    """The estimate at which automatic compaction runs again after one that left the request at ``after_fold`` tokens,
+    at or above its ``threshold``: ``after_fold`` plus COMPACT_REGROWTH of the threshold, but not past
+    MAX_COMPACT_RATIO of the model's ``window`` (the provider rejects the request beyond it; the compaction that
+    recovers from that is not held back). Never below ``after_fold``: a request already that close to the window
+    compacts again at once, as it always did."""
+    return max(after_fold, min(after_fold + int(threshold * COMPACT_REGROWTH), int(window * MAX_COMPACT_RATIO)))
+
+
 def text_tokens(text: str) -> int:
     """Estimated tokens of ``text``: ~4 characters per token, plus half a token for every UTF-8 byte past the first of
     a character (CJK text and emoji take about a token per character, of which chars // 4 counted a quarter)."""

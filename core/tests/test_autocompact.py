@@ -296,3 +296,30 @@ async def test_a_limit_below_the_fixed_request_overhead_is_called_out(tmp_path, 
     out = (await cmd(server, "/autocompact 120k --session", live.session_id))["message"]
     assert "every turn" not in out
     await server.close()
+
+
+# ── what the status says ──────────────────────────────────────────────
+
+
+def test_a_share_with_a_decimal_is_shown_as_typed_and_a_typo_of_a_limit_is_refused():
+    from k3code.commands.autocompact_cmd import describe
+
+    cfg = SimpleNamespace(models={}, context={"compact_at_ratio": 0.605})
+    assert "at 60.5% of the window" in describe(autocompact_policy(cfg), cfg, "claude-x")  # not "60%" or "61%"
+    assert parse_changes("60.5%")["compact_at_ratio"] == 0.605
+    assert parse_changes("10m")["compact_at_tokens"] == 10_000_000
+    for word in ("120000k", "11m", "99999999999"):  # 120k with the k typed in front of the zeros, and so on
+        with pytest.raises(AutoCompactError, match="at most 10,000,000"):
+            parse_changes(word)
+
+
+async def test_a_saved_limit_says_when_this_session_keeps_its_own(tmp_path, monkeypatch):
+    server, live = await seed(tmp_path, monkeypatch, Recording())
+    await cmd(server, "/autocompact off --session", live.session_id)
+    res = await cmd(server, "/autocompact 3k", live.session_id)  # saved for the other sessions
+    assert "Saved in" in res["output"] and "This session keeps its own setting" in res["output"]
+    assert "Auto-compact is off" in res["output"] and res["autocompact"]["session_only"]
+    await cmd(server, "/autocompact reset --session", live.session_id)
+    res = await cmd(server, "/autocompact 4k", live.session_id)
+    assert "keeps its own setting" not in res["output"] and "at 4,000 tokens" in res["output"]
+    await server.close()

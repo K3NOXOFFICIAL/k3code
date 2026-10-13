@@ -63,6 +63,7 @@ import { getOverlayState, patchOverlayState } from "./overlayStore.js";
 import {
   addStreamedText,
   completionTokensOf,
+  discardStreamedText,
   settleOutput,
 } from "./outputTokensStore.js";
 import { flashGoodVibes } from "./petFlashStore.js";
@@ -1689,6 +1690,12 @@ export function createGatewayEventHandler(
         turnController.recordMessageDelta(
           ev.payload ?? ({} as StreamDeltaPayload),
         );
+
+        return;
+      case "message.reset":
+        // The attempt that was streaming failed part-way and is retried from
+        // the start: forget its text (and its share of the token estimate).
+        discardStreamedText(turnController.recordMessageReset());
 
         return;
       case "message.interim": {

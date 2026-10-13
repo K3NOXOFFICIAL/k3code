@@ -427,11 +427,18 @@ class ImportReport:
     #: settings the bundle hides in part (a value holding ``<redacted>`` among other text): left as they are on this
     #: machine, or not written; a value that really contains that text is among them
     hidden: list[str] = field(default_factory=list)
+    #: providers left out because the bundle hides their endpoint (or key variable) and this machine has none
+    incomplete: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         lines = []
         for f in self.settings_written:
             lines.append(f"settings written: {f}")
+        for name in self.incomplete:
+            lines.append(
+                f"warning: provider {name} from the bundle was not imported: the export hid its base_url or "
+                "api_key_env and this machine has no entry of that name; add it here (it is not a failed import)"
+            )
         for key in self.skipped:
             lines.append(
                 f"warning: skipped {key} from the bundle (runs code, approves tools or sends keys; accept it item by "
@@ -455,6 +462,32 @@ class ImportReport:
                 f"{self.untrusted_project} is not trusted yet: `k3code trust` shows what it changes and applies it"
             )
         return "\n".join(lines) or "nothing imported"
+
+
+def _drop_incomplete_providers(merged: dict[str, Any], incoming: dict[str, Any]) -> list[str]:
+    """Take the providers out of ``merged`` that the bundle brought without an endpoint or key variable (a URL with a
+    token-shaped segment is hidden whole by the export, and a hidden value is dropped on import): ``confio.validate``
+    refused the entry, and with it the whole import, settings and sessions. An entry this machine already had in that
+    shape is not the bundle's doing and stays for validate to name."""
+    entries = merged.get("providers")
+    brought = {x.get("name") for x in incoming.get("providers") or [] if isinstance(x, dict)}
+    if not isinstance(entries, list):
+        return []
+    dropped: list[str] = []
+    kept: list[Any] = []
+    for entry in entries:
+        gap = (
+            isinstance(entry, dict)
+            and entry.get("kind") != "claude-cli"
+            and not {"base_url", "api_key_env"} <= set(entry)
+        )
+        if gap and entry.get("name") in brought:
+            dropped.append(str(entry.get("name")))
+        else:
+            kept.append(entry)
+    if dropped:
+        merged["providers"] = kept
+    return dropped
 
 
 def _usable_cwd(value: Any) -> bool:
@@ -556,7 +589,11 @@ def apply_bundle(
                         rep.skipped.append(item.key)
             rep.hidden.extend(f"{kind}: {where}" for where in _hidden_in_part(incoming))
             merged = merge_settings(confio.read_yaml(target), incoming)
-            confio.validate(merged)
+            rep.incomplete.extend(_drop_incomplete_providers(merged, incoming))
+            try:
+                confio.validate(merged)
+            except confio.ConfigError as e:  # say whose settings: a user and a project file are both in a bundle
+                raise confio.ConfigError(f"the bundle's {kind} settings, as merged into {target}: {e}") from e
             # the bundle's project settings are its author's: never trusted on the user's behalf (see k3code.trust)
             bak = confio.write_yaml(target, merged, keep_trust=kind == "user")
             rep.settings_written.append(str(target))

@@ -172,6 +172,32 @@ async def test_a_fork_starts_with_the_stamps_of_the_session_it_copies(tmp_path, 
     assert "have not read" in (server.live_for(fresh).file_stamps.refusal("edit", proj / "f.txt") or "")
 
 
+async def test_a_fork_does_not_inherit_the_goal_or_the_background_standing(tmp_path, monkeypatch):
+    """A copy of an ACTIVE goal is a second driver of the same objective (the watchdog kicks every stored session whose
+    goal is active); a copy of a background / automation session is counted against the background cap and taken for
+    the automation's own session. The conversation, the mode and the stamps are the point of a fork; those stay."""
+    proj = _project(tmp_path)
+    server = make(tmp_path, monkeypatch, READ, mode="auto", autonomy=AUTONOMY)
+    await call(server, "session.create", {"cwd": str(proj)})
+    src = server.store.get(server.session.session_id)
+    src.meta.update(
+        {
+            "goal": {"status": "active", "text": "ship it"},
+            "background": True,
+            "origin": "automation",
+            "origin_session": "x",
+        }
+    )
+    src.meta["mode"] = "auto"
+    forked = fork_session(server.store, src, "copy")
+    assert forked.meta["forked_from"] == src.session_id and forked.meta["mode"] == "auto"
+    assert not {"goal", "background", "origin", "origin_session"} & set(forked.meta)
+    assert src.meta["goal"]["status"] == "active"  # the source keeps its own
+    assert server.store.with_goal_status("active") == [] or all(
+        s.session_id != forked.session_id for s in server.store.with_goal_status("active")
+    )
+
+
 # ── FIX 2: a stale end-of-turn snapshot cannot revert newer meta or title ─
 
 

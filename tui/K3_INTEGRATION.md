@@ -131,7 +131,7 @@ The TUI will connect via WebSocket instead of spawning a child.
 
 ## Required Gateway Contract (M1-core)
 
-The TUI expects the gateway to implement these **33 methods** and emit **24 events**:
+The TUI expects the gateway to implement these **33 methods** and emit **25 events**:
 
 ### Methods (Client → Server)
 
@@ -146,7 +146,7 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 
 - `gateway.ready`, `skin.changed`, `session.info`, `session.control.update`
 - `message.start`, `message.delta`, `reasoning.delta`, `reasoning.available`, `thinking.delta`
-- `message.interim`, `message.complete`
+- `message.interim`, `message.reset` (k3code: discard the streamed reply text, the attempt is retried), `message.complete`
 - `status.update`
 - `tool.start`, `tool.complete`, `tool.generating`, `todo.updated`
 - `notification.show`, `notification.clear`

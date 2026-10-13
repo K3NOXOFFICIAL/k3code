@@ -34,6 +34,9 @@ export interface ClientLocalGatewayEventMap {
 
 /** k3code autonomy events (M4a). The Python gateway is not the generated Hermes contract, so these are declared here. */
 export interface K3GatewayEventMap {
+  /** The model call streaming the reply failed part-way and is retried (or failed over) from the start: the client
+   *  discards the reply text streamed since the last tool row. No payload. */
+  "message.reset": Record<string, never>;
   "plan.show": {
     advisor?: string;
     auto_approved?: boolean;

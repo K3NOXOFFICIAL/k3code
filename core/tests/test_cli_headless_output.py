@@ -55,3 +55,18 @@ def test_a_headless_run_that_keeps_failing_the_same_tool_stops_and_fails(tmp_pat
     assert res.returncode == 1, res.stderr
     assert "k3code: error: stopped after 3 failed tool calls in a row (autonomy.max_tool_errors)" in res.stderr
     assert "read(" in res.stderr or "does-not-exist.txt" in res.stderr
+
+
+def test_a_headless_run_whose_calls_nobody_could_approve_tells_the_way_out_on_stderr(tmp_path):
+    # in ask mode a write needs a yes and a -p run has no one to ask: the model gets the refusal, the person this note
+    step = {"type": "tool_call", "id": "c1", "name": "write", "arguments": {"path": "x.txt", "content": "a"}}
+    res = _run(tmp_path, [step], extra_config="max_turns: 2\nheadless_permission: ask\n")
+    assert not (tmp_path / "proj" / "x.txt").exists()
+    assert "tool call(s) (write) were refused" in res.stderr and "--permission auto" in res.stderr
+    assert "headless_permission" in res.stderr
+
+
+def test_a_headless_run_whose_calls_all_ran_adds_no_note(tmp_path):
+    step = {"type": "tool_call", "id": "c1", "name": "glob", "arguments": {"pattern": "*.nothing"}}
+    res = _run(tmp_path, [step], extra_config="max_turns: 2\n")
+    assert "were refused" not in res.stderr

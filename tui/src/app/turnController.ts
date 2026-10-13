@@ -888,6 +888,28 @@ class TurnController {
     }
   }
 
+  /**
+   * `message.reset`: the model call that was streaming failed after part of
+   * its reply, and the gateway retries it (or fails over) from the start.
+   * Drop what that attempt streamed (the buffer and its live mirror) so the
+   * retry's copy is not appended to it. Tool rows, reasoning and the segments
+   * already flushed stay; a reset before any text is a no-op. Returns how many
+   * characters were dropped.
+   */
+  recordMessageReset(): number {
+    if (this.interrupted || !this.bufRef) {
+      return 0;
+    }
+
+    const dropped = this.bufRef.length;
+
+    this.streamTimer = clear(this.streamTimer);
+    this.bufRef = "";
+    patchTurnState({ streaming: "" });
+
+    return dropped;
+  }
+
   recordInterimMessage(text: string) {
     if (this.interrupted) {
       return;

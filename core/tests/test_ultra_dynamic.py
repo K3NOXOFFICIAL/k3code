@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import time
 
 import pytest
@@ -382,6 +383,10 @@ async def test_when_nothing_merged_the_report_does_not_claim_the_tests_passed(tm
     report = server.session.stored.messages[-1]["content"]
     assert "not run: nothing was merged" in report and "pass (true)" not in report
     assert "## PARTIAL" in report and "the worker made no changes" in report
+    # a worker that changed nothing has no work to point at, and its empty branch is not left behind
+    assert "its work is on branch" not in report
+    branches = subprocess.run(["git", "branch", "--list", "k3/*"], cwd=repo, capture_output=True, text=True).stdout
+    assert branches.strip() == ""
 
 
 @pytest.mark.usefixtures("sandbox_optional")

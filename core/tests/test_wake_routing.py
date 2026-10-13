@@ -616,6 +616,33 @@ async def test_ultracode_with_a_task_stays_a_one_shot_that_does_not_flip_the_mod
     assert pipe.calls[-1] == ("ultracode", "on the way to the airport") and server.session.ultra_mode == "ultracode"
 
 
+async def test_ultracode_with_a_task_in_a_dirty_checkout_is_refused_up_front_not_started_then_stopped(
+    tmp_path, monkeypatch
+):
+    """The pipeline refuses a checkout with uncommitted changes; the slash command and the wake word say so in their
+    own answer, before any "started" line, a job slot or a turn."""
+    server = make(tmp_path, monkeypatch, [])
+    pipe = pipeline(server, monkeypatch)
+    state = {"dirty": ["a.py"]}
+
+    async def dirty(_cwd: Any) -> list[str]:
+        return state["dirty"]
+
+    monkeypatch.setattr("k3code.autonomy.fanout.dirty_checkout", dirty)
+    await start(server, tmp_path)
+    out = await call(server, "slash.exec", {"command": "ultracode fix the build"})
+    assert out["output"].startswith("/ultracode not started:") and "a.py" in out["output"]
+    assert "started: plan" not in out["output"] and server.session.turn_task is None and pipe.calls == []
+    assert transcript(server) == []  # no user line, no turn
+    await submit(server, "ultracode fix the build")  # the wake word takes the same road
+    assert pipe.calls == [] and any("not started" in str(e) for e in events(server, "message.complete"))
+    state["dirty"] = []  # committed
+    out = await call(server, "slash.exec", {"command": "ultracode fix the build"})
+    assert out["output"].startswith("ultracode started: plan")
+    await finish(server)
+    assert pipe.calls == [("ultracode", "fix the build")]
+
+
 async def test_slash_commands_keep_their_usage_lines_and_acks(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [])
     pipeline(server, monkeypatch)

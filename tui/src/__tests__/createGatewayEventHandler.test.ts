@@ -7,6 +7,7 @@ import {
   patchOverlayState,
   resetOverlayState,
 } from "../app/overlayStore.js";
+import { $streamedOutputChars } from "../app/outputTokensStore.js";
 import { resetServerRequestsForTests } from "../app/serverRequestStore.js";
 import { submitPrompt } from "../app/submissionCore.js";
 import { turnController } from "../app/turnController.js";
@@ -871,6 +872,174 @@ describe("createGatewayEventHandler", () => {
       expect(answerIdx).toBe(appended.length - 1);
     },
   );
+
+  // The gateway retries a model call that failed after streaming part of its
+  // reply (and fails over to the next provider). It tells the client with
+  // `message.reset` so the failed attempt's text is not shown, nor repeated
+  // before the real answer: "PARTIAL PARTIAL PARTIAL FULL" + "FULL".
+  describe("message.reset (a retried or failed-over attempt)", () => {
+    const failedAttempts = (
+      onEvent: ReturnType<typeof createGatewayEventHandler>,
+      count: number,
+    ) => {
+      for (let i = 0; i < count; i++) {
+        onEvent({
+          payload: { text: "PARTIAL-FROM-A " },
+          type: "message.delta",
+        } as any);
+        onEvent({ payload: {}, type: "message.reset" } as any);
+      }
+    };
+
+    it("leaves the answer once after deltas, a reset per failed attempt, then the final delta and complete", () => {
+      const appended: Msg[] = [];
+      const onEvent = createGatewayEventHandler(buildCtx(appended));
+
+      onEvent({ payload: {}, type: "message.start" } as any);
+      failedAttempts(onEvent, 3);
+      expect(turnController.bufRef).toBe("");
+      onEvent({
+        payload: { text: "FULL-FROM-B" },
+        type: "message.delta",
+      } as any);
+      onEvent({
+        payload: { status: "done", text: "FULL-FROM-B" },
+        type: "message.complete",
+      } as any);
+
+      expect(appended.map((msg) => msg.text)).toEqual(["FULL-FROM-B"]);
+    });
+
+    it("clears the live text mid-turn, so the retry does not render after the partial", () => {
+      vi.useFakeTimers();
+
+      try {
+        const onEvent = createGatewayEventHandler(buildCtx([]));
+
+        onEvent({ payload: {}, type: "message.start" } as any);
+        onEvent({
+          payload: { text: "PARTIAL-FROM-A " },
+          type: "message.delta",
+        } as any);
+        vi.advanceTimersByTime(1000);
+        expect(getTurnState().streaming).toBe("PARTIAL-FROM-A ");
+
+        onEvent({ payload: {}, type: "message.reset" } as any);
+        expect(getTurnState().streaming).toBe("");
+
+        onEvent({
+          payload: { text: "FULL-FROM-B" },
+          type: "message.delta",
+        } as any);
+        vi.advanceTimersByTime(1000);
+        expect(getTurnState().streaming).toBe("FULL-FROM-B");
+      } finally {
+        vi.runAllTimers();
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not let a pending render of the dropped text come back after the reset", () => {
+      vi.useFakeTimers();
+
+      try {
+        const onEvent = createGatewayEventHandler(buildCtx([]));
+
+        onEvent({ payload: {}, type: "message.start" } as any);
+        onEvent({
+          payload: { text: "PARTIAL-FROM-A " },
+          type: "message.delta",
+        } as any);
+        // the batched render of the partial has not fired yet
+        onEvent({ payload: {}, type: "message.reset" } as any);
+        vi.advanceTimersByTime(1000);
+
+        expect(getTurnState().streaming).toBe("");
+      } finally {
+        vi.runAllTimers();
+        vi.useRealTimers();
+      }
+    });
+
+    it("keeps the tool rows and the segments already flushed; only the in-flight text goes", () => {
+      const appended: Msg[] = [];
+      const onEvent = createGatewayEventHandler(buildCtx(appended));
+
+      onEvent({ payload: {}, type: "message.start" } as any);
+      onEvent({
+        payload: { text: "Checking the config first." },
+        type: "message.delta",
+      } as any);
+      onEvent({
+        payload: {
+          context: "config.yaml",
+          name: "read_file",
+          tool_id: "tool-1",
+        },
+        type: "tool.start",
+      } as any);
+      onEvent({
+        payload: { name: "read_file", summary: "read", tool_id: "tool-1" },
+        type: "tool.complete",
+      } as any);
+      failedAttempts(onEvent, 2);
+      onEvent({
+        payload: { text: "Answer." },
+        type: "message.delta",
+      } as any);
+      onEvent({
+        payload: { text: "Answer." },
+        type: "message.complete",
+      } as any);
+
+      expect(
+        appended
+          .filter((msg) => msg.role === "assistant")
+          .map((msg) => msg.text),
+      ).toEqual(["Checking the config first.", "Answer."]);
+      expect(appended.flatMap((msg) => msg.tools ?? [])).toHaveLength(1);
+    });
+
+    it("is a no-op before any text: nothing is dropped and the next delta still shows", () => {
+      const appended: Msg[] = [];
+      const onEvent = createGatewayEventHandler(buildCtx(appended));
+
+      onEvent({ payload: {}, type: "message.start" } as any);
+      onEvent({ payload: { text: "plan" }, type: "reasoning.delta" } as any);
+      onEvent({ payload: {}, type: "message.reset" } as any);
+      onEvent({ payload: {}, type: "message.reset" } as any);
+      expect(turnController.reasoningText).toBe("plan");
+      onEvent({ payload: { text: "Answer." }, type: "message.delta" } as any);
+      onEvent({
+        payload: { text: "Answer." },
+        type: "message.complete",
+      } as any);
+
+      expect(
+        appended
+          .filter((msg) => msg.role === "assistant")
+          .map((msg) => msg.text),
+      ).toEqual(["Answer."]);
+      expect(appended.map((msg) => msg.thinking).filter(Boolean)).toEqual([
+        "plan",
+      ]);
+    });
+
+    it("takes the dropped text back out of the output-token estimate", () => {
+      const onEvent = createGatewayEventHandler(buildCtx([]));
+
+      $streamedOutputChars.set(0);
+      onEvent({ payload: {}, type: "message.start" } as any);
+      failedAttempts(onEvent, 3);
+      expect($streamedOutputChars.get()).toBe(0);
+      onEvent({
+        payload: { text: "FULL-FROM-B" },
+        type: "message.delta",
+      } as any);
+
+      expect($streamedOutputChars.get()).toBe("FULL-FROM-B".length);
+    });
+  });
 
   it("anchors inline_diff as its own segment where the edit happened", () => {
     const appended: Msg[] = [];

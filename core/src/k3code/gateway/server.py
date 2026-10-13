@@ -60,6 +60,7 @@ from k3code.context_budget import (
     ELIDE_MIN_CHARS,
     AutoCompact,
     autocompact_policy,
+    compact_resume_at,
     compact_threshold,
     context_window,
     cut_call_text,
@@ -357,6 +358,14 @@ class LiveSession:
         #: monotonic time before which automatic compaction is not tried again (it failed: a summary call can take
         #: 90 s to fail, and a turn that waits that long on every prompt is worse than a long history)
         self.compact_retry_at = 0.0
+        #: Estimated tokens of the conversation (not of the system prompt and the tools) a compaction left when that
+        #: put the request at or above the limit, i.e. what cannot be folded (the kept tail, the summary) and what
+        #: every request carries already pass it (0 = the last one did not). Automatic compaction then waits until the
+        #: request has grown past compact_resume_at(): it summarized on every turn with nothing gained. Not stored;
+        #: cleared when a request is below the limit again.
+        self.compact_unfoldable = 0
+        #: The user was told about that spell (once per spell, not on every turn).
+        self.compact_unfoldable_noted = False
         #: Prompt tokens this session sent, and how many the provider read from its cache (the status bar's hit rate).
         self.prompt_tokens_total = 0
         self.cache_read_tokens_total = 0
@@ -648,6 +657,13 @@ _ctx_client: contextvars.ContextVar[Client | None] = contextvars.ContextVar("k3_
 _ctx_session: contextvars.ContextVar[LiveSession | None] = contextvars.ContextVar("k3_session", default=None)
 #: Workspace the client named with ``slash.exec {cwd}`` (``/bg`` from a TUI attached to a daemon launched elsewhere).
 _ctx_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar("k3_cwd", default=None)
+
+
+def _in_throwaway_worktree(rules: list[Any]) -> bool:
+    """Every path the rules name lies in a fan-out child's worktree (``.k3code/worktrees/<id>/``)."""
+    return bool(rules) and all(
+        r.tool in ("edit", "read") and "/.k3code/worktrees/" in str(r.pattern).replace("\\", "/") for r in rules
+    )
 
 
 class GatewayServer:
@@ -2401,6 +2417,7 @@ class GatewayServer:
 
         config = self.config
         final_text = ""
+        text_in_flight = False  # a message.delta went out for the model call now streaming (see on_text_reset)
         usage = Usage()
         error: str | None = None
         status = "done"
@@ -2422,13 +2439,19 @@ class GatewayServer:
         session.loop = loop
 
         async def on_text_delta(chunk: str) -> None:
-            nonlocal final_text
+            nonlocal final_text, text_in_flight
             final_text += chunk
+            text_in_flight = True
             session.emit("message.delta", {"text": chunk})
 
         async def on_text_reset() -> None:
-            nonlocal final_text
+            nonlocal final_text, text_in_flight
             final_text = ""  # a retried attempt streams the answer again; judge and loop hash want one copy
+            if text_in_flight:
+                # the client holds the partial text of the attempt that just failed: without this it shows it, then the
+                # retry's copy after it ("PARTIAL PARTIAL FULL"), and the answer twice once the turn completes
+                text_in_flight = False
+                session.emit("message.reset", {})
 
         loop.on_text_delta = on_text_delta
         loop.on_text_reset = on_text_reset
@@ -2522,6 +2545,8 @@ class GatewayServer:
                         and event.message.role == "assistant"
                         and event.message.stop_reason != "model_context_window_exceeded"
                     )
+                    if answered:
+                        text_in_flight = False  # that reply is complete: a later reset concerns the next call's text
                     if noted and answered:
                         for h in noted:
                             h.reported = True
@@ -2854,7 +2879,43 @@ class GatewayServer:
         session.stored.meta["compactions"] = int(session.stored.meta.get("compactions") or 0) + 1
         self.store.save(session.stored)
         logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
+        self._track_unfoldable(session)
         return folded
+
+    def _track_unfoldable(self, session: LiveSession) -> None:
+        """After a compaction: remember the size of the request when it is still at or above the auto-compact limit
+        (what compaction cannot fold already passes it: see LiveSession.compact_unfoldable), else forget the spell."""
+        policy = self.autocompact_policy(session)
+        after = self._request_tokens(session)
+        over = policy.enabled and after >= compact_threshold(self.config, self._compaction_model(session), policy)
+        # the conversation alone: what every request carries is measured again at each turn (the first turn of a daemon
+        # replaces its estimate by the built loop's), and that must not look like growth of the history
+        session.compact_unfoldable = after - session.overhead_tokens if over else 0
+        session.compact_unfoldable_noted = session.compact_unfoldable_noted and over
+
+    @staticmethod
+    def _unfoldable_size(session: LiveSession) -> int:
+        """The request's size right after the last compaction when that left it over the limit, else 0."""
+        return session.compact_unfoldable + session.overhead_tokens if session.compact_unfoldable else 0
+
+    def _announce_unfoldable(self, session: LiveSession, threshold: int) -> None:
+        """Tell the user, once per spell, that the auto-compact limit is below what compaction cannot fold."""
+        if session.compact_unfoldable_noted:
+            return
+        session.compact_unfoldable_noted = True
+        session.emit(
+            "notification.show",
+            {
+                "text": (
+                    f"auto-compact limit {threshold:,} is below what every request carries "
+                    f"(about {self._unfoldable_size(session):,} tokens after compaction): raise it with /autocompact"
+                ),
+                "level": "info",
+                "kind": "ttl",
+                "ttl_ms": 15000,
+                "key": f"k3.compact_unfoldable.{session.session_id}",
+            },
+        )
 
     @staticmethod
     def _with_todos(
@@ -2895,17 +2956,29 @@ class GatewayServer:
         re-sent and re-stored all of it, and on a real model the context window was exceeded after a few hundred ticks
         and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; failures are logged and
         the turn goes on. ``/autocompact`` decides whether and at what size (the policy); ``force`` (the retry after a
-        ContextOverflow) skips the size test.
+        ContextOverflow) skips the size test. After a fold that leaves the request over the limit (see
+        LiveSession.compact_unfoldable) the next automatic one waits for the history to grow; ``force`` never waits.
         """
         if self.halted:  # the compaction call is a model call too
             return 0
         policy = self.autocompact_policy(session)
-        if not force and (
-            not policy.enabled
-            or time.monotonic() < session.compact_retry_at
-            or self._request_tokens(session) < compact_threshold(self.config, self._compaction_model(session), policy)
-        ):
-            return 0
+        if not force:
+            if not policy.enabled or time.monotonic() < session.compact_retry_at:
+                return 0
+            model = self._compaction_model(session)
+            threshold = compact_threshold(self.config, model, policy)
+            used = self._request_tokens(session)
+            if used < threshold:
+                session.compact_unfoldable = 0  # a spell of the limit being below what compaction leaves is over
+                session.compact_unfoldable_noted = False
+                return 0
+            if session.compact_unfoldable and used < compact_resume_at(
+                self._unfoldable_size(session), threshold, context_window(self.config, model)
+            ):
+                # the last compaction left the request over the limit already (what it cannot fold passes it): another
+                # summary now would fold next to nothing, and would again on every turn. Wait for the history to grow.
+                self._announce_unfoldable(session, threshold)
+                return 0
         session.emit("status.update", {"kind": "compacting", "text": "compacting the conversation", "state": "working"})
         try:
             folded = await self.compact_session(session)
@@ -2922,10 +2995,14 @@ class GatewayServer:
                 {
                     "text": f"Context compacted: {folded} older messages summarized",
                     "level": "info",
-                    "kind": "info",
+                    "kind": "ttl",  # an event, not a state: left standing it stayed in the notification area for good
+                    "ttl_ms": 15000,
                     "key": "k3.compact",
                 },
             )
+            if session.compact_unfoldable:  # still over the limit after the fold: say so once, and see the gate above
+                limit = compact_threshold(self.config, self._compaction_model(session), policy)
+                self._announce_unfoldable(session, limit)
         return folded
 
     def context_fields(self, session: LiveSession, *, used: int | None = None) -> dict[str, Any]:
@@ -3057,6 +3134,11 @@ class GatewayServer:
             # "session" or "always" would write one that can never apply
             once_only = bool(decision.always_ask)
             rules = [] if once_only else suggest_rules(tool_name, decision)
+            if _in_throwaway_worktree(rules):
+                # a sub-agent's file in its fan-out worktree (.k3code/worktrees/<id>/...): the rule would name a
+                # directory that is removed when the child ends, so "session" and "always" (which writes it into the
+                # project's config.yaml) would leave a rule that can never apply again
+                once_only, rules = True, []
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
             try:

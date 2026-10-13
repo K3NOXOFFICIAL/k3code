@@ -10,9 +10,14 @@ from k3code.commands._util import pop_flag, reply, split_args
 from k3code.gateway.sessions import StoredSession
 from k3code.integrations.panes import open_pane_spec
 
+# What belongs to the source session alone: its goal (a copy would be kicked by the watchdog as a second driver of the
+# same objective), its background / automation standing (a copy would count against the background cap and be taken
+# for the automation's own session) and where it reports back to.
+_NOT_INHERITED = ("goal", "background", "origin", "origin_session")
+
 
 def fork_session(store: Any, src: StoredSession, title: str = "", *, cwd: str | None = None) -> StoredSession:
-    meta = copy.deepcopy(src.meta)
+    meta = {k: copy.deepcopy(v) for k, v in src.meta.items() if k not in _NOT_INHERITED}
     meta["forked_from"] = src.session_id
     new = StoredSession(
         session_id=store.new_id(),

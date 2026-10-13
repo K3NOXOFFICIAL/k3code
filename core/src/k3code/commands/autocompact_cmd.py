@@ -33,6 +33,14 @@ USAGE = (
 
 _LIMIT = re.compile(r"^(\d+(?:\.\d+)?)\s*(k|m|%)?$", re.IGNORECASE)
 
+#: No model's window is anywhere near this; a limit past it is a typo (120000k for 120k) that would never compact.
+MAX_LIMIT_TOKENS = 10_000_000
+
+
+def _share(ratio: float) -> str:
+    """``ratio`` as a percentage, with the decimal that was typed (``60.5%``): ``:.0%`` showed it as 60% or 61%."""
+    return f"{round(ratio * 100, 2):g}%"
+
 
 class AutoCompactError(ValueError):
     """The argument is no setting /autocompact knows; the message says what is wrong."""
@@ -58,13 +66,15 @@ def parse_changes(word: str) -> dict[str, Any] | None:
         ratio = number / 100
         if not MIN_COMPACT_RATIO <= ratio <= MAX_COMPACT_RATIO:
             raise AutoCompactError(
-                f"{word}: a share of the window between {MIN_COMPACT_RATIO:.0%} and {MAX_COMPACT_RATIO:.0%}"
+                f"{word}: a share of the window between {_share(MIN_COMPACT_RATIO)} and {_share(MAX_COMPACT_RATIO)}"
             )
         return {"autocompact": None, "compact_at_tokens": None, "compact_at_ratio": round(ratio, 4)}
     tokens = int(number * {"": 1, "k": 1_000, "m": 1_000_000}[unit])
     if tokens < MIN_COMPACT_TOKENS:
         hint = f" (for a share of the window, write {number:g}%)" if not unit and 0 < number <= 100 else ""
         raise AutoCompactError(f"{word}: a limit is at least {MIN_COMPACT_TOKENS:,} tokens{hint}")
+    if tokens > MAX_LIMIT_TOKENS:
+        raise AutoCompactError(f"{word}: a limit is at most {MAX_LIMIT_TOKENS:,} tokens (no model's window is larger)")
     return {"autocompact": None, "compact_at_tokens": tokens, "compact_at_ratio": None}
 
 
@@ -108,9 +118,9 @@ def describe(policy: AutoCompact, config: Any, model: str, used: int | None = No
     if policy.tokens:
         how = f"at {limit:,} tokens"
     elif policy.ratio:
-        how = f"at {policy.ratio:.0%} of the window ({limit:,} of {window:,} tokens for {model})"
+        how = f"at {_share(policy.ratio)} of the window ({limit:,} of {window:,} tokens for {model})"
     else:
-        how = f"auto: at {COMPACT_AT_RATIO:.0%} of the window ({limit:,} of {window:,} tokens for {model})"
+        how = f"auto: at {_share(COMPACT_AT_RATIO)} of the window ({limit:,} of {window:,} tokens for {model})"
     text = f"Auto-compact is on, {how}."
     if limit >= window:
         text += f" That is past the {window:,}-token window of {model}: the provider rejects the request first."
@@ -163,6 +173,10 @@ class AutoCompactCommand(CommandDef):
                 return reply(f"Invalid config: {e}")
             ctx.apply_file_config(live.perms.cwd if live is not None else None)
             lead = f"Saved in {path}" + (f" (backup: {backup.name})." if backup else ".")
+            if live is not None and live.stored.meta.get("autocompact"):
+                lead += (
+                    " This session keeps its own setting (shown below); the saved one applies to your other sessions."
+                )
             wanted = autocompact_policy(SimpleNamespace(context=_context_of(path)))
             if autocompact_policy(ctx.config) != wanted:
                 # the config is shared by every session: the only project overlay in it is the gateway's own project

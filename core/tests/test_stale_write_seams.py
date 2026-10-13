@@ -360,6 +360,30 @@ async def test_an_ordinary_edit_still_offers_session_and_always(tmp_path, monkey
     await server.close()
 
 
+async def test_a_sub_agents_file_in_its_worktree_is_asked_once_not_offered_as_a_rule(tmp_path, monkeypatch):
+    """A fan-out child's worktree is removed when it ends: "always" would write `edit(<repo>/.k3code/worktrees/<id>/f)`
+    into the project's config.yaml for a path that can never come up again."""
+    server, live = await seed(tmp_path, monkeypatch, Recording())
+    live.perms.mode = PermissionMode.DEFAULT
+    cwd = Path(live.perms.cwd)
+    sent: dict = {}
+
+    async def ask(kind, payload, session_id):
+        sent.update(payload)
+        return {"choice": "always"}
+
+    server._ask_client = ask
+    approve = await server._approval_callback_for(live)
+    args = {"path": str(cwd / ".k3code" / "worktrees" / "sa-1234" / "f1.txt"), "content": "ok"}
+    decision = live.perms.decide("write", args)
+    assert decision.action == "ask" and not decision.always_ask
+    answer = await approve("write", args, decision)
+    assert sent["choices"] == ["once", "deny"] and sent["allow_session"] is False and sent["pattern"] == ""
+    assert answer.choice == "once" and live.perms.session_rules == []
+    assert not (cwd / ".k3code" / "config.yaml").exists()
+    await server.close()
+
+
 # ── FIX 7: a call spelled the way Claude Code spells it is still named in the failed-calls list ───────────────────
 
 
