@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+
 import pytest
 
 from k3code.agent.loop import AgentLoop
 from k3code.providers.types import Message, ToolCall
 from k3code.router import Router, build_chain
-from k3code.tools import format_tool_result
+from k3code.tools import format_tool_result, tool_glob
 from test_agent import FakeProvider, make_done_event
 
 
@@ -34,6 +37,23 @@ def test_grep_and_glob_are_plain_lists_and_say_when_empty():
     assert format_tool_result({"matches": "a.py:1:x", "warnings": "2 files skipped"}) == "a.py:1:x\n[2 files skipped]"
     assert format_tool_result({"files": ["a.py", "src/b.py"]}) == "a.py\nsrc/b.py"
     assert format_tool_result({"files": []}).startswith("(no files; ")  # says which directories glob skips
+
+
+def test_an_empty_glob_names_the_cache_folders_it_skips_tracked_files_in_them_too():
+    shown = format_tool_result({"files": []})
+    assert ".terraform" in shown and "tracked files in them too" in shown
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+async def test_glob_leaves_out_a_cache_folder_even_when_git_tracks_its_files(tmp_path):
+    (tmp_path / ".terraform").mkdir()
+    (tmp_path / ".terraform" / "main.tf").write_text("x\n")
+    (tmp_path / "app.tf").write_text("x\n")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    tracked = subprocess.run(["git", "ls-files"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert ".terraform/main.tf" in tracked.stdout.splitlines()
+    assert (await tool_glob({"pattern": "*.tf"}, cwd=tmp_path))["files"] == ["app.tf"]
 
 
 def test_write_edit_and_plain_errors_are_one_readable_line():

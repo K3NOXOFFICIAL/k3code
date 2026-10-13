@@ -108,6 +108,29 @@ def test_a_clipped_grep_tail_that_starts_at_a_path_is_left_alone_and_other_text_
     assert "continues in" not in clip_for_model("bash", grouped_grep(), 5000)
 
 
+def test_a_clipped_grep_tail_is_named_for_the_file_it_is_in_whatever_the_path_looks_like_and_wherever_it_starts():
+    from k3code.tools import _grep_resume
+
+    # a time-stamped name at the top level starts like a match line (`10:`), and a tail may begin on the blank line
+    # between two files (then it shows the next path itself)
+    names = ["src/a.py", "10:30:00.log", "src/b.py"]
+    blocks = ["\n".join([name, *(f"{n}:needle in {name} line {n}" for n in range(1, 40))]) for name in names]
+    text = "\n\n".join(blocks)
+    starts = [text.index(block) for block in blocks]
+    log = starts[1]
+    assert _grep_resume(text, log + 20) == "(continues in 10:30:00.log)\n"  # inside the first match line
+    assert _grep_resume(text, starts[2] - 1) == "", "the tail starts on the blank line above src/b.py, which it shows"
+    assert _grep_resume(text, starts[2] - 2) == "", "...and on the newline that ends the last match line"
+    assert _grep_resume(text, log) == ""
+    for at in range(len(text)):
+        into = at
+        while text[into] == "\n":  # a blank line shows nothing of the file before it: the next block starts there
+            into += 1
+        owner = max(i for i, start in enumerate(starts) if start <= into)
+        expected = "" if into == starts[owner] else f"(continues in {names[owner]})\n"
+        assert _grep_resume(text, at) == expected, (at, repr(text[at : at + 30]))
+
+
 def test_text_within_the_limit_is_returned_unchanged():
     assert clip_head_tail("x" * 10_000) == "x" * 10_000
     short = [Message(role="tool", content="y" * 10_000, tool_call_id="c1", name="read")]

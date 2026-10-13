@@ -377,9 +377,11 @@ async def test_settings_get_names_the_theme_that_theme_saved(server, tmp_path):
         res = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
         assert res["settings"]["theme"] == theme
         assert f"theme:        {theme}" in res["output"]
-    server.config.display.tui_theme = ""  # never pinned: the older display.theme, else default
-    server.config.display.theme = "light"
-    assert (await m1.rpc(server, "settings.get", {}))["result"]["settings"]["theme"] == "light"
+    # never pinned: default, whatever skin the setup wizard stored in display.theme (nothing applies it)
+    server.config.display.tui_theme = ""
+    server.config.display.theme = "midnight"
+    res = (await m1.rpc(server, "settings.get", {}))["result"]
+    assert res["settings"]["theme"] == "default" and "midnight" not in res["output"]
 
 
 async def test_settings_get_names_a_legacy_permission_mode_by_its_current_name(server, tmp_path):

@@ -405,9 +405,16 @@ def _carried(messages: list[Any]) -> list[Any]:
 
 def _trim_history(history: list[Any]) -> list[Any]:
     """``history`` without its older part (the first message at least), cut at a user message so that no tool result
-    is left without the call it answers."""
-    start = next((i for i in range(max(1, len(history) // 2), len(history)) if history[i].role == "user"), len(history))
-    return history[start:]
+    is left without the call it answers. When the last turn is more than half of it (no user message after the middle),
+    the turns before it are what is kept: they fitted before it began."""
+    start = next((i for i in range(max(1, len(history) // 2), len(history)) if history[i].role == "user"), None)
+    if start is not None:
+        return history[start:]
+    return history[: max((i for i, m in enumerate(history) if m.role == "user"), default=0)]
+
+
+def _chars(messages: list[Any]) -> int:
+    return sum(len(str(m.content or "")) for m in messages)
 
 
 async def _run_repl(
@@ -584,11 +591,18 @@ async def _run_repl(
             # what a turn did before it failed stays in the conversation (a command that ran, its result), as in a
             # gateway session; one that failed before the model answered anything left only its prompt, sent again
             carried = _carried(loop.turn_messages)
-            if carried and carried[-1].role != "user":
+            grew = bool(carried) and carried[-1].role != "user"
+            if grew:
                 history = carried
-            if overflowed:  # the same prompt would only fail again
-                history = _trim_history(history)
-                print("[k3code] the older part of the conversation was dropped to make room: send your prompt again")
+            if overflowed:
+                # the conversation is the cause when the turn's own work grew it or it holds more text than the prompt;
+                # a prompt bigger than all that came before it is its own cause, and dropping history would not fit it
+                kept = _trim_history(history) if grew or _chars(history) >= len(user_input) else history
+                if len(kept) < len(history):
+                    history = kept
+                    print("[k3code] part of the conversation was dropped to make room: send your prompt again")
+                else:
+                    print("[k3code] this prompt does not fit the window as it is: shorten it, or /clear to start over")
     await _reap_jobs(loop.session_id)
     await reliability.stop()
     await _close_providers(providers)

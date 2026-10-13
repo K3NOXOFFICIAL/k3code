@@ -86,6 +86,11 @@ ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
     "bash": {"run_in_background": "background"},
     "task": {"subagent_type": "agent_type"},
     "todo": {"items": "todos"},
+    "read": {"file_path": "path"},
+    "write": {"file_path": "path"},
+    "edit": {"file_path": "path", "old_str": "old_string", "new_str": "new_string"},
+    "skill": {"skill": "name"},
+    "grep": {"glob": "include"},
 }
 #: Arguments a handler still takes that its schema no longer lists (so they are not "ignored").
 LEGACY_ARGUMENTS: dict[str, frozenset[str]] = {"read": frozenset({"start", "end"})}
@@ -93,9 +98,17 @@ LEGACY_ARGUMENTS: dict[str, frozenset[str]] = {"read": frozenset({"start", "end"
 
 def normalize_arguments(tool: str, args: dict[str, Any], schema: dict[str, Any] | None) -> dict[str, Any]:
     """``args`` as the handler should get them: null options dropped, aliased names renamed (unless the model sent the
-    real name too, then the alias stays and is reported as ignored). An aliased name sent as null is an unused option
-    like any other: it is dropped here, not renamed into a null that the real name's type rejects."""
+    real name too, then the alias stays and is reported as ignored), grep's ``-i`` as ``(?i)``. An aliased name sent
+    as null is an unused option like any other: it is dropped here, not renamed into a null that the real name's type
+    rejects."""
     args = drop_null_options(args, schema)
+    if tool == "grep" and isinstance(args, dict) and isinstance(args.get("-i"), bool):
+        # Claude Code's case flag has no argument here: the regex takes it inline. Left as an ignored argument, the
+        # search ran case-sensitively and answered "no matches" for a word that is there
+        ignore_case = args["-i"]
+        args = {k: v for k, v in args.items() if k != "-i"}
+        if ignore_case and isinstance(args.get("pattern"), str) and not args["pattern"].startswith("(?i)"):
+            args["pattern"] = "(?i)" + args["pattern"]
     aliases = ARGUMENT_ALIASES.get(tool)
     if not aliases or not isinstance(args, dict) or not any(k in aliases for k in args):
         return args

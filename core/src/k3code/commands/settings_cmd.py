@@ -48,8 +48,8 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
         "permission_modes": [m.value for m in PermissionMode],
         "permission_rules": rules,
         "focus_mode": cfg.display.focus_mode,
-        # /theme saves display.tui_theme; display.theme is the older field
-        "theme": str(getattr(cfg.display, "tui_theme", "") or cfg.display.theme or "default"),
+        # /theme saves display.tui_theme, which is all the TUI applies; display.theme is the setup wizard's skin
+        "theme": str(getattr(cfg.display, "tui_theme", "") or "default"),
         "output_style": style,
         "advisor": (ctx.session_advisor(live) or None) if live and hasattr(ctx, "session_advisor") else None,
         "output_styles": outputstyle.available(cwd),

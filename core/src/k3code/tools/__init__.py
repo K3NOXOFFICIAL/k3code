@@ -163,7 +163,7 @@ def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
                 if total > MAX_READ_BYTES:
                     return too_big
                 line = _cap_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
-                used += len(line) + _NUMBER_WIDTH + 2
+                used += len(line) + len(str(number)) + 2  # what the numbered line costs: number, tab, newline
                 if selected and used > READ_MAX_CHARS:
                     break  # the char budget is spent: the model continues with offset
                 selected.append(line)
@@ -181,7 +181,6 @@ READ_DEFAULT_LIMIT = 2000
 READ_MAX_LINE_CHARS = 2000
 READ_MAX_CHARS = 60_000
 _BINARY_FILE = "{path} looks like a binary file ({size} bytes): not shown. Use bash (file, xxd, strings) to inspect it"
-_NUMBER_WIDTH = 6  # cat -n: the line number right-aligned in 6 columns, then a tab
 
 
 def _read_window(arguments: dict[str, Any]) -> tuple[int, int | None]:
@@ -260,7 +259,7 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     used = 0
     for line in lines[first - 1 : last_wanted]:
         line = _cap_line(line)
-        cost = len(line) + _NUMBER_WIDTH + 2  # what the numbered line costs: number, tab, newline
+        cost = len(line) + len(str(first + len(selected))) + 2  # what the numbered line costs: number, tab, newline
         if selected and used + cost > READ_MAX_CHARS:
             break  # the char budget is spent: the model continues with offset
         selected.append(line)
@@ -493,7 +492,8 @@ async def tool_bash(
             )
         network_on = "--unshare-net" not in (sandbox or ())
         if sandbox and proc.returncode:
-            kept = [workdir, *(sandbox[i + 1] for i, arg in enumerate(sandbox) if arg in ("--bind", "--ro-bind"))]
+            # the folders bound into the sandbox, not the call's cwd: a cwd of /tmp or ~ is the private tmpfs there
+            kept = [sandbox[i + 1] for i, arg in enumerate(sandbox) if arg in ("--bind", "--ro-bind")]
             if hint := _sandbox_hint(result["stderr"], cmd, network=network_on, roots=kept):
                 notes.append(hint)
         return {**result, "note": "; ".join(notes)} if notes else result
@@ -516,17 +516,20 @@ def _collapse_redraws(text: str) -> str:
     on the screen, and the other frames are hundreds of tokens of a pip, npm or curl download. CRLF line ends go too."""
     if "\r" not in text:
         return text
-    lines, dropped = [], 0
+    lines, dropped, last = [], 0, 0
     for line in text.split("\n"):
+        last = 0  # frames dropped from this line: after the loop, from the text's last one
         if "\r" in line:
             frames = [f for f in line.split("\r") if f]
-            dropped += max(0, len(frames) - 1)
+            last = max(0, len(frames) - 1)
+            dropped += last
             line = frames[-1] if frames else ""
         lines.append(line)
     out = "\n".join(lines)
-    if dropped and "\r" in text.rsplit("\n", 1)[-1]:
+    if last:
         # the text ends in CR frames, not in a line end: a progress bar, or a file whose lines end in a bare CR (an old
-        # Mac export; any text before it, a header or a job's status line, does not make it one that ended its line)
+        # Mac export; any text before it, a header or a job's status line, does not make it one that ended its line,
+        # and neither does a progress bar above a last line that only clears the spinner)
         out += (
             f"\n[{dropped} earlier carriage-return frames dropped; a file with CR line ends reads with tr '\\r' '\\n']"
         )
@@ -547,7 +550,7 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     escapes every newline, quote and backslash: ``{'stdout': 'a\\nb\\n', 'stderr': '', 'exit_code': 0}``. The TUI
     showed that as one unreadable line, and a model that copied a line it had read that way into an ``edit`` copied
     the escapes too. They are plain text now (stdout as is; stderr, an error note and a non-zero exit code only when
-    there is something to say). ``read`` is numbered like ``cat -n`` and ends with how to read on when it stopped
+    there is something to say). ``read`` is numbered (``12<tab>text``) and ends with how to read on when it stopped
     before the end of the file. Every other result is unchanged: other ``content``, small ok/error dicts. A PostToolUse
     hook's word (``HOOK_FEEDBACK_KEY``) follows the result it is about.
     """
@@ -582,7 +585,8 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return text or "(no matches)"
     if "files" in result and isinstance(result["files"], list):  # glob
         text = "\n".join(str(f) for f in result["files"]) or (
-            "(no files; .git node_modules .venv dist are skipped: give path=dist to search inside one)"
+            "(no files; dependency and cache folders such as .git node_modules .venv dist .terraform are skipped, "
+            "tracked files in them too: give path=dist to search inside one)"
         )
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
@@ -603,7 +607,7 @@ def _numbered_read(result: dict[str, Any]) -> str:
             return "(empty file)"
         return f"[file has {total} lines; offset {first} is past the end]"
     lines = str(result["content"]).split("\n")
-    body = "\n".join(f"{n:>{_NUMBER_WIDTH}}\t{line}" for n, line in enumerate(lines, first))
+    body = "\n".join(f"{n}\t{line}" for n, line in enumerate(lines, first))  # no cat -n padding: ~2 tokens a line
     if total is None:  # a huge file, streamed: its length is not known
         return f"{body}\n[showed {first}-{last}; continue with offset={last + 1}]"
     if last < total:
@@ -696,15 +700,18 @@ def _grep_resume(text: str, at: int) -> str:
     """The file a clipped grep result's tail belongs to, as ``(continues in <path>)\\n``, or "" when the tail shows it.
     A path stands once above its matches (:func:`_group_by_file`), so a tail that starts in the middle of a file read
     as bare ``12:text`` lines of no file at all."""
+    while at < len(text) and text[at] == "\n":  # the blank line between two files: the tail starts at the next path
+        at += 1
     end = text.find("\n", at)
     end = len(text) if end < 0 else end
     while end > 0:
         start = text.rfind("\n", 0, end) + 1
         line = text[start:end]
-        # a path is the line above a ``12:text`` line (a ``[note]`` can be one too, in a search of a single file)
+        # a path is the line above a ``12:text`` line (a ``[note]`` can be one too, in a search of a single file); one
+        # that follows a blank line is a path whatever it looks like (a file named ``10:30:00.log``)
         if (
             line
-            and not _LINE_NUMBER.match(line)
+            and (not _LINE_NUMBER.match(line) or text[start - 2 : start] == "\n\n")
             and _LINE_NUMBER.match(text, end + 1)
             and not (line.startswith("[") and line.endswith("]"))
         ):
@@ -875,14 +882,16 @@ def _glob_list(value: Any) -> Any:
     return value
 
 
-_BRE_ALTERNATION = re.compile(r"[^\s|\\]\\\|[^\s|\\]")
-_FILE_GLOB = re.compile(r"[*?\[]|\.\w+$")  # a wildcard or an extension; an include with neither is a word or a folder
+# an escaped pipe that is not part of a `\|\|` run (a literal pair of pipes on purpose) or after a backslash
+_BRE_ALTERNATION = re.compile(r"(?<![\\|])\\\|(?!\\\|)")
+# a wildcard, a brace group or an extension; an include with none of them is a word or a folder
+_FILE_GLOB = re.compile(r"[*?\[{]|\.\w+$")
 
 
 def _no_match_hints(pattern: str, include: Any) -> str:
     """Why a search that found nothing may have been asked wrongly (the common slips), or ""."""
     hints = []
-    if _BRE_ALTERNATION.search(pattern):  # `\|\|` is a literal pair of pipes on purpose: only `a\|b` is the slip
+    if _BRE_ALTERNATION.search(pattern):
         hints.append("\\| is a literal pipe in this regex flavor: write | for alternation")
     includes = include if isinstance(include, list) else [include] if include else []
     if any(not _FILE_GLOB.search(inc) for inc in includes):
@@ -1261,8 +1270,8 @@ def _expand_braces(pattern: str) -> list[str]:
 
 
 async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores;
-    outside a git tree also caches and build output). Stops at MAX_SEARCH_RESULTS or SEARCH_BUDGET_S.
+    """Find files matching a glob pattern (skipping SKIP_DIRS, tracked files in them too, and what .gitignore ignores;
+    outside a git tree also build output). Stops at MAX_SEARCH_RESULTS or SEARCH_BUDGET_S.
 
     ``{a,b}`` groups are expanded, and an absolute pattern searches from the directory its first wildcard is under."""
     pattern = arguments["pattern"]
@@ -1485,7 +1494,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="bash",
             description="Run a shell command (bash -c) and return its stdout, stderr and exit code. "
-            "`echo` does not expand \\n: use printf.\n"
+            "`echo` does not expand \\n: use printf. Every call starts a new shell in the session directory: `cd` and "
+            "exports do not carry over (pass cwd, or chain with &&).\n"
             f"Limits: killed after {BASH_DEFAULT_TIMEOUT} s by default (timeout: up to {BASH_MAX_TIMEOUT} s) or "
             f"past {MAX_OUTPUT_BYTES // (1024 * 1024)} MB of output; you see at most {MAX_TOOL_RESULT_CHARS} chars "
             "(head and tail). For servers, watchers and long builds use background: true, then bash_output.",

@@ -93,12 +93,16 @@ def head_and_tail(text: str, limit: int, head: int) -> str:
 
 def _anchor_gist(content: str) -> str:
     """What the summary model reads of the task statement the result keeps verbatim: its start and end. Of one the
-    result clips (over TASK_ANCHOR_CHARS) it reads the clipped middle instead: only the summary can carry that."""
+    result clips (over TASK_ANCHOR_CHARS) it reads the start of the clipped middle instead (what fits in
+    TASK_ANCHOR_CHARS, less when the folded part is long: see head_and_tail): only the summary can carry that."""
     if len(content) <= ANCHOR_SUMMARY_CHARS:
         return content
     if len(content) > TASK_ANCHOR_CHARS:
+        middle = content[ANCHOR_HEAD_CHARS : len(content) - ANCHOR_TAIL_CHARS]
         note = "[the start and the end of this message are kept verbatim; the middle, which is not, follows]\n"
-        return note + content[ANCHOR_HEAD_CHARS : len(content) - ANCHOR_TAIL_CHARS][: TASK_ANCHOR_CHARS - len(note)]
+        if len(note) + len(middle) > TASK_ANCHOR_CHARS:  # all of it does not fit
+            note = note.replace("follows", "follows as far as it fits")
+        return note + middle[: TASK_ANCHOR_CHARS - len(note)]
     head = ANCHOR_SUMMARY_CHARS * 3 // 4
     return (
         f"{content[:head]}\n…[the rest of this message is kept verbatim]…\n{content[-(ANCHOR_SUMMARY_CHARS - head) :]}"

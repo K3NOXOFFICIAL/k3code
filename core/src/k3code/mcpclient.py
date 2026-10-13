@@ -503,7 +503,8 @@ class McpManager:
         scored = []
         for t in tools:
             hay = f"{t.qualified} {t.description}".lower()
-            names = {t.qualified.lower(), t.name.lower()}
+            # the server's own name, and the sanitized one the prompt prints after the prefix (``search.docs``)
+            names = {t.qualified.lower(), t.name.lower(), t.qualified[len(qualified_name(t.server, "")) :].lower()}
             if q in names or names.intersection(words):
                 score = 100
             else:

@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from k3code.autonomy import advisor
+from k3code.outputstyle import PRESETS
+from k3code.prompting import build_system_prompt
 from k3code.providers.types import Message, StreamEvent, Usage
 from k3code.router import Router, build_chain
 from k3code.routing.tiers import TaskKind, Tier, TierRouters
 from k3code.subagents import runner as runner_mod
-from k3code.subagents.runner import Handle
+from k3code.subagents.runner import Handle, child_reliability
 from k3code.subagents.types import load_agent_types, parse_agent_md
 from m1cmd_helpers import git_repo, make_server, new_session
 from test_autonomy_gateway import events
@@ -218,3 +221,41 @@ async def test_a_sub_agent_whose_provider_reports_no_cache_shows_zero(tmp_path, 
     live = server.live_for(server.store.get(sid))
     h = await server.subagents.run(live, description="d", prompt="p")
     assert (h.cache_read_tokens, h.cache_write_tokens) == (0, 0)
+
+
+# ── a child is not told about the advisor tool: only the session's own loop registers it ──
+
+
+def _child_prompt(server, live, repo, agent_type="worker") -> str:
+    atype = load_agent_types(str(repo))[agent_type]
+    h = Handle(id="sa-1", description="look", agent_type=agent_type, tier="main", depth=1, parent_sid=live.session_id)
+    loop = server.subagents.build_loop(live, h, atype, repo, child_reliability(server.config, "sa-1", server._home()))
+    return f"{loop.system_prompt}\n\n{loop.system_suffix}"
+
+
+async def test_a_child_prompt_has_no_advisor_note_when_the_session_has_an_advisor(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"])
+    sid = await new_session(server, repo)
+    live = server.live_for(server.store.get(sid))
+    live.stored.meta[advisor.META_KEY] = advisor.STRONG  # `/advisor on`: the session's own loop gets the tool
+    live.stored.meta["output_style"] = "concise"  # the rest of the session's meta still shapes the child's prompt
+    own = build_system_prompt(live.system_prompt, cwd=repo, config=server.config, session_meta=live.stored.meta)
+    assert advisor.PROMPT_NOTE in own  # the session itself is told, and has the tool
+    for kind in ("worker", "explorer"):
+        prompt = _child_prompt(server, live, repo, kind)
+        assert advisor.PROMPT_NOTE not in prompt and "`advisor`" not in prompt, kind
+        assert PRESETS["concise"] in prompt, kind
+    assert live.stored.meta[advisor.META_KEY] == advisor.STRONG  # the session's own choice is not touched
+    await server.close()
+
+
+async def test_a_child_prompt_has_no_advisor_note_when_the_config_default_names_one(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy={"advisor": advisor.STRONG})
+    sid = await new_session(server, repo)
+    live = server.live_for(server.store.get(sid))
+    assert advisor.META_KEY not in live.stored.meta  # the default applies to the session, and so to its prompt
+    prompt = _child_prompt(server, live, repo)
+    assert advisor.PROMPT_NOTE not in prompt
+    await server.close()

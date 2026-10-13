@@ -34,7 +34,7 @@ async def test_the_decision_model_keeps_some_results_and_leaves_notes_for_others
         asked.append([m.tool_call_id for m in candidates])
         return {"r0": "the config lives at line 3", "r1": "keep"}
 
-    _, provider = await run_with(tmp_path, decide, n=12, window=22_000)
+    _, provider = await run_with(tmp_path, decide, n=12, window=20_500)
     assert asked and asked[0][:2] == ["r0", "r1"]  # it was asked about the old results before they were elided
     sent = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
     assert sent["r0"].startswith(ELIDED) and sent["r0"].endswith("\nStill relevant: the config lives at line 3")

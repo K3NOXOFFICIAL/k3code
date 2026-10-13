@@ -180,9 +180,9 @@ def _is_text(content_type: str) -> bool:
 
 def _page_room(budget: int, header: int) -> int:
     """The chars of page text that fit ``budget`` (what the model is sent of one tool result) under a ``header`` of
-    that many chars, at most MAX_FETCH_CHARS. Over that the loop clips the middle of the result, which no marker in
-    the page can name; the floor keeps a huge URL from leaving no room."""
-    return max(min(MAX_FETCH_CHARS, budget - header), budget // 2)
+    that many chars, at most MAX_FETCH_CHARS (also under a raised budget). Over the budget the loop clips the middle of
+    the result, which no marker in the page can name; the floor keeps a huge URL from leaving no room."""
+    return min(MAX_FETCH_CHARS, max(budget - header, budget // 2))
 
 
 def _cap_page(text: str, note: str = "", start: int = 0, limit: int = MAX_FETCH_CHARS) -> str:

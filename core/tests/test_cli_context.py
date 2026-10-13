@@ -290,6 +290,56 @@ def test_the_repl_drops_its_older_turns_when_the_conversation_outgrows_the_windo
     assert outcomes[-1] == "answered" and "dropped" in capsys.readouterr().out
 
 
+def _overflow_on_a_big_prompt(messages):
+    """The window is full when the last user message alone is over 5 000 chars, whatever came before it."""
+    from k3code.errors import ContextOverflow
+
+    last_user = [m for m in messages if m.role == "user"][-1]
+    if len(str(last_user.content)) > 5_000:
+        return ContextOverflow("prompt is too long")
+    return Message(role="assistant", content="ok")
+
+
+def test_a_prompt_that_is_too_big_on_its_own_does_not_cost_the_repl_its_conversation(tmp_path, monkeypatch, capsys):
+    provider = Scripted(_overflow_on_a_big_prompt)
+    big = "log line " * 800
+    _repl(monkeypatch, tmp_path, provider, ["q0", "q1", "q2", big, big, "after"])
+    assert [m.content for m in provider.requests[-1]] == ["q0", "ok", "q1", "ok", "q2", "ok", "after"]
+    out = capsys.readouterr().out
+    assert "shorten it" in out and "dropped" not in out, out
+
+
+def test_the_repl_does_not_say_it_dropped_a_conversation_it_does_not_have(tmp_path, monkeypatch, capsys):
+    provider = Scripted(_overflow_on_a_big_prompt)
+    _repl(monkeypatch, tmp_path, provider, ["log line " * 800, "after"])
+    assert [m.content for m in provider.requests[-1]] == ["after"]
+    out = capsys.readouterr().out
+    assert "shorten it" in out and "dropped" not in out, out
+
+
+def test_a_repl_turn_that_outgrows_the_window_midway_keeps_the_turns_before_it(tmp_path, monkeypatch, capsys):
+    from k3code.errors import ContextOverflow
+
+    files = []
+    for i in range(6):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text(f"file {i}\n")
+        files.append(f)
+
+    def script(messages):
+        users = [m for m in messages if m.role == "user"]
+        calls = sum(1 for m in messages if m.role == "assistant" and m.tool_calls)
+        if not str(users[-1].content).startswith("BIG"):
+            return Message(role="assistant", content="ok")
+        return ContextOverflow("prompt is too long") if calls >= len(files) else _read_call(calls, files[calls])
+
+    provider = Scripted(script)
+    _repl(monkeypatch, tmp_path, provider, ["q1", "q2", "q3", "BIG task", "after"])
+    # the big turn is most of the history: the three small turns before it, not nothing, are what is kept
+    assert [m.content for m in provider.requests[-1]] == ["q1", "ok", "q2", "ok", "q3", "ok", "after"]
+    assert "dropped" in capsys.readouterr().out
+
+
 def test_the_repl_clear_starts_the_conversation_over(tmp_path, monkeypatch):
     provider = Scripted(lambda messages: Message(role="assistant", content="ok"))
     _repl(monkeypatch, tmp_path, provider, ["first", "/clear", "second"])

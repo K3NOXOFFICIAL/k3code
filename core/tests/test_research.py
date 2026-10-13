@@ -812,3 +812,26 @@ async def test_web_fetch_leaves_room_for_its_header_and_a_lowered_tool_output_li
             assert sent[0].content == content, (url[:30], configured)  # the loop cut nothing: the marker is true
             marker = re.search(r"characters 0-(\d+) of \d+ are shown; continue with start_index=(\d+)\]", content)
             assert marker and marker.group(1) == marker.group(2)
+
+
+async def test_a_raised_tool_output_limit_does_not_lift_web_fetch_past_its_documented_cut():
+    """``budget // 2``, the floor for a huge URL, also lifted the cap: at 40 000 chars a page came back 20 000 long
+    while the tool says text is cut at MAX_FETCH_CHARS."""
+    from k3code.research.fetch import WebFetcher
+    from k3code.research.tools import MAX_FETCH_CHARS, _page_room, register_web_tools
+
+    assert _page_room(100_000, 230) == _page_room(40_000, 230) == _page_room(19_001, 230) == MAX_FETCH_CHARS
+    assert _page_room(400, 330) == 200, "a header that fills the budget still leaves half of it for the page"
+    words = " ".join(f"w{i:05d}" for i in range(6_000))
+    page = f"<html><body><main><p>{words}</p></main></body></html>"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=page.encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        reg = _Registry()
+        config = SimpleNamespace(research={}, context={"tool_output_chars": 40_000})
+        register_web_tools(reg, config, fetcher=WebFetcher(client=client, respect_robots=False))
+        content = (await reg.handlers["web_fetch"]({"url": "https://example.com/a"}))["content"]
+    text = content.split("\n\n", 1)[1]
+    assert len(text) <= MAX_FETCH_CHARS and "continue with start_index=" in text, len(text)

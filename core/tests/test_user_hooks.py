@@ -89,7 +89,7 @@ async def test_post_tool_feedback_keeps_a_read_numbered_once_and_an_error_an_err
     note = Hook("PostToolUse", """echo '{"additionalContext": "lint is red"}'""")
     read = await _loop(proj, [note])._execute_tool(ToolCall(id="r", name="read", arguments={"path": "a.txt"}))
     text = format_tool_result(read)
-    assert text.splitlines()[0].split("\t") == ["     1", "alpha"] and text.endswith("[PostToolUse hook] lint is red")
+    assert text.splitlines()[0].split("\t") == ["1", "alpha"] and text.endswith("[PostToolUse hook] lint is red")
     missing = await _loop(proj, [note])._execute_tool(ToolCall(id="m", name="read", arguments={"path": "nope.txt"}))
     assert "error" in missing and "content" not in missing  # the failure counter still sees a failure
 

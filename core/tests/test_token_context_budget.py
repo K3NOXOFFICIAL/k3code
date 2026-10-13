@@ -118,7 +118,7 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
 
 
 async def test_six_results_stay_whole_when_they_are_small_next_to_the_window(tmp_path):
-    calls = reads_of(tmp_path, 12, lines=8)  # ~500 chars each
+    calls = reads_of(tmp_path, 12, lines=9)  # ~570 chars each (a numbered line is no longer padded)
     provider = Recorder([*(tool_reply(c) for c in calls), text_reply("done")])
     loop = make_loop(tmp_path, provider, window=6_000)  # overhead + 12 results pass 50%; 6 results are < 15%
     async for _ in loop.run("read them all"):
@@ -228,7 +228,7 @@ async def test_a_reread_of_an_unchanged_file_points_at_the_earlier_result(tmp_pa
     assert "\ttwo" in results["a"]
     assert results["b"].startswith("[unchanged since the read at step 1 (call a)")
     assert "\ttwo" not in results["b"]
-    assert results["c"].startswith("     2\ttwo")
+    assert results["c"].startswith("2\ttwo")
     assert "TWO!" in results["e"]
 
 
@@ -319,6 +319,7 @@ def _heredoc(first: str, tag: str = "EOF", rest: str = "") -> str:
         (_heredoc("cat <<'EOF' | tee notes.md"), True),
         (_heredoc("tee -a notes.md <<'EOF'"), True),
         (_heredoc("cd src && cat > app.py <<'EOF'", rest="python app.py\n"), True),
+        (_heredoc("n=$((1 << 3)); cat > app.py <<'EOF'"), True),  # a shift is no heredoc: its "tag" has no terminator
         (_heredoc("cat <<-EOF > app.py").replace("\nEOF", "\n\tEOF"), True),  # <<- takes a tab-indented terminator
         # the heredoc is the input of a command whose output, not the script, goes to the file
         (_heredoc("python3 - <<'PY' > out.json", "PY"), False),
@@ -362,6 +363,24 @@ def test_the_commands_after_a_heredocs_terminator_are_not_elided_with_its_text()
     )
 
 
+def test_the_script_of_an_interpreters_heredoc_before_the_one_that_is_written_to_a_file_stays():
+    """Bash reads the bodies in the order of the operators: the first one here is the script python ran, which is on no
+    disk, and its terminator is a command line."""
+    from k3code.context_budget import elide_old_results
+
+    script = "".join(f"print({i})  # in the script\n" for i in range(30))
+    body = "".join(f"line {i} of the file\n" for i in range(30))
+    command = f"python3 - <<PY; cat > out.txt <<EOF\n{script}PY\n{body}EOF\nchmod +x out.txt\n"
+    msgs: list[Message] = []
+    for i in range(9):
+        msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
+    shown = elide_old_results(msgs, over=True, elided=set(), window=None)[0].tool_calls[0].arguments["command"]
+    assert shown == (
+        f"python3 - <<PY; cat > out.txt <<EOF\n{script}PY\n"
+        f"[{len(body) - 1} chars of text elided: they are in the file now — read it]\nEOF\nchmod +x out.txt\n"
+    )
+
+
 def test_a_long_first_line_is_not_searched_for_a_heredoc():
     """Two patterns tried every position of a here-string payload or a long path-like word: 3 s for 16k characters,
     on every request past the threshold."""
@@ -370,6 +389,23 @@ def test_a_long_first_line_is_not_searched_for_a_heredoc():
     from k3code.context_budget import elide_old_results
 
     command = "xxd -r -p <<< " + "ab" * 8_000 + " | tar x\nls\n"
+    msgs: list[Message] = []
+    for i in range(9):
+        msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
+    started = time.perf_counter()
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    assert time.perf_counter() - started < 0.5
+    assert out[0].tool_calls[0].arguments["command"] == command
+
+
+def test_a_first_line_of_many_heredoc_operators_is_not_searched_once_for_each():
+    """240 operators fit in a 1000-character line; each one scanned the whole command in Python (2.6 s for 200 KB, on
+    every request past the threshold). The first that writes a file has no terminator line, so the command is left."""
+    import time
+
+    from k3code.context_budget import elide_old_results
+
+    command = "cat > f " + "<<a " * 240 + "\n" + "x\n" * 100_000
     msgs: list[Message] = []
     for i in range(9):
         msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
@@ -418,6 +454,33 @@ def test_a_later_todo_call_that_failed_does_not_replace_the_list_before_it():
     out = elide_old_results(msgs, over=True, elided=set(), window=None)
     assert out[0].tool_calls[0].arguments["todos"] == _todos("LIVE")["todos"], "the only list that took effect"
     assert out[2].tool_calls[0].arguments["todos"] == bad["todos"], "and the rejected one is not 'replaced' by anything"
+
+
+def test_a_provider_that_numbers_every_call_the_same_still_shows_the_live_todo_list():
+    """The tool answers only "Todos updated", so the call is the model's only copy of its plan. Judged by call id, the
+    live call (id "0" like the ones before it) was elided as replaced by a later call, which does not exist."""
+    from k3code.context_budget import elide_old_results
+
+    def call(name: str, args: dict) -> Message:
+        return Message(role="assistant", content=None, tool_calls=[ToolCall(id="0", name=name, arguments=args)])
+
+    msgs: list[Message] = []
+    for tag in ("PLAN-A", "PLAN-B", "PLAN-LIVE"):
+        msgs += [
+            call("todo", _todos(tag)),
+            Message(role="tool", content="Todos updated (0/12 done).", tool_call_id="0"),
+        ]
+    for i in range(10):
+        msgs += [
+            call("read", {"path": f"f{i}"}),
+            Message(role="tool", content="x" * 400, tool_call_id="0", name="read"),
+        ]
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    lists = [
+        m.tool_calls[0].arguments["todos"] for m in out if m.role == "assistant" and m.tool_calls[0].name == "todo"
+    ]
+    assert [isinstance(t, str) and "replaced by a later todo call" in t for t in lists] == [True, True, False]
+    assert lists[-1] == _todos("PLAN-LIVE")["todos"]
 
 
 def test_the_text_of_an_elided_call_stays_elided_when_a_larger_window_keeps_its_result_whole():
@@ -500,3 +563,29 @@ def test_the_compaction_trigger_counts_elided_results_as_their_markers():
     assert short < whole // 3, (short, whole)
     # the four newest steps are still counted whole
     assert short > 4 * 2_500
+
+
+def test_a_loaded_skill_and_a_sub_agents_report_are_not_elided_like_old_bash_output():
+    from k3code.context_budget import PINNED_RESULT_CHARS, elide_old_results, elision_candidates
+
+    def step(i: int, name: str, text: str) -> list[Message]:
+        return [
+            Message(role="assistant", content=None, tool_calls=[ToolCall(id=f"c{i}", name=name, arguments={})]),
+            Message(role="tool", content=text, tool_call_id=f"c{i}", name=name),
+        ]
+
+    msgs = [Message(role="user", content="go")]
+    msgs += step(0, "skill", "# Skill: migrate\n" + "s" * 8_000)
+    msgs += step(1, "task", "Callers of old_api: " + "t" * 3_000)
+    msgs += step(2, "skill", "# Skill: huge\n" + "h" * (PINNED_RESULT_CHARS + 1))
+    for i in range(3, 20):
+        msgs += step(i, "bash", "b" * 2_500)
+    out = {
+        m.tool_call_id: m.content
+        for m in elide_old_results(msgs, over=True, elided=set(), window=None)
+        if m.role == "tool"
+    }
+    assert out["c0"].startswith("# Skill: migrate") and out["c1"].startswith("Callers of old_api")
+    assert out["c2"].startswith("[earlier skill result elided"), "a skill past the size cap is elided like the rest"
+    assert out["c3"].startswith("[earlier bash result elided")
+    assert {m.tool_call_id for m in elision_candidates(msgs, elided=set())} == {"c2", *(f"c{i}" for i in range(3, 14))}

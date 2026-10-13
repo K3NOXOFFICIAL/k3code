@@ -7,6 +7,7 @@ the tool schemas, and only between turns; inside a turn every old tool result wa
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import re
 from collections.abc import Collection, Mapping, Sequence
@@ -250,6 +251,17 @@ def elide_marker(name: str | None, chars: int) -> str:
     return f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed]"
 
 
+#: Results that are not elided while they are at most PINNED_RESULT_CHARS long: a loaded skill is the method for the
+#: whole task, and a sub-agent's report is gone with its run (the handle id is not in the call, so a ``task_result``
+#: cannot fetch it; a re-run is a whole child run).
+PINNED_RESULT_TOOLS = frozenset({"skill", "task"})
+PINNED_RESULT_CHARS = 12_000
+
+
+def _pinned(m: Message) -> bool:
+    return m.name in PINNED_RESULT_TOOLS and len(m.content or "") <= PINNED_RESULT_CHARS
+
+
 def elision_candidates(
     messages: Sequence[Message],
     *,
@@ -267,6 +279,7 @@ def elision_candidates(
         if messages[i].tool_call_id not in keep
         and messages[i].tool_call_id not in elided
         and len(messages[i].content or "") > ELIDE_MIN_CHARS
+        and not _pinned(messages[i])
     ]
 
 
@@ -284,8 +297,9 @@ def elide_old_results(
     Results older than the newest kept_calls() tool results and longer than ELIDE_MIN_CHARS are elided while the
     request is ``over`` the threshold. A result once elided stays elided for the rest of the turn (its id is added to
     ``elided``), so the request prefix does not flip back and forth around the threshold. Ids in ``keep`` are never
-    elided (a later "unchanged since" read points at them). ``notes`` (from the decision model, see
-    k3code.context_select) holds what is still worth knowing of an elided result; it follows the marker.
+    elided (a later "unchanged since" read points at them), nor are the pinned results (PINNED_RESULT_TOOLS).
+    ``notes`` (from the decision model, see k3code.context_select) holds what is still worth knowing of an elided
+    result; it follows the marker.
     """
     tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
     kept = kept_calls(messages, window)
@@ -300,7 +314,7 @@ def elide_old_results(
         # newest results whole, but must not show the ones the session already elided again. Not the latest step's: a
         # provider or relay that reuses call ids would have the result the model just asked for elided before it saw it
         shortcut = m.tool_call_id in elided and i < latest
-        candidate = (i in old or shortcut) and m.tool_call_id not in keep and bool(m.content)
+        candidate = (i in old or shortcut) and m.tool_call_id not in keep and bool(m.content) and not _pinned(m)
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
             marker = elide_marker(m.name, len(m.content or ""))
@@ -371,42 +385,64 @@ _FILE_WRITE = re.compile(rf"(?<![0-9&])>>?[ \t]*{_FILE_TARGET}|\btee\b(?:[ \t]+-
 _PIPE_TO_TEE = re.compile(rf"[^;&()`|]*\|[ \t]*(?:sudo[ \t]+)?tee\b(?:[ \t]+-[a-z]+)*[ \t]+{_FILE_TARGET}")
 
 
+#: No more heredoc operators than this are looked at on a first line: each one a body is searched for costs a pass over
+#: the command, and a line of a thousand characters holds up to 250 of them.
+_HEREDOC_OPS_MAX = 8
+
+
+def _writes_to_file(first: str, op: re.Match[str]) -> bool:
+    """Whether the heredoc ``op`` on the first line ``first`` is the input of a cat or tee that writes a file."""
+    before = _COMMAND_END.split(first[: op.start()])[-1]
+    after = first[op.end() :]
+    return bool(
+        _HEREDOC_WRITER.match(before)
+        and (_FILE_WRITE.search(f"{before} {_COMMAND_END.split(after, 1)[0]}") or _PIPE_TO_TEE.match(after))
+    )
+
+
 def _heredoc_text(command: str) -> tuple[str, str, str] | None:
-    """``(first line, heredoc text, the rest from its terminator line on)`` of a ``command`` whose first line writes a
-    heredoc to a file (``cat > f <<EOF``, ``cat <<EOF >> f``, ``tee f <<'EOF'``), else None. The terminator and every
-    command after it stay: they are not in the file. A command with no terminator line is left alone."""
+    """``(the command up to the heredoc's text, the text, the rest from its terminator line on)`` of a ``command``
+    whose first line writes a heredoc to a file (``cat > f <<EOF``, ``cat <<EOF >> f``, ``tee f <<'EOF'``), else None.
+    The terminator and every command after it stay: they are not in the file. So do the bodies of the heredocs that come
+    before it on the line (``python3 - <<PY; cat > f <<EOF``: bash reads them in the order of the operators). A command
+    with no terminator line is left alone."""
     first, sep, rest = command.partition("\n")
     if not sep or len(first) > _HEREDOC_LINE_MAX:
         return None
-    for op in _HEREDOC_OP.finditer(first):
-        before = _COMMAND_END.split(first[: op.start()])[-1]
-        after = first[op.end() :]
-        if not (
-            _HEREDOC_WRITER.match(before)
-            and (_FILE_WRITE.search(f"{before} {_COMMAND_END.split(after, 1)[0]}") or _PIPE_TO_TEE.match(after))
-        ):
+    ops = list(itertools.islice(_HEREDOC_OP.finditer(first), _HEREDOC_OPS_MAX))
+    writers = [_writes_to_file(first, op) for op in ops]
+    if not any(writers):
+        return None
+    body = f"\n{rest}"  # every line of it, the first too, follows a newline
+    pos = 0  # the newline before the first line of the next heredoc's body
+    for op, writer in zip(ops, writers, strict=True):
+        # the terminator line: the tag alone (behind tabs for <<-); a regex with a literal start, which is searched fast
+        end = re.compile(rf"\n{'[\t]*' if op.group(1) else ''}{re.escape(op.group(3))}(?=\n|\Z)").search(body, pos)
+        if end is None:  # a shift (``1 << 3``) or a heredoc left open: where its text ends is unknown
+            if writer:
+                return None
             continue
-        lines = rest.split("\n")
-        for k, line in enumerate(lines):
-            if (line.lstrip("\t") if op.group(1) else line) == op.group(3):
-                return first, "\n".join(lines[:k]), "\n".join(lines[k:])
+        if writer:
+            return first + body[:pos], body[pos + 1 : end.start()], body[end.start() + 1 :]
+        pos = end.end()
     return None
 
 
-def _superseded_todos(messages: Sequence[Message]) -> set[str]:
-    """Ids of the ``todo`` calls that a later one replaced. The tool takes the whole list every time and applies the
-    calls of a reply in order, so the newest call that took effect (not cut off, not answered with an error) holds the
-    live list and every call before it is out of date. Later calls that failed are not "replaced" by anything."""
+def _superseded_todos(messages: Sequence[Message]) -> set[int]:
+    """``id()`` of the ``todo`` calls that a later one replaced (not their call ids: a provider that numbers every call
+    "0" would have the live call replaced by the ones before it). The tool takes the whole list every time and applies
+    the calls of a reply in order, so the newest call that took effect (not cut off, not answered with an error) holds
+    the live list and every call before it is out of date. Later calls that failed are not "replaced" by anything."""
     failed = {m.tool_call_id for m in messages if m.role == "tool" and (m.content or "").startswith("Error:")}
     calls = [tc for m in messages if m.role == "assistant" for tc in m.tool_calls if tc.name == "todo"]
     live = next(
         (i for i in reversed(range(len(calls))) if "_unparsed" not in calls[i].arguments and calls[i].id not in failed),
         None,
     )
-    return {tc.id for tc in calls[:live]} if live is not None else set()
+    return {id(tc) for tc in calls[:live]} if live is not None else set()
 
 
-def _shrunk_arguments(tc: ToolCall, superseded: Collection[str]) -> dict[str, Any] | None:
+def _shrunk_arguments(tc: ToolCall, superseded: Collection[int]) -> dict[str, Any] | None:
     """``tc``'s arguments with the text that is elsewhere by now replaced by a marker, or None when there is none worth
     replacing: the file text of a ``write``/``edit``, the text of a heredoc a ``bash`` command wrote to a file, and a
     ``todo`` list a later call replaced (``superseded``: see _superseded_todos)."""
@@ -420,7 +456,7 @@ def _shrunk_arguments(tc: ToolCall, superseded: Collection[str]) -> dict[str, An
             )
             for k, v in args.items()
         }
-    if tc.name == "todo" and tc.id in superseded:
+    if tc.name == "todo" and id(tc) in superseded:
         todos = args.get("todos")
         if isinstance(todos, list) and len(json.dumps(todos)) > ELIDE_MIN_CHARS:
             return {**args, "todos": f"[a list of {len(todos)} items, replaced by a later todo call]"}
@@ -436,7 +472,7 @@ def _shrunk_arguments(tc: ToolCall, superseded: Collection[str]) -> dict[str, An
 
 
 def _elide_written_text(
-    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], superseded: Collection[str] = ()
+    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], superseded: Collection[int] = ()
 ) -> Message:
     """``m`` with the text of its old calls replaced by a marker where it is somewhere else by now (see
     _shrunk_arguments). The whole file stayed in the request as the call's argument long after the result was elided

@@ -187,6 +187,29 @@ def test_mcp_search_by_name_activates_those_tools_and_no_others():
     assert names("mcp__gh__get_issue labels") == {"mcp__gh__get_issue", "mcp__gh__get_issue_labels"}
 
 
+def test_mcp_search_select_takes_the_short_name_the_prompt_prints_for_a_sanitized_tool():
+    """``qualified_name`` turns a character outside [A-Za-z0-9_-] into ``_``, and the prompt lists the tool by that
+    form (``mcp__docs__{search_docs}``): ``select:search_docs`` found nothing for the server's ``search.docs``."""
+    from k3code.mcpclient import McpToolInfo
+
+    tools = [
+        McpToolInfo("docs", "search.docs", "Search the docs", {}),
+        McpToolInfo("fs", "files/read", "Read a file", {}),
+        McpToolInfo("gh", "get_issue", "Get an issue", {}),
+        McpToolInfo("gh", "get_issue_comments", "Get the comments of an issue", {}),
+    ]
+    manager = McpManager({})
+    manager.tools = lambda: tools  # type: ignore[method-assign]
+
+    def names(query: str) -> set[str]:
+        return {t.qualified for t in manager.search(query)}
+
+    assert names("select:search_docs") == {"mcp__docs__search_docs"}
+    assert names("select:files_read") == {"mcp__fs__files_read"}
+    assert names("select:search.docs") == {"mcp__docs__search_docs"}  # the server's own name still works
+    assert names("select:get_issue") == {"mcp__gh__get_issue"}  # the short name is exact, not a prefix
+
+
 def test_mcp_search_notation_expands_in_linear_time():
     """The lazy ``\\S*?`` prefix was rescanned from every position: 20,000 characters without a space took seconds."""
     import time

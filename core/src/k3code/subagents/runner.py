@@ -19,6 +19,7 @@ from typing import Any
 
 from k3code import userhooks
 from k3code.agent.loop import AgentLoop
+from k3code.autonomy import advisor as advisor_mod
 from k3code.autonomy import autonomy_cfg
 from k3code.errors import ContextOverflow
 from k3code.permissions import PermissionMode
@@ -552,12 +553,14 @@ class SubagentManager:
         server = self.server
         perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
         # A child gets the skill tool only when its type lists it and never gets the MCP tools: neither index belongs in
-        # its prompt (up to ~3k tokens of names it cannot call, in every request of a child that makes up to 200)
+        # its prompt (up to ~3k tokens of names it cannot call, in every request of a child that makes up to 200); the
+        # advisor tool is registered for the session's own loop only, so the child's prompt gets no advisor note either
+        # (the session's choice, even empty, beats the config default: "" is how the session says it has none)
         base = build_system_prompt(
             parent.system_prompt,
             cwd=cwd,
             config=server.config,
-            session_meta=parent.stored.meta,
+            session_meta={**(parent.stored.meta or {}), advisor_mod.META_KEY: ""},
             mcp=None,
             skills=not atype.tools or "skill" in atype.tools,
         )

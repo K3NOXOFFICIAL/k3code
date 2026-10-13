@@ -368,6 +368,8 @@ class LearningHub:
                 session.perms.reload()
             if payload.get("type") == "mcp":
                 await self._reload_mcp(str(payload.get("root") or cwd))
+            if payload.get("type") == "commands":
+                _unfreeze(session, "facts")  # the confirmed commands replace the scanned ones in the facts block
             return msg
         if p.kind == "permission_rule":
             msg = permrules.apply(payload, cwd=cwd)

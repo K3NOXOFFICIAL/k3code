@@ -49,20 +49,10 @@ def build_system_prompt(
     if _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the `advisor` tool exists
         parts.append(_advisor.PROMPT_NOTE)
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
-    # ``skills=False``: the caller has no skill tool, so an index of skills it cannot call would only cost tokens
-    if skills and (
-        index := skills_prompt(cwd, list(config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT)))
-    ):
-        parts.append(index)
-    if mcp is not None and (m := mcp_prompt(mcp)):
-        parts.append(m)
-    from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
-    from k3code.learning.optimizer import overlay_prompt
-    from k3code.learning.projectprep import facts_prompt
 
     # What background writers change (a re-scan of the stack, the daily distill of USER.md, an accepted gotcha, the
-    # optimizer) is taken once per session when ``frozen`` is given: from any other session, one of them rewrote this
-    # session's prompt and with it the provider's cache of the whole conversation.
+    # optimizer, a skill file that appears) is taken once per session when ``frozen`` is given: from any other session,
+    # one of them rewrote this session's prompt and with it the provider's cache of the whole conversation.
     def once(key: str, make: Any, *, empty_ok: bool = True) -> str:
         if frozen is None:
             return make()
@@ -72,6 +62,20 @@ def build_system_prompt(
                 frozen[key] = value
             return value
         return frozen[key]
+
+    # ``skills=False``: the caller has no skill tool, so an index of skills it cannot call would only cost tokens. A
+    # skill added mid-session is found by the ``skill`` tool at once and listed here from the next compaction; an index
+    # with no skills is not kept, or a session that started without any would never list the first
+    limit = int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))
+    if skills and (
+        index := once("skills", lambda: skills_prompt(cwd, list(config.skills.roots), limit=limit), empty_ok=False)
+    ):
+        parts.append(index)
+    if mcp is not None and (m := mcp_prompt(mcp)):
+        parts.append(m)
+    from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
+    from k3code.learning.optimizer import overlay_prompt
+    from k3code.learning.projectprep import facts_prompt
 
     # no facts yet is not frozen: the scan of a new project stores its result a moment after the session starts, and an
     # empty value kept for the whole session left it without them (nothing a background writer rewrites mid-session)

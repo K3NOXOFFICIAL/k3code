@@ -444,11 +444,12 @@ async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
             else:
                 await ex.review_and_fix(session, budget, report, "task", "plan", "base")
                 assert any("did not finish" in n for n in report.notes)
-                assert "review panel found nothing" not in report.notes
-                assert "review panel found nothing in the lenses that finished" in report.notes
                 # no lens answered: the report says the panel did not review the change, not "0 candidates"
+                # and not that it found nothing in the lenses that finished (none did)
                 assert report.panel_ran is False
+                assert not any("found nothing" in n for n in report.notes)
                 assert "not run: the change was not reviewed by the panel" in report.render()
+                assert "found nothing" not in report.render()
         finally:
             ultra_mod.wt_mod.git = orig  # type: ignore[assignment]
 
@@ -479,6 +480,7 @@ async def test_a_panel_with_one_lens_left_still_counts_as_run(monkeypatch):
     await ex.review_and_fix(session, AgentBudget(max_agents=9, max_tokens=1500), report, "task", "plan", "base")
     assert report.panel_ran is True, "one lens answered: the panel ran, and the dead one is listed as missing"
     assert any("did not finish" in n for n in report.notes)
+    assert "review panel found nothing in the lenses that finished" in report.notes
     assert "0 candidate finding(s)" in report.render()
 
 

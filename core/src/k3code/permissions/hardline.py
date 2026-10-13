@@ -595,8 +595,20 @@ def ssh_option_commands(name: str, args: list[str]) -> list[str]:
     return out
 
 
+def _long_option(key: str, names: frozenset[str]) -> str:
+    """``key`` (``--repl``) as GNU getopt reads it: the one of ``names`` it abbreviates (``--replace``), else itself."""
+    if key in names or len(key) < 3:
+        return key
+    hits = [n for n in names if n.startswith(key)]
+    return hits[0] if len(hits) == 1 else key
+
+
 def _skip_wrapper_options(
-    name: str, args: list[str], spec: tuple[str, frozenset[str], int], reads: list[str] | None = None
+    name: str,
+    args: list[str],
+    spec: tuple[str, frozenset[str], int],
+    reads: list[str] | None = None,
+    legacy: bool = False,
 ) -> list[str]:
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
@@ -612,6 +624,8 @@ def _skip_wrapper_options(
             continue
         if a.startswith("--"):
             key, eq, value = a.partition("=")
+            if not legacy:
+                key = _long_option(key, long_val)  # `sudo --us root rm` is `sudo --user root rm`
             if key in long_val and not eq:
                 i += 1
                 value = args[i] if i < len(args) else ""
@@ -653,8 +667,8 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None, *, legacy:
     ...) with their options dropped, ``eval`` arguments re-split, git's global options (``-C dir``, ``-c k=v``, ...)
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
     Reserved words and braces in front (``then rm``, ``{ rm``) go too. ``reads`` collects the files a dropped wrapper
-    option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS). ``legacy``: as before the audit (no reserved words, and
-    busybox / flock / strace / watch / unshare / chroot ... are not wrappers)."""
+    option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS). ``legacy``: as before the audit (no reserved words,
+    busybox / flock / strace / watch / unshare / chroot ... are not wrappers, and a long option must be spelled out)."""
     argv = list(tokens)
     for _ in range(len(tokens) + 1):  # every round drops at least one token
         while argv and _is_assignment(argv[0]):
@@ -678,7 +692,7 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None, *, legacy:
         spec = _WRAPPER_SPECS.get(name)
         if spec is None or (legacy and name in _NEW_WRAPPERS):
             return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec, reads)
+        rest = _skip_wrapper_options(name, argv[1:], spec, reads, legacy)
         if not rest:
             return argv
         argv = rest
@@ -770,6 +784,7 @@ def _xargs_replace(tokens: list[str]) -> str:
         i += 1
         if a.startswith("--"):
             key, eq, value = a.partition("=")
+            key = _long_option(key, long_val | {"--replace"})
             if key == "--replace":
                 token = value or "{}"
             elif key in long_val and not eq:
@@ -1305,22 +1320,35 @@ def _find_payloads(args: list[str]) -> list[str]:
     return out
 
 
-#: ``find`` tests that pick some of the files under a root (``-type`` and ``-maxdepth`` only shape the walk).
+#: ``find`` tests that pick some of the files under a root (``-type`` and ``-maxdepth`` only shape the walk). Not
+#: ``-readable``, ``-writable``, ``-fstype`` or ``-context``: they hold for every file of a home directory.
 _FIND_SELECTORS = frozenset(
     {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname"}
     | {"-newer", "-anewer", "-cnewer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-used", "-size"}
     | {"-user", "-group", "-empty", "-perm", "-samefile", "-inum", "-uid", "-gid", "-nouser", "-nogroup", "-links"}
-    | {"-xtype", "-fstype", "-readable", "-writable", "-executable", "-context"}
+    | {"-xtype", "-executable"}
 )
+#: Arguments with which one of those holds for (nearly) every file: ``-xtype f`` is ``-type f``, every file has a link
+#: (``-links +0``) and most have only one (``-links 1``, ``-links -2``), ``-used +0`` is any file read after it changed.
+_FIND_UNIVERSAL = {
+    "-xtype": re.compile(r".*[fd].*"),
+    "-links": re.compile(r"-\d+|\+0+|0*1"),
+    "-used": re.compile(r"\+0+"),
+}
 #: ``-newerXY``: a time of the file (a, B, c, m) against a time of the reference (the same, or t: a date string).
 _FIND_NEWER = re.compile(r"-newer[aBcm][aBcmt]")
+#: How many ( groups ) deep :func:`_find_scan` goes: a deeper one picks nothing (recursion on a long command).
+_FIND_GROUP_DEPTH = 32
 
 
-def _find_picks_some(args: list[str]) -> bool:
-    """The tests of a ``find`` expression (``args``, up to its action) are true for only some of the files: every ``-o``
-    branch holds a selector or a ( group ) that is, and not a negated one. ``! -name keep`` and ``-not -user me`` pick
-    the complement, ``-name x -o -delete`` runs the action on whatever ``-name x`` does not match."""
+def _find_scan(args: list[str], _depth: int = 0) -> tuple[bool, bool]:
+    """(the tests of a ``find`` expression (``args``) are true for only some of the files, every ``-delete`` in it is
+    preceded by tests that are). Picking some means every ``-o`` branch holds a selector or a ( group ) that does, and
+    not a negated one: ``! -name keep`` and ``-not -user me`` pick the complement, ``-name x -o -delete`` runs the
+    action on whatever ``-name x`` does not match, and after a ``,`` only the tests that follow it count
+    (``-name x , -delete`` deletes every file)."""
     branches = [False]
+    guarded = True
     negated = False
     i = 0
     while i < len(args):
@@ -1331,26 +1359,38 @@ def _find_picks_some(args: list[str]) -> bool:
             continue
         if a in ("-o", "-or"):
             branches.append(False)
+        elif a == ",":
+            branches[:] = [False]
+        elif a == "-delete":
+            guarded = guarded and all(branches)
         elif a == "(":
             start, depth = i, 1
             while i < len(args) and depth:
                 depth += (args[i] == "(") - (args[i] == ")")
                 i += 1
-            branches[-1] = branches[-1] or (not negated and _find_picks_some(args[start : i - 1]))
+            picks, ok = _find_scan(args[start : i - 1], _depth + 1) if _depth < _FIND_GROUP_DEPTH else (False, False)
+            guarded = guarded and ok
+            branches[-1] = branches[-1] or (not negated and picks)
         elif a in _FIND_SELECTORS or _FIND_NEWER.fullmatch(a):
-            branches[-1] = branches[-1] or not negated
+            universal = a in _FIND_UNIVERSAL and _FIND_UNIVERSAL[a].fullmatch(args[i] if i < len(args) else "")
+            branches[-1] = branches[-1] or (not negated and not universal)
         negated = False
-    return all(branches)
+    return all(branches), guarded
+
+
+def _find_picks_some(args: list[str]) -> bool:
+    """The tests of a ``find`` expression (``args``) are true for only some of the files, see :func:`_find_scan`."""
+    return _find_scan(args)[0]
 
 
 def _find_check(argv: list[str], cwd: str | None, home: str, dirs: list[str]) -> str | None:
     """``find / ... -delete``, and ``find ~ -delete`` / ``find ~ -type f -delete`` (the whole home directory or a system
     one like /etc, with no test that picks some of its files: ``find ~ -name '*.pyc' -delete`` is an ordinary
-    clean-up; a negated test, one on the far side of ``-o`` or one after ``-delete`` picks nothing, see
-    :func:`_find_picks_some`)."""
+    clean-up; a negated test, one on the far side of ``-o`` or ``,`` or one after ``-delete`` picks nothing, and
+    every ``-delete`` of the line counts, see :func:`_find_scan`)."""
     if not argv or argv[0] != "find" or "-delete" not in argv:
         return None
-    picks_some = _find_picks_some(argv[1 : argv.index("-delete")])
+    picks_some = _find_scan(argv[1:])[1]
     for root in _find_roots(argv[1:]):
         resolved = _resolved(root, cwd, home, dirs)
         if any(p in ("/", "/*") for p in resolved):

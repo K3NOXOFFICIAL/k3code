@@ -386,7 +386,12 @@ def _parse_mapping(text: str, where: Path, *, pure: bool = False) -> dict[str, A
         loader = yaml.SafeLoader if pure else _YAML_LOADER
         data = yaml.load(text, Loader=loader)  # noqa: S506 - a safe loader (libyaml's when present and allowed)
     except yaml.YAMLError as e:
-        raise ConfigError(f"{where}: not valid YAML ({str(e).splitlines()[0] if str(e) else type(e).__name__})") from e
+        # the first line of PyYAML's text and the position, not the quoted source line (a key could be on it)
+        mark = getattr(e, "problem_mark", None) or getattr(e, "context_mark", None)
+        at = f", line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise ConfigError(
+            f"{where}: not valid YAML ({str(e).splitlines()[0] if str(e) else type(e).__name__}{at})"
+        ) from e
     if data is None:
         return {}
     if not isinstance(data, dict):
@@ -503,10 +508,14 @@ def load_config(
     # 5. CLI overrides
     cli = cli_overrides or {}
 
-    # Merge in order. A file section left empty (`learning:`) is null: not set, rather than a type error.
+    # Merge in order. A file section left empty (`learning:`) is null: not set, rather than a type error. A null stays
+    # for a field that defaults to None (`temperature: null`), so a trusted project can reset what the user set.
+    def _set(config: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in config.items() if v is not None or (k in defaults and defaults[k] is None)}
+
     merged = defaults
-    merged = _merge_dicts(merged, {k: v for k, v in user_config.items() if v is not None})
-    merged = _merge_dicts(merged, {k: v for k, v in project_config.items() if v is not None})
+    merged = _merge_dicts(merged, _set(user_config))
+    merged = _merge_dicts(merged, _set(project_config))
     merged = _merge_dicts(merged, env_overrides)
     merged = _merge_dicts(merged, cli)
 

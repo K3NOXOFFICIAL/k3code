@@ -145,12 +145,12 @@ def test_which_results_count_as_failed_calls(result, failed):
 
 async def test_an_argument_a_builtin_tool_does_not_take_is_named_in_its_result(tmp_path):
     (tmp_path / "a.txt").write_text("Hello\n")
-    call = ToolCall(id="g1", name="grep", arguments={"pattern": "hello", "-i": True, "path": "."})
+    call = ToolCall(id="g1", name="grep", arguments={"pattern": "hello", "-n": True, "path": "."})
     provider = Replies([[call]])
     loop = loop_for(tmp_path, provider)
     await drain(loop)
     result = next(m for m in provider.seen[1] if m.role == "tool")
-    assert "ignored arguments: -i" in str(result.content) and "grep takes:" in str(result.content)
+    assert "ignored arguments: -n" in str(result.content) and "grep takes:" in str(result.content)
 
 
 async def test_a_call_with_only_known_arguments_gets_no_note(tmp_path):
@@ -188,6 +188,65 @@ def test_claude_codes_spellings_are_renamed_not_dropped():
         "path": "a",
         "run_in_background": True,
     }
+
+
+def test_claude_codes_file_path_skill_glob_and_case_flag_are_understood():
+    from k3code.tools.validate import normalize_arguments
+
+    assert normalize_arguments("read", {"file_path": "a.py", "offset": 3}, None) == {"path": "a.py", "offset": 3}
+    assert normalize_arguments("write", {"file_path": "a.py", "content": "x"}, None) == {"path": "a.py", "content": "x"}
+    edit = {"file_path": "a.py", "old_str": "o", "new_str": "n"}
+    assert normalize_arguments("edit", edit, None) == {"path": "a.py", "old_string": "o", "new_string": "n"}
+    assert normalize_arguments("skill", {"skill": "pdf"}, None) == {"name": "pdf"}
+    assert normalize_arguments("grep", {"pattern": "x", "glob": "*.py"}, None) == {"pattern": "x", "include": "*.py"}
+    # the real name wins here too
+    both = {"path": "b.py", "file_path": "a.py"}
+    assert normalize_arguments("read", both, None) == both
+    # -i is the case flag: the regex takes it inline, so a search is not run case-sensitively and answered "no matches"
+    assert normalize_arguments("grep", {"pattern": "hello", "-i": True}, None) == {"pattern": "(?i)hello"}
+    assert normalize_arguments("grep", {"pattern": "(?i)hello", "-i": True}, None) == {"pattern": "(?i)hello"}
+    assert normalize_arguments("grep", {"pattern": "hello", "-i": False}, None) == {"pattern": "hello"}
+    assert normalize_arguments("bash", {"command": "ls", "-i": True}, None) == {"command": "ls", "-i": True}
+
+
+async def test_a_read_and_a_case_insensitive_grep_in_claude_codes_spelling_run(tmp_path):
+    (tmp_path / "a.txt").write_text("Hello world\n")
+    (tmp_path / "b.md").write_text("Hello too\n")
+    calls = [
+        ToolCall(id="r1", name="read", arguments={"file_path": "a.txt"}),
+        ToolCall(id="g1", name="grep", arguments={"pattern": "hello", "-i": True, "glob": "*.txt"}),
+    ]
+    provider = Replies([calls])
+    await drain(loop_for(tmp_path, provider))
+    read, grep = (str(m.content) for m in provider.seen[1] if m.role == "tool")
+    assert read == "1\tHello world"
+    assert grep.startswith("a.txt\n1:Hello world") and "b.md" not in grep and "ignored arguments" not in grep
+
+
+async def test_a_skill_call_with_the_skill_argument_is_looked_up_by_that_name(tmp_path):
+    from k3code.extratools import register_skill_tool
+
+    provider = Replies([[ToolCall(id="s1", name="skill", arguments={"skill": "nosuchskill"})]])
+    loop = loop_for(tmp_path, provider)
+    register_skill_tool(loop.tools, tmp_path, [])
+    await drain(loop)
+    shown = str(next(m for m in provider.seen[1] if m.role == "tool").content)
+    assert shown.startswith("Error: Unknown skill: nosuchskill") and "ignored arguments" not in shown
+
+
+def test_every_alias_names_an_argument_its_tool_takes():
+    from k3code.extratools import register_skill_tool
+    from k3code.tools import build_registry
+    from k3code.tools.validate import ARGUMENT_ALIASES
+
+    reg = build_registry()
+    register_skill_tool(reg, Path.cwd(), [])
+    checked = set()
+    for tool, aliases in ARGUMENT_ALIASES.items():
+        if (found := reg.get(tool)) is not None:  # `task` is registered with the sub-agents
+            assert set(aliases.values()) <= set(found[0].parameters["properties"]), (tool, aliases)
+            checked.add(tool)
+    assert {"bash", "todo", "read", "write", "edit", "skill", "grep"} <= checked
 
 
 def test_an_unused_claude_code_option_sent_as_null_is_dropped_not_renamed_into_a_null():
@@ -306,6 +365,23 @@ async def test_a_missing_file_in_a_project_under_the_home_gets_no_private_tmp_hi
     # a file the model parked in the (discarded) home outside the project still gets the explanation
     gone = await tool_bash({"command": f"cat {home}/notes.txt"}, cwd=proj, sandbox=argv)
     assert "private to each bash call" in format_tool_result(gone)
+
+
+@needs_bwrap
+async def test_the_private_tmp_hint_is_given_when_the_call_itself_runs_in_tmp_or_the_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    proj = home / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    argv = sandbox.build_argv(proj, [], network=False)
+    # the cwd of a call is not a folder the sandbox keeps: inside it /tmp and the home are the private tmpfs
+    for cwd, missing in (("/tmp", "/tmp/notes.txt"), (str(home), f"{home}/notes.txt")):
+        res = await tool_bash({"command": f"cat {missing}", "cwd": cwd}, cwd=proj, sandbox=argv)
+        assert res["exit_code"] != 0 and "No such file" in res["stderr"], (cwd, res)
+        assert "private to each bash call" in format_tool_result(res), cwd
+    # and a file missing inside the project is still just missing, whatever the cwd
+    res = await tool_bash({"command": f"cat {proj}/nope.txt", "cwd": "/tmp"}, cwd=proj, sandbox=argv)
+    assert "private to each bash call" not in format_tool_result(res)
 
 
 @needs_bwrap
@@ -430,6 +506,18 @@ def test_output_that_is_only_cr_separated_records_says_that_frames_were_dropped(
     assert format_tool_result({"stdout": "10%\r50%\r100%\n", "stderr": "", "exit_code": 0}) == "100%"
 
 
+def test_a_progress_bar_above_a_line_that_only_clears_the_spinner_is_not_cr_separated_data():
+    from k3code.tools import _collapse_redraws
+
+    # the usual end of a spinner: its line is cleared with a bare CR and an erase code, after a bar that ended its line
+    shown = format_tool_result({"stdout": "10%\r50%\r100%\nDone\r\x1b[K", "stderr": "", "exit_code": 0})
+    assert shown == "100%\nDone"
+    for text in ("10%\r50%\r100%\ndone\r", "5%\r10%\r\ndone\r"):
+        assert "carriage-return" not in _collapse_redraws(text), text
+    # a last line that is itself CR-separated still says so, with the earlier frames counted in
+    assert "4 earlier carriage-return frames dropped" in _collapse_redraws("10%\r50%\nid\r1,a\r2,b\r3,c\r")
+
+
 async def test_cr_separated_records_say_that_frames_were_dropped_after_other_output_too(tmp_path):
     from k3code.tools import _collapse_redraws, jobs, tool_bash_output
 
@@ -534,6 +622,26 @@ def test_the_no_match_hints_name_the_slips_and_stay_silent_for_a_correct_search(
     assert "literal pipe" in both and "file-name glob" in both
 
 
+def test_the_alternation_hint_covers_the_escapes_and_spaces_around_the_pipe_too():
+    from k3code.tools import _no_match_hints
+
+    for slip in (r"\.js\|\.ts", r"\bfoo\b\|\bbar\b", r"(a\|\(b\))", r"foo \| bar", r"error\|\w+", r"a\|b\|c"):
+        assert "literal pipe" in _no_match_hints(slip, None), slip
+    # a literal pair of pipes, and an escaped backslash before a real pipe, are not the slip
+    for fine in (r"\|\|", r"a\|\|b", r"\\|b", "a|b"):
+        assert _no_match_hints(fine, None) == "", fine
+    # a brace group is a file glob, so it is not "a folder or a language"
+    assert _no_match_hints("zzz", ["*.{c,h}", "foo.{c,h}"]) == ""
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+async def test_a_search_with_escapes_around_a_backslash_pipe_that_finds_nothing_says_why(tmp_path):
+    (tmp_path / "a.js").write_text('import x from "./a.js"\n')
+    shown = format_tool_result(await tool_grep({"pattern": r"\bimport\b\|\bexport\b"}, cwd=tmp_path))
+    assert shown.startswith("[no matches. Check: \\| is a literal pipe")
+    assert format_tool_result(await tool_grep({"pattern": r"\bimport\b|\bexport\b"}, cwd=tmp_path)).startswith("a.js")
+
+
 @pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
 async def test_grep_skips_the_caches_of_common_toolchains_unless_searched_on_purpose(tmp_path):
     cache_dirs = (".next", ".nuxt", ".nox", ".gradle", ".terraform", ".turbo", ".svelte-kit", ".parcel-cache")
@@ -545,7 +653,9 @@ async def test_grep_skips_the_caches_of_common_toolchains_unless_searched_on_pur
     assert (await tool_grep({"pattern": "needle"}, cwd=tmp_path))["matches"] == "src/app.py\n1:needle"
     assert (await tool_glob({"pattern": "*.js"}, cwd=tmp_path))["files"] == []
     assert "gen.js" in (await tool_grep({"pattern": "needle", "path": ".next"}, cwd=tmp_path))["matches"]
-    # a non-string include item is named instead of crashing the tool
+
+
+def test_a_non_string_include_item_is_named_instead_of_crashing_the_tool():
     schema = {"type": "object", "properties": {"include": {"type": ["string", "array"], "items": {"type": "string"}}}}
     assert check_arguments(schema, {"include": [1, 2]}) == [
         "'include[0]' must be string, got int",
@@ -673,6 +783,28 @@ def test_the_redraw_collapse_covers_stderr_and_the_ignored_note_exempts_what_it_
     assert "extra" in _ignored_arguments(read, {"path": "a", "extra": 2})
     mcp = SimpleNamespace(name="mcp__s__t", parameters={"properties": {"a": {}}})
     assert _ignored_arguments(mcp, {"a": 1, "extra": 2}) == "", "an MCP server may take more than it declares"
+
+
+def test_a_label_argument_on_bash_is_dropped_without_a_note_and_other_unknowns_are_still_named():
+    from types import SimpleNamespace
+
+    from k3code.agent.loop import _ignored_arguments
+
+    props = {"command": {}, "timeout": {}}
+    bash = SimpleNamespace(name="bash", parameters={"properties": props})
+    assert _ignored_arguments(bash, {"command": "ls", "description": "List files"}) == ""
+    note = _ignored_arguments(bash, {"command": "ls", "description": "List files", "shell": "zsh"})
+    assert note.startswith("ignored arguments: shell;") and "description" not in note.split(";")[0]
+    # only bash's label is exempt: another tool's unknown `description` is a dropped argument
+    grep = SimpleNamespace(name="grep", parameters={"properties": {"pattern": {}}})
+    assert _ignored_arguments(grep, {"pattern": "x", "description": "d"}).startswith("ignored arguments: description;")
+
+
+async def test_a_bash_call_with_a_description_label_comes_back_as_just_its_output(tmp_path):
+    call = ToolCall(id="b1", name="bash", arguments={"command": "echo hi", "description": "Print hi"})
+    provider = Replies([[call]])
+    await drain(loop_for(tmp_path, provider))
+    assert str(next(m for m in provider.seen[1] if m.role == "tool").content) == "hi"
 
 
 async def test_the_memory_of_applied_edits_stays_bounded(tmp_path, monkeypatch):

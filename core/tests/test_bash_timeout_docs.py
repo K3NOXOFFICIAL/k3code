@@ -32,3 +32,13 @@ def test_every_builtin_tool_states_its_limits():
         assert len(limits) == 1, name
     assert "120 s by default" in reg.get("bash")[0].description
     assert f"{MAX_FETCH_CHARS} chars" in reg.get("web_fetch")[0].description
+
+
+async def test_bash_says_every_call_starts_a_new_shell_and_it_does(tmp_path):
+    description = build_registry().get("bash")[0].description
+    assert "new shell" in description and "`cd`" in description and "exports do not carry over" in description
+    (tmp_path / "src").mkdir()
+    first = await tool_bash({"command": "cd src && export K3_FRESH=1 && pwd"}, cwd=tmp_path)
+    assert first["stdout"].strip() == str(tmp_path / "src")
+    second = await tool_bash({"command": "pwd; echo ${K3_FRESH:-unset}"}, cwd=tmp_path)
+    assert second["stdout"].split() == [str(tmp_path), "unset"]

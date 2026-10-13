@@ -265,6 +265,12 @@ def _fed(command: str) -> str | None:
         ("printf '%s\\n' ~ | xargs -I{} rm -rf {}", "rm-rf-home"),
         ("echo /tmp/a / | xargs -I{} rm -rf {}", "rm-rf-root"),  # one of several items
         ("echo / | xargs rm -rf", "rm-rf-root"),  # without a replace string, as before
+        # getopt_long takes any unique prefix of a long option
+        ("echo / | xargs --repl=@ rm -rf @", "rm-rf-root"),
+        ("echo / | xargs --rep rm -rf {}", "rm-rf-root"),
+        ("echo ~ | xargs --r rm -rf {}", "rm-rf-home"),
+        ("echo / | xargs --max-a 1 -I{} rm -rf {}", "rm-rf-root"),
+        ("echo / | xargs --max-a 1 rm -rf", "rm-rf-root"),
     ],
 )
 def test_xargs_with_a_replace_string_feeds_rm_like_xargs_without_one(command: str, rule: str) -> None:
@@ -295,6 +301,37 @@ def test_the_replace_string_is_read_from_xargs_options_only() -> None:
     assert replace(["sudo", "-n", "xargs", "-n", "1", "-0I", "@", "rm", "@"]) == "@", "-n takes a value"
     assert replace(["xargs", "-n1", "rm", "-i", "-rf"]) == "", "-i after the command belongs to rm"
     assert replace(["xargs", "rm", "-rf"]) == "" and replace(["rm", "-rf", "-i"]) == ""
+    assert replace(["xargs", "--repl=@", "rm", "@"]) == "@" and replace(["xargs", "--r", "rm", "{}"]) == "{}"
+    assert replace(["xargs", "--max-a", "1", "--rep", "rm"]) == "{}", "--max-a takes a value"
+
+
+def test_a_long_option_is_read_as_the_one_it_abbreviates() -> None:
+    names = frozenset({"--user", "--user-x", "--group", "--grace"})
+    assert hardline._long_option("--gr", names) == "--gr", "ambiguous: left as written"
+    assert hardline._long_option("--gro", names) == "--group"
+    assert hardline._long_option("--user", names) == "--user", "an exact name wins over a longer one"
+    assert hardline._long_option("--zz", names) == "--zz" and hardline._long_option("--", names) == "--"
+
+
+@pytest.mark.parametrize(
+    ("abbreviated", "spelled_out"),
+    [
+        ("sudo --us root rm -rf /", "sudo --user root rm -rf /"),
+        ("timeout --sig KILL 5 rm -rf /", "timeout --signal KILL 5 rm -rf /"),
+        ("nice --adj 5 rm -rf /", "nice --adjustment 5 rm -rf /"),
+        ("env --split-s='rm -rf /'", "env --split-string='rm -rf /'"),
+        ("echo ~ | xargs --de , rm -rf", "echo ~ | xargs --delimiter , rm -rf"),
+    ],
+)
+def test_a_wrapper_option_may_be_abbreviated_as_getopt_allows(abbreviated: str, spelled_out: str) -> None:
+    assert _fed(spelled_out) is not None
+    assert _fed(abbreviated) == _fed(spelled_out)
+
+
+def test_the_legacy_reading_keeps_a_long_option_as_written() -> None:
+    tokens = ["sudo", "--us", "root", "rm", "-rf", "/"]
+    assert hardline.normalize_argv(tokens) == ["rm", "-rf", "/"]
+    assert hardline.normalize_argv(tokens, legacy=True) == ["root", "rm", "-rf", "/"]
 
 
 @pytest.mark.parametrize(
@@ -314,6 +351,16 @@ def test_the_replace_string_is_read_from_xargs_options_only() -> None:
         ("find /etc -delete", "rm-rf-root"),
         ("find /usr -type f -delete", "rm-rf-root"),
         ("find /var -mindepth 1 ! -name keep -delete", "rm-rf-root"),
+        # the action runs whatever the tests of the other -o branch, the other side of a comma or an earlier -delete say
+        ("find ~ -name x -delete -o -type f -delete", "rm-rf-home"),
+        ("find ~ -name x -delete -o -delete", "rm-rf-home"),
+        ("find ~ -name x -delete , -delete", "rm-rf-home"),
+        ("find ~ -delete -name x -delete", "rm-rf-home"),
+        ("find ~ \\( -delete \\) -name x", "rm-rf-home"),
+        ("find ~ -name x , -delete", "rm-rf-home"),
+        ("find ~ -name '*.pyc' , -delete", "rm-rf-home"),
+        ("find ~ \\( -name x , -delete \\)", "rm-rf-home"),
+        ("find ~ -name x , -type f | xargs rm -rf", "rm-rf-home"),
     ],
 )
 def test_a_find_selector_that_is_negated_or_not_applied_picks_nothing(command: str, rule: str) -> None:
@@ -334,6 +381,10 @@ def test_a_find_selector_that_is_negated_or_not_applied_picks_nothing(command: s
         "find /usr/local/share -type f -delete",
         "find ~/proj ! -name keep -delete",
         "find ~ ! -name keep -print",
+        "find ~ -type f , -name '*.pyc' -delete",
+        "find ~ -name x -delete -o -name y -delete",
+        "find ~ -name x -delete -o -type f -print",
+        "find ~ \\( -name x -delete \\)",
     ],
 )
 def test_a_find_clean_up_that_picks_files_is_not_hardline(command: str) -> None:
@@ -345,17 +396,47 @@ def test_a_find_clean_up_that_picks_files_is_not_hardline(command: str) -> None:
     [
         "find ~ -xtype l -delete",
         "find ~ -type f -links +1 -delete",
+        "find ~ -type f -links 2 -delete",
+        "find ~ -type f -used +30 -delete",
         "find ~ -type f -anewer x -delete",
         "find ~ -type f -cnewer x -delete",
         "find ~ -type f -newerBm x -delete",
         "find ~ -type f -newerac x -delete",
         "find ~ -type f -newermt 2020-01-01 -delete",
-        "find ~ -type f -fstype tmpfs -delete",
-        "find ~ -type f -readable -delete",
-        "find ~ -type f -writable -delete",
         "find ~ -type f -executable -delete",
         "find ~ -xtype l | xargs rm -r",
     ],
 )
-def test_find_tests_that_select_by_link_time_filesystem_or_access_are_selectors(command: str) -> None:
+def test_find_tests_that_select_by_link_time_or_access_are_selectors(command: str) -> None:
     assert _fed(command) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find ~ -readable -delete",
+        "find ~ -type f -writable -delete",
+        "find ~ -fstype ext4 -delete",
+        "find ~ -type f -fstype tmpfs -delete",
+        "find ~ -context '*' -delete",
+        "find ~ -links +0 -delete",
+        "find ~ -links 1 -delete",
+        "find ~ -links -2 -delete",
+        "find ~ -xtype f -delete",
+        "find ~ -xtype d -delete",
+        "find ~ -xtype f,l -delete",
+        "find ~ -used +0 -delete",
+        "find ~ -writable | xargs rm -rf",
+        "find ~ -xtype f | xargs rm -r",
+    ],
+)
+def test_find_tests_that_hold_for_every_file_are_no_selector(command: str) -> None:
+    assert _fed(command) == "rm-rf-home", command
+
+
+@pytest.mark.parametrize("tail", ["-delete", "| xargs rm -rf"])
+def test_deeply_nested_find_groups_are_refused_not_a_crash(tail: str) -> None:
+    # a recursion per group: 2000 of them in a 12 KB command ended the whole turn with a RecursionError
+    nested = "find ~ " + "\\( " * 2000 + "-name x " + "\\) " * 2000 + tail
+    assert _fed(nested) == "rm-rf-home"
+    assert _fed("find ~ \\( \\( -name x \\) \\) " + tail) is None

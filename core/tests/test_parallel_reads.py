@@ -261,3 +261,30 @@ async def test_calls_to_a_parallel_safe_mcp_server_overlap_and_those_to_others_d
     assert [m.tool_call_id for m in results] == [c.id for c in calls]  # in call order, all answered
     assert mcp.peak["ro"] == 3  # the read-only server's three calls ran together
     assert mcp.peak["rw"] == 1  # an ordinary server's did not
+
+
+@pytest.mark.asyncio
+async def test_a_parallel_batch_is_saved_once_after_all_its_results_not_once_per_result(tmp_path, monkeypatch):
+    """The saved transcript is the whole conversation, rewritten on every save: one save per result of a reply of N
+    parallel reads was N rewrites (the batch had already finished, so the intermediate ones protected nothing)."""
+    from k3code.reliability.hooks import Reliability
+
+    names = ("r1", "r2", "r3", "r4")
+    reliability = Reliability.from_settings(None, session="s1", home=tmp_path / "home")
+    loop = make_loop(tmp_path, [calls_for(*names)], reliability=reliability)
+    for n in names:
+        register(loop, n, [], side_effect=False)
+    saves: list[list[str]] = []
+    real = reliability.save_transcript
+    monkeypatch.setattr(
+        reliability,
+        "save_transcript",
+        lambda msgs: (saves.append([m.role for m in msgs]), real(msgs))[1],
+    )
+    results = await run(loop)
+    assert [m.tool_call_id for m in results] == ["c0", "c1", "c2", "c3"]  # still reported in call order
+    after_results = [roles for roles in saves if roles[-1] == "tool"]
+    assert len(after_results) == 1, saves
+    assert after_results[0].count("tool") == len(names)  # and that one save holds every result of the batch
+    saved = reliability.load_transcript()
+    assert saved is not None and [m.tool_call_id for m in saved if m.role == "tool"] == ["c0", "c1", "c2", "c3"]

@@ -19,7 +19,7 @@ async def read_text(path, **args) -> str:
 async def test_read_numbers_lines_like_cat_n(tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("alpha\nbeta\ngamma\n")
-    assert await read_text(f) == "     1\talpha\n     2\tbeta\n     3\tgamma"
+    assert await read_text(f) == "1\talpha\n2\tbeta\n3\tgamma"
 
 
 async def test_offset_and_limit_select_lines_and_the_hint_says_how_to_continue(tmp_path):
@@ -27,11 +27,11 @@ async def test_offset_and_limit_select_lines_and_the_hint_says_how_to_continue(t
     f.write_text("".join(f"row {i}\n" for i in range(1, 401)))
     text = await read_text(f, offset=101, limit=50)
     lines = text.split("\n")
-    assert lines[0] == "   101\trow 101"
-    assert lines[49] == "   150\trow 150"
+    assert lines[0] == "101\trow 101"
+    assert lines[49] == "150\trow 150"
     assert lines[-1] == "[file has 400 lines; showed 101-150; continue with offset=151]"
     tail = await read_text(f, offset=351)
-    assert tail.split("\n")[-1] == "   400\trow 400"  # the end of the file: no hint
+    assert tail.split("\n")[-1] == "400\trow 400"  # the end of the file: no hint
     assert "continue with" not in tail
 
 
@@ -39,7 +39,7 @@ async def test_default_limit_is_2000_lines(tmp_path):
     f = tmp_path / "many.txt"
     f.write_text("".join(f"{i}\n" for i in range(1, 2501)))
     text = await read_text(f)
-    assert "  2000\t2000\n[file has 2500 lines; showed 1-2000; continue with offset=2001]" in text
+    assert "\n2000\t2000\n[file has 2500 lines; showed 1-2000; continue with offset=2001]" in text
     assert "\t2001\n" not in text
 
 
@@ -66,13 +66,30 @@ async def test_read_stops_at_its_char_budget_and_long_lines_are_cut(tmp_path):
     assert len(cut) < READ_MAX_LINE_CHARS + 100
 
 
+async def test_numbers_are_not_padded_and_the_char_budget_counts_the_line_as_sent(tmp_path, monkeypatch):
+    import k3code.tools as tools
+
+    f = tmp_path / "rows.txt"
+    f.write_text("".join(f"{'y' * 100}\n" for _ in range(2000)))
+    text = await read_text(f)
+    body = text.rsplit("\n[file has", 1)[0]
+    assert body.startswith("1\t" + "y" * 100 + "\n2\t") and not any(ln[:1].isspace() for ln in body.split("\n"))
+    assert READ_MAX_CHARS - 110 <= len(body) <= READ_MAX_CHARS, "the budget is spent on what is sent, not on padding"
+    # the same for a line range of a file over the size limit, which is streamed
+    monkeypatch.setattr(tools, "MAX_READ_BYTES", 10_000)
+    monkeypatch.setattr(tools, "READ_MAX_CHARS", 1_000)
+    big = tmp_path / "big.log"
+    big.write_text("".join(f"{'z' * 20}\n" for _ in range(2000)))
+    ranged = format_tool_result(await tool_read({"path": str(big), "offset": 90, "limit": 400}))
+    body = ranged.rsplit("\n[showed", 1)[0]
+    assert body.startswith("90\t" + "z" * 20 + "\n91\t") and not any(ln[:1].isspace() for ln in body.split("\n"))
+    assert 1_000 - 30 <= len(body) <= 1_000
+
+
 async def test_start_and_end_still_work(tmp_path):
     f = tmp_path / "r.txt"
     f.write_text("a\nb\nc\nd\n")
-    assert (
-        await read_text(f, start=2, end=3)
-        == "     2\tb\n     3\tc\n[file has 4 lines; showed 2-3; continue with offset=4]"
-    )
+    assert await read_text(f, start=2, end=3) == "2\tb\n3\tc\n[file has 4 lines; showed 2-3; continue with offset=4]"
 
 
 def test_other_tools_keep_clipping_and_the_marker_says_how_to_get_the_rest():

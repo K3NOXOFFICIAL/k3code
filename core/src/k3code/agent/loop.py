@@ -503,15 +503,15 @@ class AgentLoop:
                     results = await asyncio.gather(
                         *(self._execute_tool(tc, step=n) for tc, n in zip(batch, steps, strict=True))
                     )
-                for tc, result in zip(batch, results, strict=True):
-                    tool_msg = Message(
-                        role="tool",
-                        content=format_tool_result(result),
-                        tool_call_id=tc.id,
-                        name=tc.name,
-                    )
-                    messages.append(tool_msg)
-                    self.reliability.save_transcript(messages)
+                # The batch has finished: its results join the conversation together and it is saved once. The save
+                # writes the whole conversation, so one per result made a reply of N parallel calls N rewrites.
+                tool_msgs = [
+                    Message(role="tool", content=format_tool_result(result), tool_call_id=tc.id, name=tc.name)
+                    for tc, result in zip(batch, results, strict=True)
+                ]
+                messages.extend(tool_msgs)
+                self.reliability.save_transcript(messages)
+                for tc, result, tool_msg in zip(batch, results, tool_msgs, strict=True):
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes)
@@ -714,7 +714,7 @@ class AgentLoop:
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if ignored := _ignored_arguments(spec, args):
-            # an argument the tool has no parameter for was dropped: say so (a `-i` or `description` on a call that
+            # an argument the tool has no parameter for was dropped: say so (a `-C` or `output_mode` on a call that
             # then ran with other semantics than asked looked like a success); the call itself still runs
             result = {**result, IGNORED_KEY: ignored}
         if read_key is not None and "first" in result:
@@ -1042,14 +1042,19 @@ def _call_failed(result: dict[str, Any]) -> bool:
     return code != 1 or bool(str(result.get("stderr") or "").strip())
 
 
+#: Arguments that only label a call (Claude Code's bash ``description``): dropping one changes nothing that runs, so
+#: they are not worth the note (it would stay in the context with the tool's argument list on every such call).
+_LABEL_ARGUMENTS: dict[str, frozenset[str]] = {"bash": frozenset({"description"})}
+
+
 def _ignored_arguments(spec: Any, args: dict[str, Any]) -> str:
     """A note naming the arguments of a built-in tool call that the tool does not take, or "". MCP tools are left alone:
     their schemas are the server's, which may accept more than it declares."""
     if spec.name.startswith("mcp__") or not isinstance(args, dict):
         return ""
     props = (spec.parameters or {}).get("properties") or {}
-    legacy = LEGACY_ARGUMENTS.get(spec.name, ())
-    extra = [k for k in args if k not in props and k not in legacy and not k.startswith("_")]
+    quiet = LEGACY_ARGUMENTS.get(spec.name, frozenset()) | _LABEL_ARGUMENTS.get(spec.name, frozenset())
+    extra = [k for k in args if k not in props and k not in quiet and not k.startswith("_")]
     if not extra or not props:
         return ""
     return f"ignored arguments: {', '.join(extra)}; {spec.name} takes: {', '.join(props)}"

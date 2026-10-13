@@ -88,6 +88,19 @@ async def test_a_requirement_in_the_clipped_middle_of_a_long_first_prompt_reache
     seen = caller.calls[0][1].content
     assert "MID REQUIREMENT: the export must be idempotent." in seen
     assert "the rest of this message is kept verbatim" not in seen, "the note must not say what is not true"
+    assert "follows as far as it fits" not in seen, "all of the middle is there"
+
+
+async def test_the_note_on_a_clipped_middle_says_when_only_the_start_of_it_is_shown():
+    """The summary model reads at most TASK_ANCHOR_CHARS of the task statement: of a 30k prompt, its start and end
+    are kept verbatim, and the first ~12k characters of the middle are all it gets of the rest."""
+    first = "spec " + "a" * 15_000 + " MID REQUIREMENT: the export must be idempotent. " + "b" * 15_000
+    msgs = [{"role": "user", "content": first}, *filler(12)]
+    caller = FakeCaller("the work so far")
+    await compact_messages(caller, msgs, keep=4)
+    seen = caller.calls[0][1].content
+    assert "the middle, which is not, follows as far as it fits]" in seen
+    assert "MID REQUIREMENT: the export must be idempotent." in seen, "this one is in the start of the middle"
 
 
 # ── the todo list ─────────────────────────────────────────────────────────────────────────────────────────────────

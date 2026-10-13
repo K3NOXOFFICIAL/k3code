@@ -504,9 +504,9 @@ class Ultra:
         report.panel_ran = len(missing) < len(LENSES)  # every lens dead: the change was not reviewed
         report.candidates = candidates
         if not candidates:
-            report.notes.append(
-                "review panel found nothing in the lenses that finished" if missing else "review panel found nothing"
-            )
+            # with every lens dead the report's "not run" header and the per-lens notes already say so
+            if report.panel_ran:
+                report.notes.append("review panel found nothing" + (" in the lenses that finished" if missing else ""))
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
         listing = json.dumps(candidates, indent=1)

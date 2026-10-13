@@ -218,3 +218,27 @@ def test_a_broken_file_raises_every_time_and_is_not_cached(tmp_path: Path, monke
     _old(f, "- not a mapping\n")
     with pytest.raises(ConfigError, match="top level must be a mapping"):
         _load_yaml(f)
+
+
+def test_a_trusted_project_can_reset_a_field_that_defaults_to_none(dirs: dict[str, Path]) -> None:
+    """An empty section (`learning:`) is not set; `temperature: null` is a value for a field that defaults to None."""
+    from k3code.config import Settings
+
+    _write_user(dirs, "temperature: 0.2\nheadless_permission: plan\nmax_turns: 7\n")
+    _write_project(dirs, "temperature: null\nheadless_permission:\nmax_turns:\nlearning:\n")
+    config = load_config(project_dir=dirs["project"])
+    assert config.temperature is None and config.headless_permission is None
+    assert config.max_turns == 7, "a null for a field that has a default is not set"
+    assert config.learning == Settings().learning, "an empty section is not set"
+
+
+def test_a_yaml_syntax_error_names_the_line_and_column_but_not_the_text_on_it(tmp_path: Path) -> None:
+    from k3code.config import ConfigError, _parse_mapping
+
+    secret = "-".join(["fake", "key", "7f3a9c"])  # built here, not a real one
+    text = f"providers:\n  - name: p\n    kind: openai\n    note: {secret}\n   base_url: https://x.test\n"
+    where = tmp_path / "config.yaml"
+    for pure in (False, True):
+        with pytest.raises(ConfigError, match=r"not valid YAML \(.*, line 5, column 4\)") as caught:
+            _parse_mapping(text, where, pure=pure)
+        assert secret not in str(caught.value) and str(where) in str(caught.value)
