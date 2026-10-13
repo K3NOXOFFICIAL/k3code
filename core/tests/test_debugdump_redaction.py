@@ -364,3 +364,39 @@ def test_client_secret_flags_hide_their_value(flag):
     assert PW not in scrub_text(f"tool {flag} {PW}")
     assert PW not in scrub_text(f"tool {flag}={PW}")
     assert redact({"args": [flag, PW]})["args"] == [flag, REDACTED]
+
+
+# K3NOX-363: a token that only starts like a path, or a known value percent-encoded in a URL, is still a known secret
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/" + "aB3dEf9hIj2kLm5nOp8q" + "Rs1t",  # standard base64 can start with "/"
+        "/aB3dEf9h" + "/Ij2kLm5nOp8qRs1tUv",
+        "~/" + PAT,  # a known prefix behind a path start
+    ],
+)
+def test_a_token_that_starts_like_a_path_is_a_known_secret(value):
+    cfg = Settings(mcp={"servers": {"s": McpServerConfig(command="srv", env={"UPSTREAM": value})}})
+    assert value in debugdump.secret_values(cfg)
+
+
+def test_ordinary_paths_are_not_known_secrets():
+    paths = ["/home/dev/.k3code/skills", "~/.config/k3code", "/usr/lib/x86_64-linux-gnu", "~/Documents/Notes2024"]
+    paths += ["/var/run/docker.sock", "/opt/node-v18.17.0-linux-x64/bin"]
+    cfg = Settings(
+        mcp={"servers": {"s": McpServerConfig(command="srv", env={f"P{i}": p for i, p in enumerate(paths)})}}
+    )
+    assert not set(paths) & set(debugdump.secret_values(cfg))
+
+
+async def test_a_known_secret_is_dropped_also_when_percent_encoded(tmp_path, monkeypatch):
+    from urllib.parse import quote
+
+    known = "Kn0wn" + "Sec,ret" + "/Zq9x"  # not token-shaped once decoded (the comma), so only the known value hides it
+    monkeypatch.setenv("K3_TEST_API_TOKEN", known)
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": f"GET https://x.example.com/a?q={quote(known, safe='')} 401"})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path, probe=False))
+    assert "Sec%2Cret" not in files["events.json"]

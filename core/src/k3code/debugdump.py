@@ -14,9 +14,19 @@ import tarfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from k3code.daemon import k3_home
-from k3code.redact import REDACTED, drop_values, is_secret_key, looks_like_secret, redact, scrub_text, scrub_urls
+from k3code.redact import (
+    REDACTED,
+    _token_shaped,
+    drop_values,
+    is_secret_key,
+    looks_like_secret,
+    redact,
+    scrub_text,
+    scrub_urls,
+)
 
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)", re.I)
 _SECRET_SHAPES = (
@@ -33,9 +43,13 @@ _ORDINARY_PART = re.compile(r"[A-Z]?[a-z]+[0-9]{0,4}|[A-Z]+|[0-9]{1,5}")
 def _ordinary(value: str) -> bool:
     """An MCP env/header value that is a word, path, address, locale or MIME type rather than a credential: hiding it
     wherever it appears would break every setting that repeats it (`http://127.0.0.1:4000/v1`)."""
-    if value.isalpha() or value.startswith(("/", "~")):
+    if looks_like_secret(value) or scrub_text(scrub_urls(value)) != value:
+        return False
+    if value.isalpha():
         return True
-    if not re.search(r"[/.:]", value) or looks_like_secret(value) or scrub_text(scrub_urls(value)) != value:
+    if value.startswith(("/", "~")):  # a path, unless a segment is token-shaped (standard base64 can start with `/`)
+        return not any(_token_shaped(seg, 16) for seg in re.split(r"[/~]", value))
+    if not re.search(r"[/.:]", value):
         return False
     return all(_ORDINARY_PART.fullmatch(p) for p in re.split(r"[/.:@?&=#_\-]+", value) if p)
 
@@ -53,7 +67,7 @@ def _env_refs(obj: Any) -> set[str]:
 def secret_values(config: Any = None) -> list[str]:
     """Every secret value this process knows, longest first: env vars that look secret, provider keys, the variables
     ``*_env`` settings name (``bearer_env``), and MCP env/header values that are secret by name or by shape. Each also
-    in its JSON-escaped form, for JSON text inside a tool result."""
+    in its JSON-escaped form, for JSON text inside a tool result, and percent-encoded, for a URL."""
     from k3code.config import env_value
 
     values: set[str] = set()
@@ -76,7 +90,12 @@ def secret_values(config: Any = None) -> list[str]:
                 values.add(value)
             if m := _AUTH_SCHEME.fullmatch(value.strip()):
                 values.add(m.group(1))
-    out = {f for v in values if len(v) >= 6 for f in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1])}
+    out = {
+        f
+        for v in values
+        if len(v) >= 6
+        for f in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1], quote(v, safe=""))
+    }
     return sorted(out, key=len, reverse=True)
 
 
