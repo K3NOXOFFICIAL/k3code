@@ -171,6 +171,15 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
     rework = [
+        # a file is read before it is rewritten (#100: write refuses one this loop has not read)
+        {
+            "type": "tool_call",
+            "id": "r2",
+            "match": "REWORK",
+            "when": "first",
+            "name": "read",
+            "arguments": {"path": "f2.txt"},
+        },
         {
             "type": "tool_call",
             "id": "w2",
@@ -321,6 +330,15 @@ async def test_merge_conflict_between_children_is_resolved_by_the_child(tmp_path
         *worker(2, "shared.txt", content="from two\n"),
         reviewer(subs[0]),
         reviewer(subs[1]),
+        # the child reads the conflicted file before it writes the resolution (#100)
+        {
+            "type": "tool_call",
+            "id": "see",
+            "match": "conflicts in",
+            "when": "first",
+            "name": "read",
+            "arguments": {"path": "shared.txt"},
+        },
         {
             "type": "tool_call",
             "id": "fix",
