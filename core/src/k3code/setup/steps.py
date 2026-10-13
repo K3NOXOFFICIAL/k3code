@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIERS = ("main", "strong", "cheap", "fast")
 PERMISSION_MODES = ["ask", "auto-edit", "yolo"]
+#: What an answers file may set: the three of the menu and the other two the config accepts.
+ANSWER_PERMISSION_MODES = [*PERMISSION_MODES, "plan", "auto"]
 USES = ["coding", "ops", "research", "mixed"]
 #: use → (permission mode, plan-first, fan-out cap, output style)
 USE_DEFAULTS: dict[str, tuple[str, bool, int, str]] = {
@@ -331,7 +333,8 @@ def _context_windows(c: Ctx, model_ids: list[str]) -> dict[str, int]:
 
 def step_permissions(c: Ctx) -> dict[str, Any]:
     default = c.data.get("usage", {}).get("permission_mode", "ask")
-    mode = c.p.select("permissions.mode", "Default permission mode", PERMISSION_MODES, default)
+    modes = PERMISSION_MODES if c.p.interactive else ANSWER_PERMISSION_MODES
+    mode = c.p.select("permissions.mode", "Default permission mode", modes, default)
     c.say("Hardline denies (never allowed, even in yolo):")
     for name in HARDLINE_NAMES:
         c.say(f"  - {name}")

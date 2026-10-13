@@ -1,3 +1,17 @@
+# Answers for `k3code setup --non-interactive --answers FILE` and `k3code onboard --answers FILE`.
+# The file is checked before anything runs: an unknown key (a typo), a section or value of the wrong type, a choice
+# that is not on the menu and a boolean that is not true/false stop it with exit code 2 and one line saying why.
+# A key you leave out takes its default. Keys under `providers.entries` are: preset, name, base_url, kind,
+# api_key_env (the variable's NAME), api_key.
+#
+# `k3code onboard --answers` reads the `onboard:` section instead (mode: fast | full; for fast: provider, and for
+# provider `api` also endpoint, plus key and model):
+#   onboard:
+#     mode: fast
+#     provider: openai   # anthropic | openai | openrouter | claude-cli | local | api
+#     key: your-api-key
+#     model: your-model-id
+#   (mode: full runs the setup steps below with the same file)
 welcome:
   mode: fresh
 about:
