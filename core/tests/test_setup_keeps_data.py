@@ -272,3 +272,12 @@ def test_summary_after_a_partial_run_writes_no_keys_of_steps_that_never_ran(env:
     cfg = _cfg()
     assert cfg["display"] == {"theme": "dracula"}
     assert not {"permission_mode", "output_style", "autonomy", "panes"} & cfg.keys()
+
+
+def test_tiers_with_a_blank_answer_keeps_the_models_an_entry_has(env: Path) -> None:
+    _fast(env, "http://127.0.0.1:9/v1")
+    cfg = _cfg()
+    cfg["providers"][0]["models"] = {"default": "b-main", "strong": "a-strong"}
+    _put_cfg(cfg)
+    _step("tiers", {"tiers": {}})  # Enter on every tier prompt, or no tiers in the answers file
+    assert _cfg()["providers"][0]["models"] == {"default": "b-main", "strong": "a-strong"}

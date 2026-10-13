@@ -609,7 +609,7 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
         by_tier = (data.get("tiers") or {}).get("models") or {}
         merged["providers"] = [
             {**p, "models": _with_tier_models(p.get("models"), _tier_models(by_tier[p["name"]]))}
-            if p.get("name") in by_tier
+            if by_tier.get(p.get("name"))  # a blank answer for an entry keeps the models it has
             else p
             for p in old_chain
         ]
