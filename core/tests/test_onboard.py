@@ -40,6 +40,10 @@ class Scripted(AnswerPrompter):
         self.asked.append(key)
         return super().text(key, message, default, secret)
 
+    def confirm(self, key: str, message: str, default: bool = True) -> bool:
+        self.asked.append(key)
+        return super().confirm(key, message, default)
+
 
 def _boom(*_args: Any, **_kwargs: Any) -> None:
     raise AssertionError("must not run here")
@@ -53,7 +57,13 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.chdir(tmp_path)
-    for name in ("K3CODE_API_KEY", "OMNIROUTE_API_KEY", "ANTHROPIC_API_KEY"):
+    for name in (
+        "K3CODE_API_KEY",
+        "K3CODE_ENDPOINT_API_KEY",
+        "K3CODE_ENDPOINT_2_API_KEY",
+        "OMNIROUTE_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
         # set-then-delete makes teardown restore the variable even though the flows export keys into os.environ
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
@@ -117,7 +127,7 @@ def test_onboard_fast_api_writes_a_loadable_config_and_keeps_the_key_out_of_it(r
         "endpoint",
         "openai",
         "http://127.0.0.1:9/v1",
-        "K3CODE_API_KEY",
+        "K3CODE_ENDPOINT_API_KEY",  # its own variable, not a K3CODE_API_KEY shared by every endpoint (#114, #120)
     )
     assert prov.models == {"default": "m-fast"}
     assert prov.api_key == "sk-SECRET-FAST"  # read back from the 0600 env file, as a later run would
@@ -265,3 +275,78 @@ def test_onboard_clears_auth_cooldowns_for_the_rewritten_provider(root) -> None:
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
     assert r.exit_code == 0, r.output
     assert CooldownStore(path=path).reason_of(provider="endpoint", model="m-fast") is None
+
+
+def _fast_api(root: Path, endpoint: str, **extra: str) -> str:
+    answers = _answers(
+        root, {"onboard": {"mode": "fast", "provider": "api", "endpoint": endpoint, "model": "m", **extra}}
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    return r.output
+
+
+def test_fast_api_does_not_send_a_leftover_generic_key_to_a_new_endpoint(root) -> None:
+    """#114: K3CODE_API_KEY left in the env file by another vendor was used for the new endpoint without a question
+    (and called "from your environment"), so the old vendor's key went to the new host."""
+    from k3code.setup.state import set_env_var
+
+    old = "fake-" + "old-vendor-key"
+    set_env_var("K3CODE_API_KEY", old)
+    out = _fast_api(root, "http://127.0.0.1:18081/v1")
+    assert "using K3CODE_API_KEY" not in out
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key_env != "K3CODE_API_KEY"
+    assert prov.api_key != old
+    assert f"NOTE: {prov.api_key_env} is not set yet" in out
+
+
+def test_fast_offers_to_keep_or_replace_a_stored_key_and_says_where_it_is(root, capsys) -> None:
+    """#114: a key already stored for the provider was used without a word, so a wrong stored key could not be
+    replaced in fast setup; the message also said "your environment" for a key from the env file."""
+    from k3code.setup.state import set_env_var
+
+    set_env_var("ANTHROPIC_API_KEY", "fake-" + "wrong-key")
+    keep = Scripted({"onboard": {"mode": "fast", "provider": "anthropic"}})
+    ob.run_fast(keep, do_probe=False)
+    assert "onboard.keep_key" in keep.asked and "onboard.key" not in keep.asked
+    assert "using ANTHROPIC_API_KEY from the env file" in capsys.readouterr().out
+
+    replace = Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "keep_key": False, "key": "fake-right"}})
+    ob.run_fast(replace, do_probe=False)
+    assert "onboard.key" in replace.asked
+    assert load_config(project_dir=root).providers[0].api_key == "fake-right"
+
+
+def test_fast_api_asks_for_the_key_of_a_new_endpoint_even_with_a_generic_key_set(root) -> None:
+    """#114, interactive: the key question was skipped whenever K3CODE_API_KEY had any value."""
+    from k3code.setup.state import set_env_var
+
+    set_env_var("K3CODE_API_KEY", "fake-" + "old-vendor-key")
+    endpoint = "http://127.0.0.1:18081/v1"
+    p = Scripted({"onboard": {"mode": "fast", "provider": "api", "endpoint": endpoint, "key": "fake-new-key"}})
+    ob.run_fast(p, do_probe=False)
+    assert "onboard.key" in p.asked
+    assert load_config(project_dir=root).providers[0].api_key == "fake-new-key"
+
+
+def test_fast_onboarding_of_a_second_endpoint_keeps_the_first_with_its_own_key(root) -> None:
+    """#120: every fast custom endpoint was named "endpoint" with key variable K3CODE_API_KEY, so setting up a
+    second gateway dropped the first entry and overwrote its key in the env file."""
+    _fast_api(root, "http://127.0.0.1:18081/v1", key="fake-key-a")
+    out = _fast_api(root, "http://127.0.0.1:18082/v1", key="fake-key-b")
+    assert "kept as fallback" in out
+    cfg = load_config(project_dir=root)
+    assert [(p.base_url, p.api_key) for p in cfg.providers] == [
+        ("http://127.0.0.1:18082/v1", "fake-key-b"),
+        ("http://127.0.0.1:18081/v1", "fake-key-a"),
+    ]
+    assert len({p.name for p in cfg.providers}) == 2 and len({p.api_key_env for p in cfg.providers}) == 2
+
+    # a re-run for the first endpoint without a key replaces that entry and keeps its own key
+    _fast_api(root, "http://127.0.0.1:18081/v1")
+    cfg = load_config(project_dir=root)
+    assert [(p.base_url, p.api_key) for p in cfg.providers] == [
+        ("http://127.0.0.1:18081/v1", "fake-key-a"),
+        ("http://127.0.0.1:18082/v1", "fake-key-b"),
+    ]

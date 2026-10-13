@@ -401,3 +401,35 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     from k3code.setup.steps import parse_window
 
     assert parse_window(text) is None
+
+
+def test_wizard_gives_each_custom_endpoint_its_own_key_variable(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#120: two custom entries both got api_key_env K3CODE_API_KEY (and the prompted ones both the name "custom"),
+    so the env file kept only the second key and the first endpoint was sent the second one's key."""
+    from k3code.setup import steps
+
+    for name in (
+        "K3CODE_API_KEY",
+        "K3CODE_GW1_API_KEY",
+        "K3CODE_GW2_API_KEY",
+        "K3CODE_CUSTOM_API_KEY",
+        "K3CODE_CUSTOM_2_API_KEY",
+    ):
+        monkeypatch.setenv(name, "")  # set-then-delete: teardown removes what the step exports
+        monkeypatch.delenv(name)
+    a, b = "http://127.0.0.1:47311/v1", "http://127.0.0.1:47312/v1"
+    from_file = {
+        "entries": [
+            {"preset": "custom", "name": "gw1", "base_url": a, "api_key": "fake-key-1"},
+            {"preset": "custom", "name": "gw2", "base_url": b, "api_key": "fake-key-2"},
+        ],
+        "test": False,
+    }
+    prompted = {"preset0": "custom", "base_url0": a, "key0": "fake-key-1", "add1": True}
+    prompted |= {"preset1": "custom", "base_url1": b, "key1": "fake-key-2", "add2": False, "test": False}
+    for answers in (from_file, prompted):
+        ctx = steps.Ctx(p=AnswerPrompter({"providers": answers}), data={}, do_probe=False)
+        entries = steps.step_providers(ctx)["entries"]
+        assert len({e["name"] for e in entries}) == 2, entries
+        stored = st.read_env_file()
+        assert [stored.get(e["api_key_env"]) for e in entries] == ["fake-key-1", "fake-key-2"], entries

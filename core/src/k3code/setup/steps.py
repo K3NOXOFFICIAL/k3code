@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -151,15 +151,41 @@ def step_usage(c: Ctx) -> dict[str, Any]:
     return out
 
 
-def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only."""
+def unique_name(name: str, taken: Collection[str]) -> str:
+    """``name``, or ``name-2``, ``name-3``, ... when another provider entry already has it."""
+    out, n = name, 2
+    while out in taken:
+        out, n = f"{name}-{n}", n + 1
+    return out
+
+
+def key_env_for(name: str, taken: Collection[str] = ()) -> str:
+    """The key variable of an entry whose preset names none: ``K3CODE_<NAME>_API_KEY``, one not in ``taken``.
+
+    One variable per endpoint: a shared K3CODE_API_KEY sent the key of one endpoint to the next one set up, and
+    storing the second key overwrote the first (#114, #120)."""
+    stem = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") or "ENDPOINT"
+    var, n = f"K3CODE_{stem}_API_KEY", 2
+    while var in taken:
+        var, n = f"K3CODE_{stem}_{n}_API_KEY", n + 1
+    return var
+
+
+def _entry_from(
+    c: Ctx, idx: int, label: str, spec: dict[str, Any] | None, others: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any] | None:
+    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only.
+
+    ``others`` are the entries already built in this run: a name or key variable made up here differs from theirs."""
+    names = {str(e.get("name")) for e in others}
+    key_envs = {str(e.get("api_key_env")) for e in others}
     if spec is None:
         if not c.p.confirm(f"providers.add{idx}", f"Add a {label} provider?", idx == 0):
             return None
         preset = c.p.select(f"providers.preset{idx}", "Preset", PRESET_CHOICES, default_preset())
         if preset == "claude-cli":  # Claude Code's own login: no URL and no key
             return {"name": "claude-cli", "kind": "claude-cli"}
-        spec = {"preset": preset}
+        spec = {"preset": preset, "name": unique_name(preset, names)}
         base = probe.PRESETS.get(preset, {})
         spec["base_url"] = c.p.text(
             f"providers.base_url{idx}",
@@ -178,7 +204,7 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
             "",
             secret=True,
         )
-        spec["api_key_env"] = base.get("api_key_env", "K3CODE_API_KEY")
+        spec["api_key_env"] = base.get("api_key_env") or key_env_for(spec["name"], key_envs)
         if key.strip():
             spec["api_key"] = key.strip()
         else:
@@ -200,11 +226,12 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
     if spec.get("preset") == "claude-cli" or spec.get("kind") == "claude-cli":  # an answers file can name it too
         return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
+    name = spec.get("name") or unique_name(spec.get("preset") or f"provider{idx + 1}", names)
     entry = {
-        "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",
+        "name": name,
         "kind": spec.get("kind") or base.get("kind", "openai"),
         "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY"),
+        "api_key_env": spec.get("api_key_env") or base.get("api_key_env") or key_env_for(name, key_envs),
     }
     if spec.get("preset") == "omniroute":
         _GATEWAYS.add(entry["name"])
@@ -224,9 +251,9 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         if specs is not None:
             if i >= len(specs):
                 break
-            e = _entry_from(c, i, label, dict(specs[i]))
+            e = _entry_from(c, i, label, dict(specs[i]), entries)
         else:
-            e = _entry_from(c, i, label, None)
+            e = _entry_from(c, i, label, None, entries)
             if e is None:
                 break
         if e:
