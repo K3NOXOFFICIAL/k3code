@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
 from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
@@ -61,8 +62,8 @@ class ReplayStore:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         if len(line) > MAX_RECORD_CHARS:
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        ensure_private_dir(self.path.parent)
+        with private_file(self.path).open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         if self.path.stat().st_size > MAX_FILE_BYTES:
             lines = self.path.read_text(encoding="utf-8").splitlines()

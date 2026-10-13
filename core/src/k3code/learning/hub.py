@@ -27,6 +27,7 @@ from k3code.learning import (
 )
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.learning.updateconfig import merge_patch
+from k3code.paths import ensure_private_dir, private_file
 from k3code.redact import scrub_text
 
 logger = logging.getLogger(__name__)
@@ -68,8 +69,8 @@ class LearningHub:
 
     def _set_state(self, **kv: Any) -> None:
         st = {**self._state(), **kv}
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._state_path.write_text(json.dumps(st), encoding="utf-8")
+        ensure_private_dir(self._state_path.parent)
+        private_file(self._state_path).write_text(json.dumps(st), encoding="utf-8")
 
     def spawn(self, coro: Any) -> None:
         task = asyncio.get_running_loop().create_task(coro)

@@ -14,7 +14,7 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning.ranking import jaccard, tokens
-from k3code.paths import home
+from k3code.paths import home, private_file
 from k3code.skills import parse_frontmatter
 
 DUP_THRESHOLD = 0.7
@@ -42,10 +42,9 @@ def record_use(name: str, *, ok: bool = True, clock: Callable[[], float] = time.
     e["failures"] += 0 if ok else 1
     e["last_used"] = clock()
     path = _usage_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     # temp file + rename: a crash (or a second process) mid-write left a truncated file, which load_usage then read
     # as empty and the next write made every count start over
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))  # 0600; a missing skills/ is made 0700
     tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -110,7 +109,7 @@ def curate(
     stale = find_stale(skills, usage, now, stale_days)
     marks = {name: {"state": "stale", "reason": why, "at": now} for name, why in stale}
     if root.is_dir():
-        (root / ".curator.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
+        private_file(root / ".curator.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
     proposals: list[Proposal] = []
     for keep, drop, sim in find_duplicates(skills):
         p = store.add(

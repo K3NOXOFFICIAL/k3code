@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import private_file
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -85,8 +86,7 @@ class ProposalStore:
         self.path = Path(home) / "proposals.jsonl"
 
     def _write(self, p: Proposal) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        with private_file(self.path).open("a", encoding="utf-8") as f:  # what the owner approved: 0600
             f.write(json.dumps(p.as_dict(), ensure_ascii=False) + "\n")
 
     def all(self) -> list[Proposal]:
