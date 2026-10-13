@@ -157,6 +157,18 @@ class FileStamps:
 MAX_READ_BYTES = 10 * 1024 * 1024
 
 
+def _file_size_note(size: int) -> str:
+    return f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB)"
+
+
+def _too_big_to_read(path: Path) -> dict[str, Any] | None:
+    """edit loads the whole file and matches it in memory, so it takes no more than read would load whole."""
+    size = path.stat().st_size
+    if size <= MAX_READ_BYTES:
+        return None
+    return {"error": f"{_file_size_note(size)}: edit cannot load it; change it with bash (sed, python) instead"}
+
+
 def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
     """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them."""
     selected: list[str] = []
@@ -220,7 +232,12 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
     ``start``/``end`` (an inclusive line range) still work. The result carries the raw lines (``content``) and where
     they are (``first``, ``last``, ``total``); format_tool_result numbers them for the model and says how to go on.
+    Runs on a worker thread: the gateway serves every session from one event loop (see tool_edit).
     """
+    return await asyncio.to_thread(_read_sync, arguments, cwd)
+
+
+def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
@@ -231,7 +248,7 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
         if not explicit:
             return {
-                "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                "error": f"{_file_size_note(size)}: "
                 "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
             }
         return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
@@ -261,6 +278,10 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
 async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Write a file, creating parent directories (atomically; an existing file keeps its mode)."""
+    return await asyncio.to_thread(_write_sync, arguments, cwd)
+
+
+def _write_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     content = arguments["content"]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +312,8 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
     old_string = arguments["old_string"]
     new_string = arguments["new_string"]
     replace_all = arguments.get("replace_all", False)
+    if (too_big := _too_big_to_read(path)) is not None:
+        return too_big
     raw = path.read_bytes()
     try:
         content = raw.decode("utf-8")  # strict: errors="replace" wrote U+FFFD over latin-1/binary bytes for good
@@ -321,7 +344,15 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
 
 
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included).
+
+    The body runs on a worker thread: the gateway serves every session from one event loop, and a failed edit on a
+    big file tries every match strategy and then a similarity search over each line.
+    """
+    return await asyncio.to_thread(_edit_sync, arguments, cwd)
+
+
+def _edit_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     plan = plan_edit(arguments, cwd=cwd)
     if isinstance(plan, dict):
         return plan
