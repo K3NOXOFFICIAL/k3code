@@ -207,6 +207,33 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     assert "retrying" in states and states[-1] == "merged"
 
 
+async def test_a_reviewer_without_a_verdict_escalates_instead_of_passing(tmp_path, monkeypatch):
+    # issue #97: a review with no VERDICT line (a crash, a stop, a ramble) used to count as a pass and was merged
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt"),
+        reviewer(subs[0]),
+        {"type": "text", "match": "Subtask: SUB-TWO add f2", "text": "I ran out of time before deciding."},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert (repo / "f1.txt").exists() and not (repo / "f2.txt").exists()  # the unreviewed work was not merged
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "no review verdict" in t2[-1]["detail"]
+    assert not any("--- REWORK ---" in c["text"] for p in server.providers for c in p.log)  # not the worker's fault
+    reviewers = [h for h in server.subagents.handles.values() if h.agent_type == "reviewer"]
+    assert len(reviewers) == 3  # SUB-ONE once, SUB-TWO asked once more
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
+
+
 async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
@@ -236,6 +263,44 @@ async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch)
     t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
     assert any(p["state"] == "retrying" and "tests failed" in p["detail"] for p in t2)
     assert git(repo, "log", "--oneline", "--merges").count("Merge k3/") == 2
+
+
+async def test_work_reworked_after_failing_tests_is_reviewed_again_before_it_merges(tmp_path, monkeypatch):
+    # the rework after a failed test run (or a conflict) went straight back to the merge: what it added was never
+    # reviewed
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "bad.txt"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        {
+            "type": "tool_call",
+            "id": "rm",
+            "match": "--- REWORK ---",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "rm bad.txt && echo unreviewed > unreviewed.txt"},
+        },
+        {"type": "text", "match": "--- REWORK ---", "when": "after_tool", "text": "REWORK-REPORT done"},
+        # the second review of SUB-TWO carries the rework's report and rejects it
+        {"type": "text", "match": "REWORK-REPORT", "text": "\nunreviewed.txt is unrelated. VERDICT: fail"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="test ! -f bad.txt")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert not (repo / "unreviewed.txt").exists() and "unreviewed.txt" not in git(repo, "ls-files")
+    t2_reviews = [h for h in server.subagents.handles.values() if h.description == "review: SUB-TWO add bad"]
+    assert len(t2_reviews) == 2
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "unreviewed.txt is unrelated" in t2[-1]["detail"]
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
 
 
 async def test_persistent_failure_escalates_to_parent_and_keeps_branch(tmp_path, monkeypatch):
