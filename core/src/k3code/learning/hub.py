@@ -183,21 +183,15 @@ class LearningHub:
         pid = self.log.project_for(cwd)
         if self._gotcha_dismissed(pid, tool, sig):
             return ""
-        rows = [
-            r
-            for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
-            if r["subject"] == sig and r["detail"].get("tool") == tool
-        ]
-        hint = next((str(r["detail"]["followup"]) for r in reversed(rows) if r["detail"].get("followup")), "")
+        seen = self.log.tool_error_sightings(
+            pid, tool, sig, self.clock() - gotchas.WINDOW, max(gotchas.REPEATS, gotchas.AUTO_REPEATS)
+        )
+        hint = seen.followup
         line = f"{tool}: {sig}" + (f" — {hint}" if hint else "")
-        if (
-            self.cfg["auto_gotchas"]
-            and len(rows) >= gotchas.AUTO_REPEATS
-            and gotchas.auto_ok(str(rows[-1]["choice"]), hint)
-        ):
+        if self.cfg["auto_gotchas"] and seen.count >= gotchas.AUTO_REPEATS and gotchas.auto_ok(seen.choice, hint):
             self._auto_gotcha(session, pid, tool, sig, hint, line)
             return hint
-        if len(rows) >= gotchas.REPEATS:
+        if seen.count >= gotchas.REPEATS:
             self._propose_gotcha(session, pid, tool, sig, hint, line)
         return hint
 
