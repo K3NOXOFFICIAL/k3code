@@ -17,6 +17,7 @@ import yaml
 from k3code import confio
 from k3code.config import ProviderEntry, Settings
 from k3code.daemon import k3_home
+from k3code.router.cooldown import key_fingerprint
 
 
 class ChainEditError(Exception):
@@ -161,7 +162,9 @@ def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:
         for model in [spec] if isinstance(spec, str) else list(spec):
             remaining = 0.0
             if cooldowns is not None:
-                remaining = cooldowns.remaining_seconds(provider=p.name, model=model, base_url=p.base_url)
+                remaining = cooldowns.remaining_seconds(
+                    provider=p.name, model=model, base_url=p.base_url, account=key_fingerprint(p.api_key)
+                )
             state = netwatch.provider_state(p.name) if netwatch is not None else None
             # A connectivity verdict (provider_down / offline / captive) says *why* the entry is cooling down.
             if state is not None and state.value in ("provider_down", "offline", "captive"):
