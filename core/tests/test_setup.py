@@ -4,7 +4,9 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -403,6 +405,207 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     assert parse_window(text) is None
 
 
+BAD_STATE_FILES = [
+    "null",
+    "[]",
+    '"text"',
+    "42",
+    '{"completed": ["welcome", "ab',  # cut off mid-write
+    '{"completed": "welcome", "data": {}}',
+    '{"completed": [1, 2], "data": {}}',
+    '{"completed": [], "data": []}',
+    '{"completed": null, "data": {}}',
+]
+
+FRESH_STATE = {"completed": [], "data": {}}
+
+
+@pytest.mark.parametrize("text", BAD_STATE_FILES)
+def test_load_state_starts_over_from_an_unusable_file_and_keeps_a_backup(env: Path, text: str) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text(text)
+    said: list[str] = []
+    assert st.load_state(said.append) == FRESH_STATE
+    assert said and "saved progress was unreadable, starting over" in said[0] and "setup_state.json" in said[0]
+    backups = [p for p in st.state_path().parent.iterdir() if p.name.startswith("setup_state.json.")]
+    assert [p.read_text() for p in backups] == [text]  # the bad file is kept, not deleted
+    assert not st.state_path().exists()
+
+
+def test_load_state_says_nothing_about_a_missing_or_good_file(env: Path) -> None:
+    said: list[str] = []
+    assert st.load_state(said.append) == FRESH_STATE
+    st.save_state({"completed": ["welcome"], "data": {"welcome": {"mode": "fresh"}}, "done": True})
+    assert st.load_state(said.append)["completed"] == ["welcome"]
+    assert said == []
+    assert [p.name for p in st.state_path().parent.iterdir()] == ["setup_state.json"]
+
+
+@pytest.mark.parametrize("text", BAD_STATE_FILES)
+def test_setup_runs_through_an_unusable_state_file(env: Path, text: str, capsys: pytest.CaptureFixture[str]) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text(text)
+    state = run_setup(AnswerPrompter(ANSWERS), do_probe=False)
+    assert state["done"]
+    assert "saved progress was unreadable, starting over" in capsys.readouterr().out
+
+
+def test_setup_step_rerun_cli_survives_a_null_state_file(env: Path) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text("null")
+    answers = env / "answers.yaml"
+    answers.write_text(yaml.safe_dump(ANSWERS))
+    r = CliRunner().invoke(cli, ["setup", "--step", "theme", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert "saved progress was unreadable, starting over" in r.output
+    assert "AttributeError" not in r.output
+
+
+def test_setup_without_terminal_or_answers_refuses_to_prompt(env: Path) -> None:
+    r = CliRunner().invoke(cli, ["setup"])
+    assert r.exit_code == 2 and "needs a terminal" in r.output
+    assert not st.state_path().exists()
+
+
+class _AsksModels(AnswerPrompter):
+    """An interactive wizard that records the model choices a tier menu offers."""
+
+    interactive = True
+
+    def __init__(self, answers: dict[str, object]) -> None:
+        super().__init__(answers)
+        self.offered: list[list[str]] = []
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        self.offered.append(choices)
+        return default if default in choices else choices[0]
+
+
+def _models_endpoint_wanting(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    """A fake /models that answers 401 to any key but `key`, as a real provider would."""
+    from k3code.setup import probe
+
+    def get(url: str, headers: dict[str, str] | None = None, **_kw: object) -> httpx.Response:
+        good = (headers or {}).get("Authorization") == f"Bearer {key}"
+        return httpx.Response(200, json={"data": [{"id": "m-one"}, {"id": "m-two"}]}) if good else httpx.Response(401)
+
+    monkeypatch.setattr(probe.httpx, "get", get)
+
+
+def _entry_with_key_only_in_env_file(key: str) -> dict[str, str]:
+    entry = {"name": "p", "kind": "openai", "base_url": "http://fake.invalid/v1", "api_key_env": "K3CODE_TEST_FILE_KEY"}
+    st.set_env_var(entry["api_key_env"], key)
+    return entry
+
+
+def test_wizard_live_test_uses_a_key_that_is_only_in_the_env_file(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from k3code.setup import steps
+
+    key = "fake-" + os.urandom(6).hex()  # built at run time: never a real credential
+    entry = _entry_with_key_only_in_env_file(key)
+    monkeypatch.delenv(entry["api_key_env"], raising=False)
+    _models_endpoint_wanting(monkeypatch, key)
+    spec = {"name": "p", "base_url": entry["base_url"], "api_key_env": entry["api_key_env"]}
+    answers = {"providers": {"entries": [spec], "test": True}}
+    out = steps.step_providers(steps.Ctx(p=AnswerPrompter(answers), data={}))
+    shown = capsys.readouterr().out
+    assert out["tested"] == {"p": True}
+    assert "p: OK" in shown and key not in shown
+
+
+def test_wizard_tier_menu_lists_models_for_a_key_that_is_only_in_the_env_file(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code.setup import steps
+
+    key = "fake-" + os.urandom(6).hex()
+    entry = _entry_with_key_only_in_env_file(key)
+    monkeypatch.delenv(entry["api_key_env"], raising=False)
+    _models_endpoint_wanting(monkeypatch, key)
+    asker = _AsksModels({})
+    out = steps.step_tiers(steps.Ctx(p=asker, data={"providers": {"entries": [entry]}}))
+    assert asker.offered and asker.offered[0] == ["(type one)", "m-one", "m-two"]
+    assert out["models"]["p"] == dict.fromkeys(steps.TIERS, "m-one")
+
+
+def _record_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every network call setup and doctor would make, recorded and refused."""
+    import httpx
+
+    from k3code import doctor
+
+    calls: list[str] = []
+
+    def get(url: str, *_a: object, **_kw: object) -> None:
+        calls.append(str(url))
+        raise httpx.ConnectError("blocked in test")
+
+    async def provider_probe(base_url: str, timeout: float = 5.0) -> None:
+        calls.append(base_url)
+        raise OSError("blocked in test")
+
+    async def internet_probe(_cfg: object) -> SimpleNamespace:
+        calls.append("internet")
+        return SimpleNamespace(captive=False, ok=False, latency_ms=None)
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(doctor, "_default_provider_probe", provider_probe)
+    monkeypatch.setattr(doctor, "default_internet_probe", internet_probe)
+    return calls
+
+
+class _Interactive(AnswerPrompter):
+    interactive = True
+
+
+def test_providers_test_false_makes_no_network_call_in_tiers_or_summary(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code import doctor
+    from k3code.setup import detect
+
+    calls = _record_network(monkeypatch)
+    sandbox_probes: list[bool] = []
+
+    def check_sandbox(probe: bool = True) -> doctor.Check:  # local, not a network call: it must still run for real
+        sandbox_probes.append(probe)
+        return doctor.Check("sandbox", doctor.OK, "stub")
+
+    monkeypatch.setattr(doctor, "check_sandbox", check_sandbox)
+    monkeypatch.setattr(detect, "sandbox_state", lambda probe=True: "usable")
+    run_setup(AnswerPrompter(ANSWERS))  # no --no-probe; the answers file says providers.test: false
+    assert calls == []
+    assert sandbox_probes == [True]
+
+
+def test_providers_test_true_still_probes_the_providers_in_the_summary(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code.setup import detect
+
+    calls = _record_network(monkeypatch)
+    monkeypatch.setattr(detect, "sandbox_state", lambda probe=True: "usable")
+    run_setup(AnswerPrompter({**ANSWERS, "providers": {**ANSWERS["providers"], "test": True}}))
+    assert "http://127.0.0.1:9/v1/models" in calls and "https://api.anthropic.com/v1/models" in calls
+    assert "internet" in calls
+
+
+def test_tiers_lists_models_only_for_a_tier_nobody_answered(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.setup import steps
+
+    calls = _record_network(monkeypatch)
+    entry = {"name": "gw", "kind": "openai", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "OMNIROUTE_API_KEY"}
+    data = {"providers": {"entries": [entry], "live": True}}
+    steps.step_tiers(steps.Ctx(p=AnswerPrompter({"tiers": ANSWERS["tiers"]}), data=data))
+    assert calls == []  # every tier answered: nothing to choose from a model list
+    steps.step_tiers(steps.Ctx(p=_Interactive({"tiers": {"main": "m-main"}}), data=data))
+    assert calls == ["http://127.0.0.1:9/v1/models"]
+    steps.step_tiers(steps.Ctx(p=_Interactive({}), data={"providers": {"entries": [entry], "live": False}}))
+    assert len(calls) == 1  # the user declined live tests: they type the ids
+
+
 class _TierMenus(AnswerPrompter):
     """Interactive: keeps each tier menu with the entry it preselected, and takes the preselected entry."""
 
@@ -438,3 +641,131 @@ def test_tier_menus_are_capped_ranked_and_offer_type_one_first(env: Path, monkey
         assert len(choices) == probe.MAX_MODEL_CHOICES + 1
         assert default == "openai/gpt-5"
     assert out["models"]["or"] == dict.fromkeys(("main", "strong", "cheap", "fast"), "openai/gpt-5")
+
+
+def test_wizard_gives_each_custom_endpoint_its_own_key_variable(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#120: two custom entries both got api_key_env K3CODE_API_KEY (and the prompted ones both the name "custom"),
+    so the env file kept only the second key and the first endpoint was sent the second one's key."""
+    from k3code.setup import steps
+
+    for name in (
+        "K3CODE_API_KEY",
+        "K3CODE_GW1_API_KEY",
+        "K3CODE_GW2_API_KEY",
+        "K3CODE_CUSTOM_API_KEY",
+        "K3CODE_CUSTOM_2_API_KEY",
+    ):
+        monkeypatch.setenv(name, "")  # set-then-delete: teardown removes what the step exports
+        monkeypatch.delenv(name)
+    a, b = "http://127.0.0.1:47311/v1", "http://127.0.0.1:47312/v1"
+    from_file = {
+        "entries": [
+            {"preset": "custom", "name": "gw1", "base_url": a, "api_key": "fake-key-1"},
+            {"preset": "custom", "name": "gw2", "base_url": b, "api_key": "fake-key-2"},
+        ],
+        "test": False,
+    }
+    prompted = {"preset0": "custom", "base_url0": a, "key0": "fake-key-1", "add1": True}
+    prompted |= {"preset1": "custom", "base_url1": b, "key1": "fake-key-2", "add2": False, "test": False}
+    for answers in (from_file, prompted):
+        ctx = steps.Ctx(p=AnswerPrompter({"providers": answers}), data={}, do_probe=False)
+        entries = steps.step_providers(ctx)["entries"]
+        assert len({e["name"] for e in entries}) == 2, entries
+        stored = st.read_env_file()
+        assert [stored.get(e["api_key_env"]) for e in entries] == ["fake-key-1", "fake-key-2"], entries
+
+
+def _unset(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    for name in names:
+        monkeypatch.setenv(name, "")  # set-then-delete: teardown removes what the step exports
+        monkeypatch.delenv(name)
+
+
+def _setup_providers(env: Path, answers: dict) -> list:
+    """`k3code setup --step providers` with these answers; returns the provider chain the config loads with."""
+    from k3code.config import load_config
+
+    run_setup(AnswerPrompter({"providers": {**answers, "test": False}}), only_step="providers", do_probe=False)
+    return load_config(project_dir=env).providers
+
+
+def _custom(url: str, key: str, prompted: bool) -> dict:
+    if prompted:
+        return {"preset0": "custom", "base_url0": url, "key0": key, "add1": False}
+    return {"entries": [{"preset": "custom", "base_url": url, **({"api_key": key} if key else {})}]}
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_never_gives_a_new_endpoint_a_variable_that_holds_another_key(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """Security review of #204: the wizard only avoided the key variables of entries made in the same run, so a re-run
+    for host C with a blank key and the default name got K3CODE_CUSTOM_API_KEY, which still held host X's key."""
+    _unset(monkeypatch, "K3CODE_CUSTOM_API_KEY", "K3CODE_CUSTOM_2_API_KEY")
+    x, c = "http://127.0.0.1:47321/v1", "http://127.0.0.1:47322/v1"
+    x_key = "fake-" + "host-x-key"
+    [first] = _setup_providers(env, _custom(x, x_key, prompted))
+    assert first.api_key == x_key
+
+    [prov] = _setup_providers(env, _custom(c, "", prompted))
+    assert prov.base_url == c
+    assert prov.api_key_env != first.api_key_env and prov.api_key != x_key
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_rerun_for_the_same_endpoint_keeps_its_own_variable(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """The configured entry for the same URL passes its variable on: a blank key keeps the stored one and a new key
+    replaces it in place, instead of moving to K3CODE_CUSTOM_2_API_KEY on every run."""
+    _unset(monkeypatch, "K3CODE_CUSTOM_API_KEY", "K3CODE_CUSTOM_2_API_KEY")
+    x = "http://127.0.0.1:47321/v1"
+    old, new = "fake-" + "host-x-key", "fake-" + "host-x-new-key"
+    [first] = _setup_providers(env, _custom(x, old, prompted))
+    [kept] = _setup_providers(env, _custom(x, "", prompted))
+    assert (kept.api_key_env, kept.api_key) == (first.api_key_env, old)
+    [replaced] = _setup_providers(env, _custom(x, new, prompted))
+    assert (replaced.api_key_env, replaced.api_key) == (first.api_key_env, new)
+    assert set(st.read_env_file()) == {first.api_key_env}
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_uses_a_vendor_key_variable_only_at_that_vendor_url(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """Security review of #204 (#120 for presets): an openai entry with an edited base URL kept OPENAI_API_KEY, so a
+    second openai entry for another host overwrote the OpenAI key and api.openai.com was sent that host's key."""
+    _unset(monkeypatch, "OPENAI_API_KEY", "K3CODE_OPENAI_API_KEY", "K3CODE_OPENAI_2_API_KEY")
+    local = "http://127.0.0.1:18083/v1"
+    openai_key, local_key = "fake-" + "openai-key", "fake-" + "local-host-key"
+    if prompted:
+        answers = {"preset0": "openai", "key0": openai_key, "add1": True}
+        answers |= {"preset1": "openai", "base_url1": local, "key1": local_key, "add2": False}
+    else:
+        answers = {"entries": [{"preset": "openai", "api_key": openai_key}]}
+        answers["entries"].append({"preset": "openai", "base_url": local, "api_key": local_key})
+    provs = _setup_providers(env, answers)
+    assert [(p.base_url, p.api_key) for p in provs] == [("https://api.openai.com/v1", openai_key), (local, local_key)]
+    assert provs[0].api_key_env == "OPENAI_API_KEY" and provs[1].api_key_env != "OPENAI_API_KEY"
+
+
+def test_wizard_does_not_send_the_vendor_key_to_an_edited_preset_url(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither a new entry nor a re-run over the entry the old wizard wrote (openai at another URL on OPENAI_API_KEY)
+    sends the OpenAI key in the environment to that other host."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    _unset(monkeypatch, "K3CODE_OPENAI_API_KEY", "K3CODE_OPENAI_2_API_KEY")
+    openai_key = "fake-" + "openai-key"
+    monkeypatch.setenv("OPENAI_API_KEY", openai_key)
+    local = "http://127.0.0.1:18083/v1"
+    [prov] = _setup_providers(env, {"entries": [{"preset": "openai", "base_url": local}]})
+    assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key
+
+    old = {"name": "openai", "kind": "openai", "base_url": local, "api_key_env": "OPENAI_API_KEY"}
+    confio.write_yaml(user_config_path(), {"providers": [old]})
+    for answers in ({"entries": [{"preset": "openai", "base_url": local}]}, _custom(local, "", prompted=True)):
+        [prov] = _setup_providers(env, answers)
+        assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key

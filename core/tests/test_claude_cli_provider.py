@@ -974,3 +974,25 @@ def test_workdir_is_tagged_with_the_pid_and_removed_at_close(tmp_path: Path, mon
     assert cwd.name.startswith(f"k3code-claude-cli.{os.getpid()}.")
     asyncio.run(prov.aclose())
     assert not cwd.exists()
+
+
+def test_login_status_reads_claude_auth_status(fake_claude) -> None:
+    """`claude` on PATH says nothing about a login: `claude auth status` does (issue #146)."""
+    from k3code.providers.claude_cli import login_status
+
+    for state, expected in (("in", True), ("out", False), ("old", None), ("garbage", None)):
+        fake_claude(state)
+        assert login_status() is expected, state  # None = cannot tell (an old Claude Code, odd output)
+
+
+def test_login_status_cannot_tell_without_the_command_or_when_it_hangs(fake_claude, monkeypatch) -> None:
+    import time
+
+    from k3code.providers.claude_cli import login_status
+
+    fake_claude("hang")
+    start = time.monotonic()
+    assert login_status(timeout=0.5) is None
+    assert time.monotonic() - start < 10
+    monkeypatch.setenv("PATH", "")
+    assert login_status() is None

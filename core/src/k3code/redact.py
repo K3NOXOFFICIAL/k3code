@@ -1,7 +1,7 @@
 """Secret redaction for exported config/sessions.
 
-A value is replaced by ``"<redacted>"`` when its key matches ``key|token|secret|password``
-(env-var *names* such as ``api_key_env`` are kept; numbers/bools are never secrets) or when
+A value is replaced by ``"<redacted>"`` when its key names a secret (``api_key``, ``token``, ``secret``, ``password``;
+env-var *names* such as ``api_key_env`` are kept; numbers/bools are never secrets) or when
 the value itself looks like a credential (known prefixes, JWTs, bearer headers, URL userinfo,
 long opaque tokens).
 """
@@ -14,7 +14,10 @@ from urllib.parse import unquote
 
 REDACTED = "<redacted>"
 
-_KEY_RE = re.compile(r"key|token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-z])auth(?![a-z])", re.I)
+_KEY_RE = re.compile(r"token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-z])auth(?![a-z])", re.I)
+#: ``key`` names a secret as a word or the end of one (``api_key``, ``apiKey``, ``ssh_keys``), not inside another word
+#: (``keymap``, ``keyboard``). Case-sensitive: a capital after ``Key`` starts the next word.
+_KEY_WORD_RE = re.compile(r"(?:key|Key)s?(?![a-z])|KEYS?(?![A-Z])")
 #: Config sections whose every value is a secret by default (MCP server environments and request headers).
 _SECRET_SECTIONS = frozenset({"env", "environment", "headers"})
 _PREFIXED = re.compile(
@@ -31,7 +34,7 @@ def is_secret_key(key: str) -> bool:
     k = str(key)
     if k.lower().endswith("_env") or k.lower() in ("api_key_env", "env_var"):
         return False  # names of env vars, not secrets
-    return bool(_KEY_RE.search(k))
+    return bool(_KEY_RE.search(k) or _KEY_WORD_RE.search(k))
 
 
 def looks_like_secret(value: str) -> bool:
@@ -66,6 +69,35 @@ _FLAG_NAME = (
 )
 _SECRET_FLAG = re.compile(r"(?i)" + _FLAG_NAME)
 _FLAG_SECRET = re.compile(r"(?i)((?:^|\s)" + _FLAG_NAME + r"(?:=|\s+))([^\s'\"-][^\s'\"]*)")
+
+#: `the DB password is hunter2hunter2`, `deploy token was 9f8e...`, `the key is now set to 'abc'`: a credential
+#: named in a sentence. Group 1 is the words up to the value, 2 the opening quote (or ''), 3 the value with any
+#: trailing punctuation; _prose_secret decides whether it is one.
+_PROSE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])((?:pass(?:word|wd|phrase)|pwd|secret|token|api[ _-]?key|apikey|(?:private|access)[ _-]?key"
+    r"|credentials?|key)\s+(?:(?:is|was)(?:\s+(?:now|set\s+to|changed\s+to))?|equals|set\s+to)\s+)"
+    r"(['\"`]?)([^\s'\"`<>,;]{6,})"
+)
+
+#: A bare 32+ character run of letters and digits (hex digest, base62 token). A git SHA has the same shape, which is
+#: why scrub_text applies it only on request.
+_OPAQUE_RUN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{32,}(?![A-Za-z0-9])")
+
+
+def _prose_secret(m: re.Match[str]) -> str:
+    value = m.group(3)
+    core = value.rstrip(".!?)")
+    # a word is a value only when quoted or when it has a digit: "the password is stored in the vault" stays a sentence
+    if len(core) < 6 or not (m.group(2) or any(c.isdigit() for c in core)) or core == REDACTED:
+        return m.group(0)
+    return f"{m.group(1)}{m.group(2)}{REDACTED}{value[len(core) :]}"
+
+
+def _opaque_run(m: re.Match[str]) -> str:
+    v = m.group(0)
+    return REDACTED if any(c.isdigit() for c in v) and any(c.isalpha() for c in v) else v
+
+
 #: A bare `--key` hides its value only when that is token-shaped (`sort --key=2,2`, `--key docs/a.txt` stay).
 _KEY_FLAG = re.compile(r"(?i)--?key")
 _KEY_FLAG_VALUE = re.compile(r"(?i)((?:^|\s)--?key(?:=|\s+))([^\s'\"-][^\s'\"]*)")
@@ -83,19 +115,26 @@ def _hide(value: str) -> str:
     return value if _GLOB.fullmatch(value) else REDACTED
 
 
-def scrub_text(text: str) -> str:
+def scrub_text(text: str, *, opaque: bool = False) -> str:
     """Free text (session messages, URLs, command lines): mask credential shapes.
 
     Well-known prefixed tokens, private key blocks, ``NAME_PASSWORD=value`` style assignments, ``Authorization`` /
-    ``Cookie`` header values, URL query secrets (``?api_key=...``) and ``--password value`` style flags.
+    ``Cookie`` header values, URL query secrets (``?api_key=...``), ``--password value`` style flags and a credential
+    named in a sentence (``the DB password is hunter2hunter2``).
+
+    ``opaque=True`` also masks any bare run of 32+ letters and digits that has both. Text that is about to leave the
+    machine or be remembered (a memory fact, the review transcript) asks for it; a git SHA matches too, so logs and
+    exports that should keep SHAs do not.
     """
     text = _PEM.sub(REDACTED, text)
     text = _PREFIXED.sub(REDACTED, text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_hide(m.group(4))}{m.group(3)}", text)
+    text = _PROSE.sub(_prose_secret, text)
     text = _URL_SECRET.sub(lambda m: f"{m.group(1)}{_hide(m.group(2))}", text)
     text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}{_hide(m.group(2))}", text)
-    return _KEY_FLAG_VALUE.sub(lambda m: m.group(1) + (REDACTED if _token_shaped(m.group(2), 8) else m.group(2)), text)
+    text = _KEY_FLAG_VALUE.sub(lambda m: m.group(1) + (REDACTED if _token_shaped(m.group(2), 8) else m.group(2)), text)
+    return _OPAQUE_RUN.sub(_opaque_run, text) if opaque else text
 
 
 def _token_shaped(part: str, min_len: int) -> bool:

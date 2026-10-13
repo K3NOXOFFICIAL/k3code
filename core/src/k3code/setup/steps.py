@@ -6,12 +6,13 @@ import copy
 import os
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from k3code import context_budget, service
+from k3code.config import env_value
 from k3code.gateway.sessions import SessionStore
 from k3code.outputstyle import PRESETS as STYLE_PRESETS
 from k3code.paths import ensure_private_dir, home, private_file
@@ -60,6 +61,11 @@ class Ctx:
 
     def say(self, text: str = "") -> None:
         self.p.say(text)
+
+    @property
+    def live(self) -> bool:
+        """May setup call the network: no ``--no-probe``, and the providers step was not told not to test live."""
+        return self.do_probe and bool(self.data.get("providers", {}).get("live", True))
 
 
 def themes() -> list[str]:
@@ -155,15 +161,68 @@ def step_usage(c: Ctx) -> dict[str, Any]:
     return out
 
 
-def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only."""
+def unique_name(name: str, taken: Collection[str]) -> str:
+    """``name``, or ``name-2``, ``name-3``, ... when another provider entry already has it."""
+    out, n = name, 2
+    while out in taken:
+        out, n = f"{name}-{n}", n + 1
+    return out
+
+
+def key_env_for(name: str, taken: Collection[str] = ()) -> str:
+    """The key variable of an entry whose preset names none: ``K3CODE_<NAME>_API_KEY``, one not in ``taken``.
+
+    One variable per endpoint: a shared K3CODE_API_KEY sent the key of one endpoint to the next one set up, and
+    storing the second key overwrote the first (#114, #120)."""
+    stem = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") or "ENDPOINT"
+    var, n = f"K3CODE_{stem}_API_KEY", 2
+    while var in taken:
+        var, n = f"K3CODE_{stem}_{n}_API_KEY", n + 1
+    return var
+
+
+def key_env_at(base_url: str, name: str, before: Sequence[Any], taken: Collection[str] = ()) -> str:
+    """The key variable of entry ``name`` at ``base_url``, which is not a vendor preset at its own URL.
+
+    ``before`` is the provider chain in the config now. Its entry for the same URL passes its variable on, unless an
+    entry for another URL or one in ``taken`` uses it, or it is a vendor preset's (that one holds the vendor's key).
+    Otherwise a new one that holds no value yet: a leftover key belongs to some other endpoint (#114, #120)."""
+    url = base_url.rstrip("/")
+    entries = [e for e in before if isinstance(e, dict)]
+    olds = [(str(e.get("base_url") or "").rstrip("/"), str(e.get("api_key_env") or "")) for e in entries]
+    used = {*taken, *(var for at, var in olds if at != url), *(s["api_key_env"] for s in probe.PRESETS.values())}
+    same = next((var for at, var in olds if at == url), "")
+    if same and same not in used:
+        return same
+    return key_env_for(name, used | set(os.environ) | set(read_env_file()))
+
+
+def _key_env(name: str, base_url: str, preset: dict[str, str], others: Sequence[dict[str, Any]]) -> str:
+    """A vendor preset's variable only at that vendor's own URL: at another URL the vendor's key would go there, and
+    that entry's key would replace the vendor's. Anything else: :func:`key_env_at` over the configured chain."""
+    if preset.get("api_key_env") and base_url.rstrip("/") == preset["base_url"].rstrip("/"):
+        return preset["api_key_env"]
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
+    return key_env_at(base_url, name, before, {str(e.get("api_key_env")) for e in others})
+
+
+def _entry_from(
+    c: Ctx, idx: int, label: str, spec: dict[str, Any] | None, others: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any] | None:
+    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only.
+
+    ``others`` are the entries already built in this run: a name or key variable made up here differs from theirs."""
+    names = {str(e.get("name")) for e in others}
     if spec is None:
         if not c.p.confirm(f"providers.add{idx}", f"Add a {label} provider?", idx == 0):
             return None
         preset = c.p.select(f"providers.preset{idx}", "Preset", PRESET_CHOICES, default_preset())
         if preset == "claude-cli":  # Claude Code's own login: no URL and no key
             return {"name": "claude-cli", "kind": "claude-cli"}
-        spec = {"preset": preset}
+        spec = {"preset": preset, "name": unique_name(preset, names)}
         base = probe.PRESETS.get(preset, {})
         spec["base_url"] = c.p.text(
             f"providers.base_url{idx}",
@@ -182,7 +241,7 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
             "",
             secret=True,
         )
-        spec["api_key_env"] = base.get("api_key_env", "K3CODE_API_KEY")
+        spec["api_key_env"] = _key_env(spec["name"], spec["base_url"], base, others)
         if key.strip():
             spec["api_key"] = key.strip()
         else:
@@ -204,11 +263,13 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
     if spec.get("preset") == "claude-cli" or spec.get("kind") == "claude-cli":  # an answers file can name it too
         return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
+    name = spec.get("name") or unique_name(spec.get("preset") or f"provider{idx + 1}", names)
+    url = spec.get("base_url") or base.get("base_url", "")
     entry = {
-        "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",
+        "name": name,
         "kind": spec.get("kind") or base.get("kind", "openai"),
-        "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY"),
+        "base_url": url,
+        "api_key_env": spec.get("api_key_env") or _key_env(name, url, base, others),
     }
     if spec.get("preset") == "omniroute":
         _GATEWAYS.add(entry["name"])
@@ -235,26 +296,33 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         if specs is not None:
             if i >= len(specs):
                 break
-            e = _entry_from(c, i, label, dict(specs[i]))
+            e = _entry_from(c, i, label, dict(specs[i]), entries)
         else:
-            e = _entry_from(c, i, label, None)
+            e = _entry_from(c, i, label, None, entries)
             if e is None:
                 break
         if e:
             entries.append(e)
     results: dict[str, Any] = {}
-    if c.p.confirm("providers.test", "Test each provider live?", c.p.interactive) and c.do_probe:
+    test_live = c.p.confirm("providers.test", "Test each provider live?", c.p.interactive)  # kept for later steps
+    if test_live and c.do_probe:
         for e in entries:
             if e.get("kind") == "claude-cli":  # no endpoint to list models from
                 continue
-            ok, ms, _ids, detail = probe.list_models(e, os.environ.get(e["api_key_env"], ""))
+            ok, ms, _ids, detail = probe.list_models(e, env_value(e["api_key_env"]))
             c.say(f"  {e['name']}: {'OK' if ok else 'FAIL'} {ms:.0f} ms ({detail})")
             results[e["name"]] = ok
     if entries and all(probe.is_gateway(e) or e["name"] in _GATEWAYS for e in entries):
         c.say("  WARNING: every entry goes through a self-hosted gateway; add a direct provider as a bypass.")
     elif not entries:
         c.say("  WARNING: no provider configured; k3code cannot run models.")
-    return {"entries": entries, "tested": results}
+    return {"entries": entries, "tested": results, "live": test_live}
+
+
+def _tier_answer(c: Ctx, tier: str, provider: str) -> Any:
+    """The answers file's model for ``tier``: one id for every provider, or a mapping from provider name."""
+    given = c.p.raw(f"tiers.{tier}")
+    return given.get(provider) if isinstance(given, dict) else given
 
 
 def step_tiers(c: Ctx) -> dict[str, Any]:
@@ -263,14 +331,14 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
     out: dict[str, dict[str, str]] = {}
     for e in providers:
         claude_cli = e.get("kind") == "claude-cli"
-        live = c.do_probe and not claude_cli
-        key = os.environ.get(e.get("api_key_env", ""), "")
+        answers = {t: _tier_answer(c, t, e["name"]) for t in TIERS}
+        # the model list is only there to choose a tier's model from: no live tests, or every tier answered, no call
+        live = c.live and not claude_cli and any(a is None for a in answers.values())
+        key = env_value(e.get("api_key_env", ""))  # the shell, then the env file the wizard writes
         ok, _ms, ids, _d = probe.list_models(e, key) if live else (False, 0, [], "")
         tiers: dict[str, str] = {}
         for t in TIERS:
-            given = c.p.raw(f"tiers.{t}")
-            if isinstance(given, dict):
-                given = given.get(e["name"])
+            given = answers[t]
             if given is not None:
                 tiers[t] = str(given)
             elif ok and ids and c.p.interactive:
@@ -670,7 +738,7 @@ def step_summary(c: Ctx) -> dict[str, Any]:
     path = user_config_path() if c.only_step else write_config(c.data)
     mem = write_user_md(c.data, c.say)
     c.say(f"Wrote {mem}" if c.only_step else f"Wrote {path} and {mem}")
-    checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
+    checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe, network=c.live))
     c.say(doctor.format_report(checks))
     return {"config": str(path)}
 
@@ -701,6 +769,28 @@ def step_secrets(c: Ctx) -> dict[str, Any]:
 
 
 PROJECT_RECIPE_MODES = ("ask", "accept_all", "none")
+#: Trees too slow to walk for a recipe scan: under WSL, ``/mnt/c`` goes through the Windows file system (8 s once).
+SLOW_MOUNTS = (Path("/mnt"),)
+
+
+def project_scan_skip_reason(cwd: Path) -> str:
+    """Why fast setup must not scan ``cwd`` for project recipes; '' when it is a project worth scanning.
+
+    A home directory (or a parent of it), a directory outside any git repository and a slow mount are not a project:
+    scanning them takes seconds and offers recipes for whatever sits in the tree."""
+    from k3code.learning import projectstate
+
+    root = projectstate.project_root(cwd)
+    home_dir = Path.home().resolve()
+    if root == home_dir or root in home_dir.parents:
+        return "it is your home directory or a parent of it"
+    for mount in SLOW_MOUNTS:
+        mount = mount.resolve()
+        if root == mount or mount in root.parents:
+            return f"it is under {mount}"
+    if not (root / ".git").exists():
+        return "it is not inside a git repository"
+    return ""
 
 
 def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:

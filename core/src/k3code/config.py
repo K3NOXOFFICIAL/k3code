@@ -123,6 +123,10 @@ class Mem0Config(BaseModel):
     user_id: str = ""
     agent_id: str = "k3code"
 
+    def identifiers(self) -> dict[str, str]:
+        """Whose memories these are: sent on every write and every search, so a search finds what was written."""
+        return {"agent_id": self.agent_id, **({"user_id": self.user_id} if self.user_id else {})}
+
 
 class DisplayConfig(BaseModel):
     # TUI-only settings (tui_theme, tui_status_indicator, tui_statusbar, battery, pet, ...) are kept as extra

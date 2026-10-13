@@ -6,7 +6,8 @@
 #        scripts/release/release.sh --list-assets VERSION
 #
 # A release needs: the Main branch checked out, a clean tree, HEAD == origin/Main (after git fetch), VERSION ==
-# the VERSION file, a "## [VERSION]" heading in CHANGELOG.md, and no tag vVERSION yet. Then:
+# the VERSION file, a "## [VERSION]" heading in CHANGELOG.md with nothing left under "## Unreleased" (the notes are
+# the "## [VERSION]" section only), and no tag vVERSION yet. Then:
 #   1. scripts/ci/check.sh --post: the full local check, and the local-ci status on the commit
 #   2. the personal-data scan of the source export (scripts/release/build_release.sh; the export is not published)
 #   3. the assets, in .k3dev/release/VERSION/assets/:
@@ -105,6 +106,15 @@ file_ver=$(tr -d ' \t\r\n' <VERSION)
 [ "$file_ver" = "$VER" ] || problem "the VERSION file says $file_ver, not $VER (core/pyproject.toml reads its version from VERSION)"
 grep -Eq "^## \[?$(printf '%s' "$VER" | sed 's/[.]/\\./g')\]?([[:space:]]|$)" CHANGELOG.md ||
   problem "CHANGELOG.md has no '## [$VER]' heading"
+# The release notes are the '## [VER]' section alone (step 4), so whatever '## Unreleased' still holds would be left out
+# of them. Blank lines and '###' subheadings do not count as content.
+unreleased=$(awk '
+  /^## / { h = tolower($2); gsub(/[][]/, "", h); if (h == "unreleased") { in_u = 1; next } if (in_u) exit }
+  in_u && NF && !/^###/ { n++ }
+  END { print n + 0 }
+' CHANGELOG.md)
+[ "$unreleased" = 0 ] ||
+  problem "CHANGELOG.md '## Unreleased' still holds $unreleased line(s) the release notes would leave out; rename it to '## [$VER] - <date>' and start a fresh, empty '## Unreleased'"
 if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null || [ -n "$(git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null)" ]; then
   problem "tag $TAG already exists"
 fi

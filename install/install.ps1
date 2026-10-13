@@ -101,6 +101,17 @@ function Set-UserPath([string]$Value) {
   [Environment]::SetEnvironmentVariable('K3CODE_PATH_REFRESH', $null, 'User')
 }
 
+# Is DIR one of the ';'-separated entries of LIST? An entry counts when Windows would read it as the same directory:
+# the user PATH holds unexpanded %VARIABLES%, may end in a backslash and ignores case, and a plain string match would
+# add the directory a second time.
+function Test-OnPath([string]$List, [string]$Dir) {
+  $want = [Environment]::ExpandEnvironmentVariables($Dir).TrimEnd('\')
+  foreach ($entry in ($List -split ';')) {
+    if ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $want) { return $true }
+  }
+  return $false
+}
+
 function Write-CmdShim([string]$Dir, [string]$Name, [string]$Target) {
   # cmd passes %* to wsl.exe, which splits it with the Windows rules; sh then gets each argument as "$@".
   # wsl.exe starts in the Linux path of the current Windows directory by itself (no --cd: Windows 10's WSL lacks it).
@@ -281,7 +292,7 @@ if ($launcher -and -not ($PSScriptRoot -and $launcher.StartsWith($PSScriptRoot))
 Say "Windows commands in $shimDir run k3code in $($script:Distro)"
 
 $userPath = Get-UserPath
-$onPath = $userPath -and (($userPath -split ';') -contains $shimDir)
+$onPath = Test-OnPath $userPath $shimDir
 if (-not $onPath) {
   if ($NoModifyPath) {
     Say "Add $shimDir to your PATH to run k3code from PowerShell and cmd"

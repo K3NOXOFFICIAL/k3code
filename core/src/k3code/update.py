@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from typing import Any
 import httpx
 
 from k3code import service
+from k3code._version import recorded_build
 from k3code.paths import GATEWAY_ENV_VARS, data_dir, home, user_config_path
 from k3code.setup.state import env_file_path
 
@@ -59,6 +61,45 @@ def previous_version() -> str | None:
     except OSError:
         return None
     return v if v and (versions_dir() / v).is_dir() else None
+
+
+def stale_build() -> str | None:
+    """The build this process runs when ``current`` names another one (it keeps the old code until restarted)."""
+    running, installed = recorded_build(), current_version()
+    return running if running and installed and running != installed else None
+
+
+def stale_daemon_build() -> str | None:
+    """The build the daemon reports on its socket when ``current`` names another one; None when it is not running.
+
+    A daemon that predates build names reports the plain version (``0.1.0``) for any ``0.1.0-src.<sha>``: that is
+    not comparable, so it is not called stale (doctor's daemon-version check makes the same call).
+    """
+    import asyncio
+
+    from k3code import doctor
+
+    installed = current_version()
+    try:
+        running = str(asyncio.run(doctor.check_daemon()).data.get("version") or "")
+    except Exception:  # noqa: BLE001 - a daemon that does not answer is doctor's business, not the update's
+        return None
+    if not running or not installed or running == installed or installed.startswith(f"{running}-"):
+        return None
+    return running
+
+
+def current_lines(cur: str | None, behind: str | None, who: str = "running: ") -> str:
+    """``current: X``, and when a process still runs the build ``behind``, the line that says to restart."""
+    if behind is None:
+        return f"current: {cur}"
+    how = f": systemctl --user restart {service.UNIT_NAME}" if service.is_installed() else ""
+    return f"current: {cur}\n{who}{behind} (restart to use {cur}{how})"
+
+
+def up_to_date(behind: str | None, text: str) -> str:
+    """``text`` ("Already up to date."), unless a process still runs the build before the active one."""
+    return "Nothing newer to install." if behind else text
 
 
 def switch_to(version: str) -> None:
@@ -114,16 +155,19 @@ ENV_CHECKS = (
 def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
     """The new version's own venv: ``k3code --version`` names this version, and ``doctor --json --no-probe`` (which
     loads the config with the new code) has no failing check about k3code itself; environment checks do not count."""
+    vdir = vdir.absolute()  # the children below run with cwd=vdir: a relative path or K3CODE_DATA would stop matching
     exe = vdir / "venv" / "bin" / "k3code"
     if not exe.exists():
         return False, f"{exe} missing"
-    env = {**os.environ, "K3CODE_DATA": str(data_dir())}
+    env = {**os.environ, "K3CODE_DATA": str(data_dir().absolute())}
     try:
+        # cwd is the new version, not wherever the update started: doctor scans its cwd, and a drive root (/mnt/c)
+        # holds entries it cannot read. A traceback names its cause last, so the message keeps the end of stderr.
         v = subprocess.run(
-            [str(exe), "--version"], capture_output=True, text=True, timeout=timeout, env=env, check=False
+            [str(exe), "--version"], capture_output=True, text=True, timeout=timeout, env=env, cwd=vdir, check=False
         )
         if v.returncode != 0:
-            return False, f"--version failed: {v.stderr.strip()[:200]}"
+            return False, f"--version failed: {v.stderr.strip()[-400:]}"
         want = vdir.name.split("-src")[0]
         if want not in v.stdout:
             return False, f"--version says {v.stdout.strip()[:80]!r}, expected {want}"
@@ -133,12 +177,13 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
             env=env,
+            cwd=vdir,
             check=False,
         )
         try:
             report = json.loads(d.stdout)
         except ValueError:
-            return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[:200]}"
+            return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[-400:]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"{type(e).__name__}: {e}"
     checks = report.get("checks") or []
@@ -297,20 +342,28 @@ def rollback(
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
 ) -> UpdateResult:
-    prev = previous_version()
-    cur = current_version()
-    if not prev:
-        return UpdateResult(False, cur or "", "no previous version to roll back to")
-    stopped = daemon_installed() and daemon_stopped()
-    switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
-    if stopped:
-        return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
-    if daemon_installed():
-        try:
-            restart()
-        except service.ServiceError as e:
-            return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
-    return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
+    """Switch back to the previous version, under the install lock: an update that is building (or install.sh) would
+    otherwise switch ``current`` again once it is done and silently undo the rollback.
+
+    A daemon that was stopped before the switch stays stopped."""
+    try:
+        with install_lock():
+            prev = previous_version()
+            cur = current_version()
+            if not prev:
+                return UpdateResult(False, cur or "", "no previous version to roll back to")
+            stopped = daemon_installed() and daemon_stopped()
+            switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
+            if stopped:
+                return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
+            if daemon_installed():
+                try:
+                    restart()
+                except service.ServiceError as e:
+                    return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
+            return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
+    except InstallLockHeld as e:
+        return UpdateResult(False, current_version() or "", f"an update is running, not rolling back: {e}")
 
 
 #: What shows that a version dir has the TUI (the file doctor's check_tui looks for) and the k3 multi-window binary.
@@ -512,8 +565,10 @@ class UnpinnedReleaseError(IntegrityError):
 #: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
 REQUIREMENTS_SUFFIX = "-requirements.txt"
 #: install/install.sh's lock in the install root: a directory holding the pid of the run that owns it (``pid``), when
-#: that process started (``start``, see _process_start) and the TUI build dir install.sh is using (``tui_tmp``).
+#: that process started (``start``, see _process_start) and the temp paths install.sh is using (``<kind>_tmp``, for
+#: each of RECORDED_TMP_KINDS).
 INSTALL_LOCK = ".install.lock"
+RECORDED_TMP_KINDS = ("tui", "src", "giterr", "uv", "node", "go", "reqs")
 
 
 class InstallLockHeld(OSError):
@@ -570,16 +625,25 @@ def _process_start(pid: int) -> str:
     return " ".join(ps.stdout.split())
 
 
-def _remove_recorded_tui_tmp(lock: Path) -> None:
-    """Remove the TUI build dir a killed install.sh recorded in ``lock``. Never an arbitrary path from a lock file:
-    only a ``k3code-tui.*`` directly in the temp dir install.sh uses."""
-    try:
-        recorded = Path((lock / "tui_tmp").read_text().rstrip("\n"))
-    except OSError:
-        return
+def _remove_recorded_tmp(lock: Path) -> None:
+    """Remove the temp paths a killed install.sh recorded in ``lock`` (``<kind>_tmp`` holds the ``k3code-<kind>.*`` it
+    made). Never an arbitrary path from a lock file: only one named for its kind, directly in the temp dir install.sh
+    uses."""
     tmp = Path(os.environ.get("TMPDIR") or "/tmp")
-    if recorded.parent == tmp and recorded.name.startswith("k3code-tui.") and recorded.name != "k3code-tui.":
-        shutil.rmtree(recorded, ignore_errors=True)
+    for kind in RECORDED_TMP_KINDS:
+        try:
+            recorded = Path((lock / f"{kind}_tmp").read_text().rstrip("\n"))
+        except OSError:
+            continue
+        prefix = f"k3code-{kind}."
+        if recorded.parent != tmp or not recorded.name.startswith(prefix) or recorded.name == prefix:
+            continue
+        if recorded.is_dir() and not recorded.is_symlink():
+            shutil.rmtree(recorded, ignore_errors=True)
+        else:
+            recorded.unlink(missing_ok=True)
+        if kind == "giterr":  # the ref list read without git
+            recorded.with_name(recorded.name + ".refs").unlink(missing_ok=True)
 
 
 def _take_over_stale_lock(lock: Path) -> None:
@@ -602,7 +666,7 @@ def _take_over_stale_lock(lock: Path) -> None:
         now = _process_start(pid) if started else ""
         if not now or now == started:
             raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
-    _remove_recorded_tui_tmp(lock)
+    _remove_recorded_tmp(lock)
     # Not atomic, as in install.sh's take_lock: two runs that find the same stale lock can interleave (one removes it
     # and makes its own, the other then removes that one) and both go on; only a run that arrives between the rmtree
     # and the mkdir is stopped, by the mkdir. It takes two installs started within the same few milliseconds over a
@@ -621,7 +685,7 @@ def install_lock() -> Iterator[None]:
     install.sh removes every ``versions/<v>`` without ``.complete`` when it takes over a stale lock, and this build
     removes an unfinished ``versions/<ver>`` itself, so the two must not build at the same time. A lock whose process
     is gone (a killed install or update, also when its pid now names a later process) is taken over, as install.sh
-    does, with the TUI build dir it recorded; a lock with a live pid, or without a pid (an install that is just
+    does, with the temp paths it recorded; a lock with a live pid, or without a pid (an install that is just
     starting), refuses."""
     lock = data_dir() / INSTALL_LOCK
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -926,11 +990,50 @@ def vet_staged(version: str) -> list[str]:
     return [f"warning: {version} has no k3 multi-window binary ({why}; the installer's messages are in {log}): {kept}"]
 
 
-def update_from_source(checkout: Path, *, pull: bool = True) -> str:
-    """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name."""
+#: What install.sh puts in front of its own progress lines ("installing the k3code core", "building the TUI ...").
+INSTALLER_PREFIX = "k3code-install:"
+
+
+def _show_progress(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
+
+
+def _run_installer(
+    cmd: list[str], *, env: dict[str, str], progress: Callable[[str], None], stdin: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the installer with its output captured, handing its own progress lines to ``progress`` as they appear.
+
+    A build takes 13-25 s warm and minutes cold, and ``capture_output`` kept all of it back until the end. The tools it
+    runs (npm, uv, go) write a lot more to the same stderr; that is only kept, for the failure message."""
+    rfd, wfd = os.pipe()
+    lines: list[str] = []
+
+    def pump() -> None:
+        with os.fdopen(rfd, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                lines.append(line)
+                if line.startswith(INSTALLER_PREFIX):
+                    # keep reading whatever the display does: a pump that stops lets the pipe fill and blocks the build
+                    with contextlib.suppress(Exception):
+                        progress(line.rstrip("\n"))
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=wfd, text=True, stdin=stdin, env=env)
+    finally:
+        os.close(wfd)
+        reader.join()
+    return subprocess.CompletedProcess(r.args, r.returncode, r.stdout, "".join(lines))
+
+
+def update_from_source(checkout: Path, *, pull: bool = True, progress: Callable[[str], None] = _show_progress) -> str:
+    """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name.
+
+    The installer's progress lines go to ``progress`` (stderr by default) while it builds."""
     if pull:
         pull_checkout(checkout)
-    r = subprocess.run(
+    r = _run_installer(
         [
             "sh",
             str(checkout / "install" / "install.sh"),
@@ -940,10 +1043,8 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
             "--no-activate",
             "--print-version",
         ],
-        check=False,
-        capture_output=True,
-        text=True,
         env=_installer_env(),
+        progress=progress,
     )
     if r.returncode:
         tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
@@ -1054,15 +1155,60 @@ def remote_head(url: str, ref: str) -> str:
     )
 
 
-def update_from_git(url: str, ref: str) -> str:
+#: The temporary clone update_from_git runs the ref's installer from, and the file in it naming the update that owns it
+#: (its pid, then when that process started, as in the install lock).
+STAGING_PREFIX = ".update-git-"
+STAGING_OWNER = "owner"
+#: How long a staging directory with no readable owner file is left alone: an update between mkdtemp and writing it.
+STAGING_GRACE = 60.0
+
+
+def _staging_dir_is_stale(d: Path) -> bool:
+    """Whether the update that made staging directory ``d`` is gone (a pid now naming another process counts as gone).
+
+    A directory without an owner file (made before the file existed, or by an update killed before writing it) is
+    stale once it is older than STAGING_GRACE."""
+    try:
+        pid_line, _, started = (d / STAGING_OWNER).read_text().partition("\n")
+        pid = int(pid_line)
+    except (OSError, ValueError):
+        try:
+            return time.time() - d.stat().st_mtime > STAGING_GRACE
+        except OSError:
+            return False
+    if not _pid_running(pid):
+        return True
+    started = started.strip()
+    now = _process_start(pid) if started else ""
+    return bool(now) and now != started
+
+
+def _sweep_stale_staging_dirs() -> None:
+    """Remove the ``.update-git-*`` directories that killed updates left in the data dir: SIGKILL skips the ``finally``
+    that removes them, and nothing else ever did."""
+    try:
+        entries = list(data_dir().iterdir())
+    except OSError:
+        return
+    for d in entries:
+        if d.name.startswith(STAGING_PREFIX) and d.is_dir() and not d.is_symlink() and _staging_dir_is_stale(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def update_from_git(url: str, ref: str, *, progress: Callable[[str], None] = _show_progress) -> str:
     """Stage a new version from ``ref`` on ``url`` via that ref's own installer (``--no-activate``); its name.
 
+    The installer's progress lines go to ``progress`` (stderr by default) while it builds.
+
     The installer comes from a shallow fetch of the ref into a temporary directory under the data dir (never
-    ``versions/``, which prune and the version list read), removed again whatever happens. ``--from-git`` (not
-    ``--from-source``) keeps the install a git install: it records ``.ref`` and no checkout path."""
+    ``versions/``, which prune and the version list read), removed again whatever happens (and by the next update
+    when this one is killed outright). ``--from-git`` (not ``--from-source``) keeps the install a git install: it
+    records ``.ref`` and no checkout path."""
     data_dir().mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix=".update-git-", dir=data_dir()))
+    _sweep_stale_staging_dirs()
+    tmp = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=data_dir()))
     try:
+        (tmp / STAGING_OWNER).write_text(f"{os.getpid()}\n{_process_start(os.getpid())}\n")
         src = tmp / "src"
         _git(["-c", "init.defaultBranch=main", "init", "-q", str(src)], LS_REMOTE_TIMEOUT, "git init")
         _git(["-C", str(src), "fetch", "-q", "--depth", "1", url, ref], FETCH_TIMEOUT, f"git fetch {ref} from {url}")
@@ -1070,7 +1216,7 @@ def update_from_git(url: str, ref: str) -> str:
         installer = src / "install" / "install.sh"
         if not installer.is_file():
             raise SourceUpdateError(f"'{ref}' on {url} has no install/install.sh: it is not a k3code repository")
-        r = subprocess.run(
+        r = _run_installer(
             [
                 "sh",
                 str(installer),
@@ -1083,11 +1229,9 @@ def update_from_git(url: str, ref: str) -> str:
                 "--no-activate",
                 "--print-version",
             ],
-            check=False,
-            capture_output=True,
-            text=True,
             stdin=subprocess.DEVNULL,
             env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
+            progress=progress,
         )
         if r.returncode or not r.stdout.strip():
             tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])

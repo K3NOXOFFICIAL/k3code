@@ -13,9 +13,12 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.permissions.engine import sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
+    SIMILARITY_STRATEGIES,
+    STRATEGIES,
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
@@ -275,6 +278,8 @@ class EditPlan:
     crlf: bool  # written back with CRLF line ends
     count: int
     strategy: str
+    replaced: str | None = None  # a similarity match only: the file's own text that old_string stood for
+    line: int = 0  # the first line of ``replaced``
 
 
 def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
@@ -306,7 +311,13 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
     if error:
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
-    return EditPlan(path, content, new_content, crlf, count, strategy)
+    replaced, line = None, 0
+    if strategy in SIMILARITY_STRATEGIES:
+        # old_string only resembles what is replaced (a value the model misremembered): name the file's real text.
+        # Such a match is always unique, so the strategy finds the same one span again.
+        [(start, end)] = dict(STRATEGIES)[strategy](content, old_string)
+        replaced, line = content[start:end], content.count("\n", 0, start) + 1
+    return EditPlan(path, content, new_content, crlf, count, strategy, replaced, line)
 
 
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -316,7 +327,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         return plan
     new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
     _atomic_write(plan.path, new_content.encode("utf-8"))
-    return {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    result = {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    if plan.replaced is not None:
+        result.update(replaced=plan.replaced, line=plan.line)
+    return result
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
@@ -472,10 +486,19 @@ def _format_tool_result(result: dict[str, Any]) -> Any:
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
-    if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
+    if result.keys() - {"replaced", "line"} == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
         n = result["replacements"]
         how = "" if result["strategy"] == "exact" else f" (matched by {result['strategy']}, not exactly)"
-        return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        text = f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        if "replaced" in result:  # a similarity match: the text it replaced is not old_string
+            first = result["line"]
+            last = first + result["replaced"].count("\n")
+            where = f"line {first}" if first == last else f"lines {first}-{last}"
+            text += (
+                f"\nold_string is not in the file; it replaced this similar text at {where}. "
+                f"Check it is what you meant:\n{result['replaced']}"
+            )
+        return text
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
     return json.dumps(result, ensure_ascii=False, default=str)
@@ -624,16 +647,20 @@ _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/workt
 _RG_MAX_COLUMNS = 400
 
 
-def _grep_line(raw: str) -> tuple[str, bool]:
+def _grep_line(raw: bytes, verdicts: dict[bytes, bool]) -> tuple[str, bool]:
     """An ``rg --null`` output line as ``path:line:text``, and whether it comes from a credential file
     (``sensitive_path``: dotenv files, ``~/.ssh`` ...). An include glob such as ``*`` or ``.env*`` turns rg's
-    hidden-file filter off, so this is what keeps ``.env`` out of a search."""
-    from k3code.permissions.engine import sensitive_path
+    hidden-file filter off, so this is what keeps ``.env`` out of a search.
 
-    path, sep, rest = raw.partition("\0")
-    if not sep:
-        return raw, False  # one file searched: rg prints no name, and the engine has decided on that path already
-    return f"{path}:{rest}", sensitive_path(os.path.abspath(path))
+    The file name stays bytes until the check: decoded with replacement characters first, a path with bytes that
+    are not UTF-8 (a home directory named so) would no longer match ``~/.ssh`` and the like. ``verdicts`` caches
+    the answer per file name (the check resolves symlinks, too slow to repeat for every matching line)."""
+    name, sep, rest = raw.partition(b"\0")
+    if not sep:  # one file searched: rg prints no name, and tool_grep has decided on that path already
+        return raw.decode("utf-8", errors="replace"), False
+    if (hide := verdicts.get(name)) is None:
+        hide = verdicts[name] = sensitive_path(os.path.abspath(os.fsdecode(name)))
+    return f"{name.decode('utf-8', errors='replace')}:{rest.decode('utf-8', errors='replace')}", hide
 
 
 def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
@@ -648,11 +675,17 @@ def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
 
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
-    Lines from credential files are never returned (see _grep_line)."""
+
+    Lines from credential files (``sensitive_path``: dotenv files, key directories, the daemon's env file) are
+    never returned (see _grep_line), and a sensitive ``path`` is refused here: the permission engine only sees
+    ``path``, while an include glob or a repository's own ``.ignore`` (``!.env``) reopens hidden files to rg,
+    and the fallback walks them anyway."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
+    if sensitive_path(str(path)):
+        return {"error": f"Hardline deny (sensitive-path): {path}"}
     try:
         # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
@@ -668,17 +701,21 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 cmd += ["-g", f"!{exc}"]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", str(path)]
+        # rg anchors a -g glob that holds a slash at its working directory: run it where the search starts
+        root = path if path.is_dir() else path.parent
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_env(),
+            cwd=root if root.is_dir() else None,
         )
         assert proc.stdout is not None and proc.stderr is not None
         lines: list[str] = []
         withheld = 0
         cut = ""
+        verdicts: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
             try:
@@ -688,7 +725,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 break
             if not raw:
                 break
-            line, secret = _grep_line(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            line, secret = _grep_line(raw.rstrip(b"\n"), verdicts)
             if secret:
                 withheld += 1
                 continue
@@ -717,9 +754,17 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if withheld:
             _note_withheld(result, f"{withheld} matching line(s) in credential files (.env, keys) not shown")
         return result
-    except (FileNotFoundError, RuntimeError):
-        # Python fallback (no rg): off the event loop, same tree rules as glob, capped
-        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+    except (FileNotFoundError, RuntimeError) as rg_failure:
+        # Python fallback (no rg, or a pattern rg refuses such as look-around): off the event loop, same tree rules as
+        # glob, capped
+        import re
+
+        try:
+            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+        except re.error:
+            if isinstance(rg_failure, RuntimeError):  # a pattern neither engine takes: rg's message names the fault
+                raise rg_failure from None
+            raise
 
 
 #: Directories glob and the grep fallback never enter, even inside a git work tree where .gitignore may not list
@@ -938,10 +983,18 @@ def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> It
             yield f"{fp}:{number}:{line}"
 
 
+def _search_glob_match(rel: str, pattern: str) -> bool:
+    """rg ``-g`` semantics: a glob without a slash matches the file name at any depth, one with a slash is anchored at
+    the searched directory (``tests/*.py`` is not ``pkg/tests/x.py``; ``**/tests/*.py`` is)."""
+    import fnmatch
+
+    if "/" not in pattern:
+        return fnmatch.fnmatchcase(rel.rpartition("/")[2], pattern)
+    return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
+
+
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
-
-    from k3code.permissions.engine import sensitive_path
 
     includes = include if isinstance(include, list) else [include] if include else []
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
@@ -962,9 +1015,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if is_dir:
             continue
         fp = base / rel
-        if includes and not any(Path(fp.name).match(p) for p in includes):
+        if includes and not any(_search_glob_match(rel, p) for p in includes):
             continue
-        if excludes and any(Path(fp.name).match(p) for p in excludes):
+        if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
         if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1

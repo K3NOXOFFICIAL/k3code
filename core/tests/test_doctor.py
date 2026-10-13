@@ -37,6 +37,78 @@ def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
     assert chk.status == doctor.OK and "/usr/bin/bwrap" in chk.detail
 
 
+async def test_sandbox_no_probe_still_reports_an_unusable_bwrap(monkeypatch, tmp_path):
+    """--no-probe skips network probes, not the local bwrap self-test: it printed "bubblewrap at ..." as OK on a host
+    where every sandboxed command fails (and so did the summary step of `setup --no-probe`)."""
+    from k3code import doctor
+    from k3code.config import Settings
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    checks = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert checks["sandbox"].status == doctor.WARN
+    assert checks["sandbox"].detail.startswith("bubblewrap is installed but unusable")
+
+
+def test_sandbox_hint_names_the_ubuntu_apparmor_fix(monkeypatch, tmp_path):
+    """Ubuntu 23.10+/24.04 blocks user namespaces for bwrap through AppArmor; the old hint ("try: bwrap --ro-bind / /
+    true") was a test, not a fix."""
+    from k3code import doctor
+    from k3code.reliability import sandbox
+
+    restrict = tmp_path / "apparmor_restrict_unprivileged_userns"
+    monkeypatch.setattr(doctor, "_APPARMOR_USERNS", restrict)
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    restrict.write_text("1\n")
+    chk = doctor.check_sandbox()
+    assert chk.status == doctor.WARN
+    assert "AppArmor" in chk.fix and "kernel.apparmor_restrict_unprivileged_userns=0" in chk.fix
+    assert "/etc/apparmor.d/bwrap" in chk.fix and "userns" in chk.fix and "/usr/bin/bwrap" in chk.fix
+    restrict.write_text("0\n")  # not the Ubuntu restriction: no AppArmor advice
+    assert "AppArmor" not in doctor.check_sandbox().fix
+    restrict.unlink()
+    assert "AppArmor" not in doctor.check_sandbox().fix
+
+
+async def test_doctor_warns_while_the_daemon_is_halted(tmp_path):
+    """`/daemon pause` persists halt.json; doctor (also --no-probe, also while the daemon is down) said nothing."""
+    from k3code import doctor
+    from k3code.config import Settings
+    from k3code.halt import set_halt
+
+    before = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert before["daemon-paused"].status == doctor.OK
+    set_halt(tmp_path, "/daemon pause")
+    after = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert after["daemon-paused"].status == doctor.WARN
+    assert "/daemon pause" in after["daemon-paused"].detail and "/daemon resume" in after["daemon-paused"].fix
+
+
+async def test_check_daemon_warns_in_restart_storm_safe_mode(tmp_path):
+    import asyncio
+
+    from k3code import __version__, doctor
+
+    sock = tmp_path / "d.sock"
+
+    async def handle(reader, writer):
+        await reader.readline()
+        result = b'{"ready":true,"background_paused":true,"version":"' + __version__.encode() + b'"}'
+        writer.write(b'{"jsonrpc":"2.0","id":"doctor","result":' + result + b"}\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(handle, path=str(sock))
+    try:
+        chk = await doctor.check_daemon(sock)
+    finally:
+        server.close()
+    assert chk.status == doctor.WARN and "paused" in chk.detail and "/daemon resume" in chk.fix
+    assert chk.data["version"] == __version__  # the stale-daemon check still reads it
+
+
 def test_sandbox_warns_when_names_cannot_resolve_inside_it(monkeypatch):
     """#137: on WSL 2 bwrap started fine, so /doctor said OK, while /etc/resolv.conf was missing in the sandbox."""
     from k3code import doctor
@@ -50,15 +122,15 @@ def test_sandbox_warns_when_names_cannot_resolve_inside_it(monkeypatch):
     assert "cannot read /etc/resolv.conf" in chk.detail and "ls -l /etc/resolv.conf" in chk.fix
 
 
-def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
+def test_sandbox_no_probe_runs_the_self_test_but_not_the_name_lookup_probe(monkeypatch):
     from k3code import doctor
     from k3code.reliability import sandbox
 
     def must_not_probe():
-        raise AssertionError("--no-probe must not spawn bwrap")
+        raise AssertionError("--no-probe must not spawn bwrap to look up host names")
 
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
-    monkeypatch.setattr(sandbox, "usable", must_not_probe)
+    monkeypatch.setattr(sandbox, "usable", lambda: True)  # the local self-test runs with --no-probe too
     monkeypatch.setattr(sandbox, "hidden_name_lookup_files", must_not_probe)
     assert doctor.check_sandbox(probe=False).status == doctor.OK
 
@@ -119,6 +191,89 @@ def test_browser_check_finds_the_headless_shell_playwright_installs(monkeypatch,
     binary.chmod(0o755)
     chk = doctor.check_browser()
     assert chk.status == doctor.OK and chk.data["exe"] == str(binary)
+
+
+def _browser_with_tools(monkeypatch, tmp_path, ldd_out=None, apt=True, apt_knows=()):
+    """An executable Chromium binary (an old-layout name) and a PATH holding only fake tools: ``ldd`` printing
+    ``ldd_out`` (none when None), ``apt-get`` and ``apt-cache`` (knowing only the packages in ``apt_knows``)."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1" / "chrome-linux"
+    shell_dir.mkdir(parents=True)
+    binary = shell_dir / "headless_shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    tools = {}
+    if ldd_out is not None:
+        tools["ldd"] = "".join(f"echo '{ln}'\n" for ln in ldd_out)
+    if apt:
+        tools["apt-get"] = "exit 0\n"
+        tools["apt-cache"] = 'case "$2" in ' + "|".join(apt_knows or ("-",)) + ") exit 0 ;; *) exit 100 ;; esac\n"
+    for name, body in tools.items():
+        (bindir / name).write_text("#!/bin/sh\n" + body)
+        (bindir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    return doctor
+
+
+NSPR_NSS_ALSA_MISSING = (
+    "\tlinux-vdso.so.1 (0x00007ffd)",
+    "\tlibnspr4.so => not found",
+    "\tlibnss3.so => not found",
+    "\tlibnssutil3.so => not found",
+    "\tlibasound.so.2 => not found",
+    "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",
+)
+
+
+def test_browser_check_names_the_libraries_a_chromium_binary_cannot_load(monkeypatch, tmp_path):
+    """#113: the binary is there and executable but the loader cannot start it; the warning names the libraries
+    and the apt packages, and does not send the user to the installer, which cannot fix it."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt_knows=("libasound2t64",))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN
+    assert "cannot start" in chk.detail
+    for lib in ("libnspr4.so", "libnss3.so", "libnssutil3.so", "libasound.so.2"):
+        assert lib in chk.detail
+    assert chk.fix == "sudo apt-get install -y libnspr4 libnss3 libasound2t64"
+    assert "installer" not in chk.fix + chk.detail
+
+
+def test_browser_check_picks_the_alsa_package_this_release_has(monkeypatch, tmp_path):
+    """Ubuntu 24.04 renamed libasound2 to libasound2t64; older releases still ship libasound2."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibasound.so.2 => not found",))
+    assert doctor.check_browser().fix == "sudo apt-get install -y libasound2"
+
+
+def test_browser_check_sends_other_missing_libraries_to_playwright_install_deps(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibgbm.so.1 => not found", "\tlibnss3.so => not found"))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libgbm.so.1" in chk.detail
+    assert chk.fix.startswith("sudo ") and "-m playwright install-deps chromium-headless-shell" in chk.fix
+
+
+def test_browser_check_without_apt_names_the_libraries_only(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt=False)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libnspr4.so" in chk.detail
+    assert "package" in chk.fix and "libnss3.so" in chk.fix and "apt-get" not in chk.fix
+
+
+def test_browser_check_is_ok_when_ldd_finds_every_library(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",))
+    assert doctor.check_browser().status == doctor.OK
+
+
+def test_browser_check_without_ldd_cannot_tell_and_stays_ok(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path)
+    assert doctor.check_browser().status == doctor.OK
 
 
 def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
@@ -385,3 +540,74 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     left = CooldownStore(path=path)
     assert left.reason_of(provider="good", model="m") is None
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
+
+
+def test_no_provider_check_points_at_onboard(monkeypatch, tmp_path):
+    """First-run guidance names one command: an empty config told people to hand-edit config.yaml while the README,
+    the installer and the headless hint all say `k3code onboard`."""
+    import asyncio
+
+    from k3code import doctor
+    from k3code.config import Settings
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    (chk,) = asyncio.run(doctor.check_providers(Settings()))
+    assert chk.status == doctor.FAIL and chk.detail == "no providers configured"
+    assert "`k3code onboard`" in chk.fix
+    assert "config.yaml" not in chk.fix
+
+
+async def test_setup_status_reports_safe_mode_to_doctor():
+    from k3code.gateway.server import GatewayServer, _setup_status
+
+    server = GatewayServer()
+    assert (await _setup_status(server, {}))["background_paused"] is False
+    server.background_paused = True
+    assert (await _setup_status(server, {}))["background_paused"] is True
+
+
+def test_tui_hint_for_an_install_without_sources_does_not_send_you_to_a_tui_dir(monkeypatch):
+    """An install keeps only tui/dist, so when its build failed or was skipped there is no `tui/` to `cd` into. The
+    hint must say what works: the installer keeps a version it already built, so it needs an uninstall first."""
+    from k3code import doctor
+    from k3code.paths import NodeChoice
+
+    node = NodeChoice("/fake/node", "v22.1.0", "PATH", "the node on PATH, Node >= 20")
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: node)
+    monkeypatch.setattr(doctor, "find_repo_root", lambda: None)
+    check = doctor.check_tui()
+    assert check.status == doctor.WARN
+    assert "cd tui" not in check.fix
+    assert "uninstall.sh" in check.fix and "install.sh" in check.fix
+
+
+def test_tui_hint_for_a_source_checkout_still_builds_in_the_checkout(monkeypatch, tmp_path):
+    from k3code import doctor
+    from k3code.paths import NodeChoice
+
+    (tmp_path / "tui").mkdir()
+    (tmp_path / "tui" / "package.json").write_text("{}")
+    node = NodeChoice("/fake/node", "v22.1.0", "PATH", "the node on PATH, Node >= 20")
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: node)
+    monkeypatch.setattr(doctor, "find_repo_root", lambda: tmp_path)
+    check = doctor.check_tui()
+    assert check.status == doctor.WARN and "npm run build" in check.fix
+
+
+async def test_claude_cli_on_path_but_not_logged_in_is_a_warning(fake_claude):
+    """`claude` being on PATH made doctor green; the first turn then failed 401 (issue #146)."""
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    cfg = Settings(providers=[ProviderEntry(name="claude-cli", kind="claude-cli")])
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+    assert row.status == doctor.WARN and "not logged in" in row.detail
+    assert "`claude`" in row.fix and "/login" in row.fix
+    for state in ("in", "old"):  # logged in, or a Claude Code that cannot say: no complaint
+        fake_claude(state)
+        row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+        assert row.status == doctor.OK and "Claude Code CLI at" in row.detail, state
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg, probe=False) if c.name == "provider:claude-cli")
+    assert row.status == doctor.OK  # --no-probe: claude is not run

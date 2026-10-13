@@ -69,9 +69,8 @@ def request_headers(
     has_key = bool(api_key.strip())
     if not has_key and not keyless:
         raise ProviderError(
-            "No API key configured for this provider: its api_key_env variable is empty. "
-            "Run `k3code setup --step providers`, or put KEY=value in ~/.config/k3code/env. "
-            "`k3code doctor` shows which variable is missing.",
+            # Short on purpose: the router cuts an entry's error at 160 characters, and the fix is at the end.
+            "No API key configured for this provider. Run `k3code onboard`, or put KEY=value in ~/.config/k3code/env.",
             status_code=401,
         )
     if kind == "anthropic":

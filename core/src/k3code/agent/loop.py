@@ -128,9 +128,10 @@ class AgentLoop:
         self._failed: list[tuple[str, str]] = []
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
         self.tool_error_stop_message = True
-        #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
-        #: tool errors with it. A string it returns is a lesson for the failure, sent after the step's tool results.
-        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], str | None] | None = None
+        #: called after every tool call with (call, result, failure or None, reply=): the gateway's learning hub
+        #: records tool errors with it. ``reply`` is one object per model reply, shared by the calls it asked for
+        #: together. A string it returns is a lesson for the failure, sent after the step's tool results.
+        self.on_tool_outcome: Callable[..., str | None] | None = None
         #: (tool, signature) pairs whose lesson was already sent this run: one reminder per signature per turn
         self._learned: set[tuple[str, str]] = set()
         #: Set when the loop stopped before the task was done: "tool_errors" | "loop_guard" (the attempt looks stuck)
@@ -154,12 +155,18 @@ class AgentLoop:
         #: Unattended bash keeps the network only when configured (``autonomy.unattended_network``).
         self.unattended_network = unattended_network
         self._sandbox_warned = False
+        #: called (on the event loop, once per loop) when an interactive auto/yolo bash runs or asks to run without the
+        #: sandbox because bwrap is unusable here; the gateway shows the session a notice
+        self.on_unsandboxed: Callable[[], None] | None = None
+        self._unsandboxed_told = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         #: called when a retry makes the streamed text so far void (the consumer clears its copy)
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
         self.on_checkpoint: Callable[[], None] | None = None
+        #: awaited once the user's prompt joined the conversation, before the first model call (the gateway persists)
+        self.on_turn_start: Callable[[], Awaitable[None]] | None = None
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
         self.take_steer: Callable[[], list[str]] | None = None
         self.approval_callback = approval_callback
@@ -268,6 +275,8 @@ class AgentLoop:
                     messages.append(Message(role="user", content=user_prompt))
                 self.turn_messages = messages  # the resumed transcript replaced the list
         self.reliability.save_transcript(messages)
+        if self.on_turn_start:
+            await self.on_turn_start()  # the prompt is on disk before a slow first answer: a dropped terminal keeps it
 
         for turn in itertools.count():
             if 0 < self.max_turns <= turn:
@@ -381,6 +390,7 @@ class AgentLoop:
 
             # Execute the tool calls and yield their results in the model's order. Consecutive read-only calls run
             # together (see _batches); every other call runs alone.
+            reply = object()  # tells the outcome hook which calls the model asked for before it saw any result
             for batch in self._batches(tool_calls):
                 if self.interrupted:
                     logger.info("Interrupted before tool %s", batch[0].name)
@@ -406,7 +416,7 @@ class AgentLoop:
                     messages.append(tool_msg)
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
-                    failure = self._observe_result(tc, result, notes)
+                    failure = self._observe_result(tc, result, notes, reply)
                     if "error" in result and "content" not in result:
                         self._tool_errors += 1
                         self._failed.append(
@@ -515,8 +525,9 @@ class AgentLoop:
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
             return {"error": f"Permission denied (unattended run): {decision.message}"}
-        # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
+        # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
+        no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
         if home_rooted:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
@@ -527,13 +538,27 @@ class AgentLoop:
                 auto_allowed=False,
                 message="no sandbox at the home directory: approve to run unsandboxed, or start k3code in a project",
             )
+        elif no_bwrap:
+            self._tell_unsandboxed()
+            if decision.auto_allowed:
+                # Auto mode allows what the sandbox would contain. Without bwrap the command runs on the host, so a
+                # human approves what only auto mode allowed (rules and the read-only allowlist still apply, as in
+                # accept-edits). yolo is the explicit no-prompt mode: it runs, and the session has been told.
+                decision = replace(
+                    decision,
+                    action="ask",
+                    needs_human=True,
+                    auto_allowed=False,
+                    message="no sandbox here (bubblewrap is unusable): approve to run this on the host, see /doctor",
+                )
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
         # a hook's "approve" answers the prompt, but never one only a human may answer
         if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
-                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
+                why = f": {decision.message}" if decision.message else ""
+                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter){why}"}
             answer = await self.approval_callback(tool_call.name, args, decision)
             if not answer.allowed:
                 what = _preview(tool_call.name, args)
@@ -688,15 +713,33 @@ class AgentLoop:
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return False
         if not sandbox.usable():
-            return False  # no bwrap: bash already runs unsandboxed (warned once in _sandbox_argv), nothing to approve
+            return False  # no bwrap: see _bwrap_unusable
         return sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is not None
+
+    def _bwrap_unusable(self) -> bool:
+        """An interactive sandboxed session (auto/yolo) on a host where bwrap is unusable: its bash runs on the host."""
+        if self.background or self.unattended:
+            return False  # nobody to approve: _sandbox_argv refuses bash instead (fail closed)
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
+            return False
+        return not sandbox.usable()
+
+    def _tell_unsandboxed(self) -> None:
+        if self._unsandboxed_told or self.on_unsandboxed is None:
+            return
+        self._unsandboxed_told = True
+        try:
+            self.on_unsandboxed()
+        except Exception:  # noqa: BLE001 - a notice must never break a turn
+            logger.warning("unsandboxed notice failed", exc_info=True)
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
 
-        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once). An unattended
-        session (background, goal continuation, sub-agent) has no human to see a warning, so it raises
-        :class:`sandbox.SandboxUnavailable` instead: fail closed, nothing runs.
+        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once; the session is told
+        and auto mode asks first, see _bwrap_unusable). An unattended session (background, goal continuation,
+        sub-agent) has no human to see a warning, so it raises :class:`sandbox.SandboxUnavailable` instead: fail
+        closed, nothing runs.
         """
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
@@ -759,7 +802,9 @@ class AgentLoop:
             return False
         return outcome.verdict is Verdict.STOP
 
-    def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
+    def _observe_result(
+        self, tc: ToolCall, result: dict[str, Any], notes: list[Message], reply: object
+    ) -> Failure | None:
         """Tell the learning hook and the loop guard how a call went; queue into ``notes`` the hook's lesson for the
         failure (once per signature per run) and the guard's reminder (one per step: the request guard's note, when
         there is one, already says to change approach; a lesson does not count against it)."""
@@ -767,7 +812,7 @@ class AgentLoop:
         failure = failure_of(tc.name, tc.arguments, result)
         if self.on_tool_outcome is not None:
             try:
-                learned = self.on_tool_outcome(tc, result, failure)
+                learned = self.on_tool_outcome(tc, result, failure, reply=reply)
             except Exception:  # noqa: BLE001 - learning must never break a turn
                 logger.warning("tool outcome hook failed", exc_info=True)
                 learned = None

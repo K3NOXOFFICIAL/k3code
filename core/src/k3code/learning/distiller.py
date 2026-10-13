@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
-from k3code.learning.decisions import DecisionLog
+from k3code.learning.decisions import DecisionLog, project_id
 from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
@@ -368,9 +369,17 @@ MEM0_POSTED = "mem0_posted.json"
 MEM0_POSTED_MAX = 2000
 
 
-def _posted_key(m: Any, text: str) -> str:
-    """Same text to the same mem0 target = same key; another url, agent or user posts again."""
-    return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}\0{text}".encode()).hexdigest()[:24]
+def project_scope(cwd: str | Path, project: str = "") -> dict[str, str]:
+    """The mem0 scope of a fact that is only true of one project: its stable id and a short repo name."""
+    pid = project or project_id(cwd)
+    repo = re.split(r"[/:]", pid)[-1] if pid.startswith("git:") else Path(cwd).resolve().name
+    return {"project": pid, "repo": repo or "project", "scope": "project"}
+
+
+def _posted_key(m: Any, text: str, scope: dict[str, str] | None = None) -> str:
+    """Same text to the same mem0 target = same key; another url, agent, user or project posts again."""
+    where = f"\0{scope['project']}" if scope else ""
+    return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}{where}\0{text}".encode()).hexdigest()[:24]
 
 
 def _load_posted(path: Path) -> list[str]:
@@ -381,11 +390,57 @@ def _load_posted(path: Path) -> list[str]:
     return [str(k) for k in data] if isinstance(data, list) else []
 
 
-def _save_posted(path: Path, keys: list[str]) -> None:
+def _write_private_json(path: Path, data: Any) -> None:
     ensure_private_dir(path.parent)
     tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))
-    tmp.write_text(json.dumps(keys[-MEM0_POSTED_MAX:]), encoding="utf-8")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _save_posted(path: Path, keys: list[str]) -> None:
+    _write_private_json(path, keys[-MEM0_POSTED_MAX:])
+
+
+#: What mem0 did not take (it was down, or the pass stopped before the item): the next pass posts it first. A review
+#: fact is derived once, so without this a failed post lost it (a preference is re-derived by the daily distill).
+MEM0_OUTBOX = "mem0_outbox.json"
+MEM0_OUTBOX_MAX = 200
+#: One store_mem0 pass at a time: two passes would read the same ledger and outbox and overwrite each other's writes.
+_MEM0_LOCK = threading.Lock()
+
+
+def _load_outbox(path: Path) -> list[tuple[Preference, dict[str, str] | None]]:
+    """What the last pass could not send: each preference with the project scope it was derived under, if any."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [
+            (
+                Preference(str(e["text"]), float(e["confidence"]), int(e["evidence"])),
+                {str(k): str(v) for k, v in e["scope"].items()} if isinstance(e.get("scope"), dict) else None,
+            )
+            for e in data
+        ]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return []
+
+
+def _save_outbox(path: Path, items: list[tuple[Preference, dict[str, str] | None]]) -> None:
+    if not items:
+        path.unlink(missing_ok=True)
+        return
+    _write_private_json(
+        path,
+        [
+            {"text": p.text, "confidence": p.confidence, "evidence": p.evidence, **({"scope": sc} if sc else {})}
+            for p, sc in items[-MEM0_OUTBOX_MAX:]
+        ],
+    )
+
+
+def _refused(exc: Exception) -> bool:
+    """mem0 answered and refused this one body (400, 413, 422): retrying cannot work and the next item may be fine.
+    Anything else (no connection, a timeout, 401/403, 429, 5xx) means mem0 is not usable for the rest of the pass."""
+    return getattr(getattr(exc, "response", None), "status_code", 0) in (400, 413, 422)
 
 
 def store_mem0(
@@ -393,46 +448,70 @@ def store_mem0(
     prefs: list[Preference],
     post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
     posted: Path | None = None,
+    outbox: Path | None = None,
+    scope: dict[str, str] | None = None,
 ) -> int:
     """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only.
 
     ``posted`` is a JSON file of what was already sent: a preference posted before is skipped (the daily distill
-    re-derives every preference and posted each one again, every day). Returns how many were posted now."""
+    re-derives every preference and posted each one again, every day). ``outbox`` is a JSON file of what could not
+    be sent (each with its own scope): it is posted first on the next pass. ``scope`` (see :func:`project_scope`)
+    marks a project fact: it names the project in the text and metadata, so another repo's recall does not read
+    it as a trait of the user. The first failed post ends the pass (a host that does not answer would cost the connect
+    timeout once, not once per item) and every item not yet sent goes to the outbox.
+    Returns how many were posted now."""
     m = getattr(config, "mem0", None)
     if m is None or not m.url:
         return 0
-    done = _load_posted(posted) if posted is not None else []
-    seen = set(done)
-    headers = {"Content-Type": "application/json"}
-    if m.api_key_env and os.environ.get(m.api_key_env):
-        headers["Authorization"] = f"Token {os.environ[m.api_key_env]}"
-    if post is None:
-        import httpx
+    with _MEM0_LOCK:
+        done = _load_posted(posted) if posted is not None else []
+        seen = set(done)
+        queued = _load_outbox(outbox) if outbox is not None else []
+        headers = {"Content-Type": "application/json"}
+        if m.api_key_env and os.environ.get(m.api_key_env):
+            headers["Authorization"] = f"Token {os.environ[m.api_key_env]}"
+        if post is None:
+            import httpx
 
-        def post(url: str, body: dict[str, Any], hdrs: dict[str, str]) -> None:  # noqa: F811
-            httpx.post(url, json=body, headers=hdrs, timeout=10).raise_for_status()
+            def post(url: str, body: dict[str, Any], hdrs: dict[str, str]) -> None:  # noqa: F811
+                httpx.post(url, json=body, headers=hdrs, timeout=httpx.Timeout(10, connect=2)).raise_for_status()
 
-    n = 0
-    for p in prefs:
-        key = _posted_key(m, p.text)
-        if key in seen:
-            continue
-        body = {
-            "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
-            "agent_id": m.agent_id,
-            **({"user_id": m.user_id} if m.user_id else {}),
-            "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
-        }
-        try:
-            post(m.url.rstrip("/") + "/memories", body, headers)
+        n = 0
+        unsent: list[tuple[Preference, dict[str, str] | None]] = []
+        down = False
+        for p, sc in [*queued, *((p, scope) for p in prefs)]:
+            key = _posted_key(m, p.text, sc)
+            if key in seen:
+                continue
+            seen.add(key)  # one try per text and pass, whether it came from the outbox or from prefs
+            if down:
+                unsent.append((p, sc))
+                continue
+            label = f"Project fact ({sc['repo']}, learned by k3code)" if sc else "User preference (learned by k3code)"
+            body = {
+                "messages": [{"role": "user", "content": f"{label}: {p.text}"}],
+                **m.identifiers(),
+                "metadata": {
+                    "confidence": p.confidence,
+                    "evidence": p.evidence,
+                    "source": "k3code-distiller",
+                    **(sc or {}),
+                },
+            }
+            try:
+                post(m.url.rstrip("/") + "/memories", body, headers)
+            except Exception as e:  # noqa: BLE001 - mem0 is best effort; what it did not take waits in the outbox
+                if not _refused(e):
+                    down = True
+                    unsent.append((p, sc))
+                continue
             n += 1
-        except Exception:  # noqa: BLE001 - mem0 is best effort (a failed one is tried again next time)
-            continue
-        seen.add(key)
-        done.append(key)
-    if posted is not None and n:
-        _save_posted(posted, done)
-    return n
+            done.append(key)
+        if posted is not None and n:
+            _save_posted(posted, done)
+        if outbox is not None and (unsent or queued):
+            _save_outbox(outbox, unsent)
+        return n
 
 
 async def distill(
@@ -453,8 +532,10 @@ async def distill(
     last = [p.text for p in load_preferences(home, top=1_000_000)]  # what the previous run wrote, to migrate USER.md
     write_auto_section(user_md, prefs, known=last)
     write_preferences_json(home, prefs)
-    # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
-    await asyncio.to_thread(store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED)
+    # blocking HTTP (2 s to connect, 10 s per request): never on the event loop that serves every session
+    await asyncio.to_thread(
+        store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED, home / "learning" / MEM0_OUTBOX
+    )
     if proposals is not None:
         propose_denial_preferences(log, proposals)
         for s in suggestions:

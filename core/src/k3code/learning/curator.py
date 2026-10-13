@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -18,10 +19,65 @@ from k3code.paths import home, private_file
 from k3code.skills import parse_frontmatter
 
 DUP_THRESHOLD = 0.7
+#: A draft younger than this is never pruned (a crash leftover, or the "draft kept at" of an accepted card, can still
+#: be wanted for a few days).
+DRAFT_GRACE = 7 * 86400.0
 
 
 def skills_dir() -> Path:
     return home() / "skills"
+
+
+def drafts_dir(root: Path | None = None) -> Path:
+    return (root or skills_dir()) / "_drafts"
+
+
+def skill_body(text: str) -> str:
+    """The markdown below a SKILL.md's frontmatter."""
+    m = re.match(r"---\n.*?\n---\n(.*)", text, re.S)
+    return m.group(1) if m else text
+
+
+def draft_text(payload: dict[str, Any]) -> str | None:
+    """The SKILL.md a "save" card would move into the skills, or None when the draft is gone."""
+    try:
+        return Path(payload["draft"]).read_text(encoding="utf-8")
+    except (KeyError, OSError):
+        return None
+
+
+def discard_draft(payload: dict[str, Any], root: Path | None = None) -> bool:
+    """Delete the draft of a dismissed "save" card; True if it was there. Only a real directory directly under
+    ``_drafts`` goes, whatever the payload says."""
+    if payload.get("op") != "save" or not payload.get("draft"):
+        return False
+    d = Path(payload["draft"]).parent
+    if d.is_symlink() or not d.is_dir() or d.parent.resolve() != drafts_dir(root).resolve():
+        return False
+    shutil.rmtree(d, ignore_errors=True)
+    return True
+
+
+def prune_drafts(store: ProposalStore, now: float, root: Path | None = None, grace: float = DRAFT_GRACE) -> list[str]:
+    """Delete the drafts no pending card is waiting on (a dismissed or accepted card, a crash, an older version left
+    them); returns their names. A draft younger than ``grace`` stays."""
+    base = drafts_dir(root)
+    if not base.is_dir():
+        return []
+    wanted = {
+        Path(p.payload["draft"]).parent.resolve()
+        for p in store.all()
+        if p.kind == "skill" and p.status == "pending" and p.payload.get("op") == "save" and p.payload.get("draft")
+    }
+    pruned = []
+    for d in sorted(base.iterdir()):
+        if d.is_symlink() or not d.is_dir() or d.resolve() in wanted:
+            continue
+        md = d / "SKILL.md"
+        if now - max(d.stat().st_mtime, md.stat().st_mtime if md.is_file() else 0.0) > grace:
+            shutil.rmtree(d, ignore_errors=True)
+            pruned.append(d.name)
+    return pruned
 
 
 def _usage_path() -> Path:
@@ -101,7 +157,8 @@ def find_duplicates(skills: list[dict[str, Any]]) -> list[tuple[str, str, float]
 def curate(
     store: ProposalStore, *, now: float | None = None, stale_days: int = 30, root: Path | None = None
 ) -> dict[str, Any]:
-    """Mark stale skills (``.curator.json``) and propose merges for duplicates. Never deletes."""
+    """Mark stale skills (``.curator.json``) and propose merges for duplicates. Never deletes a skill; it does prune
+    the drafts nobody is waiting on."""
     now = time.time() if now is None else now
     root = root or skills_dir()
     skills = list_skills(root)
@@ -110,13 +167,15 @@ def curate(
     marks = {name: {"state": "stale", "reason": why, "at": now} for name, why in stale}
     if root.is_dir():
         private_file(root / ".curator.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
+    # a skill is listed by its frontmatter name, but it is archived by the directory it lives in
+    dirs = {s["name"]: s["dir"].name for s in skills}
     proposals: list[Proposal] = []
     for keep, drop, sim in find_duplicates(skills):
         p = store.add(
             "skill",
             f"Skills '{keep}' and '{drop}' overlap ({int(sim * 100)}%) → merge (archive '{drop}')?",
             f"archive skill {drop}",
-            payload={"op": "merge", "keep": keep, "drop": drop, "similarity": sim},
+            payload={"op": "merge", "keep": keep, "drop": drop, "dir": dirs[drop], "similarity": sim},
             key=dedup_key("skill", f"merge {keep} {drop}"),
         )
         if p:
@@ -126,12 +185,23 @@ def curate(
             "skill",
             f"Skill '{name}' looks stale ({why}) → archive it?",
             f"archive skill {name}",
-            payload={"op": "archive", "drop": name},
+            payload={"op": "archive", "drop": name, "dir": dirs[name]},
             key=dedup_key("skill", f"stale {name}"),
         )
         if p:
             proposals.append(p)
-    return {"stale": stale, "proposals": proposals}
+    return {"stale": stale, "proposals": proposals, "pruned": prune_drafts(store, now, root)}
+
+
+def _skill_dir(root: Path, name: str) -> Path | None:
+    """``root/<name>`` when ``name`` is a skill directory that sits directly in ``root``, else None.
+
+    ``list_skills`` skips ``.`` and ``_`` entries (``_archive``, ``_drafts``), so they are never a skill to archive.
+    """
+    src = root / name
+    if not name or name.startswith((".", "_")) or src.parent.resolve() != root.resolve():
+        return None
+    return src if src.is_dir() else None
 
 
 def apply(payload: dict[str, Any], root: Path | None = None) -> str:
@@ -145,10 +215,12 @@ def apply(payload: dict[str, Any], root: Path | None = None) -> str:
         shutil.move(str(src.parent), str(dest))
         return f"skill saved to {dest}"
     if op in ("merge", "archive"):
-        src = root / payload["drop"]
-        if not src.is_dir():
+        # `dir` is the directory name; a proposal queued before it existed only has the frontmatter name in `drop`
+        name = str(payload.get("dir") or payload["drop"])
+        src = _skill_dir(root, name)
+        if src is None:
             return f"skill {payload['drop']} not found"
-        dest = root / "_archive" / payload["drop"]
+        dest = root / "_archive" / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         return f"archived {payload['drop']} → {dest}"

@@ -297,7 +297,7 @@ class Ultra:
             report.fanout = fan
             if fan is not None and fan.stopped:
                 raise BudgetStop(fan.stopped)
-            if fan is None:  # no git repo, or uncommitted changes in the checkout: one worker, in place
+            if fan is None:  # fan-out skipped (no repo, dirty checkout, no sandbox or test runner): one worker
                 prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
                 report.notes.append(f"implementation (single worker in place, fan-out skipped): {h.status}")

@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import select
 import shlex
 import subprocess
 import sys
@@ -83,6 +84,16 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("%s %s", event.kind, event.detail)
 
 
+def _warn_unsandboxed(mode: str) -> None:
+    """An auto/yolo run whose bash has no sandbox here (bwrap unusable): said once on stderr, not only in the log."""
+    what = (
+        "yolo mode runs every command on this machine"
+        if mode == "yolo"
+        else "auto mode refuses each command it would have run in the sandbox (nobody can approve it here)"
+    )
+    sys.stderr.write(f"[k3code] no sandbox: bubblewrap is unusable here, so {what}; see k3code doctor\n")
+
+
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
     from k3code.paths import home as k3code_home
@@ -148,6 +159,7 @@ async def _run_headless(
         reliability=reliability,
         session=session,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
@@ -245,6 +257,52 @@ def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
     name = parts[0][1:]
     cmd = build_registry().get(name) if name and not name.startswith("/") else None
     return (cmd, name, parts[1] if len(parts) > 1 else "") if cmd is not None else None
+
+
+#: How long ``-p TEXT`` waits for anything on a piped stdin (data or end of file) before it goes on without it.
+_STDIN_WAIT_SECONDS = 3.0
+
+
+def _read_stdin(wait: float | None) -> str:
+    """All the text on stdin. With ``wait``, "" when nothing at all arrives within that many seconds.
+
+    A scheduler or harness that leaves stdin open and idle must not hang ``k3code -p TEXT``; ``-p -`` asked for stdin,
+    so it passes ``wait=None`` and waits for the end of the input.
+    """
+    stream = sys.stdin
+    if stream is None:  # fd 0 was closed
+        return ""
+    if wait is not None:
+        try:
+            ready = bool(select.select([stream], [], [], wait)[0])
+        except (OSError, ValueError, TypeError):  # an in-memory stream has no descriptor to poll, and cannot block
+            ready = True
+        if not ready:
+            click.echo(
+                f"k3code: no input arrived on stdin within {wait:g} s, going on without it "
+                "(`< /dev/null` skips the wait)",
+                err=True,
+            )
+            return ""
+    try:
+        return stream.read()
+    except UnicodeDecodeError:
+        raise click.ClickException("stdin is not UTF-8 text") from None
+
+
+def _headless_prompt(prompt: str | None) -> str | None:
+    """The prompt a headless run sends: ``-p -`` is read from stdin, and a piped stdin follows a ``-p TEXT`` prompt.
+
+    ``echo text | k3code -p summarize`` sends "summarize", a blank line and the text. A terminal is never read for
+    ``-p TEXT``, and neither is stdin for a slash command (``-p /stats``), which involves no model.
+    """
+    if prompt == "-":
+        if not (text := _read_stdin(wait=None)).strip():
+            raise click.UsageError("-p -: no prompt on stdin")
+        return text.rstrip()
+    if not prompt or sys.stdin is None or sys.stdin.isatty() or _headless_slash(prompt) is not None:
+        return prompt
+    return f"{prompt}\n\n{text}" if (text := _read_stdin(wait=_STDIN_WAIT_SECONDS).rstrip()) else prompt
 
 
 class _LightCommandContext:
@@ -426,6 +484,7 @@ async def _run_repl(
         cwd=Path.cwd(),
         reliability=reliability,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
@@ -546,7 +605,12 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
 
 
 @click.command()
-@click.option("-p", "--prompt", "prompt", help="Headless prompt; omit for REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    "prompt",
+    help="Headless prompt; omit for REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
@@ -581,6 +645,7 @@ def main(
     Examples:
       k3code -p "create hello.py" --permission auto
       k3code -p "fix the bug" --json
+      git diff | k3code -p "review this"
       k3code  # starts the TUI (or the REPL with --repl / non-tty)
     """
     if stdio_flag:
@@ -594,6 +659,7 @@ def main(
     from k3code.config import load_config
     from k3code.permissions import PermissionMode
 
+    prompt = _headless_prompt(prompt)
     # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
     # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
     project_dir = config_dir or Path.cwd()
@@ -815,7 +881,11 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
     help="Show the version and exit.",
 )
 @click.pass_context
-@click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    help="Headless prompt; omit for TUI/REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
@@ -1130,6 +1200,8 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
         if answers is None:
             raise click.UsageError("--non-interactive needs --answers FILE")
         p: Any = _answers_prompter(answers)
+    elif answers is None and not _is_interactive():
+        raise click.UsageError("`k3code setup` needs a terminal; pass --answers FILE to run it without prompts")
     else:
         p = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
@@ -1213,6 +1285,8 @@ def update_cmd(
         raise SystemExit(0 if res.ok else 1)
     cfg = upd.update_settings()
     cur = upd.current_version()
+    daemon_behind = upd.stale_daemon_build()
+    block = upd.current_lines(cur, daemon_behind, "daemon:  ")  # `current:`, and the daemon's build if it is behind
     rel = None
     git_ref = None
     if not from_source:
@@ -1251,16 +1325,16 @@ def update_cmd(
             raise click.ClickException(str(e)) from e
         if upd.is_commit_sha(git_ref):
             click.echo(
-                f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
+                f"{block}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
                 f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
             )
             return
-        click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
+        click.echo(f"{block}\nlatest:  {head[:7]} ({git_ref})")
         if check:
             return
         have = upd.installed_sha()
         if have and head.startswith(have):
-            click.echo("Already up to date.")
+            click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
@@ -1279,7 +1353,7 @@ def update_cmd(
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
         if not (src / ".git").exists():
             raise click.ClickException(_unusable_source(src))
-        click.echo(f"current: {cur}\nsource: {src}")
+        click.echo(f"{block}\nsource: {src}")
         if check:
             return
         if not yes:
@@ -1289,14 +1363,14 @@ def update_cmd(
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
         if ver == cur:  # the checkout builds the version that is already active
-            click.echo(f"Already up to date ({ver}).")
+            click.echo(upd.up_to_date(daemon_behind, f"Already up to date ({ver})."))
             return
     else:
         assert rel is not None
-        click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
+        click.echo(f"{block}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
         if check or not upd.is_newer(rel.version, cur):
             if not check:
-                click.echo("Already up to date.")
+                click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)

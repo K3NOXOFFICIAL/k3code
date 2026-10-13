@@ -9,7 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from k3code.tools import build_registry, tool_bash, tool_edit, tool_glob, tool_grep, tool_read, tool_write
+from k3code.tools import (
+    build_registry,
+    format_tool_result,
+    tool_bash,
+    tool_edit,
+    tool_glob,
+    tool_grep,
+    tool_read,
+    tool_write,
+)
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -144,6 +153,61 @@ async def test_edit_replace_all(temp_dir):
     assert f.read_text() == "bar\nbar\n"
 
 
+async def test_edit_by_similarity_shows_the_text_it_replaced(temp_dir):
+    # #103: old_string only resembled the file, a different value was rewritten and the result did not say which
+    f = temp_dir / "conf.py"
+    f.write_text("MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30\n")
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "context_aware"
+    assert format_tool_result(result) == (
+        "Edited: 1 replacement (matched by context_aware, not exactly)\n"
+        "old_string is not in the file; it replaced this similar text at lines 1-3. Check it is what you meant:\n"
+        "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30"
+    )
+
+    f.write_bytes(b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 30\r\n")  # matched as LF text, written as CRLF
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert (result["line"], result["replaced"]) == (2, "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30")
+    assert f.read_bytes() == b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 60\r\n"
+
+    g = temp_dir / "g.py"
+    g.write_text("import os\n\ndef g():\n    x = 1\n    y = 2\n    z = 3\n    return x\n")
+    result = await tool_edit(
+        {
+            "path": str(g),
+            "old_string": "def g():\n    x = 10\n    y = 20\n    q = 99\n    return x",
+            "new_string": "def g():\n    x = 7\n    return x",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "block_anchor"
+    text = format_tool_result(result)
+    assert "at lines 3-7" in text
+    assert text.endswith("def g():\n    x = 1\n    y = 2\n    z = 3\n    return x")  # z = 3 is gone: now it says so
+
+
+async def test_edit_with_a_precise_match_stays_one_line(temp_dir):
+    f = temp_dir / "conf.py"
+    f.write_text("TIMEOUT = 30\n")
+    result = await tool_edit({"path": str(f), "old_string": " TIMEOUT = 30", "new_string": "TIMEOUT = 6"}, cwd=temp_dir)
+    assert result == {"ok": True, "replacements": 1, "strategy": "line_trimmed"}
+    assert format_tool_result(result) == "Edited: 1 replacement (matched by line_trimmed, not exactly)"
+
+
 async def test_bash_simple(temp_dir):
     result = await tool_bash({"command": "echo hello"}, cwd=temp_dir)
     assert result["stdout"].strip() == "hello"
@@ -206,6 +270,127 @@ async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir)
     (temp_dir / "notes.txt").write_text("the flag --files is literal here\n")
     result = await tool_grep({"pattern": "--files", "path": "."}, cwd=temp_dir)
     assert "notes.txt:1:the flag --files is literal here" in result["matches"]
+
+
+# ── grep never hands a credential file to the model (K3NOX-68, GitHub #138) ──
+
+
+def _secret_project(root: Path) -> Path:
+    (root / ".env").write_text("API_KEY=sk-dotenv-secret\n")
+    (root / ".env.local").write_text("API_KEY=sk-local-secret\n")
+    (root / ".env.example").write_text("API_KEY=example-template\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "a.js").write_text("API_KEY in a dependency\n")
+    (root / "app.py").write_text("API_KEY = os.environ['API_KEY']\n")
+    return root
+
+
+def _no_rg(monkeypatch, root: Path) -> None:
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("PATH", str(root / "no-bin"))  # no rg (and no git): the Python fallback
+
+
+@pytest.fixture
+def rg():
+    import shutil
+
+    if not shutil.which("rg"):
+        pytest.skip("rg not installed")
+
+
+@pytest.mark.parametrize("include", ["*", ".env*", ["*.py", ".*"], "**"])
+async def test_grep_include_glob_does_not_reopen_dotenv_files_or_node_modules(temp_dir, rg, include):
+    # rg's last matching glob wins and an include glob overrides its hidden-file filter: `include: "*"` used to
+    # return .env (and node_modules) while read/grep of `.env` itself is a sensitive-path hardline deny.
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".", "include": include}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "node_modules" not in res["matches"]
+    if include != ".env*":
+        assert "app.py:1:API_KEY" in res["matches"]
+    if include in ("*", ".env*", "**"):
+        assert ".env.example:1:API_KEY=example-template" in res["matches"]  # a template is no secret
+
+
+async def test_grep_ignore_file_negation_does_not_reopen_dotenv(temp_dir, rg):
+    # A hostile repository can whitelist its .env for rg without any include: `!.env` in .ignore or .gitignore.
+    _secret_project(temp_dir)
+    (temp_dir / ".ignore").write_text("!.env\n!.env.local\n")
+    res = await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "app.py:1:API_KEY" in res["matches"]
+
+
+async def test_grep_include_can_still_search_inside_node_modules_by_path(temp_dir, rg):
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": "node_modules/pkg", "include": "*.js"}, cwd=temp_dir)
+    assert "a.js:1:API_KEY in a dependency" in res["matches"]
+
+
+async def test_grep_fallback_skips_dotenv_files(temp_dir, monkeypatch):
+    # The Python fallback walks hidden files (and `git ls-files -co` lists a .env that is not ignored).
+    _secret_project(temp_dir)
+    _no_rg(monkeypatch, temp_dir)
+    for include in (None, "*", ".env*"):
+        args = {"pattern": "API_KEY", "path": ".", **({"include": include} if include else {})}
+        res = await tool_grep(args, cwd=temp_dir)
+        assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"], include
+        assert "API_KEY=example-template" in res["matches"], include
+    assert "app.py" in (await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir))["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_home_directory_skips_key_and_k3code_secret_files(temp_dir, monkeypatch, fallback):
+    import shutil
+
+    if not fallback and not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    home = temp_dir / "home"
+    for rel, text in {
+        ".ssh/id_ed25519": "API_KEY ssh-private-key",
+        ".aws/credentials": "API_KEY aws_secret_access_key",
+        ".config/k3code/env": "API_KEY=sk-daemon-env",
+        "notes/todo.txt": "API_KEY rotate me",
+    }.items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in res["matches"]
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+
+
+async def test_grep_hides_key_files_under_a_home_whose_name_is_not_utf8(temp_dir, monkeypatch, rg):
+    # rg prints the raw name bytes. Decoded with replacement characters first, `$HOME/.ssh` would no longer match.
+    home = temp_dir / os.fsdecode(b"h\xffome")
+    try:
+        (home / ".ssh").mkdir(parents=True)
+    except (OSError, UnicodeError):
+        pytest.skip("filesystem refuses non-UTF-8 names")
+    (home / ".ssh" / "id_ed25519").write_text("API_KEY ssh-private-key\n")
+    (home / "todo.txt").write_text("API_KEY rotate me\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in res["matches"]
+    assert "ssh-private-key" not in res["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_dotenv_file_itself_is_refused(temp_dir, monkeypatch, fallback):
+    _secret_project(temp_dir)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".env"}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in str(res)
+    assert "sensitive-path" in res["error"]
+    template = await tool_grep({"pattern": "API_KEY", "path": ".env.example"}, cwd=temp_dir)
+    assert "example-template" in template["matches"]
 
 
 async def test_glob_finds(temp_dir):
