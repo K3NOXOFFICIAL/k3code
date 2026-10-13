@@ -390,13 +390,22 @@ def _glob_dirs(root: Path, pattern: str, budget: list[int]) -> list[Path]:
     return found
 
 
+def _is_plain_dir(p: Path) -> bool:
+    """A directory that is not a symlink. An entry the filesystem refuses to stat (``pagefile.sys`` on a Windows drive
+    root under WSL) is not one: Python before 3.14 raises EACCES from ``is_dir`` there."""
+    try:
+        return p.is_dir() and not p.is_symlink()
+    except OSError:
+        return False
+
+
 def _scan_dirs(root: Path, names: set[str]) -> list[str]:
     """Relative directories to scan: ".", first-level subdirectories, workspace members (inside the root only)."""
     dirs = {"."}
     for n in names:
         if n.startswith(".") or n in SKIP_DIRS:
             continue
-        if (root / n).is_dir() and not (root / n).is_symlink():
+        if _is_plain_dir(root / n):
             dirs.add(n)
     resolved_root = root.resolve()
     extra: set[str] = set()
