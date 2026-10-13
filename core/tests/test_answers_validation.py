@@ -187,6 +187,8 @@ INTERACTIVE_ONLY = {
     "integrations.addmcp",
     "integrations.mcp_name",
     "integrations.mcp_target",
+    "onboard.retry_key",  # a rejected key, asked again (an unattended run fails instead, #147)
+    "onboard.probe_failed",  # retry, save anyway or cancel after a failed key check (unattended: no question)
 }
 
 
