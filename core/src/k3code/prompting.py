@@ -34,13 +34,14 @@ def prompt_sections(
     mcp: Any = None,
     skills: bool = True,
     advisor: bool = True,
+    attended: bool = True,
 ) -> list[tuple[str, str]]:
     """The prompt as ``(name, text)`` sections in the order they are sent."""
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
     # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
     parts = [("base", base.rstrip())]
-    style = outputstyle.style_text(effective_style(config, session_meta), cwd)
+    style = outputstyle.style_text(effective_style(config, session_meta), cwd, attended=attended)
     if style:
         parts.append(("style", style))
     from k3code.autonomy import advisor as _advisor
@@ -83,9 +84,17 @@ def build_system_prompt(
     mcp: Any = None,
     skills: bool = True,
     advisor: bool = True,
+    attended: bool = True,
 ) -> str:
     sections = prompt_sections(
-        base, cwd=cwd, config=config, session_meta=session_meta, mcp=mcp, skills=skills, advisor=advisor
+        base,
+        cwd=cwd,
+        config=config,
+        session_meta=session_meta,
+        mcp=mcp,
+        skills=skills,
+        advisor=advisor,
+        attended=attended,
     )
     return "\n\n".join(text for _, text in sections) + "\n"
 
@@ -129,7 +138,7 @@ def assemble_mode(mode: str, *, cwd: str | Path, config: Any) -> tuple[str, list
         atype = load_agent_types(cwd).get(name)
         if atype is None:
             raise ValueError(f"unknown sub-agent type {name!r} (one of {', '.join(mode_names(cwd))})")
-        session = prompt_sections(base, cwd=cwd, config=config)
+        session = prompt_sections(base, cwd=cwd, config=config, attended=False)  # as SubagentManager.build_loop
         text = subagent_system_prompt(
             "\n\n".join(t for _, t in session), name=name, description="<task description>", body=atype.prompt
         )
