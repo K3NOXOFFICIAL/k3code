@@ -1253,9 +1253,15 @@ def update_cmd(
         except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
             raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
+    try:
+        warnings = upd.vet_staged(ver)  # refuses a version that lost the TUI; nothing is switched or pruned then
+    except upd.SourceUpdateError as e:
+        raise click.ClickException(str(e)) from e
     res = upd.activate(ver)
     click.echo(res.message)
     if res.ok:
+        for line in warnings:
+            click.echo(line)
         upd.prune()
     raise SystemExit(0 if res.ok else 1)
 
