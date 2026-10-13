@@ -236,7 +236,10 @@ def _made_progress(chunk: dict[str, Any]) -> bool:
 
 
 def _inband_error(chunk: dict[str, Any]) -> ProviderError:
-    """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands."""
+    """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands.
+
+    No numeric status in the chunk means no status: a forced 502 would settle the class as ``server`` before the
+    error-code and message stages see ``insufficient_quota`` or ``rate_limit_exceeded``."""
     err = chunk.get("error")
     status = None
     if isinstance(err, dict):
@@ -249,7 +252,7 @@ def _inband_error(chunk: dict[str, Any]) -> ProviderError:
                 status = int(value)
                 break
     return ProviderError(
-        message=_error_message(chunk) or "error in stream", status_code=status or 502, headers={}, body=chunk
+        message=_error_message(chunk) or "error in stream", status_code=status, headers={}, body=chunk
     )
 
 

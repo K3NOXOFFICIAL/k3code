@@ -242,6 +242,7 @@ _INBAND_STATUS = {
     "rate_limit_error": 429,
     "api_error": 500,
     "authentication_error": 401,
+    "billing_error": 402,
     "permission_error": 403,
     "not_found_error": 404,
     "invalid_request_error": 400,
@@ -251,7 +252,7 @@ _INBAND_STATUS = {
 def _inband_error(event: dict[str, Any]) -> ProviderError:
     """An ``event: error`` inside a 200 stream, as a ProviderError the classifier understands."""
     err = event.get("error") if isinstance(event.get("error"), dict) else {}
-    status = _INBAND_STATUS.get(str(err.get("type") or ""), 500)
+    status = _INBAND_STATUS.get(str(err.get("type") or ""))  # unmapped: let the code/message stages decide
     message = str(err.get("message") or "error in stream")
     return ProviderError(message=message, status_code=status, headers={}, body=event)
 
