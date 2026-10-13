@@ -71,6 +71,23 @@ def test_mcp_server_env_headers_and_args_are_redacted_by_default():
     assert out["cookie_jar"] == REDACTED and out["author"] == "alice"
 
 
+@pytest.mark.parametrize(
+    "name", ["api_key", "apikey", "apiKey", "API_KEY", "x-api-key", "secret_key", "private_key", "ssh_keys", "key"]
+)
+def test_key_names_are_secret(name):
+    assert redact({name: "plain-looking-value"}) == {name: REDACTED}
+
+
+@pytest.mark.parametrize("name", ["token", "secret", "password", "auth_token", "client_secret", "db_password"])
+def test_other_secret_names_are_secret(name):
+    assert redact({name: "plain-looking-value"}) == {name: REDACTED}
+
+
+@pytest.mark.parametrize("name", ["keymap", "KEYMAP", "keyboard_layout", "keybindings", "keystroke_delay"])
+def test_a_name_that_only_contains_key_is_not_a_secret(name):
+    assert redact({"panes": {name: "tuios"}}) == {"panes": {name: "tuios"}}
+
+
 def test_session_payloads_are_scrubbed_in_every_string():
     session = {"messages": [{"role": "tool", "content": "$ cat .env\nDB_PASSWORD=hunter2secret\nAPI_KEY=abcdef123456"}]}
     out = redact_session_json(session)
