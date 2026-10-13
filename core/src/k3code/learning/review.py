@@ -7,11 +7,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
-from k3code.learning import distiller
+from k3code.learning import DEFAULTS, curator, distiller
+from k3code.learning.ranking import jaccard, tokens
 from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
 from k3code.memory import clean_fact
 from k3code.paths import ensure_private_dir, home, private_file
@@ -30,6 +33,12 @@ SYSTEM = (
     "contents. Return empty lists when nothing qualifies."
 )
 _NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+
+#: A project gets at most ``max_skill_cards`` new skill cards per this long, answered or not.
+CARD_WINDOW = 7 * 86400.0
+
+#: How much of the body the card itself shows (the TUI cuts it to the terminal width); ``/proposals show`` has it all.
+PREVIEW_CHARS = 120
 
 
 #: A compaction summary is the only record of the folded part of the conversation, so it is clipped less than a message.
@@ -83,6 +92,23 @@ def write_draft(name: str, description: str, body: str) -> Path:
     return md
 
 
+def _is_save_card(p: Proposal) -> bool:
+    return p.kind == "skill" and p.payload.get("op") == "save"
+
+
+def _known_skills(existing: list[Proposal]) -> list[set[str]]:
+    """Token sets of the live skills and of every skill a card was made for, dismissed ones included (the draft of
+    a card that was answered is gone, so its body is kept in the card)."""
+    out = [tokens(curator.skill_body(sk["text"])) for sk in curator.list_skills()]
+    for p in existing:
+        if _is_save_card(p):
+            body = p.payload.get("body")
+            if body is None:  # a card made before the body was kept in it
+                body = curator.skill_body(curator.draft_text(p.payload) or "")
+            out.append(tokens(str(body)))
+    return out
+
+
 async def review_session(
     caller: Any,
     messages: list[dict[str, Any]],
@@ -95,11 +121,18 @@ async def review_session(
     mem0_post: Any = None,
     project: str = "",
     turns: int | None = None,
+    ranker: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    max_skill_cards: int = DEFAULTS["skill_cards_per_week"],
+    now: float | None = None,
 ) -> dict[str, Any]:
     """Returns {"skipped": bool, "facts": [...], "drafts": [paths], "proposals": [...]}.
 
     ``turns`` is the user turns of the whole session (``session_turns``); ``messages`` may be a compacted list that is
     shorter than the session.
+
+    A skill becomes a card only when its body is not like a live skill or a skill an earlier card was made for (a
+    reworded name is not a new skill), the ``ranker`` keeps it, and the project is under ``max_skill_cards`` per
+    ``CARD_WINDOW``. A card whose name was seen never rewrites that draft.
     """
     if (user_turns(messages) if turns is None else turns) <= min_turns:
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
@@ -134,27 +167,53 @@ async def review_session(
                 distiller.project_scope(cwd, project),
             )
         )
-    drafts: list[str] = []
-    props: list[Proposal] = []
+    existing = store.all()
+    known = _known_skills(existing)
+    seen = {p.key for p in existing}
+    since = (time.time() if now is None else now) - CARD_WINDOW
+    made = sum(1 for p in existing if _is_save_card(p) and p.project == project and p.ts >= since)
+    cands: list[dict[str, Any]] = []
     for s in data.get("skills") or []:
         if not isinstance(s, dict) or not _NAME.match(str(s.get("name", ""))) or not str(s.get("body", "")).strip():
             continue
-        if (home() / "skills" / s["name"]).exists():
+        name = s["name"]
+        key = dedup_key("skill", f"save {name}")
+        if (home() / "skills" / name).exists() or key in seen:
             continue
-        body = scrub_text(str(s["body"]))
-        md = write_draft(s["name"], scrub_text(str(s.get("description", ""))).replace("\n", " "), body)
-        drafts.append(str(md))
-        label = f"Save skill '{s['name']}'? ({str(s.get('description', ''))[:80]})"
-        payload = {"op": "save", "name": s["name"], "draft": str(md)}
-        p = store.add(
-            "skill",
-            label,
-            f"save skill {s['name']}",
-            session_id,
-            payload=payload,
-            project=project,
-            key=dedup_key("skill", f"save {s['name']}"),
+        body = scrub_text(str(s["body"])).strip()
+        mine = tokens(body)
+        if any(jaccard(mine, k) >= curator.DUP_THRESHOLD for k in known):
+            continue
+        known.append(mine)
+        seen.add(key)
+        desc = scrub_text(str(s.get("description", ""))).replace("\n", " ")
+        preview = " ".join(body.split())
+        label = (
+            f"Save skill '{name}'? ({desc[:80]}) {preview[:PREVIEW_CHARS]}{'…' if len(preview) > PREVIEW_CHARS else ''}"
         )
+        cands.append(
+            {
+                "kind": "skill",
+                "text": label,
+                "action": f"save skill {name}",
+                "key": key,
+                "name": name,
+                "desc": desc,
+                "body": body,
+            }
+        )
+    if ranker is not None:
+        cands = ranker(cands)
+    drafts: list[str] = []
+    props: list[Proposal] = []
+    for c in cands:
+        if made >= max_skill_cards:
+            break
+        md = write_draft(c["name"], c["desc"], c["body"])
+        drafts.append(str(md))
+        payload = {"op": "save", "name": c["name"], "draft": str(md), "body": c["body"]}
+        p = store.add("skill", c["text"], c["action"], session_id, payload=payload, project=project, key=c["key"])
         if p:
             props.append(p)
+            made += 1
     return {"skipped": False, "facts": facts, "drafts": drafts, "proposals": props}

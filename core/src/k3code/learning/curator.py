@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -18,10 +19,65 @@ from k3code.paths import home, private_file
 from k3code.skills import parse_frontmatter
 
 DUP_THRESHOLD = 0.7
+#: A draft younger than this is never pruned (a crash leftover, or the "draft kept at" of an accepted card, can still
+#: be wanted for a few days).
+DRAFT_GRACE = 7 * 86400.0
 
 
 def skills_dir() -> Path:
     return home() / "skills"
+
+
+def drafts_dir(root: Path | None = None) -> Path:
+    return (root or skills_dir()) / "_drafts"
+
+
+def skill_body(text: str) -> str:
+    """The markdown below a SKILL.md's frontmatter."""
+    m = re.match(r"---\n.*?\n---\n(.*)", text, re.S)
+    return m.group(1) if m else text
+
+
+def draft_text(payload: dict[str, Any]) -> str | None:
+    """The SKILL.md a "save" card would move into the skills, or None when the draft is gone."""
+    try:
+        return Path(payload["draft"]).read_text(encoding="utf-8")
+    except (KeyError, OSError):
+        return None
+
+
+def discard_draft(payload: dict[str, Any], root: Path | None = None) -> bool:
+    """Delete the draft of a dismissed "save" card; True if it was there. Only a real directory directly under
+    ``_drafts`` goes, whatever the payload says."""
+    if payload.get("op") != "save" or not payload.get("draft"):
+        return False
+    d = Path(payload["draft"]).parent
+    if d.is_symlink() or not d.is_dir() or d.parent.resolve() != drafts_dir(root).resolve():
+        return False
+    shutil.rmtree(d, ignore_errors=True)
+    return True
+
+
+def prune_drafts(store: ProposalStore, now: float, root: Path | None = None, grace: float = DRAFT_GRACE) -> list[str]:
+    """Delete the drafts no pending card is waiting on (a dismissed or accepted card, a crash, an older version left
+    them); returns their names. A draft younger than ``grace`` stays."""
+    base = drafts_dir(root)
+    if not base.is_dir():
+        return []
+    wanted = {
+        Path(p.payload["draft"]).parent.resolve()
+        for p in store.all()
+        if p.kind == "skill" and p.status == "pending" and p.payload.get("op") == "save" and p.payload.get("draft")
+    }
+    pruned = []
+    for d in sorted(base.iterdir()):
+        if d.is_symlink() or not d.is_dir() or d.resolve() in wanted:
+            continue
+        md = d / "SKILL.md"
+        if now - max(d.stat().st_mtime, md.stat().st_mtime if md.is_file() else 0.0) > grace:
+            shutil.rmtree(d, ignore_errors=True)
+            pruned.append(d.name)
+    return pruned
 
 
 def _usage_path() -> Path:
@@ -101,7 +157,8 @@ def find_duplicates(skills: list[dict[str, Any]]) -> list[tuple[str, str, float]
 def curate(
     store: ProposalStore, *, now: float | None = None, stale_days: int = 30, root: Path | None = None
 ) -> dict[str, Any]:
-    """Mark stale skills (``.curator.json``) and propose merges for duplicates. Never deletes."""
+    """Mark stale skills (``.curator.json``) and propose merges for duplicates. Never deletes a skill; it does prune
+    the drafts nobody is waiting on."""
     now = time.time() if now is None else now
     root = root or skills_dir()
     skills = list_skills(root)
@@ -133,7 +190,7 @@ def curate(
         )
         if p:
             proposals.append(p)
-    return {"stale": stale, "proposals": proposals}
+    return {"stale": stale, "proposals": proposals, "pruned": prune_drafts(store, now, root)}
 
 
 def _skill_dir(root: Path, name: str) -> Path | None:
