@@ -61,6 +61,11 @@ class Ctx:
     def say(self, text: str = "") -> None:
         self.p.say(text)
 
+    @property
+    def live(self) -> bool:
+        """May setup call the network: no ``--no-probe``, and the providers step was not told not to test live."""
+        return self.do_probe and bool(self.data.get("providers", {}).get("live", True))
+
 
 def themes() -> list[str]:
     extra = sorted(f.stem for f in (home() / "skins").glob("*.y*ml")) if (home() / "skins").is_dir() else []
@@ -298,7 +303,8 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         if e:
             entries.append(e)
     results: dict[str, Any] = {}
-    if c.p.confirm("providers.test", "Test each provider live?", c.p.interactive) and c.do_probe:
+    test_live = c.p.confirm("providers.test", "Test each provider live?", c.p.interactive)  # kept for later steps
+    if test_live and c.do_probe:
         for e in entries:
             if e.get("kind") == "claude-cli":  # no endpoint to list models from
                 continue
@@ -309,7 +315,13 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         c.say("  WARNING: every entry goes through a self-hosted gateway; add a direct provider as a bypass.")
     elif not entries:
         c.say("  WARNING: no provider configured; k3code cannot run models.")
-    return {"entries": entries, "tested": results}
+    return {"entries": entries, "tested": results, "live": test_live}
+
+
+def _tier_answer(c: Ctx, tier: str, provider: str) -> Any:
+    """The answers file's model for ``tier``: one id for every provider, or a mapping from provider name."""
+    given = c.p.raw(f"tiers.{tier}")
+    return given.get(provider) if isinstance(given, dict) else given
 
 
 def step_tiers(c: Ctx) -> dict[str, Any]:
@@ -318,14 +330,14 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
     out: dict[str, dict[str, str]] = {}
     for e in providers:
         claude_cli = e.get("kind") == "claude-cli"
-        live = c.do_probe and not claude_cli
+        answers = {t: _tier_answer(c, t, e["name"]) for t in TIERS}
+        # the model list is only there to choose a tier's model from: no live tests, or every tier answered, no call
+        live = c.live and not claude_cli and any(a is None for a in answers.values())
         key = os.environ.get(e.get("api_key_env", ""), "")
         ok, _ms, ids, _d = probe.list_models(e, key) if live else (False, 0, [], "")
         tiers: dict[str, str] = {}
         for t in TIERS:
-            given = c.p.raw(f"tiers.{t}")
-            if isinstance(given, dict):
-                given = given.get(e["name"])
+            given = answers[t]
             if given is not None:
                 tiers[t] = str(given)
             elif ok and ids and c.p.interactive:
@@ -725,7 +737,7 @@ def step_summary(c: Ctx) -> dict[str, Any]:
     path = user_config_path() if c.only_step else write_config(c.data)
     mem = write_user_md(c.data, c.say)
     c.say(f"Wrote {mem}" if c.only_step else f"Wrote {path} and {mem}")
-    checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
+    checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe, network=c.live))
     c.say(doctor.format_report(checks))
     return {"config": str(path)}
 

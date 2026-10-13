@@ -791,14 +791,18 @@ def install_subset(home: Path | None = None) -> list[Check]:
     return [Check(c.name, WARN if c.status == FAIL else c.status, c.detail, c.fix, c.data) for c in checks]
 
 
-async def run_checks(config: Settings | None = None, *, probe: bool = True, home: Path | None = None) -> list[Check]:
+async def run_checks(
+    config: Settings | None = None, *, probe: bool = True, network: bool = True, home: Path | None = None
+) -> list[Check]:
+    """``probe=False`` skips every probe; ``network=False`` skips only the ones that leave the machine (the providers,
+    the internet), so the daemon and the sandbox are still tried."""
     home = home or k3_home()
     config = config or load_config(project_dir=Path.cwd())
     checks: list[Check] = []
-    checks += await check_providers(config, probe=probe)
+    checks += await check_providers(config, probe=probe and network)
     checks.append(check_keys(config))
     checks += check_context_windows(config)
-    checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
+    checks.append(await check_netwatch_async() if probe and network else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
     checks.append(daemon_check)
