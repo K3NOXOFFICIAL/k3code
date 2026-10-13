@@ -39,7 +39,7 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     ("dotenv-cat", r"\bcat\b[^\n;|&]*\.env\b(?!\.(?:example|sample|template|dist)\b)"),
     ("git-push-force-main", r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)(?=[^\n;|&]*\b(?:main|master)\b)"),
     # `function f { f|f& }; f`: a function that pipes itself into itself (`f(){ f|f& }` is _fork_bomb's)
-    ("fork-bomb", r"\bfunction\s+([\w:.-]+)\s*(?:\(\))?\s*\{\s*\1\s*\|\s*\1\s*&?\s*\}"),
+    ("fork-bomb", r"\bfunction\s+([\w:.-]+)\s*(?:\(\)\s*)?\{\s*\1\s*\|\s*\1\s*(?:&\s*)?\}"),
 ]
 
 #: Remote hosts whose services must never be restarted from here. ``ssh <host> "<remote command>"`` can carry
@@ -326,14 +326,20 @@ def _user_pattern(rx: str) -> re.Pattern[str]:
 
 
 #: ``(){ f|f& }``: the body of a fork bomb, from its ``()`` on (the name in front is checked by _fork_bomb).
-_FORK_BODY = re.compile(r"\(\)\s*\{\s*([\w:.-]+)\s*\|\s*\1\s*&?\s*\}")
+_FORK_BODY = re.compile(r"\(\)\s*\{\s*([\w:.-]+)\s*\|\s*\1\s*(?:&\s*)?\}")  # no two \s* side by side
 
 
 def _fork_bomb(text: str) -> bool:
     """``:(){ :|:& };:`` / ``f(){ f|f& }``: a function whose body pipes its own name into itself. Matched from each
     ``()`` and checked back to the word in front, which must end with that name: linear in the line, where one regex
     from the name on tried every start of a long word (quadratic, seconds for a 10k-character command)."""
-    return any(text[: m.start()].rstrip().endswith(m.group(1)) for m in _FORK_BODY.finditer(text))
+    for m in _FORK_BODY.finditer(text):
+        end = m.start()
+        while end and text[end - 1].isspace():
+            end -= 1
+        if text.endswith(m.group(1), 0, end):
+            return True
+    return False
 
 
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
@@ -886,12 +892,12 @@ def strip_redirects(sub: str, heredocs: bool = True, legacy: bool = False) -> st
 
 # ── brace expansion, variables the command line assigns, working directories ──
 
-_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_BRACE = re.compile(r"\{([^{},]*,[^{}]*)\}")  # up to the first comma, then the rest: no backtracking over commas
 #: The most spellings the checks look at: words of one brace expansion, combinations of the values the line assigns
 #: its variables, directories a cd may lead to. Past one the line is not judged on what was kept (see capped).
 BRACE_WORDS_CAP = 64
 COMBINATIONS_CAP = 16
-DIRS_CAP = 32
+DIRS_CAP = 256  # each relative cd doubles the directories (joined to every one so far): eight chained cds fit
 
 
 def _brace_expand(word: str, limit: int) -> tuple[list[str], bool]:

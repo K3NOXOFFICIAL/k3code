@@ -334,7 +334,7 @@ def test_a_line_past_an_expansion_cap_is_asked_never_allowed(proj: Path, cmd: st
 
 
 def test_a_line_that_cds_past_the_directory_cap_is_asked_never_allowed(proj: Path) -> None:
-    cmd = "".join(f"cd {proj}/d{i}; " for i in range(32)) + "cd /; rm -rf *"  # the 33rd directory was dropped
+    cmd = "".join(f"cd {proj}/d{i}; " for i in range(hardline.DIRS_CAP)) + "cd /; rm -rf *"  # `/` was dropped
     _assert_needs_human(cmd, proj)
     assert _bash(cmd, "yolo", proj).action == "deny"
 
@@ -911,6 +911,33 @@ def test_the_fork_bomb_rule_is_linear_and_still_catches_long_and_suffix_names() 
     name = "a" * 300  # no length cap on the name: a long one is no way around the rule
     assert hardline.check(f"{name}(){{ {name}|{name}& }};{name}") == "fork-bomb"
     assert hardline.check("x.f(){ f|f& }; x.f") == "fork-bomb"  # as before: the body's name ends the word in front
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(){a|a}" * 120_000,  # many bodies: the word in front of each was copied out of the line
+        "f(){f|f" + " " * 40_000 + "x",  # an unclosed body: the two \s* around & backtracked against each other
+        "function f" + " " * 40_000 + "x",
+        "function f(){f|f" + " " * 40_000 + "x",
+        "echo {" + "," * 40_000,  # an unclosed brace group full of commas
+    ],
+    ids=["many-bodies", "unclosed-body", "function-spaces", "function-body", "brace-commas"],
+)
+def test_the_hardline_regexes_stay_fast_on_pathological_lines(text: str) -> None:
+    import time
+
+    started = time.perf_counter()
+    assert hardline._match(text, None) is None
+    hardline.brace_expand(text)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_chained_relative_cds_stay_under_the_directory_cap(proj: Path) -> None:
+    # each relative cd is joined to every directory the line may be in, so their number doubles per cd
+    cmd = "cd src && cd lib && cd x && cd y && cd z && cd w && cd v && ls"
+    assert _bash(cmd, "yolo", proj).action == "allow"
+    assert not _bash(cmd, "auto", proj).needs_human
 
 
 NEW_HARDLINE_CONTROLS = [
