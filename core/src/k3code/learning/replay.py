@@ -25,6 +25,7 @@ from typing import Any
 
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
+from k3code.skills import PROMPT_LIMIT
 from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
 
 RECORD_PARTS = ("learning", "replay", "turns.jsonl")
@@ -287,7 +288,7 @@ async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]])
     ``auto_ok`` (whether the gate allows an automatic change). Candidates that would not reduce anything are dropped."""
     now_clip = int(context.get("tool_output_chars", 10_000))
     now_memory = int(context.get("memory_chars", 20_000))
-    now_skills = int(context.get("skill_prompt_limit", 60))
+    now_skills = int(context.get("skill_prompt_limit", PROMPT_LIMIT))
     specs: list[tuple[Candidate, dict[str, Any], str]] = []
     if now_clip > TOOL_CLIP_CANDIDATE:
         specs.append(
