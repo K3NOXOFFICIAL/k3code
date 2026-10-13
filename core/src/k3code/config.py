@@ -32,7 +32,9 @@ class ProviderEntry(BaseModel):
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
     api_key_env: str = ""  # required for "openai" / "anthropic"
-    api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
+    #: populated by load_config() from the api_key_env var; never set this directly. Not in repr: a logged or
+    #: printed config must not carry the key.
+    api_key: str = Field(default="", repr=False)
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: Optional one-line text per model key ({default: "Everyday coding", cheap: "Fast and cheap"}), shown by /tune.
     descriptions: dict[str, str] = Field(default_factory=dict)
@@ -508,32 +510,40 @@ def load_config(
     merged = _merge_dicts(merged, env_overrides)
     merged = _merge_dicts(merged, cli)
 
-    # Expand provider api_key_env -> api_key (api_key_env is a required field on
-    # ProviderEntry, so look it up without popping it out of the dict).
+    _warn_unknown_escalate_keys(merged)
+    _warn_unknown_agents_keys(merged)
+    _warn_unknown_mode_keys(merged)
+    _warn_unknown_context_keys(merged)
+
+    # Validate first, then expand api_key_env -> api_key on the validated entries. A validation error echoes its input
+    # (pydantic's input_value=<the provider block>), so a key in that block would show up in the error text (its tail
+    # survives the truncation) and in every log it reaches. An api_key written in config.yaml was always replaced
+    # here; it is dropped before validation for the same reason. A providers value or entry of the wrong type is left
+    # to pydantic, which reports it like any other config error.
+    providers = merged.get("providers")
+    if isinstance(providers, list):
+        merged["providers"] = [
+            {k: v for k, v in p.items() if k != "api_key"} if isinstance(p, dict) else p for p in providers
+        ]
+    try:
+        settings = Settings(**merged)
+    except ValidationError as e:
+        raise ConfigError(_describe_invalid(e, user_config_path, project_dir)) from e
+
     # The process environment wins; otherwise fall back to the env file the setup wizard
     # writes (~/.config/k3code/env), so a key stored there also works outside systemd.
     from k3code.setup.state import read_env_file
 
     file_env = read_env_file()
-    providers = merged.get("providers")
-    for p in providers if isinstance(providers, list) else []:
-        if isinstance(p, dict):  # anything else is reported by the validation below
-            name = p.get("api_key_env", "")
-            p["api_key"] = os.environ.get(name) or file_env.get(name, "")
+    for entry in settings.providers:
+        entry.api_key = os.environ.get(entry.api_key_env) or file_env.get(entry.api_key_env, "")
 
-    try:
-        settings = Settings(**merged)
-    except ValidationError as e:
-        raise ConfigError(_describe_invalid(e, user_config_path, project_dir)) from e
-    _warn_unknown_escalate_keys(merged)
-    _warn_unknown_agents_keys(merged)
-    _warn_unknown_mode_keys(merged)
-    _warn_unknown_context_keys(merged)
     return settings
 
 
 def _describe_invalid(e: ValidationError, user_file: Path, project_dir: Path | None) -> str:
-    """The first validation error with the config file(s) or environment variable that can have caused it."""
+    """The first validation error with the config file(s) or environment variable that can have caused it. Only the
+    location and the message: pydantic's own text echoes the input, which can hold a key."""
     first = e.errors()[0]
     loc = ".".join(str(x) for x in first["loc"])
     top = str(first["loc"][0]) if first["loc"] else ""
