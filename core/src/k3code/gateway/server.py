@@ -286,6 +286,8 @@ class LiveSession:
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
+        #: the "no sandbox" notice is showing (auto/yolo bash without a usable bwrap); cleared when the mode leaves them
+        self.unsandboxed_notice = False
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -353,6 +355,32 @@ class LiveSession:
         self.stored.meta["mode"] = mode.value
         self.server.store.save(self.stored)
         self.emit("session.info", self.live_info())
+        if self.unsandboxed_notice and mode not in (PermissionMode.AUTO, PermissionMode.YOLO):
+            self.unsandboxed_notice = False
+            self.emit("notification.clear", {"key": self.UNSANDBOXED_KEY}, importance="essential")
+
+    #: Notification key of the "no sandbox" warning (see notify_unsandboxed).
+    UNSANDBOXED_KEY = "k3.sandbox.unusable"
+
+    def notify_unsandboxed(self) -> None:
+        """Tell the clients that this auto/yolo session's bash runs without the sandbox (bwrap is unusable here). The
+        notice is sticky: it stays until the mode leaves auto/yolo."""
+        if self.perms.mode == PermissionMode.YOLO:
+            what = "yolo mode runs every command on this machine"
+        else:
+            what = "auto mode asks before each command it would have run in the sandbox"
+        self.unsandboxed_notice = True
+        self.emit(
+            "notification.show",
+            {
+                "text": f"⚠ No sandbox: bubblewrap is unusable here, so {what}. See /doctor.",
+                "level": "warn",
+                "kind": "sticky",
+                "key": self.UNSANDBOXED_KEY,
+                "session_id": self.session_id,
+            },
+            importance="essential",
+        )
 
     @property
     def history(self) -> list[Message]:
@@ -1930,6 +1958,7 @@ class GatewayServer:
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
             context_window=self._router_window(router, session),
         )
+        loop.on_unsandboxed = session.notify_unsandboxed
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps

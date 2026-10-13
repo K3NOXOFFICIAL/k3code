@@ -154,6 +154,10 @@ class AgentLoop:
         #: Unattended bash keeps the network only when configured (``autonomy.unattended_network``).
         self.unattended_network = unattended_network
         self._sandbox_warned = False
+        #: called (on the event loop, once per loop) when an interactive auto/yolo bash runs or asks to run without the
+        #: sandbox because bwrap is unusable here; the gateway shows the session a notice
+        self.on_unsandboxed: Callable[[], None] | None = None
+        self._unsandboxed_told = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         #: called when a retry makes the streamed text so far void (the consumer clears its copy)
@@ -515,8 +519,9 @@ class AgentLoop:
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
             return {"error": f"Permission denied (unattended run): {decision.message}"}
-        # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
+        # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
+        no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
         if home_rooted:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
@@ -527,13 +532,27 @@ class AgentLoop:
                 auto_allowed=False,
                 message="no sandbox at the home directory: approve to run unsandboxed, or start k3code in a project",
             )
+        elif no_bwrap:
+            self._tell_unsandboxed()
+            if decision.auto_allowed:
+                # Auto mode allows what the sandbox would contain. Without bwrap the command runs on the host, so a
+                # human approves what only auto mode allowed (rules and the read-only allowlist still apply, as in
+                # accept-edits). yolo is the explicit no-prompt mode: it runs, and the session has been told.
+                decision = replace(
+                    decision,
+                    action="ask",
+                    needs_human=True,
+                    auto_allowed=False,
+                    message="no sandbox here (bubblewrap is unusable): approve to run this on the host, see /doctor",
+                )
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
         # a hook's "approve" answers the prompt, but never one only a human may answer
         if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
-                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
+                why = f": {decision.message}" if decision.message else ""
+                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter){why}"}
             answer = await self.approval_callback(tool_call.name, args, decision)
             if not answer.allowed:
                 what = _preview(tool_call.name, args)
@@ -688,15 +707,33 @@ class AgentLoop:
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return False
         if not sandbox.usable():
-            return False  # no bwrap: bash already runs unsandboxed (warned once in _sandbox_argv), nothing to approve
+            return False  # no bwrap: see _bwrap_unusable
         return sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is not None
+
+    def _bwrap_unusable(self) -> bool:
+        """An interactive sandboxed session (auto/yolo) on a host where bwrap is unusable: its bash runs on the host."""
+        if self.background or self.unattended:
+            return False  # nobody to approve: _sandbox_argv refuses bash instead (fail closed)
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
+            return False
+        return not sandbox.usable()
+
+    def _tell_unsandboxed(self) -> None:
+        if self._unsandboxed_told or self.on_unsandboxed is None:
+            return
+        self._unsandboxed_told = True
+        try:
+            self.on_unsandboxed()
+        except Exception:  # noqa: BLE001 - a notice must never break a turn
+            logger.warning("unsandboxed notice failed", exc_info=True)
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
 
-        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once). An unattended
-        session (background, goal continuation, sub-agent) has no human to see a warning, so it raises
-        :class:`sandbox.SandboxUnavailable` instead: fail closed, nothing runs.
+        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once; the session is told
+        and auto mode asks first, see _bwrap_unusable). An unattended session (background, goal continuation,
+        sub-agent) has no human to see a warning, so it raises :class:`sandbox.SandboxUnavailable` instead: fail
+        closed, nothing runs.
         """
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None

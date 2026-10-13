@@ -495,7 +495,7 @@ def check_sandbox(probe: bool = True) -> Check:
                 "sandbox",
                 WARN,
                 "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash is refused, "
-                "interactive auto/yolo bash runs unsandboxed",
+                "interactive auto mode asks before each command it would have sandboxed, yolo bash runs unsandboxed",
                 "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
             )
         # bwrap starting is not enough either: a resolver file the sandbox cannot read means no host name resolves
@@ -513,8 +513,8 @@ def check_sandbox(probe: bool = True) -> Check:
     return Check(
         "sandbox",
         WARN,
-        "bwrap not found: unattended bash (background, goal, sub-agent) is refused; auto/yolo bash runs WITHOUT a "
-        "sandbox",
+        "bwrap not found: unattended bash (background, goal, sub-agent) is refused; auto mode asks before each "
+        "command it would have sandboxed; yolo bash runs WITHOUT a sandbox",
         "install bubblewrap (dnf/apt install bubblewrap)",
     )
 

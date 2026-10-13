@@ -5,8 +5,10 @@ sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (on
 project is writable, and its git metadata is read-only so a command cannot plant a hook. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
-Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed and ``/doctor``
-warns. An unattended session is refused instead (:class:`SandboxUnavailable`): it never falls back.
+Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
+before each command only the sandbox made safe, yolo runs it, the session shows a warning and ``/doctor`` reports it
+(see ``AgentLoop._bwrap_unusable``). An unattended session is refused instead (:class:`SandboxUnavailable`): it never
+falls back.
 
 Deliberate exceptions, not sandboxed: MCP stdio servers (see ``mcpclient.stdio_env``) and harness git, which is not
 model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_git_argv`).
