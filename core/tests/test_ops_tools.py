@@ -291,6 +291,98 @@ async def test_unattended_bash_is_refused_when_bwrap_is_unusable(tmp_path, monke
     assert spawned == [] and not (tmp_path / "made.txt").exists()
 
 
+async def test_unattended_bash_the_sandbox_refuses_is_never_put_to_a_human(tmp_path, monkeypatch):
+    """A background or goal session asks no approval for bash the sandbox will refuse (approving it ran nothing),
+    and the refusal gives only its own reason: the project-directory hint only when the cwd is the refused root."""
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    home.mkdir()
+    proj.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    asked: list[str] = []
+
+    async def approve(name, args, decision):
+        asked.append(args["command"])
+        raise AssertionError("bash the sandbox refuses was put to a human")
+
+    async def refusal(usable: bool, cwd: Path, add_dirs: list[str], **kwargs) -> str:
+        monkeypatch.setattr(sandbox, "usable", lambda: usable)
+        loop = AgentLoop(_R(), system_prompt="x", cwd=cwd, headless=False, approval_callback=approve, **kwargs)  # type: ignore[arg-type]
+        loop.permissions.add_dirs = add_dirs
+        result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+        return result["error"]
+
+    for kwargs in ({"background": True}, {"unattended": True}):
+        # bwrap unusable in a project: only the bubblewrap explanation (the cwd is already a fine root)
+        err = await refusal(False, proj, [], **kwargs)
+        assert err == "bash refused: bubblewrap is unusable here: unattended bash is refused; see /doctor"
+        # the cwd is $HOME: the project-directory hint, but no add_dirs (adding a dir never unrefuses the cwd)
+        err = await refusal(True, home, [], **kwargs)
+        assert err.startswith(f"bash refused: refusing to make {home.resolve()} writable") and "add_dirs" not in err
+        assert "Unattended work needs a project directory as its root" in err
+        # a project cwd with $HOME added: the refused root is the added dir, so no project-directory hint either
+        err = await refusal(True, proj, [str(home)], **kwargs)
+        assert err.startswith(f"bash refused: refusing to make {home.resolve()} writable")
+        assert "Unattended work needs" not in err and "add_dirs" not in err
+    assert asked == [] and not (proj / "made.txt").exists() and not (home / "made.txt").exists()
+
+
+async def test_unattended_bash_refused_after_its_approval_gives_only_the_bubblewrap_reason(tmp_path, monkeypatch):
+    """bwrap that becomes unusable while the prompt was open still fails closed, with the bubblewrap reason only."""
+    import asyncio
+
+    from k3code.agent.loop import AgentLoop, ApprovalResult
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    probes = iter([True, False])  # usable when the call arrives, unusable once it was approved
+    monkeypatch.setattr(sandbox, "usable", lambda: next(probes))
+    asked: list[str] = []
+    spawned: list[tuple] = []
+
+    async def approve(name, args, decision):
+        asked.append(args["command"])
+        return ApprovalResult(choice="once")
+
+    async def refuse_spawn(*argv, **kwargs):
+        spawned.append(argv)
+        raise AssertionError("an unattended command must not be spawned without bwrap")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", refuse_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_spawn)
+    loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, headless=False, approval_callback=approve, background=True)  # type: ignore[arg-type]
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+    assert result["error"] == "bash refused: bubblewrap is unusable here: unattended bash is refused; see /doctor"
+    assert asked == ["touch made.txt"] and spawned == [] and not (tmp_path / "made.txt").exists()
+
+
+async def test_interactive_bash_without_bwrap_still_asks_for_approval(tmp_path, monkeypatch):
+    """A user is watching: the sandbox pre-check leaves the interactive prompt (and unsandboxed fallback) alone."""
+    from k3code.agent.loop import AgentLoop, ApprovalResult
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    asked: list[str] = []
+
+    async def deny(name, args, decision):
+        asked.append(args["command"])
+        return ApprovalResult(choice="deny")
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, headless=False, approval_callback=deny)  # type: ignore[arg-type]
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+    assert asked == ["touch made.txt"] and result["error"].startswith("User denied")
+
+
 def test_doctor_warns_without_bwrap(monkeypatch):
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: None)
     assert doctor.check_sandbox().status == "warn"
