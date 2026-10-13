@@ -427,14 +427,18 @@ class LearningHub:
             return
         self.mine_permissions(session)
         msgs = session.stored.messages
-        turns = review.user_turns(msgs)
         meta = session.stored.meta
+        turns = review.session_turns(meta, msgs)
+        reviewed = int(meta.get("reviewed_turns", 0))
+        if reviewed > turns:  # a mark from before the total was kept: it counted the compacted list, which is shorter
+            reviewed = 0
         minimum = int(self.cfg["review_min_turns"])
-        if status == "done" and turns > minimum and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1:
+        if status == "done" and turns > minimum and turns > reviewed + minimum - 1:
             meta["reviewed_turns"] = turns
             r = await review.review_session(
                 self.server.model_caller,
                 msgs,
+                turns=turns,
                 store=self.store,
                 cwd=Path(session.stored.cwd or "."),
                 config=self.server.config,
