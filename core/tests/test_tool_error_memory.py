@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -48,6 +49,24 @@ async def test_failures_are_recorded_scrubbed_with_class_and_project(tmp_path, m
     res = {"stdout": "", "stderr": "", "exit_code": 1}
     hub.tool_outcome(_session(server, tmp_path), tc, res, failure_of("bash", tc.arguments, res))
     assert len(hub.log.query("tool_error", actor=None)) == 1
+
+
+async def test_a_key_that_is_the_whole_error_line_is_not_stored_as_the_error_class(tmp_path, monkeypatch):
+    # a short first line without a colon becomes the class verbatim; the class is a column of its own in decisions.db
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    s = _session(server, tmp_path)
+    for result in (
+        {"error": FAKE_KEY},  # the whole error line
+        {"error": f"{FAKE_KEY}: rejected"},  # the part before the first colon
+        {"error": f"Authorization: Bearer {FAKE_KEY}"},  # a credential shape that spans the colon
+    ):
+        tc = ToolCall(id="k", name="db", arguments={})
+        hub.tool_outcome(s, tc, result, failure_of("db", tc.arguments, result))
+    stored = sqlite3.connect(hub.home / "learning" / "decisions.db").execute("SELECT choice, subject FROM decisions")
+    rows = stored.fetchall()
+    assert len(rows) == 3
+    assert FAKE_KEY not in json.dumps(rows)
 
 
 async def test_third_repeat_in_a_project_proposes_a_gotcha_with_the_followup_hint(tmp_path, monkeypatch):
