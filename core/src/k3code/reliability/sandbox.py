@@ -31,6 +31,7 @@ from pathlib import Path
 from k3code import paths
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.permissions import PermissionMode
+from k3code.permissions.engine import windows_drives
 
 logger = logging.getLogger(__name__)
 
@@ -221,8 +222,9 @@ async def spawn_unattended_shell(
     )
 
 
-def _refuse_root(root: Path, home: Path) -> None:
-    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home."""
+def _refuse_root(root: Path, home: Path, drives: Iterable[str] | None = None) -> None:
+    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home; nor,
+    under WSL, a Windows profile or a directory above one (see :func:`windows_profile_root`)."""
     for guarded in (home, home / ".ssh", paths.home()):
         target = guarded.resolve()
         if root == target or root in target.parents:
@@ -230,6 +232,28 @@ def _refuse_root(root: Path, home: Path) -> None:
                 f"refusing to make {root} writable inside the sandbox: it is or contains $HOME, ~/.ssh or the "
                 "k3code home; start the session in a project folder"
             )
+    if windows_profile_root(root, drives):
+        raise SandboxRefused(
+            f"refusing to make {root} writable inside the sandbox: it is or contains a Windows user profile (its "
+            ".ssh, .aws and AppData with the browsers' saved passwords); start the session in a project folder"
+        )
+
+
+def windows_profile_root(root: Path | str, drives: Iterable[str] | None = None) -> bool:
+    """``root`` is a Windows drive WSL mounts (``/mnt/c``), its ``Users`` folder or a profile in it
+    (``/mnt/c/Users/<name>``), or a directory above one (``/mnt``, ``/``): the Windows-side ``$HOME``, which the
+    k3code shim starts in when a Windows terminal opens in ``C:\\Users\\<name>`` (issue #134). drvfs is
+    case-insensitive, so is this. A project below a profile (``/mnt/c/Users/<name>/src/app``) is fine."""
+    folded = str(root).lower().rstrip("/")
+    for drive in windows_drives() if drives is None else drives:
+        drive = drive.lower().rstrip("/")
+        if folded == drive or drive.startswith(folded + "/"):
+            return True  # the drive itself, or above it
+        if folded.startswith(drive + "/"):
+            parts = folded[len(drive) + 1 :].split("/")
+            if parts[0] in ("users", "documents and settings") and len(parts) <= 2:
+                return True
+    return False
 
 
 def root_refusal(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> str | None:
