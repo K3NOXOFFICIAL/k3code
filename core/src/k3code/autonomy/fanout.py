@@ -467,6 +467,10 @@ class FanoutExecutor:
             if h.status != "completed":
                 self.progress(ctx, st, "escalated", f"{error}\n(retry {h.status}: {h.error})")
                 return
+            err = await self._review(ctx, st, h)  # the rework is new work: it merges only after its own pass
+            if err:
+                self.progress(ctx, st, "escalated", f"{error}\nThe reviewer rejected the fix:\n{err}")
+                return
 
     async def _cleanup(self, result: FanoutResult) -> None:
         for st in result.subtasks:
