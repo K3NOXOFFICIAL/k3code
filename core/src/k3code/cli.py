@@ -1291,7 +1291,9 @@ def update_cmd(
             upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
         except upd.IntegrityError as e:
             raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
-        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+        except upd.ReleaseBuildError as e:
+            raise click.ClickException(f"update failed: {e}\nNothing was activated.") from e
+        except (OSError, ValueError, httpx.HTTPError) as e:
             raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
     try:
