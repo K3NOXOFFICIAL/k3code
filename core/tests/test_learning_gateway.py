@@ -144,3 +144,32 @@ async def test_experiments_count_each_interactive_session_once(tmp_path, monkeyp
     await run_turn(server, "go", [])
     await hub.drain()
     assert hub.experiments.get("x1")["sessions_done"] == 1
+
+
+async def test_a_failed_apply_leaves_the_card_pending_and_unlogged(tmp_path, monkeypatch):
+    """/proposals accept set the status before the handler ran: a raising handler left the card accepted, and the
+    store's dedup then refused to ever propose it again."""
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sess = await call(server, "session.create", {"cwd": str(tmp_path)})
+    sid = sess["session_id"]
+    hub = server.learning
+    draft = tmp_path / "drafts" / "release-notes" / "SKILL.md"  # never written: the draft dir is gone
+    p = hub.store.add(
+        "skill",
+        "Save the 'release-notes' skill?",
+        "save skill release-notes",
+        payload={"op": "save", "name": "release-notes", "draft": str(draft)},
+    )
+    accept = {"name": "proposals", "arg": f"accept {p.id}", "session_id": sid}
+    out = await call(server, "command.dispatch", accept)
+    assert out["type"] == "message" and "No such file" in out["output"]  # the handler's error reaches the user
+    assert hub.store.get(p.id).status == "pending"
+    assert not [r for r in DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query("proposal")]
+    # once the draft is back, the same card can still be accepted
+    draft.parent.mkdir(parents=True)
+    draft.write_text("---\nname: release-notes\ndescription: d\n---\nbody\n")
+    out = await call(server, "command.dispatch", accept)
+    assert "skill saved" in out["output"] and hub.store.get(p.id).status == "accepted"
+    assert [r["choice"] for r in DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query("proposal")] == [
+        "accept"
+    ]

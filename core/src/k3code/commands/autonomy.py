@@ -65,11 +65,13 @@ class ProposalsCommand(CommandDef):
                 if hub is not None:
                     hub.decide(p, "dismiss", live)
                 return _msg(f"Dismissed {p.id}; it will not come back.")
+            handled = hub is not None and p.kind in LEARNED_KINDS and p.payload.get("op") != "send"
+            applied = await hub.apply(p, live) if handled else ""  # raises: the card stays pending, to retry
             store.set_status(p.id, "accepted")
             if hub is not None:
                 hub.decide(p, "accept", live)
-                if p.kind in LEARNED_KINDS and p.payload.get("op") != "send":
-                    return _msg(f"Accepted {p.id}: {await hub.apply(p, live)}")
+            if handled:
+                return _msg(f"Accepted {p.id}: {applied}")
             return {"type": "send", "message": p.action, "text": p.action, "notice": f"Accepted {p.id}: {p.text}"}
         items = store.all()
         if parts[:1] != ["all"]:
