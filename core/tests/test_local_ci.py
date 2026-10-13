@@ -483,3 +483,144 @@ def test_update_rejects_an_asset_that_does_not_match_sha256sums(
     rel = upd.Release(tag="v1.2.3", version="1.2.3", body="", prerelease=False, assets={n: n for n in names})
     with pytest.raises(ValueError, match="k3-linux-amd64"):
         upd.install_release(rel, None, uv="uv")
+
+
+# --- release.sh: a failed publish leaves no tag behind -------------------------------------------------------------
+
+_RELEASE_TOOLS = {
+    "uv": """#!/bin/sh
+case "$1" in
+  build) while [ $# -gt 0 ]; do [ "$1" = --out-dir ] && out=$2; shift; done
+         mkdir -p "$out" && echo wheel > "$out/k3code-1.2.3-py3-none-any.whl" ;;
+  export) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo requirements > "$out" ;;
+esac
+""",
+    "npm": "#!/bin/sh\nmkdir -p dist\n",
+    "go": '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo k3 > "$out"\n',
+    # The part of GitHub release.sh depends on: a draft release has no tag, publishing it creates the tag in the origin
+    # at the draft's target. State: $FAKE_GH_DIR/draft-<tag> (the target, then one asset name per line).
+    # `release list` prints what the script's --jq leaves of the list: the tags of the drafts. `release view` leaves
+    # out the asset named by FAKE_GH_HIDE (an upload that did not arrive).
+    "gh": """#!/bin/sh
+d=$FAKE_GH_DIR
+printf '%s\\n' "$*" >> "$d/gh.log"
+tag=$3
+publish() {
+  git --git-dir "$FAKE_GH_ORIGIN" rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
+    git --git-dir "$FAKE_GH_ORIGIN" tag "$tag" "$(head -n 1 "$d/draft-$tag")"
+  rm "$d/draft-$tag"
+}
+case "$1 $2" in
+  "release list") for f in "$d"/draft-*; do [ -f "$f" ] && basename "$f" | sed 's/^draft-//'; done; exit 0 ;;
+  "release view") tail -n +2 "$d/draft-$tag" | grep -v -x -e "${FAKE_GH_HIDE:-}" || exit 1 ;;
+  "release delete") rm "$d/draft-$tag" || exit 1 ;;
+  "release edit") [ "$FAKE_GH_FAIL" = edit ] && exit 1; publish ;;
+  "release create")
+    [ -f "$d/draft-$tag" ] && { echo "release $tag already exists" >&2; exit 1; }
+    shift 3; draft=0; : > "$d/new"; : > "$d/target"
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --target) echo "$2" > "$d/target"; shift ;;
+        --title | --notes-file) shift ;;
+        --draft) draft=1 ;;
+        -*) ;;
+        *) [ -f "$1" ] && basename "$1" >> "$d/new" ;;
+      esac
+      shift
+    done
+    { cat "$d/target"; cat "$d/new"; } > "$d/draft-$tag"; rm "$d/new" "$d/target"
+    [ "$FAKE_GH_FAIL" = create ] && exit 1  # an upload that fails leaves the draft behind
+    [ "$draft" = 1 ] || publish ;;
+esac
+exit 0
+""",
+}
+
+
+def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
+    """A copy of the release scripts in a repository on Main with a bare origin, and stand-ins for uv, npm, go, gh."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": "node_modules/\n.k3dev/\ntui/dist/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": "# Changelog\n\n## [1.2.3] - 2026-01-01\n\n- a change\n",
+        "core/k": "",
+        "tui/k": "",
+        "panes/k": "",
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 0\n",
+        "scripts/release/build_release.sh": "#!/bin/sh\nexit 0\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    bindir = _stub_bin(tmp)
+    for tool, text in _RELEASE_TOOLS.items():
+        (bindir / tool).write_text(text)
+        (bindir / tool).chmod(0o755)
+    (tmp / "gh-state").mkdir()
+    env.update(PATH=f"{bindir}:{env['PATH']}", FAKE_GH_DIR=str(tmp / "gh-state"), FAKE_GH_ORIGIN=str(origin))
+    return repo, env, origin
+
+
+def _release_calls(env: dict[str, str]) -> list[str]:
+    log = Path(env["FAKE_GH_DIR"]) / "gh.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _remote_tags(env: dict[str, str], origin: Path) -> list[str]:
+    return _git(origin, env, "tag", "--list").split()
+
+
+def test_release_creates_the_tag_only_by_publishing_a_complete_draft(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sha = _git(repo, env, "rev-parse", "HEAD")
+    calls = [c for c in _release_calls(env) if c.startswith("release")]
+    assert [c.split()[1] for c in calls] == ["list", "create", "view", "edit"]
+    create = calls[1].split()
+    assert "--draft" in create and create[create.index("--target") + 1] == sha  # the tag will name the checked commit
+    assert "--verify-tag" not in create  # there is no tag yet to verify
+    assert calls[3] == "release edit v1.2.3 --draft=false"
+    assert _remote_tags(env, origin) == ["v1.2.3"]  # created by publishing...
+    assert _git(origin, env, "rev-parse", "v1.2.3") == sha
+    assert _git(repo, env, "tag", "--list") == ""  # ...not pushed by the script
+
+
+@pytest.mark.parametrize("failing_step", ["create", "edit"])
+def test_release_failing_before_the_publish_leaves_no_tag_and_can_be_rerun(tmp_path: Path, failing_step: str) -> None:
+    """A tag that exists blocks a rerun (release.sh refuses an existing tag) and is what install.sh takes as the
+    newest version. A gh failure must leave neither."""
+    repo, env, origin = _release_setup(tmp_path)
+    script = str(repo / "scripts/release/release.sh")
+    r = _run(["bash", script, "1.2.3"], repo, {**env, "FAKE_GH_FAIL": failing_step})
+    assert r.returncode != 0
+    assert _remote_tags(env, origin) == [] and _git(repo, env, "tag", "--list") == ""
+    assert _git(repo, env, "ls-remote", "--tags", "origin") == ""
+    assert (Path(env["FAKE_GH_DIR"]) / "draft-v1.2.3").is_file()  # the half-made release is still a draft
+    r = _run(["bash", script, "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "replacing the draft release v1.2.3" in r.stderr
+    assert "release delete v1.2.3 --yes" in _release_calls(env)  # the draft only: never --cleanup-tag
+    assert _remote_tags(env, origin) == ["v1.2.3"]
+
+
+def test_release_refuses_a_draft_that_lacks_an_asset(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, {**env, "FAKE_GH_HIDE": "SHA256SUMS"})
+    assert r.returncode == 2 and "stays a draft" in r.stderr
+    assert not any(c.startswith("release edit") for c in _release_calls(env))
+    assert _remote_tags(env, origin) == []
+
+
+def test_release_dry_run_describes_the_draft_flow_and_contacts_no_release(tmp_path: Path) -> None:
+    repo, env, _ = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "--dry-run", "--no-check", "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--draft --target" in r.stdout and "release edit v1.2.3 --draft=false" in r.stdout
+    assert "git push" not in r.stdout and "git tag" not in r.stdout
+    assert [c for c in _release_calls(env) if c.startswith("release")] == []
