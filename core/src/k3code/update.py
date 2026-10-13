@@ -435,6 +435,19 @@ class InstallLockHeld(OSError):
     """Another install or update into the same install root holds its lock."""
 
 
+class ReleaseBuildError(RuntimeError):
+    """A ``uv`` step of building a release failed; the message ends with the last lines of uv's own output."""
+
+
+def _run_uv(cmd: list[str], what: str) -> None:
+    """Run one ``uv`` step of a release build; a failure carries the end of uv's output (the cause comes last)."""
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        tail = "\n".join(((e.stderr or "").strip() or (e.stdout or "").strip()).splitlines()[-8:])
+        raise ReleaseBuildError(f"{what} failed (exit {e.returncode}):\n{tail}") from e
+
+
 def _pid_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -584,15 +597,15 @@ def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unp
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")
-        subprocess.run([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], check=True, capture_output=True)
+        _run_uv([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], "uv venv")
         py = str(vdir / "venv" / "bin" / "python")
         reqs = next((p for n, p in files.items() if n.endswith(REQUIREMENTS_SUFFIX)), None)
         if reqs is None:  # allow_unpinned: an older release, resolved as before
-            subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+            _run_uv([uv, "pip", "install", "--python", py, str(wheel)], "uv pip install")
         else:
             pip = [uv, "pip", "install", "--python", py]
-            subprocess.run([*pip, "--require-hashes", "-r", str(reqs)], check=True, capture_output=True)
-            subprocess.run([*pip, "--no-deps", str(wheel)], check=True, capture_output=True)
+            _run_uv([*pip, "--require-hashes", "-r", str(reqs)], "uv pip install")
+            _run_uv([*pip, "--no-deps", str(wheel)], "uv pip install")
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
             (vdir / "tui").mkdir()
