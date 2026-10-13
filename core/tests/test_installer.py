@@ -1264,6 +1264,49 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert not (src / "tui" / "dist").exists()
 
 
+def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
+    # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
+    # (next test) must not promise an offline install
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    calls = tmp_path / "npm.log"
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        f'echo "npm $*" >>"{calls}"\ncase "$*" in "run build") mkdir -p dist ;; esac\n',
+    )
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--minimal",
+        "--no-install-deps",
+        drop=("K3_SKIP_TUI", "K3_NO_DOWNLOAD"),
+        path_front=tools,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "npm ci" in calls.read_text()
+
+
+def test_no_install_deps_docs_say_toolchains_only(tmp_path: Path) -> None:
+    # `uv pip install` (PyPI), `npm ci` and `go build` (module downloads) still fetch with --no-install-deps; the
+    # help text and the README must say the flag skips the toolchains only, not that it "fetches nothing"
+    help_out = run(tmp_path, INSTALL, "--help")
+    assert help_out.returncode == 0, help_out.stderr
+    (line,) = re.findall(r"^ +--no-install-deps .*(?:\n {10,}\S.*)*", help_out.stdout, re.M)  # with its wrapped lines
+    # each mention in the README runs up to the next inline-code span
+    mentions = re.findall(r"`--no-install-deps`[^`]*", (REPO / "README.md").read_text())
+    assert len(mentions) == 2, mentions  # the Requirements bullet and the flag list
+    header = re.sub(r"\n# ?", " ", INSTALL.read_text().split("set -eu")[0])
+    (comment,) = re.findall(r"--no-install-deps fetches[^.]*\.", header)
+    for text in (line, *mentions, comment):
+        assert "toolchain" in text, text
+        assert all(name in text for name in ("PyPI", "npm")), text
+        assert not re.search(r"fetch(es)? nothing|install nothing|all fetching", text, re.I), text
+
+
 def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
     # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
     # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
