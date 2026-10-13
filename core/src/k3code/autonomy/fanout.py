@@ -203,6 +203,17 @@ class FanoutExecutor:
         cfg = self.cfg
         repo = await wt_mod.repo_root(cwd)
         assert repo is not None
+        if dirty := await wt_mod.uncommitted(repo):  # workers start from HEAD and every merge lands in this checkout
+            files = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
+            session.emit(
+                "notification.show",
+                {
+                    "text": f"fan-out skipped: the checkout has uncommitted changes ({files}); commit or stash them",
+                    "level": "info",
+                    "kind": "fanout",
+                },
+            )
+            return None
         test_cmd = (cfg.get("test_command") or detect_test_command(repo)) or ""
         need_tests = cfg["require_tests"] if require_tests is None else require_tests
         io_heavy = any(IO_HEAVY_RE.search(s) for s in subtasks)
@@ -429,8 +440,10 @@ class FanoutExecutor:
             async with ctx.merge_lock:  # one merge + test run at a time
                 self.progress(ctx, st, "merging")
                 ok, out = await wt_mod.merge_trial(wt)
-                error = ""
-                if not ok:
+                error, blocked = "", not ok and out.startswith(wt_mod.BLOCKED)
+                if blocked:
+                    error = out[:1500]
+                elif not ok:
                     error = f"merge conflict with what was already merged:\n{out[-1500:]}"
                 elif ctx.test_cmd:
                     self.progress(ctx, st, "testing")
@@ -449,7 +462,7 @@ class FanoutExecutor:
                     await wt_mod.abort_merge(wt)
                     error = f"could not commit the merge: {cout}"
                 parent_head = await wt_mod.head_sha(wt.repo)
-            if st.attempts >= 1:
+            if st.attempts >= 1 or blocked:  # the child cannot clean the user's checkout: no rework for that
                 self.progress(ctx, st, "escalated", error)
                 return
             st.attempts += 1
