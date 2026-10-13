@@ -413,3 +413,22 @@ def test_tui_hint_for_a_source_checkout_still_builds_in_the_checkout(monkeypatch
     monkeypatch.setattr(doctor, "find_repo_root", lambda: tmp_path)
     check = doctor.check_tui()
     assert check.status == doctor.WARN and "npm run build" in check.fix
+
+
+async def test_claude_cli_on_path_but_not_logged_in_is_a_warning(fake_claude):
+    """`claude` being on PATH made doctor green; the first turn then failed 401 (issue #146)."""
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    cfg = Settings(providers=[ProviderEntry(name="claude-cli", kind="claude-cli")])
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+    assert row.status == doctor.WARN and "not logged in" in row.detail
+    assert "`claude`" in row.fix and "/login" in row.fix
+    for state in ("in", "old"):  # logged in, or a Claude Code that cannot say: no complaint
+        fake_claude(state)
+        row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+        assert row.status == doctor.OK and "Claude Code CLI at" in row.detail, state
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg, probe=False) if c.name == "provider:claude-cli")
+    assert row.status == doctor.OK  # --no-probe: claude is not run

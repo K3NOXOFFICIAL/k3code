@@ -19,15 +19,22 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def make_version(data: Path, ver: str, *, version_ok: bool = True, fails: int = 0) -> Path:
+#: a ``doctor`` stub body that reports nothing wrong
+DOCTOR_OK = 'echo \'{"summary": {"ok": 1, "warn": 0, "fail": 0}, "checks": []}\''
+
+
+def make_version(data: Path, ver: str, *, version_ok: bool = True, fails: int = 0, doctor: str = "") -> Path:
+    """A version directory whose ``k3code`` is a shell stub; ``doctor`` replaces what its ``doctor`` command runs."""
     d = data / "versions" / ver
     exe = d / "venv" / "bin" / "k3code"
     exe.parent.mkdir(parents=True)
+    doctor = doctor or (
+        f'echo \'{{"summary": {{"ok": 5, "warn": 0, "fail": {fails}}}, "checks": []}}\'; exit {1 if fails else 0}'
+    )
     exe.write_text(
         "#!/bin/sh\n"
         f'if [ "$1" = "--version" ]; then echo "k3code, version {ver}"; exit {0 if version_ok else 3}; fi\n'
-        f'if [ "$1" = "doctor" ]; then echo \'{{"summary": {{"ok": 5, "warn": 0, "fail": {fails}}}, "checks": []}}\'; '
-        f"exit {1 if fails else 0}; fi\n"
+        f'if [ "$1" = "doctor" ]; then {doctor}; fi\n'
     )
     exe.chmod(0o755)
     return d
@@ -48,6 +55,48 @@ def test_smoke_pass_and_fail(data: Path) -> None:
     assert not upd.smoke_test(make_version(data, "2.0.0", fails=1))[0]
     assert not upd.smoke_test(make_version(data, "3.0.0", version_ok=False))[0]
     assert not upd.smoke_test(data / "versions" / "nope")[0]
+
+
+def test_smoke_does_not_run_in_the_callers_cwd(data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`k3code update` started at a Windows drive root refused a healthy version: doctor scans its cwd and died on
+    /mnt/c/pagefile.sys (#157). The gate checks the new version, so it runs inside that version, not wherever the
+    update was started."""
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    (drive / "pagefile.sys").write_text("")
+    version = make_version(
+        data,
+        "1.0.0",
+        doctor=('if [ -e pagefile.sys ]; then echo "PermissionError: pagefile.sys" >&2; exit 1; fi; ' + DOCTOR_OK),
+    )
+    monkeypatch.chdir(drive)
+    ok, why = upd.smoke_test(version)
+    assert ok, why
+
+
+def test_smoke_with_a_relative_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The children run inside the version: a relative K3CODE_DATA must not be read again from there."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("K3CODE_DATA", "rel-data")
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    version = make_version(
+        tmp_path / "rel-data",
+        "1.0.0",
+        doctor=('[ -d "$K3CODE_DATA/versions" ] || exit 7; ' + DOCTOR_OK),
+    )
+    ok, why = upd.smoke_test(version.relative_to(tmp_path))
+    assert ok, why
+
+
+def test_smoke_failure_keeps_the_end_of_stderr(data: Path) -> None:
+    """A traceback names its cause on the last line; the first 200 characters of it were only the frames (#157)."""
+    version = make_version(data, "1.0.0", doctor='cat "$(dirname "$0")/doctor.err" >&2; exit 1')
+    frames = "Traceback (most recent call last):\n" + '  File "x.py", line 1, in f\n    g()\n' * 30
+    (version / "venv" / "bin" / "doctor.err").write_text(frames + "PermissionError: [Errno 13] Permission denied\n")
+    ok, why = upd.smoke_test(version)
+    assert not ok
+    assert "PermissionError: [Errno 13] Permission denied" in why
+    assert len(why) < 600
 
 
 def test_activate_success_restarts_daemon(data: Path) -> None:

@@ -6,7 +6,7 @@ import copy
 import os
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -155,15 +155,68 @@ def step_usage(c: Ctx) -> dict[str, Any]:
     return out
 
 
-def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only."""
+def unique_name(name: str, taken: Collection[str]) -> str:
+    """``name``, or ``name-2``, ``name-3``, ... when another provider entry already has it."""
+    out, n = name, 2
+    while out in taken:
+        out, n = f"{name}-{n}", n + 1
+    return out
+
+
+def key_env_for(name: str, taken: Collection[str] = ()) -> str:
+    """The key variable of an entry whose preset names none: ``K3CODE_<NAME>_API_KEY``, one not in ``taken``.
+
+    One variable per endpoint: a shared K3CODE_API_KEY sent the key of one endpoint to the next one set up, and
+    storing the second key overwrote the first (#114, #120)."""
+    stem = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") or "ENDPOINT"
+    var, n = f"K3CODE_{stem}_API_KEY", 2
+    while var in taken:
+        var, n = f"K3CODE_{stem}_{n}_API_KEY", n + 1
+    return var
+
+
+def key_env_at(base_url: str, name: str, before: Sequence[Any], taken: Collection[str] = ()) -> str:
+    """The key variable of entry ``name`` at ``base_url``, which is not a vendor preset at its own URL.
+
+    ``before`` is the provider chain in the config now. Its entry for the same URL passes its variable on, unless an
+    entry for another URL or one in ``taken`` uses it, or it is a vendor preset's (that one holds the vendor's key).
+    Otherwise a new one that holds no value yet: a leftover key belongs to some other endpoint (#114, #120)."""
+    url = base_url.rstrip("/")
+    entries = [e for e in before if isinstance(e, dict)]
+    olds = [(str(e.get("base_url") or "").rstrip("/"), str(e.get("api_key_env") or "")) for e in entries]
+    used = {*taken, *(var for at, var in olds if at != url), *(s["api_key_env"] for s in probe.PRESETS.values())}
+    same = next((var for at, var in olds if at == url), "")
+    if same and same not in used:
+        return same
+    return key_env_for(name, used | set(os.environ) | set(read_env_file()))
+
+
+def _key_env(name: str, base_url: str, preset: dict[str, str], others: Sequence[dict[str, Any]]) -> str:
+    """A vendor preset's variable only at that vendor's own URL: at another URL the vendor's key would go there, and
+    that entry's key would replace the vendor's. Anything else: :func:`key_env_at` over the configured chain."""
+    if preset.get("api_key_env") and base_url.rstrip("/") == preset["base_url"].rstrip("/"):
+        return preset["api_key_env"]
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
+    return key_env_at(base_url, name, before, {str(e.get("api_key_env")) for e in others})
+
+
+def _entry_from(
+    c: Ctx, idx: int, label: str, spec: dict[str, Any] | None, others: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any] | None:
+    """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only.
+
+    ``others`` are the entries already built in this run: a name or key variable made up here differs from theirs."""
+    names = {str(e.get("name")) for e in others}
     if spec is None:
         if not c.p.confirm(f"providers.add{idx}", f"Add a {label} provider?", idx == 0):
             return None
         preset = c.p.select(f"providers.preset{idx}", "Preset", PRESET_CHOICES, default_preset())
         if preset == "claude-cli":  # Claude Code's own login: no URL and no key
             return {"name": "claude-cli", "kind": "claude-cli"}
-        spec = {"preset": preset}
+        spec = {"preset": preset, "name": unique_name(preset, names)}
         base = probe.PRESETS.get(preset, {})
         spec["base_url"] = c.p.text(
             f"providers.base_url{idx}",
@@ -182,7 +235,7 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
             "",
             secret=True,
         )
-        spec["api_key_env"] = base.get("api_key_env", "K3CODE_API_KEY")
+        spec["api_key_env"] = _key_env(spec["name"], spec["base_url"], base, others)
         if key.strip():
             spec["api_key"] = key.strip()
         else:
@@ -204,11 +257,13 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
     if spec.get("preset") == "claude-cli" or spec.get("kind") == "claude-cli":  # an answers file can name it too
         return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
+    name = spec.get("name") or unique_name(spec.get("preset") or f"provider{idx + 1}", names)
+    url = spec.get("base_url") or base.get("base_url", "")
     entry = {
-        "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",
+        "name": name,
         "kind": spec.get("kind") or base.get("kind", "openai"),
-        "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY"),
+        "base_url": url,
+        "api_key_env": spec.get("api_key_env") or _key_env(name, url, base, others),
     }
     if spec.get("preset") == "omniroute":
         _GATEWAYS.add(entry["name"])
@@ -235,9 +290,9 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         if specs is not None:
             if i >= len(specs):
                 break
-            e = _entry_from(c, i, label, dict(specs[i]))
+            e = _entry_from(c, i, label, dict(specs[i]), entries)
         else:
-            e = _entry_from(c, i, label, None)
+            e = _entry_from(c, i, label, None, entries)
             if e is None:
                 break
         if e:

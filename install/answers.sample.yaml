@@ -5,7 +5,8 @@
 # api_key_env (the variable's NAME), api_key.
 #
 # `k3code onboard --answers` reads the `onboard:` section instead (mode: fast | full; for fast: provider, and for
-# provider `api` also endpoint, plus key and model):
+# provider `api` also endpoint, plus key and model; keep_key: true | false says whether to keep a key the
+# endpoint's variable already holds, when no key is given; the old shared K3CODE_API_KEY is kept only with true):
 #   onboard:
 #     mode: fast
 #     provider: openai   # anthropic | openai | openrouter | claude-cli | local | api

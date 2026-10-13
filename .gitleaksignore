@@ -43,3 +43,6 @@ e958b89b40f044e307f345cd8e128a8d2aa3420d:core/tests/test_learning_projectprep.py
 
 # fake JWT test fixture (core/tests/test_learning_decisions.py), replaced by a runtime-built string
 d33d77df9545e4e46e19a943bebb38ed260e869f:core/tests/test_learning_decisions.py:jwt:76
+
+# fake API key test fixture (core/tests/test_onboard.py, PR #229, issue #147): a pasted key of capitals and digits ending in "=="
+449651896d1e039f5a0863b439508c2d87923a1b:core/tests/test_onboard.py:generic-api-key:398

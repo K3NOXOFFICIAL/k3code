@@ -438,3 +438,131 @@ def test_tier_menus_are_capped_ranked_and_offer_type_one_first(env: Path, monkey
         assert len(choices) == probe.MAX_MODEL_CHOICES + 1
         assert default == "openai/gpt-5"
     assert out["models"]["or"] == dict.fromkeys(("main", "strong", "cheap", "fast"), "openai/gpt-5")
+
+
+def test_wizard_gives_each_custom_endpoint_its_own_key_variable(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#120: two custom entries both got api_key_env K3CODE_API_KEY (and the prompted ones both the name "custom"),
+    so the env file kept only the second key and the first endpoint was sent the second one's key."""
+    from k3code.setup import steps
+
+    for name in (
+        "K3CODE_API_KEY",
+        "K3CODE_GW1_API_KEY",
+        "K3CODE_GW2_API_KEY",
+        "K3CODE_CUSTOM_API_KEY",
+        "K3CODE_CUSTOM_2_API_KEY",
+    ):
+        monkeypatch.setenv(name, "")  # set-then-delete: teardown removes what the step exports
+        monkeypatch.delenv(name)
+    a, b = "http://127.0.0.1:47311/v1", "http://127.0.0.1:47312/v1"
+    from_file = {
+        "entries": [
+            {"preset": "custom", "name": "gw1", "base_url": a, "api_key": "fake-key-1"},
+            {"preset": "custom", "name": "gw2", "base_url": b, "api_key": "fake-key-2"},
+        ],
+        "test": False,
+    }
+    prompted = {"preset0": "custom", "base_url0": a, "key0": "fake-key-1", "add1": True}
+    prompted |= {"preset1": "custom", "base_url1": b, "key1": "fake-key-2", "add2": False, "test": False}
+    for answers in (from_file, prompted):
+        ctx = steps.Ctx(p=AnswerPrompter({"providers": answers}), data={}, do_probe=False)
+        entries = steps.step_providers(ctx)["entries"]
+        assert len({e["name"] for e in entries}) == 2, entries
+        stored = st.read_env_file()
+        assert [stored.get(e["api_key_env"]) for e in entries] == ["fake-key-1", "fake-key-2"], entries
+
+
+def _unset(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    for name in names:
+        monkeypatch.setenv(name, "")  # set-then-delete: teardown removes what the step exports
+        monkeypatch.delenv(name)
+
+
+def _setup_providers(env: Path, answers: dict) -> list:
+    """`k3code setup --step providers` with these answers; returns the provider chain the config loads with."""
+    from k3code.config import load_config
+
+    run_setup(AnswerPrompter({"providers": {**answers, "test": False}}), only_step="providers", do_probe=False)
+    return load_config(project_dir=env).providers
+
+
+def _custom(url: str, key: str, prompted: bool) -> dict:
+    if prompted:
+        return {"preset0": "custom", "base_url0": url, "key0": key, "add1": False}
+    return {"entries": [{"preset": "custom", "base_url": url, **({"api_key": key} if key else {})}]}
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_never_gives_a_new_endpoint_a_variable_that_holds_another_key(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """Security review of #204: the wizard only avoided the key variables of entries made in the same run, so a re-run
+    for host C with a blank key and the default name got K3CODE_CUSTOM_API_KEY, which still held host X's key."""
+    _unset(monkeypatch, "K3CODE_CUSTOM_API_KEY", "K3CODE_CUSTOM_2_API_KEY")
+    x, c = "http://127.0.0.1:47321/v1", "http://127.0.0.1:47322/v1"
+    x_key = "fake-" + "host-x-key"
+    [first] = _setup_providers(env, _custom(x, x_key, prompted))
+    assert first.api_key == x_key
+
+    [prov] = _setup_providers(env, _custom(c, "", prompted))
+    assert prov.base_url == c
+    assert prov.api_key_env != first.api_key_env and prov.api_key != x_key
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_rerun_for_the_same_endpoint_keeps_its_own_variable(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """The configured entry for the same URL passes its variable on: a blank key keeps the stored one and a new key
+    replaces it in place, instead of moving to K3CODE_CUSTOM_2_API_KEY on every run."""
+    _unset(monkeypatch, "K3CODE_CUSTOM_API_KEY", "K3CODE_CUSTOM_2_API_KEY")
+    x = "http://127.0.0.1:47321/v1"
+    old, new = "fake-" + "host-x-key", "fake-" + "host-x-new-key"
+    [first] = _setup_providers(env, _custom(x, old, prompted))
+    [kept] = _setup_providers(env, _custom(x, "", prompted))
+    assert (kept.api_key_env, kept.api_key) == (first.api_key_env, old)
+    [replaced] = _setup_providers(env, _custom(x, new, prompted))
+    assert (replaced.api_key_env, replaced.api_key) == (first.api_key_env, new)
+    assert set(st.read_env_file()) == {first.api_key_env}
+
+
+@pytest.mark.parametrize("prompted", [False, True])
+def test_wizard_uses_a_vendor_key_variable_only_at_that_vendor_url(
+    env: Path, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """Security review of #204 (#120 for presets): an openai entry with an edited base URL kept OPENAI_API_KEY, so a
+    second openai entry for another host overwrote the OpenAI key and api.openai.com was sent that host's key."""
+    _unset(monkeypatch, "OPENAI_API_KEY", "K3CODE_OPENAI_API_KEY", "K3CODE_OPENAI_2_API_KEY")
+    local = "http://127.0.0.1:18083/v1"
+    openai_key, local_key = "fake-" + "openai-key", "fake-" + "local-host-key"
+    if prompted:
+        answers = {"preset0": "openai", "key0": openai_key, "add1": True}
+        answers |= {"preset1": "openai", "base_url1": local, "key1": local_key, "add2": False}
+    else:
+        answers = {"entries": [{"preset": "openai", "api_key": openai_key}]}
+        answers["entries"].append({"preset": "openai", "base_url": local, "api_key": local_key})
+    provs = _setup_providers(env, answers)
+    assert [(p.base_url, p.api_key) for p in provs] == [("https://api.openai.com/v1", openai_key), (local, local_key)]
+    assert provs[0].api_key_env == "OPENAI_API_KEY" and provs[1].api_key_env != "OPENAI_API_KEY"
+
+
+def test_wizard_does_not_send_the_vendor_key_to_an_edited_preset_url(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither a new entry nor a re-run over the entry the old wizard wrote (openai at another URL on OPENAI_API_KEY)
+    sends the OpenAI key in the environment to that other host."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    _unset(monkeypatch, "K3CODE_OPENAI_API_KEY", "K3CODE_OPENAI_2_API_KEY")
+    openai_key = "fake-" + "openai-key"
+    monkeypatch.setenv("OPENAI_API_KEY", openai_key)
+    local = "http://127.0.0.1:18083/v1"
+    [prov] = _setup_providers(env, {"entries": [{"preset": "openai", "base_url": local}]})
+    assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key
+
+    old = {"name": "openai", "kind": "openai", "base_url": local, "api_key_env": "OPENAI_API_KEY"}
+    confio.write_yaml(user_config_path(), {"providers": [old]})
+    for answers in ({"entries": [{"preset": "openai", "base_url": local}]}, _custom(local, "", prompted=True)):
+        [prov] = _setup_providers(env, answers)
+        assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key
