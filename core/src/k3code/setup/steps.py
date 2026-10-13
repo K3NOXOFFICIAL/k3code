@@ -756,6 +756,28 @@ def step_secrets(c: Ctx) -> dict[str, Any]:
 
 
 PROJECT_RECIPE_MODES = ("ask", "accept_all", "none")
+#: Trees too slow to walk for a recipe scan: under WSL, ``/mnt/c`` goes through the Windows file system (8 s once).
+SLOW_MOUNTS = (Path("/mnt"),)
+
+
+def project_scan_skip_reason(cwd: Path) -> str:
+    """Why fast setup must not scan ``cwd`` for project recipes; '' when it is a project worth scanning.
+
+    A home directory (or a parent of it), a directory outside any git repository and a slow mount are not a project:
+    scanning them takes seconds and offers recipes for whatever sits in the tree."""
+    from k3code.learning import projectstate
+
+    root = projectstate.project_root(cwd)
+    home_dir = Path.home().resolve()
+    if root == home_dir or root in home_dir.parents:
+        return "it is your home directory or a parent of it"
+    for mount in SLOW_MOUNTS:
+        mount = mount.resolve()
+        if root == mount or mount in root.parents:
+            return f"it is under {mount}"
+    if not (root / ".git").exists():
+        return "it is not inside a git repository"
+    return ""
 
 
 def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:

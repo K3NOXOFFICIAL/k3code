@@ -24,6 +24,7 @@ from k3code.setup.steps import (
     key_env_at,
     key_env_for,
     offer_project_recipes,
+    project_scan_skip_reason,
     unique_name,
     write_config,
 )
@@ -322,7 +323,10 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         p.say(f"  kept as fallback (after {entry['name']}): {', '.join(kept)}")
     if not model:
         p.say("  No model set yet: add providers[0].models.default with `k3code config-edit`.")
-    offer_project_recipes(p, Path.cwd())
+    if why := project_scan_skip_reason(Path.cwd()):
+        p.say(f"Project recipes not offered ({why}); a session in a project offers them as cards.")
+    else:
+        offer_project_recipes(p, Path.cwd())
     p.say("Ready. `k3code onboard` (choose full) adds more providers, MCP servers and more any time.")
 
 
