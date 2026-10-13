@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from k3code.paths import ensure_private_dir, home, private_file, project_state_dir
+from k3code.paths import ensure_private_dir, home, main_checkout, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
 
 PROJECT_FILES = ("K3CODE.md", "AGENTS.md", "CLAUDE.md")  # all that exist are read, in this order
@@ -34,6 +34,13 @@ def project_root(cwd: str | Path) -> Path:
         if (d / ".git").exists():
             return d
     return start
+
+
+def identity_root(cwd: str | Path) -> Path:
+    """The directory a project's remembered state (learned notes, stack facts) is keyed by: ``project_root``, but a
+    linked git worktree (a fan-out child's) is its main checkout. The files a session reads stay its own tree's."""
+    root = project_root(cwd)
+    return main_checkout(root) or root
 
 
 def user_memory_path() -> Path:
@@ -63,7 +70,7 @@ def clean_fact(text: str) -> str:
 
 def learned_notes_path(cwd: str | Path) -> Path:
     """``$K3CODE_HOME/projects/<key>/learned.md``: learned facts live outside the repository, never in its files."""
-    return project_state_dir(project_root(cwd)) / LEARNED_FILE
+    return project_state_dir(identity_root(cwd)) / LEARNED_FILE
 
 
 def read_learned(cwd: str | Path) -> list[str]:
