@@ -2050,21 +2050,16 @@ class GatewayServer:
             or text.lstrip().startswith("/")
         ):
             return None
-        session.emit("status.update", {"kind": "status", "text": "checking scope", "state": "working"})
-        verdict = await self.autonomy.mode_verdict(session, text)
-        min_scope = str(ultra_cfg(self.config)["min_scope"])
-        if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
-            return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
         if dirty := await dirty_checkout(Path(session.perms.cwd)):
-            # /ultracode refuses a checkout with uncommitted changes (the fan-out merges into it): this prompt, one
-            # ultracode would have taken, is answered by an ordinary turn instead of that refusal (the gate reuses the
-            # verdict), and the user is told once per dirty spell, for a few seconds
+            # /ultracode refuses a checkout with uncommitted changes (the fan-out merges into it): the prompts of the
+            # always-on mode get an ordinary turn until it is committed (checked before the scope verdict, which
+            # would cost a classifier call for nothing), and the user hears it once per dirty spell, for 15 s
             if not session.ultra_dirty_noted:
                 session.ultra_dirty_noted = True
                 session.emit(
                     "notification.show",
                     {
-                        "text": f"ultracode is on but skipped for this prompt: {dirty_text(dirty)}",
+                        "text": f"ultracode is on but not running: {dirty_text(dirty)}. Prompts get an ordinary turn.",
                         "level": "info",
                         "kind": "ttl",
                         "ttl_ms": 15000,
@@ -2072,7 +2067,12 @@ class GatewayServer:
                     },
                 )
             return None
-        session.ultra_dirty_noted = False
+        session.ultra_dirty_noted = False  # clean again: the next dirty spell is announced anew
+        session.emit("status.update", {"kind": "status", "text": "checking scope", "state": "working"})
+        verdict = await self.autonomy.mode_verdict(session, text)
+        min_scope = str(ultra_cfg(self.config)["min_scope"])
+        if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
+            return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
         ultracode: Any = self.commands.get("ultracode")
         spec = await ultracode.prepare(self, session, text, context=context, verdict=verdict)
         self.autonomy.drop_mode_verdict(session)

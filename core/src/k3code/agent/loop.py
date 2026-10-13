@@ -79,6 +79,15 @@ PlanCallback = Callable[[str], Awaitable[str | None]]
 AutoAllowCallback = Callable[[str, dict[str, Any], Decision], None]
 
 
+def _stat_sig(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) of ``path``, None when it cannot be statted."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
 class AgentLoop:
     """Runs the conversation loop with tool execution."""
 
@@ -752,21 +761,17 @@ class AgentLoop:
         stamped = self._tool_path(args) if seen else None
         if stamped is not None:
             self.file_stamps.record(stamped)
+        before = _stat_sig(stamped) if stamped is not None and tool_call.name in FILE_TOOLS else None
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
-        if (
-            stamped is not None
-            and tool_call.name in FILE_TOOLS
-            and not post.blocked
-            and self.hooks
-            and self.hooks.for_event("PostToolUse", tool_call.name)
-        ):
-            # A formatter hook (prettier, black, gofmt) rewrote the file this call changed: that is the file as the
-            # session left it, not a change by someone else, or the next edit of it was refused as "changed since you
-            # read it". Not for a read: what the model was shown is then no longer what is on disk. A later `write`
-            # still needs a fresh read (`absorbed`): whatever the hook's window let in (a save of the user's) would be
-            # replaced unseen.
+        if stamped is not None and before is not None and _stat_sig(stamped) != before:
+            # The file changed while the hooks ran (whether or not one blocked: `eslint --fix || exit 2` rewrites the
+            # file and blocks). A formatter (prettier, black, gofmt) is the session's own work, not a change by
+            # someone else, or the next edit was refused as "changed since you read it". A hook that left the file
+            # alone changes nothing. Not for a read: what the model was shown is then no longer what is on disk. A later
+            # `write` still needs a fresh read (`absorbed`): what the hook's window let in (a save of the user's)
+            # would be replaced unseen.
             self.file_stamps.record(stamped, absorbed=True)
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
         if feedback:  # the tool already ran: the hook's word joins its result for the model (format_tool_result)

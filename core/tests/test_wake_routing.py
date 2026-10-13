@@ -997,17 +997,28 @@ async def test_mode_on_in_a_checkout_with_uncommitted_changes_is_a_normal_turn_a
     assert len(ultra_dirty_notices(server)) == 2  # a new dirty spell is announced again
 
 
-async def test_mode_on_a_trivial_prompt_in_a_dirty_checkout_says_nothing(tmp_path, monkeypatch):
+async def test_the_dirty_checkout_notice_is_rearmed_by_a_clean_one_whatever_the_prompts_in_between(
+    tmp_path, monkeypatch
+):
+    """One notice per dirty spell: a clean checkout seen at any typed prompt (a trivial one too) ends the spell, and the
+    check costs no classifier call (the verdict is not asked for while the pipeline cannot run anyway)."""
     server = make(
         tmp_path, monkeypatch, [verdict("trivial"), NORMAL], autonomy={"degrade_trivial": False, "proposals": False}
     )
     pipe = pipeline(server, monkeypatch)
+    state = {"dirty": ["a.py"]}
 
     async def dirty(_cwd: Any) -> list[str]:
-        return ["a.py"]
+        return state["dirty"]
 
     monkeypatch.setattr("k3code.gateway.server.dirty_checkout", dirty)
     await start(server, tmp_path)
     server.session.ultra_mode = "ultracode"
     await submit(server, "what does the retry flag do?")
-    assert pipe.calls == [] and ultra_dirty_notices(server) == []  # ultracode would not have taken it anyway
+    assert len(ultra_dirty_notices(server)) == 1 and pipe.calls == []
+    state["dirty"] = []
+    await submit(server, "and the quiet flag?")  # clean, trivial: nothing to announce, the spell ends
+    assert len(ultra_dirty_notices(server)) == 1
+    state["dirty"] = ["b.py"]
+    await submit(server, "and the verbose flag?")
+    assert len(ultra_dirty_notices(server)) == 2

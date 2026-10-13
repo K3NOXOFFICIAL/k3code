@@ -502,3 +502,53 @@ async def test_clear_forgets_what_the_session_had_read(tmp_path):
     assert live.file_stamps.refusal("edit", f) is not None
     assert "file_stamps" not in live.stored.meta
     assert store.saved and all("file_stamps" not in meta for meta in store.saved)  # what is written has none
+
+
+def blocking_formatter(tmp_path, target: Path) -> userhooks.HookRunner:
+    """`eslint --fix || exit 2`: fixes the file and reports on stderr, which blocks (the usual lint-hook shape)."""
+    hook = tmp_path / "lint.sh"
+    hook.write_text(f"#!/bin/sh\nprintf '# fixed\\n' >> {target}\necho 'lint fixed 1 problem' >&2\nexit 2\n")
+    hook.chmod(0o755)
+    return userhooks.HookRunner([userhooks.Hook("PostToolUse", str(hook), "edit|write")], cwd=tmp_path)
+
+
+async def test_a_blocking_hook_that_rewrote_the_file_does_not_make_the_next_edit_stale(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("x=1\ny=2\n")
+    loop = loop_for(tmp_path, two_edits(f), mode=PermissionMode.YOLO)
+    loop.hooks = blocking_formatter(tmp_path, f)
+    results = await run(loop)
+    assert "Edited: 1 replacement" in results["e1"] and "lint fixed 1 problem" in results["e1"]
+    assert "Edited: 1 replacement" in results["e2"], results["e2"]
+
+
+async def test_a_hook_that_leaves_the_file_alone_does_not_hold_up_a_whole_file_write(tmp_path):
+    """A logging or audit hook that matches the edit (or fails) says nothing about the file: no false 'rewrote it'."""
+    f = tmp_path / "a.py"
+    f.write_text("x=1\ny=2\n")
+    hook = tmp_path / "log.sh"
+    hook.write_text("#!/bin/sh\nexit 1\n")  # matches, changes nothing, and errors
+    hook.chmod(0o755)
+    script = [
+        call("r", "read", path=str(f)),
+        call("e", "edit", path=str(f), old_string="x=1", new_string="x = 10"),
+        call("w", "write", path=str(f), content="whole\n"),
+    ]
+    loop = loop_for(tmp_path, script, mode=PermissionMode.YOLO)
+    loop.hooks = userhooks.HookRunner([userhooks.Hook("PostToolUse", str(hook), "*")], cwd=tmp_path)
+    results = await run(loop)
+    assert "Wrote" in results["w"] and f.read_text() == "whole\n"
+
+
+def test_a_file_a_hook_rewrote_is_not_carried_across_a_resume(tmp_path):
+    kept, rewritten = tmp_path / "kept.py", tmp_path / "rewritten.py"
+    for f in (kept, rewritten):
+        f.write_text("x")
+    stamps = FileStamps()
+    stamps.record(kept)
+    stamps.record(rewritten, absorbed=True)
+    exported = stamps.export()
+    assert str(kept) in exported and str(rewritten) not in exported
+    fresh = FileStamps()
+    fresh.load(exported)
+    assert fresh.refusal("write", kept) is None and "not read" in (fresh.refusal("write", rewritten) or "")

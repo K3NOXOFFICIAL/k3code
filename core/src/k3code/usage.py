@@ -266,7 +266,8 @@ class UsageDB:
             if kind == "call":
                 n = 0 if detail == CUT_SHORT else 1  # the tokens of a dead attempt count, it is not another call
                 g["calls"] += n
-                calls[key][f"{provider}/{model}"] += n
+                if n:
+                    calls[key][f"{provider}/{model}"] += n
                 if tier:
                     t = g["by_tier"].setdefault(tier, {"calls": 0, "tokens_in": 0, "tokens_out": 0})
                     t["calls"] += n

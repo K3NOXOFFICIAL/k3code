@@ -56,6 +56,7 @@ FAILOVER_COOLDOWN_S = 60.0
 #: The reasons that arm it. Such a window only steers calls toward an entry that is free: it is not a reset to wait
 #: for, so a chain whose entries are all in one is tried again at once (see ``_walk`` and ``earliest_reset``).
 _DEAD_ENTRY_REASONS = frozenset({FailoverReason.server, FailoverReason.timeout})
+_PERMANENT = frozenset({FailoverReason.auth, FailoverReason.bad_request})  # no wait fixes these
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ class Router:
         max_tokens: int = 8192,
         temperature: float | None = None,
         stall_retries: int | None = None,
+        retry_deferred: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         """Yield stream events from the first entry that completes its handshake.
 
@@ -206,7 +208,13 @@ class Router:
         deadline passes 0, or the deadline cuts the walk off in the middle of the retry and no later entry is tried.
         """
         async for event in self._walk(
-            messages, tools, model=model, max_tokens=max_tokens, temperature=temperature, stall_retries=stall_retries
+            messages,
+            tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stall_retries=stall_retries,
+            retry_deferred=retry_deferred,
         ):
             if event.type == "error":
                 # Providers may surface mid-stream failures as error events; treat
@@ -248,6 +256,7 @@ class Router:
         max_tokens: int,
         temperature: float | None,
         stall_retries: int | None = None,
+        retry_deferred: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         last_reason: FailoverReason | None = None
         last_detail = ""
@@ -262,7 +271,7 @@ class Router:
         pos = 0
         while True:
             if pos >= len(order):
-                if deferred and not second_pass:
+                if deferred and not second_pass and retry_deferred:
                     order.extend(deferred)
                     second_pass = True
                     continue
@@ -296,7 +305,8 @@ class Router:
                     skip_reason,
                     "cooldown",
                 )
-                if cooled is not None:
+                # (a deferred entry is tried in the second pass: its own failure counts, not its window)
+                if cooled is not None and (cooled not in _DEAD_ENTRY_REASONS or not retry_deferred):
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
@@ -331,7 +341,11 @@ class Router:
                     return
                 except Exception as exc:  # noqa: BLE001 - classified below
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
-                    last_reason = classified.reason
+                    # a retried entry (second pass) must not hide, behind a permanent error, the reset another entry
+                    # is waiting for: the same two failures would park or fail hard by whether A was in a window
+                    retried_permanent = second_pass and saw_limit and classified.reason in _PERMANENT
+                    if not retried_permanent:
+                        last_reason = classified.reason
                     last_detail = summarize(exc)
                     failure_hint = classified.hint or failure_hint
                     all_network = all_network and classified.reason is FailoverReason.network

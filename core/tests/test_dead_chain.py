@@ -306,7 +306,7 @@ async def test_only_a_call_with_a_long_deadline_sets_it_for_the_providers():
                 yield event
 
     books = SimpleNamespace(rows=[], db=None)
-    router = Router(build_chain([Spy("a")], [["m"]]), sleep=no_sleep)
+    router = Router(build_chain([Spy("a"), Entry("b")], [["m"], ["m"]]), sleep=no_sleep)
     caller = ModelCaller(
         lambda: {t: router for t in Tier},
         SimpleNamespace(task_tiers=None, providers=[]),
@@ -345,3 +345,82 @@ async def test_a_hung_local_primary_fails_over_inside_a_long_deadline():
     assert caller_mod.LONG_DEADLINE_S <= 90.0
     reply = await caller.complete(TaskKind.COMPACTION, MSGS, session_id="s1", timeout=90.0)
     assert reply.text == "from b" and a.limit == 90.0 * 0.6
+
+
+# ── the second pass over dead-window entries: where it must not run, and what it must not change ────────────────────
+
+
+def rate_limited() -> ProviderError:
+    return ProviderError(
+        "rate limited", status_code=429, headers={"Retry-After": "3600"}, body={"error": {"message": "rate limited"}}
+    )
+
+
+def unknown_model() -> ProviderError:
+    return ProviderError("unknown model", status_code=400)
+
+
+def offline() -> Exception:
+    return to_provider_error(httpx.ConnectError("refused"), kind="openai")
+
+
+async def test_a_call_under_a_deadline_does_not_retry_the_entries_it_skipped():
+    """The second pass would run inside the deadline and leave the tier escalation (a fresh deadline) no time."""
+    a, b = Entry("a", reply="from a"), Entry("b", fail=stalled)
+    router = router_of([a, b])
+    _arm_window(router, 0)
+    with pytest.raises(ChainExhausted):
+        await drain(router.stream(MSGS, [], max_tokens=10, temperature=None, retry_deferred=False))
+    assert a.calls == 0
+    events = await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))  # without the switch: tried
+    assert events[-1].message.content == "from a"
+
+
+async def test_a_deadline_bound_call_asks_the_router_not_to_retry_skipped_entries():
+    from k3code.routing.caller import ModelCaller
+
+    seen: list[dict] = []
+
+    class Spy:
+        chain = [object()]
+
+        async def stream(self, messages, tools, **kwargs):
+            seen.append(kwargs)
+            yield StreamEvent(type="done", message=Message(role="assistant", content="ok"))
+
+    caller = ModelCaller(
+        lambda: {t: Spy() for t in Tier},
+        SimpleNamespace(task_tiers=None, providers=[]),
+        SimpleNamespace(record=lambda kind, **kw: None),
+    )
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1", timeout=15.0)
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1")
+    assert seen[0].get("retry_deferred") is False and seen[0].get("stall_retries") == 0
+    assert "retry_deferred" not in seen[1]
+
+
+async def test_a_retried_entry_does_not_hide_the_reset_another_entry_is_waiting_for():
+    """A (in a window) answers 400 once tried; B is rate-limited for an hour. The chain must still be a wait, not a
+    bad request, whether or not A happened to be in a window."""
+    for armed in (True, False):
+        a, b = Entry("a", fail=unknown_model), Entry("b", fail=rate_limited)
+        router = router_of([a, b])
+        if armed:
+            _arm_window(router, 0)
+        with pytest.raises(ChainExhausted) as err:
+            await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+        assert err.value.last_reason == "rate_limit", (
+            armed
+        )  # PersistentRetry parks on it (it fails hard on bad_request)
+
+
+async def test_an_offline_chain_is_unreachable_even_when_an_entry_was_in_a_window():
+    from k3code.errors import AllProvidersUnreachable
+
+    for armed in (False, True):
+        a, b = Entry("a", fail=offline), Entry("b", fail=offline)
+        router = router_of([a, b])
+        if armed:
+            _arm_window(router, 0)
+        with pytest.raises(AllProvidersUnreachable):
+            await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))

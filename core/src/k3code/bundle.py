@@ -203,7 +203,7 @@ def _hidden_in_part(obj: Any, path: str = "") -> list[str]:
         for i, v in enumerate(obj):
             here = f"{path}[{i}]"
             if _placeholder(v) and v != REDACTED:
-                found.append(here)
+                found.append(f"{here} (a list entry: written as it stands)")
             else:
                 found.extend(_hidden_in_part(v, here))
     return found
@@ -313,6 +313,10 @@ _SCALAR_SENSITIVE: tuple[tuple[str, ...], ...] = (
     ("research", "searxng_url"),  # its origin is exempt from the private-address guard
     ("automation", "webhook_port"),  # opens a listening port
     ("artifacts", "publish_dir"),  # where /artifacts publish writes
+    ("sandbox", "home_readonly"),  # $HOME entries (.kube, .docker, .config/gh ...) shown read-only to sandboxed bash
+    ("autonomy", "unattended_network"),  # network for unattended bash: with the line above, a way to send them out
+    ("autonomy", "gate_modes"),  # [] switches the scope gate off
+    ("autonomy", "fanout", "test_command"),  # a shell command the fan-out runs
 )
 
 
@@ -331,14 +335,17 @@ def _show(value: Any) -> str:
     return json.dumps(redact(value), ensure_ascii=False, sort_keys=True)
 
 
-def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> list[SensitiveItem]:
+def sensitive_items(
+    bundle: Bundle, existing: dict[str, Any] | None = None, *, incoming: dict[str, Any] | None = None
+) -> list[SensitiveItem]:
     """The user-level settings an import must not apply without an explicit yes, item by item.
 
     MCP servers (a stdio ``command`` runs on the next start), permission rules (approve tools without asking),
     providers (``base_url``/``api_key_env``: where a key is sent) and ``hooks``. ``existing`` defaults to the
     user's config.yaml; an item that would not change anything is not listed.
     """
-    incoming = bundle.settings.get("user") or {}
+    if incoming is None:  # the bundle's user settings; its project settings when they land in the user's file
+        incoming = bundle.settings.get("user") or {}
     have = confio.read_yaml(user_config_path()) if existing is None else existing
     items: list[SensitiveItem] = []
     servers = (incoming.get("mcp") or {}).get("servers") if isinstance(incoming.get("mcp"), dict) else None
@@ -360,9 +367,18 @@ def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> l
         diff = []
         for p in (p for p in providers if isinstance(p, dict)):
             old = old_by_name.get(p.get("name")) or {}
-            for k in ("base_url", "api_key_env"):
+            for k in ("base_url", "api_key_env", "kind"):
                 if p.get(k) != old.get(k) and not _placeholder(p.get(k)):  # a hidden value changes nothing on import
                     diff.append(f"providers.{p.get('name', '?')}.{k}: {_show(old.get(k))} → {_show(p.get(k))}")
+        # the list is the fallback chain (the first entry that answers is used): dropping or reordering entries sends
+        # the prompts somewhere else without a single field of an entry changing
+        old_names = [str(p.get("name")) for p in have.get("providers") or [] if isinstance(p, dict)]
+        new_names = [str(p.get("name")) for p in providers if isinstance(p, dict)]
+        if gone := [n for n in old_names if n not in new_names]:
+            diff.append(f"providers: removes {', '.join(gone)}")
+        kept_old, kept_new = [n for n in old_names if n in new_names], [n for n in new_names if n in old_names]
+        if kept_old != kept_new:
+            diff.append(f"providers: order {', '.join(kept_old)} → {', '.join(kept_new)}")
         if diff:
             items.append(SensitiveItem("providers", ("providers",), diff))
     for path in _SCALAR_SENSITIVE:
@@ -413,7 +429,10 @@ class ImportReport:
             )
         if self.hidden:
             shown = ", ".join(self.hidden[:5]) + (f" and {len(self.hidden) - 5} more" if len(self.hidden) > 5 else "")
-            lines.append(f"note: not written, the bundle hides all or part of them (kept as they are here): {shown}")
+            lines.append(
+                "note: the bundle hides all or part of these values; a setting is not written (the value here is "
+                f"kept), a list entry is: {shown}"
+            )
         for sid, why in self.invalid_sessions.items():
             lines.append(f"warning: skipped session {sid} from the bundle: {why}")
         for b in self.backups:
@@ -470,6 +489,13 @@ def _stored_from(obj: dict[str, Any]) -> tuple[StoredSession | None, str]:
     return sess, ""
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
 def apply_bundle(
     bundle: Bundle,
     *,
@@ -486,8 +512,10 @@ def apply_bundle(
     if settings:
         for kind, incoming in bundle.settings.items():
             target = user_config_path() if kind == "user" else project_config_path(cwd)
-            if kind == "user" and not trust_bundle:
-                for item in sensitive_items(bundle, confio.read_yaml(target)):
+            # the project's settings are the user's own file too when the working directory is $HOME (K3CODE_HOME at
+            # its default): everything below the gate then applied unasked
+            if (kind == "user" or _same_file(target, user_config_path())) and not trust_bundle:
+                for item in sensitive_items(bundle, confio.read_yaml(target), incoming=incoming):
                     if accept is None or not accept(item):
                         incoming = _without(incoming, item.path)
                         rep.skipped.append(item.key)

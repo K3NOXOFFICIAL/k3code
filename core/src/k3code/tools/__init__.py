@@ -160,8 +160,11 @@ class FileStamps:
     def export(self) -> dict[str, list[int]]:
         """The newest ``KEEP`` stamps as JSON-able ``path → [mtime_ns, size]``, for the session's stored meta: stamps
         in memory alone were lost with the live session, so a resumed one refused the first edit of every file its
-        history shows as read."""
-        return {path: list(stamp) for path, stamp in list(self._seen.items())[-self.KEEP :]}
+        history shows as read. A file a hook rewrote after the session's edit (``_absorbed``) is left out: the resumed
+        session reads it before it writes it whole, as the live one would have to."""
+        return {
+            path: list(stamp) for path, stamp in list(self._seen.items())[-self.KEEP :] if path not in self._absorbed
+        }
 
     def load(self, data: Any) -> None:
         """Take stamps from :meth:`export`. Anything else (a hand-edited or damaged meta) is skipped, not raised on.

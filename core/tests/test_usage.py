@@ -139,3 +139,18 @@ def test_the_row_of_an_attempt_cut_short_adds_tokens_but_is_not_another_call(tmp
     ]
     out = collect(rows, DecisionLog(tmp_path / "dec.db"), [], since=0.0)
     assert out["tiers"]["cheap"]["calls"] == 1
+    spent = [{**r, "tokens_in": 1000, "tokens_out": 0 if r["detail"] else 5} for r in rows]
+    out = collect(spent, DecisionLog(tmp_path / "dec2.db"), [], since=0.0)
+    assert out["calls"] == 1 and out["tokens_by_tier"]["cheap"] == 2005  # the dead attempt's tokens were spent
+
+
+def test_a_model_that_only_had_a_dead_attempt_is_not_listed_with_zero_calls(tmp_path):
+    from k3code.usage import CUT_SHORT
+
+    db = UsageDB(tmp_path / "usage.db")
+    kw = {"session": "s1", "tier": "cheap", "task_kind": "title"}
+    db.record("call", provider="local", model="qwen", tokens_in=500, detail=CUT_SHORT, **kw)
+    db.record("call", provider="remote", model="haiku", tokens_in=700, tokens_out=5, **kw)
+    (g,) = db.aggregate("session")
+    assert [name for name, _ in g["by_model"]] == ["remote/haiku"] if isinstance(g["by_model"], list) else True
+    assert "qwen" not in str(g["by_model"]) and "haiku" in str(g["by_model"])

@@ -90,7 +90,9 @@ def collect(
     ev = [r for r in usage_rows if since <= r["ts"] < until]
     sessions = {r["session"] for r in ev if r["session"]}
     n_sess = max(1, len(sessions))
-    calls = [r for r in ev if r["kind"] == "call" and r.get("detail") != CUT_SHORT]  # a dead attempt is no extra call
+    call_rows = [r for r in ev if r["kind"] == "call"]
+    # a dead attempt (its prompt was counted, no answer came) spent tokens but is not another call: rates count calls
+    calls = [r for r in call_rows if r.get("detail") != CUT_SHORT]
     by_tier: dict[str, dict[str, int]] = {}
     for r in calls:
         by_tier.setdefault(r["tier"] or "main", _tier_row())["calls"] += 1
@@ -112,14 +114,14 @@ def collect(
     tokens_by_kind: dict[str, int] = {}
     kind_tier: dict[str, dict[str, dict[str, int]]] = {}  # kind -> tier -> {"calls", "tokens"}
     turns: set[str] = set()
-    for r in calls:
+    for r in call_rows:
         n = int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
         tier = r["tier"] or "main"
         tokens_by_tier[tier] = tokens_by_tier.get(tier, 0) + n
         if r["task_kind"]:
             tokens_by_kind[r["task_kind"]] = tokens_by_kind.get(r["task_kind"], 0) + n
             cell = kind_tier.setdefault(r["task_kind"], {}).setdefault(tier, {"calls": 0, "tokens": 0})
-            cell["calls"] += 1
+            cell["calls"] += 0 if r.get("detail") == CUT_SHORT else 1
             cell["tokens"] += n
         if r.get("turn"):
             turns.add(r["turn"])

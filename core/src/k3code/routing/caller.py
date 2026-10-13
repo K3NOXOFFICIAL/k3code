@@ -162,12 +162,17 @@ class ModelCaller:
         stream = getattr(router, "stream", None)
         if stream is None:  # a router that only completes (a test double) has no attempts to meter
             return await router.complete(messages, tools, max_tokens=max_tokens)
-        events = stream(messages, tools, max_tokens=max_tokens, **({"stall_retries": 0} if timeout else {}))
+        # (no second pass over the entries skipped for a window either: it would run inside the deadline and leave the
+        # tier escalation, which gets a fresh deadline, no time)
+        under_deadline = {"stall_retries": 0, "retry_deferred": False} if timeout else {}
+        events = stream(messages, tools, max_tokens=max_tokens, **under_deadline)
         pending: Usage | None = None
         served = ("", "")  # who the pending prompt was sent to: the attempts list moves on with the next one
         final: Message | None = None
         # a long deadline (compaction) leaves a stall limit of 300 s (a local server) no way to fire first
-        deadline = CALL_DEADLINE.set(timeout) if timeout and timeout >= LONG_DEADLINE_S else None
+        # (only with another entry to fail over to: a single entry has nothing to be cut short for)
+        long_call = bool(timeout and timeout >= LONG_DEADLINE_S and len(getattr(router, "chain", ())) > 1)
+        deadline = CALL_DEADLINE.set(timeout) if long_call else None
         try:
             async for event in events:
                 if event.type == "partial_usage" and event.usage is not None:
