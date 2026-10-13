@@ -11,7 +11,9 @@ never loses a turn to transient infrastructure failures:
   ``reliability.parked(next_retry_at=...)`` / ``reliability.unparked``.
 - ``ChainExhausted`` with every entry cooling down (the router fails over past long
   Retry-After / quota windows instead of sleeping) → park until the earliest reset
-  (``exc.retry_after``), emitting ``reliability.parked`` with the wall-clock time.
+  (``exc.retry_after``), emitting ``reliability.parked`` with the wall-clock time. The router's 60 s skip window
+  after a server error or timeout is not such a reset (it reports no ``retry_after`` for it), so a chain of dead
+  entries fails like any other transient exhaustion: at once when attended, after ``max_unattended_parks`` otherwise.
 - Other ``ChainExhausted`` with ``last_reason`` ``rate_limit``/``quota`` → park until the
   provider-declared window when known (tracked from ``router.retry`` events), otherwise
   the same backoff ladder.

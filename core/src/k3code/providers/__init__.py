@@ -10,6 +10,7 @@ from k3code.providers.base import Provider
 from k3code.providers.claude_cli import ClaudeCliProvider
 from k3code.providers.fake import FakeProvider, fake_provider_requested, load_fake_steps
 from k3code.providers.openai_compat import OpenAICompatProvider
+from k3code.providers.stall import REASONING_TIMEOUT, is_local_endpoint
 
 
 def provider_signature(entry: ProviderEntry) -> dict[str, Any]:
@@ -19,6 +20,18 @@ def provider_signature(entry: ProviderEntry) -> dict[str, Any]:
     A field added to ``ProviderEntry`` is part of the signature until it is excluded here.
     """
     return entry.model_dump(exclude={"models", "descriptions", "tiers"})
+
+
+def stall_limits(entry: ProviderEntry) -> dict[str, float | None]:
+    """The stall limits to build the entry's provider with: what the config says, else the reasoning-model limit for a
+    server the user runs (None = the default for the model). A local server prefills a long prompt before its first
+    token, and a stall retry would only repeat that prefill."""
+    local = is_local_endpoint(entry.base_url, keyless=not entry.api_key_env)
+    longer = REASONING_TIMEOUT if local else None
+    return {
+        "first_event_timeout": entry.first_event_timeout if entry.first_event_timeout is not None else longer,
+        "idle_timeout": entry.idle_timeout if entry.idle_timeout is not None else longer,
+    }
 
 
 def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
@@ -43,6 +56,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
                     cache_ttl=entry.cache_ttl,
+                    **stall_limits(entry),
                 )
             )
         elif entry.kind == "anthropic":
@@ -54,6 +68,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
                     cache_ttl=entry.cache_ttl,
+                    **stall_limits(entry),
                 )
             )
         elif entry.kind == "claude-cli":

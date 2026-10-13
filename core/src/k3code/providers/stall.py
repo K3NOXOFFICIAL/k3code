@@ -9,6 +9,7 @@ that accepts the request and then sends only comments (``: keepalive``, ``: OPEN
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from collections.abc import AsyncIterator, Awaitable
 from typing import TypeVar
@@ -25,6 +26,23 @@ IDLE_TIMEOUT = 120.0
 REASONING_TIMEOUT = 300.0
 
 T = TypeVar("T")
+
+
+def is_local_endpoint(base_url: str, *, keyless: bool = False) -> bool:
+    """Whether the server is one the user runs (a keyless endpoint, a loopback address, ``localhost``, ``*.local``):
+    it prefills a long prompt before the first token, which on a modest GPU outlasts the default first-event limit."""
+    if keyless:
+        return True
+    try:
+        host = httpx.URL(base_url).host.lower()
+    except (httpx.InvalidURL, ValueError):
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class StreamStalled(httpx.ReadTimeout):

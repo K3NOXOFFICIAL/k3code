@@ -298,9 +298,16 @@ class CooldownStore:
         return entry.reason if entry is not None else None
 
     def record_success(self, *, provider: str, model: str, base_url: str = "") -> None:
-        """The entry answered: its next rate limit starts the ladder from the bottom again."""
-        self.strikes.pop(_identity(provider, model, base_url), None)
-        self.auth_strikes.pop(_identity(provider, model, base_url), None)
+        """The entry answered: its next rate limit starts the ladder from the bottom again, and a server/timeout window
+        it was tried through anyway (every entry was cooling) ends: it would otherwise steer calls away from the
+        one entry that works."""
+        key = _identity(provider, model, base_url)
+        self.strikes.pop(key, None)
+        self.auth_strikes.pop(key, None)
+        cooling = self.entries.get(key)
+        if cooling is not None and cooling.reason in (FailoverReason.server, FailoverReason.timeout):
+            self.entries.pop(key, None)
+            self._save()
 
     def clear(self, *, provider: str, model: str, base_url: str = "") -> None:
         self.entries.pop(_identity(provider, model, base_url), None)

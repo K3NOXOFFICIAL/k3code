@@ -491,17 +491,19 @@ async def test_a_lone_entry_is_still_retried_on_every_call():
     assert only.calls == 4  # nowhere else to go: every call tries it
 
 
-async def test_a_whole_chain_that_is_down_says_unavailable_not_rate_limited():
+async def test_a_whole_chain_that_is_down_is_tried_again_and_never_called_rate_limited():
     from k3code.errors import ChainExhausted
 
     a, b = _Flaky("a"), _Flaky("b")
     router = Router(build_chain([a, b], [["m"], ["m"]]), max_retries=0, base_delay=0.0, max_delay=0.0)
     with pytest.raises(ChainExhausted):
         await _ask_router(router)
-    with pytest.raises(ChainExhausted) as err:  # both are cooling now
+    with pytest.raises(ChainExhausted) as err:  # both are in their 60 s window now: nothing is free, so both run again
         await _ask_router(router)
-    assert "unavailable until" in str(err.value) and "rate-limited" not in str(err.value)
-    assert 0 < err.value.retry_after <= 60
+    assert (a.calls, b.calls) == (2, 2)
+    assert "rate-limited" not in str(err.value) and "last reason: server" in str(err.value)
+    # a server window is no reset to wait for: a caller that parks on retry_after would park on a dead chain forever
+    assert err.value.retry_after is None
 
 
 async def test_a_stopped_turn_still_tells_the_client_it_is_over(tmp_path, monkeypatch):

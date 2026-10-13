@@ -64,6 +64,18 @@ class ProviderEntry(BaseModel):
     #: 5-minute entry expired on every tick; "1h" keeps its prompt cached between ticks. Anthropic's API only: a relay
     #: that rejects unknown cache_control fields needs "5m".
     cache_ttl: str = "5m"
+    #: Stall limits in seconds (providers/stall.py): how long a reply may take to show its first token, and how long
+    #: it may then be silent between two. None = the default: 60 s and 120 s, or 300 s for a keyless or local server
+    #: (Ollama, llama.cpp, vLLM on this machine), whose prefill of a long prompt can take minutes before any token.
+    first_event_timeout: float | None = None
+    idle_timeout: float | None = None
+
+    @field_validator("first_event_timeout", "idle_timeout")
+    @classmethod
+    def validate_stall_limit(cls, v: float | None, info: Any) -> float | None:
+        if v is not None and not 0 < v < float("inf"):  # also false for nan
+            raise ValueError(f"{info.field_name} must be a number of seconds above 0")
+        return v
 
     @field_validator("cache_ttl")
     @classmethod
@@ -258,8 +270,7 @@ class Settings(BaseModel):
     # User hooks: {PreToolUse: [{matcher, command, timeout}], ...}. Run from the user's config and, once the project
     # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
     hooks: dict[str, Any] = Field(default_factory=dict)
-    # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
-    # see retention()
+    # What the daemon prunes at start: the keys and defaults are in RETENTION_DEFAULTS; see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")

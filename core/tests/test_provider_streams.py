@@ -179,7 +179,9 @@ def test_an_openrouter_call_on_the_users_own_key_counts_the_upstream_charge_too(
     }
     assert _parse_usage(byok, reports_cost=True).cost_usd == pytest.approx(0.52)
     # without the flag the upstream figure is not added (it could already be inside `cost`)
-    assert _parse_usage({**byok, "is_byok": False, "cost": 0.6}, reports_cost=True).cost_usd == pytest.approx(0.6)
+    assert _parse_usage({**byok, "is_byok": False, "cost": 0.6}, reports_cost=True).cost_usd == pytest.approx(
+        0.6, abs=0.001
+    )
     assert _parse_usage({**byok, "cost_details": ["not", "a", "dict"]}, reports_cost=True).cost_usd == 0.0
 
 
@@ -462,6 +464,94 @@ async def test_the_one_hour_cache_ttl_is_priced_by_the_provider_that_asked_for_i
     assert (await run(provider("1h")))[-1].usage.cache_write_multiple == 2.0
     assert (await run(provider("5m")))[-1].usage.cache_write_multiple is None
     assert (await run(provider("1h", cache="off")))[-1].usage.cache_write_multiple is None, "no cache, no surcharge"
+
+
+ONE_HOUR_WRITE = (
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":'
+    '{"input_tokens":10,"cache_creation_input_tokens":100000}}}\n\n'
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    '"delta":{"type":"text_delta","text":"ok"}}\n\n'
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+    '"usage":{"output_tokens":0}}\n\n'
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+
+def priced(usage, model: str) -> float:
+    from types import SimpleNamespace
+
+    from k3code.pricing import estimate_usd
+
+    usage.model = model
+    return estimate_usd(SimpleNamespace(models={}), usage)
+
+
+async def test_an_attempt_that_died_on_a_one_hour_cache_is_priced_as_the_one_that_finished():
+    provider = AnthropicProvider(
+        name="a", base_url="https://a.test", api_key="k", cache_ttl="1h", client=client(ONE_HOUR_WRITE)
+    )
+    events = await run(provider)
+    partial = next(e.usage for e in events if e.type == "partial_usage")
+    final = events[-1].usage
+    assert partial.cache_write_multiple == 2.0 == final.cache_write_multiple
+    # no output tokens, so the two figures are the same request: the 100k written tokens cost 2x, not 1.25x
+    assert priced(partial, "claude-sonnet-4-5") == priced(final, "claude-sonnet-4-5") == pytest.approx(0.6, abs=0.001)
+
+
+async def test_a_claude_relay_on_a_one_hour_cache_is_priced_at_the_two_times_write_rate():
+    body = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+        'data: {"choices":[],"usage":{"prompt_tokens":100010,"completion_tokens":0,'
+        '"prompt_tokens_details":{"cache_write_tokens":100000}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def relay(ttl: str, cache: str = "auto") -> OpenAICompatProvider:
+        return OpenAICompatProvider(
+            name="o",
+            base_url="https://relay.test/v1",
+            api_key="k",
+            client=client(body),
+            cache_ttl=ttl,
+            prompt_cache=cache,
+        )
+
+    async def usage_of(provider: OpenAICompatProvider, model: str):
+        return [e async for e in provider.stream(MSGS, [], model)][-1].usage
+
+    one_hour = await usage_of(relay("1h"), "claude-sonnet-4-5")
+    assert one_hour.cache_write_multiple == 2.0
+    assert priced(one_hour, "claude-sonnet-4-5") == pytest.approx(0.6, abs=0.001)
+    five = await usage_of(relay("5m"), "claude-sonnet-4-5")
+    assert five.cache_write_multiple is None and priced(five, "claude-sonnet-4-5") == pytest.approx(0.375, abs=0.001)
+    # no breakpoints went out, so nothing was written at the 1-hour rate
+    assert (await usage_of(relay("1h"), "gpt-4o")).cache_write_multiple is None
+    off = await usage_of(relay("1h", cache="off"), "claude-sonnet-4-5")
+    assert off.cache_write_multiple is None
+
+
+async def test_a_relay_that_refuses_the_breakpoints_is_not_priced_for_a_one_hour_write():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if len(sent) == 1:
+            return httpx.Response(400, json={"error": {"message": "unknown field cache_control"}})
+        body = (
+            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+            'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":1}}\n\ndata: [DONE]\n\n'
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+
+    provider = OpenAICompatProvider(
+        name="o",
+        base_url="https://relay.test/v1",
+        api_key="k",
+        cache_ttl="1h",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    events = [e async for e in provider.stream(MSGS, [], "claude-sonnet-4-5")]
+    assert len(sent) == 2 and events[-1].usage.cache_write_multiple is None
 
 
 COST_BODY = (

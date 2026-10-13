@@ -208,15 +208,15 @@ k3code picks the number of sub-agents from the task instead of using a fixed cou
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `ultracode.max_agents` | Most sub-agents one `/ultracode` run may start in all (planners, workers, reviewers, the fixer). `auto` starts a run at 24 and keeps what its plan needs (a worker, its reviewer and one rework each, plus the review). 1 to 64 | 12 |
+| `ultracode.max_agents` | Most sub-agents one `/ultracode` run may start in all (planners, workers, reviewers, the fixer). `auto` starts a run at 24 and keeps what its plan needs (per worker: itself, one rework and the reviews of both, each review allowed one retry; plus the review tail). 1 to 64 | 12 |
 | `autonomy.agents.max_parallel` | Most sub-agents of a session running at the same time: the cap on the model's own `task` calls, and the ceiling of a fan-out's width (1 to 8) | 4 |
 | `autonomy.agents.dynamic` | Size the planners and workers from the task (below). `false` is the older fixed shape: three planners, one worker per plan step | on |
 
 How `/ultracode` sizes a run when `dynamic` is on:
 
 - **Planners.** A task the classifier rated trivial or small, low risk and needing no plan gets one planner (no judge call; if it fails, the next angle is tried). Everything else keeps three: a medium or larger task, one the safety floor flagged (credentials, migrations, force pushes), one you rated with `/scope`, one the classifier could not rate, and a task you start with `/ultracode <task>` or the word `ultracode`.
-- **Workers.** The plan's top-level steps are grouped into units that can run apart: steps the planner marked `(parallel)` stay separate and the unmarked ones form one chain; steps that name the same file (the planner ends each step with `[files: path/a.py, path/b/]`), or say "after step 2", always stay together. The units are packed into as many workers as the budget pays for (each worker costs itself plus its reviewer; a rework after a rejection comes out of the same pool, and a subtask that cannot get one is reported as skipped), and never more than 8 (a trivial or small task is one worker). At the default budget of 12 that is at most three workers. Nothing is dropped: extra units are joined into a worker's task, in order.
-- **The review is kept.** Three agents (the two review lenses and the fixer) are held back from the fan-out, so a wide plan can never use up the budget before its review and final tests. A run that cannot afford even one worker and its reviewer stops before it starts and tells you to raise `/maxagents`. A report whose panel never ran says "not run", not "0 findings".
+- **Workers.** The plan's top-level steps are grouped into units that can run apart: steps the planner marked `(parallel)` stay separate and the unmarked ones form one chain; steps that name the same file (the planner ends each step with `[files: path/a.py, path/b/]`), or say "after step 2", always stay together. The units are packed into as many workers as the budget pays for (each worker costs itself plus its reviewer; a rework after a rejection comes out of the same pool and starts only when the pool can also pay for its re-review, otherwise the subtask is escalated with the branch that keeps its work), and never more than 8 (a trivial or small task is one worker). At the default budget of 12 that is at most two workers (three need `/maxagents 14`). Nothing is dropped: extra units are joined into a worker's task, in order.
+- **The review is kept.** Five agents (each of the two review lenses, asked up to twice, and the fixer) are held back from the fan-out, so a wide plan can never use up the budget before its review and final tests. A run that cannot afford even one worker and its reviewer stops before it starts and tells you to raise `/maxagents`. A report whose panel never ran says "not run", not "0 findings".
 - **Width.** Workers run `min(workers, autonomy.fanout.max_parallel, autonomy.agents.max_parallel)` at a time (2 when the subtasks look IO-heavy: install, build, docker, ...). Both ceilings used to stop at 3 whatever was configured.
 
 The same limits apply when the model starts agents itself with the `task` tool: past `max_parallel` live children, `max_nested` (3) live sub-agents of one child, `max_spawns` (16) calls in one turn, or 16 live agents in the whole gateway, the call fails with a message that says which limit it hit and the model collects a result or does the part itself. Nothing is queued. Calls to read-only agent types (`explorer`, `planner`) in one reply run at the same time; anything that can write waits its turn.
@@ -430,6 +430,12 @@ providers:                          # the fallback chain, in order (add as many 
     api_key_env: ANTHROPIC_API_KEY
     models: {default: claude-sonnet-5-5}
     # cache_ttl: 1h                 # prompt-cache entries live 5m (default) or 1h; see "Long sessions" above
+    # first_event_timeout: 60       # seconds a reply may take to show its first token before it counts as stalled
+    # idle_timeout: 120             #   ... and seconds it may then be silent between two. Both default to 300 for a
+    #                               #   server that takes no key or runs on this machine (Ollama, llama.cpp, vLLM): its
+    #                               #   prefill of a long prompt can take minutes. A stalled reply is retried once, then
+    #                               #   the next provider is tried (a one-shot call under a deadline, such as the
+    #                               #   compaction summary, moves on at the first stall).
 
 permission_mode: ask                # ask | auto-edit | plan | auto | yolo
 currency: EUR                      # EUR (default) or USD: how /stats and the budget messages show money

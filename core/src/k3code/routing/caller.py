@@ -8,6 +8,7 @@ failure escalates to the next tier (``routing.escalated``) until the top of the 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -17,7 +18,7 @@ from typing import Any
 
 from k3code.errors import ChainExhausted
 from k3code.providers import effort as effort_mod
-from k3code.providers.types import Message, ToolSpec
+from k3code.providers.types import Message, ToolSpec, Usage
 from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_for
 
 logger = logging.getLogger(__name__)
@@ -137,37 +138,64 @@ class ModelCaller:
             return "", usage.model
         return self._last_attempt() if self._last_attempt else ("", "")
 
-    async def _once(
+    async def _answer(
         self,
-        routers: TierRouters,
-        kind: TaskKind,
-        tier: Tier,
+        router: Any,
         messages: list[Message],
-        session_id: str,
         tools: list[ToolSpec],
         max_tokens: int,
         timeout: float | None,
-        router: Any = None,
-        *,
-        retried: bool = False,
-    ) -> CallResult:
-        router = router if router is not None else routers.get(tier)
-        coro = router.complete(messages, tools, max_tokens=max_tokens)
-        started = time.monotonic()
-        attempts: list[tuple[str, str]] = []
-        token = attempt_holder.set(attempts)
-        # the session's /effort is for the work it asked for: a title, a verdict or a summary at "max" spent the reply
-        # cap on reasoning and ended empty, at several times the cost
-        effort_token = effort_mod.REASONING_EFFORT.set(None) if kind in NO_EFFORT_KINDS else None
+        attempts: list[tuple[str, str]],
+        book_dead: Callable[[Usage, tuple[str, str]], None],
+    ) -> Message:
+        """The router's final message. An attempt that died after the provider counted its prompt (``partial_usage``) is
+        spend all the same: ``book_dead`` gets it, as the agent loop's ``_metered`` does for a turn.
+
+        A call under a deadline fails over on the first stalled stream: the deadline would cut a second try on the
+        same entry short, and the entries after it would never run."""
+        stream = getattr(router, "stream", None)
+        if stream is None:  # a router that only completes (a test double) has no attempts to meter
+            return await router.complete(messages, tools, max_tokens=max_tokens)
+        events = stream(messages, tools, max_tokens=max_tokens, **({"stall_retries": 0} if timeout else {}))
+        pending: Usage | None = None
+        served = ("", "")  # who the pending prompt was sent to: the attempts list moves on with the next one
+        final: Message | None = None
         try:
-            final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+            async for event in events:
+                if event.type == "partial_usage" and event.usage is not None:
+                    if pending is not None:  # an earlier attempt died before a retry's prompt was counted
+                        book_dead(pending, served)
+                    pending, served = event.usage, (attempts[-1] if attempts else ("", event.usage.model))
+                elif event.type == "reset":
+                    if pending is not None:
+                        book_dead(pending, served)
+                        pending = None
+                elif event.type == "done" and event.message is not None:
+                    pending, final = None, event.message  # the final usage replaces the prompt count
         finally:
-            attempt_holder.reset(token)
-            if effort_token is not None:
-                effort_mod.REASONING_EFFORT.reset(effort_token)
-        seconds = time.monotonic() - started
-        usage = final.usage
-        provider, model = self._served(attempts, usage)
+            if pending is not None:  # the walk ended in an error, or the deadline cancelled it
+                book_dead(pending, served)
+            aclose = getattr(events, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+        if final is None:
+            raise ChainExhausted("provider stream ended without a final message", last_reason="unknown")
+        return final
+
+    def _book(
+        self,
+        usage: Usage | None,
+        served: tuple[str, str],
+        session_id: str,
+        tier: Tier,
+        kind: TaskKind,
+        *,
+        seconds: float = 0.0,
+        detail: str = "",
+    ) -> None:
+        """Charge a call's usage to the session and write its row."""
+        provider, model = served
         pt, ct = (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0)
         # charged before the row is written: the day's ledger, started from the log, must not read this call twice
         if self._charge is not None and usage is not None and session_id:
@@ -190,7 +218,50 @@ class ModelCaller:
                 task_kind=kind.value,
                 turn=self._turn_of(session_id) if self._turn_of else "",
                 seconds=seconds,
+                detail=detail,
             )
+
+    async def _once(
+        self,
+        routers: TierRouters,
+        kind: TaskKind,
+        tier: Tier,
+        messages: list[Message],
+        session_id: str,
+        tools: list[ToolSpec],
+        max_tokens: int,
+        timeout: float | None,
+        router: Any = None,
+        *,
+        retried: bool = False,
+    ) -> CallResult:
+        router = router if router is not None else routers.get(tier)
+        started = time.monotonic()
+        attempts: list[tuple[str, str]] = []
+        token = attempt_holder.set(attempts)
+        # the session's /effort is for the work it asked for: a title, a verdict or a summary at "max" spent the reply
+        # cap on reasoning and ended empty, at several times the cost
+        effort_token = effort_mod.REASONING_EFFORT.set(None) if kind in NO_EFFORT_KINDS else None
+        try:
+            coro = self._answer(
+                router,
+                messages,
+                tools,
+                max_tokens,
+                timeout,
+                attempts,
+                lambda usage, served: self._book(usage, served, session_id, tier, kind, detail="attempt cut short"),
+            )
+            final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        finally:
+            attempt_holder.reset(token)
+            if effort_token is not None:
+                effort_mod.REASONING_EFFORT.reset(effort_token)
+        seconds = time.monotonic() - started
+        usage = final.usage
+        provider, model = self._served(attempts, usage)
+        pt, ct = (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0)
+        self._book(usage, (provider, model), session_id, tier, kind, seconds=seconds)
         result = CallResult(final.content or "", tier, model, provider, pt, ct)
         if (
             not result.text.strip()

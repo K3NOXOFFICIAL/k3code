@@ -70,6 +70,11 @@ class AnthropicProvider(Provider):
     def _url(self) -> str:
         return f"{self.base_url}/v1/messages"
 
+    @property
+    def _write_multiple(self) -> float | None:
+        """A cache write against the base input price: the 1-hour entry costs 2x (None = the 5-minute 1.25x)."""
+        return 2.0 if self.prompt_cache and self.cache_ttl == "1h" else None
+
     def _payload(
         self,
         messages: list[Message],
@@ -190,6 +195,7 @@ class AnthropicProvider(Provider):
                                 prompt_tokens=usage_in,
                                 cache_read_tokens=cache_read,
                                 cache_creation_tokens=cache_creation,
+                                cache_write_multiple=self._write_multiple,
                             ),
                         )
                 elif etype == "message_delta":
@@ -210,7 +216,7 @@ class AnthropicProvider(Provider):
                 completion_tokens=usage_out,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
-                cache_write_multiple=2.0 if self.prompt_cache and self.cache_ttl == "1h" else None,
+                cache_write_multiple=self._write_multiple,
             )
             final_calls = [
                 ToolCall(

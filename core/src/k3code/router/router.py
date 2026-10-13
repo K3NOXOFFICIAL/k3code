@@ -12,6 +12,8 @@ Rules (from the M0 task spec):
 - A second auth failure in a row also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the
   rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing):
   later calls skip the dead entry at once, and a replaced key is tried immediately.
+- An entry that stayed down (server error, timeout) through every retry is skipped for 60 s while a later entry is free.
+  With none free it is tried again, and such a window never sets ``retry_after``: it is no reset to wait for.
 - context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
   every failure was a network error, otherwise :class:`ChainExhausted` (carrying
@@ -51,6 +53,9 @@ from k3code.router.cooldown import CooldownStore, key_fingerprint
 MIN_RETRY_DELAY = 0.5
 #: How long an entry that stayed broken through every retry is skipped when the chain has another (server, timeout).
 FAILOVER_COOLDOWN_S = 60.0
+#: The reasons that arm it. Such a window only steers calls toward an entry that is free: it is not a reset to wait
+#: for, so a chain whose entries are all in one is tried again at once (see ``_walk`` and ``earliest_reset``).
+_DEAD_ENTRY_REASONS = frozenset({FailoverReason.server, FailoverReason.timeout})
 
 logger = logging.getLogger(__name__)
 
@@ -191,13 +196,18 @@ class Router:
         model: str | None = None,
         max_tokens: int = 8192,
         temperature: float | None = None,
+        stall_retries: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Yield stream events from the first entry that completes its handshake.
 
         The walk state machine runs while yielding: any ProviderError after
         streaming started terminates the stream (partial outputs are not replayed).
+        ``stall_retries``: retries of one entry after a stalled stream (None = ``STALL_RETRIES``); a call under a
+        deadline passes 0, or the deadline cuts the walk off in the middle of the retry and no later entry is tried.
         """
-        async for event in self._walk(messages, tools, model=model, max_tokens=max_tokens, temperature=temperature):
+        async for event in self._walk(
+            messages, tools, model=model, max_tokens=max_tokens, temperature=temperature, stall_retries=stall_retries
+        ):
             if event.type == "error":
                 # Providers may surface mid-stream failures as error events; treat
                 # them like raised exceptions.
@@ -216,9 +226,12 @@ class Router:
         model: str | None = None,
         max_tokens: int = 8192,
         temperature: float | None = None,
+        stall_retries: int | None = None,
     ) -> Message:
         """Drain the stream and return the final assistant message."""
-        stream = self.stream(messages, tools, model=model, max_tokens=max_tokens, temperature=temperature)
+        stream = self.stream(
+            messages, tools, model=model, max_tokens=max_tokens, temperature=temperature, stall_retries=stall_retries
+        )
         async for event in stream:
             if event.type == "done" and event.message is not None:
                 return event.message
@@ -234,6 +247,7 @@ class Router:
         model: str | None = None,
         max_tokens: int,
         temperature: float | None,
+        stall_retries: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         last_reason: FailoverReason | None = None
         last_detail = ""
@@ -247,6 +261,18 @@ class Router:
             entry = self.chain[entry_index]
             target_model = model if entry_index == 0 and model else entry.model
             skip_reason = self._skip_in_cooldown(entry, target_model)
+            cooled = None
+            if skip_reason is not None:
+                cooled = self.cooldowns.reason_of(
+                    provider=entry.provider_name,
+                    model=target_model,
+                    base_url=entry.base_url,
+                    fingerprint=entry.key_fingerprint,
+                )
+                if cooled in _DEAD_ENTRY_REASONS and not self._free_entry_after(entry_index):
+                    # No live entry left to go to: skipping this one would only turn a dead chain into a 60 s wait
+                    # (and, unattended, a park that never counts against its cap). Try it, as before the window.
+                    skip_reason = None
             if skip_reason is not None:
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
@@ -254,12 +280,6 @@ class Router:
                     entry.model,
                     skip_reason,
                     "cooldown",
-                )
-                cooled = self.cooldowns.reason_of(
-                    provider=entry.provider_name,
-                    model=target_model,
-                    base_url=entry.base_url,
-                    fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
                     last_reason = cooled
@@ -328,7 +348,8 @@ class Router:
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
                     # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
-                    if attempt >= (min(self.max_retries, STALL_RETRIES) if is_stall(exc) else self.max_retries):
+                    stall_limit = STALL_RETRIES if stall_retries is None else stall_retries
+                    if attempt >= (min(self.max_retries, stall_limit) if is_stall(exc) else self.max_retries):
                         self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
                         break
                     attempt += 1
@@ -398,8 +419,10 @@ class Router:
         return None
 
     def earliest_reset(self, model: str | None = None, *, auth_failed: Collection[int] = ()) -> float | None:
-        """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down. ``model`` is the
-        override the walk runs the first entry with: cooldowns are keyed by the model actually called.
+        """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down. A server or timeout
+        window does not count as cooling (the walk tries such an entry when no other is free), so a chain whose entries
+        all failed that way has no wait. ``model`` is the override the walk runs the first entry with: cooldowns are
+        keyed by the model actually called.
         ``auth_failed`` are the chain indices the walk just saw rejected (a first rejection arms no cooldown): waiting
         on the others still makes sense, those entries only come back with a new key."""
         if not self.chain or self.cooldowns is None:
@@ -409,16 +432,22 @@ class Router:
         for index, entry in enumerate(self.chain):
             target = model if index == 0 and model else entry.model
             fp = entry.key_fingerprint
-            if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
-            ):
+            cooled = (
+                self.cooldowns.reason_of(
+                    provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                )
+                if self.cooldowns.in_cooldown(
+                    provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                )
+                else None
+            )
+            if cooled is None or cooled in _DEAD_ENTRY_REASONS:
+                # A server/timeout window is not a reset to wait for: the walk tries such an entry when nothing else
+                # is free, so the chain is not "all cooling" and no caller should park on it.
                 if index in auth_failed:
                     continue
                 return None
             left = self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
-            )
-            cooled = self.cooldowns.reason_of(
                 provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
             )
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
@@ -444,6 +473,11 @@ class Router:
             )
         return None
 
+    def _free_entry_after(self, entry_index: int) -> bool:
+        """Whether a later entry is out of cooldown. Earlier ones are not counted: one that is free now was just tried
+        and failed (without a window, or the walk would not have come this far)."""
+        return any(self._skip_in_cooldown(other, other.model) is None for other in self.chain[entry_index + 1 :])
+
     def _failover(
         self,
         entry: ChainEntry,
@@ -468,7 +502,7 @@ class Router:
         )
         if (
             not armed
-            and reason in (FailoverReason.server, FailoverReason.timeout)
+            and reason in _DEAD_ENTRY_REASONS
             and len(self.chain) > 1  # a lone entry is retried on every call, as it always was: there is nowhere else
         ):
             # It stayed down through every retry: a hung or failing primary cost three full attempts (3 x 300 s read

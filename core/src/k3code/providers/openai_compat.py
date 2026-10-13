@@ -158,6 +158,8 @@ class OpenAICompatProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         response, watchdog = await self._open(messages, tools, model, max_tokens=max_tokens, temperature=temperature)
+        # known only now: _open drops the breakpoints for good when the relay refuses them
+        write_multiple = 2.0 if self.prompt_cache and "claude" in model.lower() and self.cache_ttl == "1h" else None
         try:
             tool_calls: dict[int, dict[str, Any]] = {}
             current: dict[int, int] = {}  # wire index -> slot of the call being streamed on it
@@ -213,7 +215,9 @@ class OpenAICompatProvider(Provider):
                         if args := fn.get("arguments"):
                             slot["args"].append(args)
                 if chunk_usage := chunk.get("usage"):
-                    usage = _parse_usage(chunk_usage, reports_cost="openrouter" in self.base_url.lower())
+                    usage = _parse_usage(
+                        chunk_usage, reports_cost="openrouter" in self.base_url.lower(), write_multiple=write_multiple
+                    )
             if not complete:
                 # A proxy closing early or an upstream dying mid-answer ends the body cleanly: without this the
                 # half sentence became a successful turn, was saved to history and never failed over.
@@ -329,7 +333,9 @@ def _is_amount(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and value >= 0
 
 
-def _parse_usage(chunk_usage: dict[str, Any], *, reports_cost: bool = False) -> Any:
+def _parse_usage(
+    chunk_usage: dict[str, Any], *, reports_cost: bool = False, write_multiple: float | None = None
+) -> Any:
     from k3code.providers.types import Usage
 
     details = chunk_usage.get("prompt_tokens_details") or {}
@@ -364,6 +370,7 @@ def _parse_usage(chunk_usage: dict[str, Any], *, reports_cost: bool = False) -> 
             or 0
         ),
         cache_creation_tokens=cache_creation,
+        cache_write_multiple=write_multiple,
     )
 
 
