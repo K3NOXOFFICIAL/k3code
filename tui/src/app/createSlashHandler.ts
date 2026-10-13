@@ -16,15 +16,27 @@ import {
   shouldFallbackToDispatch,
 } from "./userMessages.js";
 
+export interface SlashRunOpts {
+  /**
+   * Run next to the command that took the latest flight number instead of
+   * superseding it, so the answers (and errors) of several commands sent
+   * together all reach the transcript. A command typed later still supersedes
+   * them all.
+   */
+  alongside?: boolean;
+}
+
 export function createSlashHandler(
   ctx: SlashHandlerContext,
-): (cmd: string) => boolean {
+): (cmd: string, opts?: SlashRunOpts) => boolean {
   const { gw } = ctx.gateway;
   const { catalog } = ctx.local;
   const { page, send, sys } = ctx.transcript;
 
-  const handler = (cmd: string): boolean => {
-    const flight = ++ctx.slashFlightRef.current;
+  const handler = (cmd: string, opts: SlashRunOpts = {}): boolean => {
+    const flight = opts.alongside
+      ? ctx.slashFlightRef.current
+      : ++ctx.slashFlightRef.current;
     const ui = getUiState();
     const sid = ui.sid;
     const parsed = parseSlashCommand(cmd);
@@ -86,7 +98,7 @@ export function createSlashHandler(
 
       if (exact) {
         if (exact.toLowerCase() !== needle) {
-          return handler(`${exact}${argTail}`);
+          return handler(`${exact}${argTail}`, opts);
         }
       } else {
         // Tiered name scoring (ported from grok-cli's slash menu): prefix
@@ -113,7 +125,7 @@ export function createSlashHandler(
         ];
 
         if (matches.length === 1 && matches[0]!.toLowerCase() !== needle) {
-          return handler(`${matches[0]}${argTail}`);
+          return handler(`${matches[0]}${argTail}`, opts);
         }
 
         if (matches.length > 1) {
@@ -142,7 +154,7 @@ export function createSlashHandler(
       }
 
       if (d.type === "alias") {
-        return void handler(`/${d.target}${argTail}`);
+        return void handler(`/${d.target}${argTail}`, opts);
       }
 
       // A skill/bundle dispatch's `message` is the expanded skill body —

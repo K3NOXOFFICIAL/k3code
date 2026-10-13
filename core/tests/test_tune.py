@@ -354,7 +354,7 @@ async def test_tune_get_effort_is_unknown_when_nothing_resolves():
 
 
 async def test_settings_get_returns_the_view_with_its_option_lists_and_text(server, tmp_path):
-    """settings.get feeds the interactive /settings panel: the view, its option lists and the plain text."""
+    """settings.get feeds the /dashboard Session and Status tabs: the view, its option lists and the plain text."""
     sid = await _session(server, tmp_path)
     await m1.cmd(server, "/tune cheap effort high", sid)
     res = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
@@ -365,6 +365,30 @@ async def test_settings_get_returns_the_view_with_its_option_lists_and_text(serv
     assert res["output"].startswith("model:        cheap")
     bare = (await m1.rpc(server, "settings.get", {}))["result"]
     assert bare["settings"]["model_keys"] == view["model_keys"] and "output" in bare
+
+
+async def test_settings_get_names_the_theme_that_theme_saved(server, tmp_path):
+    """/theme saves display.tui_theme: the Theme row, the Status tab and the /settings text say what it set."""
+    sid = await _session(server, tmp_path)
+    before = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
+    assert before["settings"]["theme"] == "default"
+    for theme in ("dark", "light", "auto"):
+        assert (await m1.rpc(server, "config.set", {"key": "theme", "value": theme}))["result"]["value"] == theme
+        res = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
+        assert res["settings"]["theme"] == theme
+        assert f"theme:        {theme}" in res["output"]
+    server.config.display.tui_theme = ""  # never pinned: the older display.theme, else default
+    server.config.display.theme = "light"
+    assert (await m1.rpc(server, "settings.get", {}))["result"]["settings"]["theme"] == "light"
+
+
+async def test_settings_get_names_a_legacy_permission_mode_by_its_current_name(server, tmp_path):
+    """Without a session the configured mode is shown: an old config's ask is default, so no chip repeats it."""
+    for old, name in (("ask", "default"), ("auto-edit", "accept-edits"), ("plan", "plan"), ("nonsense", "nonsense")):
+        server.config.permission_mode = old
+        view = (await m1.rpc(server, "settings.get", {}))["result"]["settings"]
+        assert view["permission_mode"] == name
+    assert "default" in view["permission_modes"] and "ask" not in view["permission_modes"]
 
 
 async def test_tune_get_without_a_session_and_with_an_unknown_one(server):

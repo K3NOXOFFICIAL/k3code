@@ -4546,7 +4546,7 @@ async def _session_status(server: GatewayServer, params: dict[str, Any]) -> dict
 
 
 async def _settings_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """``settings.get``: the structured /settings view (plus its text) for the interactive settings panel."""
+    """``settings.get``: the structured /settings view (plus its text) for the /dashboard Session and Status tabs."""
     from k3code.commands.settings_cmd import build_settings_view, render_text
 
     session = server._session_for(params.get("session_id"))

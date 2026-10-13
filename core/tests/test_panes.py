@@ -349,7 +349,7 @@ READONLY_ALLOWED = frozenset(
         "session.resume",
         "session.status",
         "session.usage",
-        "settings.get",  # the /settings panel's view: what config.get and tune.get show, read
+        "settings.get",  # the /dashboard Session and Status tabs' view: what config.get and tune.get show, read
         "setup.status",
         "skills.reload",  # lists what a fresh scan finds
         "spawn_tree.save",  # an acknowledgement

@@ -22,7 +22,10 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
         spec = p.models.get(cfg.default_model) or p.models.get("default") or next(iter(p.models.values()), "")
         chain.append({"provider": p.name, "models": spec if isinstance(spec, list) else [spec]})
     rules = 0
-    mode = cfg.permission_mode
+    try:
+        mode = PermissionMode(cfg.permission_mode).value  # an old config may still say ask or auto-edit
+    except ValueError:
+        mode = cfg.permission_mode
     if live is not None:
         live.perms.cwd = cwd
         live.perms.reload()
@@ -45,7 +48,8 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
         "permission_modes": [m.value for m in PermissionMode],
         "permission_rules": rules,
         "focus_mode": cfg.display.focus_mode,
-        "theme": cfg.display.theme or "default",
+        # /theme saves display.tui_theme; display.theme is the older field
+        "theme": str(getattr(cfg.display, "tui_theme", "") or cfg.display.theme or "default"),
         "output_style": style,
         "advisor": (ctx.session_advisor(live) or None) if live and hasattr(ctx, "session_advisor") else None,
         "output_styles": outputstyle.available(cwd),

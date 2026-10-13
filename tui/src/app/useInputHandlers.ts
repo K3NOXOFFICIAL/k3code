@@ -141,7 +141,6 @@ const CTRL_C_ORDER = [
   "modelPicker",
   "tunePicker",
   "dashboard",
-  "settingsPanel",
   "skillsHub",
   "pluginsHub",
   "sessions",
@@ -363,8 +362,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys);
       case "modelPicker":
         return patchOverlayState({ modelPicker: false });
-      case "settingsPanel":
-        return patchOverlayState({ settingsPanel: false });
       case "tunePicker":
         return patchOverlayState({ tunePicker: false });
       case "dashboard":

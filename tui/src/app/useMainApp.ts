@@ -32,11 +32,7 @@ import {
   shortCwd,
 } from "../domain/paths.js";
 import { sessionScopedModelArg } from "../domain/slash.js";
-import {
-  type DashboardChange,
-  dashboardSummary,
-  type DashboardUi,
-} from "../domain/dashboard.js";
+import { type DashboardChange, type DashboardUi } from "../domain/dashboard.js";
 import { tuneSummary } from "../domain/tune.js";
 import { type GatewayClient } from "../gatewayClient.js";
 import type {
@@ -82,7 +78,8 @@ import { clearProposals, setProposalHandlers } from "../k3/proposalsStore.js";
 import { applyAgentSnapshot } from "./agentRoster.js";
 import { createGatewayEventHandler } from "./createGatewayEventHandler.js";
 import { createServerRequestHandler } from "./createServerRequestHandler.js";
-import { createSlashHandler } from "./createSlashHandler.js";
+import { createSlashHandler, type SlashRunOpts } from "./createSlashHandler.js";
+import { saveDashboard } from "./dashboardSave.js";
 import { planGatewayRecovery } from "./gatewayRecovery.js";
 import { applyGoalSnapshot } from "./goalStatus.js";
 import { getInputSelection } from "./inputSelectionStore.js";
@@ -331,7 +328,9 @@ export function useMainApp(gw: GatewayClient) {
   );
 
   const slashFlightRef = useRef(0);
-  const slashRef = useRef<(cmd: string) => boolean>(() => false);
+  const slashRef = useRef<(cmd: string, opts?: SlashRunOpts) => boolean>(
+    () => false,
+  );
   const colsRef = useRef(cols);
   const scrollRef = useRef<null | ScrollBoxHandle>(null);
   const onEventRef = useRef<(ev: AnyGatewayEvent) => void>(() => {});
@@ -1473,28 +1472,14 @@ export function useMainApp(gw: GatewayClient) {
     slashRef.current(`/model ${value}`);
   }, []);
 
-  // /dashboard popup: Enter. The draft is painted first (the fields that waited for Enter too), then one config.set
-  // per changed key; a key the gateway refuses is named in the transcript instead of silently reverting on restart.
+  // /dashboard popup: Enter (see saveDashboard).
   const onDashboardSave = useCallback(
-    (changes: DashboardChange[], patch: Partial<DashboardUi>) => {
-      patchUiState(patch);
-      patchOverlayState({ dashboard: null });
-      sys(dashboardSummary(changes));
-
-      for (const { command, key, value } of changes) {
-        if (command) {
-          slashRef.current(command); // the command checks, saves and says what it did
-
-          continue;
-        }
-
-        void rpc("config.set", { key, value }).then((r) => {
-          if (r === null) {
-            sys(`could not save ${key}: it applies to this session only`);
-          }
-        });
-      }
-    },
+    (changes: DashboardChange[], patch: Partial<DashboardUi>) =>
+      saveDashboard(changes, patch, {
+        rpc,
+        run: (command, opts) => slashRef.current(command, opts),
+        sys,
+      }),
     [rpc, sys],
   );
 
@@ -1511,10 +1496,6 @@ export function useMainApp(gw: GatewayClient) {
     },
     [rpc, sys],
   );
-
-  const onSettingsApply = useCallback((command: string) => {
-    slashRef.current(command);
-  }, []);
 
   const closeLiveSession = useCallback(
     async (id: string) => {
@@ -1658,7 +1639,6 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onDashboardSave,
       onModelSelect,
-      onSettingsApply,
       onTuneApply,
       // Resuming a cold session from the overlay CLOSES the current one, so it
       // must respect the busy guard just like the `/resume` slash path.
@@ -1684,7 +1664,6 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onDashboardSave,
       onModelSelect,
-      onSettingsApply,
       onTuneApply,
       session,
     ],

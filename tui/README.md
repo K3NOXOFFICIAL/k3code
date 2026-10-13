@@ -210,9 +210,12 @@ Notes:
 | Tune popup                  | `Esc`, `Ctrl+C`     | Close without applying                            |
 | Dashboard (`/dashboard`)    | `Up/Down`           | Move between rows                                 |
 | Dashboard popup             | `Left/Right`        | Change the row's value                            |
-| Dashboard popup             | `Tab`, `1-4`        | Change tab                                        |
+| Dashboard popup             | `Tab`, `1-6`        | Change tab                                        |
+| Dashboard popup             | `/`                 | Search the rows of every tab                      |
+| Dashboard popup             | `PgUp/PgDn`, `g/G`  | Jump over the rows, or scroll the Status text     |
 | Dashboard popup             | `Enter`             | Save the changes                                  |
-| Dashboard popup             | `Esc`, `Ctrl+C`     | Close and put everything back                     |
+| Dashboard popup             | `Esc`               | Clear the search, then close and revert           |
+| Dashboard popup             | `q`, `Ctrl+C`       | Close and put everything back                     |
 
 Notes:
 
@@ -302,12 +305,16 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 A bare `/model` or `/effort` opens the same popup, not the provider/key picker;
 `/model --refresh` still opens the provider picker.
 
+`/settings` — the Dashboard popup on its Session tab (see below). `/settings status`
+(or `text`) prints the read-only settings text in the pager instead.
+
 ### Dashboard (`dashboard.ts`)
 
 `/dashboard` (alias `/display`) — one tabbed popup for the settings that
-otherwise take a dozen commands. `/dashboard [look|details|input|context]` opens it on
-that tab. It stays shut while an approval, question, password or confirm prompt
-is waiting, and reads no key or click while one is up.
+otherwise take a dozen commands. `/dashboard [look|details|input|context|session|status]`
+(or the tab's number) opens it on that tab; `/settings` opens it on Session. It
+stays shut while an approval, question, password or confirm prompt is waiting,
+and reads no key or click while one is up.
 
 | Tab     | Rows                                                                                                             |
 | ------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -315,19 +322,38 @@ is waiting, and reads no key or click while one is up.
 | Details | the global details mode and the four sections (thinking, tool calls, sub-agents, activity)                       |
 | Input   | mouse tracking (`off`, `wheel`, `buttons`, `all`), what a message typed while busy does, focus view              |
 | Context | `/autocompact`: `auto`, 50-90% of the window or `off` (a saved token limit such as `120k` shows as its own chip) |
+| Session | model, reasoning effort, permission mode, output style, theme (`auto`, `light`, `dark`), show thinking           |
+| Status  | the read-only text of `/settings` (no rows): scroll it with `↑/↓`, `PgUp/PgDn`, `Home/End`                       |
 
-`←/→` (or `h`/`l`, space) change the row, `↑/↓` move, `Tab`/`Shift+Tab` or `1-4`
-change tab, `Enter` saves (one `config.set` per changed key), `Esc` or `Ctrl+C`
+`←/→` (or `h`/`l`, space) change the row, `↑/↓` move, `Tab`/`Shift+Tab` or `1-6`
+change tab, `Enter` saves (one `config.set` per changed key), `Esc`, `q` or `Ctrl+C`
 puts everything back. Rows paint live while the popup is open; focus view waits
-for `Enter` because the gateway stashes and restores state when it changes, and the
-Context row is applied by running `/autocompact <value>` on `Enter` (the command
-checks and saves it, and says what it did).
+for `Enter` because the gateway stashes and restores state when it changes. The
+Context and Session rows are applied on `Enter` by running their own command
+(`/autocompact 70%`, `/model <key>`, `/reasoning high`, `/permissions mode plan`,
+`/output-style <name>`, `/theme dark`, `/reasoning show|hide`), which checks and
+saves the value and says what it did.
+
+The Session rows and the Status text come from `settings.get`, which answers after
+the popup is open: until then Session shows "loading settings…" (or why the request
+failed) and the other tabs already work. A value `settings.get` reports that its
+list does not have (a model the backend did not list) is added as the last chip.
+
+`/` opens a search box: what is typed filters the rows of **every** tab by label,
+tab name, heading (`Model`, `Display`, `Input`: where the old `/settings` panel filed
+the row), id or the value the row had when the popup opened (not the Status text),
+listed in tab order with the tab each lives on. A row you change stays in the list. `Backspace` deletes, `Enter` keeps the filter and gives the keys back
+to the rows (the next `Enter` saves), `↑/↓` and `Tab` leave the box and act, `Esc`
+clears the filter before the next `Esc` closes; `Esc` while still typing goes back to
+the tab and row the search began on. Changing tab drops the filter. Alt/Option and
+Ctrl chords (Option+arrows is a word jump in many terminals) do nothing.
 
 Mouse: a click on a tab or on a row only moves the cursor; a click on a chip
 (`[top]`, `off`…) is the control and picks that option. The wheel walks the
-rows. The pure state, keys, layout and hit-testing are in `src/domain/dashboard.ts`
-(unit-tested without a terminal); `src/components/dashboard.tsx` only paints the
-lines and feeds keys and clicks in. A later tab is one more entry in
+rows, and scrolls the Status text. The pure state, keys, layout and hit-testing
+are in `src/domain/dashboard.ts` (unit-tested without a terminal);
+`src/components/dashboard.tsx` only paints the lines, feeds keys and clicks in
+and asks the gateway for `settings.get`. A later tab is one more entry in
 `DASHBOARD_TABS` and rows in `DASHBOARD_FIELDS`.
 
 ### Ops (`ops.ts`)
@@ -479,7 +505,7 @@ ui-tui/
       messageLine.tsx            transcript rows
       modelPicker.tsx            model switch picker
       tunePicker.tsx             Tune popup: model, effort and ultracode (/tune, Ctrl+O)
-      dashboard.tsx              Dashboard popup: look, details and input settings (/dashboard, /display)
+      dashboard.tsx              Dashboard popup: look, details, input, context, session and status (/dashboard, /display, /settings)
       overlayControls.tsx        shared overlay control buttons
       pluginsHub.tsx             plugins hub overlay
       prompts.tsx                approval + clarify flows

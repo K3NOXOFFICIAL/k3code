@@ -411,9 +411,17 @@ export const sessionCommands: SlashCommand[] = [
                 showReasoning: false,
               }));
             } else if (r.value === "show") {
+              // Show un-hides the section; a collapsed or expanded one the user pinned (the /dashboard saves
+              // Show thinking and the Thinking row together) stays as it is.
               patchUiState((state) => ({
                 ...state,
-                sections: { ...state.sections, thinking: "expanded" },
+                sections: {
+                  ...state.sections,
+                  thinking:
+                    state.sections.thinking === "collapsed"
+                      ? "collapsed"
+                      : "expanded",
+                },
                 showReasoning: true,
               }));
             }

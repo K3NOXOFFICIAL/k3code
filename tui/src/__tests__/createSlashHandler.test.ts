@@ -413,6 +413,154 @@ describe("createSlashHandler", () => {
     });
   });
 
+  it("/reasoning show leaves a collapsed Thinking section as pinned, and expands a hidden or unpinned one", async () => {
+    const run = createSlashHandler(
+      buildCtx({
+        gateway: {
+          ...buildGateway(),
+          rpc: vi.fn(() => Promise.resolve({ value: "show" })),
+        },
+      }),
+    );
+
+    for (const [before, after] of [
+      ["collapsed", "collapsed"],
+      ["expanded", "expanded"],
+      ["hidden", "expanded"],
+      [undefined, "expanded"],
+    ] as const) {
+      patchUiState({
+        sections: before ? { thinking: before } : {},
+        showReasoning: false,
+        sid: "sid-abc",
+      });
+      run("/reasoning show");
+
+      await vi.waitFor(() => expect(getUiState().showReasoning).toBe(true));
+      expect(getUiState().sections.thinking, String(before)).toBe(after);
+    }
+  });
+
+  describe("commands sent together", () => {
+    const together = () => {
+      // the theme write fails a little later, after any redirect below has run
+      const rpc = vi.fn((_method: string, params: Record<string, unknown>) =>
+        params.key === "theme"
+          ? new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("theme write failed")), 15),
+            )
+          : Promise.resolve({ value: params.value }),
+      );
+      const request = vi.fn((method: string, params: { command?: string }) =>
+        Promise.resolve(
+          method === "slash.exec" && params.command === "mode show"
+            ? { target: "reasoning", type: "alias" }
+            : {},
+        ),
+      );
+      const ctx = buildCtx({
+        gateway: {
+          ...buildGateway(),
+          gw: { ...buildGateway().gw, request },
+          rpc,
+        },
+        local: {
+          ...buildLocal(),
+          catalog: {
+            canon: { "/reasoning": "/reasoning", "/rs": "/reasoning" },
+          },
+        } as never,
+      });
+
+      patchUiState({ sid: "sid-abc" });
+
+      return { ctx, run: createSlashHandler(ctx) };
+    };
+
+    it("a command typed after another supersedes its answer and its error", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/reasoning show");
+
+      await vi.waitFor(() =>
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: show"),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      expect(ctx.transcript.sys).toHaveBeenCalledTimes(1);
+    });
+
+    it("alongside, every command answers: the earlier one's error shows, and so does the later one's confirmation", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/reasoning show", { alongside: true });
+
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: show");
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringMatching(/^error: .*theme write failed/),
+        );
+      });
+    });
+
+    it("alongside carries through a catalog alias to the command it stands for", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/rs show", { alongside: true });
+
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: show");
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringMatching(/^error: .*theme write failed/),
+        );
+      });
+    });
+
+    it("alongside carries through a prefix the catalog completes", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/reas show", { alongside: true });
+
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: show");
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringMatching(/^error: .*theme write failed/),
+        );
+      });
+    });
+
+    it("alongside carries through an alias the gateway answers with", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/mode show", { alongside: true });
+
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: show");
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringMatching(/^error: .*theme write failed/),
+        );
+      });
+    });
+
+    it("a command typed after them still supersedes them all", async () => {
+      const { ctx, run } = together();
+
+      run("/theme dark");
+      run("/reasoning show", { alongside: true });
+      run("/reasoning hide");
+
+      await vi.waitFor(() =>
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("reasoning: hide"),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      expect(ctx.transcript.sys).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("reads /reasoning status for the active session", () => {
     patchUiState({ sid: "sid-abc" });
     const ctx = buildCtx();

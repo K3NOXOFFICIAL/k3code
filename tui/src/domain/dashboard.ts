@@ -22,10 +22,16 @@ import { SECTION_NAMES, sectionMode } from "./details.js";
  * A field is a row of choices ("chips"); ←/→ or a click on a chip picks one,
  * ↑/↓ or a click on a row moves the cursor. A field that is `preview` is
  * painted live while the popup is open and put back by Esc; the others are
- * applied by Enter only. Enter sends one `config.set` per changed key.
+ * applied by Enter only. Enter sends one `config.set` per changed key, or the
+ * field's own slash command.
+ *
+ * Two tabs read `settings.get`, which answers later: the Session rows (model,
+ * effort, permissions, style, theme, thinking) and the Status text appear once
+ * `applySnapshot` has run. `/` searches the rows of every tab at once.
  */
 
-export type DashboardTabId = "context" | "details" | "input" | "look";
+export type DashboardTabId =
+  "context" | "details" | "input" | "look" | "session" | "status";
 
 export const DASHBOARD_TABS: readonly { id: DashboardTabId; label: string }[] =
   [
@@ -33,6 +39,8 @@ export const DASHBOARD_TABS: readonly { id: DashboardTabId; label: string }[] =
     { id: "details", label: "Details" },
     { id: "input", label: "Input" },
     { id: "context", label: "Context" },
+    { id: "session", label: "Session" },
+    { id: "status", label: "Status" },
   ];
 
 /** A section row that follows the global details mode (or the built-in default) rather than pinning one. */
@@ -44,13 +52,18 @@ export interface DashboardField {
    * command checks and saves it itself (`/autocompact 70%`).
    */
   command?: (value: string) => string;
+  /** The heading the old /settings panel filed the row under, or the nearest one for a row it lacked (none for Autocompact): a search for it lists the row. */
+  group?: "Display" | "Input" | "Model";
   /** One line under the list while the cursor is on the row. */
   hint: string;
   id: string;
   /** The `config.set` key a change is sent under (the name in a summary when `command` applies it). */
   key: string;
   label: string;
-  /** Choices in the order ←/→ walk them; a value the ui already has that is not one of them is added at the end. */
+  /**
+   * Choices in the order ←/→ walk them; a value the ui already has that is not one of them is added at the end.
+   * Empty for the lists only the backend knows (models, permission modes, output styles): `applySnapshot` fills them.
+   */
   options: readonly string[];
   /** Painted while the popup is open; false = applied when Enter saves. */
   preview: boolean;
@@ -66,8 +79,15 @@ const SECTION_LABELS: Record<SectionName, string> = {
 
 const MODE_OPTIONS = ["hidden", "collapsed", "expanded"] as const;
 
+const EFFORT_OPTIONS = ["default", "low", "medium", "high", "xhigh", "max"];
+
+/** A command argument: a name with a space (`my style`) is quoted, which the gateway reads back as one word. */
+const quoted = (value: string) =>
+  /\s/.test(value) ? JSON.stringify(value) : value;
+
 export const DASHBOARD_FIELDS: readonly DashboardField[] = [
   {
+    group: "Display",
     hint: "Where the status rule (model, context, cost) sits.",
     id: "statusbar",
     key: "statusbar",
@@ -77,6 +97,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "look",
   },
   {
+    group: "Display",
     hint: "The spinner style while the model works. ascii is safe everywhere.",
     id: "indicator",
     key: "indicator",
@@ -86,6 +107,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "look",
   },
   {
+    group: "Display",
     hint: "Tighter spacing between transcript blocks.",
     id: "density",
     key: "density",
@@ -95,6 +117,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "look",
   },
   {
+    group: "Display",
     hint: "A battery gauge in the status bar (laptops).",
     id: "battery",
     key: "battery",
@@ -104,6 +127,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "look",
   },
   {
+    group: "Display",
     hint: "How much agent detail to show. Picking one sets all four sections below.",
     id: "details",
     key: "details_mode",
@@ -113,6 +137,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "details",
   },
   ...SECTION_NAMES.map((name): DashboardField => ({
+    group: "Display",
     hint: `${SECTION_LABELS[name]}: pin a mode, or default to follow the global one.`,
     id: `section.${name}`,
     key: `details_mode.${name}`,
@@ -122,6 +147,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "details",
   })),
   {
+    group: "Input",
     hint: "all: wheel scrolls, a click moves the cursor. Select text with Shift-drag (Option-drag on macOS). wheel: scroll only, the terminal keeps selection.",
     id: "mouse",
     key: "mouse",
@@ -131,6 +157,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "input",
   },
   {
+    group: "Input",
     hint: "A message typed while the model works: queue it, steer the running turn, or interrupt.",
     id: "busy",
     key: "busy",
@@ -140,6 +167,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     tab: "input",
   },
   {
+    group: "Input",
     hint: "Show only your prompts, questions, errors and final answers (Ctrl+F). Applied on Enter.",
     id: "focus",
     key: "focus",
@@ -157,6 +185,72 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     options: ["auto", "50%", "60%", "70%", "80%", "90%", "off"],
     preview: false,
     tab: "context",
+  },
+  {
+    command: (value) => `/model ${value}`,
+    group: "Model",
+    hint: "The model this session uses. Enter switches to it (/model).",
+    id: "model",
+    key: "model",
+    label: "Model",
+    options: [],
+    preview: false,
+    tab: "session",
+  },
+  {
+    command: (value) => `/reasoning ${value}`,
+    group: "Model",
+    hint: "How hard the model thinks; default leaves it to the model. Enter applies it (/reasoning).",
+    id: "effort",
+    key: "effort",
+    label: "Reasoning effort",
+    options: EFFORT_OPTIONS,
+    preview: false,
+    tab: "session",
+  },
+  {
+    command: (value) => `/permissions mode ${value}`,
+    group: "Model",
+    hint: "What runs without asking first. Enter applies it (/permissions mode).",
+    id: "permissions",
+    key: "permissions",
+    label: "Permission mode",
+    options: [],
+    preview: false,
+    tab: "session",
+  },
+  {
+    command: (value) => `/output-style ${quoted(value)}`,
+    group: "Model",
+    hint: "How answers are written. Enter applies it (/output-style).",
+    id: "style",
+    key: "style",
+    label: "Output style",
+    options: [],
+    preview: false,
+    tab: "session",
+  },
+  {
+    command: (value) => `/theme ${value}`,
+    group: "Display",
+    hint: "Colour theme: auto follows the terminal, or pin light or dark. Enter applies it (/theme).",
+    id: "theme",
+    key: "theme",
+    label: "Theme",
+    options: ["auto", "light", "dark"],
+    preview: false,
+    tab: "session",
+  },
+  {
+    command: (value) => `/reasoning ${value === "on" ? "show" : "hide"}`,
+    group: "Display",
+    hint: "Show the model's reasoning in the transcript. Enter applies it (/reasoning show|hide).",
+    id: "reasoning",
+    key: "reasoning",
+    label: "Show thinking",
+    options: ["off", "on"],
+    preview: false,
+    tab: "session",
   },
 ];
 
@@ -180,6 +274,7 @@ export type DashboardUi = Pick<
   | "indicatorStyle"
   | "mouseTracking"
   | "sections"
+  | "showReasoning"
   | "statusBar"
 >;
 
@@ -197,6 +292,7 @@ export const dashboardUi = (ui: DashboardUi): DashboardUi => ({
   indicatorStyle: ui.indicatorStyle,
   mouseTracking: ui.mouseTracking,
   sections: { ...ui.sections },
+  showReasoning: ui.showReasoning,
   statusBar: ui.statusBar,
 });
 
@@ -213,6 +309,7 @@ export function dashboardValues(ui: DashboardUi): DashboardValues {
     focus: onOff(ui.focusView),
     indicator: ui.indicatorStyle,
     mouse: ui.mouseTracking,
+    reasoning: onOff(ui.showReasoning),
     statusbar: ui.statusBar,
   };
 
@@ -282,7 +379,8 @@ export function dashboardPatch(
     patch.focusView = values.focus === "on";
   }
 
-  // `autocompact` is not painted: its command saves it, and the config sync reads the saved value back
+  // `autocompact` is not painted: its command saves it, and the config sync reads the saved value back.
+  // Nor is the Session tab (`showReasoning` included): each of its commands applies its own value.
 
   return patch;
 }
@@ -290,7 +388,7 @@ export function dashboardPatch(
 // ── State ────────────────────────────────────────────────────────────
 
 export interface DashboardState {
-  /** Row within the tab's fields. */
+  /** Row within the list the screen shows: the tab's fields, or the rows the search matches. */
   cursor: number;
   /** The ui as the popup found it: what Esc puts back. */
   origin: DashboardUi;
@@ -302,11 +400,25 @@ export interface DashboardState {
   base: DashboardValues;
   /** The chips of each row: the field's options, plus the value the ui had if it is none of them (a `120k` limit). */
   options: Record<string, readonly string[]>;
+  /** The search text. A non-empty one lists the matching rows of every tab instead of the tab's own. */
+  query: string;
+  /** The row the cursor was on when the box opened on an empty text: Esc in the box puts it back. Null on a kept text. */
+  searchFrom: null | number;
+  /** Typing into the search box: printable keys go to `query`. */
+  searching: boolean;
+  /** Whether `settings.get` has answered; the Session rows and the Status text wait for it. */
+  session: "failed" | "loading" | "ready";
+  /** Why it failed. */
+  sessionError: string;
+  /** The Status tab's text, one entry per line. */
+  statusLines: string[];
+  /** The first line of the Status text that is painted. */
+  statusScroll: number;
 }
 
-/** The chips of a row: ``f.options``, with ``value`` added at the end when it is not among them. */
-const chipsFor = (f: DashboardField, value: string | undefined) =>
-  value && !f.options.includes(value) ? [...f.options, value] : f.options;
+/** The chips of a row: ``options``, with ``value`` added at the end when it is not among them. */
+const chipsFor = (options: readonly string[], value: string | undefined) =>
+  value && !options.includes(value) ? [...options, value] : options;
 
 export function initDashboardState(
   ui: DashboardUi,
@@ -319,9 +431,16 @@ export function initDashboardState(
     base: { ...values },
     cursor: 0,
     options: Object.fromEntries(
-      DASHBOARD_FIELDS.map((f) => [f.id, chipsFor(f, values[f.id])]),
+      DASHBOARD_FIELDS.map((f) => [f.id, chipsFor(f.options, values[f.id])]),
     ),
     origin,
+    query: "",
+    searchFrom: null,
+    searching: false,
+    session: "loading",
+    sessionError: "",
+    statusLines: [],
+    statusScroll: 0,
     tab: Math.max(
       0,
       DASHBOARD_TABS.findIndex((t) => t.id === tab),
@@ -330,10 +449,146 @@ export function initDashboardState(
   };
 }
 
-export const currentFields = (state: DashboardState): DashboardField[] =>
-  fieldsOf(DASHBOARD_TABS[state.tab]!.id);
+// ── Settings snapshot ────────────────────────────────────────────────
 
-/** `/dashboard [look|details|input|context]`, `/display ...`: a tab by name or number, else null. */
+/** What `settings.get` says, as the Session and Status tabs need it. */
+export interface DashboardSnapshot {
+  effort: string;
+  model: string;
+  modelKeys: string[];
+  outputStyle: string;
+  outputStyles: string[];
+  permissionMode: string;
+  permissionModes: string[];
+  /** The plain `/settings` text, one entry per line. */
+  statusLines: string[];
+  /** `auto`, `light` or `dark`: the backend's `default` (or nothing) means auto. */
+  theme: string;
+}
+
+const isRecord = (x: unknown): x is Record<string, unknown> =>
+  !!x && typeof x === "object";
+
+/** The `settings.get` result (its `settings` view and `output` text) as a snapshot; a missing or odd field gets a default. */
+export function normalizeDashboardSnapshot(raw: unknown): DashboardSnapshot {
+  const r = isRecord(raw) ? raw : {};
+  const v = isRecord(r.settings) ? r.settings : {};
+  const str = (x: unknown, fallback = "") =>
+    typeof x === "string" && x ? x : fallback;
+  const strs = (x: unknown) =>
+    Array.isArray(x)
+      ? [...new Set(x.filter((s): s is string => typeof s === "string" && !!s))]
+      : [];
+  const theme = str(v.theme);
+  const output = str(r.output).trimEnd();
+
+  return {
+    effort: str(v.effort, "default"),
+    model: str(v.model_key),
+    modelKeys: strs(v.model_keys),
+    outputStyle: str(v.output_style, "default"),
+    outputStyles: strs(v.output_styles),
+    permissionMode: str(v.permission_mode, "default"),
+    permissionModes: strs(v.permission_modes),
+    statusLines: output ? output.split(/\r?\n/) : [],
+    theme: theme === "default" ? "auto" : theme || "auto",
+  };
+}
+
+/**
+ * The snapshot arrived: show the Session rows with its values and option lists
+ * and the Status text. Only those move: a Look value the user already changed
+ * while it was loading stays changed.
+ */
+export function applySnapshot(
+  state: DashboardState,
+  snap: DashboardSnapshot,
+): DashboardState {
+  const picked: DashboardValues = {
+    effort: snap.effort,
+    model: snap.model,
+    permissions: snap.permissionMode,
+    style: snap.outputStyle,
+    theme: snap.theme,
+  };
+  const lists: Record<string, readonly string[]> = {
+    model: snap.modelKeys,
+    permissions: snap.permissionModes,
+    style: snap.outputStyles,
+  };
+  const options = { ...state.options };
+
+  for (const [id, value] of Object.entries(picked)) {
+    options[id] = chipsFor(lists[id] ?? byId.get(id)!.options, value);
+  }
+
+  return inList({
+    ...state,
+    base: { ...state.base, ...picked },
+    options,
+    session: "ready",
+    sessionError: "",
+    statusLines: snap.statusLines,
+    values: { ...state.values, ...picked },
+  });
+}
+
+/** `settings.get` failed: the Session and Status tabs say why instead of showing rows. */
+export const failSnapshot = (
+  state: DashboardState,
+  message: string,
+): DashboardState =>
+  inList({ ...state, session: "failed", sessionError: message });
+
+// ── Rows ─────────────────────────────────────────────────────────────
+
+const tabLabel = (tab: DashboardTabId) =>
+  DASHBOARD_TABS.find((t) => t.id === tab)!.label;
+
+const activeTab = (state: DashboardState) => DASHBOARD_TABS[state.tab]!.id;
+
+/** The search text without the spaces around it, lower-cased: what a row has to contain. */
+const needle = (state: DashboardState) => state.query.trim().toLowerCase();
+
+/** The rows a tab shows: the Session rows wait for the snapshot, Status has none. */
+const tabFields = (state: DashboardState, tab: DashboardTabId) =>
+  tab === "session" && state.session !== "ready" ? [] : fieldsOf(tab);
+
+/**
+ * The rows the cursor walks: the active tab's, or with a search text the rows
+ * of every tab whose label, tab name, heading, id or value contains it, in tab
+ * order. The value is the one the popup found: a row whose value you change
+ * stays in the list under the cursor.
+ */
+export function currentFields(state: DashboardState): DashboardField[] {
+  const q = needle(state);
+
+  if (!q) {
+    return tabFields(state, activeTab(state));
+  }
+
+  return DASHBOARD_TABS.flatMap((t) => tabFields(state, t.id)).filter((f) =>
+    [
+      f.label,
+      tabLabel(f.tab),
+      f.group ?? "",
+      f.id,
+      state.base[f.id] ?? "",
+    ].some((s) => s.toLowerCase().includes(q)),
+  );
+}
+
+/** `state` with the cursor held inside the rows it walks, after rows came or went. */
+function inList(state: DashboardState): DashboardState {
+  const cursor = Math.max(
+    0,
+    Math.min(state.cursor, currentFields(state).length - 1),
+  );
+
+  return cursor === state.cursor ? state : { ...state, cursor };
+}
+
+/** `/dashboard [look|details|input|context|session|status]`, `/display ...`: a tab by name or number, else null. */
 export function parseDashboardTab(arg: string): DashboardTabId | null {
   const word = arg.trim().toLowerCase();
   const byNumber = DASHBOARD_TABS[Number(word) - 1];
@@ -398,8 +653,9 @@ export function dashboardChanges(state: DashboardState): DashboardChange[] {
   const moved = (id: string) => state.values[id] !== state.base[id];
   const out: DashboardChange[] = [];
 
+  // a Session row hidden again (a second settings.get failed) keeps its draft, but nobody sees it: it is not sent
   for (const f of DASHBOARD_FIELDS) {
-    if (f.id.startsWith("section.")) {
+    if (f.id.startsWith("section.") || !tabFields(state, f.tab).includes(f)) {
       continue;
     }
 
@@ -434,11 +690,17 @@ export function dashboardChanges(state: DashboardState): DashboardChange[] {
 export type DashboardKey = Partial<
   Pick<
     Key,
+    | "backspace"
     | "ctrl"
+    | "delete"
     | "downArrow"
+    | "end"
     | "escape"
+    | "home"
     | "leftArrow"
     | "meta"
+    | "pageDown"
+    | "pageUp"
     | "return"
     | "rightArrow"
     | "shift"
@@ -446,6 +708,16 @@ export type DashboardKey = Partial<
     | "upArrow"
   >
 >;
+
+export interface DashboardKeyOpts {
+  /** Height of the Status text window (`layout.bodyRows`): the page for PgUp/PgDn and where scrolling stops. */
+  bodyRows?: number;
+  /** An approval / question / password / confirm prompt is open: every key and click is ignored. */
+  locked?: boolean;
+}
+
+/** The window height when the caller does not say. */
+const DEFAULT_BODY_ROWS = 8;
 
 export type DashboardAction =
   | { type: "none" }
@@ -470,7 +742,12 @@ const cancelStep = (state: DashboardState): DashboardStep => ({
   state,
 });
 
-/** The value after `delta` steps through the row's chips (wraps: a row is a ring of chips). */
+/**
+ * The value after `delta` steps through the row's chips (wraps: a row is a
+ * ring of chips). A value that is none of them (a model the backend did not
+ * list) steps onto the first chip going forward and the last going back; a
+ * row with no chips steps onto nothing, which `setField` refuses.
+ */
 function stepped(
   state: DashboardState,
   f: DashboardField,
@@ -478,9 +755,11 @@ function stepped(
   delta: number,
 ): string {
   const chips = state.options[f.id] ?? f.options;
-  const i = Math.max(0, chips.indexOf(value));
+  const i = chips.indexOf(value);
 
-  return chips[(i + delta + chips.length) % chips.length]!;
+  return i < 0
+    ? chips[delta < 0 ? chips.length - 1 : 0]!
+    : chips[(i + delta + chips.length) % chips.length]!;
 }
 
 /** Pick `value` on a field: the row's own value, and with the global details mode the four sections too. */
@@ -493,6 +772,7 @@ export function setField(
 
   if (
     !f ||
+    !tabFields(state, f.tab).includes(f) ||
     !(state.options[id] ?? f.options).includes(value) ||
     state.values[id] === value
   ) {
@@ -516,13 +796,17 @@ export function setField(
   };
 }
 
+/** A tab opens at its first row with no search: a search text belongs to the tab it was typed on. */
 const moveTab = (state: DashboardState, tab: number): DashboardStep => {
   const n = DASHBOARD_TABS.length;
   const to = ((tab % n) + n) % n;
 
-  return to === state.tab
+  return to === state.tab && !state.query && !state.searching
     ? { action: { type: "none" }, state }
-    : { action: { type: "none" }, state: { ...state, cursor: 0, tab: to } };
+    : {
+        action: { type: "none" },
+        state: { ...state, cursor: 0, query: "", searching: false, tab: to },
+      };
 };
 
 const moveCursor = (state: DashboardState, cursor: number): DashboardStep => {
@@ -534,9 +818,135 @@ const moveCursor = (state: DashboardState, cursor: number): DashboardStep => {
   };
 };
 
+// ── Status text ──────────────────────────────────────────────────────
+
+const onStatus = (state: DashboardState) => activeTab(state) === "status";
+
+const bodyRowsOf = (opts: DashboardKeyOpts) =>
+  Math.max(1, opts.bodyRows ?? DEFAULT_BODY_ROWS);
+
+/** The first line painted for a window of `rows` lines: `statusScroll`, held inside the text. */
+const statusTop = (state: DashboardState, rows: number) =>
+  Math.max(0, Math.min(state.statusScroll, state.statusLines.length - rows));
+
+/** Scroll the Status text so line `to` is the first one painted, as far as the text allows. */
+function scrollStatus(
+  state: DashboardState,
+  to: number,
+  rows: number,
+): DashboardStep {
+  const top = Math.max(0, Math.min(to, state.statusLines.length - rows));
+
+  return {
+    action: { type: "none" },
+    state: top === state.statusScroll ? state : { ...state, statusScroll: top },
+  };
+}
+
+/** One row up or down: the cursor walks the list, on the Status tab the text scrolls. */
+const walk = (
+  state: DashboardState,
+  delta: number,
+  opts: DashboardKeyOpts,
+): DashboardStep => {
+  const rows = bodyRowsOf(opts);
+
+  return onStatus(state)
+    ? scrollStatus(state, statusTop(state, rows) + delta, rows)
+    : moveCursor(state, state.cursor + delta);
+};
+
+// ── Search ───────────────────────────────────────────────────────────
+
+/** The tab the cursor row lives on. With a search text the list spans every tab, so that is not the tab the popup was opened on. */
+const shownTab = (state: DashboardState) =>
+  DASHBOARD_TABS.findIndex(
+    (t) =>
+      t.id === (currentFields(state)[state.cursor]?.tab ?? activeTab(state)),
+  );
+
+/** Leave the search: no text, no typing. The cursor stays on its row, in that row's own tab. */
+function clearSearch(state: DashboardState): DashboardStep {
+  const field = currentFields(state)[state.cursor];
+  const tab = shownTab(state);
+
+  return {
+    action: { type: "none" },
+    state: {
+      ...state,
+      cursor: field
+        ? tabFields(state, DASHBOARD_TABS[tab]!.id).indexOf(field)
+        : 0,
+      query: "",
+      searching: false,
+      tab,
+    },
+  };
+}
+
+/** Esc in the box, on a text typed from empty: the search never was. The tab and the cursor stay where they were. */
+const cancelSearch = (state: DashboardState): DashboardStep => ({
+  action: { type: "none" },
+  state: {
+    ...state,
+    cursor: state.searchFrom ?? 0,
+    query: "",
+    searching: false,
+  },
+});
+
 /**
- * One keypress. ←/→ (h/l, space) change the row, ↑/↓ (k/j) move between rows,
- * Tab / Shift+Tab and 1-3 change tab, Enter saves, Esc puts everything back.
+ * A key while the search box has the keyboard: printable characters (digits,
+ * h/l/j/k and space too) go into the text. Enter keeps the text and hands the
+ * keys back; ↑/↓ and Tab hand them back and act; Esc drops the search.
+ */
+function searchKey(
+  state: DashboardState,
+  ch: string,
+  key: DashboardKey,
+  opts: DashboardKeyOpts,
+): DashboardStep {
+  const typed = (query: string): DashboardStep => ({
+    action: { type: "none" },
+    state: { ...state, cursor: 0, query },
+  });
+
+  if (key.escape) {
+    return state.searchFrom === null ? clearSearch(state) : cancelSearch(state);
+  }
+
+  // Alt/Option and Ctrl chords are not the plain keys (Ink marks a plain Esc as meta too, hence after it)
+  if (key.ctrl || key.meta) {
+    return { action: { type: "none" }, state };
+  }
+
+  // a blank text is no search: Enter and ↑/↓/Tab drop it alike
+  const kept = { ...state, query: needle(state) ? state.query : "" };
+
+  if (key.return) {
+    return { action: { type: "none" }, state: { ...kept, searching: false } };
+  }
+
+  if (key.upArrow || key.downArrow || key.tab) {
+    return dashboardKey({ ...kept, searching: false }, ch, key, opts);
+  }
+
+  if (key.backspace || key.delete) {
+    // by character, not by UTF-16 unit: one Backspace takes an emoji whole
+    return typed(Array.from(state.query).slice(0, -1).join(""));
+  }
+
+  const text = ch.replace(/\p{Cc}/gu, "");
+
+  return text ? typed(state.query + text) : { action: { type: "none" }, state };
+}
+
+/**
+ * One keypress. ←/→ (h/l, space) change the row, ↑/↓ (k/j) move between rows
+ * (and scroll the Status text), PgUp/PgDn, Home/End and g/G jump, Tab /
+ * Shift+Tab and 1-6 change tab, `/` searches every tab's rows, Enter saves,
+ * Esc clears the search and then puts everything back, `q` puts everything
+ * back. An Alt/Option or Ctrl chord is none of these keys and does nothing.
  * Locked (an approval / question / password / confirm prompt is open) every
  * key is ignored, so the prompt owns the keyboard.
  */
@@ -544,7 +954,7 @@ export function dashboardKey(
   state: DashboardState,
   ch: string,
   key: DashboardKey,
-  opts: { locked?: boolean } = {},
+  opts: DashboardKeyOpts = {},
 ): DashboardStep {
   const same: DashboardStep = { action: { type: "none" }, state };
 
@@ -552,8 +962,18 @@ export function dashboardKey(
     return same;
   }
 
+  if (state.searching) {
+    return searchKey(state, ch, key, opts);
+  }
+
   if (key.escape) {
-    return cancelStep(state);
+    return state.query ? clearSearch(state) : cancelStep(state);
+  }
+
+  // Alt/Option and Ctrl chords are not the plain keys: Option+←/→ (a word jump) must not change a row, Alt+Enter not save.
+  // Ink marks a plain Esc as meta too, hence after it.
+  if (key.ctrl || key.meta) {
+    return same;
   }
 
   if (key.return) {
@@ -572,15 +992,39 @@ export function dashboardKey(
   }
 
   if (key.tab) {
-    return moveTab(state, state.tab + (key.shift ? -1 : 1));
+    return moveTab(state, shownTab(state) + (key.shift ? -1 : 1));
   }
 
   if (key.upArrow) {
-    return moveCursor(state, state.cursor - 1);
+    return walk(state, -1, opts);
   }
 
   if (key.downArrow) {
-    return moveCursor(state, state.cursor + 1);
+    return walk(state, 1, opts);
+  }
+
+  // PgUp/PgDn, Home/End and g/G jump: down the Status text, and over the rows of any other tab (a search lists a dozen)
+  const rows = bodyRowsOf(opts);
+  const status = onStatus(state);
+  const at = status ? statusTop(state, rows) : state.cursor;
+  const end = status ? state.statusLines.length : currentFields(state).length;
+  const goTo = (to: number) =>
+    status ? scrollStatus(state, to, rows) : moveCursor(state, to);
+
+  if (key.pageUp) {
+    return goTo(at - rows);
+  }
+
+  if (key.pageDown) {
+    return goTo(at + rows);
+  }
+
+  if (key.home) {
+    return goTo(0);
+  }
+
+  if (key.end) {
+    return goTo(end);
   }
 
   const field = currentFields(state)[state.cursor];
@@ -601,10 +1045,6 @@ export function dashboardKey(
     return change(1);
   }
 
-  if (key.ctrl || key.meta) {
-    return same;
-  }
-
   switch (ch) {
     case "h":
       return change(-1);
@@ -612,9 +1052,26 @@ export function dashboardKey(
     case " ":
       return change(1);
     case "k":
-      return moveCursor(state, state.cursor - 1);
+      return walk(state, -1, opts);
     case "j":
-      return moveCursor(state, state.cursor + 1);
+      return walk(state, 1, opts);
+    case "g":
+      return goTo(0);
+    case "G":
+      return goTo(end);
+    case "/":
+      return status
+        ? same
+        : {
+            action: { type: "none" },
+            state: {
+              ...state,
+              searchFrom: state.query ? null : state.cursor,
+              searching: true,
+            },
+          };
+    case "q":
+      return cancelStep(state);
     default:
   }
 
@@ -635,6 +1092,11 @@ const SIDE_CHROME = 4;
 export const DASHBOARD_OVERLAY_CHROME = 6;
 
 export interface DashboardLayout {
+  /**
+   * Rows left for the list or the Status text once the fixed lines are drawn,
+   * so the popup stays inside the terminal. A search line takes one of them.
+   */
+  bodyRows: number;
   /** A short terminal: no title and no blank lines. */
   compact: boolean;
   width: number;
@@ -653,17 +1115,27 @@ export const dashboardWidth = (cols: number, maxWidth?: number) =>
 /** Rows the hint under the list may take. */
 const HINT_LINES = 2;
 
-/** The tallest tab (title, tabs, 2 blanks, rows, hint, keys) must fit under the chrome, else drop the roomy lines. */
+/** The lines around the body: tabs, hint, keys; the roomy layout adds the title and two blanks. */
+const COMPACT_FIXED = 1 + HINT_LINES + 1;
+const ROOMY_FIXED = 1 + COMPACT_FIXED + 2;
+
+/**
+ * The tallest tab (title, tabs, 2 blanks, rows, hint, keys) must fit under the
+ * chrome, else drop the roomy lines. What the fixed lines leave is `bodyRows`:
+ * the Status text and the search results show that many lines.
+ */
 export function dashboardLayout(o: {
   cols: number;
   maxWidth?: number;
   rows: number;
 }): DashboardLayout {
   const tallest = Math.max(...DASHBOARD_TABS.map((t) => fieldsOf(t.id).length));
-  const roomy = 1 + 1 + 1 + tallest + 1 + HINT_LINES + 1;
+  const room = o.rows - DASHBOARD_OVERLAY_CHROME;
+  const compact = room < ROOMY_FIXED + tallest;
 
   return {
-    compact: o.rows - DASHBOARD_OVERLAY_CHROME < roomy,
+    bodyRows: Math.max(1, room - (compact ? COMPACT_FIXED : ROOMY_FIXED)),
+    compact,
     width: dashboardWidth(o.cols, o.maxWidth),
   };
 }
@@ -690,7 +1162,16 @@ export interface DashboardLine {
   active?: boolean;
   /** The field this line is (index in the tab), for a click on the row outside its chips. */
   field?: number;
-  kind: "blank" | "hint" | "keys" | "row" | "tabs" | "title";
+  kind:
+    | "blank"
+    | "hint"
+    | "keys"
+    | "note"
+    | "row"
+    | "search"
+    | "tabs"
+    | "text"
+    | "title";
   segs: DashboardSeg[];
   targets: DashboardTarget[];
 }
@@ -742,21 +1223,70 @@ export function wrap(text: string, width: number, max: number): string[] {
   return lines.map((l) => cut(l, width));
 }
 
-function tabsLine(state: DashboardState): DashboardLine {
-  const segs: DashboardSeg[] = [];
+/** Columns a cut end of a row of chips takes: `… ` before the first painted chip, ` …` after the last. */
+const MORE = 2;
+
+/**
+ * The chips [from, to) a row (or the tab bar) paints in `room` columns: from
+ * the first, or from the nearest later one that keeps the picked chip
+ * (`picked`, -1 for none) in view when the list is wider than the popup.
+ */
+function chipSpan(
+  texts: readonly string[],
+  picked: number,
+  room: number,
+): [from: number, to: number] {
+  const width = (from: number, to: number) =>
+    texts.slice(from, to).reduce((n, t) => n + t.length, 0) +
+    (from > 0 ? MORE : 0) +
+    (to < texts.length ? MORE : 0);
+  let from = 0;
+
+  while (from < picked && width(from, picked + 1) > room) {
+    from++;
+  }
+
+  let to = Math.max(from, picked + 1);
+
+  while (to < texts.length && width(from, to + 1) <= room) {
+    to++;
+  }
+
+  return [from, to];
+}
+
+function tabsLine(
+  state: DashboardState,
+  layout: DashboardLayout,
+): DashboardLine {
+  const segs: DashboardSeg[] = [seg(" ", "muted")];
   const targets: DashboardTarget[] = [];
+  // with a search text the list spans every tab: none is the one shown
+  const on = (i: number) => i === state.tab && !needle(state);
+  const texts = DASHBOARD_TABS.map((t, i) =>
+    on(i) ? `[${t.label}]` : ` ${t.label} `,
+  );
+  const [from, to] = chipSpan(texts, state.tab, layout.width - 1);
   let col = 1;
 
-  segs.push(seg(" ", "muted"));
+  if (from > 0) {
+    segs.push(seg("… ", "muted"));
+    col += MORE;
+  }
 
-  DASHBOARD_TABS.forEach((t, i) => {
-    const on = i === state.tab;
-    const text = on ? `[${t.label}]` : ` ${t.label} `;
+  for (let i = from; i < to; i++) {
+    const text = texts[i]!;
 
     targets.push({ end: col + text.length, index: i, start: col, type: "tab" });
-    segs.push(seg(text, on ? "accent" : "muted", on ? { bold: true } : {}));
+    segs.push(
+      seg(text, on(i) ? "accent" : "muted", on(i) ? { bold: true } : {}),
+    );
     col += text.length;
-  });
+  }
+
+  if (to < texts.length) {
+    segs.push(seg(" …", "muted"));
+  }
 
   return { kind: "tabs", segs, targets };
 }
@@ -788,22 +1318,29 @@ function rowLine(
   labelW: number,
 ): DashboardLine {
   const active = index === state.cursor;
-  const value = state.values[f.id]!;
+  const value = state.values[f.id] ?? "";
   const segs: DashboardSeg[] = [];
   const targets: DashboardTarget[] = [];
   const head = `${active ? "❯ " : "  "}${f.label.padEnd(labelW)}  `;
+  const chips = state.options[f.id] ?? f.options;
+  const [from, to] = chipSpan(
+    chips.map((option) => (option === value ? `[${option}]` : ` ${option} `)),
+    chips.indexOf(value),
+    layout.width - head.length,
+  );
 
   segs.push(seg(head, "plain"));
 
   let col = head.length;
 
-  for (const option of state.options[f.id] ?? f.options) {
+  if (from > 0) {
+    segs.push(seg("… ", "muted"));
+    col += MORE;
+  }
+
+  for (const option of chips.slice(from, to)) {
     const picked = option === value;
     const text = picked ? `[${option}]` : ` ${option} `;
-
-    if (col + text.length > layout.width) {
-      break;
-    }
 
     targets.push({
       end: col + text.length,
@@ -816,18 +1353,85 @@ function rowLine(
     col += text.length;
   }
 
-  const note = defaultNote(state, f);
+  if (to < chips.length) {
+    segs.push(seg(" …", "muted"));
+    col += MORE;
+  }
 
-  if (note && col + note.length <= layout.width) {
-    segs.push(seg(note, "muted"));
+  // a row in a search result says which tab it lives on
+  const notes = [
+    defaultNote(state, f),
+    needle(state) ? ` · ${tabLabel(f.tab)}` : "",
+  ];
+
+  for (const note of notes) {
+    if (note && col + note.length <= layout.width) {
+      segs.push(seg(note, "muted"));
+      col += note.length;
+    }
   }
 
   return { active, field: index, kind: "row", segs, targets };
 }
 
+/** First row of a window of `height` rows that keeps `cursor` in view, in the middle when it can be. */
+const windowStart = (cursor: number, total: number, height: number) =>
+  total <= height
+    ? 0
+    : Math.min(Math.max(0, cursor - Math.floor(height / 2)), total - height);
+
+const KEYS_SEARCH =
+  "←/→ change · ↑/↓ row · Tab tab · / search · Enter save · Esc revert";
 const KEYS = "←/→ change · ↑/↓ row · Tab tab · Enter save · Esc revert";
 const KEYS_SHORT = "←/→ ↑/↓ Tab · Enter save · Esc revert";
+const KEYS_FILTER = "←/→ change · ↑/↓ row · / edit · Enter save · Esc clear";
+const KEYS_FILTER_SHORT = "←/→ ↑/↓ · Enter save · Esc clear";
+const KEYS_TYPING = "type to filter · Enter done · Esc clear";
+const KEYS_STATUS = "↑/↓ PgUp/PgDn scroll · Tab next · Enter save · Esc revert";
+const KEYS_STATUS_SHORT = "↑/↓ scroll · Tab · Enter save · Esc";
 const LOCKED = "Answer the question above first.";
+
+/** The first line that fits `width`, else the last (the shortest). */
+const fitting = (width: number, ...lines: string[]) =>
+  lines.find((l) => l.length <= width) ?? lines.at(-1)!;
+
+function keysLine(state: DashboardState, width: number): string {
+  if (state.searching) {
+    return KEYS_TYPING;
+  }
+
+  if (onStatus(state)) {
+    return fitting(width, KEYS_STATUS, KEYS_STATUS_SHORT);
+  }
+
+  return state.query
+    ? fitting(width, KEYS_FILTER, KEYS_FILTER_SHORT)
+    : fitting(width, KEYS_SEARCH, KEYS, KEYS_SHORT);
+}
+
+/** The search line: the text, with a caret while it is being typed; the tail of a text too long for the popup. */
+function searchLine(state: DashboardState, width: number): DashboardLine {
+  const chars = Array.from(
+    `search: ${state.query}${state.searching ? "▌" : ""}`,
+  );
+
+  return plain(
+    "search",
+    seg(
+      chars.length > width
+        ? `…${chars.slice(1 - width).join("")}`
+        : chars.join(""),
+      state.searching ? "accent" : "muted",
+    ),
+  );
+}
+
+/** Why a tab has no rows to show: the snapshot is on its way, or failed. */
+function waiting(state: DashboardState, loading: string): string {
+  return state.session === "failed"
+    ? `settings unavailable${state.sessionError ? `: ${state.sessionError}` : ""}`
+    : loading;
+}
 
 /** The popup as lines, top to bottom. */
 export function dashboardScreen(
@@ -836,40 +1440,75 @@ export function dashboardScreen(
   opts: { locked?: boolean } = {},
 ): DashboardLine[] {
   const fields = currentFields(state);
-  const labelW = Math.max(...fields.map((f) => f.label.length));
+  const status = onStatus(state);
+  const searching = state.searching || !!state.query;
+  const labelW = Math.max(0, ...fields.map((f) => f.label.length));
   const lines: DashboardLine[] = [];
   const spacer = () => !layout.compact && lines.push(blank());
+  const note = (text: string) =>
+    lines.push(plain("note", seg(cut(text, layout.width), "muted")));
+  let hint = fields[state.cursor]?.hint ?? "";
 
   if (!layout.compact) {
-    lines.push(plain("title", seg("Display & input", "label", { bold: true })));
+    lines.push(plain("title", seg("Settings", "label", { bold: true })));
   }
 
-  lines.push(tabsLine(state));
+  lines.push(tabsLine(state, layout));
+
+  if (searching) {
+    lines.push(searchLine(state, layout.width));
+  }
+
   spacer();
 
-  fields.forEach((f, i) => {
-    lines.push(rowLine(state, layout, f, i, labelW));
-  });
+  if (status) {
+    const rows = layout.bodyRows;
+    const top = statusTop(state, rows);
+    // the text of an earlier answer is not painted under the reason a later one failed
+    const shown =
+      state.session === "ready" ? state.statusLines.slice(top, top + rows) : [];
+
+    if (state.session !== "ready") {
+      note(waiting(state, "loading…"));
+    } else if (!shown.length) {
+      note("no status text");
+    }
+
+    for (const l of shown) {
+      lines.push(plain("text", seg(cut(l, layout.width) || " ", "plain")));
+    }
+
+    hint =
+      shown.length && state.statusLines.length > rows
+        ? `lines ${top + 1}-${top + shown.length} of ${state.statusLines.length}`
+        : "";
+  } else if (fields.length) {
+    const height = Math.max(1, layout.bodyRows - (searching ? 1 : 0));
+    const start = windowStart(state.cursor, fields.length, height);
+
+    fields.slice(start, start + height).forEach((f, i) => {
+      lines.push(rowLine(state, layout, f, start + i, labelW));
+    });
+  } else {
+    note(
+      needle(state)
+        ? "no setting matches"
+        : waiting(state, "loading settings…"),
+    );
+  }
 
   spacer();
 
-  const hint = wrap(
-    fields[state.cursor]?.hint ?? "",
-    layout.width - 1,
-    HINT_LINES,
-  );
+  const wrapped = wrap(hint, layout.width - 1, HINT_LINES);
 
   for (let i = 0; i < HINT_LINES; i++) {
-    lines.push(plain("hint", seg(hint[i] ?? " ", "muted")));
+    lines.push(plain("hint", seg(wrapped[i] ?? " ", "muted")));
   }
 
   lines.push(
     plain(
       "keys",
-      seg(
-        opts.locked ? LOCKED : layout.width >= KEYS.length ? KEYS : KEYS_SHORT,
-        "muted",
-      ),
+      seg(opts.locked ? LOCKED : keysLine(state, layout.width), "muted"),
     ),
   );
 
@@ -971,26 +1610,30 @@ export const dashboardClickAt = (
     opts,
   );
 
-/** Wheel over the popup walks the rows, as ↑/↓ do. */
+/** Wheel over the popup walks the rows, as ↑/↓ do, and scrolls the Status text. */
 export const dashboardWheel = (
   state: DashboardState,
   dir: -1 | 1,
-  opts: { locked?: boolean } = {},
+  opts: DashboardKeyOpts = {},
 ): DashboardStep =>
-  opts.locked
-    ? { action: { type: "none" }, state }
-    : moveCursor(state, state.cursor + dir);
+  opts.locked ? { action: { type: "none" }, state } : walk(state, dir, opts);
 
-/** The summary the transcript gets after Enter. */
+/**
+ * The summary the transcript gets after Enter: the `config.set` changes. A
+ * change with a `command` is left out, since the command says what it did, or
+ * why it could not, when it answers; "" when nothing is left to say.
+ */
 export function dashboardSummary(changes: DashboardChange[]): string {
-  if (!changes.length) {
-    return "display: no changes";
+  const saved = changes.filter((c) => !c.command);
+
+  if (!saved.length) {
+    return "";
   }
 
-  const shown = changes
+  const shown = saved
     .filter((c) => !c.key.startsWith("details_mode."))
     .map((c) => `${c.key}=${c.value}`);
-  const sections = changes.filter((c) => c.key.startsWith("details_mode."));
+  const sections = saved.filter((c) => c.key.startsWith("details_mode."));
 
   if (sections.length) {
     shown.push(

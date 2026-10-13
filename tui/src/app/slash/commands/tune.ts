@@ -1,5 +1,5 @@
 import type { SlashExecResponse } from "../../../gatewayTypes.js";
-import { openSettingsPanel, openTunePicker } from "../../overlayStore.js";
+import { openDashboard, openTunePicker } from "../../overlayStore.js";
 import type { SlashCommand, SlashRunCtx } from "../types.js";
 
 /**
@@ -33,9 +33,9 @@ function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
 // and the generic slash path sends them there untouched.
 export const tuneCommands: SlashCommand[] = [
   {
-    help: "interactive settings panel (arrows to move/change, / to search, Tab for status)",
+    help: "the /dashboard popup on its Session tab (model, effort, permissions, style, theme; / searches every tab); /settings status prints the text",
     name: "settings",
-    usage: "/settings [status]",
+    usage: "/settings [status|text]",
     run: (arg, ctx) => {
       if (arg.trim() === "status" || arg.trim() === "text") {
         return ctx.gateway.gw
@@ -54,7 +54,7 @@ export const tuneCommands: SlashCommand[] = [
           .catch(ctx.guardedErr);
       }
 
-      if (!openSettingsPanel()) {
+      if (!openDashboard("session")) {
         ctx.transcript.sys("finish the pending prompt first");
       }
     },
