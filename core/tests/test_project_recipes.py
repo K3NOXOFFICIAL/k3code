@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -414,3 +415,22 @@ def test_an_entry_the_filesystem_refuses_to_stat_is_skipped_by_the_scan(tmp_path
     refuse_stat_of(monkeypatch, "swapfile.sys")
     scan = stacks.scan(root)
     assert [(s["id"], s["dir"]) for s in scan.stacks] == [("node", "web")]
+
+
+def test_a_root_entry_that_denies_stat_does_not_stop_the_scan(tmp_path, monkeypatch):
+    """A Windows drive root seen from WSL (/mnt/c) lists pagefile.sys, and stat on it fails with EACCES. Before
+    Python 3.13 Path.is_dir() re-raises that, so `k3code doctor` died there; the scan skips what it cannot stat
+    (#157)."""
+    from k3code import doctor
+
+    root = make(tmp_path / "c", {"pagefile.sys": "", "app/package.json": json.dumps({"scripts": {"test": "vitest"}})})
+    real_is_dir = Path.is_dir
+
+    def is_dir(self, *args, **kwargs):
+        if self.name == "pagefile.sys":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    assert _node_dirs(root) == ["app"]
+    assert doctor.check_project(root).status == doctor.OK
