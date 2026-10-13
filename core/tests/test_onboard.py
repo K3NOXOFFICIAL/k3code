@@ -265,3 +265,65 @@ def test_onboard_clears_auth_cooldowns_for_the_rewritten_provider(root) -> None:
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
     assert r.exit_code == 0, r.output
     assert CooldownStore(path=path).reason_of(provider="endpoint", model="m-fast") is None
+
+
+def _fast_onboard_said(root: Path, cwd: Path, monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any] | None = None):
+    """Fast setup run from ``cwd``; returns (what it said, the roots handed to the stack scan)."""
+    from k3code.learning import projectprep, stacks
+
+    scanned: list[Path] = []
+    real_scan = stacks.scan
+
+    def spy(path: Any, *a: Any, **k: Any) -> Any:
+        scanned.append(Path(path))
+        return real_scan(path, *a, **k)
+
+    monkeypatch.setattr(stacks, "scan", spy)
+    monkeypatch.setattr(projectprep, "prepare", _boom)  # `ask` mode would go through it and prompt "Apply now?"
+    monkeypatch.chdir(cwd)
+    p = Scripted({"onboard": {"mode": "fast", "provider": "claude-cli"}, **(extra or {})})
+    said: list[str] = []
+    p.say = said.append  # type: ignore[method-assign]
+    monkeypatch.setattr(p, "confirm", _boom)
+    ob.run_fast(p, do_probe=False)
+    return said, scanned
+
+
+def _project(path: Path, *, git: bool = True) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "package.json").write_text('{"scripts": {"test": "vitest"}}')
+    if git:
+        (path / ".git").mkdir()
+    return path
+
+
+@pytest.mark.parametrize("where", ["home", "home_that_is_a_git_repo_subdir", "parent_of_home", "no_git", "mount"])
+def test_fast_onboard_leaves_a_directory_that_is_not_a_project_alone(root, monkeypatch, where) -> None:
+    """Fast setup scanned whatever the working directory was (8 s from /mnt/c/Users/<me>) and asked "Apply now?"."""
+    from k3code.setup import steps
+
+    home = _project(root / "home")  # a dotfiles repo: it has .git, it is still not a project to prepare
+    cwd = {
+        "home": home,
+        "home_that_is_a_git_repo_subdir": home / "sub",
+        "parent_of_home": _project(root, git=True),
+        "no_git": _project(root / "scratch", git=False),
+        "mount": _project(root / "mnt" / "c" / "proj"),
+    }[where]
+    cwd.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(steps, "SLOW_MOUNTS", (root / "mnt",))
+    said, scanned = _fast_onboard_said(root, cwd, monkeypatch)
+    assert scanned == []
+    assert any("Project recipes not offered" in s for s in said)
+    assert any(s.startswith("Ready.") for s in said)
+
+
+def test_fast_onboard_still_offers_the_recipes_of_a_real_project(root, monkeypatch) -> None:
+    from k3code.setup import steps
+
+    proj = _project(root / "home" / "work" / "proj")
+    monkeypatch.setattr(steps, "SLOW_MOUNTS", (root / "mnt",))
+    said, scanned = _fast_onboard_said(root, proj, monkeypatch, {"project_recipes": "none"})
+    assert scanned == [proj.resolve()]
+    assert not any("Project recipes not offered" in s for s in said)
+    assert any("node (npm)" in s for s in said)
