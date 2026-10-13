@@ -106,3 +106,13 @@ async def test_doctor_lists_a_keyless_entrys_models_instead_of_warning_about_its
     checks = await doctor.check_providers(Settings(providers=[_entry("")]))
     row = next(c for c in checks if c.name == "provider:local")
     assert row.status == doctor.OK and row.detail.startswith("HTTP 200, 1 models")
+
+
+def test_settings_shows_a_keyless_entry_as_taking_no_key() -> None:
+    from k3code.commands.settings_cmd import render_text
+
+    provider = {"name": "local", "kind": "openai", "api_key_env": "", "key_set": False}
+    view = {"model_key": "d", "model_chain": [], "effort": "", "permission_mode": "ask", "permission_rules": 0}
+    view |= {"focus_mode": False, "theme": "", "output_style": "", "paths": {}}
+    text = render_text({**view, "providers": [provider]})
+    assert "local [openai] takes no key" in text and "MISSING" not in text
