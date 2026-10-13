@@ -3993,6 +3993,7 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
         "provider_configured": bool(server.config.providers),
         "ready": bool(server.config.providers),
         "version": build_version(),  # doctor and `k3code update` compare it with `current` to spot a stale daemon
+        "background_paused": server.background_paused,  # restart-storm safe mode; doctor warns about it
     }
 
 
