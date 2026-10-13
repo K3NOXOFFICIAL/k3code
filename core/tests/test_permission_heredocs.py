@@ -13,13 +13,20 @@ from pathlib import Path
 import pytest
 
 from k3code.permissions import Rule, decide
-from k3code.permissions.hardline import parse
+from k3code.permissions.hardline import check, parse
 
 MODES = ["default", "accept-edits", "auto", "yolo"]
+HIDDEN = "rm -rf ~"  # a hardline payload: whatever reaches the checks as a command is denied
 
 
 def _bash(cmd: str, mode: str, cwd: Path, **kw):
     return decide(mode=mode, tool="bash", args={"command": cmd}, cwd=cwd, **kw)
+
+
+def _not_allowed(cmd: str, cwd: Path) -> None:
+    for mode in ("default", "auto"):
+        dec = _bash(cmd, mode, cwd)
+        assert dec.action != "allow", (mode, dec, cmd)
 
 
 # ── heredoc bodies: substitutions in an unquoted body run ──
@@ -259,3 +266,200 @@ def test_the_parser_keeps_the_body_apart_from_the_commands() -> None:
     q = parse("cat <<'EOF'\nsee $(echo hi)\nEOF")
     assert q.sub_payloads == [[]] and q.nested == [] and q.heredocs[0][0].quoted
     assert q.heredocs[0][0].body == "see $(echo hi)\n"
+
+
+# ── the body ends where bash ends it ──
+# bash takes the whole word after << and removes its quotes; a quote anywhere makes it quoted.
+# (word as written, bash's delimiter line, the line a word-prefix reading would stop at)
+DELIMITER_WORDS = [
+    ("E'OF'", "EOF", "E"),
+    ('E"OF"', "EOF", "E"),
+    ('"E"OF', "EOF", "E"),
+    ("EOF-1", "EOF-1", "EOF"),
+    ("EOF.x", "EOF.x", "EOF"),
+    ("'EOF'x", "EOFx", "EOF"),
+]
+
+
+@pytest.mark.parametrize(("word", "shell_line", "parser_line"), DELIMITER_WORDS)
+def test_the_body_ends_where_the_shell_ends_it(tmp_path: Path, word: str, shell_line: str, parser_line: str) -> None:
+    cmd = f"cat <<{word}\n{shell_line}\n{HIDDEN}\n{parser_line}\n"
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+
+
+# `<<` ends only on a line that is exactly the delimiter, `<<-` strips leading tabs only
+DELIMITER_LINES = [
+    ("<<", "\tEOF"),
+    ("<<", "EOF "),
+    ("<<-", "  EOF"),
+    ("<<", "EOF\r"),
+]
+
+
+@pytest.mark.parametrize(("op", "early"), DELIMITER_LINES)
+def test_a_delimiter_line_with_extra_blanks_does_not_end_the_body(tmp_path: Path, op: str, early: str) -> None:
+    cmd = f"cat {op}EOF\n{early}\n'\nEOF\n{HIDDEN}\n'\n"
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+
+
+# in an unquoted body bash joins a line ending in an odd number of backslashes with the next before it compares
+JOINED_LINES = [
+    f"cat <<EOF\nx\\\nEOF\n'\nEOF\n{HIDDEN}\n'\n",
+    f"cat <<-EOF\n\tx\\\n\tEOF\n'\n\tEOF\n{HIDDEN}\n'\n",
+    f"cat <<EOF\nx\\\\\\\nEOF\n'\nEOF\n{HIDDEN}\n'\n",
+    # an even number is an escaped backslash: the next line is the delimiter
+    f"cat <<EOF\nx\\\\\nEOF\n{HIDDEN}\n",
+    # a quoted body joins nothing
+    f"cat <<'EOF'\nx\\\nEOF\n{HIDDEN}\n",
+]
+
+
+@pytest.mark.parametrize("cmd", JOINED_LINES)
+def test_a_line_continuation_in_a_body_moves_the_delimiter_line_like_bash(tmp_path: Path, cmd: str) -> None:
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+
+
+# in ((...)) closed by )) a << is a shift, as in bash: the next lines are commands
+SHIFTS = [
+    f"((x = 1 << y))\n{HIDDEN}\ny\n",
+    f"((x = 1 << 2))\n{HIDDEN}\n2\n",
+    f"for ((i = 1 << y; i < 2; i++)); do :; done\n{HIDDEN}\ny\n",
+    f"echo $((1 << y))\n{HIDDEN}\ny\n",
+    # `((a) )` is two subshells: there the << is a heredoc
+    f"((cat <<y) )\n'\ny\n{HIDDEN}\n",
+]
+
+
+@pytest.mark.parametrize("cmd", SHIFTS)
+def test_a_shift_in_arithmetic_does_not_start_a_body(tmp_path: Path, cmd: str) -> None:
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    assert not parse(cmd).unterminated
+
+
+def test_a_shift_needs_no_person(tmp_path: Path) -> None:
+    for cmd in ("echo $((1 << 3))", "((n <<= 1))"):
+        assert not parse(cmd).unterminated, cmd
+        assert _bash(cmd, "auto", tmp_path).action == "allow", cmd
+
+
+# a << bash may read as something else (in ${...} or a[...]) or a word bash versions read differently: no body is
+# skipped and no rule vouches for the command
+UNSURE = [
+    f"echo ${{a[1<<y]}}\n{HIDDEN}\ny\n",
+    f"echo ${{x<<y}}\n{HIDDEN}\ny\n",
+    f"a[1<<y]=1\n{HIDDEN}\ny\n",
+    f"echo $((1 <<\ny))\n{HIDDEN}\ny\n",
+    f"cat <<$'EOF'\nEOF\n{HIDDEN}\n$'EOF'\n",
+    f'cat <<"EOF$x"\nEOF\n{HIDDEN}\n',
+    f"cat <<EO\\\nF\nEOF\n{HIDDEN}\n",
+    f"cat <<\n{HIDDEN}\n",
+    f"echo $(cat <<$'EOF'\nx\nEOF\n)\n{HIDDEN}\n",
+    # a heredoc started in a substitution that closes on its line: bash reads the body from the next lines
+    f"echo $(cat <<EOF)\nEOF\n{HIDDEN}\n",
+    f"echo `cat <<EOF`\nEOF\n{HIDDEN}\n",
+]
+
+
+@pytest.mark.parametrize("cmd", UNSURE)
+def test_a_heredoc_the_parser_cannot_place_needs_a_person(tmp_path: Path, cmd: str) -> None:
+    assert parse(cmd).unterminated, cmd
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+
+
+QUOTED_WORDS = ["\\EOF", "E'OF'", 'E"O"F', "'E'OF", "'EOF'"]
+
+
+@pytest.mark.parametrize("word", QUOTED_WORDS)
+def test_a_quote_anywhere_in_the_word_keeps_the_body_data(tmp_path: Path, word: str) -> None:
+    cmd = f"cat <<{word}\n$(rm -rf ~)\nEOF"
+    assert _bash(cmd, "default", tmp_path).action == "allow"
+    (heredoc,) = parse(cmd).heredocs[0]
+    assert heredoc.quoted and heredoc.payloads == []
+
+
+def test_the_parser_reads_the_whole_delimiter_word() -> None:
+    words = {
+        "cat <<EOF-1\nEOF\n$(x)\nEOF-1\n": ("EOF\n$(x)\n", False),
+        "cat << -EOF\n$(x)\n-EOF\n": ("$(x)\n", False),
+        "cat <<E#F\nx\nE#F\n": ("x\n", False),
+        "cat <<$x\n$(x)\n$x\n": ("$(x)\n", False),
+        "cat <<''\nx\n\n": ("x\n", True),
+        "cat <<EOF;ls\nx\nEOF\n": ("x\n", False),
+    }
+    for cmd, (body, quoted) in words.items():
+        p = parse(cmd)
+        (heredoc,) = p.heredocs[0]
+        assert (heredoc.body, heredoc.quoted, p.unterminated) == (body, quoted, False), cmd
+
+
+# ── backslash-newline in an unquoted body ──
+# bash removes \<newline> in an unquoted body, so `$\` + newline + `(cmd)` is a live substitution
+@pytest.mark.parametrize("payload", [f"$\\\n({HIDDEN})", "$\\\n(touch x)", f"`\\\n{HIDDEN}`", "$\\\n\\\n(touch x)"])
+def test_a_line_continuation_does_not_hide_a_body_substitution(tmp_path: Path, payload: str) -> None:
+    cmd = f"cat <<EOF\nline\n{payload}\nEOF\n"
+    for mode in ("default", "accept-edits"):
+        dec = _bash(cmd, mode, tmp_path)
+        assert dec.action != "allow", (mode, dec)
+
+
+def test_a_payload_split_by_a_line_continuation_goes_through_the_hardline(tmp_path: Path) -> None:
+    cmd = f"cat <<EOF\n$\\\n({HIDDEN})\nEOF\n"
+    assert all(_bash(cmd, mode, tmp_path).hardline == "rm-rf-home" for mode in MODES)
+    # an escaped backslash before the newline is text, the $ ends the line
+    assert parse("cat <<EOF\n$\\\\\n(x)\nEOF").heredocs[0][0].payloads == []
+
+
+# ── ssh with no remote command runs its stdin as a script on the remote host ──
+REMOTE_RESTART = "sudo systemctl restart nginx"
+
+
+def test_a_heredoc_fed_to_ssh_is_checked_like_its_command_operand(tmp_path: Path) -> None:
+    as_operand = check(f"ssh protected-host-a '{REMOTE_RESTART}'", cwd=str(tmp_path))
+    assert as_operand is not None  # the existing protected-host rule
+    assert check(f"ssh protected-host-a <<'EOF'\n{REMOTE_RESTART}\nEOF\n", cwd=str(tmp_path)) == as_operand
+    assert check(f"cat <<'EOF' | ssh protected-host-a\n{REMOTE_RESTART}\nEOF\n", cwd=str(tmp_path)) == as_operand
+
+
+SSH_SCRIPTS = [
+    f"ssh -p 2222 -o BatchMode=yes protected-host-a <<'EOF'\n{REMOTE_RESTART}\nEOF",
+    f"ssh protected-host-a -T <<'EOF'\n{REMOTE_RESTART}\nEOF",
+    f"ssh -- protected-host-a <<'EOF'\n{REMOTE_RESTART}\nEOF",
+    f"ssh protected-host-a bash -s <<'EOF'\n{REMOTE_RESTART}\nEOF",
+    f"ssh protected-host-a sudo sh <<'EOF'\n{REMOTE_RESTART}\nEOF",
+    f"sudo -u ops ssh protected-host-a <<EOF\ncd /srv\n{REMOTE_RESTART}\nEOF",
+    f"cat <<'EOF' | tr a a | ssh protected-host-a\necho start\n{REMOTE_RESTART}\nEOF",
+]
+
+
+@pytest.mark.parametrize("cmd", SSH_SCRIPTS)
+def test_every_command_of_a_remote_script_meets_the_remote_host_rules(tmp_path: Path, cmd: str) -> None:
+    for mode in MODES:
+        dec = _bash(cmd, mode, tmp_path)
+        assert dec.action == "deny" and dec.hardline == "protected-host-a-service-restart", (mode, cmd, dec)
+
+
+def test_a_remote_script_goes_through_the_hardline_and_no_rule_vouches_for_it(tmp_path: Path) -> None:
+    assert _bash(f"ssh build-host <<'EOF'\n{HIDDEN}\nEOF", "yolo", tmp_path).hardline == "rm-rf-home"
+    broad = [Rule("bash", p, "allow") for p in ("ssh *", "cat *")]
+    for cmd in ("ssh build-host <<'EOF'\nuptime\nEOF", "cat <<'EOF' | ssh build-host\nuptime\nEOF"):
+        assert _bash(cmd, "default", tmp_path, user_rules=broad).action == "ask", cmd
+
+
+def test_the_parser_marks_what_ssh_runs_from_its_stdin() -> None:
+    marks = {
+        "ssh h <<'EOF'\nx\nEOF": ["shell"],
+        "ssh -i key -l me h <<'EOF'\nx\nEOF": ["shell"],
+        "ssh h bash <<'EOF'\nx\nEOF": ["shell"],
+        "ssh h python3 <<'EOF'\nx\nEOF": ["other"],
+        "ssh h 'cat > f' <<'EOF'\nx\nEOF": [""],
+        "ssh h -- uptime <<'EOF'\nx\nEOF": [""],
+        "ssh -s h sftp <<'EOF'\nx\nEOF": [""],
+    }
+    for cmd, expected in marks.items():
+        assert parse(cmd).code_heredoc == expected, cmd
+    assert parse("cat <<'EOF' | ssh -p 22 h | ssh g ls\nx\nEOF").remote_heredoc[0] == ["ssh -p 22 h"]
