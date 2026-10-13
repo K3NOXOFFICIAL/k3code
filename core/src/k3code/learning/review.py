@@ -244,14 +244,16 @@ async def review_session(
     if notes != current:
         write_learned(cwd, notes)
     if changed:
-        # store_mem0 is blocking HTTP (10 s per fact) and project_scope may run git: never on the gateway's event
-        # loop. The facts are about this project (commands, hosts, conventions), so mem0 gets them scoped to it.
+        # store_mem0 is blocking HTTP (2 s to connect, 10 s per request) and project_scope may run git: never on the
+        # gateway's event loop. The facts are about this project (commands, hosts, conventions), so mem0 gets them
+        # scoped to it.
         await asyncio.to_thread(
             lambda: distiller.store_mem0(
                 config,
                 [distiller.Preference(f, 0.6, 1) for f in changed],
                 mem0_post,
                 home() / "learning" / distiller.MEM0_POSTED,  # a fact seen again in a later review is not posted again
+                home() / "learning" / distiller.MEM0_OUTBOX,  # a fact mem0 did not take goes out with the next review's
                 distiller.project_scope(cwd, project),
             )
         )
