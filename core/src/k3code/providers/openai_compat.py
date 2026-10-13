@@ -31,6 +31,7 @@ class OpenAICompatProvider(Provider):
         name: str,
         base_url: str,
         api_key: str,
+        keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
     ) -> None:
@@ -44,6 +45,7 @@ class OpenAICompatProvider(Provider):
             self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
         )
         self.api_key = api_key
+        self.keyless = keyless  # api_key_env "": the endpoint takes no key (Ollama), send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
 
@@ -104,7 +106,7 @@ class OpenAICompatProvider(Provider):
             request = self._client.build_request(
                 "POST",
                 self._url(),
-                headers=request_headers("openai", self.api_key),
+                headers=request_headers("openai", self.api_key, keyless=self.keyless),
                 json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
             )
             try:

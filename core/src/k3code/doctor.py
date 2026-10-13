@@ -86,8 +86,8 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             *(
                 _noop_probe()
                 if p.kind == "claude-cli"
-                else _probe_key(p)
-                if p.api_key or (p.api_key_env and os.environ.get(p.api_key_env))
+                else _probe_key(p)  # a keyless entry (api_key_env "") lists its models without a key
+                if p.api_key or not p.api_key_env or os.environ.get(p.api_key_env)
                 else _probe_provider(p.base_url)
                 for p in config.providers
             )
@@ -114,7 +114,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         if ok and not keyless:
             # the key answered: an auth cooldown armed by an earlier rejection is stale (the key was fixed in place)
             clear_auth_cooldowns(k3_home() / "cooldowns.json", provider=p.name)
-        if ok and keyless:
+        if ok and keyless and p.api_key_env:
             # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
             checks.append(
                 Check(
@@ -197,14 +197,18 @@ def check_keys(config: Settings) -> Check:
     missing = [
         p.api_key_env
         for p in config.providers
-        if p.kind != "claude-cli" and not (p.api_key or os.environ.get(p.api_key_env))
+        # claude-cli uses the local login, and an entry with api_key_env "" (Ollama) declares that it takes no key
+        if p.kind != "claude-cli" and p.api_key_env and not (p.api_key or os.environ.get(p.api_key_env))
     ]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
         fake = bool(os.environ.get("K3CODE_FAKE_PROVIDER"))
         # FAIL only when no chain entry can run: a keyless fallback behind a working entry is a warning
-        usable = any(p.kind == "claude-cli" or p.api_key or os.environ.get(p.api_key_env) for p in config.providers)
+        usable = any(
+            p.kind == "claude-cli" or not p.api_key_env or p.api_key or os.environ.get(p.api_key_env)
+            for p in config.providers
+        )
         return Check(
             "api-keys",
             WARN if fake or usable else FAIL,
@@ -212,7 +216,7 @@ def check_keys(config: Settings) -> Check:
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
         )
-    keyed = sum(1 for p in config.providers if p.kind != "claude-cli")  # claude-cli uses the local login, no key
+    keyed = sum(1 for p in config.providers if p.kind != "claude-cli" and p.api_key_env)  # claude-cli, keyless: none
     return Check("api-keys", OK, f"{keyed} key env var(s) present" if keyed else "no provider needs a key")
 
 

@@ -23,7 +23,7 @@ class ProviderEntry(BaseModel):
     name: str
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
-    api_key_env: str = ""  # required for "openai" / "anthropic"
+    api_key_env: str = ""  # required for "openai" / "anthropic"; "" = the endpoint takes no key (Ollama)
     api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: Optional one-line text per model key ({default: "Everyday coding", cheap: "Fast and cheap"}), shown by /tune.

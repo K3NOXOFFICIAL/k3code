@@ -38,6 +38,7 @@ class AnthropicProvider(Provider):
         name: str,
         base_url: str = "https://api.anthropic.com",
         api_key: str,
+        keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
     ) -> None:
@@ -46,6 +47,7 @@ class AnthropicProvider(Provider):
         self.prompt_cache = prompt_cache != "off"
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.keyless = keyless  # api_key_env "": the endpoint takes no key, send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
 
@@ -101,7 +103,7 @@ class AnthropicProvider(Provider):
         request = self._client.build_request(
             "POST",
             self._url(),
-            headers=request_headers("anthropic", self.api_key),
+            headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
             json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
         )
         try:

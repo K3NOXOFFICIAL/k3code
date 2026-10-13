@@ -125,6 +125,24 @@ def test_onboard_fast_api_writes_a_loadable_config_and_keeps_the_key_out_of_it(r
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
 
 
+def test_onboard_fast_local_writes_a_keyless_entry_that_doctor_accepts(root, monkeypatch) -> None:
+    """#107: "local (Ollama, no key)" wrote api_key_env LOCAL_API_KEY, so doctor and the first turn wanted a key."""
+    from k3code.doctor import OK, check_keys
+
+    monkeypatch.setenv("LOCAL_API_KEY", "")
+    monkeypatch.delenv("LOCAL_API_KEY")
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "local", "model": "llama3"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    prov = load_config(project_dir=root).providers[0]
+    assert (prov.name, prov.base_url, prov.api_key_env) == ("local", "http://localhost:11434/v1", "")
+    assert check_keys(load_config(project_dir=root)).status == OK
+    monkeypatch.setenv("LOCAL_API_KEY", "test-local-key")  # a key already set up for the local server is kept
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert load_config(project_dir=root).providers[0].api_key_env == "LOCAL_API_KEY"
+
+
 def test_onboard_full_runs_the_wizard_and_records_the_answer(root, monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(ob, "run_setup", lambda p, **kw: calls.append(kw))
