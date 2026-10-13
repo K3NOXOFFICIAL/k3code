@@ -366,6 +366,13 @@ const TURN_LAYER_COPY: Record<string, [string, string]> = {
   ],
 };
 
+// A claude-cli provider has no key: its auth failure is Claude Code saying "Not logged in · Please run /login".
+const CLAUDE_LOGIN_RE = /not logged in|run \/login/i;
+const CLAUDE_LOGIN_COPY: [string, string] = [
+  "Claude Code is not logged in",
+  "Run `claude` and /login, then /retry.",
+];
+
 const TURN_DEFAULT_COPY: [string, string] = [
   "The request failed",
   "Send /retry, or switch with /model.",
@@ -390,8 +397,11 @@ export const describeTurnFailure = (payload: TurnFailure): string => {
     typeof surface.provider === "string" && surface.provider
       ? ` (${surface.provider})`
       : "";
+  const raw = (payload.error ?? "").replace(/^Error:\s*/, "");
   const [title, hint] =
-    TURN_CODE_COPY[code] ?? TURN_LAYER_COPY[layer] ?? TURN_DEFAULT_COPY;
+    (code === "auth" || code === "auth_permanent") && CLAUDE_LOGIN_RE.test(raw)
+      ? CLAUDE_LOGIN_COPY
+      : (TURN_CODE_COPY[code] ?? TURN_LAYER_COPY[layer] ?? TURN_DEFAULT_COPY);
   // The backend always sets recoverable=true on a turn error; error_surface.retryable
   // is the signal that actually says whether /retry can help.
   const retryable =
@@ -400,7 +410,6 @@ export const describeTurnFailure = (payload: TurnFailure): string => {
   const nextStep = retryable
     ? hint
     : hint.replace(/(?:Send|Try) \/retry/, "Pick another model with /model");
-  const raw = (payload.error ?? "").replace(/^Error:\s*/, "");
 
   return [
     `${title}${provider}. Your message was not answered.`,

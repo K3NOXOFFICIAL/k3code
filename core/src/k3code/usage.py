@@ -9,12 +9,20 @@ unknown instead of inventing a number.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+
+logger = logging.getLogger("k3code.usage")
+
+#: A failing usage write is logged at most this often (seconds).
+_WARN_INTERVAL = 60.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -51,6 +59,7 @@ class UsageDB:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._last_warn: float | None = None  # monotonic time of the last "write failed" warning
         self._db = sqlstore.connect(self.path)
         self._db.executescript(_SCHEMA)
         cols = {row[1] for row in self._db.execute("PRAGMA table_info(events)")}
@@ -84,30 +93,43 @@ class UsageDB:
         if kind not in KINDS:
             raise ValueError(f"unknown usage event kind {kind!r}")
         ts = time.time() if ts is None else ts
-        self._db.execute(
-            "INSERT INTO events (ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd,"
-            " seconds, detail, tier, task_kind, turn, cache_read, cache_write)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                ts,
-                time.strftime("%Y-%m-%d", time.localtime(ts)),
-                session,
-                kind,
-                provider,
-                model,
-                tokens_in,
-                tokens_out,
-                cost_usd,
-                seconds,
-                detail[:500],
-                tier,
-                task_kind,
-                turn,
-                cache_read,
-                cache_write,
-            ),
-        )
-        self._db.commit()
+        # Best effort: statistics must never fail a turn or abort a failover (disk full, locked, read-only, closed).
+        try:
+            self._db.execute(
+                "INSERT INTO events (ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd,"
+                " seconds, detail, tier, task_kind, turn, cache_read, cache_write)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ts,
+                    time.strftime("%Y-%m-%d", time.localtime(ts)),
+                    session,
+                    kind,
+                    provider,
+                    model,
+                    tokens_in,
+                    tokens_out,
+                    cost_usd,
+                    seconds,
+                    detail[:500],
+                    tier,
+                    task_kind,
+                    turn,
+                    cache_read,
+                    cache_write,
+                ),
+            )
+            self._db.commit()
+        except (sqlite3.Error, OSError) as exc:
+            with contextlib.suppress(sqlite3.Error):
+                self._db.rollback()  # do not leave a half-open transaction holding the write lock
+            self._warn_write_failed(kind, exc)
+
+    def _warn_write_failed(self, kind: str, exc: Exception) -> None:
+        now = time.monotonic()
+        if self._last_warn is not None and now - self._last_warn < _WARN_INTERVAL:
+            return
+        self._last_warn = now
+        logger.warning("usage.db write failed (%s event dropped): %s: %s", kind, type(exc).__name__, exc)
 
     def prune(self, older_than_days: float, *, now: float | None = None) -> int:
         """Delete events older than ``older_than_days`` (the daemon calls it at start); returns rows deleted."""

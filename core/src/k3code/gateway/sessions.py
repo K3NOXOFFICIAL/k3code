@@ -17,6 +17,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,38 @@ class StoredSession:
     meta: dict[str, Any] = field(default_factory=dict)  # per-session extras: add_dirs, mode
 
 
+@dataclass
+class SessionSummary:
+    """A session without its transcript: what a listing shows, read from columns, never by parsing ``messages``."""
+
+    session_id: str
+    title: str = ""
+    model: str = ""
+    provider: str = ""
+    cwd: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    message_count: int = 0
+    preview: str = ""
+
+
+PREVIEW_CHARS = 120
+
+
+def dump_messages(messages: list[dict[str, Any]]) -> str:
+    """``json.dumps(messages, ensure_ascii=False)``, one message per encoder call. The C encoder keeps the GIL for a
+    whole call, so a transcript encoded in one piece freezes every other thread; in pieces they run in between."""
+    return "[" + ", ".join(json.dumps(m, ensure_ascii=False) for m in messages) + "]"
+
+
+def summarize_messages(messages: list[dict[str, Any]]) -> tuple[int, str]:
+    """``(message count, preview)``: the preview is the first non-empty user message, cut to ``PREVIEW_CHARS``."""
+    for m in messages:
+        if m.get("role") == "user" and m.get("content"):
+            return len(messages), str(m["content"])[:PREVIEW_CHARS]
+    return len(messages), ""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -66,11 +99,18 @@ class SessionStore:
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
+        self._executor: ThreadPoolExecutor | None = None
+        self._writer: SessionStore | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+        # -1 = not computed yet (a row written before these columns existed): the first listing fills it in
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT -1")
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
@@ -89,8 +129,9 @@ class SessionStore:
             updated_at=now,
         )
         self._db.execute(
-            "INSERT INTO sessions (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO sessions"
+            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, message_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?,0)",
             (sess.session_id, sess.title, sess.model, sess.provider, sess.cwd, "[]", "{}", now, now),
         )
         self._db.commit()
@@ -107,21 +148,25 @@ class SessionStore:
 
     def _insert_row(self, sess: StoredSession) -> None:
         """The full-row INSERT shared by :meth:`insert` and a save that restores a swept row; no commit."""
+        count, preview = summarize_messages(sess.messages)
         self._db.execute(
             "INSERT INTO sessions"
-            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta,"
+            " message_count, preview)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sess.session_id,
                 sess.title,
                 sess.model,
                 sess.provider,
                 sess.cwd,
-                json.dumps(sess.messages, ensure_ascii=False),
+                dump_messages(sess.messages),
                 json.dumps(sess.usage, ensure_ascii=False),
                 sess.created_at,
                 sess.updated_at,
                 json.dumps(sess.meta, ensure_ascii=False),
+                count,
+                preview,
             ),
         )
 
@@ -161,30 +206,57 @@ class SessionStore:
         ).fetchall()
         return [s for s in (self.get(row[0]) for row in ids) if s is not None]
 
-    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[StoredSession]:
+    _SUMMARY_COLUMNS = "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview"
+
+    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[SessionSummary]:
+        """The newest sessions as summaries. Reads columns only: a transcript can be huge and is never parsed."""
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
-            "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at"
-            f" FROM sessions{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",  # noqa: S608
+            f"SELECT {self._SUMMARY_COLUMNS} FROM sessions{where}"  # noqa: S608
+            " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             (max(1, limit), max(0, offset)),
         ).fetchall()
-        out: list[StoredSession] = []
-        for row in rows:
-            messages = json.loads(row[5] or "[]")
-            out.append(
-                StoredSession(
-                    session_id=row[0],
-                    title=row[1] or "",
-                    model=row[2] or "",
-                    provider=row[3] or "",
-                    cwd=row[4] or "",
-                    messages=messages,
-                    usage=json.loads(row[6] or "{}"),
-                    created_at=row[7],
-                    updated_at=row[8],
-                )
-            )
+        return [self._summary(row) for row in rows]
+
+    def summaries(self, ids: list[str]) -> list[SessionSummary]:
+        """Summaries of ``ids`` in that order; an id with no row is skipped."""
+        out: list[SessionSummary] = []
+        for sid in ids:
+            row = self._db.execute(
+                f"SELECT {self._SUMMARY_COLUMNS} FROM sessions WHERE session_id = ?",  # noqa: S608
+                (sid,),
+            ).fetchone()
+            if row is not None:
+                out.append(self._summary(row))
         return out
+
+    def _summary(self, row: tuple[Any, ...]) -> SessionSummary:
+        count, preview = row[7], row[8] or ""
+        if count < 0:  # written before the columns existed: parse this one transcript once and keep the answer
+            count, preview = self._backfill_summary(row[0])
+        return SessionSummary(
+            session_id=row[0],
+            title=row[1] or "",
+            model=row[2] or "",
+            provider=row[3] or "",
+            cwd=row[4] or "",
+            created_at=row[5],
+            updated_at=row[6],
+            message_count=count,
+            preview=preview,
+        )
+
+    def _backfill_summary(self, session_id: str) -> tuple[int, str]:
+        row = self._db.execute("SELECT messages FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            return 0, ""
+        count, preview = summarize_messages(json.loads(row[0] or "[]"))
+        with self._db:  # `message_count < 0`: a save that landed since the read has the real values already
+            self._db.execute(
+                "UPDATE sessions SET message_count=?, preview=? WHERE session_id=? AND message_count < 0",
+                (count, preview, session_id),
+            )
+        return count, preview
 
     def worked_in(self, *, limit: int) -> list[tuple[str, str]]:
         """``(session_id, cwd)`` of the newest ``limit`` sessions with at least one message and no automation origin.
@@ -204,19 +276,23 @@ class SessionStore:
         sweep removed it: then its tombstone is there and the row is restored from ``sess`` (another process, such
         as a standalone stdio TUI, may hold the session open past the sweep's age limit)."""
         sess.updated_at = time.time()
+        count, preview = summarize_messages(sess.messages)
+        messages = dump_messages(sess.messages)
         with self._db:
             cur = self._db.execute(
-                "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
-                " WHERE session_id=?",
+                "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?,"
+                " message_count=?, preview=? WHERE session_id=?",
                 (
                     sess.title,
                     sess.model,
                     sess.provider,
                     sess.cwd,
-                    json.dumps(sess.messages, ensure_ascii=False),
+                    messages,
                     json.dumps(sess.usage, ensure_ascii=False),
                     sess.updated_at,
                     json.dumps(sess.meta, ensure_ascii=False),
+                    count,
+                    preview,
                     sess.session_id,
                 ),
             )
@@ -228,6 +304,42 @@ class SessionStore:
             sess.created_at = sess.created_at or sess.updated_at
             self._insert_row(sess)
         logger.info("restored stored session %s removed by the empty-session sweep", sess.session_id)
+
+    def checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str = "") -> None:
+        """Write only the transcript (and the model, when the row has none): a mid-turn checkpoint must not carry the
+        title or meta it was snapshotted with over a newer value saved in between. A missing row stays missing."""
+        count, preview = summarize_messages(messages)
+        payload = dump_messages(messages)
+        with self._db:
+            self._db.execute(
+                "UPDATE sessions SET messages=?, model=CASE WHEN model='' THEN ? ELSE model END, updated_at=?,"
+                " message_count=?, preview=? WHERE session_id=?",
+                (payload, model, time.time(), count, preview, session_id),
+            )
+
+    async def _on_writer(self, name: str, *args: Any) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k3code-session-writer")
+        await asyncio.get_running_loop().run_in_executor(self._executor, self._call_writer, name, *args)
+
+    def _call_writer(self, name: str, *args: Any) -> None:
+        if self._writer is None:  # a sqlite connection may only be used by the thread that made it
+            self._writer = SessionStore(self.path)
+        getattr(self._writer, name)(*args)
+
+    async def save_async(self, sess: StoredSession) -> None:
+        """:meth:`save` on a worker thread with its own connection, so a large transcript does not stall the event
+        loop. One worker, so writes land in the order they were queued. Pass a snapshot, not a live object."""
+        await self._on_writer("save", sess)
+
+    async def checkpoint_async(self, session_id: str, messages: list[dict[str, Any]], model: str = "") -> None:
+        """:meth:`checkpoint` on the same worker (so after any queued write, before any later one)."""
+        await self._on_writer("checkpoint", session_id, messages, model)
+
+    def _close_writer(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
 
     def delete(self, session_id: str) -> bool:
         """Delete the row and any sweep tombstone for it, so no later save brings the session back."""
@@ -329,5 +441,13 @@ class SessionStore:
         rows = self.worked_in(limit=1)
         return self.get(rows[0][0]) if rows else None
 
+    def compact(self) -> int:
+        """Return the pages of deleted transcripts to the filesystem; bytes freed (see :func:`sqlstore.compact`)."""
+        return sqlstore.compact(self._db)
+
     def close(self) -> None:
+        if self._executor is not None:  # lets every queued save finish first
+            self._executor.submit(self._close_writer).result()
+            self._executor.shutdown(wait=True)
+            self._executor = None
         self._db.close()

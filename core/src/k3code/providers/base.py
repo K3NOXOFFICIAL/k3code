@@ -61,25 +61,29 @@ def redact(value: str | None) -> str:
     return "***" if len(value) <= 4 else f"***{value[-2:]}"
 
 
-def request_headers(kind: str, api_key: str, *, anthropic_beta: str | None = None) -> dict[str, str]:
-    """Headers for one API call. The key goes only here — never into logs."""
-    if not api_key.strip():
+def request_headers(
+    kind: str, api_key: str, *, keyless: bool = False, anthropic_beta: str | None = None
+) -> dict[str, str]:
+    """Headers for one API call. The key goes only here — never into logs. A ``keyless`` entry (``api_key_env: ""``,
+    e.g. Ollama) sends no key header; for any other entry an empty key is a configuration error."""
+    has_key = bool(api_key.strip())
+    if not has_key and not keyless:
         raise ProviderError(
-            "No API key configured for this provider: its api_key_env variable is empty. "
-            "Run `k3code setup --step providers`, or put KEY=value in ~/.config/k3code/env. "
-            "`k3code doctor` shows which variable is missing.",
+            # Short on purpose: the router cuts an entry's error at 160 characters, and the fix is at the end.
+            "No API key configured for this provider. Run `k3code onboard`, or put KEY=value in ~/.config/k3code/env.",
             status_code=401,
         )
     if kind == "anthropic":
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+        headers = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
+        if has_key:
+            headers["x-api-key"] = api_key
         if anthropic_beta:
             headers["anthropic-beta"] = anthropic_beta
         return headers
-    return {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+    headers = {"content-type": "application/json"}
+    if has_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def http_status_of(exc: BaseException) -> int | None:

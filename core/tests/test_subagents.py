@@ -56,6 +56,29 @@ async def test_task_sync_returns_child_answer_and_emits_events(tmp_path, monkeyp
     assert h.tier == "main" and h.agent_type == "worker"
 
 
+async def test_a_child_runs_on_its_parents_model_key_when_another_session_switches_the_router(tmp_path, monkeypatch):
+    """The child resolved the daemon-wide router after awaiting the parent's approval callback; a session starting a
+    turn on another model key in that window sent the child to the other session's main model (#130)."""
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    server.config.providers[0].models["alt"] = "m-alt"
+    await start(server, tmp_path)
+    real_approval = server._approval_callback_for
+
+    async def other_turn_starts(session):
+        server._ensure_router("alt")  # another session's turn begins while this one awaits
+        return await real_approval(session)
+
+    monkeypatch.setattr(server, "_approval_callback_for", other_turn_starts)
+    await run_turn(server, "PARENT: delegate it")
+    assert last_tool_result(server) == "the answer is 42"
+    assert "m-alt" not in models_called(server), models_called(server)
+
+
 async def test_subagent_list_reports_a_wall_clock_start(tmp_path, monkeypatch):
     """started_at was time.monotonic() (seconds since boot); the TUI read it as a Unix time and showed every
     sub-agent as running for ~56 years."""

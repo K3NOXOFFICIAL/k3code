@@ -12,6 +12,7 @@ has, using the ``reliability.*`` / ``net.state`` kinds from
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -100,6 +101,9 @@ class Reliability:
         self.unattended = False  # see set_unattended
         self._started = False
         self._net_forwarded = False
+        # what the transcript file holds: these messages (by identity, in order) in this many bytes; see save_transcript
+        self._saved: list[Message] = []
+        self._saved_bytes = -1
 
     # ── construction ──
 
@@ -267,39 +271,68 @@ class Reliability:
         return self.home / "journal" / f"{self.session}.messages.json"
 
     def save_transcript(self, messages: list[Message]) -> None:
-        """M2: atomically persist the conversation so a crashed run can resume."""
+        """M2: persist the conversation so a crashed run can resume.
+
+        One JSON line per message. The loop saves after every step and tool result, so a save appends only the
+        messages added since the last one: rewriting the whole conversation each time cost O(steps × transcript)
+        on the event loop (#72). The file is rewritten (tmp + replace) only when it no longer holds a prefix of
+        ``messages``: another list (a resume, another loop on this session) or a file changed or gone underneath."""
         path = self._transcript_path()
         if path is None or not self.flags.journal:
             return
-        data = [
-            {
-                "role": m.role,
-                "content": m.content,
-                "tool_call_id": m.tool_call_id,
-                "name": m.name,
-                "tool_calls": [
-                    {"id": c.id, "name": c.name, "arguments": c.arguments, "raw_arguments": c.raw_arguments}
-                    for c in m.tool_calls
-                ],
-            }
-            for m in messages
-        ]
+        saved, size = self._saved, self._saved_bytes
+        self._saved, self._saved_bytes = [], -1  # what the file holds is unknown until this save succeeds
         try:
             # the whole conversation, tool output included: 0700/0600 whatever the umask (saved before any tool
             # call opens the journal, so it cannot rely on ToolJournal for the directory's mode)
             ensure_private_dir(path.parent)
-            tmp = path.with_suffix(".tmp")
-            private_file(tmp).write_text(json.dumps(data))  # write_text truncates and keeps the 0600 mode
-            os.replace(tmp, path)
+            if (
+                len(saved) <= len(messages)
+                and all(a is b for a, b in zip(saved, messages, strict=False))
+                and path.exists()
+                and path.stat().st_size == size
+            ):
+                with path.open("ab") as fh:
+                    fh.write(_transcript_lines(messages[len(saved) :]))
+                    size = fh.tell()
+            else:
+                data = _transcript_lines(messages)
+                tmp = path.with_suffix(".tmp")
+                private_file(tmp).write_bytes(data)  # write_bytes truncates and keeps the 0600 mode
+                os.replace(tmp, path)
+                size = len(data)
+            self._saved, self._saved_bytes = list(messages), size
         except OSError as e:
             logger.debug("transcript not saved (%s)", e)
+
+    def clear_transcript(self) -> None:
+        """A turn that ended cleanly has nothing left to resume: the session store holds the conversation."""
+        path = self._transcript_path()
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
 
     def load_transcript(self) -> list[Message] | None:
         path = self._transcript_path()
         if path is None or not path.exists():
             return None
         try:
-            raw = json.loads(path.read_text())
+            raw: list[Any] = []
+            lines = path.read_text().split("\n")
+            for i, line in enumerate(lines):
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    if i == len(lines) - 1:
+                        break  # a crash cut the last append short: resume from the messages before it
+                    raise
+                if isinstance(rec, list):  # the whole transcript as one JSON array, as saved before it was appended to
+                    raw.extend(rec)
+                else:
+                    raw.append(rec)
             return [
                 Message(
                     role=d["role"],
@@ -431,3 +464,23 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
     for key in known & set(raw):
         setattr(settings, key, raw[key])
     return Reliability.from_settings(settings, session=session, home=home)
+
+
+def _transcript_lines(messages: list[Message]) -> bytes:
+    """``messages`` as transcript lines: one JSON object per message (see :meth:`Reliability.save_transcript`)."""
+    return "".join(
+        json.dumps(
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "name": m.name,
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments, "raw_arguments": c.raw_arguments}
+                    for c in m.tool_calls
+                ],
+            }
+        )
+        + "\n"
+        for m in messages
+    ).encode()

@@ -37,6 +37,7 @@ def write_user_config(h):
                     }
                 ],
                 "mem0": {"url": "http://m", "api_key_env": "MEM_KEY", "user_id": "u"},
+                "panes": {"keymap": "tuios"},
                 "mcp": {"servers": {"s": {"command": "x", "env": {"GITHUB_TOKEN": SECRET_TOKEN, "FOO": "bar"}}}},
                 "extra_password": SECRET_PASS,
             }
@@ -87,6 +88,7 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     for secret in (SECRET_KEY, SECRET_TOKEN, SECRET_PASS):
         assert secret.encode() not in blob
     assert b"MY_API_KEY" in blob and b"max_tokens: 4096" in blob
+    assert b"keymap: tuios" in blob  # 'key' inside 'keymap' is not a secret name
     await server.close()
 
     # Fresh install: has its own config (with a real secret that must survive) and no sessions.
@@ -101,6 +103,7 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     assert merged["max_turns"] == 7 and merged["max_tokens"] == 4096
     assert merged["mem0"]["api_key"] == "LOCAL-SECRET-VALUE"  # <redacted> never overwrites
     assert merged["mem0"]["url"] == "http://m"
+    assert merged["panes"] == {"keymap": "tuios"}
     assert REDACTED not in (h2 / "config.yaml").read_text()
     assert list(h2.glob("config.yaml.bak-*")), "existing config must be backed up"
     imported = server2.store.get(sid)  # id was free in the new store → kept

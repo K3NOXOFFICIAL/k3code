@@ -20,8 +20,48 @@ const LABELS = {
   session: "Allow this session",
 } as const;
 const CMD_PREVIEW_LINES = 10;
+/** Rows of an edit/write diff shown at once; `[` and `]` page through the rest. */
+export const DIFF_VIEW_LINES = 16;
 
 type ApprovalChoice = "always" | "deny" | "once" | "session";
+
+/**
+ * The rows of an approval's change preview (a unified diff) to show from
+ * `offset`: clamped so the window never runs past the end. Pure, for tests.
+ */
+export function previewWindow(
+  preview: string,
+  offset: number,
+  height: number = DIFF_VIEW_LINES,
+): { lines: string[]; offset: number; total: number } {
+  const all = preview.split("\n");
+  const start = Math.max(0, Math.min(offset, all.length - height));
+
+  return {
+    lines: all.slice(start, start + height),
+    offset: start,
+    total: all.length,
+  };
+}
+
+/** How a diff row is drawn: added, removed, hunk header or context. */
+export function diffLineKind(
+  line: string,
+): "add" | "context" | "del" | "file" | "hunk" {
+  if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+    return "file";
+  }
+
+  if (line.startsWith("@@")) {
+    return "hunk";
+  }
+
+  if (line.startsWith("+")) {
+    return "add";
+  }
+
+  return line.startsWith("-") ? "del" : "context";
+}
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   if (req.choices) {
@@ -47,7 +87,8 @@ type ApprovalKey = {
 type ApprovalAction =
   | { kind: "choose"; choice: ApprovalChoice }
   | { kind: "move"; delta: -1 | 1 }
-  | { kind: "noop" };
+  | { kind: "noop" }
+  | { kind: "scroll"; delta: -1 | 1 };
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -59,6 +100,8 @@ type ApprovalAction =
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
  * for approvals).  Numbers 1..opts.length pick the labelled choice.  Enter
  * confirms the current selection.  ↑/↓ moves the selection within bounds.
+ * `[` / `]` page the change preview of an edit/write (PgUp/PgDn already
+ * scroll the transcript while a prompt is open).
  */
 export function approvalAction(
   ch: string,
@@ -68,6 +111,10 @@ export function approvalAction(
 ): ApprovalAction {
   if (key.escape) {
     return { kind: "choose", choice: "deny" };
+  }
+
+  if (ch === "[" || ch === "]") {
+    return { kind: "scroll", delta: ch === "[" ? -1 : 1 };
   }
 
   const n = parseInt(ch, 10);
@@ -98,7 +145,11 @@ export function ApprovalPrompt({
   t,
 }: ApprovalPromptProps) {
   const [sel, setSel] = useState(0);
+  const [diffTop, setDiffTop] = useState(0);
   const opts = approvalOptions(req);
+  const diff = req.preview
+    ? previewWindow(req.preview, diffTop, DIFF_VIEW_LINES)
+    : null;
 
   useInput((ch, key) => {
     const action = approvalAction(ch, key, sel, opts);
@@ -107,6 +158,11 @@ export function ApprovalPrompt({
       onChoice(action.choice);
     } else if (action.kind === "move") {
       setSel((s) => s + action.delta);
+    } else if (action.kind === "scroll" && diff) {
+      // a page minus one row of overlap; previewWindow clamps the end
+      const step = Math.max(1, DIFF_VIEW_LINES - 1) * action.delta;
+
+      setDiffTop(previewWindow(req.preview!, diff.offset + step).offset);
     }
   });
 
@@ -148,6 +204,54 @@ export function ApprovalPrompt({
           </Text>
         ) : null}
       </Box>
+
+      {diff ? (
+        <Box
+          borderColor={t.color.muted}
+          borderStyle="single"
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+        >
+          {diff.lines.map((line, i) => {
+            const kind = diffLineKind(line);
+
+            return (
+              <Text
+                backgroundColor={
+                  kind === "add"
+                    ? t.color.diffAdded
+                    : kind === "del"
+                      ? t.color.diffRemoved
+                      : undefined
+                }
+                bold={kind === "file"}
+                color={
+                  kind === "add"
+                    ? t.color.diffAddedWord
+                    : kind === "del"
+                      ? t.color.diffRemovedWord
+                      : kind === "hunk"
+                        ? t.color.muted
+                        : t.color.text
+                }
+                dimColor={kind === "context"}
+                key={diff.offset + i}
+                wrap="truncate-end"
+              >
+                {line || " "}
+              </Text>
+            );
+          })}
+
+          {diff.total > DIFF_VIEW_LINES ? (
+            <Text color={t.color.muted}>
+              lines {diff.offset + 1}–{diff.offset + diff.lines.length} of{" "}
+              {diff.total} · [ / ] scroll
+            </Text>
+          ) : null}
+        </Box>
+      ) : null}
 
       <Text />
 

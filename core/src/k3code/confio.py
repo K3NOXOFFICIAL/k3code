@@ -62,15 +62,21 @@ def latest_backup(path: Path) -> Path | None:
 def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True, keep_trust: bool = True) -> Path | None:
     """Write ``data`` as YAML; the previous file is copied to ``.bak-<ts>`` first. Returns the backup.
 
+    A write that would not change the file's bytes makes no backup (and returns None): rewriting the same config
+    must not pile up identical ``.bak-*`` files.
+
     ``keep_trust=False`` for content someone else wrote (an imported bundle): a project config written that way is
     left untrusted until the user approves it with `k3code trust`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     bak: Path | None = None
     if backup and path.is_file():
+        previous = path.read_bytes()
+        if previous == text.encode("utf-8"):
+            return None
         bak = backup_path(path)
-        bak.write_bytes(path.read_bytes())
-    text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        bak.write_bytes(previous)
     if keep_trust:
         with trust.keeping_trust(path):
             path.write_text(text, encoding="utf-8")

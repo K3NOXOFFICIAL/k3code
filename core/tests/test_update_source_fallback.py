@@ -86,6 +86,56 @@ def test_an_install_without_a_checkout_still_gets_the_token_advice(tmp_path, mon
     assert r.exit_code != 0 and "GITHUB_TOKEN" in r.output and "Traceback" not in r.output
 
 
+# -- a recorded checkout that is gone is not the same as no recorded checkout --------------------------------------
+
+
+def test_a_moved_checkout_is_named_not_blamed_on_the_github_api(checkout, monkeypatch):
+    moved = checkout.rename(checkout.with_name("clone copy"))  # the issue's "clone copy with spaces"
+    (checkout.parent / "data" / "source_path").write_text(str(checkout))  # still recorded at the old place
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", _deny)
+    monkeypatch.setattr(upd, "update_from_source", lambda *a, **k: pytest.fail("there is nothing to build from"))
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and "Traceback" not in r.output
+    assert str(checkout) in r.output and "does not exist" in r.output and "update.source" in r.output
+    assert "404" in r.output  # the release lookup failure stays visible, after the path
+    assert moved.exists()
+
+
+def test_a_moved_checkout_is_named_when_there_is_no_release_either(checkout, monkeypatch):
+    checkout.rename(checkout.with_name("clone copy"))
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: None)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and str(checkout) in r.output and "does not exist" in r.output
+    assert "keeps no checkout or git ref" not in r.output
+
+
+def test_from_source_names_the_recorded_path_when_it_is_gone(checkout, monkeypatch):
+    checkout.rename(checkout.with_name("clone copy"))
+    monkeypatch.setattr(upd, "update_from_source", lambda *a, **k: pytest.fail("there is nothing to build from"))
+    for extra in ([], ["--no-pull"], ["--check"]):
+        r = CliRunner().invoke(cli, ["update", "--from-source", "--yes", *extra])
+        assert r.exit_code != 0, r.output
+        assert str(checkout) in r.output and "does not exist" in r.output and "update.source" in r.output
+        assert "no source checkout known" not in r.output
+
+
+def test_a_recorded_path_that_is_not_a_git_checkout_says_so(checkout, monkeypatch):
+    (checkout / ".git").rmdir()
+    r = CliRunner().invoke(cli, ["update", "--from-source", "--no-pull", "--yes"])
+    assert r.exit_code != 0 and str(checkout) in r.output and "not a git checkout" in r.output
+    assert "does not exist" not in r.output and "no source checkout known" not in r.output
+
+
+def test_from_source_with_no_recorded_checkout_keeps_its_own_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    r = CliRunner().invoke(cli, ["update", "--from-source", "--yes"])
+    assert r.exit_code != 0 and "no source checkout known; set update.source in config.yaml" in r.output
+    assert "does not exist" not in r.output
+
+
 def test_from_wsl_a_windows_clone_is_pulled_with_windows_git(monkeypatch):
     monkeypatch.setattr(upd, "_in_wsl", lambda: True)
     monkeypatch.setattr(
@@ -244,6 +294,17 @@ async def test_slash_update_on_an_install_pinned_to_a_sha_has_nothing_to_update(
     for arg in ("", "now"):
         assert "pinned to commit" in await _slash(arg)
     assert applied == []
+
+
+async def test_slash_update_on_a_pinned_install_names_install_ps1_in_wsl(git_install, monkeypatch):
+    git_install(ref=OLD)
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: ref)
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    out = await _slash("")
+    assert "install.ps1 --from-git --ref Main`" in out and "`sh install.sh --from-git --ref Main`" in out
+    monkeypatch.setattr(upd, "_in_wsl", lambda: False)
+    out = await _slash("")
+    assert "`sh install.sh --from-git --ref Main`" in out and "install.ps1" not in out
 
 
 async def test_slash_update_without_release_checkout_or_git_ref_still_says_no_releases(tmp_path, monkeypatch):

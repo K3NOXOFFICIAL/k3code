@@ -117,3 +117,42 @@ def test_service_restart_resets_the_start_limit_and_reports_failure(monkeypatch)
     rc["restart"] = 1
     r = CliRunner().invoke(cli, ["service", "restart"])
     assert r.exit_code == 1 and "start-limit-hit" in r.output, r.output
+
+
+def environment_file(unit: str) -> str:
+    (line,) = (ln for ln in unit.splitlines() if ln.startswith("EnvironmentFile="))
+    return line.removeprefix("EnvironmentFile=-")
+
+
+def test_the_unit_reads_the_env_file_the_wizard_writes_when_xdg_config_home_is_set(tmp_path: Path, monkeypatch) -> None:
+    from k3code.setup.state import set_env_var
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    written = set_env_var("OMNIROUTE_API_KEY", "fake-" + "key")
+    # the unit used to hard-code %h/.config/k3code/env, so the daemon never saw a key stored under $XDG_CONFIG_HOME
+    assert written == tmp_path / "xdg" / "k3code" / "env"
+    assert environment_file(service.render_unit()) == str(written)
+
+
+def test_the_unit_keeps_the_portable_env_file_path_when_it_is_the_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert environment_file(service.render_unit()) == "%h/.config/k3code/env"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "home" / ".config"))  # set, but the same place
+    assert environment_file(service.render_unit()) == "%h/.config/k3code/env"
+
+
+def test_the_env_file_path_in_the_unit_is_absolute_unquoted_and_escapes_percent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # systemd rejects a quoted EnvironmentFile= path as "not absolute"; a space needs no quoting, a % is a specifier
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my 100% cfg"))
+    assert environment_file(service.render_unit()) == f"{tmp_path}/my 100%% cfg/k3code/env"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative-cfg")
+    assert environment_file(service.render_unit()) == f"{tmp_path}/relative-cfg/k3code/env"
+
+
+def test_an_explicit_exec_start_keeps_the_default_env_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert environment_file(service.render_unit("/usr/bin/k3code daemon")) == "%h/.config/k3code/env"

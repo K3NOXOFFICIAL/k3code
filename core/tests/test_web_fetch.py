@@ -183,6 +183,42 @@ async def test_fetch_page_without_a_shared_fetcher_still_works_with_an_injected_
     assert title == "T" and "hello world" in text
 
 
+async def test_fetch_page_resolves_links_against_the_url_after_redirects():
+    """Issue #99: links reach the model as absolute URLs, resolved against the page the body came from."""
+    doc = b'<html><body><main><p>Read the <a href="guide.html">guide</a>.</p></main></body></html>'
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        if req.url.path == "/docs":
+            return httpx.Response(301, headers={"location": "/docs/v2/"})
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=doc)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        _, text = await fetch_page("https://docs.test/docs", client=client)
+    assert text == "Read the [guide](https://docs.test/docs/v2/guide.html)."
+
+
+async def test_a_fetched_page_is_parsed_off_the_event_loop(monkeypatch):
+    """Links and tables make the parse heavier (a link-dense 2 MiB page takes seconds): it must not stall the daemon."""
+    import threading
+
+    from k3code.research import tools as t
+
+    seen: list[str] = []
+    real = t.extract_text
+    monkeypatch.setattr(t, "extract_text", lambda m, *a: (seen.append(threading.current_thread().name), real(m, *a))[1])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=PAGE)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        _, text = await fetch_page("https://plain.test/p", client=client)
+    assert text == "hello world" and seen and seen[0] != threading.main_thread().name
+
+
 async def test_redirect_hops_are_checked_against_robots_and_the_host_bucket():
     clock, hits = FakeClock(), []
 

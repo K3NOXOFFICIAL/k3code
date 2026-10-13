@@ -5,8 +5,10 @@ sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (on
 project is writable, and its git metadata is read-only so a command cannot plant a hook. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
-Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed and ``/doctor``
-warns. An unattended session is refused instead (:class:`SandboxUnavailable`): it never falls back.
+Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
+before each command only the sandbox made safe, yolo runs it, the session shows a warning and ``/doctor`` reports it
+(see ``AgentLoop._bwrap_unusable``). An unattended session is refused instead (:class:`SandboxUnavailable`): it never
+falls back.
 
 Deliberate exceptions, not sandboxed: MCP stdio servers (see ``mcpclient.stdio_env``) and harness git, which is not
 model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_git_argv`).
@@ -15,6 +17,7 @@ model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -28,6 +31,7 @@ from pathlib import Path
 from k3code import paths
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.permissions import PermissionMode
+from k3code.permissions.engine import windows_drives
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +43,33 @@ SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
 #: :func:`child_env`.
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
-#: Harness git never runs a hook or a fsmonitor program: a sandboxed command could have written one into .git.
+#: Harness git (worktrees, merges, triggers, scope classification) runs in the daemon, outside the sandbox, on a
+#: repository the model may have written to. It never runs a hook or a fsmonitor program, and it reads no system or
+#: global git config (see :data:`HARNESS_GIT_ENV`). Diff callers add :data:`HARNESS_GIT_DIFF_FLAGS`.
+#:
+#: What this cannot prevent: a filter (``filter.<name>.clean``/``smudge``), a diff or merge driver, a signing program
+#: or an include, defined in the repository's own config (``.git/config``, ``.git/config.worktree``) still runs when
+#: git touches a file it applies to (``status``, ``add``, ``merge``, ``commit``), because git has no switch that
+#: ignores a configured driver by name. That is closed at the source: the write and edit tools always ask before they
+#: change those files (see :func:`k3code.permissions.engine.protected_path`) and the sandbox binds the git metadata
+#: read-only. It stays open for a repository config changed by anything else (an unsandboxed command someone
+#: approved, a process outside k3code) and for a driver the user keeps in the repository on purpose.
 HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+#: Environment of harness git: no system or global config (``~/.gitconfig`` could define a driver or an alias too).
+#: The cost is that the user's own settings do not apply to it either (``safe.directory``, LFS filters, a global
+#: ignore file).
+HARNESS_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+#: ``git diff`` runs ``diff.external`` and the textconv drivers by default; the harness only needs the plain text.
+HARNESS_GIT_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
 _GITDIR_LINE = re.compile(r"^gitdir:\s*(.+?)\s*$", re.MULTILINE)
+#: Files the C library reads to resolve a host name. Any of them may be a link out of the bound system dirs (WSL 2:
+#: /etc/resolv.conf -> /mnt/wsl/resolv.conf; Debian resolvconf: -> ../run/resolvconf/resolv.conf): see
+#: :func:`_name_lookup_argv`.
+NAME_LOOKUP_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf")
+_MAX_LINKS = 40  # the kernel's limit before ELOOP
 
 
 class SandboxRefused(RuntimeError):
@@ -144,8 +169,14 @@ def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def harness_git_argv(*args: str) -> list[str]:
-    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled."""
+    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled. Run it
+    with :func:`harness_git_env`."""
     return ["git", *HARNESS_GIT_CONFIG, *args]
+
+
+def harness_git_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The :func:`child_env` of a harness git process: no system or global git config (see HARNESS_GIT_ENV)."""
+    return child_env({**(extra or {}), **HARNESS_GIT_ENV})
 
 
 def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, network: bool = False) -> list[str]:
@@ -191,8 +222,9 @@ async def spawn_unattended_shell(
     )
 
 
-def _refuse_root(root: Path, home: Path) -> None:
-    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home."""
+def _refuse_root(root: Path, home: Path, drives: Iterable[str] | None = None) -> None:
+    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home; nor,
+    under WSL, a Windows profile or a directory above one (see :func:`windows_profile_root`)."""
     for guarded in (home, home / ".ssh", paths.home()):
         target = guarded.resolve()
         if root == target or root in target.parents:
@@ -200,6 +232,28 @@ def _refuse_root(root: Path, home: Path) -> None:
                 f"refusing to make {root} writable inside the sandbox: it is or contains $HOME, ~/.ssh or the "
                 "k3code home; start the session in a project folder"
             )
+    if windows_profile_root(root, drives):
+        raise SandboxRefused(
+            f"refusing to make {root} writable inside the sandbox: it is or contains a Windows user profile (its "
+            ".ssh, .aws and AppData with the browsers' saved passwords); start the session in a project folder"
+        )
+
+
+def windows_profile_root(root: Path | str, drives: Iterable[str] | None = None) -> bool:
+    """``root`` is a Windows drive WSL mounts (``/mnt/c``), its ``Users`` folder or a profile in it
+    (``/mnt/c/Users/<name>``), or a directory above one (``/mnt``, ``/``): the Windows-side ``$HOME``, which the
+    k3code shim starts in when a Windows terminal opens in ``C:\\Users\\<name>`` (issue #134). drvfs is
+    case-insensitive, so is this. A project below a profile (``/mnt/c/Users/<name>/src/app``) is fine."""
+    folded = str(root).lower().rstrip("/")
+    for drive in windows_drives() if drives is None else drives:
+        drive = drive.lower().rstrip("/")
+        if folded == drive or drive.startswith(folded + "/"):
+            return True  # the drive itself, or above it
+        if folded.startswith(drive + "/"):
+            parts = folded[len(drive) + 1 :].split("/")
+            if parts[0] in ("users", "documents and settings") and len(parts) <= 2:
+                return True
+    return False
 
 
 def root_refusal(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> str | None:
@@ -240,6 +294,65 @@ def exposes_home(path: Path | str, home: Path | None = None) -> bool:
     return home.is_relative_to(Path(path).resolve())
 
 
+def _link_walk(path: str) -> tuple[list[tuple[str, str]], str]:
+    """Resolve the absolute ``path`` as the kernel does, one component at a time. Returns every link met on the way as
+    ``(where, target)``, ``where`` free of links itself, and the path it ends at. Raises ``OSError`` on a loop."""
+    links: list[tuple[str, str]] = []
+    pending = [p for p in path.split("/") if p][::-1]
+    done = "/"
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            done = os.path.dirname(done)
+        elif part != ".":
+            here = os.path.join(done, part)
+            if not os.path.islink(here):
+                done = here
+                continue
+            if len(links) >= _MAX_LINKS:
+                raise OSError(errno.ELOOP, "too many levels of symbolic links", path)
+            target = os.readlink(here)
+            links.append((here, target))
+            if target.startswith("/"):
+                done = "/"
+            pending += [p for p in target.split("/") if p][::-1]
+    return links, done
+
+
+def _name_lookup_argv(shown: Sequence[str], hidden: Sequence[Path]) -> list[str]:
+    """bwrap ops that keep each :data:`NAME_LOOKUP_FILES` entry readable when it links out of ``shown`` (the system
+    dirs already in the sandbox): the links on the way are recreated and the file at the end is bound read-only at its
+    own path. A file whose link or bind would land inside or above ``hidden`` ($HOME, the k3code home), or on or above
+    a shown dir or /tmp, is left out: the sandbox keeps hiding those, and an op that collides with another mount fails
+    the whole sandbox."""
+    shown_paths = [Path(s) for s in shown]
+    mounted = (*hidden, *shown_paths, Path("/tmp"))
+
+    def clashes(dest: Path) -> bool:
+        return any(dest.is_relative_to(h) for h in hidden) or any(m.is_relative_to(dest) for m in mounted)
+
+    out: list[str] = []
+    placed: set[str] = set()
+    for name in NAME_LOOKUP_FILES:
+        try:
+            links, end = _link_walk(name)
+        except (OSError, ValueError):
+            logger.debug("sandbox: cannot follow %s", name, exc_info=True)
+            continue
+        if not links or not os.path.isfile(end):
+            continue
+        ops = [("--symlink", target, where) for where, target in links] + [("--ro-bind", end, end)]
+        ops = [op for op in ops if not any(Path(op[2]).is_relative_to(s) for s in shown_paths)]
+        if any(clashes(Path(op[2])) for op in ops):
+            logger.warning("sandbox: %s links to %s, which the sandbox does not show; names may not resolve", name, end)
+            continue
+        for op in ops:
+            if op[2] not in placed:
+                placed.add(op[2])
+                out += op
+    return out
+
+
 def build_argv(
     cwd: Path | str,
     add_dirs: Iterable[Path | str] = (),
@@ -275,19 +388,30 @@ def build_argv(
         if value is not None:
             argv += ["--setenv", name, value]
     # System: read-only. /bin, /lib* are usually symlinks into /usr; recreate them as symlinks.
+    shown = ["/proc", "/dev"]
     for path in ("/usr", "/etc"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     for path in ("/bin", "/sbin", "/lib", "/lib32", "/lib64"):
         if os.path.islink(path):
             argv += ["--symlink", os.readlink(path), path]
+            shown.append(path)
         elif os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     # /etc/resolv.conf is often a link into /run; keep name resolution working (when the network is on).
     for path in ("/run/systemd/resolve", "/run/NetworkManager"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    # A resolver file linked anywhere else (WSL 2: /mnt/wsl/resolv.conf) is bound at its own path, after the /tmp
+    # tmpfs and before $HOME is masked; never from $HOME or the k3code home. Both spellings of those count: the later
+    # mounts use the given path, and a link recreated above it would make bwrap fail to place them.
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    private = [home, paths.home(), *([Path(xdg) / "k3code"] if xdg else [])]
+    argv += _name_lookup_argv(shown, [*private, *(Path(os.path.realpath(p)) for p in private)])
     # $HOME hidden behind an empty tmpfs, then only the cache dirs and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
@@ -313,7 +437,6 @@ def build_argv(
     for path in _home_readonly_paths(home, extra, [*roots, cache]):
         argv += ["--ro-bind", str(path), str(path)]
     # $HOME secrets are masked again after the project binds: a bind above them would re-expose them
-    xdg = os.environ.get("XDG_CONFIG_HOME")
     secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])
     for path in dict.fromkeys(str(p) for p in secrets):
         if os.path.isdir(path):
@@ -372,3 +495,26 @@ def _probe_bwrap() -> bool:
     except (OSError, subprocess.SubprocessError, SandboxRefused):
         return False
     return r.returncode == 0
+
+
+def hidden_name_lookup_files() -> list[str]:
+    """The :data:`NAME_LOOKUP_FILES` readable here but not inside the sandbox, where host names then do not resolve
+    although the network is on. Reads files only, no lookup. Spawns bwrap (up to 10 s); [] when it cannot run."""
+    path = bwrap_path()
+    wanted = [f for f in NAME_LOOKUP_FILES if os.access(f, os.R_OK)]
+    if path is None or not wanted:
+        return []
+    script = 'for f; do [ -r "$f" ] || echo "$f"; done'
+    try:
+        with tempfile.TemporaryDirectory(prefix="k3code-bwrap-") as scratch:
+            r = subprocess.run(
+                [*build_argv(scratch, bwrap=path), "/bin/sh", "-c", script, "sh", *wanted],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=child_env(),
+            )
+    except (OSError, subprocess.SubprocessError, SandboxRefused):
+        return []
+    return [f for f in r.stdout.splitlines() if f in wanted] if r.returncode == 0 else []

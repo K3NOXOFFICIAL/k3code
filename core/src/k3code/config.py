@@ -23,8 +23,10 @@ class ProviderEntry(BaseModel):
     name: str
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
-    api_key_env: str = ""  # required for "openai" / "anthropic"
-    api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
+    api_key_env: str = ""  # required for "openai" / "anthropic"; "" = the endpoint takes no key (Ollama)
+    #: populated by load_config() from the api_key_env var; never set this directly. Not in repr: a logged or
+    #: printed config must not carry the key.
+    api_key: str = Field(default="", repr=False)
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: Optional one-line text per model key ({default: "Everyday coding", cheap: "Fast and cheap"}), shown by /tune.
     descriptions: dict[str, str] = Field(default_factory=dict)
@@ -120,6 +122,10 @@ class Mem0Config(BaseModel):
     api_key_env: str = ""
     user_id: str = ""
     agent_id: str = "k3code"
+
+    def identifiers(self) -> dict[str, str]:
+        """Whose memories these are: sent on every write and every search, so a search finds what was written."""
+        return {"agent_id": self.agent_id, **({"user_id": self.user_id} if self.user_id else {})}
 
 
 class DisplayConfig(BaseModel):
@@ -261,9 +267,15 @@ class Settings(BaseModel):
         return {**dict.fromkeys(CONFIG_KEYS, True), **v}
 
 
-#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
-#: learning decisions (days).
-RETENTION_DEFAULTS: dict[str, int] = {"usage_days": 180, "journal_days": 30, "debug_bundles": 10, "decisions_days": 365}
+#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), the journal directory's size
+#: cap (MB; the oldest closed files go first), debug bundles kept (count), learning decisions (days).
+RETENTION_DEFAULTS: dict[str, int] = {
+    "usage_days": 180,
+    "journal_days": 30,
+    "journal_mb": 512,
+    "debug_bundles": 10,
+    "decisions_days": 365,
+}
 
 
 def retention(config: Any) -> dict[str, int]:
@@ -375,18 +387,27 @@ def load_config(
     _warn_unknown_escalate_keys(merged)
     _warn_unknown_mode_keys(merged)
 
-    # Expand provider api_key_env -> api_key (api_key_env is a required field on
-    # ProviderEntry, so look it up without popping it out of the dict).
+    # Validate first, then expand api_key_env -> api_key on the validated entries. A validation error echoes its input
+    # (pydantic's input_value=<the provider block>), so a key in that block would show up in the error text (its tail
+    # survives the truncation) and in every log it reaches. An api_key written in config.yaml was always replaced
+    # here; it is dropped before validation for the same reason. A providers value or entry of the wrong type is left
+    # to pydantic, which reports it like any other config error.
+    providers = merged.get("providers")
+    if isinstance(providers, list):
+        merged["providers"] = [
+            {k: v for k, v in p.items() if k != "api_key"} if isinstance(p, dict) else p for p in providers
+        ]
+    settings = Settings(**merged)
+
     # The process environment wins; otherwise fall back to the env file the setup wizard
     # writes (~/.config/k3code/env), so a key stored there also works outside systemd.
     from k3code.setup.state import read_env_file
 
     file_env = read_env_file()
-    for p in merged.get("providers", []):
-        name = p.get("api_key_env", "")
-        p["api_key"] = os.environ.get(name) or file_env.get(name, "")
+    for entry in settings.providers:
+        entry.api_key = os.environ.get(entry.api_key_env) or file_env.get(entry.api_key_env, "")
 
-    return Settings(**merged)
+    return settings
 
 
 def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:

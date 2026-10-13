@@ -16,13 +16,17 @@
 # Everything k3code needs is fetched into your home directory, without root: uv (and through it Python),
 # a private Node runtime (PREFIX/share/k3code/node, for the TUI) and a Go toolchain (PREFIX/share/k3code/go,
 # to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
-# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches
-# nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
+# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches none of
+# these toolchains; the PyPI, npm and Go module packages the build needs still download. The installer never
+# runs onboarding; it ends by telling you to run `k3code onboard`.
 # Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
 # prints a health subset. It never fails the install.
-# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
+# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium), K3_CONNECT_TIMEOUT=SECS (a download connection gives up after
+#   SECS seconds and is retried; default 15). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
+# K3_REQUIRE_TUI=1 (set by `k3code update`): a TUI build that was tried and failed fails the run, so no version without
+# the TUI is staged for an update. Without it such a failure is a warning and k3code uses the line REPL.
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -52,7 +56,8 @@ Options:
   --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
   --yes, -y             accepted for older callers; with it, presetup never prompts for sudo
-  --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
+  --no-install-deps     fetch no toolchains (uv, Python, Node, Go, bubblewrap, Chromium; fail or skip with the hints
+                        instead); PyPI, npm and Go module packages still download
   --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
   --allow-root          install as root anyway (for example in a container); refused by default
@@ -105,13 +110,33 @@ cleanup() {
 have() { command -v "$1" >/dev/null 2>&1; }
 have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
-fetch() { # fetch URL FILE: https only, whichever downloader is there
+# curl -s and wget -q say nothing while they wait for a connection and retry it, so a proxy or a firewall that swallows
+# connections looked like a hang. Say so every SECS seconds, until the installer (PID) is gone or the download ends.
+fetch_still_trying() { # fetch_still_trying PID HOST SECS
+  waited=0
+  while sleep "$3" >/dev/null 2>&1 && kill -0 "$1" 2>/dev/null; do # sleep's output closed: an orphaned sleep must not hold a pipe open
+    waited=$((waited + $3))
+    log "still trying to download from $2 (${waited}s): a connection attempt gives up after ${3}s and is retried; Ctrl-C stops"
+  done
+}
+
+fetch() { # fetch URL FILE: https only, whichever downloader is there; a connection attempt gives up after K3_CONNECT_TIMEOUT s (15)
   case "$1" in https://*) ;; *) return 1 ;; esac
+  secs=${K3_CONNECT_TIMEOUT:-15}
+  case "$secs" in '' | *[!0-9]* | 0) secs=15 ;; esac
+  site=${1#https://}
+  site=${site%%/*}
+  fetch_still_trying "$$" "${site##*@}" "$secs" &
+  watcher=$!
+  fetch_rc=0
   if have curl; then
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
+    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout "$secs" --retry 3 "$1" -o "$2" || fetch_rc=$?
   else # BusyBox wget (Alpine) has no --https-only and GNU wget applies it only to recursive fetches: the case above is the guard
-    wget -q --tries=3 -O "$2" "$1"
+    wget -q -T "$secs" --tries=3 -O "$2" "$1" || fetch_rc=$? # -T: GNU wget bounds DNS, connect and read with it, BusyBox the read
   fi
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$fetch_rc"
 }
 
 ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
@@ -181,16 +206,27 @@ tui_tmp_root() { # the temp dir the TUI build uses, without trailing slashes (ma
   printf '%s\n' "$root"
 }
 
-clean_recorded_tmp() { # clean_recorded_tmp LOCK: the TUI build dir the install that held LOCK recorded (killed mid-build)
-  t=$(cat "$1/tui_tmp" 2>/dev/null || true)
-  name=${t#"$(tui_tmp_root)"/}
-  while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
-  # never follow an arbitrary path from a lock file: only a k3code-tui.* directly in the temp dir this run uses
-  case "$name" in "$t" | */*) return 0 ;; k3code-tui.?*) ;; *) return 0 ;; esac
-  if [ -d "$t" ]; then
-    rm -rf "$t"
-    log "removed the TUI build directory $t that the interrupted install left"
-  fi
+record_tmp() { # record_tmp KIND PATH: a k3code-KIND.* this run made in the temp dir, noted in the lock for a takeover after SIGKILL
+  if [ -n "$LOCK" ]; then printf '%s\n' "$2" >"$LOCK/${1}_tmp"; fi
+}
+
+clean_recorded_tmp() { # clean_recorded_tmp LOCK: what the install that held LOCK recorded of its temp paths (killed mid-run)
+  for kind in tui src giterr uv node go reqs; do # the kinds record_tmp is called with; update.py RECORDED_TMP_KINDS has the same
+    t=$(cat "$1/${kind}_tmp" 2>/dev/null || true)
+    name=${t#"$(tui_tmp_root)"/}
+    while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
+    # never follow an arbitrary path from a lock file: only a k3code-KIND.* directly in the temp dir this run uses
+    case "$name" in "$t" | */*) continue ;; "k3code-$kind".?*) ;; *) continue ;; esac
+    if [ -e "$t" ]; then
+      rm -rf "$t"
+      if [ "$kind" = giterr ]; then rm -f "$t.refs"; fi # the ref list read without git
+      if [ "$kind" = tui ]; then
+        log "removed the TUI build directory $t that the interrupted install left"
+      else
+        log "removed $t, which the interrupted install left"
+      fi
+    fi
+  done
 }
 
 clean_unfinished_versions() { # versions/<v> a killed install left without .complete (never the one current names)
@@ -274,7 +310,17 @@ detect_platform() {
   case "$ARCH" in x86_64 | amd64) NODE_ARCH=x64 GO_ARCH=amd64 ;; *) NODE_ARCH=arm64 GO_ARCH=arm64 ;; esac
   case "$PLATFORM" in Linux) NODE_OS=linux GO_OS=linux ;; *) NODE_OS=darwin GO_OS=darwin ;; esac
   MUSL=0
-  if [ "$PLATFORM" = Linux ] && ls /lib/ld-musl-* >/dev/null 2>&1; then MUSL=1; fi # Alpine: no official Node build
+  if [ "$PLATFORM" = Linux ] && running_on_musl; then MUSL=1; fi # Alpine: no official Node build
+}
+
+running_on_musl() { # the C library this system runs on; a /lib/ld-musl-* file alone proves nothing (Debian's musl package ships one)
+  if have ldd; then
+    case $(ldd --version 2>&1 || true) in
+      *[Mm][Uu][Ss][Ll]*) return 0 ;;
+      *GLIBC* | *GNU*) return 1 ;;
+    esac
+  fi
+  [ -e /etc/alpine-release ]
 }
 
 detect_pm() {
@@ -461,6 +507,7 @@ ensure_uv() {
   base=https://github.com/astral-sh/uv/releases/download/$UV_VERSION
   log "uv is missing: installing uv $UV_VERSION ($target) into $BIN from its release archive (sha256 pinned in this script)"
   UV_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-uv.XXXXXX")
+  record_tmp uv "$UV_TMP"
   if ! { fetch "$base/uv-$target.tar.gz" "$UV_TMP/uv.tar.gz" && fetch "$base/uv-$target.tar.gz.sha256" "$UV_TMP/uv.sha256"; }; then
     die "could not download uv $UV_VERSION (no network?); install uv yourself: $(hint_cmd uv)"
   fi
@@ -490,7 +537,19 @@ version_ge() { # version_ge A B: dotted version A is B or newer (three numeric p
   }'
 }
 
-go_version_of() { GOTOOLCHAIN=local "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'; }
+# go_isolate GO: in a subshell, keeps a Go fetched into $DATA inside $DATA (uninstall.sh removes it all): the module
+# cache (dropped after the build), the build cache, and the config dir where the go command keeps its telemetry. That
+# leaves ~/go, ~/.cache/go-build and ~/.config/go untouched. A Go from PATH is the user's own and is left alone.
+go_isolate() {
+  case "$1" in
+    "$DATA"/*) export GOPATH="$DATA/go/path" GOCACHE="$DATA/go/cache" XDG_CONFIG_HOME="$DATA/go/config" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;;
+  esac
+}
+go_version_of() ( # `go version` writes telemetry counters too
+  export GOTOOLCHAIN=local
+  go_isolate "$1"
+  "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'
+)
 
 go_wanted() { # the Go release panes/go.mod asks for, named the way go.dev names it (go 1.22 is go1.22.0)
   v=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" 2>/dev/null | head -n 1)
@@ -522,6 +581,7 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
   if [ "$MUSL" = 1 ] || ! can_fetch; then return 0; fi
   base=https://nodejs.org/dist/latest-v22.x
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-node.XXXXXX")
+  record_tmp node "$t"
   if ! fetch "$base/SHASUMS256.txt" "$t/SHASUMS256.txt"; then
     log "WARNING: could not reach nodejs.org; the TUI is skipped (k3code uses the line REPL)"
     rm -rf "$t"
@@ -565,6 +625,7 @@ ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked again
   gv=$GO_WANT
   name="go$gv.$GO_OS-$GO_ARCH.tar.gz"
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
+  record_tmp go "$t"
   log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary${GO:+ ($GO is older)}"
   want=""
   if fetch "https://go.dev/dl/?mode=json&include=all" "$t/releases.json"; then want=$(go_sha256 "$t/releases.json" "$name"); fi
@@ -706,6 +767,17 @@ recorded_version() {
   printf '%s' "$found"
 }
 
+plain_url() { # plain_url URL: an http(s) URL without its user:password@ part, so no credential is ever stored
+  case "$1" in
+    http://* | https://*)
+      pu_rest=${1#*://}
+      pu_auth=${pu_rest%%/*}
+      printf '%s://%s%s\n' "${1%%://*}" "${pu_auth##*@}" "${pu_rest#"$pu_auth"}"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 installed_ref() { # the ref the active version was built from, if it was recorded
   if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
   return 0
@@ -794,6 +866,7 @@ tree_id() {
 }
 
 acquire_source() {
+  COMMIT_TIME="" # the committer time of the commit built (recorded as .committed, so a later install can tell which is older)
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
     if [ -n "$d" ] && [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ]; then
@@ -818,6 +891,7 @@ acquire_source() {
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi
+    if [ -n "$SHA" ]; then COMMIT_TIME=$(src_git log -1 --format=%ct HEAD 2>/dev/null || true); fi
     if [ -z "$SHA" ]; then
       id=$(tree_id)
       # without a checksum tool the name would be a bare X.Y.Z-src.tree and a second checkout would look installed
@@ -828,6 +902,7 @@ acquire_source() {
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
+    record_tmp giterr "$GIT_ERR"
     if [ -z "$REF" ]; then
       if ! pick_default_ref; then
         FROM=source
@@ -848,6 +923,7 @@ acquire_source() {
         ;;
     esac
     TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
+    record_tmp src "$TMP"
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
@@ -860,6 +936,7 @@ acquire_source() {
       if git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
         git -C "$SRC_ROOT" checkout -q FETCH_HEAD
         SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+        COMMIT_TIME=$(git -C "$SRC_ROOT" log -1 --format=%ct HEAD 2>/dev/null || true)
         fetched=1
       fi
     fi
@@ -883,6 +960,13 @@ acquire_source() {
 }
 
 # ---- build -----------------------------------------------------------------
+tui_failed() { # tui_failed WHY: the TUI was built and the build failed (a skipped one is not a failure)
+  # `k3code update` stages with --no-activate and must not switch to a version that lost the TUI because the npm
+  # registry was unreachable; the half-built version is removed on exit, so the next update builds it again
+  if [ "${K3_REQUIRE_TUI:-0}" = 1 ]; then die "$1; nothing was activated"; fi
+  log "WARNING: $1; k3code will use the line REPL"
+}
+
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
@@ -894,9 +978,9 @@ build_tui() {
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
     TUI_TMP=$(mktemp -d "$(tui_tmp_root)/k3code-tui.XXXXXX")
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
-    printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
+    record_tmp tui "$TUI_TMP"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
-      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      tui_failed "could not copy the TUI sources to $TUI_TMP"
       return 0
     fi
     tui=$TUI_TMP/tui
@@ -907,7 +991,7 @@ build_tui() {
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
-    log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
+    tui_failed "the TUI did not build (output above)"
   fi
   return 0
 }
@@ -919,12 +1003,9 @@ build_panes() {
     return 0
   fi
   log "building the k3 pane binary"
-  case "$GO" in
-    "$DATA"/*) set -- env GOPATH="$DATA/go/path" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;; # keep ~/go untouched
-    *) set -- env ;;
-  esac
-  if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+  if ! (cd "$SRC_ROOT/panes" && go_isolate "$GO" && CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
+    printf 'k3: the go build failed\n' >"$VERDIR/.degraded" # k3code update reports it (k3 is optional: the version stays)
   fi
   if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
   return 0
@@ -943,6 +1024,7 @@ install_core_copy() {
     return 0
   fi
   REQS=$(mktemp "${TMPDIR:-/tmp}/k3code-reqs.XXXXXX")
+  record_tmp reqs "$REQS"
   "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-emit-project -o "$REQS" >/dev/null ||
     die "could not export the locked runtime dependencies (core/uv.lock is stale?): run 'uv lock' in core/"
   "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --require-hashes -r "$REQS" >&2
@@ -951,9 +1033,36 @@ install_core_copy() {
   REQS=""
 }
 
+# put_file FILE VALUE: FILE holds VALUE. It is only written when it differs (a repeated run changes nothing), through a
+# temp file and a rename, so an interrupted write never leaves a torn file.
+put_file() {
+  if [ "$(cat "$1" 2>/dev/null)" != "$2" ]; then
+    printf '%s\n' "$2" >"$1.new"
+    mv -f "$1.new" "$1"
+  fi
+  return 0
+}
+
+# A git build and a source build of one commit share the version name, so the version may be complete already: the way
+# this run was asked for is recorded on every run, not only on a build. A git install keeps `.ref` and `.url` (the ref
+# and the remote `k3code update` follows: a SHA pins it, a branch or tag does not; a fork or mirror, not upstream) and
+# no checkout path; a source install keeps the checkout path and neither (it follows the checkout).
+record_origin() {
+  if [ "$FROM" = source ]; then
+    put_file "$DATA/source_path" "$SOURCE_PATH"
+    rm -f "$VERDIR/.ref" "$VERDIR/.url"
+  fi
+  if [ "$FROM" = git ]; then
+    put_file "$VERDIR/.ref" "$REF"
+    put_file "$VERDIR/.url" "$(plain_url "$GIT_URL")"
+  fi
+  return 0
+}
+
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
+    record_origin # the build is reused, but the ref, remote and checkout asked for now are what the install follows
     return 0
   fi
   log "installing version $VER into $VERDIR"
@@ -985,8 +1094,8 @@ install_version() {
   if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
-  if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
+  record_origin
+  if [ -n "${COMMIT_TIME:-}" ]; then printf '%s\n' "$COMMIT_TIME" >"$VERDIR/.committed"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
@@ -1083,6 +1192,32 @@ restart_daemon() { # a running daemon keeps executing the old version until it r
   return 0
 }
 
+# lt, gt or eq: how the X.Y.Z that starts version name A compares with B's. eq too when either is not dotted numbers.
+version_order() {
+  awk -v a="${1%%-*}" -v b="${2%%-*}" 'BEGIN {
+    if (a !~ /^[0-9]+(\.[0-9]+)*$/ || b !~ /^[0-9]+(\.[0-9]+)*$/) { print "eq"; exit }
+    n = split(a, x, "."); m = split(b, y, ".")
+    for (i = 1; i <= (n > m ? n : m); i++) {
+      if (x[i] + 0 != y[i] + 0) { print (x[i] + 0 < y[i] + 0 ? "lt" : "gt"); exit }
+    }
+    print "eq"
+  }'
+}
+
+# Is VER older than the installed version CUR? A lower X.Y.Z says so; at the same X.Y.Z the commit times recorded at
+# build do. An install from before they were recorded, or a build without git, cannot be compared: not older.
+older_than_installed() {
+  case $(version_order "$VER" "$1") in
+    lt) return 0 ;;
+    gt) return 1 ;;
+  esac
+  new=$(cat "$VERDIR/.committed" 2>/dev/null || true)
+  old=$(cat "$DATA/versions/$1/.committed" 2>/dev/null || true)
+  case "$new" in '' | *[!0-9]*) return 1 ;; esac
+  case "$old" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$new" -lt "$old" ]
+}
+
 activate() {
   cur=""
   if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
@@ -1090,6 +1225,9 @@ activate() {
     if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
     set_current "$VERDIR"
     log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
+    if [ -n "$cur" ] && older_than_installed "$cur"; then
+      log "this is older than the installed version $cur: activated anyway; k3code update --rollback returns to $cur"
+    fi
   fi
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
   link_bin k3code "$DATA/current/venv/bin/k3code"
@@ -1174,13 +1312,37 @@ chromium_present() { # the marker from an earlier run and the browser it names a
   return 1
 }
 
+# A downloaded headless shell can still fail to start: Playwright does not install the system libraries it links
+# (libnss3, libnspr4 and libasound2 are missing on a bare Ubuntu). Start it once; on a failure name what the loader
+# cannot find. The health subset that follows prints the install command. Returns 1 only when it ran and failed.
+chromium_starts() {
+  b=""
+  for f in "$DATA"/browsers/chromium_headless_shell-*/*/chrome-headless-shell "$DATA"/browsers/chromium_headless_shell-*/*/headless_shell; do
+    if [ -x "$f" ]; then
+      b=$f
+      break
+    fi
+  done
+  if [ -z "$b" ]; then return 0; fi # nothing to start (a stub run, or the download is elsewhere)
+  if have timeout; then out=$(timeout 20 "$b" --version 2>&1) && return 0; else out=$("$b" --version 2>&1) && return 0; fi
+  missing=""
+  if have ldd; then missing=$(ldd "$b" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found.*/\1/p' | tr '\n' ' ') || missing=""; fi
+  if [ -n "$missing" ]; then
+    log "presetup: WARNING: Chromium is downloaded but cannot start: missing system libraries: ${missing% }"
+    say "      the browser tool stays off until they are installed (the health check below gives the command)"
+  else
+    log "presetup: WARNING: Chromium is downloaded but failed to run: $(printf '%s\n' "$out" | head -n 1)"
+  fi
+  return 1
+}
+
 presetup_chromium() {
   if [ "${K3CODE_SKIP_CHROMIUM:-0}" = 1 ]; then
     log "presetup: Chromium skipped (K3CODE_SKIP_CHROMIUM=1)"
     return 0
   fi
   if chromium_present; then
-    log "presetup: Chromium already installed in $DATA/browsers"
+    if chromium_starts; then log "presetup: Chromium already installed in $DATA/browsers"; fi
     return 0
   fi
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
@@ -1204,7 +1366,7 @@ presetup_chromium() {
   fi
   mkdir -p "$DATA/presetup"
   printf '%s\n' "$PLAYWRIGHT_VERSION" >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
-  log "presetup: Chromium installed in $DATA/browsers"
+  if chromium_starts; then log "presetup: Chromium installed in $DATA/browsers"; fi
   return 0
 }
 presetup_doctor() {
