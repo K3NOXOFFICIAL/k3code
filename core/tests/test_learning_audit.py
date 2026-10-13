@@ -48,16 +48,15 @@ def test_user_md_is_not_emptied_when_the_write_itself_fails(tmp_path, monkeypatc
 
 async def test_a_model_reply_with_a_lone_surrogate_does_not_wipe_user_md_or_preferences(tmp_path):
     log = DecisionLog(tmp_path)
-    for _ in range(3):
-        log.record("undo", subject="x", choice="x")
+    _seed_pref(log)
     md = tmp_path / "USER.md"
     md.write_text("# Me\nI like tabs.\n")
-    caller = FakeCaller('[{"key": "undo", "text": "prefers small edits \\ud83d"}]')
+    caller = FakeCaller(f'[{{"key": "{PREF}", "text": "prefers small edits \\ud83d"}}]')
     await distiller.distill(log, home=tmp_path, user_md=md, caller=caller)
     assert "I like tabs." in md.read_text(encoding="utf-8")
     assert "prefers small edits" in md.read_text(encoding="utf-8")
     prefs = json.loads((tmp_path / "learning" / "preferences.json").read_text(encoding="utf-8"))
-    assert "prefers small edits" in prefs["undo"]["text"]
+    assert "prefers small edits" in prefs[PREF]["text"]
     assert oct((tmp_path / "learning" / "preferences.json").stat().st_mode & 0o777) == "0o600"
     assert oct(md.stat().st_mode & 0o777) == "0o600"
 
@@ -272,9 +271,17 @@ async def _hub(tmp_path, monkeypatch, **settings):
     return server, server.learning, server.live_for(server.store.get(sid))
 
 
+#: the preference three sessions of leaving model m1 derive (the "undo" kind it used to rest on is gone)
+PREF = "avoid:m1:"
+
+
+def _seed_pref(log, sessions: int = 3, first: int = 0) -> None:
+    for i in range(first, first + sessions):
+        log.record("model_switch", session=f"s{i}", subject="m2", detail={"from": "m1", "task_kind": ""})
+
+
 def _seed_undo(hub) -> None:
-    for _ in range(3):
-        hub.log.record("undo", subject="x")
+    _seed_pref(hub.log)
 
 
 class _SlowCaller(FakeCaller):
@@ -290,7 +297,7 @@ async def test_two_sessions_finishing_together_make_one_maintenance_pass(tmp_pat
 
     server, hub, _ = await _hub(tmp_path, monkeypatch)
     _seed_undo(hub)
-    caller = server.model_caller = _SlowCaller('[{"key": "undo", "text": "prefers small edits"}]')
+    caller = server.model_caller = _SlowCaller(f'[{{"key": "{PREF}", "text": "prefers small edits"}}]')
     a, b = await asyncio.gather(hub.maintenance(), hub.maintenance())
     assert len(caller.calls) == 1, "the second pass read the state before the first one stamped it"
     assert sorted(map(bool, (a, b))) == [True, True]  # one did the work, the other says it skipped
@@ -304,7 +311,7 @@ async def test_a_failed_maintenance_pass_is_not_tried_again_at_every_turn_end(tm
 
     server, hub, _ = await _hub(tmp_path, monkeypatch)
     _seed_undo(hub)
-    caller = server.model_caller = FakeCaller('[{"key": "undo", "text": "prefers small edits"}]')
+    caller = server.model_caller = FakeCaller(f'[{{"key": "{PREF}", "text": "prefers small edits"}}]')
     monkeypatch.setattr(curator, "curate", lambda *a, **k: 1 / 0)
     with pytest.raises(ZeroDivisionError):
         await hub.maintenance()
@@ -376,13 +383,17 @@ def _messages():
     ]
 
 
-async def test_replay_records_are_kept_only_while_the_optimizer_is_enabled(tmp_path, monkeypatch):
+async def test_replay_records_are_kept_while_learning_is_on_whether_or_not_the_optimizer_is(tmp_path, monkeypatch):
+    """/optimizer run is an analysis of the records while the optimizer is off: they must exist by then."""
     server, hub, live = await _hub(tmp_path, monkeypatch)
     hub.record_turn_replay(live, _messages(), "done", "main", "interactive_turn", "t1", history_len=0)
-    assert not hub.replays.path.exists()
+    assert len(hub.replays.load()) == 1
     server.config.learning = {"optimizer": {"enabled": True}}
     hub.record_turn_replay(live, _messages(), "done", "main", "interactive_turn", "t2", history_len=0)
-    assert len(hub.replays.load()) == 1
+    assert len(hub.replays.load()) == 2
+    server.config.learning = {"enabled": False}
+    hub.record_turn_replay(live, _messages(), "done", "main", "interactive_turn", "t3", history_len=0)
+    assert len(hub.replays.load()) == 2  # learning itself off: nothing is recorded
     await server.close()
 
 
@@ -523,18 +534,16 @@ async def test_the_last_failure_memory_is_bounded_and_keeps_only_what_the_hint_n
 
 async def test_unchanged_preferences_are_not_polished_again_the_next_day(tmp_path):
     log = DecisionLog(tmp_path)
-    for _ in range(3):
-        log.record("undo", subject="x")
+    _seed_pref(log)
     md = tmp_path / "USER.md"
     caller = FakeCaller(
-        '[{"key": "undo", "text": "prefers small edits"}]', '[{"key": "undo", "text": "likes tiny diffs"}]'
+        f'[{{"key": "{PREF}", "text": "prefers small edits"}}]', f'[{{"key": "{PREF}", "text": "likes tiny diffs"}}]'
     )
     first = await distiller.distill(log, home=tmp_path, user_md=md, caller=caller)
     second = await distiller.distill(log, home=tmp_path, user_md=md, caller=caller)
     assert len(caller.calls) == 1
     assert [p.text for p in first] == [p.text for p in second] == ["prefers small edits"]
-    for _ in range(3):  # more evidence: it is worth asking again
-        log.record("undo", subject="x")
+    _seed_pref(log, first=3)  # three more sessions of evidence: it is worth asking again
     await distiller.distill(log, home=tmp_path, user_md=md, caller=caller)
     assert len(caller.calls) == 2
 

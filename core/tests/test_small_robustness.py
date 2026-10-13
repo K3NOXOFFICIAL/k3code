@@ -15,7 +15,7 @@ from k3code import skills as skills_mod
 from k3code.config import Mem0Config, Settings
 from k3code.extratools import register_skill_tool
 from k3code.learning import curator, distiller, projectprep
-from k3code.tools import ToolRegistry, format_tool_result, tool_glob, tool_grep
+from k3code.tools import GREP_MAX_COLUMNS, ToolRegistry, format_tool_result, tool_glob, tool_grep
 
 #: tools.MAX_SEARCH_RESULTS (a literal, so the tests still collect with the fix set aside)
 MAX_SEARCH_RESULTS = 1000
@@ -323,7 +323,7 @@ async def test_the_grep_fallback_skips_a_200_mb_binary_without_reading_it(tmp_pa
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert res["matches"] == f"{tmp_path / 'a.py'}:1:needle"
+    assert res["matches"] == "a.py\n1:needle"  # the path (relative to the session) once, then its lines
     assert peak < 16 * 1024 * 1024
 
 
@@ -343,7 +343,7 @@ async def test_the_grep_fallback_streams_a_large_text_file(tmp_path, no_git_env,
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    hits = [line.split(":")[1] for line in res["matches"].splitlines()]
+    hits = [line.split(":")[0] for line in res["matches"].splitlines() if line[:1].isdigit()]
     assert hits == [str(64 * 1024 + 1), str(64 * 1024 + 2)]
     assert peak < 16 * 1024 * 1024
 
@@ -374,7 +374,7 @@ async def test_the_grep_fallback_cuts_long_matching_lines_like_rg(tmp_path, no_g
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert f"{tmp_path / 'a.js'}:1:{'x' * 400} [... omitted end of long line]" in res["matches"].splitlines()
+    assert f"1:{'x' * GREP_MAX_COLUMNS} [... omitted end of long line]" in res["matches"].splitlines()
     assert peak < 16 * 1024 * 1024
 
 
@@ -383,5 +383,5 @@ async def test_the_grep_fallback_says_a_named_binary_file_matches(tmp_path, no_g
     lib.write_bytes(b"\x7fELF\x00\x00 SYMBOL_NAME\n" + b"\x00" * 100)
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
     res = await tool_grep({"pattern": "SYMBOL_NAME", "path": str(lib)}, cwd=tmp_path)
-    assert res["matches"] == f"{lib}: binary file matches"
+    assert res["matches"] == "lib.so: binary file matches"
     assert (await tool_grep({"pattern": "absent", "path": str(lib)}, cwd=tmp_path))["matches"] == ""

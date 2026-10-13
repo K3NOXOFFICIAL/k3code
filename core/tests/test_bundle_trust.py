@@ -313,6 +313,7 @@ def test_exporting_then_importing_on_the_same_machine_keeps_the_secrets_it_redac
     merged = merge_settings(have, incoming)
     assert merged["mcp"]["servers"]["s"]["args"] == ["srv", "--token=ghp_abc", "--verbose"]
     assert merged["hooks"]["PreToolUse"] == [{"matcher": "*", "command": "secret-cmd --key=k"}]
-    # lists that do not line up are not guessed at: the placeholder is dropped, never written
-    other = merge_settings({"a": {"args": ["x"]}}, {"a": {"args": ["y", REDACTED, "z"]}})
-    assert other == {"a": {"args": ["y", "z"]}}
+    # lists that do not line up are not guessed at: the placeholder stays in its slot (dropping it would shift every
+    # argument after it), and a dict key holding it is dropped
+    other = merge_settings({"a": {"args": ["x"]}}, {"a": {"args": ["y", REDACTED, "z"], "env": {"K": REDACTED}}})
+    assert other == {"a": {"args": ["y", REDACTED, "z"], "env": {}}}

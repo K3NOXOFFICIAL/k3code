@@ -508,9 +508,10 @@ class LearningHub:
         history_len: int = 0,
     ) -> None:
         """Keep one finished turn's inputs and outcome for the replay harness. Never raises: it runs at turn end.
-        Only the optimizer reads the records, so nothing is kept (or built: it renders the skills and memory prompts
-        and appends to a file of up to 40 MB) while ``learning.optimizer.enabled`` is off."""
-        if not self.enabled or not self.cfg["optimizer"]["enabled"]:
+        Kept while learning is on whether or not the optimizer is: ``/optimizer run`` is an analysis of these records
+        while ``learning.optimizer.enabled`` is off, and a file that only starts to fill once it is switched on leaves
+        that analysis nothing to replay."""
+        if not self.enabled:
             return
         try:
             from k3code.memory import memory_prompt

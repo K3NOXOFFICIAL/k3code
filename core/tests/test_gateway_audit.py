@@ -100,10 +100,10 @@ async def test_persist_failure_is_reported_once(env: Path, monkeypatch) -> None:
     server, _ = make_server(env / "work", monkeypatch)
     sid = await new_session(server, env)
 
-    def boom(_stored) -> None:
+    async def boom(_stored) -> None:
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(server.store, "save", boom)
+    monkeypatch.setattr(server.store, "save_async", boom)  # the turn's write goes through the store's writer thread
     await submit_and_wait(server, "one")
     await submit_and_wait(server, "two")
     shown = [

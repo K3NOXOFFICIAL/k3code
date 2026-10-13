@@ -202,7 +202,9 @@ def _has_redacted(obj: Any) -> bool:
 def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
     """An incoming list holding placeholders, over a list of the same length (the bundle's own export, imported on the
     machine it came from): each placeholder keeps what is there, so a round trip does not delete ``--token=…`` from an
-    ``args`` list or the ``command`` of a hook. Lists of another length are not aligned: placeholders are dropped."""
+    ``args`` list or the ``command`` of a hook. Lists of another length are not aligned, so
+    the placeholder stays where it is (see ``_strip_redacted``): it never overwrites a real value, and it does not shift
+    the arguments after it."""
     if len(existing) != len(incoming):
         return _strip_redacted(incoming)
     out: list[Any] = []

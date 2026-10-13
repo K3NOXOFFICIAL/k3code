@@ -162,5 +162,6 @@ async def test_replay_record_lists_skills_at_the_configured_limit(tmp_path, monk
     server.learning.record_turn_replay(session, [], "done", "main", "interactive_turn", "t1")
     (record,) = server.learning.replays.load()
     prompt = skills_prompt(str(tmp_path), [str(roots)], limit=3)  # what a turn at limit 3 puts in the system prompt
-    listed = [len(line) for line in prompt.splitlines() if line.startswith("- ")]
-    assert record["skill_lines"] == listed and len(listed) < 8
+    # the "- …and N more" footer is no skill: the replay would count it against the limit it is judging
+    listed = [len(line) for line in prompt.splitlines() if line.startswith("- ") and not line.startswith("- …")]
+    assert record["skill_lines"] == listed and len(listed) == 3
