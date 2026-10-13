@@ -26,9 +26,10 @@ def project_root(cwd: str | Path) -> Path:
 
 
 def state_dir(cwd: str | Path) -> Path:
+    from k3code.memory import identity_root
     from k3code.paths import project_state_dir
 
-    return project_state_dir(project_root(cwd))
+    return project_state_dir(identity_root(cwd))
 
 
 def state_path(cwd: str | Path) -> Path:

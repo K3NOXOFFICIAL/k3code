@@ -59,6 +59,32 @@ def project_key(root: str | Path) -> str:
     return re.sub(r"[/:\\]+", "_", str(root)) or "default"
 
 
+def main_checkout(root: str | Path) -> Path | None:
+    """The main checkout of the linked git worktree whose top level is ``root``; None when ``root`` is not one.
+
+    A linked worktree (every fan-out child's) has a ``.git`` *file*, ``gitdir: <repo>/.git/worktrees/<name>``. That
+    directory names the shared git dir in ``commondir`` and records the worktree in ``gitdir``; the three have to
+    agree, so a ``.git`` file that merely points into some repository (a submodule, a copy, a forged one) is not
+    taken for its worktree. Read from those files with no ``git`` process: it runs on every prompt build.
+    """
+    top = Path(root).expanduser().resolve()
+    dotgit = top / ".git"
+    try:
+        if not dotgit.is_file():
+            return None
+        pointer = dotgit.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir:"):
+            return None
+        admin = (top / pointer.removeprefix("gitdir:").strip()).resolve()
+        common = (admin / (admin / "commondir").read_text(encoding="utf-8").strip()).resolve()
+        recorded = (admin / (admin / "gitdir").read_text(encoding="utf-8").strip()).resolve()
+    except (OSError, ValueError):
+        return None
+    if recorded != dotgit or admin.parent != common / "worktrees" or common.name != ".git":
+        return None
+    return common.parent
+
+
 def project_state_dir(root: str | Path) -> Path:
     """Per-project state k3code keeps outside the repository (input history, learned notes)."""
     return home() / "projects" / project_key(root)
