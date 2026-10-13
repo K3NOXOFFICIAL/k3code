@@ -86,7 +86,7 @@ from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
 from k3code.providers import effort as effort_mod
-from k3code.providers import make_providers
+from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
@@ -559,6 +559,8 @@ class GatewayServer:
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
+        self._provider_sigs: list[dict[str, Any]] = []  # provider_signature of the entries self.providers came from
+        self._retiring: dict[int, Any] = {}  # replaced providers not closed yet (id -> provider), see _retire_providers
         self.router: Router | None = None
         self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
         self._running = False
@@ -1234,6 +1236,7 @@ class GatewayServer:
                 except Exception:
                     logger.warning("session %s: stopping its reliability bundle failed", live.session_id, exc_info=True)
         await self.mcp.close()
+        await self._close_retired()
         for p in self.providers:
             await p.aclose()
         self.store.close()
@@ -1405,8 +1408,9 @@ class GatewayServer:
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
         rebuild the whole stack on every alternating turn: new httpx clients, a new cooldown store, a stray temp
-        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; the providers
-        and the cooldown store are rebuilt only when the provider config itself is replaced (/config reload).
+        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; when the provider
+        config itself is replaced (/config reload) only the blocks that changed get a new provider (see
+        ``_swap_providers``).
         """
         key = model or self.config.default_model
         # _router_cfg None: a router injected from outside (tests) is taken as is
@@ -1414,11 +1418,9 @@ class GatewayServer:
         if self.router is not None and self._chain_key == key and current:
             return
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
-            self._retire_providers(self.providers)
-            self.providers = make_providers(self.config.providers)
-            self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
+            self._swap_providers()
             self._router_cache = {}
-            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains of the replaced providers
+            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains with the old model specs
             self._router_cfg = self.config.providers
         tiers = self._router_cache.get(key)
         if tiers is None:
@@ -1429,15 +1431,62 @@ class GatewayServer:
         self.router = tiers.get(Tier.MAIN)
         self._chain_key = key
 
+    def _swap_providers(self) -> None:
+        """Providers for ``config.providers``: a block whose settings did not change keeps its provider.
+
+        A turn keeps the router it started with, and with it these provider objects: closing them under it made its
+        next call fail with "client has been closed", and a claude-cli provider takes its warm processes down. So
+        only a changed or removed block is rebuilt and retired. The cooldown store stays: its keys name the endpoint,
+        and an auth cooldown is tied to the key's fingerprint, so a replaced key does not inherit it.
+        """
+        entries = self.config.providers
+        sigs = [provider_signature(e) for e in entries]
+        spare = list(zip(self._provider_sigs, self.providers, strict=False))
+        fresh: list[Any] = []
+        for entry, sig in zip(entries, sigs, strict=True):
+            hit = next((i for i, (old_sig, _) in enumerate(spare) if old_sig == sig), None)
+            fresh.append(spare.pop(hit)[1] if hit is not None else make_providers([entry])[0])
+        if not fresh:  # K3CODE_FAKE_PROVIDER still gives a chain without entries one scripted provider
+            fresh = make_providers(entries)
+        kept = {id(p) for p in fresh}
+        self._retire_providers([p for p in self.providers if id(p) not in kept])
+        self.providers, self._provider_sigs = fresh, sigs
+
+    #: A replaced provider is closed once no turn is in flight (after PROVIDER_DRAIN_S at most); polled this often.
+    PROVIDER_DRAIN_S = 900.0
+    PROVIDER_DRAIN_POLL_S = 2.0
+
     def _retire_providers(self, providers: list[Any]) -> None:
-        """Close replaced providers in the background (their httpx pools / temp dirs would otherwise wait for GC)."""
-        for p in providers:
-            try:
-                task = asyncio.get_running_loop().create_task(p.aclose())
-            except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+        """Close replaced providers in the background once the turns that may hold them are done.
+
+        Their httpx pools / temp dirs would otherwise wait for GC; but a turn in flight still calls them through the
+        router it started with, so the close waits for the sessions to go quiet (``PROVIDER_DRAIN_S`` at most).
+        """
+        if not providers:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._close_when_drained(providers))
+        except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+            return
+        self._retiring.update({id(p): p for p in providers})
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    async def _close_when_drained(self, providers: list[Any]) -> None:
+        deadline = time.monotonic() + self.PROVIDER_DRAIN_S
+        while not self.stopping and time.monotonic() < deadline and any(s.turn_in_flight for s in self.live.values()):
+            await asyncio.sleep(self.PROVIDER_DRAIN_POLL_S)
+        await self._close_retired(providers)
+
+    async def _close_retired(self, providers: list[Any] | None = None) -> None:
+        """Close retired providers (all of them by default); one that is already closed is skipped."""
+        for p in list(self._retiring.values()) if providers is None else providers:
+            if self._retiring.pop(id(p), None) is None:
                 continue
-            self._side_tasks.add(task)
-            task.add_done_callback(self._side_tasks.discard)
+            try:
+                await p.aclose()
+            except Exception:  # noqa: BLE001 - one provider failing to close must not keep the others open
+                logger.warning("closing retired provider %s failed", getattr(p, "name", "?"), exc_info=True)
 
     _chain_key: str | None = None
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
@@ -2526,6 +2575,10 @@ class GatewayServer:
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
+        if "providers" in changed and fresh.providers == self.config.providers:
+            # Same chain: keep the list, so the providers and routers built from it stay as they are (a turn of
+            # another session may be calling them) instead of being rebuilt by the next turn.
+            changed.discard("providers")
         for key in changed:
             setattr(self.config, key, getattr(fresh, key))
         self._file_keys = keys
