@@ -141,6 +141,65 @@ def test_only_a_tui_build_dir_directly_in_tmpdir_is_removed_with_a_stale_lock(
     assert not lock.exists()
 
 
+# What install.sh records in its lock (<kind>_tmp) for each scratch path it makes in TMPDIR as k3code-<kind>.XXXXXX.
+SCRATCH_FILES = ("giterr", "reqs")
+SCRATCH_KINDS = ("tui", "src", "giterr", "uv", "node", "go", "reqs")
+
+
+def _scratch(tmp: Path, kind: str, name: str = "Ab12Cd") -> Path:
+    path = tmp / f"k3code-{kind}.{name}"
+    if kind in SCRATCH_FILES:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n")
+    else:
+        (path / "sub").mkdir(parents=True)
+    return path
+
+
+@pytest.mark.parametrize("kind", SCRATCH_KINDS)
+def test_a_stale_lock_takes_every_scratch_path_install_sh_recorded(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str, kind: str
+) -> None:
+    # a SIGKILLed install.sh cannot clean up: the checkout it fetched (with node_modules), its git error file, the
+    # downloads for uv, Node and Go all stayed in TMPDIR for good
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{_dead_pid()}\n")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    path = _scratch(tmp_path / "tmp", kind)
+    refs = path.with_name(path.name + ".refs")  # without git, the HTTPS ref list lives next to the git error file
+    if kind == "giterr":
+        refs.write_text("x\n")
+    (lock / f"{kind}_tmp").write_text(f"{path}\n")
+    upd.install_release(_release(monkeypatch, []), None, uv=fake_uv)
+    assert not path.exists() and not refs.exists()
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize(
+    ("recorded", "removed"),
+    [
+        ("tmp/k3code-src.Ab12Cd", True),  # the control: a k3code-src.* directly in TMPDIR goes
+        ("tmp/k3code-tui.Ab12Cd", False),  # another kind's name under this kind's record
+        ("tmp/not-k3code", False),
+        ("tmp/sub/k3code-src.Zz99", False),
+        ("elsewhere/k3code-src.Zz99", False),
+    ],
+)
+def test_only_a_scratch_path_of_the_recorded_kind_directly_in_tmpdir_is_removed(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str, recorded: str, removed: bool
+) -> None:
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{_dead_pid()}\n")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    (tmp_path / recorded).mkdir(parents=True)
+    (lock / "src_tmp").write_text(f"{tmp_path / recorded}\n")
+    upd.install_release(_release(monkeypatch, []), None, uv=fake_uv)
+    assert (tmp_path / recorded).exists() is not removed
+    assert not lock.exists()
+
+
 def test_a_live_pid_that_started_when_the_lock_says_still_refuses(
     data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str
 ) -> None:

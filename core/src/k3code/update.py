@@ -427,8 +427,10 @@ class UnpinnedReleaseError(IntegrityError):
 #: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
 REQUIREMENTS_SUFFIX = "-requirements.txt"
 #: install/install.sh's lock in the install root: a directory holding the pid of the run that owns it (``pid``), when
-#: that process started (``start``, see _process_start) and the TUI build dir install.sh is using (``tui_tmp``).
+#: that process started (``start``, see _process_start) and the temp paths install.sh is using (``<kind>_tmp``, for
+#: each of RECORDED_TMP_KINDS).
 INSTALL_LOCK = ".install.lock"
+RECORDED_TMP_KINDS = ("tui", "src", "giterr", "uv", "node", "go", "reqs")
 
 
 class InstallLockHeld(OSError):
@@ -472,16 +474,25 @@ def _process_start(pid: int) -> str:
     return " ".join(ps.stdout.split())
 
 
-def _remove_recorded_tui_tmp(lock: Path) -> None:
-    """Remove the TUI build dir a killed install.sh recorded in ``lock``. Never an arbitrary path from a lock file:
-    only a ``k3code-tui.*`` directly in the temp dir install.sh uses."""
-    try:
-        recorded = Path((lock / "tui_tmp").read_text().rstrip("\n"))
-    except OSError:
-        return
+def _remove_recorded_tmp(lock: Path) -> None:
+    """Remove the temp paths a killed install.sh recorded in ``lock`` (``<kind>_tmp`` holds the ``k3code-<kind>.*`` it
+    made). Never an arbitrary path from a lock file: only one named for its kind, directly in the temp dir install.sh
+    uses."""
     tmp = Path(os.environ.get("TMPDIR") or "/tmp")
-    if recorded.parent == tmp and recorded.name.startswith("k3code-tui.") and recorded.name != "k3code-tui.":
-        shutil.rmtree(recorded, ignore_errors=True)
+    for kind in RECORDED_TMP_KINDS:
+        try:
+            recorded = Path((lock / f"{kind}_tmp").read_text().rstrip("\n"))
+        except OSError:
+            continue
+        prefix = f"k3code-{kind}."
+        if recorded.parent != tmp or not recorded.name.startswith(prefix) or recorded.name == prefix:
+            continue
+        if recorded.is_dir() and not recorded.is_symlink():
+            shutil.rmtree(recorded, ignore_errors=True)
+        else:
+            recorded.unlink(missing_ok=True)
+        if kind == "giterr":  # the ref list read without git
+            recorded.with_name(recorded.name + ".refs").unlink(missing_ok=True)
 
 
 def _take_over_stale_lock(lock: Path) -> None:
@@ -504,7 +515,7 @@ def _take_over_stale_lock(lock: Path) -> None:
         now = _process_start(pid) if started else ""
         if not now or now == started:
             raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
-    _remove_recorded_tui_tmp(lock)
+    _remove_recorded_tmp(lock)
     # Not atomic, as in install.sh's take_lock: two runs that find the same stale lock can interleave (one removes it
     # and makes its own, the other then removes that one) and both go on; only a run that arrives between the rmtree
     # and the mkdir is stopped, by the mkdir. It takes two installs started within the same few milliseconds over a
@@ -523,7 +534,7 @@ def install_lock() -> Iterator[None]:
     install.sh removes every ``versions/<v>`` without ``.complete`` when it takes over a stale lock, and this build
     removes an unfinished ``versions/<ver>`` itself, so the two must not build at the same time. A lock whose process
     is gone (a killed install or update, also when its pid now names a later process) is taken over, as install.sh
-    does, with the TUI build dir it recorded; a lock with a live pid, or without a pid (an install that is just
+    does, with the temp paths it recorded; a lock with a live pid, or without a pid (an install that is just
     starting), refuses."""
     lock = data_dir() / INSTALL_LOCK
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -874,15 +885,58 @@ def remote_head(url: str, ref: str) -> str:
     )
 
 
+#: The temporary clone update_from_git runs the ref's installer from, and the file in it naming the update that owns it
+#: (its pid, then when that process started, as in the install lock).
+STAGING_PREFIX = ".update-git-"
+STAGING_OWNER = "owner"
+#: How long a staging directory with no readable owner file is left alone: an update between mkdtemp and writing it.
+STAGING_GRACE = 60.0
+
+
+def _staging_dir_is_stale(d: Path) -> bool:
+    """Whether the update that made staging directory ``d`` is gone (a pid now naming another process counts as gone).
+
+    A directory without an owner file (made before the file existed, or by an update killed before writing it) is
+    stale once it is older than STAGING_GRACE."""
+    try:
+        pid_line, _, started = (d / STAGING_OWNER).read_text().partition("\n")
+        pid = int(pid_line)
+    except (OSError, ValueError):
+        try:
+            return time.time() - d.stat().st_mtime > STAGING_GRACE
+        except OSError:
+            return False
+    if not _pid_running(pid):
+        return True
+    started = started.strip()
+    now = _process_start(pid) if started else ""
+    return bool(now) and now != started
+
+
+def _sweep_stale_staging_dirs() -> None:
+    """Remove the ``.update-git-*`` directories that killed updates left in the data dir: SIGKILL skips the ``finally``
+    that removes them, and nothing else ever did."""
+    try:
+        entries = list(data_dir().iterdir())
+    except OSError:
+        return
+    for d in entries:
+        if d.name.startswith(STAGING_PREFIX) and d.is_dir() and not d.is_symlink() and _staging_dir_is_stale(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def update_from_git(url: str, ref: str) -> str:
     """Stage a new version from ``ref`` on ``url`` via that ref's own installer (``--no-activate``); its name.
 
     The installer comes from a shallow fetch of the ref into a temporary directory under the data dir (never
-    ``versions/``, which prune and the version list read), removed again whatever happens. ``--from-git`` (not
-    ``--from-source``) keeps the install a git install: it records ``.ref`` and no checkout path."""
+    ``versions/``, which prune and the version list read), removed again whatever happens (and by the next update
+    when this one is killed outright). ``--from-git`` (not ``--from-source``) keeps the install a git install: it
+    records ``.ref`` and no checkout path."""
     data_dir().mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix=".update-git-", dir=data_dir()))
+    _sweep_stale_staging_dirs()
+    tmp = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=data_dir()))
     try:
+        (tmp / STAGING_OWNER).write_text(f"{os.getpid()}\n{_process_start(os.getpid())}\n")
         src = tmp / "src"
         _git(["-c", "init.defaultBranch=main", "init", "-q", str(src)], LS_REMOTE_TIMEOUT, "git init")
         _git(["-C", str(src), "fetch", "-q", "--depth", "1", url, ref], FETCH_TIMEOUT, f"git fetch {ref} from {url}")
