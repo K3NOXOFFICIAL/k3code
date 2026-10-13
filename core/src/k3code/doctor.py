@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -531,6 +532,46 @@ def check_isolation() -> Check:
     return Check("hermes-isolation", OK, "no Hermes env; k3code reads only its own config and environment")
 
 
+# The libraries a bare Debian/Ubuntu is missing for Chromium's headless shell (seen on a fresh Ubuntu 24.04 WSL), and
+# the apt package that ships each. Any other missing library is left to Playwright, which keeps the full list.
+_CHROMIUM_APT_LIBS = {
+    "libnspr4.so": "libnspr4",
+    "libnss3.so": "libnss3",
+    "libnssutil3.so": "libnss3",
+    "libasound.so.2": "libasound2",
+}
+
+
+def _missing_libraries(binary: Path) -> list[str]:
+    """The shared libraries the loader cannot find for ``binary``, from ldd (the browser itself is not started)."""
+    ldd = shutil.which("ldd")
+    if ldd is None:
+        return []
+    try:
+        r = subprocess.run([ldd, str(binary)], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln.split("=>")[0].strip() for ln in r.stdout.splitlines() if ln.rstrip().endswith("=> not found")]
+
+
+def _apt_package(name: str) -> str:
+    """Ubuntu 24.04 renamed some libraries to ``<name>t64`` (libasound2 among them); older releases keep ``name``."""
+    try:
+        r = subprocess.run(["apt-cache", "show", name + "t64"], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return name
+    return name + "t64" if r.returncode == 0 else name
+
+
+def _libraries_fix(missing: list[str]) -> str:
+    if shutil.which("apt-get") is None:
+        return f"install the packages that provide {', '.join(missing)} with your system package manager"
+    packages = [_CHROMIUM_APT_LIBS.get(lib) for lib in missing]
+    if None in packages:
+        return f"sudo {shlex.quote(sys.executable)} -m playwright install-deps chromium-headless-shell"
+    return "sudo apt-get install -y " + " ".join(_apt_package(p) for p in dict.fromkeys(packages) if p)
+
+
 def check_browser() -> Check:
     """The optional browser tool: Playwright importable and Chromium where presetup puts it (local probe only)."""
     import importlib.util
@@ -562,6 +603,16 @@ def check_browser() -> Check:
                 f"Chromium directory at {location} has no executable browser; the browser tool is off",
                 f"PLAYWRIGHT_BROWSERS_PATH={location} {sys.executable} -m playwright install"
                 " --force --only-shell chromium",
+            )
+        missing = _missing_libraries(binary)
+        if missing:
+            return Check(
+                "browser",
+                WARN,
+                f"Chromium at {location} cannot start: the system libraries {', '.join(missing)} are missing; "
+                "the browser tool is off",
+                _libraries_fix(missing),
+                data={"path": str(location), "exe": str(binary), "missing_libraries": missing},
             )
         return Check(
             "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}

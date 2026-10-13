@@ -1184,13 +1184,37 @@ chromium_present() { # the marker from an earlier run and the browser it names a
   return 1
 }
 
+# A downloaded headless shell can still fail to start: Playwright does not install the system libraries it links
+# (libnss3, libnspr4 and libasound2 are missing on a bare Ubuntu). Start it once; on a failure name what the loader
+# cannot find. The health subset that follows prints the install command. Returns 1 only when it ran and failed.
+chromium_starts() {
+  b=""
+  for f in "$DATA"/browsers/chromium_headless_shell-*/*/chrome-headless-shell "$DATA"/browsers/chromium_headless_shell-*/*/headless_shell; do
+    if [ -x "$f" ]; then
+      b=$f
+      break
+    fi
+  done
+  if [ -z "$b" ]; then return 0; fi # nothing to start (a stub run, or the download is elsewhere)
+  if have timeout; then out=$(timeout 20 "$b" --version 2>&1) && return 0; else out=$("$b" --version 2>&1) && return 0; fi
+  missing=""
+  if have ldd; then missing=$(ldd "$b" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found.*/\1/p' | tr '\n' ' ') || missing=""; fi
+  if [ -n "$missing" ]; then
+    log "presetup: WARNING: Chromium is downloaded but cannot start: missing system libraries: ${missing% }"
+    say "      the browser tool stays off until they are installed (the health check below gives the command)"
+  else
+    log "presetup: WARNING: Chromium is downloaded but failed to run: $(printf '%s\n' "$out" | head -n 1)"
+  fi
+  return 1
+}
+
 presetup_chromium() {
   if [ "${K3CODE_SKIP_CHROMIUM:-0}" = 1 ]; then
     log "presetup: Chromium skipped (K3CODE_SKIP_CHROMIUM=1)"
     return 0
   fi
   if chromium_present; then
-    log "presetup: Chromium already installed in $DATA/browsers"
+    if chromium_starts; then log "presetup: Chromium already installed in $DATA/browsers"; fi
     return 0
   fi
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
@@ -1214,7 +1238,7 @@ presetup_chromium() {
   fi
   mkdir -p "$DATA/presetup"
   printf '%s\n' "$PLAYWRIGHT_VERSION" >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
-  log "presetup: Chromium installed in $DATA/browsers"
+  if chromium_starts; then log "presetup: Chromium installed in $DATA/browsers"; fi
   return 0
 }
 presetup_doctor() {

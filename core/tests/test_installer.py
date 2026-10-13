@@ -604,6 +604,54 @@ def test_chromium_opt_outs_write_no_marker(tmp_path: Path) -> None:
     assert not (minimal / ".local" / "share" / "k3code" / CHROMIUM_MARKER).exists()
 
 
+def _seed_chromium(home: Path, body: str) -> None:
+    """An earlier run's Chromium (its marker and a headless shell that runs ``body``) so presetup only probes it."""
+    data = home / ".local" / "share" / "k3code"
+    (data / CHROMIUM_MARKER).parent.mkdir(parents=True)
+    (data / CHROMIUM_MARKER).write_text("1.63.0\n")
+    shell = data / "browsers" / "chromium_headless_shell-1" / "chrome-headless-shell-linux64" / "chrome-headless-shell"
+    shell.parent.mkdir(parents=True)
+    shell.write_text("#!/bin/sh\n" + body)
+    shell.chmod(0o755)
+
+
+@linux_only
+def test_chromium_that_cannot_start_is_a_warning_that_names_the_libraries(tmp_path: Path) -> None:
+    """#113: the download works but the loader lacks libnspr4 and friends; the install said "Chromium installed" and
+    stayed silent. Now it starts the shell once, names what ldd finds missing, and still exits 0."""
+    _seed_chromium(tmp_path, "echo 'error while loading shared libraries: libnspr4.so' >&2\nexit 127\n")
+    ldd = stub_bin(
+        tmp_path,
+        "ldd",
+        "echo '\tlibc.so.6 => /lib/libc.so.6 (0x1)'\n"
+        "echo '\tlibnspr4.so => not found'\n"
+        "echo '\tlibasound.so.2 => not found'\n",
+    )
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", path_front=ldd)
+    assert r.returncode == 0, r.stderr
+    assert "Chromium is downloaded but cannot start" in r.stderr
+    assert "libnspr4.so libasound.so.2" in r.stderr and "libc.so.6" not in r.stderr.split("cannot start")[1]
+    assert "Chromium already installed" not in r.stderr  # no success line for a browser that cannot run
+
+
+@linux_only
+def test_chromium_that_fails_for_another_reason_is_still_a_warning(tmp_path: Path) -> None:
+    _seed_chromium(tmp_path, "echo 'Illegal instruction' >&2\nexit 132\n")
+    ldd = stub_bin(tmp_path, "ldd", "echo '\tlibc.so.6 => /lib/libc.so.6 (0x1)'\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", path_front=ldd)
+    assert r.returncode == 0, r.stderr
+    assert "Chromium is downloaded but failed to run" in r.stderr and "Illegal instruction" in r.stderr
+
+
+@linux_only
+def test_chromium_that_starts_is_reported_as_installed(tmp_path: Path) -> None:
+    _seed_chromium(tmp_path, "echo 'Google Chrome for Testing 1'\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert "Chromium already installed" in r.stderr
+    assert "cannot start" not in r.stderr and "failed to run" not in r.stderr
+
+
 def test_uninstall_removes_the_chromium_location(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
     data = tmp_path / ".local" / "share" / "k3code"
