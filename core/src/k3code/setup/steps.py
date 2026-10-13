@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from k3code import context_budget, service
+from k3code.config import env_value
 from k3code.gateway.sessions import SessionStore
 from k3code.outputstyle import PRESETS as STYLE_PRESETS
 from k3code.paths import ensure_private_dir, home, private_file
@@ -308,7 +309,7 @@ def step_providers(c: Ctx) -> dict[str, Any]:
         for e in entries:
             if e.get("kind") == "claude-cli":  # no endpoint to list models from
                 continue
-            ok, ms, _ids, detail = probe.list_models(e, os.environ.get(e["api_key_env"], ""))
+            ok, ms, _ids, detail = probe.list_models(e, env_value(e["api_key_env"]))
             c.say(f"  {e['name']}: {'OK' if ok else 'FAIL'} {ms:.0f} ms ({detail})")
             results[e["name"]] = ok
     if entries and all(probe.is_gateway(e) or e["name"] in _GATEWAYS for e in entries):
@@ -333,7 +334,7 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
         answers = {t: _tier_answer(c, t, e["name"]) for t in TIERS}
         # the model list is only there to choose a tier's model from: no live tests, or every tier answered, no call
         live = c.live and not claude_cli and any(a is None for a in answers.values())
-        key = os.environ.get(e.get("api_key_env", ""), "")
+        key = env_value(e.get("api_key_env", ""))  # the shell, then the env file the wizard writes
         ok, _ms, ids, _d = probe.list_models(e, key) if live else (False, 0, [], "")
         tiers: dict[str, str] = {}
         for t in TIERS:
