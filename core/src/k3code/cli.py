@@ -1105,6 +1105,16 @@ def _confirm_item(item: Any) -> bool:
     return click.confirm(f"Apply {item.key}?", default=False)
 
 
+def _answers_prompter(path: Path) -> Any:
+    """The prompter for an answers file; a file that is not valid is a usage error naming it, not a traceback."""
+    from k3code.setup.prompter import AnswerPrompter, AnswersError
+
+    try:
+        return AnswerPrompter.from_file(path)
+    except AnswersError as e:
+        raise click.UsageError(f"{path}: {e}") from None
+
+
 @cli.command("setup")
 @click.option("--step", "step", help="Re-run a single step (welcome, about, system, usage, providers, tiers, ...)")
 @click.option("--non-interactive", is_flag=True, help="Take every answer from --answers")
@@ -1113,17 +1123,19 @@ def _confirm_item(item: Any) -> bool:
 @click.option("--no-probe", is_flag=True, help="Skip live provider/integration tests")
 def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, restart: bool, no_probe: bool) -> None:
     """Guided, resumable first-run setup."""
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter
     from k3code.setup.wizard import run_setup
 
     if non_interactive:
         if answers is None:
             raise click.UsageError("--non-interactive needs --answers FILE")
-        p: Any = AnswerPrompter.from_file(answers)
+        p: Any = _answers_prompter(answers)
     else:
-        p = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+        p = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_setup(p, only_step=step, restart=restart, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
@@ -1139,13 +1151,15 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
 def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
     """Guided first-run setup: fast (API endpoint + key) or full. Run it any time."""
     from k3code.setup.onboard import run_onboarding
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter, Prompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter, Prompter
 
     if answers is None and not _is_interactive():
         raise click.UsageError("`k3code onboard` needs a terminal; pass --answers FILE to run it without prompts")
-    p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    p: Prompter = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_onboarding(p, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):

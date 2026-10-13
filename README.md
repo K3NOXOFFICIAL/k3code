@@ -105,7 +105,7 @@ The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`
 k3code doctor                                    # health checks with fix hints
 k3code setup --step providers                    # re-run one step (any step name above)
 k3code setup --restart                           # ignore saved progress and start over
-k3code setup --non-interactive --answers FILE    # unattended setup (add --no-probe to skip live provider tests)
+k3code setup --non-interactive --answers FILE    # unattended setup (add --no-probe to skip live provider tests; see install/answers.sample.yaml)
 k3code export my.k3bundle                        # settings (secrets and configured key values redacted) and sessions
 k3code import my.k3bundle                        # merge them on another machine (existing config is backed up)
 k3code update --check                            # show the current and latest version
