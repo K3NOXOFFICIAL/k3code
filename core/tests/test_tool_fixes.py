@@ -23,9 +23,11 @@ from k3code.tools.validate import check_arguments, drop_null_options
 async def test_a_command_that_leaves_a_child_running_returns_when_it_exits(tmp_path):
     """`sleep 100 & echo started` waited for the child's pipes and reported a timeout, with the work done."""
     started = time.monotonic()
-    res = await tool_bash({"command": "sleep 100 & echo started", "timeout": 20}, cwd=tmp_path)
+    res = await tool_bash({"command": "sleep 100 & echo started", "timeout": 60}, cwd=tmp_path)
     elapsed = time.monotonic() - started
-    assert elapsed < 6, f"took {elapsed:.1f}s: {res}"  # the result is in the message: this one is host-sensitive
+    # the command returns after the 1 s pipe grace; waiting for the child's pipes would take its 100 s or the 60 s
+    # timeout, so a slow host (seconds) does not fail this and a regression (a minute) does
+    assert elapsed < 30, f"took {elapsed:.1f}s: {res}"
     assert res["exit_code"] == 0 and res["stdout"] == "started\n" and "error" not in res, res
     text = format_tool_result(res)
     assert text.startswith("started") and "background was stopped" in text and "exit code" not in text, text
