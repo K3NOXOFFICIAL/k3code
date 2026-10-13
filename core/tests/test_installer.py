@@ -530,6 +530,47 @@ def test_from_git_branch_falls_back_to_the_installed_build_when_offline(tmp_path
     assert (home / ".local" / "bin" / "k3code").is_symlink()
 
 
+def test_from_source_on_a_commit_installed_from_git_becomes_a_source_install(tmp_path: Path) -> None:
+    # A git build and a source build of one commit share the version name `X.Y.Z-src.<sha>`, so the second run found
+    # the version complete and returned early: `k3code update` still took the install for a git install (.ref kept,
+    # no source_path) and followed the remote branch instead of the checkout.
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "versions" / ver / ".ref").is_file() and not (data / "source_path").exists()
+
+    again = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr  # the early return is the path under test
+    assert (data / "source_path").read_text().strip() == str(src)
+    assert not (data / "versions" / ver / ".ref").exists()
+    assert (data / "current").resolve().name == ver
+
+
+def test_from_git_on_a_commit_installed_from_source_becomes_a_git_install(tmp_path: Path) -> None:
+    # the other direction of the same early return: the source build has no .ref, and the git run removes source_path
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "source_path").is_file() and not (data / "versions" / ver / ".ref").exists()
+
+    again = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr
+    assert (data / "versions" / ver / ".ref").read_text().strip() == branch.stdout.strip()
+    assert not (data / "source_path").exists()
+
+
 def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     assert real_git is not None
