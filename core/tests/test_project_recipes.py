@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -387,3 +388,22 @@ def test_a_workspace_glob_stops_at_the_depth_cap_and_skips_dependency_dirs(tmp_p
     files = {"pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n"}
     files |= _members(["packages/web", "packages/ui/button", f"packages/{deep}", "packages/node_modules/x"])
     assert _node_dirs(make(tmp_path / "repo", files)) == ["packages/ui/button", "packages/web"]
+
+
+def test_a_root_entry_that_denies_stat_does_not_stop_the_scan(tmp_path, monkeypatch):
+    """A Windows drive root seen from WSL (/mnt/c) lists pagefile.sys, and stat on it fails with EACCES. Before
+    Python 3.13 Path.is_dir() re-raises that, so `k3code doctor` died there; the scan skips what it cannot stat
+    (#157)."""
+    from k3code import doctor
+
+    root = make(tmp_path / "c", {"pagefile.sys": "", "app/package.json": json.dumps({"scripts": {"test": "vitest"}})})
+    real_is_dir = Path.is_dir
+
+    def is_dir(self, *args, **kwargs):
+        if self.name == "pagefile.sys":
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    assert _node_dirs(root) == ["app"]
+    assert doctor.check_project(root).status == doctor.OK
