@@ -426,13 +426,15 @@ def check_tui() -> Check:
         return Check("tui", FAIL, "node not found", "install Node.js >= 20")
     major = int(version.lstrip("v").split(".")[0] or 0) if version else 0
     if entry is None or not entry.is_file():
-        return Check(
-            "tui",
-            WARN,
-            f"node {version}, TUI build missing",
-            "cd tui && npm install && npm run build",
-            {"node": version},
+        # An install keeps only tui/dist, so with no sources there is no tui/ to build in. The installer keeps a
+        # version it already built (`version X already installed`), so only an uninstall makes it build again.
+        fix = (
+            "cd tui && npm install && npm run build"
+            if root
+            else "check node 20+ with npm and the network, run `sh install/uninstall.sh` (it keeps your data), then "
+            "`sh install/install.sh` again; re-running the installer alone keeps this version as it is"
         )
+        return Check("tui", WARN, f"node {version}, TUI build missing", fix, {"node": version})
     if major < 20:
         return Check("tui", WARN, f"node {version} is old", "upgrade to Node.js >= 20", {"node": version})
     return Check("tui", OK, f"node {version}, tui/dist/entry.js present", data={"node": version})
