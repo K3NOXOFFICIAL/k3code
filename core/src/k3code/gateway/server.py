@@ -1879,7 +1879,9 @@ class GatewayServer:
                 session_id=session.session_id,
                 router=self._decision_router(decision),
             )
-        loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
+        loop.on_tool_outcome = lambda call, result, failure, **kw: self.learning.tool_outcome(
+            session, call, result, failure, **kw
+        )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
