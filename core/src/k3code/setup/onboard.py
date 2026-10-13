@@ -15,7 +15,7 @@ from typing import Any
 from k3code.paths import home, user_config_path
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
-from k3code.setup.state import env_file_path, read_env_file
+from k3code.setup.state import env_file_path, read_env_file, set_env_var
 from k3code.setup.steps import Ctx, _entry_from, offer_project_recipes, write_config
 from k3code.setup.wizard import run_setup
 
@@ -103,6 +103,20 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
     return pick
 
 
+def _keep_env_key(p: Prompter, env_name: str, value: str) -> None:
+    """A key that exists only in this shell's environment: the daemon's unit and the Windows `wsl sh -lc` commands
+    never see it, so offer it to the 0600 env file (default yes) or say plainly that they will not."""
+    where = env_file_path()
+    if p.confirm("onboard.save_env_key", f"Copy {env_name} into {where} (0600) so the daemon sees it too?", True):
+        set_env_var(env_name, value)
+        p.say(f"  stored {env_name} in {where} (0600)")
+    else:
+        p.say(
+            f"  NOTE: {env_name} stays in this shell only; the daemon and the Windows commands will not see it."
+            f" Add it to {where} to change that."
+        )
+
+
 def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any], str]:
     """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown)."""
     if name == "api":
@@ -125,10 +139,15 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
         "api_key_env": known.get("api_key_env", "K3CODE_API_KEY"),
     }
     env_name = spec["api_key_env"]
-    existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
+    in_file = read_env_file().get(env_name, "")
+    existing = os.environ.get(env_name) or in_file
     key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
     if existing and not key:
-        p.say(f"  using {env_name} from your environment")
+        if in_file:
+            p.say(f"  using {env_name} from {env_file_path()}")
+        else:
+            p.say(f"  using {env_name} from your environment")
+            _keep_env_key(p, env_name, existing)
     elif preset != "local" and not key:
         key = p.text(
             "onboard.key",
