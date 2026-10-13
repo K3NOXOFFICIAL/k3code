@@ -183,16 +183,27 @@ tui_tmp_root() { # the temp dir the TUI build uses, without trailing slashes (ma
   printf '%s\n' "$root"
 }
 
-clean_recorded_tmp() { # clean_recorded_tmp LOCK: the TUI build dir the install that held LOCK recorded (killed mid-build)
-  t=$(cat "$1/tui_tmp" 2>/dev/null || true)
-  name=${t#"$(tui_tmp_root)"/}
-  while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
-  # never follow an arbitrary path from a lock file: only a k3code-tui.* directly in the temp dir this run uses
-  case "$name" in "$t" | */*) return 0 ;; k3code-tui.?*) ;; *) return 0 ;; esac
-  if [ -d "$t" ]; then
-    rm -rf "$t"
-    log "removed the TUI build directory $t that the interrupted install left"
-  fi
+record_tmp() { # record_tmp KIND PATH: a k3code-KIND.* this run made in the temp dir, noted in the lock for a takeover after SIGKILL
+  if [ -n "$LOCK" ]; then printf '%s\n' "$2" >"$LOCK/${1}_tmp"; fi
+}
+
+clean_recorded_tmp() { # clean_recorded_tmp LOCK: what the install that held LOCK recorded of its temp paths (killed mid-run)
+  for kind in tui src giterr uv node go reqs; do # the kinds record_tmp is called with; update.py RECORDED_TMP_KINDS has the same
+    t=$(cat "$1/${kind}_tmp" 2>/dev/null || true)
+    name=${t#"$(tui_tmp_root)"/}
+    while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
+    # never follow an arbitrary path from a lock file: only a k3code-KIND.* directly in the temp dir this run uses
+    case "$name" in "$t" | */*) continue ;; "k3code-$kind".?*) ;; *) continue ;; esac
+    if [ -e "$t" ]; then
+      rm -rf "$t"
+      if [ "$kind" = giterr ]; then rm -f "$t.refs"; fi # the ref list read without git
+      if [ "$kind" = tui ]; then
+        log "removed the TUI build directory $t that the interrupted install left"
+      else
+        log "removed $t, which the interrupted install left"
+      fi
+    fi
+  done
 }
 
 clean_unfinished_versions() { # versions/<v> a killed install left without .complete (never the one current names)
@@ -473,6 +484,7 @@ ensure_uv() {
   base=https://github.com/astral-sh/uv/releases/download/$UV_VERSION
   log "uv is missing: installing uv $UV_VERSION ($target) into $BIN from its release archive (sha256 pinned in this script)"
   UV_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-uv.XXXXXX")
+  record_tmp uv "$UV_TMP"
   if ! { fetch "$base/uv-$target.tar.gz" "$UV_TMP/uv.tar.gz" && fetch "$base/uv-$target.tar.gz.sha256" "$UV_TMP/uv.sha256"; }; then
     die "could not download uv $UV_VERSION (no network?); install uv yourself: $(hint_cmd uv)"
   fi
@@ -546,6 +558,7 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
   if [ "$MUSL" = 1 ] || ! can_fetch; then return 0; fi
   base=https://nodejs.org/dist/latest-v22.x
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-node.XXXXXX")
+  record_tmp node "$t"
   if ! fetch "$base/SHASUMS256.txt" "$t/SHASUMS256.txt"; then
     log "WARNING: could not reach nodejs.org; the TUI is skipped (k3code uses the line REPL)"
     rm -rf "$t"
@@ -589,6 +602,7 @@ ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked again
   gv=$GO_WANT
   name="go$gv.$GO_OS-$GO_ARCH.tar.gz"
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
+  record_tmp go "$t"
   log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary${GO:+ ($GO is older)}"
   want=""
   if fetch "https://go.dev/dl/?mode=json&include=all" "$t/releases.json"; then want=$(go_sha256 "$t/releases.json" "$name"); fi
@@ -854,6 +868,7 @@ acquire_source() {
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
+    record_tmp giterr "$GIT_ERR"
     if [ -z "$REF" ]; then
       if ! pick_default_ref; then
         FROM=source
@@ -874,6 +889,7 @@ acquire_source() {
         ;;
     esac
     TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
+    record_tmp src "$TMP"
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
@@ -921,7 +937,7 @@ build_tui() {
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
     TUI_TMP=$(mktemp -d "$(tui_tmp_root)/k3code-tui.XXXXXX")
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
-    printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
+    record_tmp tui "$TUI_TMP"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
       log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
       return 0
@@ -966,6 +982,7 @@ install_core_copy() {
     return 0
   fi
   REQS=$(mktemp "${TMPDIR:-/tmp}/k3code-reqs.XXXXXX")
+  record_tmp reqs "$REQS"
   "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-emit-project -o "$REQS" >/dev/null ||
     die "could not export the locked runtime dependencies (core/uv.lock is stale?): run 'uv lock' in core/"
   "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --require-hashes -r "$REQS" >&2

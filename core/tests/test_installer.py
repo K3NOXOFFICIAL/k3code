@@ -4,6 +4,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -886,6 +887,88 @@ def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) 
     r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": f"{tmp_path / 'tmp'}/"})
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+
+
+# What install.sh records in its lock (<kind>_tmp) for each scratch path it makes in TMPDIR as k3code-<kind>.XXXXXX.
+SCRATCH_FILES = ("giterr", "reqs")
+SCRATCH_KINDS = ("tui", "src", "giterr", "uv", "node", "go", "reqs")
+
+
+def _stale_lock(tmp_path: Path) -> Path:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    (lock / "pid").write_text(f"{dead}\n")
+    return lock
+
+
+@pytest.mark.parametrize("kind", SCRATCH_KINDS)
+def test_a_stale_lock_takes_every_scratch_path_the_killed_install_recorded(tmp_path: Path, kind: str) -> None:
+    # SIGKILL skips the trap: the checkout fetched into TMPDIR (236 MB with node_modules), its git error file and the
+    # uv, Node and Go downloads stayed there for good, because only the TUI build dir was recorded
+    lock = _stale_lock(tmp_path)
+    path = tmp_path / "tmp" / f"k3code-{kind}.Ab12Cd"
+    path.parent.mkdir()
+    refs = path.with_name(path.name + ".refs")  # without git, the HTTPS ref list lives next to the git error file
+    if kind in SCRATCH_FILES:
+        path.write_text("x\n")
+    else:
+        (path / "sub").mkdir(parents=True)
+    if kind == "giterr":
+        refs.write_text("x\n")
+    (lock / f"{kind}_tmp").write_text(f"{path}\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and re.search(f"removed .*{re.escape(str(path))}", r.stderr)
+    assert not path.exists() and not refs.exists()
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize(
+    ("recorded", "removed"),
+    [
+        ("tmp/k3code-src.Ab12Cd", True),  # the control: a k3code-src.* directly in TMPDIR goes
+        ("tmp/k3code-tui.Ab12Cd", False),  # another kind's name under this kind's record
+        ("tmp/not-k3code", False),
+        ("tmp/sub/k3code-src.Zz99", False),
+        ("elsewhere/k3code-src.Zz99", False),
+    ],
+)
+def test_only_a_scratch_path_of_the_recorded_kind_directly_in_tmpdir_is_removed(
+    tmp_path: Path, recorded: str, removed: bool
+) -> None:
+    lock = _stale_lock(tmp_path)
+    (tmp_path / recorded).mkdir(parents=True)
+    (lock / "src_tmp").write_text(f"{tmp_path / recorded}\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr
+    assert (tmp_path / recorded).exists() is not removed
+
+
+@pytest.mark.parametrize("slash", ["", "/"])  # macOS TMPDIR ends in "/"
+def test_a_sigkilled_from_git_install_leaves_nothing_in_tmpdir_once_the_next_run_took_over(
+    tmp_path: Path, slash: str
+) -> None:
+    src = _source_repo(tmp_path)
+    url = f"file://{src}"
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    env = {"TMPDIR": f"{tmp}{slash}"}
+    # the fetch is where the checkout and the git error file exist and the build has not started: kill the whole
+    # process group there (the stub is in it), so install.sh cannot run its exit trap
+    real = shutil.which("git")
+    killer = stub_bin(tmp_path, "git", f'case "$*" in *" fetch "*) kill -9 0 ;; esac\nexec "{real}" "$@"\n')
+    killed = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env, path_front=killer)
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    left = sorted(p.name.rpartition(".")[0] for p in tmp.iterdir())
+    assert left == ["k3code-giterr", "k3code-src"], left  # the run really was killed with its scratch in place
+    assert (tmp_path / DATA_REL / ".install.lock").is_dir()
+    again = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env)
+    assert again.returncode == 0, again.stderr
+    assert "taking over the install lock" in again.stderr
+    assert list(tmp.iterdir()) == []
+    assert not (tmp_path / DATA_REL / ".install.lock").exists()
 
 
 def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

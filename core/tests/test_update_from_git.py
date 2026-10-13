@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ if [ -n "${K3_STUB_GATE:-}" ]; then # build on only once the test has seen the l
   while [ ! -e "$K3_STUB_GATE" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
   [ -e "$K3_STUB_GATE" ] || { echo "the progress line was not shown while the installer ran" >&2; exit 4; }
 fi
+cp "$(dirname "$0")/../../owner" "$K3_STUB_ARGS.owner" 2>/dev/null || :
 if [ -n "${K3_STUB_FAIL:-}" ]; then
   echo "building the TUI" >&2
   echo "npm ERR! something broke" >&2
@@ -190,6 +192,51 @@ def test_a_failing_progress_display_does_not_stop_the_installer_or_its_later_lin
 
     assert upd.update_from_source(tmp_path, pull=False, progress=progress) == "0.1.0-src.abc"
     assert seen == ["k3code-install: one", "k3code-install: two"]
+
+
+def _dead_pid() -> int:
+    return int(subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout)
+
+
+def _staging_dir(data: Path, name: str, owner: str | None, *, age: float = 0.0) -> Path:
+    """A `.update-git-*` directory as a `k3code update` leaves it when it is SIGKILLed: a clone, an owner when known."""
+    d = data / f".update-git-{name}"
+    (d / "src" / "install").mkdir(parents=True)
+    (d / "src" / "install" / "install.sh").write_text("#!/bin/sh\n")
+    if owner is not None:
+        (d / "owner").write_text(owner)
+    if age:
+        old = time.time() - age
+        os.utime(d, (old, old))
+    return d
+
+
+def test_a_killed_updates_staging_clone_is_removed_by_the_next_update(remote, data, no_release):
+    _install(data, "1234567aaaa")
+    killed = _staging_dir(data, "dead", f"{_dead_pid()}\n{upd._process_start(os.getpid())}\n")
+    reused = _staging_dir(data, "reused", f"{os.getpid()}\n0\n")  # its pid now belongs to this (later) process
+    ownerless = _staging_dir(data, "old", None, age=120)  # from before the owner file, or killed before writing it
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert not killed.exists() and not reused.exists() and not ownerless.exists()
+    assert sorted(p.name for p in data.iterdir()) == ["current", "versions"]
+
+
+def test_a_running_updates_staging_clone_is_left_alone(remote, data, no_release):
+    _install(data, "1234567aaaa")
+    start = upd._process_start(os.getpid())
+    live = _staging_dir(data, "live", f"{os.getpid()}\n{start}\n", age=3600)  # old, but its owner is running
+    fresh = _staging_dir(data, "fresh", None)  # between mkdtemp and the owner file of an update that just started
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert live.is_dir() and fresh.is_dir()
+
+
+def test_a_staging_clone_names_its_owner_while_the_installer_runs(remote, data, no_release):
+    _install(data, "1234567aaaa")
+    assert upd.update_from_git(remote["url"], "main") == STAGED
+    pid, _, start = (remote["logs"] / "args.owner").read_text().partition("\n")
+    assert pid == str(os.getpid()) and start.strip() == upd._process_start(os.getpid())
 
 
 @pytest.mark.parametrize("uid", [0, 1000])
