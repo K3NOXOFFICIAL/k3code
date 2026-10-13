@@ -10,7 +10,7 @@ from pathlib import Path
 from k3code.autonomy.proposals import ProposalStore
 from k3code.learning import review
 from k3code.memory import learned_notes_path, memory_prompt, read_learned
-from k3code.paths import project_key
+from k3code.paths import _flat_key, project_key
 from learn_helpers import FakeCaller
 
 INJECTED = [
@@ -54,10 +54,11 @@ async def test_facts_go_to_k3code_home_and_never_into_repo_files(tmp_path: Path)
     assert learned.is_file()
 
 
-def test_project_key_matches_the_tui_history_key() -> None:
-    # tui/src/lib/history.ts projectHistoryKey: root.replace(/[/:\\]+/g, "_") || "default"
-    assert project_key("/home/dev/src/myapp") == "_home_dev_src_myapp"
-    assert project_key("C:\\work\\myapp") == "C_work_myapp"
+def test_the_flattened_key_is_still_the_tui_history_key() -> None:
+    # tui/src/lib/history.ts projectHistoryKey: root.replace(/[/:\\]+/g, "_") || "default". The TUI keeps its input
+    # history there; project_key no longer is that name, and the old directory is what project_state_dir adopts.
+    assert _flat_key("/home/dev/src/myapp") == "_home_dev_src_myapp"
+    assert _flat_key("C:\\work\\myapp") == "C_work_myapp"
 
 
 def test_facts_are_single_capped_lines_without_headings_links_or_fences() -> None:
