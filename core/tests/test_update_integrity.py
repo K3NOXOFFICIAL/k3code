@@ -129,7 +129,9 @@ def test_rollback_reports_a_daemon_that_does_not_come_back(data: Path) -> None:
     def refuse() -> None:
         raise service.ServiceError("systemctl --user restart k3code.service failed: start-limit-hit")
 
-    res = upd.activate("1.1.0", restart=refuse, daemon_installed=lambda: True, wait=lambda h: True)
+    res = upd.activate(
+        "1.1.0", restart=refuse, daemon_installed=lambda: True, daemon_stopped=lambda: False, wait=lambda h: True
+    )
     assert not res.ok and res.rolled_back and "did not restart" in res.message
     assert upd.current_version() == "1.0.0"
 

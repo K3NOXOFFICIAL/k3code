@@ -27,6 +27,7 @@ DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
 DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
+DAEMON_NOT_STARTED = "daemon not running, not started"
 
 
 def versions_dir() -> Path:
@@ -164,6 +165,15 @@ def daemon_healthy() -> bool:
     return service.active_state() == "active"
 
 
+def daemon_is_stopped() -> bool:
+    """True when systemd says the unit is ``inactive``, which is what ``systemctl --user stop`` leaves.
+
+    A restart would start it, so an update or rollback leaves it alone (``install.sh`` does the same). ``failed`` (it
+    crashed) and ``activating`` (it is waiting out an automatic restart) are not stopped: the restart is what brings
+    them back. Without systemd the answer is no, and ``restart()`` reports that as before."""
+    return service.active_state() == "inactive"
+
+
 def wait_healthy(
     healthy: Callable[[], bool] = daemon_healthy,
     timeout: float = DAEMON_WAIT_SECONDS,
@@ -236,11 +246,14 @@ def activate(
     restart: Callable[[], None] = restart_daemon,
     healthy: Callable[[], bool] = daemon_healthy,
     daemon_installed: Callable[[], bool] = service.is_installed,
+    daemon_stopped: Callable[[], bool] = daemon_is_stopped,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
     carry: Callable[[Path, Path], str | None] = carry_playwright,
 ) -> UpdateResult:
     """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure.
+
+    A daemon that was stopped before the switch stays stopped: the new version is activated and nothing is started.
 
     Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
     package the current one has (before the smoke test, which then runs the venv as it will be used)."""
@@ -254,9 +267,12 @@ def activate(
         if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
             shutil.rmtree(vdir, ignore_errors=True)
         return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
+    stopped = daemon_installed() and daemon_stopped()  # asked before the switch, as the installer asks before its own
     switch_to(version)
     log.append(f"switched current -> {version} (was {prev})")
-    if daemon_installed():
+    if stopped:
+        log.append(DAEMON_NOT_STARTED)
+    elif daemon_installed():
         try:
             restart()
             up = wait(healthy)
@@ -274,18 +290,24 @@ def activate(
                 log.append(f"daemon unhealthy after {DAEMON_WAIT_SECONDS}s; rolled back to {prev}")
                 return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
             return UpdateResult(False, version, "daemon unhealthy and no previous version to roll back to", log=log)
-    warnings = "".join(f"\n{line}" for line in log if line.startswith("warning:"))
-    return UpdateResult(True, version, f"updated to {version}{warnings}", log=log)
+    notes = "".join(f"\n{line}" for line in log if line.startswith("warning:") or line == DAEMON_NOT_STARTED)
+    return UpdateResult(True, version, f"updated to {version}{notes}", log=log)
 
 
 def rollback(
-    *, restart: Callable[[], None] = restart_daemon, daemon_installed: Callable[[], bool] = service.is_installed
+    *,
+    restart: Callable[[], None] = restart_daemon,
+    daemon_installed: Callable[[], bool] = service.is_installed,
+    daemon_stopped: Callable[[], bool] = daemon_is_stopped,
 ) -> UpdateResult:
     prev = previous_version()
     cur = current_version()
     if not prev:
         return UpdateResult(False, cur or "", "no previous version to roll back to")
+    stopped = daemon_installed() and daemon_stopped()
     switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
+    if stopped:
+        return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
     if daemon_installed():
         try:
             restart()
