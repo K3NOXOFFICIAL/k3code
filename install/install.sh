@@ -954,6 +954,12 @@ install_core_copy() {
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
+    # The build is reused, but the ref asked for now is what the install follows: a SHA pins it, a branch or tag does
+    # not (`k3code update` reads .ref). A temp file and a rename, so an interrupted write never leaves a torn .ref.
+    if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then
+      printf '%s\n' "$REF" >"$VERDIR/.ref.new"
+      mv -f "$VERDIR/.ref.new" "$VERDIR/.ref"
+    fi
     return 0
   fi
   log "installing version $VER into $VERDIR"
