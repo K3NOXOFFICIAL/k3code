@@ -3,7 +3,13 @@ question is asked once, and headless or piped runs without a provider print one 
 
 from __future__ import annotations
 
+import json
+import os
+import socket
 import stat
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +22,7 @@ from k3code.cli import cli
 from k3code.config import load_config
 from k3code.paths import user_config_path
 from k3code.setup import onboard as ob
+from k3code.setup import probe
 from k3code.setup import prompter as prompter_mod
 from k3code.setup.prompter import AnswerPrompter
 
@@ -606,3 +613,260 @@ def test_fast_claude_cli_has_no_login_note_when_logged_in_or_unprobed(root, fake
     fake_claude("out")
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])  # --no-probe: claude is not run
     assert r.exit_code == 0 and "not logged in" not in r.output, r.output
+
+
+# --- a live check that rejects the key must not be waved through (#147) ---------------------------------------------
+
+GOOD = "sk-good-" + "7" * 16  # fake keys, built at run time
+BAD = "sk-bad-" + "0" * 16
+REDIRECTS = {
+    "/moved/models": "/v1/models",
+    "/leaky/models": "http://user:" + "pw" * 6 + "@127.0.0.1/v1/models?token=" + "ab" * 8,  # credentials in the target
+}
+
+
+@pytest.fixture
+def endpoint() -> Iterator[str]:
+    """A local OpenAI-style endpoint: /v1/models lists two models for GOOD and answers 401 to any other key;
+    /moved/models redirects to it; everything else is a 404. Yields its base URL (http://127.0.0.1:<port>)."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/v1/models":
+                if self.headers.get("Authorization") == f"Bearer {GOOD}":
+                    body = json.dumps({"data": [{"id": "m-one"}, {"id": "m-two"}]}).encode()
+                    self.send_response(200)
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(401)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+            elif self.path in ("/moved/models", "/leaky/models"):
+                self.send_response(301)
+                self.send_header("location", REDIRECTS[self.path])
+                self.send_header("content-length", "0")
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _closed_port_url() -> str:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    return f"http://127.0.0.1:{port}/v1"
+
+
+def _onboard(root: Path, base_url: str, key: str, model: str | None = None) -> Any:
+    fast: dict[str, Any] = {"mode": "fast", "provider": "api", "endpoint": base_url, "key": key}
+    if model:
+        fast["model"] = model
+    return CliRunner().invoke(cli, ["onboard", "--answers", str(_answers(root, {"onboard": fast}))])
+
+
+def _env_text(root: Path) -> str:
+    path = root / "xdg" / "k3code" / "env"
+    return path.read_text() if path.is_file() else ""
+
+
+@pytest.mark.parametrize("model", [None, "m-given"])
+def test_unattended_onboard_with_a_rejected_key_fails_and_stores_nothing(root, endpoint, model) -> None:
+    r = _onboard(root, f"{endpoint}/v1", BAD, model)
+    assert r.exit_code != 0, r.output
+    assert "K3CODE_ENDPOINT_API_KEY was rejected" in r.output and "HTTP 401" in r.output and "--no-probe" in r.output
+    assert BAD not in r.output
+    assert not user_config_path().exists()
+    assert BAD not in _env_text(root) and "K3CODE_ENDPOINT_API_KEY" not in os.environ
+
+
+def test_a_rejected_key_does_not_replace_the_one_already_stored(root, endpoint) -> None:
+    assert _onboard(root, f"{endpoint}/v1", GOOD).exit_code == 0
+    assert f"K3CODE_ENDPOINT_API_KEY={GOOD}" in _env_text(root)
+    r = _onboard(root, f"{endpoint}/v1", BAD)
+    assert r.exit_code != 0, r.output
+    assert BAD not in _env_text(root) and f"K3CODE_ENDPOINT_API_KEY={GOOD}" in _env_text(root)
+
+
+def test_unattended_onboard_with_an_accepted_key_picks_a_listed_model(root, endpoint) -> None:
+    r = _onboard(root, f"{endpoint}/v1", f"  'K3CODE_API_KEY={GOOD}'  ")  # pasted whole, quoted
+    assert r.exit_code == 0, r.output
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key == GOOD and prov.models == {"default": "m-one"}
+
+
+def test_no_probe_still_stores_whatever_key_it_is_given(root, endpoint) -> None:
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "api", "endpoint": endpoint, "key": BAD}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert f"K3CODE_ENDPOINT_API_KEY={BAD}" in _env_text(root)
+
+
+def test_unattended_onboard_without_a_key_does_not_fail_on_a_401(root, endpoint) -> None:
+    """The key is supplied later (CI injects it at run time): nothing was rejected, so nothing fails."""
+    r = _onboard(root, f"{endpoint}/v1", "")
+    assert r.exit_code == 0, r.output
+    assert "wants a key" in r.output and "rejected" not in r.output
+    assert user_config_path().is_file()
+
+
+@pytest.mark.parametrize(
+    ("path", "hint"),
+    [("/moved", "redirects"), ("/nope", "check the base URL")],
+)
+def test_a_wrong_url_is_told_apart_from_a_bad_key(root, endpoint, path, hint) -> None:
+    r = _onboard(root, f"{endpoint}{path}", GOOD)
+    assert r.exit_code == 0, r.output  # only a rejected key is an error; the config is still written
+    assert hint in r.output and "rejected" not in r.output
+    assert ("redirects to /v1/models" in r.output) == (path == "/moved")  # a redirect names where it leads
+
+
+def test_an_all_capitals_key_with_padding_is_stored_as_given(root) -> None:
+    key = "ABCDEFGH12345678=="
+    r = _onboard(root, _closed_port_url(), key)  # unreachable: the key cannot be checked, so it is saved as typed
+    assert r.exit_code == 0, r.output
+    assert load_config(project_dir=root).providers[0].api_key == key
+
+
+def test_a_redirect_target_is_printed_without_credentials(root, endpoint) -> None:
+    r = _onboard(root, f"{endpoint}/leaky", GOOD)
+    assert r.exit_code == 0, r.output
+    assert "redirects to" in r.output and "pwpw" not in r.output and "abab" not in r.output
+
+
+def test_an_unreachable_endpoint_says_so_and_still_writes_the_config(root) -> None:
+    r = _onboard(root, _closed_port_url(), GOOD)
+    assert r.exit_code == 0, r.output
+    assert "could not be reached" in r.output and "rejected" not in r.output
+    assert load_config(project_dir=root).providers[0].api_key == GOOD
+
+
+class Retrying(Scripted):
+    """Interactive: the keys typed at the re-ask and the answers to the "what now" question come from queues."""
+
+    def __init__(
+        self, answers: dict[str, Any], keys: list[str] | None = None, choices: list[str] | None = None
+    ) -> None:
+        super().__init__(answers)
+        self.keys, self.choices = list(keys or []), list(choices or [])
+        self.said: list[str] = []
+
+    def text(self, key: str, message: str, default: str = "", secret: bool = False) -> str:
+        if key == "onboard.retry_key":
+            self.asked.append(key)
+            return self.keys.pop(0)
+        return super().text(key, message, default, secret)
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        if key == "onboard.probe_failed":
+            self.asked.append(key)
+            return self.choices.pop(0)
+        return super().select(key, message, choices, default)
+
+    def say(self, text: str = "") -> None:
+        self.said.append(text)
+
+
+def _interactive(endpoint: str, key: str, **queues: Any) -> Retrying:
+    fast = {"provider": "api", "endpoint": f"{endpoint}/v1", "key": key}
+    return Retrying({"onboard": fast}, **queues)
+
+
+def test_interactive_onboard_asks_for_the_key_again_and_stores_only_the_one_that_works(
+    root, endpoint, monkeypatch
+) -> None:
+    monkeypatch.setattr(ob, "detect_providers", lambda **_: {})
+    p = _interactive(endpoint, BAD, keys=[f'"{BAD}"', f"Bearer {GOOD}"])
+    ob.run_fast(p)
+    assert p.asked.count("onboard.retry_key") == 2 and "onboard.probe_failed" not in p.asked
+    said = "\n".join(p.said)
+    assert f"{len(BAD)} characters, ends in {BAD[-4:]}" in said and BAD not in said  # enough to spot a typo
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key == GOOD and prov.models == {"default": "m-one"}
+    assert BAD not in _env_text(root)
+
+
+def test_interactive_onboard_gives_up_after_three_rejected_keys(root, endpoint, monkeypatch) -> None:
+    monkeypatch.setattr(ob, "detect_providers", lambda **_: {})
+    p = _interactive(endpoint, BAD, keys=[BAD, BAD], choices=["cancel"])
+    with pytest.raises(KeyboardInterrupt):
+        ob.run_fast(p)
+    assert p.asked.count("onboard.retry_key") == 2  # the first key plus two more is three tries
+    assert not user_config_path().exists() and BAD not in _env_text(root)
+
+
+def test_interactive_save_anyway_after_the_tries_stores_the_key_as_asked(root, endpoint, monkeypatch) -> None:
+    monkeypatch.setattr(ob, "detect_providers", lambda **_: {})
+    p = _interactive(endpoint, BAD, keys=[BAD, BAD], choices=["save anyway"])
+    ob.run_fast(p)
+    assert load_config(project_dir=root).providers[0].api_key == BAD
+
+
+def test_interactive_network_failure_offers_retry_save_or_cancel(root, monkeypatch) -> None:
+    monkeypatch.setattr(ob, "detect_providers", lambda **_: {})
+    p = Retrying(
+        {"onboard": {"provider": "api", "endpoint": _closed_port_url(), "key": GOOD}}, choices=["retry", "save anyway"]
+    )
+    ob.run_fast(p)
+    assert p.asked.count("onboard.probe_failed") == 2
+    assert load_config(project_dir=root).providers[0].api_key == GOOD
+
+
+@pytest.mark.parametrize(
+    ("pasted", "key"),
+    [
+        (f"  {GOOD}\n", GOOD),
+        (f'"{GOOD}"', GOOD),
+        (f"'{GOOD}'", GOOD),
+        (f"K3CODE_API_KEY={GOOD}", GOOD),
+        (f'export ANTHROPIC_API_KEY="{GOOD}"', GOOD),
+        (f"Bearer {GOOD}", GOOD),
+        (f"bearer  {GOOD}", GOOD),
+        ("sk-ant-abc=def", "sk-ant-abc=def"),  # an "=" inside a key is not a NAME= prefix
+        ("sk-" + "A" * 20 + "==", "sk-" + "A" * 20 + "=="),
+        ("ABCD1234=", "ABCD1234="),  # all capitals and digits, padded: still a key, not an empty NAME=
+        ("ABCDEFGH12345678==", "ABCDEFGH12345678=="),
+        ('"ABCD1234="', "ABCD1234="),
+        ("", ""),
+    ],
+)
+def test_clean_key_takes_the_key_out_of_what_was_pasted(pasted, key) -> None:
+    assert ob.clean_key(pasted) == key
+
+
+@pytest.mark.parametrize(
+    ("detail", "kind"),
+    [
+        ("HTTP 401", "auth"),
+        ("HTTP 403", "auth"),
+        ("HTTP 301", "redirect"),
+        ("HTTP 308, redirects to /v1/models", "redirect"),
+        ("HTTP 404", "url"),
+        ("UnsupportedProtocol", "url"),
+        ("ConnectError", "unreachable"),
+        ("ReadTimeout", "unreachable"),
+        ("HTTP 429", "other"),
+        ("HTTP 502", "other"),
+    ],
+)
+def test_probe_failures_are_classified(detail, kind) -> None:
+    assert probe.explain(detail)[0] == kind
+
+
+def test_list_models_names_where_a_redirect_goes(endpoint) -> None:
+    ok, _ms, _ids, detail = probe.list_models({"kind": "openai", "base_url": f"{endpoint}/moved"}, GOOD)
+    assert not ok and detail == "HTTP 301, redirects to /v1/models"

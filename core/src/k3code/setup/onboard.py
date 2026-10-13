@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
 
 from k3code.paths import home, user_config_path
+from k3code.redact import scrub_text
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file
@@ -71,6 +73,9 @@ TIER_MODELS: dict[str, dict[str, str]] = {
     },
     "claude-cli": {"main": CLAUDE_CLI_MODEL, "strong": "opus", "cheap": "haiku", "fast": "haiku"},
 }
+MAX_KEY_TRIES = 3  # keys asked for before a rejected one has to be saved anyway or given up on (#147)
+# `NAME=` counts only with a value after it: "ABCD1234=" and "ABCDEFGH==" are keys (all capitals, padded), not a NAME.
+_PASTED = re.compile(r"^(?:(?i:export)\s+)?(?:[A-Z_][A-Z0-9_]*=(?=[^=\s])|(?i:bearer)\s+)")
 
 
 def detect_providers(*, do_probe: bool = True) -> dict[str, str]:
@@ -130,6 +135,68 @@ def _custom_names(base: str, before: list[Any]) -> tuple[str, str]:
     return name, key_env_at(base, name, before)
 
 
+def clean_key(raw: str) -> str:
+    """The key itself from what was pasted: without quotes, whitespace, `NAME=` / `export NAME=` or `Bearer `."""
+    key = raw.strip().strip("\"'").strip()
+    return _PASTED.sub("", key, count=1).strip().strip("\"'").strip()
+
+
+def _describe(key: str) -> str:
+    """The length of a key and, when it is long enough to hide the rest, its last four characters: to spot a typo."""
+    return f"{len(key)} characters" + (f", ends in {key[-4:]}" if len(key) >= 16 else "")
+
+
+def _check_key(p: Prompter, entry: dict[str, Any], key: str, existing: str) -> tuple[str, list[str]]:
+    """List the endpoint's models with the key before the key is stored. Returns (key to store, model ids).
+
+    A key the endpoint rejects is not stored. Unattended that is an error (`--no-probe` skips the check); interactively
+    the key is asked for again, up to MAX_KEY_TRIES keys in all, then it can be saved anyway or given up on. Another
+    failure (offline, wrong URL, a redirect) is reported and the key kept; interactively it can be retried first.
+    No key at all is not a rejected one: the key may be supplied later (#147)."""
+    env_name, base, tries = entry["api_key_env"], scrub_text(entry["base_url"]), 1
+    while True:
+        sent = key or existing
+        ok, _ms, ids, detail = probe.list_models(entry, sent)
+        if ok:
+            return key, ids
+        kind, hint = probe.explain(detail)
+        if kind == "auth" and not sent:
+            hint = "the endpoint wants a key"
+        if kind == "auth" and sent:
+            if not p.interactive:
+                raise ValueError(
+                    f"{env_name} was rejected by {base} ({detail}); nothing was written. "
+                    "Fix the key, or pass --no-probe to skip this check."
+                )
+            who = f"The key you entered ({_describe(key)})" if key else f"The {env_name} that is already set"
+            p.say(f"  {who} was rejected by {base} ({detail}).")
+            if tries < MAX_KEY_TRIES:
+                tries += 1
+                typed = clean_key(
+                    p.text("onboard.retry_key", "API key again (hidden; blank = stop asking)", "", secret=True)
+                )
+                if typed:
+                    key = typed
+                    continue
+            options = ["save anyway", "cancel"]
+        else:
+            p.say(f"  could not list models ({detail}): {hint}")
+            if not p.interactive or kind == "auth":
+                return key, []
+            options = ["retry", "save anyway", "cancel"]
+        answer = p.select(
+            "onboard.probe_failed",
+            "The key could not be checked. What now?",
+            options,
+            options[0] if "retry" in options else "cancel",
+        )
+        if answer == "cancel":
+            p.say("  Nothing was written.")
+            raise KeyboardInterrupt
+        if answer == "save anyway":
+            return key, []
+
+
 def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> tuple[dict[str, Any], str]:
     """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown).
 
@@ -154,7 +221,7 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
     env_name = spec["api_key_env"]
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
     where = "your environment" if os.environ.get(env_name) else f"the env file {env_file_path()}"
-    key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
+    key = clean_key(str(p.raw("onboard.key", "") or "")) if not p.interactive else ""
     question = f"Keep the {env_name} key from {where}?"
     shared = env_name == "K3CODE_API_KEY"  # every endpoint used to share it, so its key may be another vendor's (#114)
     if shared:
@@ -168,7 +235,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
             f"API key (hidden; stored 0600 in {env_file_path()}; blank = set {env_name} yourself)",
             "",
             secret=True,
-        ).strip()
+        )
+        key = clean_key(key)
     # Declined and nothing typed: the key in that variable is not this endpoint's, so it is not used for it.
     declined = bool(existing) and not kept and not key
     if declined:
@@ -176,8 +244,7 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
         if preset == "custom":  # a variable of its own; a vendor preset's variable is fixed and keeps its key
             taken = {str(e.get("api_key_env") or "") for e in before if isinstance(e, dict)}
             spec["api_key_env"] = env_name = key_env_for(spec["name"], taken | set(os.environ) | set(read_env_file()))
-    if key:
-        spec["api_key"] = key
+    # The key is not in spec yet: it is stored once the endpoint has accepted it (or could not say).
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
     if entry is None:  # only the interactive branch of _entry_from returns None
         raise ValueError("no provider entry was built")
@@ -189,12 +256,11 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 
     ids: list[str] = []
+    if do_probe and not declined:  # a declined key is not this endpoint's: nothing to check, and none is sent
+        key, ids = _check_key(p, entry, key, existing)
+    if key:
+        _entry_from(Ctx(p=p, data={}), 0, "primary", {**spec, "api_key": key})  # the same entry, now storing the key
     answered = p.raw("onboard.model", None) if not p.interactive else None
-    if do_probe and not answered and not declined:
-        ok, _ms, ids, detail = probe.list_models(entry, key or existing or os.environ.get(env_name, ""))
-        if not ok:
-            p.say(f"  could not list models ({detail}); check the key and URL with `k3code doctor`")
-            ids = []
     model = str(answered).strip() if answered else _pick_model(p, preset, ids)
     if model:
         p.say(f"  model: {model}")
