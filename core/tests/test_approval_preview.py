@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from k3code.providers.types import ToolCall
 from k3code.tools import preview as preview_mod
 from k3code.tools import tool_edit
 from k3code.tools.preview import MAX_LINES, change_preview
+from test_permissions_gateway import call, make_server, run_turn
 
 
 def test_an_edit_preview_is_the_unified_diff_the_edit_will_make(tmp_path: Path) -> None:
@@ -81,3 +83,32 @@ async def test_the_gateway_puts_the_preview_into_the_approval_request(tmp_path: 
     text = await _change_preview("write", {"path": "a.txt", "content": "new\n"}, tmp_path)
     assert text is not None and "+new" in text.splitlines()
     assert await _change_preview("bash", {"command": "ls"}, tmp_path) is None
+
+
+def _write_a_txt() -> ToolCall:
+    return ToolCall(id="w", name="write", arguments={"path": "a.txt", "content": "new\n"})
+
+
+async def test_the_approval_frame_carries_the_preview(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "a.txt").write_text("old\n")
+    server, _ = make_server(tmp_path, [_write_a_txt(), "ok"], monkeypatch)  # default mode: a write asks
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "once"}])
+    assert len(seen) == 1 and seen[0]["params"]["command"] == "write a.txt"
+    assert seen[0]["params"]["preview"].splitlines() == ["--- a/a.txt", "+++ b/a.txt", "@@ -1 +1 @@", "-old", "+new"]
+    assert (tmp_path / "a.txt").read_text() == "new\n"
+
+
+async def test_a_preview_that_fails_never_blocks_the_prompt(tmp_path: Path, monkeypatch) -> None:
+    def broken(*args, **kwargs):
+        raise RuntimeError("preview exploded")
+
+    monkeypatch.setattr(preview_mod, "change_preview", broken)
+    (tmp_path / "a.txt").write_text("old\n")
+    server, _ = make_server(tmp_path, [_write_a_txt(), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "once"}])
+    # the person is still asked, just without a diff, and their answer still applies
+    assert len(seen) == 1 and seen[0]["params"]["command"] == "write a.txt"
+    assert "preview" not in seen[0]["params"]
+    assert (tmp_path / "a.txt").read_text() == "new\n"
