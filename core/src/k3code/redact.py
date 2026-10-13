@@ -1,7 +1,7 @@
 """Secret redaction for exported config/sessions.
 
-A value is replaced by ``"<redacted>"`` when its key matches ``key|token|secret|password``
-(env-var *names* such as ``api_key_env`` are kept; numbers/bools are never secrets) or when
+A value is replaced by ``"<redacted>"`` when its key names a secret (``api_key``, ``token``, ``secret``, ``password``;
+env-var *names* such as ``api_key_env`` are kept; numbers/bools are never secrets) or when
 the value itself looks like a credential (known prefixes, JWTs, bearer headers, URL userinfo,
 long opaque tokens).
 """
@@ -14,7 +14,10 @@ from urllib.parse import unquote
 
 REDACTED = "<redacted>"
 
-_KEY_RE = re.compile(r"key|token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-z])auth(?![a-z])", re.I)
+_KEY_RE = re.compile(r"token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-z])auth(?![a-z])", re.I)
+#: ``key`` names a secret as a word or the end of one (``api_key``, ``apiKey``, ``ssh_keys``), not inside another word
+#: (``keymap``, ``keyboard``). Case-sensitive: a capital after ``Key`` starts the next word.
+_KEY_WORD_RE = re.compile(r"(?:key|Key)s?(?![a-z])|KEYS?(?![A-Z])")
 #: Config sections whose every value is a secret by default (MCP server environments and request headers).
 _SECRET_SECTIONS = frozenset({"env", "environment", "headers"})
 _PREFIXED = re.compile(
@@ -31,7 +34,7 @@ def is_secret_key(key: str) -> bool:
     k = str(key)
     if k.lower().endswith("_env") or k.lower() in ("api_key_env", "env_var"):
         return False  # names of env vars, not secrets
-    return bool(_KEY_RE.search(k))
+    return bool(_KEY_RE.search(k) or _KEY_WORD_RE.search(k))
 
 
 def looks_like_secret(value: str) -> bool:
