@@ -238,14 +238,15 @@ class PlanFirst:
 
         perms = PermissionState(mode=PermissionMode.PLAN, cwd=session.perms.cwd, add_dirs=list(session.perms.add_dirs))
         # The same composed prompt as the session's normal loop (project memory, facts, gotchas, style, overlay), so
-        # the plan follows the rules the execution turn runs under. No skills index or MCP names: this loop has
-        # neither tool.
+        # the plan follows the rules the execution turn runs under. No skills index, MCP names or advisor note: this
+        # loop has none of those tools.
         base = build_system_prompt(
             session.system_prompt,
             cwd=session.perms.cwd,
             config=server.config,
             session_meta=session.stored.meta,
             skills=False,
+            advisor=False,
         )
         loop = AgentLoop(
             router,

@@ -205,6 +205,19 @@ async def test_planner_sees_the_project_memory_the_executor_sees(tmp_path, monke
     assert "skill" not in planner_call["tools"] and "skill" in main_call["tools"]
 
 
+async def test_planner_is_not_told_about_an_advisor_tool_it_does_not_have(tmp_path, monkeypatch):
+    """With /advisor on, the prompt names the ``advisor`` tool. Only the normal loop registers it; the planner must not
+    be told to consult a tool it cannot call."""
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    main_call = next(c for p in server.providers for c in p.log if c["model"] == "m-main")
+    assert "advisor" in main_call["tools"] and "advisor` tool" in main_call["text"]  # the control: the normal loop
+    assert "advisor" not in planner_call["tools"] and "advisor` tool" not in planner_call["text"]
+
+
 async def test_high_risk_in_auto_requires_approval(tmp_path, monkeypatch):
     steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *EXECUTOR]
     server = make(tmp_path, monkeypatch, steps)

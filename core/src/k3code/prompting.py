@@ -31,6 +31,7 @@ def build_system_prompt(
     session_meta: dict[str, Any] | None = None,
     mcp: Any = None,
     skills: bool = True,
+    advisor: bool = True,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
@@ -42,7 +43,7 @@ def build_system_prompt(
     from k3code.autonomy import advisor as _advisor
     from k3code.autonomy import autonomy_cfg
 
-    if _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the `advisor` tool exists
+    if advisor and _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the tool exists
         parts.append(_advisor.PROMPT_NOTE)
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
     if skills and (
