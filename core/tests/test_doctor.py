@@ -349,3 +349,22 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     left = CooldownStore(path=path)
     assert left.reason_of(provider="good", model="m") is None
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
+
+
+async def test_claude_cli_on_path_but_not_logged_in_is_a_warning(fake_claude):
+    """`claude` being on PATH made doctor green; the first turn then failed 401 (issue #146)."""
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    cfg = Settings(providers=[ProviderEntry(name="claude-cli", kind="claude-cli")])
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+    assert row.status == doctor.WARN and "not logged in" in row.detail
+    assert "`claude`" in row.fix and "/login" in row.fix
+    for state in ("in", "old"):  # logged in, or a Claude Code that cannot say: no complaint
+        fake_claude(state)
+        row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+        assert row.status == doctor.OK and "Claude Code CLI at" in row.detail, state
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg, probe=False) if c.name == "provider:claude-cli")
+    assert row.status == doctor.OK  # --no-probe: claude is not run

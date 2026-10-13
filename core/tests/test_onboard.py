@@ -348,7 +348,7 @@ class _Menus(Scripted):
 def test_fast_model_menu_lists_current_chat_models_first(root, monkeypatch) -> None:
     """#122: the menu was the first 15 ids alphabetically ('01-ai/yi-large', ...) with '(type one)' last."""
     _serve_models(monkeypatch, LONG_LIST)
-    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    monkeypatch.setattr(ob, "detect_providers", lambda **_kw: {})
     p = _Menus({"onboard": {"mode": "fast", "provider": "openrouter", "key": "k"}})
     ob.run_fast(p)
     choices, default = p.menus["onboard.model"]
@@ -569,7 +569,7 @@ def _interactive(endpoint: str, key: str, **queues: Any) -> Retrying:
 def test_interactive_onboard_asks_for_the_key_again_and_stores_only_the_one_that_works(
     root, endpoint, monkeypatch
 ) -> None:
-    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    monkeypatch.setattr(ob, "detect_providers", lambda **_kw: {})
     p = _interactive(endpoint, BAD, keys=[f'"{BAD}"', f"Bearer {GOOD}"])
     ob.run_fast(p)
     assert p.asked.count("onboard.retry_key") == 2 and "onboard.probe_failed" not in p.asked
@@ -581,7 +581,7 @@ def test_interactive_onboard_asks_for_the_key_again_and_stores_only_the_one_that
 
 
 def test_interactive_onboard_gives_up_after_three_rejected_keys(root, endpoint, monkeypatch) -> None:
-    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    monkeypatch.setattr(ob, "detect_providers", lambda **_kw: {})
     p = _interactive(endpoint, BAD, keys=[BAD, BAD], choices=["cancel"])
     with pytest.raises(KeyboardInterrupt):
         ob.run_fast(p)
@@ -590,14 +590,14 @@ def test_interactive_onboard_gives_up_after_three_rejected_keys(root, endpoint, 
 
 
 def test_interactive_save_anyway_after_the_tries_stores_the_key_as_asked(root, endpoint, monkeypatch) -> None:
-    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    monkeypatch.setattr(ob, "detect_providers", lambda **_kw: {})
     p = _interactive(endpoint, BAD, keys=[BAD, BAD], choices=["save anyway"])
     ob.run_fast(p)
     assert load_config(project_dir=root).providers[0].api_key == BAD
 
 
 def test_interactive_network_failure_offers_retry_save_or_cancel(root, monkeypatch) -> None:
-    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    monkeypatch.setattr(ob, "detect_providers", lambda **_kw: {})
     p = Retrying(
         {"onboard": {"provider": "api", "endpoint": _closed_port_url(), "key": GOOD}}, choices=["retry", "save anyway"]
     )
@@ -650,3 +650,34 @@ def test_probe_failures_are_classified(detail, kind) -> None:
 def test_list_models_names_where_a_redirect_goes(endpoint) -> None:
     ok, _ms, _ids, detail = probe.list_models({"kind": "openai", "base_url": f"{endpoint}/moved"}, GOOD)
     assert not ok and detail == "HTTP 301, redirects to /v1/models"
+
+
+def test_detect_offers_claude_cli_only_while_claude_is_logged_in(root, monkeypatch, fake_claude) -> None:
+    """`claude` on PATH is not a login: a logged-out one is not "found", an unknown state counts as before."""
+    monkeypatch.setattr(ob.probe, "probe_url", lambda *a, **k: (False, 0.0, "down"))
+    fake_claude("in")
+    assert "logged in" in ob.detect_providers()["claude-cli"]
+    fake_claude("out")
+    assert "claude-cli" not in ob.detect_providers()
+    fake_claude("old")  # a Claude Code without `auth status`: cannot tell
+    assert "claude-cli" in ob.detect_providers()
+
+
+def test_fast_claude_cli_says_when_claude_is_not_logged_in(root, fake_claude) -> None:
+    """The unattended default (`claude` exists, no onboard.provider) used to end with a plain "Ready"."""
+    fake_claude("out")
+    answers = _answers(root, {"onboard": {"mode": "fast"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers)])
+    assert r.exit_code == 0, r.output
+    assert "not logged in" in r.output and "`claude`" in r.output and "/login" in r.output
+    assert [(p.name, p.kind) for p in load_config(project_dir=root).providers] == [("claude-cli", "claude-cli")]
+
+
+def test_fast_claude_cli_has_no_login_note_when_logged_in_or_unprobed(root, fake_claude) -> None:
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "claude-cli"}})
+    fake_claude("in")
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers)])
+    assert r.exit_code == 0 and "not logged in" not in r.output, r.output
+    fake_claude("out")
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])  # --no-probe: claude is not run
+    assert r.exit_code == 0 and "not logged in" not in r.output, r.output

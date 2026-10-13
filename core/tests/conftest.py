@@ -237,6 +237,59 @@ def _descendants(root: int) -> list[int]:
     return out
 
 
+@pytest.fixture(autouse=True)
+def _no_real_claude_login(monkeypatch):
+    """Setup and doctor must not run the developer's own `claude auth status` from tests: the login is unknown.
+
+    Returns the real probe, for the tests that run it against the `fake_claude` shim."""
+    from k3code.providers import claude_cli
+
+    real = claude_cli.login_status
+    monkeypatch.setattr(claude_cli, "login_status", lambda *args, **kwargs: None)
+    return real
+
+
+@pytest.fixture
+def fake_claude(tmp_path, monkeypatch, _no_real_claude_login):
+    """A `claude` on PATH that answers `auth status` like Claude Code 2.1 does; ``fake_claude(state)`` picks the answer.
+
+    ``in`` / ``out``: the JSON with loggedIn true / false. ``old``: a Claude Code without `auth` (error, no JSON).
+    ``garbage``: output that is not JSON. ``hang``: never answers. Also restores the real login probe."""
+    import stat
+    import sys
+
+    from k3code.providers import claude_cli
+
+    shim = tmp_path / "fakebin" / "claude"
+    shim.parent.mkdir()
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys, time\n"
+        "if sys.argv[1:3] != ['auth', 'status']:\n"
+        "    sys.exit(2)\n"
+        "mode = os.environ.get('FAKE_CLAUDE_AUTH', 'in')\n"
+        "if mode == 'hang':\n"
+        "    time.sleep(60)\n"
+        "if mode == 'old':\n"
+        "    sys.stderr.write(\"error: unknown command 'auth'\\n\")\n"
+        "    sys.exit(1)\n"
+        "if mode == 'garbage':\n"
+        "    print('please run /login')\n"
+        "    sys.exit(0)\n"
+        "print(json.dumps({'loggedIn': mode == 'in', 'authMethod': 'claude.ai' if mode == 'in' else 'none'}))\n"
+        "sys.exit(0 if mode == 'in' else 1)\n"
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(claude_cli, "login_status", _no_real_claude_login)
+
+    def choose(state: str = "in") -> None:
+        monkeypatch.setenv("FAKE_CLAUDE_AUTH", state)
+
+    choose("in")
+    return choose
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _reap_child_processes():
     """Kill every process the suite spawned (MCP stdio servers, daemons, shells) at session end.
