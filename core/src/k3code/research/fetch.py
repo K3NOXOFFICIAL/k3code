@@ -115,7 +115,8 @@ class WebFetcher:
         # created on first use, inside the running loop: a client made at import or in __init__ would be bound to the
         # wrong event loop once pytest (or a restarted gateway) runs another one
         if self._client is None or self._client.is_closed:
-            # the guarded transport connects to the address it vetted (net_guard: DNS rebinding)
+            # the guarded transport connects to the address it vetted (net_guard: DNS rebinding); with a transport of
+            # its own the client ignores HTTP(S)_PROXY/ALL_PROXY, as intended: a proxy would resolve the name again
             transport = None if self.allow_private else GuardedTransport(self.allow_origins)
             self._client = httpx.AsyncClient(
                 follow_redirects=False, timeout=self.deadline, headers=HEADERS, transport=transport
