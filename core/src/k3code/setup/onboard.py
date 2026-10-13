@@ -63,7 +63,6 @@ TIER_MODELS: dict[str, dict[str, str]] = {
     },
     "claude-cli": {"main": CLAUDE_CLI_MODEL, "strong": "opus", "cheap": "haiku", "fast": "haiku"},
 }
-MAX_MODEL_CHOICES = 15
 
 
 def detect_providers() -> dict[str, str]:
@@ -96,8 +95,8 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
         return p.text("onboard.model", "Model id for everyday work (blank = set it later)", "").strip()
     if not p.interactive:
         return str(p.raw("onboard.model", ids[0]))
-    shown = ids[:MAX_MODEL_CHOICES]
-    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", [*shown, "(type one)"])
+    shown = ids[: probe.MAX_MODEL_CHOICES]
+    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", ["(type one)", *shown], ids[0])
     if pick == "(type one)":
         return p.text("onboard.model.custom", "Model id", "").strip()
     return pick

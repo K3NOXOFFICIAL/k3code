@@ -265,3 +265,106 @@ def test_onboard_clears_auth_cooldowns_for_the_rewritten_provider(root) -> None:
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
     assert r.exit_code == 0, r.output
     assert CooldownStore(path=path).reason_of(provider="endpoint", model="m-fast") is None
+
+
+class _ModelList:
+    """A ``GET /models`` answer."""
+
+    status_code = 200
+
+    def __init__(self, data: list[dict[str, Any]]) -> None:
+        self.data = data
+
+    def json(self) -> dict[str, Any]:
+        return {"data": self.data}
+
+
+def _serve_models(monkeypatch: pytest.MonkeyPatch, data: list[dict[str, Any]]) -> None:
+    monkeypatch.setattr(ob.probe.httpx, "get", lambda *_a, **_kw: _ModelList(data))
+
+
+# OpenRouter-like: 31 lab ids that sort before the big families and were listed after them, plus non-chat ids.
+LONG_LIST: list[dict[str, Any]] = [
+    *({"id": f"01-lab/m-{n:02d}", "created": 1_760_000_000 + n} for n in range(30)),
+    {"id": "aetherwings/mn-star", "created": 1_760_100_000},
+    {"id": "openai/gpt-4o", "created": 1_715_000_000},
+    {"id": "openai/gpt-5", "created": 1_754_000_000},
+    {"id": "anthropic/claude-sonnet-4.5", "created": 1_759_000_000},
+    {"id": "google/gemini-2.5-pro", "created": 1_750_000_000},
+    {"id": "openai/gpt-4o-mini-tts", "created": 1_759_900_000},
+    {"id": "openai/text-embedding-3-small", "created": 1_759_500_000},
+]
+
+
+def test_unattended_onboard_never_picks_a_non_chat_model_from_the_endpoint_list(root, monkeypatch) -> None:
+    """#121: with no onboard.model, the default model was the alphabetically first id, babbage-002."""
+    _serve_models(monkeypatch, [{"id": i} for i in ("text-embedding-3-small", "gpt-5", "babbage-002", "whisper-1")])
+    answers = _answers(
+        root, {"onboard": {"mode": "fast", "provider": "api", "endpoint": "http://127.0.0.1:9/v1", "key": "k"}}
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers)])
+    assert r.exit_code == 0, r.output
+    assert "default model gpt-5." in r.output
+    assert load_config(project_dir=root).providers[0].models == {"default": "gpt-5"}
+
+
+class _Menus(Scripted):
+    """Scripted, and keeps each menu it showed with the entry it preselected."""
+
+    def __init__(self, answers: dict[str, Any]) -> None:
+        super().__init__(answers)
+        self.menus: dict[str, tuple[list[str], str | None]] = {}
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        self.menus[key] = (choices, default)
+        return super().select(key, message, choices, default)
+
+
+def test_fast_model_menu_lists_current_chat_models_first(root, monkeypatch) -> None:
+    """#122: the menu was the first 15 ids alphabetically ('01-ai/yi-large', ...) with '(type one)' last."""
+    _serve_models(monkeypatch, LONG_LIST)
+    monkeypatch.setattr(ob, "detect_providers", lambda: {})
+    p = _Menus({"onboard": {"mode": "fast", "provider": "openrouter", "key": "k"}})
+    ob.run_fast(p)
+    choices, default = p.menus["onboard.model"]
+    assert choices[:5] == [
+        "(type one)",
+        "anthropic/claude-sonnet-4.5",
+        "openai/gpt-5",
+        "google/gemini-2.5-pro",
+        "openai/gpt-4o",
+    ]
+    assert choices[5] == "aetherwings/mn-star"  # then everything else, newest first
+    assert len(choices) == ob.probe.MAX_MODEL_CHOICES + 1
+    assert not {"openai/gpt-4o-mini-tts", "openai/text-embedding-3-small"} & set(choices)
+    assert default == "anthropic/claude-sonnet-4.5"
+    assert load_config(project_dir=root).providers[0].models == {"default": "anthropic/claude-sonnet-4.5"}
+
+
+def test_rank_models_leaves_out_only_non_chat_ids() -> None:
+    non_chat = [
+        "text-embedding-3-small",
+        "nomic-embed-text:latest",
+        "whisper-1",
+        "tts-1-hd",
+        "gpt-4o-mini-tts",
+        "gpt-4o-transcribe",
+        "gpt-4o-audio-preview",
+        "gpt-realtime",
+        "dall-e-3",
+        "gpt-image-1",
+        "sora-2",
+        "omni-moderation-latest",
+        "bge-reranker-v2",
+        "babbage-002",
+        "davinci-002",
+        "gpt-3.5-turbo-instruct",
+    ]
+    chat = ["mattsmodel:7b", "gpt-5", "meta-llama/llama-3.1-8b-instruct", "soraya/chat-7b", "claude-sonnet-4.5"]
+    assert ob.probe.rank_models([{"id": i} for i in [*non_chat, *chat]]) == [
+        "claude-sonnet-4.5",
+        "gpt-5",
+        "mattsmodel:7b",
+        "meta-llama/llama-3.1-8b-instruct",
+        "soraya/chat-7b",
+    ]
