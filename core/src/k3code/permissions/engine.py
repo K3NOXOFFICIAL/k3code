@@ -9,6 +9,7 @@ except hardline and the edits of protected files, see :func:`protected_path`, wh
 from __future__ import annotations
 
 import fnmatch
+import functools
 import glob
 import os
 import re
@@ -858,6 +859,11 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
+    if is_edit and dec.action != "deny" and secret_store(path):
+        # write/edit run in the daemon, outside the sandbox: ~/.ssh/authorized_keys or a file in a Windows profile's
+        # AppData (its Startup folder) is changed only when a person says so; yolo still allows it (issue #134)
+        dec.action, dec.needs_human = "ask", True
+        dec.message = f"Writes into a key or credential store; confirm it yourself: {path}"
     return dec
 
 
@@ -876,18 +882,72 @@ def _secret_dirs() -> list[str]:
     return dirs
 
 
+#: Entries of a Windows profile (``<drive>/Users/<name>``) that hold keys or credentials: the ssh/cloud/gpg folders,
+#: AppData (browser credential stores, the Startup folder) and the registry hive files ``NTUSER.DAT*``. Lower case.
+_WINDOWS_PROFILE_SECRETS = (".ssh", ".aws", ".gnupg", "appdata")
+
+
+def windows_drives(mounts: str | None = None) -> list[str]:
+    """Mount points (lower case) of the Windows drives WSL mounts (drvfs; ``9p`` with ``aname=drvfs`` on WSL 2), read
+    from ``/proc/mounts`` or ``mounts``. Empty elsewhere."""
+    if mounts is None:
+        return list(_mounted_windows_drives())
+    out: list[str] = []
+    for line in mounts.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and (fields[2] == "drvfs" or (fields[2] == "9p" and "aname=drvfs" in fields[3])):
+            out.append(fields[1].replace("\\040", " ").rstrip("/").lower() or "/")
+    return out
+
+
+@functools.cache
+def _mounted_windows_drives() -> tuple[str, ...]:
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            return tuple(windows_drives(f.read()))
+    except OSError:
+        return ()
+
+
+def windows_profile_secret(path: str, drives: list[str] | None = None) -> bool:
+    """``path`` (absolute) is a credential location in a Windows profile that WSL mounts: ``/mnt/c/Users/<name>/.ssh``,
+    ``.aws``, ``.gnupg``, ``AppData`` or ``NTUSER.DAT*`` (case-insensitive, as drvfs is). A session started in
+    ``C:\\Users\\<name>`` has all of them inside its project root (issue #134)."""
+    folded = path.lower()
+    for drive in windows_drives() if drives is None else drives:
+        prefix = drive.rstrip("/") + "/users/"
+        if folded.startswith(prefix):
+            parts = folded[len(prefix) :].split("/")
+            if len(parts) >= 2 and (parts[1] in _WINDOWS_PROFILE_SECRETS or parts[1].startswith("ntuser.dat")):
+                return True
+    return False
+
+
 def sensitive_path(path: str) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
-    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks), and
+    (``/proc/*/environ``), a dotenv file, or the keys and credential stores of a Windows profile WSL mounts (see
+    :func:`windows_profile_secret`). Checked on the path as written and on its realpath (symlinks), and
     case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files."""
+    if secret_store(path):
+        return True
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        if _dotenv_name(os.path.basename(p)):
+            return True
+    return False
+
+
+def secret_store(path: str) -> bool:
+    """``path`` (absolute) is in a key or credential store (``sensitive_path`` without the dotenv files): the secret
+    dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
+    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
     dirs = [os.path.normpath(d) for d in _secret_dirs()]
     dirs = [d.lower() for d in dict.fromkeys(dirs + [os.path.realpath(d) for d in dirs])]
     for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
         folded = p.lower()
         if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in dirs):
             return True
-        if _dotenv_name(os.path.basename(p)):
+        if windows_profile_secret(p):
             return True
     return False
 

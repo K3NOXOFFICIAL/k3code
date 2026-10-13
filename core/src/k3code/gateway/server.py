@@ -113,6 +113,7 @@ from k3code.routing.tiers import (
 )
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
+from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import FileStamps, clip_for_model, register_todo
 from k3code.tools import build_registry as build_tool_registry
@@ -286,6 +287,8 @@ class LiveSession:
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
+        #: the "no sandbox" notice is showing (auto/yolo bash without a usable bwrap); cleared when the mode leaves them
+        self.unsandboxed_notice = False
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -353,6 +356,32 @@ class LiveSession:
         self.stored.meta["mode"] = mode.value
         self.server.store.save(self.stored)
         self.emit("session.info", self.live_info())
+        if self.unsandboxed_notice and mode not in (PermissionMode.AUTO, PermissionMode.YOLO):
+            self.unsandboxed_notice = False
+            self.emit("notification.clear", {"key": self.UNSANDBOXED_KEY}, importance="essential")
+
+    #: Notification key of the "no sandbox" warning (see notify_unsandboxed).
+    UNSANDBOXED_KEY = "k3.sandbox.unusable"
+
+    def notify_unsandboxed(self) -> None:
+        """Tell the clients that this auto/yolo session's bash runs without the sandbox (bwrap is unusable here). The
+        notice is sticky: it stays until the mode leaves auto/yolo."""
+        if self.perms.mode == PermissionMode.YOLO:
+            what = "yolo mode runs every command on this machine"
+        else:
+            what = "auto mode asks before each command it would have run in the sandbox"
+        self.unsandboxed_notice = True
+        self.emit(
+            "notification.show",
+            {
+                "text": f"⚠ No sandbox: bubblewrap is unusable here, so {what}. See /doctor.",
+                "level": "warn",
+                "kind": "sticky",
+                "key": self.UNSANDBOXED_KEY,
+                "session_id": self.session_id,
+            },
+            importance="essential",
+        )
 
     @property
     def history(self) -> list[Message]:
@@ -842,6 +871,7 @@ class GatewayServer:
         if not stdio:
             self.clients.remove(self._stdio_client)
         self._idle_sweeper = asyncio.get_running_loop().create_task(self._idle_sweep_loop(), name="k3-idle-sweeper")
+        reaper = asyncio.get_running_loop().create_task(self._reap_at_start(), name="k3-worktree-reaper")
         try:
             if socket_path is not None:
                 await self.start_socket(socket_path)
@@ -855,6 +885,33 @@ class GatewayServer:
             self.shutdown()
         finally:
             self._idle_sweeper.cancel()
+            reaper.cancel()
+
+    #: How many of the newest sessions' working directories the start-up reap looks at.
+    REAP_SESSIONS = 200
+
+    async def _reap_at_start(self) -> None:
+        try:  # housekeeping: it must never hurt the gateway it runs in, but a failure must be visible
+            await self.reap_orphan_worktrees()
+        except Exception:
+            logger.exception("reaping orphaned worktrees failed")
+
+    async def reap_orphan_worktrees(self) -> None:
+        """Reap what fan-out and sub-agent workers left behind when their process died (``worktree.reap``), in each
+        repository these sessions worked in: nothing else removes a dead worker's checkout and branch."""
+        cwds = dict.fromkeys(cwd for _, cwd in self.store.worked_in(limit=self.REAP_SESSIONS) if cwd)
+        for cwd in cwds:
+            if not Path(cwd).is_dir():
+                continue
+            reaped = await wt_mod.reap(cwd)
+            if reaped is not None and (reaped.worktrees or reaped.merged or reaped.expired):
+                logger.info(
+                    "reaped in %s: %d orphaned worktree(s), %d merged and %d expired k3/* branch(es)",
+                    reaped.repo,
+                    len(reaped.worktrees),
+                    len(reaped.merged),
+                    len(reaped.expired),
+                )
 
     async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1418,7 +1475,7 @@ class GatewayServer:
 
     # ── router wiring ─────────────────────────────────────────────────
 
-    def _ensure_router(self, model: str | None = None) -> None:
+    def _ensure_router(self, model: str | None = None) -> TierRouters:
         """Provider chain + routers, built once per provider config and once per model key.
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
@@ -1426,12 +1483,15 @@ class GatewayServer:
         dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; when the provider
         config itself is replaced (/config reload) only the blocks that changed get a new provider (see
         ``_swap_providers``).
+
+        Returns the key's routers. ``self.router`` / ``self._tiers`` follow whichever turn called this last, so a
+        turn keeps the returned value instead of reading them again after an await (#130).
         """
         key = model or self.config.default_model
         # _router_cfg None: a router injected from outside (tests) is taken as is
         current = self._router_cfg is None or self._router_cfg is self.config.providers
         if self.router is not None and self._chain_key == key and current:
-            return
+            return self.tier_routers()
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
             self._swap_providers()
             self._router_cache = {}
@@ -1445,6 +1505,7 @@ class GatewayServer:
         self._tiers = tiers
         self.router = tiers.get(Tier.MAIN)
         self._chain_key = key
+        return tiers
 
     def _swap_providers(self) -> None:
         """Providers for ``config.providers``: a block whose settings did not change keeps its provider.
@@ -1926,7 +1987,9 @@ class GatewayServer:
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
             context_window=self._router_window(router, session),
         )
+        loop.on_unsandboxed = session.notify_unsandboxed
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
@@ -2025,7 +2088,7 @@ class GatewayServer:
         ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
-        self._ensure_router(session.stored.model or None)
+        tiers = self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
@@ -2065,7 +2128,7 @@ class GatewayServer:
         loop = self._build_loop(
             session,
             reliability,
-            self.tier_routers().get(tier),
+            tiers.get(tier),
             kind,
             approval,
             max_tool_errors=max_errors,
@@ -2120,7 +2183,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors,
@@ -2195,7 +2258,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
@@ -2314,7 +2377,7 @@ class GatewayServer:
             if loop.turn_messages:
                 stored = session.stored
                 stored.messages = _serialize_messages(loop.turn_messages)
-                stored.model = stored.model or self._chain_key or self.config.default_model
+                stored.model = stored.model or self.config.default_model  # keyless: runs on default
                 snapshot = dataclasses.replace(
                     stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
                 )
@@ -2367,23 +2430,36 @@ class GatewayServer:
 
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
-    def _checkpoint_turn(self, session: LiveSession) -> None:
+    def _checkpoint_turn(self, session: LiveSession, *, force: bool = False) -> None:
         """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
-        an OOM kill or a reboot loses seconds of work instead of the whole turn."""
+        an OOM kill or a reboot loses seconds of work instead of the whole turn. ``force`` skips the time throttle and
+        leaves its clock alone: the turn's start, which a prompt drained right after the previous turn would otherwise
+        fall inside of, and which must not close the throttle on the turn's first tool call."""
         loop = session.loop
         if loop is None or not loop.turn_messages:
             return
-        if time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if not force and time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
             return
         if session.checkpoint_task is not None and not session.checkpoint_task.done():
             return
-        session.last_checkpoint = time.monotonic()
+        if not force:
+            session.last_checkpoint = time.monotonic()
         messages = _serialize_messages(loop.turn_messages)
         session.stored.messages = messages
-        session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+        session.stored.model = session.stored.model or self.config.default_model  # keyless: runs on default (#130)
         session.checkpoint_task = asyncio.create_task(
             self._write_checkpoint(session.session_id, messages, session.stored.model)
         )
+
+    async def _checkpoint_turn_start(self, session: LiveSession) -> None:
+        """The turn's prompt reaches the store before the first model call. The write runs off the event loop, so it
+        is awaited here: left in flight it would make the turn's first tool-call checkpoint skip (one write at a time)
+        and that call would not be on disk before the tool runs. Waited with ``asyncio.wait`` as ``_persist_turn``
+        does, so a cancelled turn does not cancel the write."""
+        self._checkpoint_turn(session, force=True)
+        task = session.checkpoint_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
 
     async def _write_checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str) -> None:
         try:

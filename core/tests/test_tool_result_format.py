@@ -48,6 +48,15 @@ def test_write_edit_and_plain_errors_are_one_readable_line():
     assert format_tool_result({"error": "File not found: x"}) == "Error: File not found: x"
 
 
+def test_an_edit_by_similarity_names_the_text_it_replaced():
+    one = {"ok": True, "replacements": 1, "strategy": "context_aware", "replaced": "TIMEOUT = 30", "line": 2}
+    assert format_tool_result(one) == (
+        "Edited: 1 replacement (matched by context_aware, not exactly)\n"
+        "old_string is not in the file; it replaced this similar text at line 2. Check it is what you meant:\n"
+        "TIMEOUT = 30"
+    )
+
+
 def test_everything_else_is_unchanged():
     assert format_tool_result({"content": "line 1\nline 2", "lines": "1-2"}) == "line 1\nline 2"
     assert format_tool_result({"content": ""}) == ""
