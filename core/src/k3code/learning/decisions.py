@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from k3code import sqlstore
 from k3code.paths import ensure_private_dir
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     detail TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS decisions_kind ON decisions(kind, project);
+CREATE INDEX IF NOT EXISTS decisions_kind_project_subject_ts ON decisions(kind, project, subject, ts);
 """
 
 
@@ -86,6 +87,14 @@ def project_id(cwd: str | Path) -> str:
 
 #: Decisions older than this are deleted by :meth:`DecisionLog.prune` (``retention.decisions_days``).
 MAX_AGE_DAYS = 365
+
+
+class ToolErrorSightings(NamedTuple):
+    """What :meth:`DecisionLog.tool_error_sightings` found for one failure signature."""
+
+    count: int  #: sightings in the window, at most the ``cap`` asked for
+    choice: str  #: the error class of the newest one, "" when there is none
+    followup: str  #: the working retry noted on the newest sighting that has one, "" when none has
 
 
 class DecisionLog:
@@ -210,6 +219,28 @@ class DecisionLog:
             d["detail"] = json.loads(d["detail"] or "{}")
             rows.append(d)
         return rows
+
+    def tool_error_sightings(self, project: str, tool: str, subject: str, since: float, cap: int) -> ToolErrorSightings:
+        """The ``tool_error`` rows of ``project`` since ``since`` with this ``tool`` and ``subject`` (any actor),
+        without loading the other rows of the window: three queries through the
+        ``decisions_kind_project_subject_ts`` index. ``count`` stops at ``cap``, so it does not grow with the number
+        of sightings either; only the search for a ``followup`` runs back through them, inside SQLite, until it finds
+        one."""
+        where = (
+            "FROM decisions WHERE kind='tool_error' AND project=? AND subject=? AND ts>=?"
+            " AND json_extract(detail, '$.tool')=?"
+        )
+        args = (project, subject, since, tool)
+        count = int(self._db.execute(f"SELECT COUNT(*) FROM (SELECT 1 {where} LIMIT ?)", (*args, cap)).fetchone()[0])
+        if not count:
+            return ToolErrorSightings(0, "", "")
+        newest = "ORDER BY ts DESC, id DESC LIMIT 1"
+        choice = self._db.execute(f"SELECT choice {where} {newest}", args).fetchone()
+        followup = self._db.execute(
+            f"SELECT json_extract(detail, '$.followup') {where} AND json_extract(detail, '$.followup') != '' {newest}",
+            args,
+        ).fetchone()
+        return ToolErrorSightings(count, str(choice[0]), str(followup[0]) if followup else "")
 
     def count(self, kind: str | None = None) -> int:
         if kind:

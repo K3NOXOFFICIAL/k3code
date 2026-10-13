@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 from k3code.config import Settings
-from k3code.learning import gotchas
+from k3code.learning import decisions, gotchas
 from k3code.learning.decisions import DecisionLog
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import ToolCall
@@ -232,6 +232,45 @@ async def test_repeats_older_than_the_window_or_in_other_projects_do_not_count(t
     _fail(hub, _session(server, other), "npm b", "sh: 1: npm: not found")
     _fail(hub, _session(server, tmp_path), "npm c", "sh: 1: npm: not found")
     assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]
+
+
+async def test_a_failure_decodes_none_of_the_other_rows_of_the_window(tmp_path, monkeypatch):
+    # every recorded failure used to read and json-decode all tool_error rows of the 14-day window (linear in them:
+    # ~36 ms at 10k rows, on the event loop); the lookup is now an indexed query on the failure's own signature
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    pid = hub.log.project_for(str(tmp_path))
+    now = time.time()
+    noise = [
+        (
+            now - i,
+            "tool_error",
+            pid,
+            f"tool{i}: exit <n>: boom {i}",
+            "exit 1",
+            '{"tool": "bash", "actor": "user"}',
+            "user",
+        )
+        for i in range(10_000)
+    ]
+    hub.log._db.executemany(
+        "INSERT INTO decisions (ts, kind, project, subject, choice, detail, actor) VALUES (?,?,?,?,?,?,?)", noise
+    )
+    hub.log._db.commit()
+    decoded = 0
+    real_loads = json.loads
+
+    def counting_loads(*a, **kw):
+        nonlocal decoded
+        decoded += 1
+        return real_loads(*a, **kw)
+
+    monkeypatch.setattr(decisions, "json", SimpleNamespace(loads=counting_loads, dumps=json.dumps))
+    sess = _session(server, tmp_path)
+    for n in range(3):  # the third sighting proposes the card: the repeat count still works through the new lookup
+        _fail(hub, sess, f"npm run x{n}", "sh: 1: npm: not found")
+    assert decoded <= 5, f"{decoded} of the 10000 rows of the window were json-decoded"
+    assert len([p for p in hub.store.all() if p.kind == "project_gotcha"]) == 1
 
 
 async def test_accepting_writes_home_gotchas_and_the_prompt_carries_them(tmp_path, monkeypatch):
