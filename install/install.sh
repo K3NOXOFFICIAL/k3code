@@ -951,9 +951,23 @@ install_core_copy() {
   REQS=""
 }
 
+# A git build and a source build of one commit share the version name, so the version may be complete already: the way
+# this run was asked for is recorded on every run, not only on a build. A git install keeps `.ref` and no checkout path
+# (`k3code update` follows the ref), a source install the checkout path and no `.ref` (it follows the checkout). A file
+# is only written when it changes, so a repeated run changes nothing.
+record_origin() {
+  if [ "$FROM" = source ]; then
+    if [ "$(cat "$DATA/source_path" 2>/dev/null)" != "$SOURCE_PATH" ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
+    rm -f "$VERDIR/.ref"
+  fi
+  if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
+  return 0
+}
+
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
+    record_origin
     return 0
   fi
   log "installing version $VER into $VERDIR"
@@ -985,8 +999,7 @@ install_version() {
   if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
-  if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
+  record_origin
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
