@@ -120,6 +120,7 @@ There is no release yet. An install built from a checkout (`install.sh --from-so
 ```sh
 k3code                                   # interactive TUI
 k3code -p "fix the failing test" --json  # headless: one prompt, JSON result
+git diff | k3code -p "review this"       # headless: piped text follows the prompt; `-p -` reads it all from stdin
 k3code daemon                            # a long-running host: sessions, schedules and automations keep running
 ```
 

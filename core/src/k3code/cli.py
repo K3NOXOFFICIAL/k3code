@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import select
 import shlex
 import subprocess
 import sys
@@ -245,6 +246,52 @@ def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
     name = parts[0][1:]
     cmd = build_registry().get(name) if name and not name.startswith("/") else None
     return (cmd, name, parts[1] if len(parts) > 1 else "") if cmd is not None else None
+
+
+#: How long ``-p TEXT`` waits for anything on a piped stdin (data or end of file) before it goes on without it.
+_STDIN_WAIT_SECONDS = 3.0
+
+
+def _read_stdin(wait: float | None) -> str:
+    """All the text on stdin. With ``wait``, "" when nothing at all arrives within that many seconds.
+
+    A scheduler or harness that leaves stdin open and idle must not hang ``k3code -p TEXT``; ``-p -`` asked for stdin,
+    so it passes ``wait=None`` and waits for the end of the input.
+    """
+    stream = sys.stdin
+    if stream is None:  # fd 0 was closed
+        return ""
+    if wait is not None:
+        try:
+            ready = bool(select.select([stream], [], [], wait)[0])
+        except (OSError, ValueError, TypeError):  # an in-memory stream has no descriptor to poll, and cannot block
+            ready = True
+        if not ready:
+            click.echo(
+                f"k3code: no input arrived on stdin within {wait:g} s, going on without it "
+                "(`< /dev/null` skips the wait)",
+                err=True,
+            )
+            return ""
+    try:
+        return stream.read()
+    except UnicodeDecodeError:
+        raise click.ClickException("stdin is not UTF-8 text") from None
+
+
+def _headless_prompt(prompt: str | None) -> str | None:
+    """The prompt a headless run sends: ``-p -`` is read from stdin, and a piped stdin follows a ``-p TEXT`` prompt.
+
+    ``echo text | k3code -p summarize`` sends "summarize", a blank line and the text. A terminal is never read for
+    ``-p TEXT``, and neither is stdin for a slash command (``-p /stats``), which involves no model.
+    """
+    if prompt == "-":
+        if not (text := _read_stdin(wait=None)).strip():
+            raise click.UsageError("-p -: no prompt on stdin")
+        return text.rstrip()
+    if not prompt or sys.stdin is None or sys.stdin.isatty() or _headless_slash(prompt) is not None:
+        return prompt
+    return f"{prompt}\n\n{text}" if (text := _read_stdin(wait=_STDIN_WAIT_SECONDS).rstrip()) else prompt
 
 
 class _LightCommandContext:
@@ -546,7 +593,12 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
 
 
 @click.command()
-@click.option("-p", "--prompt", "prompt", help="Headless prompt; omit for REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    "prompt",
+    help="Headless prompt; omit for REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
@@ -581,6 +633,7 @@ def main(
     Examples:
       k3code -p "create hello.py" --permission auto
       k3code -p "fix the bug" --json
+      git diff | k3code -p "review this"
       k3code  # starts the TUI (or the REPL with --repl / non-tty)
     """
     if stdio_flag:
@@ -594,6 +647,7 @@ def main(
     from k3code.config import load_config
     from k3code.permissions import PermissionMode
 
+    prompt = _headless_prompt(prompt)
     # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
     # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
     project_dir = config_dir or Path.cwd()
@@ -787,7 +841,11 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
     help="Show the version and exit.",
 )
 @click.pass_context
-@click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    help="Headless prompt; omit for TUI/REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
