@@ -387,3 +387,30 @@ def test_a_workspace_glob_stops_at_the_depth_cap_and_skips_dependency_dirs(tmp_p
     files = {"pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n"}
     files |= _members(["packages/web", "packages/ui/button", f"packages/{deep}", "packages/node_modules/x"])
     assert _node_dirs(make(tmp_path / "repo", files)) == ["packages/ui/button", "packages/web"]
+
+
+def refuse_stat_of(monkeypatch, name: str) -> None:
+    """Make ``Path.is_dir`` and ``Path.is_symlink`` raise EACCES for one entry, as Python 3.12 does on a Windows drive
+    root (DrvFs refuses to stat ``pagefile.sys``). 3.14 swallows every OSError there, so a real chmod would not show it.
+    """
+    real_is_dir, real_is_symlink = Path.is_dir, Path.is_symlink
+
+    def guard(real):
+        def check(self, *args, **kwargs):
+            if self.name == name:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real(self, *args, **kwargs)
+
+        return check
+
+    monkeypatch.setattr(Path, "is_dir", guard(real_is_dir))
+    monkeypatch.setattr(Path, "is_symlink", guard(real_is_symlink))
+
+
+def test_an_entry_the_filesystem_refuses_to_stat_is_skipped_by_the_scan(tmp_path, monkeypatch):
+    """`k3code doctor` from `C:\\` died with PermissionError on `/mnt/c/swapfile.sys` (#111)."""
+    web = json.dumps({"scripts": {"test": "vitest"}})
+    root = make(tmp_path / "drive", {"swapfile.sys": "", "web/package.json": web})
+    refuse_stat_of(monkeypatch, "swapfile.sys")
+    scan = stacks.scan(root)
+    assert [(s["id"], s["dir"]) for s in scan.stacks] == [("node", "web")]

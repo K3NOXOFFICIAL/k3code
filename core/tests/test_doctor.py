@@ -304,6 +304,27 @@ def test_project_check_reports_the_stacks_a_read_only_scan_finds(tmp_path):
     assert not projectstate.state_path(tmp_path).exists()
 
 
+def test_doctor_project_check_survives_an_entry_the_filesystem_refuses_to_stat(tmp_path, monkeypatch):
+    """`k3code doctor` from a Windows drive root crashed on `/mnt/c/swapfile.sys` (#111)."""
+    from pathlib import Path
+
+    from k3code import doctor
+
+    (tmp_path / "swapfile.sys").write_text("")
+    (tmp_path / "go.mod").write_text("module demo\n")
+    real_is_dir = Path.is_dir
+
+    def is_dir(self, *args, **kwargs):
+        if self.name == "swapfile.sys":
+            raise PermissionError(13, "Permission denied", str(self))  # what Python 3.12 does on DrvFs
+        return real_is_dir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    chk = doctor.check_project(tmp_path)
+    assert chk.status == doctor.OK
+    assert chk.data["stacks"] == ["go (go)"]
+
+
 def test_doctor_names_chain_models_whose_context_window_is_a_guess():
     """Issue #30: an id with no models.<id>.context_window and no known family gets a hint; the others stay quiet."""
     from k3code.config import ProviderEntry, Settings
