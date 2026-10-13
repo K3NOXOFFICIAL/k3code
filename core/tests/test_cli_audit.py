@@ -844,6 +844,20 @@ def test_config_edit_never_writes_the_rejected_edit_through_a_planted_symlink(en
     assert cfg.read_text() == "max_turns: 4\n"
 
 
+def test_config_edit_keeps_the_rejected_edit_under_another_name_when_the_usual_one_is_taken(env: Path, monkeypatch):
+    from k3code import confio
+    from k3code.commands.config_cmd import edit_config_file
+
+    cfg = env / "repo" / ".k3code" / "config.yaml"
+    (cfg.parent / "config.yaml.rejected").mkdir(parents=True)  # a directory there: the edit must not be lost
+    cfg.write_text("max_turns: 4\n")
+    monkeypatch.setenv("EDITOR", _editor(env, 'printf "max_turns: lots\\n" > "$1"'))
+    with pytest.raises(confio.ConfigError, match=r"your edit is in config\.yaml\.rejected-") as err:
+        edit_config_file(cfg)
+    (kept,) = [p for p in cfg.parent.glob("config.yaml.rejected-*") if p.name in str(err.value)]
+    assert kept.read_text() == "max_turns: lots\n" and cfg.read_text() == "max_turns: 4\n"
+
+
 # ── L2 / L4 / L7 ──────────────────────────────────────────────────────────────────────────────────────────────
 
 

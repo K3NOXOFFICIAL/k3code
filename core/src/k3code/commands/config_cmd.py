@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -105,8 +106,10 @@ def edit_config_file(path: Path) -> int:
             confio.replace_bytes(path, before)
         if bak is not None:
             bak.unlink(missing_ok=True)
-        rejected = path.with_name(path.name + ".rejected")
-        kept = f"your edit is in {rejected.name}" if _write_new(rejected, after) else "your edit could not be kept"
+        # the usual name, else (taken by a directory, say) a fresh one: the edit is not lost
+        names = (f"{path.name}.rejected", f"{path.name}.rejected-{secrets.token_hex(4)}")
+        rejected = next((n for n in names if _write_new(path.with_name(n), after)), None)
+        kept = f"your edit is in {rejected}" if rejected else "your edit could not be kept"
         raise confio.ConfigError(f"{path.name} is not valid ({e}); kept the previous content, {kept}") from e
     return rc
 
@@ -119,8 +122,12 @@ def _write_new(path: Path, data: bytes) -> bool:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
         return False
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        path.unlink(missing_ok=True)
+        return False
     return True
 
 
