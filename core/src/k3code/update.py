@@ -112,16 +112,19 @@ ENV_CHECKS = (
 def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
     """The new version's own venv: ``k3code --version`` names this version, and ``doctor --json --no-probe`` (which
     loads the config with the new code) has no failing check about k3code itself; environment checks do not count."""
+    vdir = vdir.absolute()  # the children below run with cwd=vdir: a relative path or K3CODE_DATA would stop matching
     exe = vdir / "venv" / "bin" / "k3code"
     if not exe.exists():
         return False, f"{exe} missing"
-    env = {**os.environ, "K3CODE_DATA": str(data_dir())}
+    env = {**os.environ, "K3CODE_DATA": str(data_dir().absolute())}
     try:
+        # cwd is the new version, not wherever the update started: doctor scans its cwd, and a drive root (/mnt/c)
+        # holds entries it cannot read. A traceback names its cause last, so the message keeps the end of stderr.
         v = subprocess.run(
-            [str(exe), "--version"], capture_output=True, text=True, timeout=timeout, env=env, check=False
+            [str(exe), "--version"], capture_output=True, text=True, timeout=timeout, env=env, cwd=vdir, check=False
         )
         if v.returncode != 0:
-            return False, f"--version failed: {v.stderr.strip()[:200]}"
+            return False, f"--version failed: {v.stderr.strip()[-400:]}"
         want = vdir.name.split("-src")[0]
         if want not in v.stdout:
             return False, f"--version says {v.stdout.strip()[:80]!r}, expected {want}"
@@ -131,12 +134,13 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
             env=env,
+            cwd=vdir,
             check=False,
         )
         try:
             report = json.loads(d.stdout)
         except ValueError:
-            return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[:200]}"
+            return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[-400:]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"{type(e).__name__}: {e}"
     checks = report.get("checks") or []

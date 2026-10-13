@@ -103,6 +103,15 @@ def _load_toml(p: Path) -> dict[str, Any]:
         return {}
 
 
+def _is_dir(p: Path) -> bool:
+    """``Path.is_dir`` that counts an entry it cannot stat as not a directory: before Python 3.13 it re-raises EACCES,
+    and a Windows drive root seen from WSL (``/mnt/c``) lists ``pagefile.sys`` and others that deny stat."""
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 def _names(d: Path) -> set[str]:
     try:
         return set(os.listdir(d))
@@ -379,7 +388,7 @@ def _glob_dirs(root: Path, pattern: str, budget: list[int]) -> list[Path]:
                     walk(child, i, depth + 1)
         elif not any(c in seg for c in "*?["):
             child = d / seg
-            if child.is_dir() and seg not in SKIP_DIRS:
+            if _is_dir(child) and seg not in SKIP_DIRS:
                 walk(child, i + 1, depth)
         else:
             for child in _subdirs(d, budget, follow_links=True):
@@ -396,7 +405,7 @@ def _scan_dirs(root: Path, names: set[str]) -> list[str]:
     for n in names:
         if n.startswith(".") or n in SKIP_DIRS:
             continue
-        if (root / n).is_dir() and not (root / n).is_symlink():
+        if _is_dir(root / n) and not (root / n).is_symlink():
             dirs.add(n)
     resolved_root = root.resolve()
     extra: set[str] = set()
