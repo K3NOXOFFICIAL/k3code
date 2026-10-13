@@ -9,7 +9,7 @@ import pytest
 from k3code.errors import AllProvidersUnreachable, ChainExhausted
 from k3code.providers.types import Message, StreamEvent, Usage
 from k3code.reliability.events import PARKED, PAUSED, RESUMED, UNPARKED, EventEmitter
-from k3code.reliability.netwatch import NetState
+from k3code.reliability.netwatch import InternetProbeResult, NetState, NetWatch
 from k3code.reliability.persistent_retry import (
     CancelToken,
     PersistentRetry,
@@ -132,6 +132,33 @@ async def test_captive_pauses_like_offline():
     assert router.calls == 2
     assert [e.kind for e in seen] == [PAUSED, RESUMED]
     assert out
+
+
+async def test_local_provider_answers_without_internet_so_the_turn_parks_instead_of_pausing():
+    """A host with no internet and an Ollama on loopback: one connect error must not freeze the turn (#124)."""
+
+    async def no_internet(config):
+        return InternetProbeResult(ok=False)
+
+    async def provider_answers(base_url: str, timeout: float):
+        return (200, "{}", base_url)
+
+    async def no_nm():
+        return None
+
+    nw = NetWatch(internet_probe=no_internet, provider_probe=provider_answers, nm_probe=no_nm)
+    nw.add_provider("local", "http://127.0.0.1:11434/v1")
+    await nw._probe_all()  # what the monitor loop does each round
+
+    router = FakeRouter(fails=1, error=AllProvidersUnreachable("connect error", attempts=1))
+    # max_wait turns a pause that never ends into the original error instead of a hang
+    config = RetryConfig(park_base=1.0, park_max=8.0, poll_interval=0.5, max_wait=30.0)
+    retry, clock, events, seen = _retry(router, netwatch=nw, config=config)
+    out = await _drain(retry.stream([Message(role="user", content="hi")], []))
+
+    assert router.calls == 2
+    assert [e.kind for e in seen] == [PARKED, UNPARKED]
+    assert any(e.type == "text_delta" for e in out)
 
 
 async def test_provider_down_parks_with_ladder_then_succeeds():
