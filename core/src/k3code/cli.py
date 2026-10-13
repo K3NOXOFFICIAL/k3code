@@ -27,13 +27,6 @@ logging.basicConfig(level=os.environ.get("K3CODE_LOG_LEVEL", "WARNING").upper(),
 logger = logging.getLogger(__name__)
 
 
-def _load_system_prompt() -> str:
-    prompt_path = Path(__file__).parent / "prompts" / "system.md"
-    if prompt_path.is_file():
-        return prompt_path.read_text(encoding="utf-8")
-    return "You are a helpful coding assistant."
-
-
 def _resolve_model_specs(config: Any) -> list[str | list[str]]:
     """Pick each provider's configured model(s) for ``config.default_model``.
 
@@ -127,7 +120,7 @@ async def _run_headless(
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
-    from k3code.prompting import build_system_prompt
+    from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
     from k3code.reliability.persistent_retry import TurnCancelled
@@ -136,7 +129,7 @@ async def _run_headless(
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -444,7 +437,7 @@ async def _run_repl(
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
-    from k3code.prompting import build_system_prompt
+    from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
     from k3code.reliability.persistent_retry import TurnCancelled
@@ -454,7 +447,7 @@ async def _run_repl(
     if model and (err := _use_model_key(config, model)):
         print(f"[Error] {err}; using {config.default_model}")
         model = None
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -932,6 +925,40 @@ def cli(
             repl=repl,
             stdio_flag=False,
         )
+
+
+@cli.group("prompt")
+def prompt_group() -> None:
+    """Inspect the system prompt k3code sends."""
+
+
+@prompt_group.command("dump")
+@click.option("--mode", default="interactive", show_default=True, help="interactive|headless|plan|subagent:<type>")
+@click.option("--sections", "sections_only", is_flag=True, help="Print the per-section size table instead of the text")
+@click.option("--tools", "with_tools", is_flag=True, help="Also print the tool schemas and count them in the table")
+@click.option("--hash", "hash_only", is_flag=True, help="Print only the SHA-256 of the prompt")
+@click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
+def prompt_dump(mode: str, sections_only: bool, with_tools: bool, hash_only: bool, config_dir: Path | None) -> None:
+    """Print the assembled system prompt of a mode, as this project would start it (MCP tool names excluded)."""
+    from k3code.config import load_config
+    from k3code.prompting import assemble_mode, prompt_hash, section_table, tool_schemas_json
+
+    project_dir = config_dir or Path.cwd()
+    try:
+        text, sections = assemble_mode(mode, cwd=project_dir, config=load_config(project_dir=project_dir))
+    except ValueError as e:
+        raise click.UsageError(str(e)) from None
+    tools = tool_schemas_json() if with_tools else ""
+    if hash_only:
+        click.echo(prompt_hash(text))
+        return
+    if sections_only:
+        click.echo(section_table(sections, tools))
+        click.echo(f"sha256 {prompt_hash(text)}")
+        return
+    click.echo(text, nl=False)
+    if tools:
+        click.echo(f"\n--- tool schemas ---\n{tools}")
 
 
 @cli.command("gateway")

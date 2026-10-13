@@ -1,4 +1,4 @@
-"""``/debug dump``: a redacted support bundle (recent events, config without secrets, versions, doctor)."""
+"""``/debug dump``: a redacted support bundle (events, config without secrets, versions, doctor, prompt hashes)."""
 
 from __future__ import annotations
 
@@ -140,6 +140,8 @@ def versions() -> dict[str, str]:
 async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, probe: bool = True) -> Path:
     """Write ``$K3CODE_HOME/debug/<ts>.tar.gz`` and return its path."""
     from k3code import doctor
+    from k3code.config import default_project_dir
+    from k3code.prompting import prompt_fingerprints
 
     home = home or k3_home()
     secrets = secret_values(server.config)
@@ -150,6 +152,8 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
         "config.json": json.dumps(safe_config(server.config, secrets), indent=2, default=str),
         "versions.json": json.dumps(versions(), indent=2),
         "doctor.json": doctor.to_json(checks),
+        # hashes and section sizes only: the text carries project memory, so it stays out of a bundle that is shared
+        "prompt.json": json.dumps(prompt_fingerprints(server.config, default_project_dir()), indent=2),
     }
     out_dir = home / "debug"
     out_dir.mkdir(parents=True, exist_ok=True)
