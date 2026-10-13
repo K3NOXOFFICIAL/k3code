@@ -140,6 +140,37 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert not (tmp_path / ".k3code").exists()
 
 
+def test_purge_also_removes_the_k3_pane_config(tmp_path: Path) -> None:
+    # the k3 binary writes its default config to ~/.config/tuios/config.toml on its first start
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    pane_config = tmp_path / ".config" / "tuios"
+    pane_config.mkdir(parents=True)
+    (pane_config / "config.toml").write_text("[appearance]\n")
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert (pane_config / "config.toml").is_file()  # a plain uninstall keeps it, like the rest of your settings
+    assert str(pane_config) in r.stdout
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert not pane_config.exists()
+
+
+def test_uninstall_names_the_shared_caches_it_leaves(tmp_path: Path) -> None:
+    # uv and npm fill these while installing; other projects use them too, so they stay, and the output says where
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert "uv cache" not in r.stdout and "npm cache" not in r.stdout  # nothing there, nothing to name
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    (tmp_path / ".cache" / "uv").mkdir(parents=True)
+    (tmp_path / ".npm" / "_cacache").mkdir(parents=True)
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert f"{tmp_path / '.cache' / 'uv'} (uv cache clean)" in r.stdout
+    assert f"{tmp_path / '.npm'} (npm cache clean --force)" in r.stdout
+    assert (tmp_path / ".cache" / "uv").is_dir() and (tmp_path / ".npm" / "_cacache").is_dir()
+
+
 def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
     # Git Bash / MSYS / Cygwin: install.sh cannot install there and says to use install.ps1 (WSL) instead.
     fake = tmp_path / "fakebin"
@@ -1516,6 +1547,40 @@ def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> Non
     else:
         assert not private.exists()
         assert "did not match the sha256 go.dev lists" in r.stderr
+
+
+@pytest.mark.skipif(not GO_OS or not GO_ARCH, reason="needs a platform go.dev builds for")
+def test_the_private_go_keeps_its_caches_and_telemetry_in_the_data_dir(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    want = next(ln.split()[1] for ln in (REPO / "panes" / "go.mod").read_text().splitlines() if ln.startswith("go "))
+    seen = tmp_path / "go-calls.log"
+    fake_go = (
+        "#!/bin/sh\n"
+        f'echo "$1 cache=$GOCACHE config=$XDG_CONFIG_HOME path=$GOPATH" >>"{seen}"\n'
+        f'case "$1" in version) echo "go version go{want} {GO_OS}/{GO_ARCH}" ;;\n'
+        'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    )
+    archive = _tar_gz({"go/bin/go": fake_go})
+    name = f"go{want}.{GO_OS}-{GO_ARCH}.tar.gz"
+    releases = [
+        {
+            "version": f"go{want}",
+            "files": [
+                {"filename": name, "os": GO_OS, "arch": GO_ARCH, "sha256": hashlib.sha256(archive).hexdigest()},
+            ],
+        }
+    ]
+    curl, _ = _download_stub(tmp_path, {name: archive, "releases.json": json.dumps(releases).encode()})
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", drop=("K3_NO_DOWNLOAD", "K3_SKIP_GO"), path_front=curl)
+    assert r.returncode == 0, r.stderr
+    data = tmp_path / DATA_REL
+    calls = seen.read_text().splitlines()
+    assert any(c.startswith("build ") for c in calls) and any(c.startswith("version ") for c in calls)
+    for c in calls:  # `go version` writes telemetry counters as `go build` does: both stay inside the data dir
+        assert f"cache={data}/go/cache config={data}/go/config path={data}/go/path" in c
+    assert not (tmp_path / ".cache").exists() and not (tmp_path / ".config" / "go").exists()
 
 
 def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
