@@ -40,6 +40,10 @@ class Scripted(AnswerPrompter):
         self.asked.append(key)
         return super().text(key, message, default, secret)
 
+    def confirm(self, key: str, message: str, default: bool = True) -> bool:
+        self.asked.append(key)
+        return super().confirm(key, message, default)
+
 
 def _boom(*_args: Any, **_kwargs: Any) -> None:
     raise AssertionError("must not run here")
@@ -53,7 +57,13 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.chdir(tmp_path)
-    for name in ("K3CODE_API_KEY", "OMNIROUTE_API_KEY", "ANTHROPIC_API_KEY"):
+    for name in (
+        "K3CODE_API_KEY",
+        "K3CODE_ENDPOINT_API_KEY",
+        "K3CODE_ENDPOINT_2_API_KEY",
+        "OMNIROUTE_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
         # set-then-delete makes teardown restore the variable even though the flows export keys into os.environ
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
@@ -117,7 +127,7 @@ def test_onboard_fast_api_writes_a_loadable_config_and_keeps_the_key_out_of_it(r
         "endpoint",
         "openai",
         "http://127.0.0.1:9/v1",
-        "K3CODE_API_KEY",
+        "K3CODE_ENDPOINT_API_KEY",  # its own variable, not a K3CODE_API_KEY shared by every endpoint (#114, #120)
     )
     assert prov.models == {"default": "m-fast"}
     assert prov.api_key == "sk-SECRET-FAST"  # read back from the 0600 env file, as a later run would
@@ -386,3 +396,182 @@ def test_rank_models_leaves_out_only_non_chat_ids() -> None:
         "meta-llama/llama-3.1-8b-instruct",
         "soraya/chat-7b",
     ]
+
+
+def _fast_api(root: Path, endpoint: str, **extra: str) -> str:
+    answers = _answers(
+        root, {"onboard": {"mode": "fast", "provider": "api", "endpoint": endpoint, "model": "m", **extra}}
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    return r.output
+
+
+def test_fast_api_does_not_send_a_leftover_generic_key_to_a_new_endpoint(root) -> None:
+    """#114: K3CODE_API_KEY left in the env file by another vendor was used for the new endpoint without a question
+    (and called "from your environment"), so the old vendor's key went to the new host."""
+    from k3code.setup.state import set_env_var
+
+    old = "fake-" + "old-vendor-key"
+    set_env_var("K3CODE_API_KEY", old)
+    out = _fast_api(root, "http://127.0.0.1:18081/v1")
+    assert "using K3CODE_API_KEY" not in out
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key_env != "K3CODE_API_KEY"
+    assert prov.api_key != old
+    assert f"NOTE: {prov.api_key_env} is not set yet" in out
+
+
+def test_fast_offers_to_keep_or_replace_a_stored_key_and_says_where_it_is(root, capsys) -> None:
+    """#114: a key already stored for the provider was used without a word, so a wrong stored key could not be
+    replaced in fast setup; the message also said "your environment" for a key from the env file."""
+    from k3code.setup.state import set_env_var
+
+    set_env_var("ANTHROPIC_API_KEY", "fake-" + "wrong-key")
+    keep = Scripted({"onboard": {"mode": "fast", "provider": "anthropic"}})
+    ob.run_fast(keep, do_probe=False)
+    assert "onboard.keep_key" in keep.asked and "onboard.key" not in keep.asked
+    assert "using ANTHROPIC_API_KEY from the env file" in capsys.readouterr().out
+
+    replace = Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "keep_key": False, "key": "fake-right"}})
+    ob.run_fast(replace, do_probe=False)
+    assert "onboard.key" in replace.asked
+    assert load_config(project_dir=root).providers[0].api_key == "fake-right"
+
+
+def test_fast_api_asks_for_the_key_of_a_new_endpoint_even_with_a_generic_key_set(root) -> None:
+    """#114, interactive: the key question was skipped whenever K3CODE_API_KEY had any value."""
+    from k3code.setup.state import set_env_var
+
+    set_env_var("K3CODE_API_KEY", "fake-" + "old-vendor-key")
+    endpoint = "http://127.0.0.1:18081/v1"
+    p = Scripted({"onboard": {"mode": "fast", "provider": "api", "endpoint": endpoint, "key": "fake-new-key"}})
+    ob.run_fast(p, do_probe=False)
+    assert "onboard.key" in p.asked
+    assert load_config(project_dir=root).providers[0].api_key == "fake-new-key"
+
+
+def test_fast_onboarding_of_a_second_endpoint_keeps_the_first_with_its_own_key(root) -> None:
+    """#120: every fast custom endpoint was named "endpoint" with key variable K3CODE_API_KEY, so setting up a
+    second gateway dropped the first entry and overwrote its key in the env file."""
+    _fast_api(root, "http://127.0.0.1:18081/v1", key="fake-key-a")
+    out = _fast_api(root, "http://127.0.0.1:18082/v1", key="fake-key-b")
+    assert "kept as fallback" in out
+    cfg = load_config(project_dir=root)
+    assert [(p.base_url, p.api_key) for p in cfg.providers] == [
+        ("http://127.0.0.1:18082/v1", "fake-key-b"),
+        ("http://127.0.0.1:18081/v1", "fake-key-a"),
+    ]
+    assert len({p.name for p in cfg.providers}) == 2 and len({p.api_key_env for p in cfg.providers}) == 2
+
+    # a re-run for the first endpoint without a key replaces that entry and keeps its own key
+    _fast_api(root, "http://127.0.0.1:18081/v1")
+    cfg = load_config(project_dir=root)
+    assert [(p.base_url, p.api_key) for p in cfg.providers] == [
+        ("http://127.0.0.1:18081/v1", "fake-key-a"),
+        ("http://127.0.0.1:18082/v1", "fake-key-b"),
+    ]
+
+
+def _record_probes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Every (base_url, key) fast setup lists models with; the answer is a plain failure."""
+    seen: list[tuple[str, str]] = []
+
+    def fake(entry: dict[str, Any], key: str, timeout: float = 8.0) -> tuple[bool, float, list[str], str]:
+        seen.append((entry["base_url"], key))
+        return False, 0.0, [], "HTTP 401"
+
+    monkeypatch.setattr(ob.probe, "list_models", fake)
+    return seen
+
+
+def test_declining_the_stored_key_and_giving_none_never_sends_that_key_to_the_endpoint(
+    root, monkeypatch, capsys
+) -> None:
+    """Security review of #204: after "n" and a blank key the entry still used the declined variable, so vendor A's
+    key (left on the shared K3CODE_API_KEY by the old code) kept going to endpoint B, and B was probed with it."""
+    from k3code import confio
+    from k3code.setup.state import set_env_var
+
+    b = "http://127.0.0.1:18082/v1"
+    vendor_a_key = "fake-" + "vendor-a-key"
+    set_env_var("K3CODE_API_KEY", vendor_a_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "endpoint", "kind": "openai", "base_url": b, "api_key_env": "K3CODE_API_KEY"}]},
+    )
+    probes = _record_probes(monkeypatch)
+    p = Scripted({"onboard": {"mode": "fast", "provider": "api", "endpoint": b, "keep_key": False, "model": "m"}})
+    ob.run_fast(p, do_probe=True)
+
+    assert "onboard.keep_key" in p.asked
+    assert all(key != vendor_a_key for _url, key in probes), probes
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key_env != "K3CODE_API_KEY" and prov.api_key != vendor_a_key
+    assert f"NOTE: {prov.api_key_env} is not set yet" in capsys.readouterr().out
+
+
+def test_declining_a_vendor_key_and_giving_none_does_not_probe_with_it_and_says_it_is_still_stored(
+    root, monkeypatch, capsys
+) -> None:
+    """The same for a preset: its variable is fixed, so the old key stays there, but it is not used to probe and the
+    output no longer claims nothing is stored."""
+    from k3code.setup.state import set_env_var
+
+    old = "fake-" + "wrong-anthropic-key"
+    set_env_var("ANTHROPIC_API_KEY", old)
+    probes = _record_probes(monkeypatch)
+    ob.run_fast(Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "keep_key": False}}), do_probe=True)
+
+    assert probes == []
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY" in out and "still stored" in out and "not set yet" not in out
+    assert old not in out
+
+
+def test_keeping_the_old_shared_key_is_not_the_default_and_the_question_says_why(root, monkeypatch) -> None:
+    """Security review of #204: every endpoint used to share K3CODE_API_KEY, so the key in it may be another vendor's
+    (#114), yet "Keep the K3CODE_API_KEY key?" defaulted to yes and pressing Enter kept sending it to this endpoint."""
+    from k3code import confio
+    from k3code.setup.state import set_env_var
+
+    b = "http://127.0.0.1:18082/v1"
+    vendor_a_key = "fake-" + "vendor-a-key"
+    set_env_var("K3CODE_API_KEY", vendor_a_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "endpoint", "kind": "openai", "base_url": b, "api_key_env": "K3CODE_API_KEY"}]},
+    )
+    asked: list[tuple[str, bool]] = []
+
+    class Recording(Scripted):
+        def confirm(self, key: str, message: str, default: bool = True) -> bool:
+            if key == "onboard.keep_key":
+                asked.append((message, default))
+            return super().confirm(key, message, default)
+
+    probes = _record_probes(monkeypatch)
+    ob.run_fast(Recording({"onboard": {"mode": "fast", "provider": "api", "endpoint": b, "model": "m"}}), do_probe=True)
+
+    [(message, default)] = asked
+    assert default is False and "another endpoint" in message
+    assert all(key != vendor_a_key for _url, key in probes), probes
+    assert load_config(project_dir=root).providers[0].api_key != vendor_a_key
+
+
+def test_fast_api_never_takes_over_a_vendor_key_variable_for_another_url(root, monkeypatch) -> None:
+    """The old wizard wrote an openai entry with an edited URL on OPENAI_API_KEY; fast setup for that URL passed the
+    variable on, so the OpenAI key kept going to the other host."""
+    from k3code import confio
+
+    local = "http://127.0.0.1:18083/v1"
+    openai_key = "fake-" + "openai-key"
+    monkeypatch.setenv("OPENAI_API_KEY", openai_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "openai", "kind": "openai", "base_url": local, "api_key_env": "OPENAI_API_KEY"}]},
+    )
+    _fast_api(root, local)
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.base_url == local
+    assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key

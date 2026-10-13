@@ -16,7 +16,15 @@ from k3code.paths import home, user_config_path
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file
-from k3code.setup.steps import Ctx, _entry_from, offer_project_recipes, write_config
+from k3code.setup.steps import (
+    Ctx,
+    _entry_from,
+    key_env_at,
+    key_env_for,
+    offer_project_recipes,
+    unique_name,
+    write_config,
+)
 from k3code.setup.wizard import run_setup
 
 QUESTION = "Fast setup (API endpoint + key) or full setup?"
@@ -102,8 +110,19 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
     return pick
 
 
-def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any], str]:
-    """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown)."""
+def _custom_names(base: str, before: list[Any]) -> tuple[str, str]:
+    """Name and key variable for a custom endpoint, never those of another endpoint already configured (#114, #120).
+
+    The entry being replaced (same endpoint) passes its variable on, the same rule as the wizard (key_env_at)."""
+    others = [e for e in before if isinstance(e, dict) and str(e.get("base_url") or "").rstrip("/") != base]
+    name = unique_name("endpoint", {str(e.get("name")) for e in others})
+    return name, key_env_at(base, name, before)
+
+
+def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> tuple[dict[str, Any], str]:
+    """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown).
+
+    ``before`` is the provider chain in the config now."""
     if name == "api":
         base = ""
         while not base:
@@ -116,18 +135,22 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
         preset = name
         base = probe.PRESETS[name]["base_url"]
     known = probe.PRESETS.get(preset, {})
-    spec: dict[str, Any] = {
-        "preset": preset,
-        "name": preset if preset != "custom" else "endpoint",
-        "base_url": base,
-        "kind": known.get("kind", "openai"),
-        "api_key_env": known.get("api_key_env", "K3CODE_API_KEY"),
-    }
+    spec: dict[str, Any] = {"preset": preset, "base_url": base, "kind": known.get("kind", "openai")}
+    if preset == "custom":
+        spec["name"], spec["api_key_env"] = _custom_names(base, before)
+    else:
+        spec["name"], spec["api_key_env"] = preset, known["api_key_env"]
     env_name = spec["api_key_env"]
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
+    where = "your environment" if os.environ.get(env_name) else f"the env file {env_file_path()}"
     key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
-    if existing and not key:
-        p.say(f"  using {env_name} from your environment")
+    question = f"Keep the {env_name} key from {where}?"
+    shared = env_name == "K3CODE_API_KEY"  # every endpoint used to share it, so its key may be another vendor's (#114)
+    if shared:
+        question += " (the old shared variable: it may hold another endpoint's key)"
+    kept = bool(existing and not key and p.confirm("onboard.keep_key", question, not shared))
+    if kept:
+        p.say(f"  using {env_name} from {where}")
     elif preset != "local" and not key:
         key = p.text(
             "onboard.key",
@@ -135,6 +158,13 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
             "",
             secret=True,
         ).strip()
+    # Declined and nothing typed: the key in that variable is not this endpoint's, so it is not used for it.
+    declined = bool(existing) and not kept and not key
+    if declined:
+        existing = ""
+        if preset == "custom":  # a variable of its own; a vendor preset's variable is fixed and keeps its key
+            taken = {str(e.get("api_key_env") or "") for e in before if isinstance(e, dict)}
+            spec["api_key_env"] = env_name = key_env_for(spec["name"], taken | set(os.environ) | set(read_env_file()))
     if key:
         spec["api_key"] = key
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
@@ -142,12 +172,14 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
         raise ValueError("no provider entry was built")
     if preset == "local" and not key and not existing:
         entry["api_key_env"] = ""  # Ollama takes no key: an empty name declares the entry keyless (#107)
-    if not key and not existing and preset != "local":
+    if declined and preset != "custom":
+        p.say(f"  NOTE: the {env_name} key is still stored; replace it in {env_file_path()} or export a new one.")
+    elif not key and not existing and preset != "local":
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 
     ids: list[str] = []
     answered = p.raw("onboard.model", None) if not p.interactive else None
-    if do_probe and not answered:
+    if do_probe and not answered and not declined:
         ok, _ms, ids, detail = probe.list_models(entry, key or existing or os.environ.get(env_name, ""))
         if not ok:
             p.say(f"  could not list models ({detail}); check the key and URL with `k3code doctor`")
@@ -170,6 +202,9 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     kind = next((n for n, label in labels.items() if picked in (n, label)), picked.split()[0] if picked else "")
     if kind not in PROVIDERS:
         raise ValueError(f"onboard.provider must be one of: {', '.join(PROVIDERS)} (got {picked!r})")
+    from k3code import confio
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
     tiers: dict[str, str]
     if kind == "claude-cli":
         if shutil.which("claude") is None:
@@ -177,7 +212,7 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         entry: dict[str, Any] = {"name": "claude-cli", "kind": "claude-cli"}
         tiers = dict(TIER_MODELS["claude-cli"])
     else:
-        entry, model = _api_entry(p, kind, do_probe=do_probe)
+        entry, model = _api_entry(p, kind, do_probe=do_probe, before=before)
         known = TIER_MODELS.get(kind, {})
         tiers = {**known, "main": model} if model and known.get("main") == model else ({"main": model} if model else {})
     model = tiers.get("main", "")
@@ -185,9 +220,6 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         "providers": {"entries": [entry]},
         "tiers": {"models": {entry["name"]: tiers} if tiers else {}},
     }
-    from k3code import confio
-
-    before = confio.read_yaml(user_config_path()).get("providers") or []
     path = write_config(data, only="providers")  # keeps the rest of an existing config untouched
     p.say(f"Wrote {path}: provider {entry['name']} ({entry['kind']}), default model {model or '(not set yet)'}.")
     if kept := _keep_other_providers(path, before, entry):
