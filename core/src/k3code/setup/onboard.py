@@ -141,6 +141,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
     if entry is None:  # only the interactive branch of _entry_from returns None
         raise ValueError("no provider entry was built")
+    if preset == "local" and not key and not existing:
+        entry["api_key_env"] = ""  # Ollama takes no key: an empty name declares the entry keyless (#107)
     if not key and not existing and preset != "local":
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 

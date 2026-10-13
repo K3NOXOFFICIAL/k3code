@@ -352,7 +352,8 @@ providers:                          # the fallback chain, in order (add as many 
   - name: gateway
     kind: openai                    # openai-compatible, or: anthropic
     base_url: https://your-gateway.example/v1
-    api_key_env: GATEWAY_API_KEY    # the NAME of an environment variable (or a key in ~/.config/k3code/env)
+    api_key_env: GATEWAY_API_KEY    # the NAME of an environment variable (or a key in ~/.config/k3code/env);
+                                    #   "" for a server that takes no key (Ollama): no key header is sent
     models:
       default: [model-a, model-b]   # tried in order before moving to the next provider
       strong: model-strong          # planning, review, advisor

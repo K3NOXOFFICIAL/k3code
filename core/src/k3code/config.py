@@ -23,7 +23,7 @@ class ProviderEntry(BaseModel):
     name: str
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
-    api_key_env: str = ""  # required for "openai" / "anthropic"
+    api_key_env: str = ""  # required for "openai" / "anthropic"; "" = the endpoint takes no key (Ollama)
     #: populated by load_config() from the api_key_env var; never set this directly. Not in repr: a logged or
     #: printed config must not carry the key.
     api_key: str = Field(default="", repr=False)
