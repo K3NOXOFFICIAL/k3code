@@ -164,6 +164,8 @@ class AgentLoop:
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
         self.on_checkpoint: Callable[[], None] | None = None
+        #: awaited once the user's prompt joined the conversation, before the first model call (the gateway persists)
+        self.on_turn_start: Callable[[], Awaitable[None]] | None = None
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
         self.take_steer: Callable[[], list[str]] | None = None
         self.approval_callback = approval_callback
@@ -272,6 +274,8 @@ class AgentLoop:
                     messages.append(Message(role="user", content=user_prompt))
                 self.turn_messages = messages  # the resumed transcript replaced the list
         self.reliability.save_transcript(messages)
+        if self.on_turn_start:
+            await self.on_turn_start()  # the prompt is on disk before a slow first answer: a dropped terminal keeps it
 
         for turn in itertools.count():
             if 0 < self.max_turns <= turn:

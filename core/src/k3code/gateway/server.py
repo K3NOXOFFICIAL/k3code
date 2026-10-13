@@ -1960,6 +1960,7 @@ class GatewayServer:
         )
         loop.on_unsandboxed = session.notify_unsandboxed
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
@@ -2400,23 +2401,36 @@ class GatewayServer:
 
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
-    def _checkpoint_turn(self, session: LiveSession) -> None:
+    def _checkpoint_turn(self, session: LiveSession, *, force: bool = False) -> None:
         """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
-        an OOM kill or a reboot loses seconds of work instead of the whole turn."""
+        an OOM kill or a reboot loses seconds of work instead of the whole turn. ``force`` skips the time throttle and
+        leaves its clock alone: the turn's start, which a prompt drained right after the previous turn would otherwise
+        fall inside of, and which must not close the throttle on the turn's first tool call."""
         loop = session.loop
         if loop is None or not loop.turn_messages:
             return
-        if time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if not force and time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
             return
         if session.checkpoint_task is not None and not session.checkpoint_task.done():
             return
-        session.last_checkpoint = time.monotonic()
+        if not force:
+            session.last_checkpoint = time.monotonic()
         messages = _serialize_messages(loop.turn_messages)
         session.stored.messages = messages
         session.stored.model = session.stored.model or self.config.default_model  # keyless: runs on default (#130)
         session.checkpoint_task = asyncio.create_task(
             self._write_checkpoint(session.session_id, messages, session.stored.model)
         )
+
+    async def _checkpoint_turn_start(self, session: LiveSession) -> None:
+        """The turn's prompt reaches the store before the first model call. The write runs off the event loop, so it
+        is awaited here: left in flight it would make the turn's first tool-call checkpoint skip (one write at a time)
+        and that call would not be on disk before the tool runs. Waited with ``asyncio.wait`` as ``_persist_turn``
+        does, so a cancelled turn does not cancel the write."""
+        self._checkpoint_turn(session, force=True)
+        task = session.checkpoint_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
 
     async def _write_checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str) -> None:
         try:
