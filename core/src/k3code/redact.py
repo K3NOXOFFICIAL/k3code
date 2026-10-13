@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import unquote
 
 REDACTED = "<redacted>"
 
@@ -56,17 +57,22 @@ _URL_SECRET = re.compile(
     r"(?i)([?&](?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|key|password|"
     r"passwd|pwd|sig|signature)=)[^&\s\"']+"
 )
-#: A flag that takes a credential: `--token`, `--github-token`, `--pat`, `--api-key`, `--client-secret` ...
+#: A flag that takes a credential: `--token`, `--github-token`, `--pat`, `--api-key`, `--client-secret` ... A `--no-`
+#: flag takes none, and `key` names one only after a credential word (`--sort-key`, `--recv-key` are not secrets).
 _FLAG_NAME = (
-    r"--?(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|token|api[_-]?key|apikey|secret|client[_-]?secret|"
-    r"auth(?:[_-]?(?:token|key))?|bearer|credentials?|access[_-]?key|private[_-]?key|pat|key)"
+    r"--?(?!no[_-])(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|token|apikey|secret|bearer|credentials?|pat|"
+    r"auth(?:[_-]?token)?|(?:api|access|private|secret|client|auth|license|subscription|account|master|signing)[_-]?key)"
 )
 _SECRET_FLAG = re.compile(r"(?i)" + _FLAG_NAME)
 _FLAG_SECRET = re.compile(r"(?i)((?:^|\s)" + _FLAG_NAME + r"(?:=|\s+))[^\s'\"-][^\s'\"]*")
+#: A bare `--key` hides its value only when that is token-shaped (`sort --key=2,2`, `--key docs/a.txt` stay).
+_KEY_FLAG = re.compile(r"(?i)--?key")
+_KEY_FLAG_VALUE = re.compile(r"(?i)((?:^|\s)--?key(?:=|\s+))([^\s'\"-][^\s'\"]*)")
 _URL = re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s'\"<>]+", re.I)
 _TOKEN_CHARS = re.compile(r"[A-Za-z0-9_\-+=~]+")
+_BASE64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
-_SLUG_WORD = re.compile(r"[a-z]+[0-9]{0,4}|[0-9]{1,4}")
+_SLUG_WORD = re.compile(r"[a-z]+[0-9]{0,4}|[0-9]{1,8}")
 
 
 def scrub_text(text: str) -> str:
@@ -80,12 +86,17 @@ def scrub_text(text: str) -> str:
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}{m.group(3)}", text)
     text = _URL_SECRET.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
-    return _FLAG_SECRET.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
+    text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
+    return _KEY_FLAG_VALUE.sub(lambda m: m.group(1) + (REDACTED if _token_shaped(m.group(2), 8) else m.group(2)), text)
 
 
 def _token_shaped(part: str, min_len: int) -> bool:
     """``part`` is a run of base64/hex-like characters of at least ``min_len`` that is not an ordinary word or slug
     (``getting-started-guide``); a false positive hides a harmless value, a miss would leak a credential."""
+    part = unquote(part)  # a percent-encoded token is still a token
+    if "/" in part:  # standard base64; a path, `Europe/Berlin` or `@scope/pkg` is not one
+        mixed = part != part.lower() and part != part.upper() and any(c.isdigit() for c in part)
+        return len(part) >= min_len and bool(_BASE64.fullmatch(part)) and not part.startswith("/") and mixed
     if len(part) < min_len or not _TOKEN_CHARS.fullmatch(part):
         return False
     if _HEX.fullmatch(part):
@@ -133,7 +144,7 @@ def scrub_urls(text: str) -> str:
 def drop_values(obj: Any, secrets: list[str]) -> Any:
     """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
     if isinstance(obj, dict):
-        return {k: drop_values(v, secrets) for k, v in obj.items()}
+        return {drop_values(k, secrets): drop_values(v, secrets) for k, v in obj.items()}
     if isinstance(obj, list):
         return [drop_values(v, secrets) for v in obj]
     if isinstance(obj, str):
@@ -143,25 +154,35 @@ def drop_values(obj: Any, secrets: list[str]) -> Any:
     return obj
 
 
+def _flag_value(flag: str, value: str) -> bool:
+    """``value`` follows ``flag`` in an argv list and is its credential (after a bare ``--key``: if token-shaped)."""
+    return bool(_SECRET_FLAG.fullmatch(flag)) or (bool(_KEY_FLAG.fullmatch(flag)) and _token_shaped(value, 8))
+
+
 def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
     """Deep copy of ``obj`` with secrets replaced by ``"<redacted>"``."""
     if isinstance(obj, dict):
-        return {
-            k: redact(v, _force=_force or is_secret_key(k) or str(k).lower() in _SECRET_SECTIONS, _argv=k == "args")
+        return {  # a key can carry a secret too (`permissions.bash` stores an approved command as the key)
+            redact(k) if isinstance(k, str) else k: redact(
+                v, _force=_force or is_secret_key(k) or str(k).lower() in _SECRET_SECTIONS, _argv=k == "args"
+            )
             for k, v in obj.items()
         }
     if isinstance(obj, list):
         out: list[Any] = []
-        hide_next = False  # an argv-style list: the element after `--token` is the token
+        flag: Any = None  # an argv-style list: the element after `--token` is the token
         for v in obj:
-            if hide_next and isinstance(v, str) and not v.startswith("-"):
+            if isinstance(flag, str) and isinstance(v, str) and not v.startswith("-") and _flag_value(flag, v):
                 out.append(REDACTED)
-                hide_next = False
+                flag = None
                 continue
-            hide_next = isinstance(v, str) and bool(_SECRET_FLAG.fullmatch(v))
-            if _argv and isinstance(v, str) and _token_shaped(v, 20):
-                out.append(REDACTED)  # a lone argument of token shape in an argv list (`args`)
-                continue
+            flag = v
+            if _argv and isinstance(v, str):
+                # a lone argument of token shape in an argv list (`args`); of `--name=value` only the value
+                name, eq, value = v.partition("=") if v.startswith("-") and "=" in v else ("", "", v)
+                if _token_shaped(value, 20):
+                    out.append(f"{name}{eq}{REDACTED}")
+                    continue
             out.append(redact(v, _force=_force))
         return out
     if isinstance(obj, str):
