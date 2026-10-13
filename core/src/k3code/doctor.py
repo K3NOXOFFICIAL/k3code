@@ -46,10 +46,6 @@ def _is_omniroute(name: str, base_url: str) -> bool:
     return any(m in text for m in OMNIROUTE_MARKERS)
 
 
-async def _noop_probe() -> tuple[bool, float | None, str]:
-    return True, None, "local"
-
-
 async def _probe_provider(base_url: str, timeout: float = 5.0) -> tuple[bool, float | None, str]:
     start = time.monotonic()
     try:
@@ -76,6 +72,14 @@ async def _probe_key(p: Any) -> tuple[bool, float | None, str]:
     return False, ms, detail
 
 
+async def _probe_claude_login() -> tuple[bool, float | None, str]:
+    """`claude` on PATH is not a login. Only a Claude Code that says it is logged out fails; no answer is fine."""
+    from k3code.providers import claude_cli
+
+    logged_in = await asyncio.to_thread(claude_cli.login_status)
+    return logged_in is not False, None, "not logged in" if logged_in is False else "local"
+
+
 async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     checks: list[Check] = []
     if not config.providers:
@@ -84,7 +88,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     if probe:
         results = await asyncio.gather(
             *(
-                _noop_probe()
+                _probe_claude_login()
                 if p.kind == "claude-cli"
                 else _probe_key(p)  # a keyless entry (api_key_env "") lists its models without a key
                 if p.api_key or not p.api_key_env or os.environ.get(p.api_key_env)
@@ -95,14 +99,16 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     for i, p in enumerate(config.providers):
         if p.kind == "claude-cli":  # local binary, nothing to reach over HTTP
             path = shutil.which("claude")
+            logged_out = bool(path and probe and not results[i][0])
+            if not path:
+                status, detail = FAIL, "Claude Code CLI not found on PATH"
+                fix = "install Claude Code and run `claude` once to log in, or remove this entry"
+            elif logged_out:
+                status, detail, fix = WARN, f"Claude Code CLI at {path}, but not logged in", "run `claude`, then /login"
+            else:
+                status, detail, fix = OK, f"Claude Code CLI at {path}", ""
             checks.append(
-                Check(
-                    f"provider:{p.name}",
-                    OK if path else FAIL,
-                    f"Claude Code CLI at {path}" if path else "Claude Code CLI not found on PATH",
-                    "" if path else "install Claude Code and run `claude` once to log in, or remove this entry",
-                    {"kind": "claude-cli", "command": path or ""},
-                )
+                Check(f"provider:{p.name}", status, detail, fix, {"kind": "claude-cli", "command": path or ""})
             )
             continue
         if not probe:

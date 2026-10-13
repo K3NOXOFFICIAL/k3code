@@ -73,8 +73,10 @@ TIER_MODELS: dict[str, dict[str, str]] = {
 }
 
 
-def detect_providers() -> dict[str, str]:
-    """What is already usable here: provider -> why (a key in the environment, the claude command, Ollama)."""
+def detect_providers(*, do_probe: bool = True) -> dict[str, str]:
+    """What is already usable here: provider -> why (a key in the environment, a Claude Code login, Ollama).
+
+    The claude command alone is not a login: with ``do_probe``, a Claude Code that says it is logged out is left out."""
     found: dict[str, str] = {}
     env_file = read_env_file()
     for name in ("anthropic", "openai", "openrouter"):
@@ -82,11 +84,20 @@ def detect_providers() -> dict[str, str]:
         if os.environ.get(var) or env_file.get(var):
             found[name] = f"{var} is set"
     if shutil.which("claude"):
-        found["claude-cli"] = "the claude command is installed"
+        logged_in = _claude_login() if do_probe else None
+        if logged_in is not False:
+            found["claude-cli"] = "Claude Code is logged in" if logged_in else "the claude command is installed"
     ok, _ms, _detail = probe.probe_url(probe.PRESETS["local"]["base_url"].rsplit("/v1", 1)[0], timeout=0.4)
     if ok:
         found["local"] = "Ollama is running"
     return found
+
+
+def _claude_login() -> bool | None:
+    """Whether Claude Code is logged in (None = cannot tell); see ``claude_cli.login_status``."""
+    from k3code.providers import claude_cli
+
+    return claude_cli.login_status()
 
 
 def _default_provider(found: dict[str, str]) -> str:
@@ -192,7 +203,7 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
 
 def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     """Fast setup: one provider with defaults for everything else. Picks what is already set up here first."""
-    found = detect_providers() if p.interactive else {}
+    found = detect_providers(do_probe=do_probe) if p.interactive else {}
     for name, why in found.items():
         p.say(f"  found {name}: {why}")
     labels = {n: f"{n:<11} {PROVIDER_HELP[n]}" + ("  (found)" if n in found else "") for n in PROVIDERS}
@@ -209,6 +220,8 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     if kind == "claude-cli":
         if shutil.which("claude") is None:
             p.say("  NOTE: the `claude` command is not on PATH yet; install Claude Code before the first turn.")
+        elif do_probe and _claude_login() is False:
+            p.say("  NOTE: Claude Code is not logged in, so the first turn would fail: run `claude`, then /login.")
         entry: dict[str, Any] = {"name": "claude-cli", "kind": "claude-cli"}
         tiers = dict(TIER_MODELS["claude-cli"])
     else:
