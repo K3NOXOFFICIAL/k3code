@@ -110,13 +110,15 @@ def curate(
     marks = {name: {"state": "stale", "reason": why, "at": now} for name, why in stale}
     if root.is_dir():
         private_file(root / ".curator.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
+    # a skill is listed by its frontmatter name, but it is archived by the directory it lives in
+    dirs = {s["name"]: s["dir"].name for s in skills}
     proposals: list[Proposal] = []
     for keep, drop, sim in find_duplicates(skills):
         p = store.add(
             "skill",
             f"Skills '{keep}' and '{drop}' overlap ({int(sim * 100)}%) → merge (archive '{drop}')?",
             f"archive skill {drop}",
-            payload={"op": "merge", "keep": keep, "drop": drop, "similarity": sim},
+            payload={"op": "merge", "keep": keep, "drop": drop, "dir": dirs[drop], "similarity": sim},
             key=dedup_key("skill", f"merge {keep} {drop}"),
         )
         if p:
@@ -126,12 +128,23 @@ def curate(
             "skill",
             f"Skill '{name}' looks stale ({why}) → archive it?",
             f"archive skill {name}",
-            payload={"op": "archive", "drop": name},
+            payload={"op": "archive", "drop": name, "dir": dirs[name]},
             key=dedup_key("skill", f"stale {name}"),
         )
         if p:
             proposals.append(p)
     return {"stale": stale, "proposals": proposals}
+
+
+def _skill_dir(root: Path, name: str) -> Path | None:
+    """``root/<name>`` when ``name`` is a skill directory that sits directly in ``root``, else None.
+
+    ``list_skills`` skips ``.`` and ``_`` entries (``_archive``, ``_drafts``), so they are never a skill to archive.
+    """
+    src = root / name
+    if not name or name.startswith((".", "_")) or src.parent.resolve() != root.resolve():
+        return None
+    return src if src.is_dir() else None
 
 
 def apply(payload: dict[str, Any], root: Path | None = None) -> str:
@@ -145,10 +158,12 @@ def apply(payload: dict[str, Any], root: Path | None = None) -> str:
         shutil.move(str(src.parent), str(dest))
         return f"skill saved to {dest}"
     if op in ("merge", "archive"):
-        src = root / payload["drop"]
-        if not src.is_dir():
+        # `dir` is the directory name; a proposal queued before it existed only has the frontmatter name in `drop`
+        name = str(payload.get("dir") or payload["drop"])
+        src = _skill_dir(root, name)
+        if src is None:
             return f"skill {payload['drop']} not found"
-        dest = root / "_archive" / payload["drop"]
+        dest = root / "_archive" / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         return f"archived {payload['drop']} → {dest}"

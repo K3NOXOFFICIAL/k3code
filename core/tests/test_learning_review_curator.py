@@ -110,6 +110,84 @@ def test_curator_dedup_stale_and_archive(tmp_path, monkeypatch):
     assert (home / "skills" / "deploy").is_dir()  # stale skills are only marked, never deleted
 
 
+def _old_skill(home, dirname, frontmatter_name, clock):
+    import os
+
+    d = home / "skills" / dirname
+    d.mkdir(parents=True)
+    md = d / "SKILL.md"
+    md.write_text(f"---\nname: {frontmatter_name}\ndescription: an old skill\n---\nbody\n")
+    old = clock() - 40 * 86400
+    os.utime(md, (old, old))
+    return d
+
+
+def test_curator_archives_a_skill_by_its_directory_not_its_frontmatter_name(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    clock = FakeClock()
+    d = _old_skill(home, "deploy-v2", "Deploy service", clock)  # the directory differs from the frontmatter name
+    res = curator.curate(ProposalStore(tmp_path), now=clock(), stale_days=30)
+    (p,) = res["proposals"]
+    assert p.payload["dir"] == "deploy-v2" and p.payload["drop"] == "Deploy service"
+    assert "archived" in curator.apply(p.payload)
+    assert not d.exists() and (home / "skills" / "_archive" / "deploy-v2" / "SKILL.md").is_file()
+
+
+def test_curator_merge_archives_the_dropped_skill_by_its_directory(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    clock = FakeClock()
+    for dirname, name in (("a-dir", "Lint Fix"), ("b-dir", "Lint Repair")):
+        d = home / "skills" / dirname
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: fix lint warnings\n---\nrun the linter\n")
+    res = curator.curate(ProposalStore(tmp_path), now=clock(), stale_days=30)
+    (p,) = [p for p in res["proposals"] if p.payload["op"] == "merge"]
+    assert p.payload["dir"] in ("a-dir", "b-dir")
+    assert "archived" in curator.apply(p.payload)
+    assert (home / "skills" / "_archive" / p.payload["dir"]).is_dir()
+    assert not (home / "skills" / p.payload["dir"]).exists()
+
+
+def test_curator_hostile_frontmatter_name_cannot_move_a_directory_outside_the_skills_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    clock = FakeClock()
+    outside = home / "outside"  # a sibling of the skills dir, reached as skills/../outside
+    outside.mkdir(parents=True)
+    (outside / "keep.txt").write_text("mine")
+    d = _old_skill(home, "evil", "../outside", clock)
+    (p,) = curator.curate(ProposalStore(tmp_path), now=clock(), stale_days=30)["proposals"]
+    curator.apply(p.payload)
+    assert (outside / "keep.txt").read_text() == "mine"
+    assert not d.exists() and (home / "skills" / "_archive" / "evil").is_dir()
+
+
+def test_curator_apply_rejects_a_payload_path_outside_the_skills_root(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    (home / "skills" / "real").mkdir(parents=True)
+    for victim in (home / "x", tmp_path / "abs-victim"):
+        victim.mkdir()
+    hostile = ["../x", "..", ".", "", "real/..", str(tmp_path / "abs-victim"), "_archive", ".usage.json"]
+    for op in ("archive", "merge"):
+        for key in ("dir", "drop"):  # a payload from before `dir` existed carries only `drop`
+            for bad in hostile:
+                msg = curator.apply({"op": op, key: bad, "drop": bad})
+                assert msg.startswith("skill ") and "not found" in msg, (op, key, bad, msg)
+    assert (home / "x").is_dir() and (tmp_path / "abs-victim").is_dir() and (home / "skills" / "real").is_dir()
+    assert not (home / "skills" / "_archive").exists()
+
+
+def test_curator_apply_still_archives_a_payload_that_has_only_a_drop_name(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    (home / "skills" / "old-style").mkdir(parents=True)  # a proposal queued before `dir` was added
+    assert "archived" in curator.apply({"op": "archive", "drop": "old-style"})
+    assert (home / "skills" / "_archive" / "old-style").is_dir()
+
+
 def test_facts_section_roundtrip(tmp_path):
     md = tmp_path / "K3CODE.md"
     md.write_text("# A\ntext\n")
