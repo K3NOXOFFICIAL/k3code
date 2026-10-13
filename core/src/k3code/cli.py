@@ -955,6 +955,18 @@ def service_status() -> None:
     click.echo("\n".join(service.status()))
 
 
+@service_group.command("restart")
+def service_restart() -> None:
+    """Restart the daemon unit. Also clears the start limit a crash loop hit."""
+    from k3code import service
+
+    try:
+        service.restart()
+    except service.ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"restarted {service.UNIT_NAME}")
+
+
 @cli.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 @click.option("--no-probe", is_flag=True, help="Skip network probes")

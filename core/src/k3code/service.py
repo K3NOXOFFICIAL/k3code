@@ -1,4 +1,4 @@
-"""``k3code service install|uninstall|status``: manage the systemd *user* unit for the daemon."""
+"""``k3code service install|uninstall|status|restart``: manage the systemd *user* unit for the daemon."""
 
 from __future__ import annotations
 
