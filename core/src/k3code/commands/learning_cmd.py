@@ -57,10 +57,20 @@ class OptimizerCommand(CommandDef):
         if sub == "run":
             live = ctx.sessions.get(session_id) if session_id else None
             m = hub.metrics(since=hub.clock() - 7 * 86400)
+            known = {x["id"] for x in hub.experiments.all()}
             made = await hub.run_optimizer(live)  # metric proposals, replayed token candidates, gated auto-apply
-            return reply(
+            lines = [
                 f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); {len(made)} new overlay proposal(s)."
-            )
+            ]
+            applied = [x for x in hub.experiments.all() if x["id"] not in known]
+            if not hub.cfg["optimizer"]["enabled"]:
+                lines.append(
+                    "Optimizer is off (learning.optimizer.enabled: true opts in): analysis only, nothing was applied."
+                )
+            elif applied:
+                lines.append("Applied automatically:")
+                lines += [f"- {x['id']}: {x['title']} (undo: /optimizer rollback {x['id']})" for x in applied]
+            return reply("\n".join(lines))
         if sub == "rollback":
             if len(parts) < 2:
                 return reply("Usage: /optimizer rollback <id>")
