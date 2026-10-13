@@ -49,73 +49,115 @@ def _conf(n: int, base: int = 3) -> float:
     return round(min(0.95, 0.5 + 0.1 * (n - base + 1)), 2) if n >= base else round(0.3 + 0.05 * n, 2)
 
 
-def derive(log: DecisionLog, *, min_evidence: int = 3) -> tuple[list[Preference], list[dict[str, Any]]]:
-    """Deterministic pattern extraction. Returns (preferences, task_tier suggestions)."""
+#: Decisions older than this do not count towards a learned preference (the log itself keeps a year).
+PREFERENCE_WINDOW_DAYS = 90
+
+_DERIVED_KINDS = ("model_switch", "plan", "approval", "interrupt", "scope", "proposal")
+
+
+def _sessions(rows: list[dict[str, Any]]) -> int:
+    """Distinct sessions in ``rows``; a row that names no session counts as its own."""
+    return len({r["session"] or f"row:{r['id']}" for r in rows})
+
+
+def _by(rows: list[dict[str, Any]], key: Callable[[dict[str, Any]], Any]) -> dict[Any, list[dict[str, Any]]]:
+    groups: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        groups[key(r)].append(r)
+    return groups
+
+
+def derive(
+    log: DecisionLog, *, min_evidence: int = 3, since: float | None = None
+) -> tuple[list[Preference], list[dict[str, Any]]]:
+    """Deterministic pattern extraction. Returns (preferences, task_tier suggestions).
+
+    A preference ends up in the user's memory until the next run drops it, so it must rest on a habit, not on a
+    long log: only decisions since ``since`` count, nine repeats inside one session are one session of evidence, and
+    the sessions must repeat in one project (a stray row in each of three projects is no habit). A pattern that
+    qualifies in several projects keeps its strongest evidence; one that two projects judge in opposite ways
+    (welcomed in one, disliked in the other) is no trait of the user and is dropped."""
+    rows = {kind: log.query(kind, since=since) for kind in _DERIVED_KINDS}
+    best: dict[str, Preference] = {}
+    tiers: dict[tuple[str, str], dict[str, Any]] = {}
+    for project in sorted({r["project"] for rs in rows.values() for r in rs}):
+        in_project = {kind: [r for r in rs if r["project"] == project] for kind, rs in rows.items()}
+        prefs, suggestions = _derive_in_project(in_project, min_evidence)
+        for p in prefs:
+            if p.key not in best or p.evidence > best[p.key].evidence:
+                best[p.key] = p
+        for s in suggestions:
+            kept = tiers.get((s["model"], s["task_kind"]))
+            if kept is None or s["evidence"] > kept["evidence"]:
+                tiers[(s["model"], s["task_kind"])] = s
+    for key in [k for k in best if k.startswith("prop+:") and f"prop-:{k[6:]}" in best]:
+        del best[key], best[f"prop-:{key[6:]}"]
+    prefs = sorted(best.values(), key=lambda p: (-p.confidence, -p.evidence, p.text))
+    return prefs, list(tiers.values())
+
+
+def _derive_in_project(
+    rows: dict[str, list[dict[str, Any]]], min_evidence: int
+) -> tuple[list[Preference], list[dict[str, Any]]]:
+    """The patterns of one project's decisions; evidence is counted in sessions."""
     prefs: list[Preference] = []
+    suggestions: list[dict[str, Any]] = []
 
     def add(key: str, text: str, n: int) -> None:
         prefs.append(Preference(text=text, confidence=_conf(n, min_evidence), evidence=n, key=key))
 
     # model switches: moving away from model X
-    away: Counter[tuple[str, str]] = Counter()
-    tiers: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
-    for r in log.query("model_switch"):
-        d = r["detail"]
-        kind = d.get("task_kind") or ""
-        away[(d.get("from", ""), kind)] += 1
-        if kind and d.get("to_tier"):
-            tiers[(d.get("from", ""), kind)][d["to_tier"]] += 1
-    suggestions: list[dict[str, Any]] = []
-    for (model, kind), n in away.items():
+    for (model, kind), switches in _by(
+        rows["model_switch"], lambda r: (r["detail"].get("from", ""), r["detail"].get("task_kind") or "")
+    ).items():
+        n = _sessions(switches)
         if n >= min_evidence and model:
             add(f"avoid:{model}:{kind}", f"avoids model {model}" + (f" for {kind} tasks" if kind else ""), n)
-            if kind and tiers[(model, kind)]:
-                tier, tn = tiers[(model, kind)].most_common(1)[0]
-                if tn >= min_evidence:
-                    suggestions.append({"model": model, "task_kind": kind, "tier": tier, "evidence": tn})
+            to_tier = _by(
+                [r for r in switches if kind and r["detail"].get("to_tier")], lambda r: r["detail"]["to_tier"]
+            )
+            if to_tier:
+                tier, moved = max(to_tier.items(), key=lambda kv: _sessions(kv[1]))
+                if _sessions(moved) >= min_evidence:
+                    suggestions.append({"model": model, "task_kind": kind, "tier": tier, "evidence": _sessions(moved)})
 
     # plans
-    plans = log.query("plan")
-    no_verif = sum(
-        1 for r in plans if r["choice"] in ("deny", "rejected") and r["detail"].get("has_verification") is False
+    plans = rows["plan"]
+    no_verif = _sessions(
+        [r for r in plans if r["choice"] in ("deny", "rejected") and r["detail"].get("has_verification") is False]
     )
     if no_verif >= max(2, min_evidence - 1):
         add("plan:verification", "rejects plans without verification steps", no_verif)
-    edited = sum(1 for r in plans if r["detail"].get("edited"))
+    edited = _sessions([r for r in plans if r["detail"].get("edited")])
     if edited >= min_evidence:
         add("plan:edits", "usually edits plans before approving them", edited)
 
     # approvals
-    tests = [r for r in log.query("approval") if r["choice"] != "deny" and TEST_RE.search(r["subject"])]
-    if len(tests) >= min_evidence + 2:
-        add("approve:tests", "always wants tests run (approves test commands without friction)", len(tests))
+    tests = [r for r in rows["approval"] if r["choice"] != "deny" and TEST_RE.search(r["subject"])]
+    if _sessions(tests) >= min_evidence + 2:
+        add("approve:tests", "always wants tests run (approves test commands without friction)", _sessions(tests))
     # interrupts
-    ints = Counter(r["subject"] for r in log.query("interrupt") if r["subject"])
-    for what, n in ints.items():
-        if n >= min_evidence:
-            add(f"interrupt:{what}", f"often interrupts `{what}` steps; prefer smaller steps there", n)
+    for what, interrupts in _by([r for r in rows["interrupt"] if r["subject"]], lambda r: r["subject"]).items():
+        if _sessions(interrupts) >= min_evidence:
+            add(
+                f"interrupt:{what}",
+                f"often interrupts `{what}` steps; prefer smaller steps there",
+                _sessions(interrupts),
+            )
     # scope overrides
-    sc = Counter(r["choice"] for r in log.query("scope"))
-    for level, n in sc.items():
-        if n >= min_evidence:
-            add(f"scope:{level}", f"often overrides task scope to '{level}'", n)
-    # undo
-    undo = log.count("undo")
-    if undo >= min_evidence:
-        add("undo", "frequently rolls back changes; prefer small, reviewable edits", undo)
+    for level, overrides in _by(rows["scope"], lambda r: r["choice"]).items():
+        if _sessions(overrides) >= min_evidence:
+            add(f"scope:{level}", f"often overrides task scope to '{level}'", _sessions(overrides))
     # proposals by kind
-    by_kind: dict[str, Counter[str]] = defaultdict(Counter)
-    for r in log.query("proposal"):
-        by_kind[r["detail"].get("kind") or "?"][r["choice"]] += 1
-    for kind, c in by_kind.items():
-        tot = c["accept"] + c["dismiss"]
-        if tot >= min_evidence:
-            rate = c["accept"] / tot
+    for kind, proposals in _by(rows["proposal"], lambda r: r["detail"].get("kind") or "?").items():
+        decided = [r for r in proposals if r["choice"] in ("accept", "dismiss")]
+        n = _sessions(decided)
+        if n >= min_evidence:
+            rate = sum(1 for r in decided if r["choice"] == "accept") / len(decided)
             if rate >= 0.75:
-                add(f"prop+:{kind}", f"welcomes '{kind}' proposals", tot)
+                add(f"prop+:{kind}", f"welcomes '{kind}' proposals", n)
             elif rate <= 0.25:
-                add(f"prop-:{kind}", f"dislikes '{kind}' proposals; propose them rarely", tot)
-    prefs.sort(key=lambda p: (-p.confidence, -p.evidence, p.text))
+                add(f"prop-:{kind}", f"dislikes '{kind}' proposals; propose them rarely", n)
     return prefs, suggestions
 
 
@@ -403,9 +445,10 @@ async def distill(
     proposals: ProposalStore | None = None,
     mem0_post: Any = None,
     min_evidence: int = 3,
+    window_days: float = PREFERENCE_WINDOW_DAYS,
     session_id: str = "",
 ) -> list[Preference]:
-    prefs, suggestions = derive(log, min_evidence=min_evidence)
+    prefs, suggestions = derive(log, min_evidence=min_evidence, since=log.clock() - window_days * 86400)
     prefs = await polish(caller, prefs, session_id=session_id)
     last = [p.text for p in load_preferences(home, top=1_000_000)]  # what the previous run wrote, to migrate USER.md
     write_auto_section(user_md, prefs, known=last)
