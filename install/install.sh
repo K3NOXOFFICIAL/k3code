@@ -706,6 +706,17 @@ recorded_version() {
   printf '%s' "$found"
 }
 
+plain_url() { # plain_url URL: an http(s) URL without its user:password@ part, so no credential is ever stored
+  case "$1" in
+    http://* | https://*)
+      pu_rest=${1#*://}
+      pu_auth=${pu_rest%%/*}
+      printf '%s://%s%s\n' "${1%%://*}" "${pu_auth##*@}" "${pu_rest#"$pu_auth"}"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 installed_ref() { # the ref the active version was built from, if it was recorded
   if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
   return 0
@@ -986,7 +997,10 @@ install_version() {
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
   if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
+  if [ "$FROM" = git ]; then
+    printf '%s\n' "$REF" >"$VERDIR/.ref"
+    plain_url "$GIT_URL" >"$VERDIR/.url" # `k3code update` follows the same remote (a fork or mirror, not upstream)
+  fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
