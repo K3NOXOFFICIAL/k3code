@@ -413,29 +413,22 @@ def find_repo_root() -> Path | None:
 
 
 def check_tui() -> Check:
-    from k3code.paths import find_node
+    from k3code.paths import MIN_NODE_MAJOR, NODE_ENV, resolve_node
 
-    node = find_node()
+    choice = resolve_node()
     root = find_repo_root()
     entry = root / "tui" / "dist" / "entry.js" if root else None
-    version = ""
-    if node:
-        r = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
-        version = r.stdout.strip()
-    if not node:
-        return Check("tui", FAIL, "node not found", "install Node.js >= 20")
-    major = int(version.lstrip("v").split(".")[0] or 0) if version else 0
+    fix = f"install Node.js >= {MIN_NODE_MAJOR}, run the k3code installer, or set {NODE_ENV}"
+    if not choice.path:
+        status = WARN if choice.old else FAIL
+        return Check("tui", status, choice.reason, fix, {"node": choice.old.split(" ")[0]} if choice.old else {})
+    used = f"node {choice.version} ({choice.reason}: {choice.path})"
+    data = {"node": choice.version, "path": choice.path, "source": choice.source}
     if entry is None or not entry.is_file():
-        return Check(
-            "tui",
-            WARN,
-            f"node {version}, TUI build missing",
-            "cd tui && npm install && npm run build",
-            {"node": version},
-        )
-    if major < 20:
-        return Check("tui", WARN, f"node {version} is old", "upgrade to Node.js >= 20", {"node": version})
-    return Check("tui", OK, f"node {version}, tui/dist/entry.js present", data={"node": version})
+        return Check("tui", WARN, f"{used}, TUI build missing", "cd tui && npm install && npm run build", data)
+    if choice.major < MIN_NODE_MAJOR:  # only K3CODE_NODE can name a node that old
+        return Check("tui", WARN, f"{used} is old", f"use Node.js >= {MIN_NODE_MAJOR} (or unset {NODE_ENV})", data)
+    return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
 
 
 def check_home(home: Path) -> Check:

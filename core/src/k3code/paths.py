@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 #: Environment variables that point a process at the daemon's socket. Never passed to a child process: only an
@@ -96,14 +98,88 @@ def install_roots(module_file: Path | None = None) -> list[Path]:
     return roots
 
 
-def find_node() -> str | None:
-    """``node`` on PATH, else the one the installer put in ``<data>/node/<ver>/bin``."""
+#: The oldest Node major the TUI runs on (install.sh asks for the same).
+MIN_NODE_MAJOR = 20
+#: Environment variable that names the node to use, whatever its version.
+NODE_ENV = "K3CODE_NODE"
+
+
+@dataclass(frozen=True)
+class NodeChoice:
+    """The node ``find_node`` settled on, or why there is none."""
+
+    path: str | None
+    version: str = ""  # "v22.23.3"
+    source: str = ""  # "K3CODE_NODE", "private" or "PATH"
+    reason: str = ""  # why this node was chosen, or what is wrong when ``path`` is None
+    old: str = ""  # a node that was found but is older than MIN_NODE_MAJOR, "v18.19.1 at /usr/bin/node"
+
+    @property
+    def major(self) -> int:
+        return _parse_node_version(self.version)[0]
+
+
+def _parse_node_version(text: str) -> tuple[int, int, int]:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+
+
+def _node_version(path: str) -> str:
+    """``node --version`` of ``path`` ("v22.23.3"), or "" when it does not run or prints no version."""
+    import subprocess
+
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.match(r"\s*v(\d+\.\d+\.\d+)", out)
+    return f"v{m.group(1)}" if m else ""
+
+
+def resolve_node() -> NodeChoice:
+    """Pick the node that runs the TUI: ``K3CODE_NODE``, else the installer's private Node, else one on PATH.
+
+    The private Node (``<data>/node/<ver>/bin/node``, newest first) and the PATH node must both be at least
+    ``MIN_NODE_MAJOR``: an old distro node first on PATH used to win and crash the TUI at start. ``K3CODE_NODE`` is
+    taken as given (an explicit choice), but a value that is not a working node is an error, never a silent fallback.
+    """
     import shutil
 
-    found = shutil.which("node")
-    if found:
-        return found
-    for cand in sorted((data_dir() / "node").glob("*/bin/node"), reverse=True):
-        if cand.is_file():
-            return str(cand)
-    return None
+    fix = f"set {NODE_ENV} to a node binary, or run the k3code installer (it fetches a private Node)"
+    explicit = os.environ.get(NODE_ENV, "").strip()
+    if explicit:
+        found = shutil.which(os.path.expanduser(explicit))
+        version = _node_version(found) if found else ""
+        if not found or not version:
+            return NodeChoice(None, reason=f"{NODE_ENV}={explicit} is not a working node; {fix}")
+        return NodeChoice(found, version, NODE_ENV, f"set by {NODE_ENV}")
+    privates = sorted(
+        (p for p in (data_dir() / "node").glob("*/bin/node") if p.is_file()),
+        key=lambda p: _parse_node_version(p.parent.parent.name),
+        reverse=True,
+    )
+    candidates = [("private", str(p), "the private Node from the installer") for p in privates]
+    if on_path := shutil.which("node"):
+        candidates.append(("PATH", on_path, "the node on PATH"))
+    old = ""
+    for source, path, what in candidates:
+        version = _node_version(path)
+        if not version:
+            continue
+        if _parse_node_version(version)[0] < MIN_NODE_MAJOR:
+            old = old or f"{version} at {path}"
+            continue
+        return NodeChoice(path, version, source, f"{what}, Node >= {MIN_NODE_MAJOR}")
+    if old:
+        return NodeChoice(None, reason=f"Node >= {MIN_NODE_MAJOR} required (found {old}); {fix}", old=old)
+    return NodeChoice(None, reason=f"Node >= {MIN_NODE_MAJOR} not found; {fix}")
+
+
+def find_node() -> str | None:
+    """The node to run the TUI with (see ``resolve_node``), or None."""
+    return resolve_node().path
+
+
+def node_problem() -> str:
+    """Why ``find_node`` found nothing, as one sentence for the user."""
+    return resolve_node().reason
