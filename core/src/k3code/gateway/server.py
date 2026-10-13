@@ -24,6 +24,7 @@ import copy
 import dataclasses
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -4038,6 +4039,33 @@ async def _complete_slash(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"items": items[:50], "replace_from": 1}
 
 
+#: directory entries `complete.path` looks at before it stops reading; the rest of a huge directory is not offered
+COMPLETE_PATH_SCAN_CAP = 2000
+
+
+def _scan_path_matches(directory: Path, stem: str) -> list[tuple[str, bool]]:
+    """``(name, is_dir)`` of the entries in ``directory`` that complete ``stem``: at most 50, directories first.
+
+    Blocking; the caller runs it on a worker thread. Reads at most ``COMPLETE_PATH_SCAN_CAP`` entries and sorts
+    only the matches."""
+    low = stem.lower()
+    matches: list[tuple[str, bool]] = []
+    with os.scandir(directory) as it:
+        for entry in itertools.islice(it, COMPLETE_PATH_SCAN_CAP):
+            name = entry.name
+            if name.startswith(".") and not stem.startswith("."):
+                continue
+            if not name.lower().startswith(low):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            matches.append((name, is_dir))
+    matches.sort(key=lambda m: (not m[1], m[0].lower()))
+    return matches[:50]
+
+
 async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """Path completion for ``@file`` / ``./x`` words, relative to the session's directory."""
     word = str(params.get("word", ""))
@@ -4049,24 +4077,19 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     stem = "" if raw.endswith("/") else expanded.name
     items: list[dict[str, str]] = []
     try:
-        for entry in sorted(directory.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if entry.name.startswith(".") and not stem.startswith("."):
-                continue
-            if not entry.name.lower().startswith(stem.lower()):
-                continue
-            shown = raw[: len(raw) - len(stem)] + entry.name + ("/" if entry.is_dir() else "")
-            items.append(
-                {
-                    "text": ("@" if word.startswith("@") else "") + shown,
-                    "display": shown,
-                    "meta": "dir" if entry.is_dir() else "file",
-                    "kind": "path",
-                }
-            )
-            if len(items) >= 50:
-                break
+        matches = await asyncio.to_thread(_scan_path_matches, directory, stem)
     except OSError:
-        pass
+        matches = []
+    for name, is_dir in matches:
+        shown = raw[: len(raw) - len(stem)] + name + ("/" if is_dir else "")
+        items.append(
+            {
+                "text": ("@" if word.startswith("@") else "") + shown,
+                "display": shown,
+                "meta": "dir" if is_dir else "file",
+                "kind": "path",
+            }
+        )
     return {"items": items}
 
 
