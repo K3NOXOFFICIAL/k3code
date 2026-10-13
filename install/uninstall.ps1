@@ -1,6 +1,6 @@
 <#
 Remove k3code from Windows: runs install/uninstall.sh in the WSL distribution install.ps1 used, then
-deletes the k3code.exe/k3.exe launchers (or k3code.cmd/k3.cmd shims) and their PATH entry. Your data in WSL (~/.k3code, ~/.config/k3code)
+deletes the k3code.exe/k3.exe launchers (or k3code.cmd/k3.cmd shims) and their PATH entry. Your data in WSL (~/.k3code, ~/.config/k3code, ~/.config/tuios)
 is kept unless you pass -Purge.
 
   powershell -ExecutionPolicy Bypass -File install\uninstall.ps1 [-Purge] [-WindowsOnly]

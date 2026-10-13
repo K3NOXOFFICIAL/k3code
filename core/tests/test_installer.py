@@ -140,6 +140,37 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert not (tmp_path / ".k3code").exists()
 
 
+def test_purge_also_removes_the_k3_pane_config(tmp_path: Path) -> None:
+    # the k3 binary writes its default config to ~/.config/tuios/config.toml on its first start
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    pane_config = tmp_path / ".config" / "tuios"
+    pane_config.mkdir(parents=True)
+    (pane_config / "config.toml").write_text("[appearance]\n")
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert (pane_config / "config.toml").is_file()  # a plain uninstall keeps it, like the rest of your settings
+    assert str(pane_config) in r.stdout
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert not pane_config.exists()
+
+
+def test_uninstall_names_the_shared_caches_it_leaves(tmp_path: Path) -> None:
+    # uv and npm fill these while installing; other projects use them too, so they stay, and the output says where
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert "uv cache" not in r.stdout and "npm cache" not in r.stdout  # nothing there, nothing to name
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    (tmp_path / ".cache" / "uv").mkdir(parents=True)
+    (tmp_path / ".npm" / "_cacache").mkdir(parents=True)
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert f"{tmp_path / '.cache' / 'uv'} (uv cache clean)" in r.stdout
+    assert f"{tmp_path / '.npm'} (npm cache clean --force)" in r.stdout
+    assert (tmp_path / ".cache" / "uv").is_dir() and (tmp_path / ".npm" / "_cacache").is_dir()
+
+
 def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
     # Git Bash / MSYS / Cygwin: install.sh cannot install there and says to use install.ps1 (WSL) instead.
     fake = tmp_path / "fakebin"
@@ -218,6 +249,49 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / ".local" / "share" / "k3code").exists()
     assert not (appdata / "k3code").exists()
+
+
+SHIM_DIR = "C:\\Users\\k\\AppData\\Local\\k3code\\bin"
+LOCAL_APPDATA = "C:\\Users\\k\\AppData\\Local"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(
+    ("user_path", "expected"),
+    [
+        (f"C:\\Windows;{SHIM_DIR}", True),
+        (f"C:\\Windows;{SHIM_DIR}\\", True),  # the finding: a trailing backslash was added a second time
+        (f"C:\\Windows;{SHIM_DIR}\\\\", True),
+        ("C:\\Windows;c:\\users\\K\\APPDATA\\local\\K3CODE\\Bin", True),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code\\bin", True),  # the registry value keeps %VARIABLES% unexpanded
+        ("%LOCALAPPDATA%\\K3CODE\\BIN\\;C:\\Windows", True),
+        (f"C:\\Windows;;{SHIM_DIR};", True),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code\\bin2", False),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code", False),
+        (f"C:\\Windows;{SHIM_DIR}\\sub", False),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code", False),
+        ("C:\\Windows;;", False),
+        ("", False),
+    ],
+)
+def test_install_ps1_path_check_ignores_how_the_entry_is_spelled(user_path: str, expected: bool) -> None:
+    # The user PATH is read unexpanded from the registry. An entry that differs from the shim directory only by a
+    # trailing backslash, case or %VARIABLE% spelling is the same directory and must not be appended again. The check
+    # is one function: only that function is loaded from the script (the script itself needs Windows and WSL to run).
+    script = REPO / "install" / "install.ps1"
+    command = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script}', [ref]$null, [ref]$null); "
+        "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+        "-and $n.Name -eq 'Test-OnPath' }, $true); "
+        "if (-not $fn) { [Console]::Error.WriteLine('no function Test-OnPath in install.ps1'); exit 2 }; "
+        "Invoke-Expression $fn.Extent.Text; "
+        f"[Console]::Out.Write((Test-OnPath '{user_path}' '{SHIM_DIR}'))"
+    )
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"), "LOCALAPPDATA": LOCAL_APPDATA}
+    cmd = ["pwsh", "-NoProfile", "-Command", command]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ("True" if expected else "False"), user_path
 
 
 def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
@@ -497,6 +571,49 @@ def test_from_git_branch_falls_back_to_the_installed_build_when_offline(tmp_path
     assert "could not fetch 'main'" in again.stderr
     assert "Using the installed version" in again.stderr
     assert (home / ".local" / "bin" / "k3code").is_symlink()
+
+
+def test_from_source_on_a_commit_installed_from_git_becomes_a_source_install(tmp_path: Path) -> None:
+    # A git build and a source build of one commit share the version name `X.Y.Z-src.<sha>`, so the second run found
+    # the version complete and returned early: `k3code update` still took the install for a git install (.ref kept,
+    # no source_path) and followed the remote branch instead of the checkout.
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "versions" / ver / ".ref").is_file() and not (data / "source_path").exists()
+
+    again = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr  # the early return is the path under test
+    assert (data / "source_path").read_text().strip() == str(src)
+    assert not (data / "versions" / ver / ".ref").exists()
+    assert not (data / "versions" / ver / ".url").exists()  # the remote goes with the ref
+    assert (data / "current").resolve().name == ver
+
+
+def test_from_git_on_a_commit_installed_from_source_becomes_a_git_install(tmp_path: Path) -> None:
+    # the other direction of the same early return: the source build has no .ref, and the git run removes source_path
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "source_path").is_file() and not (data / "versions" / ver / ".ref").exists()
+
+    again = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr
+    assert (data / "versions" / ver / ".ref").read_text().strip() == branch.stdout.strip()
+    assert (data / "versions" / ver / ".url").read_text().strip() == f"file://{src}"  # update follows this remote
+    assert not (data / "source_path").exists()
 
 
 def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> None:
@@ -1319,6 +1436,81 @@ def test_the_recorded_remote_keeps_no_credentials(tmp_path: Path) -> None:
     assert fake not in "".join(p.read_text() for p in (home / DATA_REL).rglob(".url"))
 
 
+OLDER_NOTICE = "this is older than the installed version"
+
+
+def _commit_at(src: Path, when: str, message: str, version: str | None = None) -> str:
+    """Commit in ``src`` with the committer date ``when`` (ISO 8601), optionally after setting VERSION; its SHA."""
+    if version is not None:
+        (src / "VERSION").write_text(f"{version}\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"GIT_COMMITTER_DATE": when}
+    cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src)]
+    subprocess.run([*cmd, "commit", "-q", "-a", "--allow-empty", "-m", message, "--date", when], check=True, env=env)
+    return _git(src, "rev-parse", "HEAD")
+
+
+def test_activating_an_older_commit_says_so_and_still_does_it(tmp_path: Path) -> None:
+    # install.sh --ref <older> over a newer install of the same X.Y.Z switched `current` with only the generic
+    # "current -> ..." line: nothing said it was a downgrade
+    src = _source_repo(tmp_path)
+    first = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+
+    def install(ref: str) -> str:
+        r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r.stderr
+
+    assert OLDER_NOTICE not in install(tip)  # the first install has nothing to be older than
+    newer = (data / "current").resolve().name
+    err = install(first)
+    assert OLDER_NOTICE in err and newer in err
+    assert (data / "current").resolve().name != newer  # still allowed: the older commit is now current
+    assert (data / "previous").read_text().strip() == newer  # and the newer one is what a rollback returns to
+    assert OLDER_NOTICE not in install(tip)  # going forward again is not a downgrade
+    assert OLDER_NOTICE not in install(tip)  # nor is re-running the current version
+
+
+def test_activating_a_lower_version_says_so_without_commit_times(tmp_path: Path) -> None:
+    # the lower X.Y.Z is older whatever the commit dates say, and an install made before commit times were
+    # recorded (no .committed file) can still be compared by its version
+    src = _source_repo(tmp_path)
+    old_tag = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2000-01-01T00:00:00Z", "newer version, older timestamp", version="0.0.2")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", tip, "--minimal")
+    assert r.returncode == 0, r.stderr
+    (data / "current" / ".committed").unlink(missing_ok=True)
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", old_tag, "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+    assert (data / "current").resolve().name.startswith("0.0.1-src.")
+
+
+def test_a_newer_checkout_over_an_older_install_gets_no_downgrade_notice(tmp_path: Path) -> None:
+    src, git = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE not in r.stderr
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "previous:" in r.stderr and OLDER_NOTICE not in r.stderr
+    subprocess.run([*git, "checkout", "-q", "HEAD~1"], check=True)  # a checkout of the older commit
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+
+
 def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
     (src / "VERSION").write_text("0.0.2\n")
@@ -1465,6 +1657,43 @@ def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> Non
         assert "did not match the sha256 go.dev lists" in r.stderr
 
 
+@pytest.mark.skipif(not GO_OS or not GO_ARCH, reason="needs a platform go.dev builds for")
+def test_the_private_go_keeps_its_caches_and_telemetry_in_the_data_dir(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    want = next(ln.split()[1] for ln in (REPO / "panes" / "go.mod").read_text().splitlines() if ln.startswith("go "))
+    seen = tmp_path / "go-calls.log"
+    fake_go = (
+        "#!/bin/sh\n"
+        f'echo "$1 cache=$GOCACHE config=$XDG_CONFIG_HOME path=$GOPATH" >>"{seen}"\n'
+        f'case "$1" in version) echo "go version go{want} {GO_OS}/{GO_ARCH}" ;;\n'
+        'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    )
+    archive = _tar_gz({"go/bin/go": fake_go})
+    name = f"go{want}.{GO_OS}-{GO_ARCH}.tar.gz"
+    releases = [
+        {
+            "version": f"go{want}",
+            "files": [
+                {"filename": name, "os": GO_OS, "arch": GO_ARCH, "sha256": hashlib.sha256(archive).hexdigest()},
+            ],
+        }
+    ]
+    curl, _ = _download_stub(tmp_path, {name: archive, "releases.json": json.dumps(releases).encode()})
+    # the go on PATH is too old for panes/go.mod (same stub dir as curl), so the installer fetches the private one;
+    # without it a host that has a current go would build with that and never reach the fake
+    stub_bin(tmp_path, "go", 'case "$1" in version) echo "go version go1.20.1 x/y" ;; *) exit 1 ;; esac\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", drop=("K3_NO_DOWNLOAD", "K3_SKIP_GO"), path_front=curl)
+    assert r.returncode == 0, r.stderr
+    data = tmp_path / DATA_REL
+    calls = seen.read_text().splitlines()
+    assert any(c.startswith("build ") for c in calls) and any(c.startswith("version ") for c in calls)
+    for c in calls:  # `go version` writes telemetry counters as `go build` does: both stay inside the data dir
+        assert f"cache={data}/go/cache config={data}/go/config path={data}/go/path" in c
+    assert not (tmp_path / ".cache").exists() and not (tmp_path / ".config" / "go").exists()
+
+
 def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     url = "https://alice:s3cr3t-token@example.invalid/x.git"
@@ -1595,6 +1824,49 @@ def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: b
         assert "WARNING: the k3 pane binary did not build" in r.stderr
         assert not (current / "bin" / "k3").exists()
         assert (current / ".degraded").read_text().startswith("k3:")
+
+
+def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
+    # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
+    # (next test) must not promise an offline install
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    calls = tmp_path / "npm.log"
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        f'echo "npm $*" >>"{calls}"\ncase "$*" in "run build") mkdir -p dist ;; esac\n',
+    )
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--minimal",
+        "--no-install-deps",
+        drop=("K3_SKIP_TUI", "K3_NO_DOWNLOAD"),
+        path_front=tools,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "npm ci" in calls.read_text()
+
+
+def test_no_install_deps_docs_say_toolchains_only(tmp_path: Path) -> None:
+    # `uv pip install` (PyPI), `npm ci` and `go build` (module downloads) still fetch with --no-install-deps; the
+    # help text and the README must say the flag skips the toolchains only, not that it "fetches nothing"
+    help_out = run(tmp_path, INSTALL, "--help")
+    assert help_out.returncode == 0, help_out.stderr
+    (line,) = re.findall(r"^ +--no-install-deps .*(?:\n {10,}\S.*)*", help_out.stdout, re.M)  # with its wrapped lines
+    # each mention in the README runs up to the next inline-code span
+    mentions = re.findall(r"`--no-install-deps`[^`]*", (REPO / "README.md").read_text())
+    assert len(mentions) == 2, mentions  # the Requirements bullet and the flag list
+    header = re.sub(r"\n# ?", " ", INSTALL.read_text().split("set -eu")[0])
+    (comment,) = re.findall(r"--no-install-deps fetches[^.]*\.", header)
+    for text in (line, *mentions, comment):
+        assert "toolchain" in text, text
+        assert all(name in text for name in ("PyPI", "npm")), text
+        assert not re.search(r"fetch(es)? nothing|install nothing|all fetching", text, re.I), text
 
 
 def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:

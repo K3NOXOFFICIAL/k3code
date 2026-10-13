@@ -188,3 +188,89 @@ def test_the_start_time_is_counted_from_the_last_parenthesis() -> None:
     rest = " ".join(["S", *[str(n) for n in range(4, 22)], "987654", "23", "24"])
     assert upd._stat_start(f"4242 (k3 (x) y)) {rest}\n".encode()) == "987654"
     assert upd._stat_start(b"4242 (cut short) S 1 2\n") == ""
+
+
+# -- `k3code update --rollback` honours the same lock -------------------------------------------------------------
+
+
+def _versions(*names: str) -> None:
+    """Version dirs with ``names[0]`` as ``previous`` and the last one as ``current``."""
+    for n in names:
+        (upd.versions_dir() / n).mkdir(parents=True)
+    for n in names:
+        upd.switch_to(n)
+
+
+def _held_by_a_live_update(data: Path) -> Path:
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{os.getpid()}\n")  # a live process: an update or install.sh mid-build
+    (lock / "start").write_text(f"{upd._process_start(os.getpid())}\n")
+    return lock
+
+
+def test_rollback_refuses_while_an_update_builds(data: Path) -> None:
+    _versions("1.0.0", "1.1.0")
+    lock = _held_by_a_live_update(data)
+    restarted: list[str] = []
+    res = upd.rollback(
+        restart=lambda: restarted.append("r"), daemon_installed=lambda: True, daemon_stopped=lambda: False
+    )
+    assert not res.ok and not res.rolled_back
+    assert "an update is running" in res.message
+    assert (upd.current_version(), upd.previous_version()) == ("1.1.0", "1.0.0")  # nothing switched
+    assert restarted == []  # the daemon was left alone
+    assert (lock / "pid").read_text().strip() == str(os.getpid())  # and the running update keeps its lock
+
+
+def test_rollback_during_a_build_is_not_overridden_by_the_update(
+    data: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str
+) -> None:
+    # the reported race: update A builds 9.0.0, `update --rollback` runs meanwhile, then A activates
+    _versions("1.0.0", "1.1.0")
+    rel = _release(monkeypatch, [])
+    real_download = upd._download
+    during: list[upd.UpdateResult] = []
+
+    def download(url: str, dest: Path, tok: str | None) -> None:
+        if not during:
+            during.append(upd.rollback(daemon_installed=lambda: False))
+        real_download(url, dest, tok)
+
+    monkeypatch.setattr(upd, "_download", download)
+    upd.install_release(rel, None, uv=fake_uv)
+    assert not during[0].ok and "an update is running" in during[0].message
+    assert upd.current_version() == "1.1.0"  # the refused rollback did not move `current` under the build
+    upd.switch_to("9.0.0")  # what activate() does next
+    assert (upd.current_version(), upd.previous_version()) == ("9.0.0", "1.1.0")
+
+
+def test_rollback_holds_the_lock_while_it_switches_and_restarts(data: Path) -> None:
+    _versions("1.0.0", "1.1.0")
+    seen: list[tuple[str, str]] = []
+
+    def restart() -> None:
+        pid = data / LOCK / "pid"
+        seen.append((pid.read_text().strip() if pid.is_file() else "", upd.current_version() or ""))
+
+    res = upd.rollback(restart=restart, daemon_installed=lambda: True, daemon_stopped=lambda: False)
+    assert res.ok and upd.current_version() == "1.0.0"
+    assert seen == [(str(os.getpid()), "1.0.0")]  # an update cannot start building while the daemon restarts
+    assert not (data / LOCK).exists()
+
+
+def test_rollback_drops_the_lock_when_nothing_could_be_rolled_back(data: Path) -> None:
+    _versions("1.0.0")
+    res = upd.rollback(daemon_installed=lambda: False)
+    assert not res.ok and "no previous version" in res.message
+    assert not (data / LOCK).exists()
+
+
+def test_a_lock_a_killed_update_left_does_not_block_a_rollback(data: Path) -> None:
+    _versions("1.0.0", "1.1.0")
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{_dead_pid()}\n")  # the process that took it is gone
+    res = upd.rollback(daemon_installed=lambda: False)
+    assert res.ok and upd.current_version() == "1.0.0"
+    assert not lock.exists()

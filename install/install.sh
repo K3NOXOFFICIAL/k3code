@@ -16,8 +16,9 @@
 # Everything k3code needs is fetched into your home directory, without root: uv (and through it Python),
 # a private Node runtime (PREFIX/share/k3code/node, for the TUI) and a Go toolchain (PREFIX/share/k3code/go,
 # to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
-# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches
-# nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
+# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches none of
+# these toolchains; the PyPI, npm and Go module packages the build needs still download. The installer never
+# runs onboarding; it ends by telling you to run `k3code onboard`.
 # Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
 # prints a health subset. It never fails the install.
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
@@ -54,7 +55,8 @@ Options:
   --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
   --yes, -y             accepted for older callers; with it, presetup never prompts for sudo
-  --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
+  --no-install-deps     fetch no toolchains (uv, Python, Node, Go, bubblewrap, Chromium; fail or skip with the hints
+                        instead); PyPI, npm and Go module packages still download
   --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
   --allow-root          install as root anyway (for example in a container); refused by default
@@ -502,7 +504,19 @@ version_ge() { # version_ge A B: dotted version A is B or newer (three numeric p
   }'
 }
 
-go_version_of() { GOTOOLCHAIN=local "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'; }
+# go_isolate GO: in a subshell, keeps a Go fetched into $DATA inside $DATA (uninstall.sh removes it all): the module
+# cache (dropped after the build), the build cache, and the config dir where the go command keeps its telemetry. That
+# leaves ~/go, ~/.cache/go-build and ~/.config/go untouched. A Go from PATH is the user's own and is left alone.
+go_isolate() {
+  case "$1" in
+    "$DATA"/*) export GOPATH="$DATA/go/path" GOCACHE="$DATA/go/cache" XDG_CONFIG_HOME="$DATA/go/config" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;;
+  esac
+}
+go_version_of() ( # `go version` writes telemetry counters too
+  export GOTOOLCHAIN=local
+  go_isolate "$1"
+  "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'
+)
 
 go_wanted() { # the Go release panes/go.mod asks for, named the way go.dev names it (go 1.22 is go1.22.0)
   v=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" 2>/dev/null | head -n 1)
@@ -817,6 +831,7 @@ tree_id() {
 }
 
 acquire_source() {
+  COMMIT_TIME="" # the committer time of the commit built (recorded as .committed, so a later install can tell which is older)
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
     if [ -n "$d" ] && [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ]; then
@@ -841,6 +856,7 @@ acquire_source() {
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi
+    if [ -n "$SHA" ]; then COMMIT_TIME=$(src_git log -1 --format=%ct HEAD 2>/dev/null || true); fi
     if [ -z "$SHA" ]; then
       id=$(tree_id)
       # without a checksum tool the name would be a bare X.Y.Z-src.tree and a second checkout would look installed
@@ -883,6 +899,7 @@ acquire_source() {
       if git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
         git -C "$SRC_ROOT" checkout -q FETCH_HEAD
         SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+        COMMIT_TIME=$(git -C "$SRC_ROOT" log -1 --format=%ct HEAD 2>/dev/null || true)
         fetched=1
       fi
     fi
@@ -949,11 +966,7 @@ build_panes() {
     return 0
   fi
   log "building the k3 pane binary"
-  case "$GO" in
-    "$DATA"/*) set -- env GOPATH="$DATA/go/path" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;; # keep ~/go untouched
-    *) set -- env ;;
-  esac
-  if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+  if ! (cd "$SRC_ROOT/panes" && go_isolate "$GO" && CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
     printf 'k3: the go build failed\n' >"$VERDIR/.degraded" # k3code update reports it (k3 is optional: the version stays)
   fi
@@ -982,15 +995,36 @@ install_core_copy() {
   REQS=""
 }
 
+# put_file FILE VALUE: FILE holds VALUE. It is only written when it differs (a repeated run changes nothing), through a
+# temp file and a rename, so an interrupted write never leaves a torn file.
+put_file() {
+  if [ "$(cat "$1" 2>/dev/null)" != "$2" ]; then
+    printf '%s\n' "$2" >"$1.new"
+    mv -f "$1.new" "$1"
+  fi
+  return 0
+}
+
+# A git build and a source build of one commit share the version name, so the version may be complete already: the way
+# this run was asked for is recorded on every run, not only on a build. A git install keeps `.ref` and `.url` (the ref
+# and the remote `k3code update` follows: a SHA pins it, a branch or tag does not; a fork or mirror, not upstream) and
+# no checkout path; a source install keeps the checkout path and neither (it follows the checkout).
+record_origin() {
+  if [ "$FROM" = source ]; then
+    put_file "$DATA/source_path" "$SOURCE_PATH"
+    rm -f "$VERDIR/.ref" "$VERDIR/.url"
+  fi
+  if [ "$FROM" = git ]; then
+    put_file "$VERDIR/.ref" "$REF"
+    put_file "$VERDIR/.url" "$(plain_url "$GIT_URL")"
+  fi
+  return 0
+}
+
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
-    # The build is reused, but the ref asked for now is what the install follows: a SHA pins it, a branch or tag does
-    # not (`k3code update` reads .ref). A temp file and a rename, so an interrupted write never leaves a torn .ref.
-    if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then
-      printf '%s\n' "$REF" >"$VERDIR/.ref.new"
-      mv -f "$VERDIR/.ref.new" "$VERDIR/.ref"
-    fi
+    record_origin # the build is reused, but the ref, remote and checkout asked for now are what the install follows
     return 0
   fi
   log "installing version $VER into $VERDIR"
@@ -1022,11 +1056,8 @@ install_version() {
   if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
-  if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then
-    printf '%s\n' "$REF" >"$VERDIR/.ref"
-    plain_url "$GIT_URL" >"$VERDIR/.url" # `k3code update` follows the same remote (a fork or mirror, not upstream)
-  fi
+  record_origin
+  if [ -n "${COMMIT_TIME:-}" ]; then printf '%s\n' "$COMMIT_TIME" >"$VERDIR/.committed"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
@@ -1123,6 +1154,32 @@ restart_daemon() { # a running daemon keeps executing the old version until it r
   return 0
 }
 
+# lt, gt or eq: how the X.Y.Z that starts version name A compares with B's. eq too when either is not dotted numbers.
+version_order() {
+  awk -v a="${1%%-*}" -v b="${2%%-*}" 'BEGIN {
+    if (a !~ /^[0-9]+(\.[0-9]+)*$/ || b !~ /^[0-9]+(\.[0-9]+)*$/) { print "eq"; exit }
+    n = split(a, x, "."); m = split(b, y, ".")
+    for (i = 1; i <= (n > m ? n : m); i++) {
+      if (x[i] + 0 != y[i] + 0) { print (x[i] + 0 < y[i] + 0 ? "lt" : "gt"); exit }
+    }
+    print "eq"
+  }'
+}
+
+# Is VER older than the installed version CUR? A lower X.Y.Z says so; at the same X.Y.Z the commit times recorded at
+# build do. An install from before they were recorded, or a build without git, cannot be compared: not older.
+older_than_installed() {
+  case $(version_order "$VER" "$1") in
+    lt) return 0 ;;
+    gt) return 1 ;;
+  esac
+  new=$(cat "$VERDIR/.committed" 2>/dev/null || true)
+  old=$(cat "$DATA/versions/$1/.committed" 2>/dev/null || true)
+  case "$new" in '' | *[!0-9]*) return 1 ;; esac
+  case "$old" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$new" -lt "$old" ]
+}
+
 activate() {
   cur=""
   if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
@@ -1130,6 +1187,9 @@ activate() {
     if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
     set_current "$VERDIR"
     log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
+    if [ -n "$cur" ] && older_than_installed "$cur"; then
+      log "this is older than the installed version $cur: activated anyway; k3code update --rollback returns to $cur"
+    fi
   fi
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
   link_bin k3code "$DATA/current/venv/bin/k3code"
