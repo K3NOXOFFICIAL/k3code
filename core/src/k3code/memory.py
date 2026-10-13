@@ -72,7 +72,7 @@ def project_memory_path(cwd: str | Path, *, for_write: bool = False) -> Path:
 
 def clean_fact(text: str) -> str:
     """One line of at most MAX_FACT_CHARS with no heading, link or code fence; '' when the fact must be dropped."""
-    fact = " ".join(scrub_text(text).split())
+    fact = " ".join(scrub_text(text, opaque=True).split())
     if not fact or REDACTED in fact or _FENCE.search(fact):
         return ""
     fact = _LINK.sub(r"\1", fact)  # [text](url) and ![alt](url) keep only their text

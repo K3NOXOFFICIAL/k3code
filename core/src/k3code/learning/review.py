@@ -75,11 +75,14 @@ def session_turns(meta: dict[str, Any], messages: list[dict[str, Any]]) -> int:
 
 
 def transcript(messages: list[dict[str, Any]], limit: int = 9000) -> str:
+    """The user and assistant turns, scrubbed (the cheap-tier model may be another provider) and then clipped, so a
+    secret cut by the clip is not left half there."""
     lines = []
     for m in messages:
         c = m.get("content")
         if isinstance(c, str) and m.get("role") in ("user", "assistant"):
-            lines.append(f"{m['role']}: {c[: SUMMARY_CLIP if c.startswith(SUMMARY_PREFIX) else 600]}")
+            clip = SUMMARY_CLIP if c.startswith(SUMMARY_PREFIX) else 600
+            lines.append(f"{m['role']}: {scrub_text(c, opaque=True)[:clip]}")
     return "\n".join(lines)[-limit:]
 
 
