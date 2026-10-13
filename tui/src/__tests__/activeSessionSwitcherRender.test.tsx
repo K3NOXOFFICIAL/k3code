@@ -98,11 +98,6 @@ const render = async (columns: number, rows: number, history: unknown[]) => {
   view.unmount();
   view.cleanup();
 
-  if (process.env.DUMP)
-    console.log(
-      frames.map((f) => JSON.stringify(stripAnsi(f))).join("\n---\n"),
-    );
-
   return stripAnsi(
     frames.filter((frame) => stripAnsi(frame).includes("Sessions")).at(-1) ??
       "",
