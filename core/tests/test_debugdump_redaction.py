@@ -141,7 +141,8 @@ def test_known_secret_values_are_dropped_from_any_shape(monkeypatch):
 
 def test_secret_values_include_the_mcp_env_and_header_values():
     values = debugdump.secret_values(_config())
-    assert EVENT_ONLY in values and HDR in values and PAT in values
+    missing = [v for v in (EVENT_ONLY, HDR, PAT) if v not in values]  # a failure shows these, not the host's env
+    assert missing == []
 
 
 # K3NOX-306: the review of PR #186 (ordinary values stay readable, export -> import round-trips, the class of each gap)
@@ -217,7 +218,8 @@ def test_ordinary_mcp_env_and_header_values_are_not_known_secrets():
         }
     )
     values = debugdump.secret_values(cfg)
-    assert not set(plain) & set(values)
+    known = [v for v in plain if v in values]  # a failure shows these, not the host's env
+    assert known == []
 
 
 def test_secret_named_and_scheme_values_are_known_secrets(monkeypatch):
@@ -236,7 +238,8 @@ def test_secret_named_and_scheme_values_are_known_secrets(monkeypatch):
         },
     )
     values = debugdump.secret_values(cfg)
-    assert {EVENT_ONLY, "a.b.c.d.e", basic} <= set(values)
+    missing = [v for v in (EVENT_ONLY, "a.b.c.d.e", basic) if v not in values]  # not the host's env on a failure
+    assert missing == []
 
 
 def test_a_bearer_env_token_from_the_env_file_is_a_known_secret(tmp_path, monkeypatch):
@@ -247,7 +250,8 @@ def test_a_bearer_env_token_from_the_env_file_is_a_known_secret(tmp_path, monkey
     env_file_path().write_text(f"HASS_LLAT={FLAG_VALUE}\n")
     server = McpServerConfig(url="https://ha.example.com/api/mcp", bearer_env="HASS_LLAT")
     cfg = Settings(mcp={"servers": {"ha": server}})
-    assert FLAG_VALUE in debugdump.secret_values(cfg)
+    known = FLAG_VALUE in debugdump.secret_values(cfg)  # a bool: a failure must not print the host's env
+    assert known
 
 
 def _write_user_config(data: dict) -> None:
@@ -379,7 +383,8 @@ def test_client_secret_flags_hide_their_value(flag):
 )
 def test_a_token_that_starts_like_a_path_is_a_known_secret(value):
     cfg = Settings(mcp={"servers": {"s": McpServerConfig(command="srv", env={"UPSTREAM": value})}})
-    assert value in debugdump.secret_values(cfg)
+    known = value in debugdump.secret_values(cfg)  # a bool: a failure must not print the host's env
+    assert known
 
 
 def test_ordinary_paths_are_not_known_secrets():
@@ -388,7 +393,8 @@ def test_ordinary_paths_are_not_known_secrets():
     cfg = Settings(
         mcp={"servers": {"s": McpServerConfig(command="srv", env={f"P{i}": p for i, p in enumerate(paths)})}}
     )
-    assert not set(paths) & set(debugdump.secret_values(cfg))
+    known = [p for p in paths if p in debugdump.secret_values(cfg)]  # a failure shows these, not the host's env
+    assert known == []
 
 
 async def test_a_known_secret_is_dropped_also_when_percent_encoded(tmp_path, monkeypatch):
