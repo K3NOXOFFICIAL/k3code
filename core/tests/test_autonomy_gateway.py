@@ -231,6 +231,53 @@ async def test_high_risk_in_auto_requires_approval(tmp_path, monkeypatch):
     assert server.session.perms.mode.value == "auto"
 
 
+async def test_planner_that_produces_no_plan_in_auto_runs_the_task_directly(tmp_path, monkeypatch):
+    """A planner that spends its turns reading and never calls exit_plan (nor answers with text) ended the turn with
+    "Plan not approved": the task was dropped unexecuted. In auto mode, below high risk, it now runs directly."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+    planner_call = {"type": "tool_call", "model": "m-strong", "match": "PLANNING mode", "name": "read"}
+    reads = [
+        {**planner_call, "when": "first", "arguments": {"path": "a.py"}},
+        {**planner_call, "when": "after_tool", "arguments": {"path": "b.py"}},
+    ]
+    done = {"type": "text", "model": "m-main", "text": "implemented without a plan"}
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *reads, done], autonomy={"proposals": False})
+    await start(server, tmp_path)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []  # low risk: nothing to approve
+    called = models_called(server)
+    assert "m-strong" in called and "m-main" in called, called
+    assert server.session.stored.messages[-1]["content"] == "implemented without a plan"
+    assert "Plan not approved" not in events(server, "message.complete")[-1]["text"]
+    assert [p["status"] for p in events(server, "plan.show")] == []  # no plan was ever proposed
+    notes = [n for n in events(server, "notification.show") if n.get("key") == "plan"]
+    assert notes and "no plan" in notes[0]["text"]
+
+
+async def test_planning_turn_that_ends_with_nothing_runs_the_task_directly_in_auto(tmp_path, monkeypatch):
+    """The gate's own decision, with the planning turn stubbed to its max-turns outcome (no exit_plan, no text)."""
+    from k3code.autonomy.plan_first import PlanFirst, _Captured
+
+    async def nothing(self, session, text, verdict):
+        return _Captured()
+
+    monkeypatch.setattr(PlanFirst, "_planning_turn", nothing)
+    done = {"type": "text", "model": "m-main", "text": "implemented without a plan"}
+    server = make(tmp_path, monkeypatch, [verdict("medium"), done], autonomy={"proposals": False})
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    assert models_called(server) == ["m-cheap", "m-main"]
+    assert server.session.stored.messages[-1]["content"] == "implemented without a plan"
+    assert scope_rows(tmp_path)[-1] == {**scope_rows(tmp_path)[-1], "outcome": "done", "planned": False}
+    # a refused high-risk plan is still refused (nothing runs): only the no-plan case falls through
+    server2 = make(sub(tmp_path, "h"), monkeypatch, [verdict("small", risk="high", needs_plan=True), done])
+    await start(server2, tmp_path / "h")
+    await run_turn(server2, "tidy things")
+    assert "m-main" not in models_called(server2)
+    assert "Plan not approved" in events(server2, "message.complete")[-1]["text"]
+
+
 async def test_high_risk_denied_does_not_execute(tmp_path, monkeypatch):
     steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *EXECUTOR]
     server = make(tmp_path, monkeypatch, steps)

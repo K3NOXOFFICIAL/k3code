@@ -8,6 +8,10 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 - **`/learned` (issue #141).** Lists the project's gotchas, auto gotchas and learned notes plus the machine gotchas, preferences and overlays with an id each; `/learned forget <id>` removes one and `/learned purge --yes` clears auto gotchas, learned notes and overlays outside an active experiment.
 
+### Fixed
+
+- **A planning turn that produces no plan no longer drops the task.** In auto mode, a strong-tier planner that spent its turns reading and never called `exit_plan` (nor answered with text) ended the turn with "Plan not approved; nothing was executed" and the implicit goal ended unjudged: the task was silently dropped. Below high risk the task now runs directly, with a notice ("The planner produced no plan; running the task directly"); a plan the user refused stays refused. A planner stopped by the loop guard or by repeated tool errors also no longer has its stop notice ("I stopped because I was repeating myself…") approved as the plan the executor must follow.
+
 ### Changed
 
 - **Optimizer A/B is a real test, not a coin flip (issue #140).** Each session is now one sample. A prompt overlay runs concurrently: sessions are split 50/50 by a hash of experiment id and session id, and control sessions are built without the overlay. A config overlay still compares against the week before, because the config is shared by every session and process. The decision needs 10 sessions per arm and uses a seeded 95% bootstrap interval of the score difference: rolled back when the upper bound is below 0, kept when the lower bound is above -0.02, otherwise `inconclusive` with the old value restored. Only one experiment runs at a time. Token growth is now scored symmetrically. `verifier_pass_rate` is renamed `turn_completion_rate`. With no real effect, 200 synthetic experiments now roll back under 10% (previously 82/200).

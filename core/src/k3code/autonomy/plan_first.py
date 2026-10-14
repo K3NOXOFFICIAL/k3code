@@ -174,6 +174,20 @@ class PlanFirst:
             return GateResult(prompt=text, verdict=verdict, scope_hash=h)
 
         captured = await self._planning_turn(session, text, verdict)
+        if not captured.approved and self._run_unplanned(session, verdict, captured):
+            # The planner spent its turns exploring and never produced a plan (nobody refused one). In auto mode,
+            # below high risk, the task runs directly instead of being dropped with "Plan not approved".
+            logger.warning("planner produced no plan for session %s; running the task directly", sid)
+            session.emit(
+                "notification.show",
+                {
+                    "text": "The planner produced no plan; running the task directly.",
+                    "level": "warning",
+                    "kind": "info",
+                    "key": "plan",
+                },
+            )
+            return GateResult(prompt=text, verdict=verdict, scope_hash=h)
         if not captured.approved:
             return GateResult(
                 prompt=text,
@@ -186,6 +200,12 @@ class PlanFirst:
         if self.cfg["proposals"]:
             self.spawn(self.propose_from(session, f"Task: {text}\n\nPlan:\n{captured.plan}"))
         return GateResult(prompt=prompt, verdict=verdict, plan=captured.plan, scope_hash=h)
+
+    @staticmethod
+    def _run_unplanned(session: Any, verdict: ScopeVerdict, captured: _Captured) -> bool:
+        """No plan came out of the planning turn, and auto mode would have approved one: run the task directly.
+        A plan somebody refused (high risk asks) stays refused."""
+        return not captured.plan and session.perms.mode is PermissionMode.AUTO and verdict.risk != "high"
 
     # ── planning turn ──
 
@@ -276,8 +296,9 @@ class PlanFirst:
             server._on_stream_event(session, event)
             if event.type == "done" and event.message and event.message.role == "assistant" and event.message.content:
                 last_text = event.message.content
-        if not cap.plan and last_text.strip() and not loop.interrupted:
-            await on_plan(last_text.strip())  # the model answered with a plan but skipped exit_plan
+        if not cap.plan and last_text.strip() and not loop.interrupted and not loop.escalation_reason:
+            # the model answered with a plan but skipped exit_plan; a loop-guard or tool-error stop notice is not one
+            await on_plan(last_text.strip())
         if not cap.approved:
             if cap.plan:
                 show("rejected")
