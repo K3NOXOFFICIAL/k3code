@@ -778,6 +778,23 @@ def test_an_unquoted_number_secret_in_the_exported_settings_is_hidden_and_other_
     assert bundle.read_bundle(out).settings["user"]["max_turns"] == 7
 
 
+def test_a_short_unquoted_number_under_a_secret_named_key_anywhere_in_the_exported_settings_is_hidden(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    top, provider = "58217", "73946"  # too short to count as a known secret value
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    text = f"max_tokens: 4096\napi_key: {top}\n"
+    text += f"providers:\n  - {{name: p, kind: openai, base_url: 'http://x/v1', api_key: {provider}}}\n"
+    user_config_path().write_text(text)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[], settings=True)
+    blob = _export_blob(out)
+    assert top not in blob and provider not in blob
+    assert bundle.read_bundle(out).settings["user"]["max_tokens"] == 4096
+
+
 @pytest.mark.parametrize("value", [8274619305, 82746.19305])
 @pytest.mark.parametrize(
     "where",

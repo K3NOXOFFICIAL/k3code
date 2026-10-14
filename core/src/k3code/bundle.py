@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, redact, redact_session_json
+from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, is_secret_key, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -28,6 +28,7 @@ _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose).
 _UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode"})
+_TOKENS_WORD = re.compile(r"tokens(?![a-z])", re.I)
 
 
 class BundleError(ValueError):
@@ -110,14 +111,22 @@ def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]
     }
 
 
+def _secret_scalar_key(key: Any) -> bool:
+    """``key`` names a secret (``is_secret_key``) for a number or bool under it. The word ``tokens`` alone names a
+    count (`max_tokens: 4096`, `tokens_per_usd`), not a credential; ``token`` still names one."""
+    return is_secret_key(_TOKENS_WORD.sub("", str(key)))
+
+
 def _secret_scalars_as_text(obj: Any, secrets: list[str], section: bool = False) -> Any:
     """``obj`` with each number or bool that is a secret as its text, so ``drop_values`` and ``redact`` (strings
-    only) hide it: one in an MCP ``env``/``headers`` section, or one whose text holds a known secret (an unquoted
-    `SERVICE_TOKEN: 8274619305` or provider `api_key: 61839274055`). Any other keeps its type: a secret-named key
-    alone does not make a number secret (`max_tokens: 4096`)."""
+    only) hide it: one in an MCP ``env``/``headers`` section, one under a secret-named key, however short (a top-level
+    or provider `api_key: 58217`), or one whose text holds a known secret (an unquoted `SERVICE_TOKEN: 8274619305`).
+    Any other keeps its type (`max_tokens: 4096`)."""
     if isinstance(obj, dict):
         return {
-            k: _secret_scalars_as_text(v, secrets, section or str(k).lower() in _SECRET_SECTIONS)
+            k: _secret_scalars_as_text(
+                v, secrets, section or str(k).lower() in _SECRET_SECTIONS or _secret_scalar_key(k)
+            )
             for k, v in obj.items()
         }
     if isinstance(obj, list):
