@@ -54,8 +54,8 @@ class UpdateCommand(CommandDef):
             token = upd.github_token()
             rel = await asyncio.to_thread(upd.fetch_latest, cfg["channel"], cfg["repo"], token, cfg["api"])
         except Exception as e:  # noqa: BLE001
-            # a git install has no release to download (a private repository answers 404): it follows its ref instead
-            if not built_from_source and not (isinstance(e, PermissionError) and upd.git_ref() is not None):
+            # a git install follows its ref instead, whatever the API said (404, rate limit, api.github.com unreachable)
+            if not built_from_source and upd.git_ref() is None:
                 return reply(f"{cur}\nCould not check releases: {e}")
             why = str(e)
         if rel is None and built_from_source:

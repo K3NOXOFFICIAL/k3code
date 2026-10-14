@@ -121,6 +121,7 @@ class FileChangeTrigger(Trigger):
         self.pattern = glob_to_regex(str(self.spec.get("glob") or "**/*"))
         self.debounce_ms = int(float(self.spec.get("debounce", 2.0)) * 1000)
         self.ready = asyncio.Event()
+        self._own_run: tuple[float, float] | None = None  # wall-clock start and end of the last fire()
 
     async def run(self) -> None:
         from watchfiles import awatch
@@ -145,8 +146,30 @@ class FileChangeTrigger(Trigger):
                     continue
                 if self.pattern.match(rel):
                     paths.append(rel)
+            paths = [p for p in paths if not self._changed_by_own_run(p)]
             if paths:
-                await self.fire({"event": "file_change", "path": paths[0], "paths": ", ".join(sorted(set(paths))[:20])})
+                start = time.time()
+                try:
+                    await self.fire(
+                        {"event": "file_change", "path": paths[0], "paths": ", ".join(sorted(set(paths))[:20])}
+                    )
+                finally:
+                    self._own_run = (start, time.time())
+
+    #: Seconds around the run window still counted as the run's own (mtime granularity, clock skew of the kernel).
+    OWN_RUN_SLACK_S = 1.0
+
+    def _changed_by_own_run(self, rel: str) -> bool:
+        """The file was last modified while the automation's last action ran: its own edit (watchfiles hands those over
+        right after the run), not a reason to run again. A deleted file cannot be dated and still counts."""
+        window = self._own_run
+        if window is None:
+            return False
+        try:
+            mtime = (self.root / rel).stat().st_mtime
+        except OSError:
+            return False
+        return window[0] - self.OWN_RUN_SLACK_S <= mtime <= window[1] + self.OWN_RUN_SLACK_S
 
 
 async def git_out(cwd: str, *args: str) -> str:
