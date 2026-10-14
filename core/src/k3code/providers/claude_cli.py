@@ -57,6 +57,8 @@ DEFAULT_COMMAND = "claude"
 _SYSTEM_FALLBACK = "You are the model behind a coding agent."
 _TOOL_BLOCK = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.DOTALL)
 _TOOL_TAG = "<tool_calls>"
+_FENCE = re.compile(r"```(?:json)?\s*")
+_BLOCK_END = re.compile(r"\s*(?:```\s*)?</tool_calls>")
 _READ_CHUNK = 1 << 16
 _WORKDIR_PREFIX = "k3code-claude-cli."
 _LEGACY_WORKDIR_MAX_AGE_S = 24 * 3600.0  # a dir from before the pid tag: nothing says whose it is, so go by age
@@ -733,6 +735,43 @@ class _StreamGate:
         return final[len(sent) :] if final.startswith(sent) else ""
 
 
+@dataclass(frozen=True)
+class _Block:
+    start: int
+    end: int  # just past the closing tag
+    body: str  # what is between the tags
+
+
+def _tool_blocks(raw: str) -> list[_Block]:
+    """The ``<tool_calls>`` blocks of ``raw``, in order. JSON that decodes ends the block where it ends, so a string
+    argument holding the text ``</tool_calls>`` (a file about this very protocol) does not close it early. A tag that
+    no JSON follows is prose about the tag ("the <tool_calls> block") and is skipped, not matched up with the real
+    block's closing tag. JSON that does not decode keeps the first closing tag as its end: ``_parse_tool_calls`` then
+    repairs it or reports it as invalid. Where no block is found at all that same lazy match is what counts."""
+    blocks: list[_Block] = []
+    pos = raw.find(_TOOL_TAG)
+    while pos >= 0:
+        at = pos + len(_TOOL_TAG)
+        while raw[at : at + 1].isspace():
+            at += 1
+        fence = _FENCE.match(raw, at)  # a fenced body: tolerated by _parse_tool_calls
+        at = fence.end() if fence else at
+        block = None
+        if fence or raw.startswith(("[", "{"), at):
+            try:
+                stop = json.JSONDecoder().raw_decode(raw, at)[1]
+            except json.JSONDecodeError:
+                stop = None
+            if stop is not None and (closing := _BLOCK_END.match(raw, stop)):
+                block = _Block(pos, closing.end(), raw[at:stop])
+            elif lazy := _TOOL_BLOCK.match(raw, pos):
+                block = _Block(pos, lazy.end(), lazy.group(1))
+        if block:
+            blocks.append(block)
+        pos = raw.find(_TOOL_TAG, block.end if block else pos + len(_TOOL_TAG))
+    return blocks or [_Block(m.start(), m.end(), m.group(1)) for m in _TOOL_BLOCK.finditer(raw)]
+
+
 def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[str, list[ToolCall]]:
     """Split the model's plain-text reply into (text for the user, tool calls from every block, in order).
 
@@ -745,15 +784,16 @@ def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[s
     raw = str(result.get("result") or "")
     if not tools:
         return raw.strip(), []
-    matches = list(_TOOL_BLOCK.finditer(raw))
-    if not matches:
+    blocks = _tool_blocks(raw)
+    if not blocks:
         if "<tool_calls>" in raw:  # opened but never closed: the reply was cut off
             raise ProviderError("The model started a <tool_calls> block but did not finish it.", status_code=502)
         return raw.strip(), []
-    calls = [c for m in matches for c in _parse_tool_calls(m.group(1))]
+    calls = [c for b in blocks for c in _parse_tool_calls(b.body)]
     if not calls:
-        return _TOOL_BLOCK.sub("", raw).strip(), []
-    return raw[: matches[0].start()].strip(), calls
+        keep = zip([0, *(b.end for b in blocks)], [*(b.start for b in blocks), len(raw)], strict=True)
+        return "".join(raw[a:z] for a, z in keep).strip(), []
+    return raw[: blocks[0].start].strip(), calls
 
 
 def _mirrors_reply(result: dict[str, Any], tools: list[ToolSpec]) -> bool:
@@ -766,12 +806,12 @@ def _mirrors_reply(result: dict[str, Any], tools: list[ToolSpec]) -> bool:
     raw = str(result.get("result") or "")
     if not tools:
         return True  # the whole text is kept
-    blocks = list(_TOOL_BLOCK.finditer(raw))
+    blocks = _tool_blocks(raw)
     if not blocks:
         return True
-    if not all(_parse_tool_calls(b.group(1)) for b in blocks):
+    if not all(_parse_tool_calls(b.body) for b in blocks):
         return False
-    gaps = [raw[a.end() : b.start()] for a, b in zip(blocks, blocks[1:], strict=False)] + [raw[blocks[-1].end() :]]
+    gaps = [raw[a.end : b.start] for a, b in zip(blocks, blocks[1:], strict=False)] + [raw[blocks[-1].end :]]
     return all(not g.strip() for g in gaps)
 
 
