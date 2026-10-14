@@ -207,6 +207,30 @@ done
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(("redirect", "passed"), [(True, True), (False, False)], ids=["redirected", "console"])
+def test_install_ps1_passes_yes_when_its_output_is_redirected(tmp_path: Path, redirect: bool, passed: bool) -> None:
+    # wsl.exe hands install.sh a terminal even then, and install.sh would ask about sudo where nobody can answer
+    seen = tmp_path / "wsl-args"
+    wsl = tmp_path / "wsl"
+    wsl.write_text(FAKE_WSL.replace("while [ $# -gt 0 ]", f'printf "%s\\n" "$*" >>"{seen}"\nwhile [ $# -gt 0 ]', 1))
+    wsl.chmod(0o755)
+    script = REPO / "install" / "install.ps1"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{script}' --check; exit $LASTEXITCODE"]
+    if redirect:
+        subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    else:
+        # a pty on input and output is a console as far as .NET can tell
+        master, slave = os.openpty()
+        try:
+            subprocess.run(cmd, env=env, stdin=slave, stdout=slave, stderr=slave, check=False, start_new_session=True)
+        finally:
+            os.close(master)
+            os.close(slave)
+    assert ("--yes" in seen.read_text()) is passed
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
 @pytest.mark.parametrize("docker_default", [False, True], ids=["ubuntu-default", "docker-desktop-default"])
 # Legacy is how Windows PowerShell 5.1 (the `powershell` every Windows has) passes arguments: embedded double quotes
 # unescaped, so the `cd "$(wslpath -a "$1")"` command reached sh cut apart and the install died with a syntax error.
@@ -1422,6 +1446,51 @@ def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
     for name in ("k3code.service", "k3code-recover.service"):
         (units / name).write_text("[Unit]\n")
     calls = tmp_path / "systemctl.log"
+@linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+def test_bwrap_install_is_not_asked_when_stdout_and_stderr_are_redirected(tmp_path: Path) -> None:
+    # wsl.exe gives the Linux side a terminal even for a redirected install.ps1: nobody sees the question, so none is
+    # asked (it used to wait forever)
+    sudo_log = tmp_path / "sudo.log"
+    stubs = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    stub_bin(tmp_path, "dnf", "exit 0\n")
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{_path_without(tmp_path, 'bwrap')}",
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "K3_STUB_VENV": "1",
+        "K3_SKIP_TUI": "1",
+        "K3_SKIP_GO": "1",
+        "K3_NO_GH": "1",
+    }
+    master, slave = os.openpty()
+    log = tmp_path / "install.log"
+    try:
+        with log.open("wb") as out:
+            proc = subprocess.Popen(
+                ["setsid", "--ctty", "sh", str(INSTALL), "--from-source", "--minimal"],
+                stdin=slave,  # the controlling terminal is there and /dev/tty opens; only the output is redirected
+                stdout=out,
+                stderr=out,
+                env=env,
+            )
+            try:
+                rc = proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
+                pytest.fail(f"the installer waited for an answer nobody could see:\n{log.read_text(errors='replace')}")
+    finally:
+        os.close(master)
+        os.close(slave)
+    text = log.read_text(errors="replace")
+    assert rc == 0, text
+    assert "Install bubblewrap now with sudo" not in text
+    assert not sudo_log.exists()
+    assert "needs root to install" in text
+
+
     stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
     r = run(tmp_path, UNINSTALL, path_front=stubs)
     assert r.returncode == 0, r.stderr

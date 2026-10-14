@@ -144,8 +144,20 @@ fetch() { # fetch URL FILE: https only, whichever downloader is there; a connect
 
 ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
   if [ "$YES" = 1 ] || ! (: </dev/tty) 2>/dev/null; then return 1; fi
+  # a person must see the question: with stdout and stderr both redirected (a log, a scheduled task; wsl.exe still
+  # hands the Linux side a pty) nobody does, and the read would wait forever
+  if ! [ -t 1 ] && ! [ -t 2 ]; then return 1; fi
   printf '%s [y/N] ' "$1" >/dev/tty
-  read -r ans </dev/tty || ans=""
+  # read -t is not POSIX: timeout bounds the read. GNU timeout puts itself in a background process group, which
+  # the terminal stops on a read, so it runs with --foreground where that exists
+  if have timeout; then
+    tflag=""
+    if timeout --foreground 1 true 2>/dev/null; then tflag="--foreground"; fi
+    # shellcheck disable=SC2086,SC2016 # tflag is empty or one flag; $a belongs to the inner sh
+    ans=$(timeout $tflag 60 sh -c 'read -r a </dev/tty && printf "%s" "$a"' 2>/dev/null) || ans=""
+  else
+    read -r ans </dev/tty || ans=""
+  fi
   case "$ans" in y | Y | yes | YES) return 0 ;; esac
   return 1
 }

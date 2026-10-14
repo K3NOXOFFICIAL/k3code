@@ -247,6 +247,11 @@ for ($i = 0; $i -lt $InstallArgs.Count - 1; $i++) { # a Windows path for --from-
 $checkout = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { '' } # empty when piped into iex
 $local = $checkout -and (Test-Path (Join-Path $PSScriptRoot 'install.sh')) -and
   (Test-Path (Join-Path $checkout 'core\pyproject.toml'))
+# wsl.exe gives the Linux side a terminal even when this script's input or output is redirected (a log, a scheduled
+# task), so install.sh would ask about sudo where nobody sees the question: --yes says nobody is there to ask
+if (([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) -and ($InstallArgs -notcontains '--yes') -and ($InstallArgs -notcontains '-y')) {
+  $InstallArgs = @($InstallArgs) + '--yes'
+}
 $quoted = ($InstallArgs | ForEach-Object { Quote-Sh $_ }) -join ' '
 if ($local) {
   $a = Get-ShArgs "exec sh install/install.sh $quoted" $checkout
