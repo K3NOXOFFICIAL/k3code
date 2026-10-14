@@ -87,6 +87,11 @@ def _warn_unsandboxed(mode: str) -> None:
     sys.stderr.write(f"[k3code] no sandbox: bubblewrap is unusable here, so {what}; see k3code doctor\n")
 
 
+def _warn_home_started() -> None:
+    """A run whose cwd is $HOME: said once on stderr (see AgentLoop._tell_home_started)."""
+    sys.stderr.write("[k3code] k3code started in your home directory: start it inside a project for full auto mode\n")
+
+
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
     from k3code.paths import home as k3code_home
@@ -153,6 +158,7 @@ async def _run_headless(
         session=session,
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
+    loop.on_home_started = _warn_home_started
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
@@ -478,6 +484,7 @@ async def _run_repl(
         reliability=reliability,
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
+    loop.on_home_started = _warn_home_started
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False

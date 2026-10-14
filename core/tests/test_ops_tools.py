@@ -808,6 +808,51 @@ async def test_bash_at_home_asks_per_command_in_an_interactive_session(tmp_path,
 
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_rule_allowed_bash_at_home_runs_read_only_sandboxed_without_a_prompt(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_rsa").write_text("SECRET-KEY\n")
+    (home / ".git-credentials").write_text("https://u:TOKEN@host\n")
+    (home / "notes.txt").write_text("hello\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+
+    class _R:
+        chain: list = []
+
+    asked: list[str] = []
+
+    class _No:
+        allowed, reason = False, ""
+
+    async def refuse(name, args, decision):
+        asked.append(args["command"])
+        return _No()
+
+    notices: list[str] = []
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="auto")  # type: ignore[arg-type]
+    loop.approval_callback = refuse
+    loop.on_home_started = lambda: notices.append("home")
+    loop._tell_home_started()
+    loop._tell_home_started()
+    assert notices == ["home"]  # one notice, not one per call
+
+    res = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "ls -a"}))
+    assert "notes.txt" in res.get("stdout", ""), res
+    res = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": "ls .ssh"}))
+    assert "id_rsa" not in res.get("stdout", "")  # the credential folder is hidden
+    res = await loop._execute_tool(ToolCall(id="c3", name="bash", arguments={"command": "cat .git-credentials"}))
+    assert "TOKEN" not in res.get("stdout", "")
+    assert asked == []  # rule-allowed read-only commands ran without a prompt
+    # anything only the mode allowed still asks a person (and here is refused)
+    res = await loop._execute_tool(ToolCall(id="c4", name="bash", arguments={"command": "touch x"}))
+    assert asked == ["touch x"] and "User denied" in res["error"] and not (home / "x").exists()
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
 async def test_escape_a_hook_planted_from_the_sandbox_never_runs_under_harness_git(tmp_path):
     from k3code.subagents import worktree
     from m1cmd_helpers import git_repo

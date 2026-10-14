@@ -861,9 +861,7 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
             # it as an auto allow), anything else is refused with a hint. A user/project/session rule still wins.
             if not _toolchain_read(path):
                 dec.action = "deny"
-                dec.message = (
-                    f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
-                )
+                dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
@@ -879,7 +877,15 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
 #: system dirs the sandbox shows bash anyway, and the language package caches under ``$HOME``. Credential paths are
 #: refused before this is consulted (sensitive_path).
 _TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
-_TOOLCHAIN_HOME = (".cargo/registry", ".cargo/git", ".rustup", "go/pkg/mod", ".npm", ".local/share/uv", ".m2/repository")
+_TOOLCHAIN_HOME = (
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup",
+    "go/pkg/mod",
+    ".npm",
+    ".local/share/uv",
+    ".m2/repository",
+)
 #: Path segments of installed packages of a known toolchain (Python, Node).
 _TOOLCHAIN_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
 

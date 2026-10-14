@@ -409,7 +409,8 @@ def test_reading_an_ordinary_file_through_a_dotdot_link_asks_outside_the_project
     proj, _ = _dotdot_project(tmp_path)
     for mode in MODES:
         dec = decide(mode=mode, tool="read", args={"path": "lnk/../notes.txt"}, cwd=proj)
-        assert dec.action == ("allow" if mode == "yolo" else "ask"), (mode, dec)
+        # auto mode refuses an out-of-project read outside the toolchain dirs instead of asking
+        assert dec.action == {"yolo": "allow", "auto": "deny"}.get(mode, "ask"), (mode, dec)
         # inside the project it stays a plain read
         assert decide(mode=mode, tool="read", args={"path": "inner/../notes.txt"}, cwd=proj).action == "allow"
 

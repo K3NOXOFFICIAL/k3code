@@ -361,6 +361,7 @@ def build_argv(
     bwrap: str | None = None,
     network: bool = True,
     home_readonly: Iterable[str] | None = None,
+    readonly_home: bool = False,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
 
@@ -372,10 +373,16 @@ def build_argv(
 
     Raises :class:`SandboxRefused` when the cwd or an added dir is ``$HOME``, a directory above it, or a directory
     above ``~/.ssh`` or the k3code home.
+
+    ``readonly_home``: the cwd is ``$HOME`` itself (see :func:`readonly_home_ok`). Nothing is writable but ``/tmp``:
+    ``$HOME`` and the added dirs are bound read-only, with the credential folders and files hidden
+    (:data:`HOME_RO_HIDDEN`). For the commands a rule allows in a session started in the home directory.
     """
     home = Path(home or Path.home())
     roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
-    for root in roots:
+    if readonly_home and not readonly_home_ok(cwd, add_dirs, home=home):
+        raise SandboxRefused(f"a read-only home sandbox needs $HOME as its working directory, not {roots[0]}")
+    for root in roots[1:] if readonly_home else roots:
         _refuse_root(root, home)
     argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
     if not network:
@@ -412,6 +419,8 @@ def build_argv(
     xdg = os.environ.get("XDG_CONFIG_HOME")
     private = [home, paths.home(), *([Path(xdg) / "k3code"] if xdg else [])]
     argv += _name_lookup_argv(shown, [*private, *(Path(os.path.realpath(p)) for p in private)])
+    if readonly_home:
+        return [*argv, *_readonly_home_argv(home, roots[1:], xdg)]
     # $HOME hidden behind an empty tmpfs, then only the cache dirs and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
@@ -443,6 +452,52 @@ def build_argv(
             argv += ["--tmpfs", path]
     argv += ["--chdir", str(roots[0])]
     return argv
+
+
+#: What a read-only ``$HOME`` view hides on top of :data:`HOME_SECRETS`, :data:`HOME_READONLY_REFUSED` and the k3code
+#: home: well-known credential files and folders (tokens, registry logins, keyrings).
+HOME_RO_HIDDEN = (
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".docker",
+    ".kube",
+    ".config/gh",
+    ".password-store",
+    ".local/share/keyrings",
+)
+
+
+def readonly_home_ok(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> bool:
+    """``cwd`` is ``$HOME`` itself and no added dir is refused as a root (see :func:`_refuse_root`): a session a
+    read-only home sandbox can serve. A cwd above ``$HOME`` (``/``) is not."""
+    home = Path(home or Path.home())
+    try:
+        if Path(cwd).resolve() != home.resolve():
+            return False
+        for d in add_dirs:
+            _refuse_root(Path(d).resolve(), home)
+    except (OSError, SandboxRefused):
+        return False
+    return True
+
+
+def _readonly_home_argv(home: Path, add_dirs: Sequence[Path], xdg: str | None) -> list[str]:
+    """bwrap ops of :func:`build_argv` with ``readonly_home``: $HOME and the added dirs read-only, secrets hidden."""
+    argv = ["--ro-bind", str(home), str(home)]
+    for d in add_dirs:
+        if d.is_dir() and not d.is_relative_to(home.resolve()) and not exposes_home(d, home):
+            argv += ["--ro-bind", str(d), str(d)]
+    hidden = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED, *HOME_RO_HIDDEN)] + [paths.home()]
+    if xdg:
+        hidden.append(Path(xdg) / "k3code")
+    for path in dict.fromkeys(str(p) for p in hidden):
+        if os.path.isdir(path):
+            argv += ["--tmpfs", path]
+        elif os.path.isfile(path) and not os.path.islink(path):
+            argv += ["--ro-bind", os.devnull, path]
+    return [*argv, "--chdir", str(home)]
 
 
 def with_chdir(argv: Sequence[str], cwd: Path | str) -> list[str]:
