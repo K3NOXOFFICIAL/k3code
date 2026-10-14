@@ -177,6 +177,8 @@ class Settings(BaseModel):
 
     providers: list[ProviderEntry] = Field(default_factory=list)
     default_model: str = "default"  # key into provider.models
+    #: provider block a session's turns try first (/provider <name> --save); "" or an unknown name = the first block
+    default_provider: str = ""
     max_turns: int = 0  # model calls per prompt; 0 = no cap (a reached cap stops the turn as needs_input)
     max_tokens: int = 8192
     temperature: float | None = None

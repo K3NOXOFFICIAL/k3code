@@ -4,7 +4,9 @@ import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  onOpenFailure,
   openCommand,
+  openCommands,
   openExternalUrl,
   parseSafeUrl,
 } from "./openExternalUrl.js";
@@ -245,5 +247,130 @@ describe("openExternalUrl", () => {
     expect(() =>
       child!.emit("error", new Error("ENOENT: xdg-open not found")),
     ).not.toThrow();
+  });
+});
+
+describe("openCommands under WSL", () => {
+  const wsl = { WSL_DISTRO_NAME: "Ubuntu" };
+
+  it("tries wslview, then explorer.exe, before xdg-open when WSL_DISTRO_NAME is set", () => {
+    expect(openCommands("linux", wsl).map((c) => c.command)).toEqual([
+      "wslview",
+      "explorer.exe",
+      "xdg-open",
+    ]);
+  });
+
+  it("detects WSL via WSL_INTEROP too", () => {
+    expect(
+      openCommands("linux", { WSL_INTEROP: "/run/WSL/1_interop" })[0]!.command,
+    ).toBe("wslview");
+  });
+
+  it("keeps plain xdg-open on linux without WSL markers and ignores them elsewhere", () => {
+    expect(openCommands("linux", {})).toEqual([
+      { command: "xdg-open", args: [] },
+    ]);
+    expect(openCommands("darwin", wsl).map((c) => c.command)).toEqual(["open"]);
+    expect(openCommands("aix", wsl)).toEqual([]);
+  });
+
+  function failingSpawn(missing: readonly string[]) {
+    const calls: string[] = [];
+    const spawn = vi.fn((command: string, args: readonly string[]) => {
+      calls.push(`${command} ${args.join(" ")}`);
+
+      const child = new EventEmitter() as EventEmitter & { unref: () => void };
+
+      child.unref = () => {};
+
+      if (missing.includes(command)) {
+        queueMicrotask(() => child.emit("error", new Error("ENOENT")));
+      }
+
+      return child as unknown as ChildProcess;
+    }) as unknown as SpawnLike;
+
+    return { calls, spawn };
+  }
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("falls through wslview -> explorer.exe -> xdg-open as each is missing", async () => {
+    const { calls, spawn } = failingSpawn(["wslview", "explorer.exe"]);
+    const onFailure = vi.fn();
+
+    expect(
+      openExternalUrl("https://example.com/a?b=1&c=2", {
+        env: wsl,
+        onFailure,
+        platform: () => "linux",
+        spawn,
+      }),
+    ).toBe(true);
+    await tick();
+
+    expect(calls).toEqual([
+      "wslview https://example.com/a?b=1&c=2",
+      "explorer.exe https://example.com/a?b=1&c=2",
+      "xdg-open https://example.com/a?b=1&c=2",
+    ]);
+    expect(onFailure).not.toHaveBeenCalled();
+  });
+
+  it("stops at the first opener that starts", async () => {
+    const { calls, spawn } = failingSpawn([]);
+
+    openExternalUrl("https://example.com/", {
+      env: wsl,
+      platform: () => "linux",
+      spawn,
+    });
+    await tick();
+
+    expect(calls).toEqual(["wslview https://example.com/"]);
+  });
+
+  it("reports in the transcript when every opener fails", async () => {
+    const { spawn } = failingSpawn(["wslview", "explorer.exe", "xdg-open"]);
+    const messages: string[] = [];
+    const off = onOpenFailure((m) => messages.push(m));
+
+    openExternalUrl("https://example.com/", {
+      env: wsl,
+      platform: () => "linux",
+      spawn,
+    });
+    await tick();
+    off();
+
+    expect(messages).toEqual([
+      "could not open link (tried wslview, explorer.exe, xdg-open): https://example.com/",
+    ]);
+  });
+
+  it("reports when the platform has no opener at all", () => {
+    const onFailure = vi.fn();
+
+    expect(
+      openExternalUrl("https://example.com/", {
+        onFailure,
+        platform: () => "aix",
+        spawn: vi.fn() as unknown as SpawnLike,
+      }),
+    ).toBe(false);
+    expect(onFailure).toHaveBeenCalledWith(
+      "could not open link: no opener for this platform: https://example.com/",
+    );
+  });
+
+  it("does not report a deliberately rejected URL", () => {
+    const onFailure = vi.fn();
+
+    openExternalUrl("file:///etc/passwd", {
+      onFailure,
+      platform: () => "linux",
+    });
+    expect(onFailure).not.toHaveBeenCalled();
   });
 });

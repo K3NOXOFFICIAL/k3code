@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, drop_values, redact, redact_session_json
+from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, is_secret_key, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -28,6 +28,7 @@ _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose).
 _UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode"})
+_TOKENS_WORD = re.compile(r"tokens(?![a-z])", re.I)
 
 
 class BundleError(ValueError):
@@ -47,19 +48,44 @@ def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[
     return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _known_secrets(config: Any, cwd: Path) -> tuple[list[str], list[str]]:
-    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first; and
-    the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
-    from k3code.debugdump import secret_values
-
+def _configs(config: Any, cwd: Path) -> list[Any]:
+    """Where the export learns the secret values: the loaded config (default: loaded for ``cwd``), and the user config
+    and the trusted project config as written. A file that does not load still names its secrets, and so does a
+    section ``load_config`` drops (a project's ``providers``): with the env vars alone a copy of an MCP value elsewhere
+    in the settings would leave in clear (K3NOX-519)."""
     if config is None:
         from k3code.config import load_config
 
         try:
             config = load_config(project_dir=cwd)
-        except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
+        except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
-    return secret_values(config), secret_values(config, guesses=False)
+    # a file that exists but does not parse names no secrets: refuse rather than export its copies in clear
+    # (the error text is left out: a YAML error quotes the line, which may hold the secret)
+    try:
+        user = confio.read_yaml(user_config_path())
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        raise BundleError(_unparsed(user_config_path())) from e
+    try:
+        project = yaml.safe_load(trust.trusted_text(cwd) or "")
+    except yaml.YAMLError as e:
+        raise BundleError(_unparsed(project_config_path(cwd))) from e
+    return [config, user, project]
+
+
+def _unparsed(path: Path) -> str:
+    return f"{path} does not parse: fix it first, or the export cannot tell which of its values to hide"
+
+
+def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:
+    """Every secret value the ``configs`` and this process know (provider keys, secret-named env vars, MCP values),
+    longest first; and the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
+    from k3code.debugdump import secret_values
+
+    def known(guesses: bool) -> list[str]:
+        return sorted(set().union(*(secret_values(c, guesses=guesses) for c in configs)), key=len, reverse=True)
+
+    return known(True), known(False)
 
 
 def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
@@ -85,6 +111,31 @@ def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]
     }
 
 
+def _secret_scalar_key(key: Any) -> bool:
+    """``key`` names a secret (``is_secret_key``) for a number or bool under it. The word ``tokens`` alone names a
+    count (`max_tokens: 4096`, `tokens_per_usd`), not a credential; ``token`` still names one."""
+    return is_secret_key(_TOKENS_WORD.sub("", str(key)))
+
+
+def _secret_scalars_as_text(obj: Any, secrets: list[str], section: bool = False) -> Any:
+    """``obj`` with each number or bool that is a secret as its text, so ``drop_values`` and ``redact`` (strings
+    only) hide it: one in an MCP ``env``/``headers`` section, one under a secret-named key, however short (a top-level
+    or provider `api_key: 58217`), or one whose text holds a known secret (an unquoted `SERVICE_TOKEN: 8274619305`).
+    Any other keeps its type (`max_tokens: 4096`)."""
+    if isinstance(obj, dict):
+        return {
+            k: _secret_scalars_as_text(
+                v, secrets, section or str(k).lower() in _SECRET_SECTIONS or _secret_scalar_key(k)
+            )
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_secret_scalars_as_text(v, secrets, section) for v in obj]
+    if isinstance(obj, int | float | bool) and (section or any(s in str(obj) for s in secrets)):
+        return str(obj)
+    return obj
+
+
 def write_bundle(
     path: Path,
     *,
@@ -95,13 +146,18 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    secrets, certain = _known_secrets(config, cwd)
+    configs = _configs(config, cwd)
+    secrets = _known_secrets(*configs)[0]
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = redact(_drop_known(confio.read_yaml(src), secrets, certain))
+                raw = confio.read_yaml(src)
+                # its own values hide their copies in it even when nothing else counts it (an untrusted project
+                # config), but only in it: a file the user never trusted must not hide part of one of their rules
+                secrets_here, certain = _known_secrets(*configs, raw)
+                data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:

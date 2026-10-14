@@ -59,19 +59,29 @@ export function SettingsPanel({
   useEffect(() => {
     let current = true;
 
-    gw.request<unknown>(
-      "settings.get",
-      sessionId ? { session_id: sessionId } : {},
-    )
-      .then((raw) => {
+    // The saved theme pin is not part of settings.get; a failed read just
+    // shows 'auto' rather than blocking the panel.
+    const pin = gw
+      .request<{ value?: unknown }>("config.get", { key: "theme" })
+      .then((r) => String(asRpcResult(r)?.value ?? ""))
+      .catch(() => "");
+
+    Promise.all([
+      gw.request<unknown>(
+        "settings.get",
+        sessionId ? { session_id: sessionId } : {},
+      ),
+      pin,
+    ])
+      .then(([raw, theme]) => {
         if (!current) {
           return;
         }
 
-        const snap: SettingsSnapshot = settingsSnapshot(
-          asRpcResult(raw),
-          localRef.current,
-        );
+        const snap: SettingsSnapshot = settingsSnapshot(asRpcResult(raw), {
+          ...localRef.current,
+          theme,
+        });
 
         live.current = initSettingsState(snap);
         setState(live.current);
