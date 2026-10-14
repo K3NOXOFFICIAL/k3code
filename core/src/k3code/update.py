@@ -306,7 +306,9 @@ def activate(
         log.append(carried)
     ok, detail = smoke(vdir)
     if not ok:
-        if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
+        # a staged build that never ran: do not leave it behind. The installer reuses an installed build of the same
+        # commit, so the staged dir can be one that a daemon or TUI still runs from: that one stays (#158).
+        if version not in {prev, previous_version(), *running_versions()}:
             shutil.rmtree(vdir, ignore_errors=True)
         return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
     stopped = daemon_installed() and daemon_stopped()  # asked before the switch, as the installer asks before its own
