@@ -539,6 +539,80 @@ def test_a_hash_inside_a_word_in_a_substitution_is_not_a_comment() -> None:
         assert not p.unterminated and p.subs == [cmd], cmd
 
 
+# H1: a `${` or `$[` opened inside a double-quoted string stays open past the closing `"` in bash and dash, so a `<<`
+# after it is inside the expansion, never a heredoc. The double-quote branch of the parser tracked only `\`, `$(` and
+# backticks, so it read `<<y` as a heredoc and hid the next line (`rm -rf ~` in the tests): auto and yolo allowed it.
+# A `${`/`$[` still open at the closing `"` now keeps its bracket open, so the `<<` after it needs a person.
+QUOTE_OPENED = [
+    f'echo "${{x:-" <<y "}}"\n{HIDDEN}\ny\n',
+    f'x="${{x:-" <<y "}}"\n{HIDDEN}\ny\n',
+    f'echo "${{x/" <<y "/z}}"\n{HIDDEN}\ny\n',
+    f'echo "$[ 1 " <<y "]"\n{HIDDEN}\ny\n',
+    f'echo "${{x:-\'" <<y "\'}}"\n{HIDDEN}\ny\n',  # a ' inside "${...}": bash and dash differ, still unsure
+]
+
+
+@pytest.mark.parametrize("cmd", QUOTE_OPENED)
+def test_a_quote_opened_expansion_hides_no_body(tmp_path: Path, cmd: str) -> None:
+    assert parse(cmd).unterminated, cmd
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    # yolo runs whatever the hardline lets through: it must see the line the `<<` does not hide
+    assert _bash(cmd, "yolo", tmp_path).hardline == "rm-rf-home"
+
+
+# R2 (bash only; dash and posix-mode bash stop at the syntax error): a heredoc inside a $(...) or backtick inside an
+# array `a=(...)` that holds an operator (`;`, `|`, `&`, `>f`, `((`, `<(`) is rescanned without the outer context, so
+# bash runs the next line while the parser consumed it as the body. The two shells differ, so the command is unsure.
+ARRAY_SUBST_HEREDOC = [
+    f"a=(1;$(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=(1|$(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=(1&$(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=(1>f;$(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=((;$(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=(;<(cat <<y\n{HIDDEN}\ny\n)\n",
+    f"a=(1;`cat <<y\n{HIDDEN}\ny\n`\n",
+    f'a=(1;"$(cat <<y\n{HIDDEN}\ny\n)"\n',
+]
+
+
+@pytest.mark.parametrize("cmd", ARRAY_SUBST_HEREDOC)
+def test_a_heredoc_in_a_substitution_in_an_array_with_an_operator_is_unsure(tmp_path: Path, cmd: str) -> None:
+    assert parse(cmd).unterminated, cmd
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    assert _bash(cmd, "yolo", tmp_path).hardline == "rm-rf-home"
+
+
+# an everyday "${...}" that opens and closes inside the quotes, or whose `}` falls in a later quoted segment, is parsed
+# as before: no body hidden, not marked unterminated, its decision unchanged. A `${...}` with no operator around a
+# substituted heredoc (`a=($(cat <<EOF...))`) still has its body read as bash reads it.
+BENIGN_QUOTED = [
+    'echo "${name:-default}"',
+    'echo "${name:-"inner"}"',
+    'echo "${arr[0]}"',
+    'echo "${x:-${y}}"',
+    'echo "$[1+2]"',
+    'echo "$((1+2))"',
+    'printf "%s\\n" "${1:-"$HOME"}"',
+    'echo "${x:-"}"<<y}"',  # bash and dash both close the expansion here and run no heredoc: one echo, no hidden body
+]
+
+
+@pytest.mark.parametrize("cmd", BENIGN_QUOTED)
+def test_a_quoted_expansion_that_stays_balanced_is_not_unterminated(tmp_path: Path, cmd: str) -> None:
+    assert not parse(cmd).unterminated, cmd
+
+
+def test_a_substituted_heredoc_in_a_plain_array_keeps_its_body(tmp_path: Path) -> None:
+    # no operator in the array: bash reads the heredoc as data fed to `cat`, so the parser keeps it a body and does
+    # not mark the command unsure (a regression guard so the R2 fix stays scoped to arrays that hold an operator)
+    cmd = f"a=($(cat <<y\n{HIDDEN}\ny\n))\n"
+    p = parse(cmd)
+    assert not p.unterminated, cmd
+    assert check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
 QUOTED_WORDS = ["\\EOF", "E'OF'", 'E"O"F', "'E'OF", "'EOF'"]
 
 

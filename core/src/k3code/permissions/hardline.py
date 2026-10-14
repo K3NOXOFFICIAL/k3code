@@ -929,7 +929,17 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         c = text[i]
         if ctx and ctx[-1][0] == "=(" and (c in ";|&" or (c in "<>" and text[i + 1 : i + 2] != "(")):
             ctx[-1] = ("=(!", -1)  # an operator in a=(...): bash drops the rest of the line, heredocs included
-        if c == "\\" and i + 1 < n:
+        in_array_op = bool(ctx) and ctx[-1][0] == "=(!"
+        if in_array_op and (c in '"`' or text.startswith(("$(", "<(", ">("), i)):
+            # inside an array a=(...) that holds an operator (R2), bash does not read a substitution, backtick or
+            # quoted string here as one token, and dash errors: the two shells diverge. Flatten the opener so the
+            # text inside (a hidden `<<` and the lines after it) is scanned as commands under the open `=(!` bracket
+            # (where `<<` is not a heredoc), and leave the command unterminated so a person confirms it.
+            out.unterminated = True
+            subst_open = text.startswith(("$(", "<(", ">("), i)
+            emit(text[i : i + 2] if subst_open else c)
+            i += 2 if subst_open else 1
+        elif c == "\\" and i + 1 < n:
             if text[i + 1] != "\n":  # \<newline> is a line continuation: both go
                 emit(text[i : i + 2])
             i += 2
@@ -942,6 +952,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             i = j + 1
         elif c == '"':
             piece, j, closed = ['"'], i + 1, False
+            qbr: list[str] = []  # ${ / $[ opened inside this quoted string, still open (its } / ] not yet seen here)
             while j < n:
                 d = text[j]
                 if d == '"':
@@ -957,6 +968,14 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                 elif d == "`":
                     j, s = backtick(j)
                     piece.append(s)
+                elif text.startswith(("${", "$["), j):
+                    qbr.append("${" if text[j + 1] == "{" else "[")
+                    piece.append(text[j : j + 2])
+                    j += 2
+                elif (d == "}" and qbr and qbr[-1] == "${") or (d == "]" and qbr and qbr[-1] == "["):
+                    qbr.pop()
+                    piece.append(d)
+                    j += 1
                 else:
                     piece.append(d)
                     j += 1
@@ -964,6 +983,10 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                 piece.append('"')
             else:
                 out.unterminated = True
+            # a ${ or $[ opened inside the quotes and still open at the closing " keeps going past it in bash and
+            # dash, so a << after it is in the expansion, not a heredoc: keep the bracket open on ctx (the closer may
+            # fall in a later quoted segment, where the two shells differ, so the command is left unsure if a << hits)
+            ctx.extend((kind, -1) for kind in qbr)
             emit("".join(piece))
             i = j
         elif c == "#" and (not cur or (len(cur[-1]) == 1 and cur[-1] in " \t<>&")):
