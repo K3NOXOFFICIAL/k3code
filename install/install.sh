@@ -1011,6 +1011,17 @@ build_panes() {
   return 0
 }
 
+# A complete version whose k3 build failed (.degraded) is reused as it is by every later run for the same commit, so
+# the build is tried again there; .degraded goes once the binary is in place (a skip, no go, leaves it).
+retry_k3_build() {
+  if ! grep -q '^k3:' "$VERDIR/.degraded" 2>/dev/null || [ ! -d "$SRC_ROOT/panes" ]; then return 0; fi
+  log "the k3 pane binary of $VER did not build last time: trying again"
+  mkdir -p "$VERDIR/bin"
+  build_panes
+  if [ -f "$VERDIR/bin/k3" ]; then rm -f "$VERDIR/.degraded"; fi
+  return 0
+}
+
 # The installed core is a regular copy (it must not depend on a checkout that can be switched or deleted).
 # Its runtime dependencies are the locked set from core/uv.lock without the dev group, so the install is the
 # set CI tested. --locked fails on a stale lock (a missing dependency) instead of installing the stale set.
@@ -1062,6 +1073,7 @@ record_origin() {
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
+    retry_k3_build
     record_origin # the build is reused, but the ref, remote and checkout asked for now are what the install follows
     return 0
   fi
