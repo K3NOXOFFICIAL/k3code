@@ -193,6 +193,17 @@ def _no_real_dns(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_host_secrets(monkeypatch):
+    """No test sees the host's secret-named variables (``*_TOKEN``, ``*_KEY``, ...): ``secret_values()`` reads them,
+    and a failing assertion on its result would print them to the terminal and the CI log (K3NOX-496). A test that
+    needs one sets a fake value of its own."""
+    from k3code.debugdump import _SECRET_NAME
+
+    for name in [n for n in os.environ if _SECRET_NAME.search(n)]:
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_tuios(monkeypatch):
     """Tests run inside k3 panes must not report to the real tuios daemon."""
     for var in ("TUIOS_SOCKET", "TUIOS_PANE_ID", "TUIOS_PANE_TOKEN", "TUIOS_SESSION"):

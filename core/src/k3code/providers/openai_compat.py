@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -35,6 +36,7 @@ class OpenAICompatProvider(Provider):
         keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        cache_models: list[str] | None = None,
         first_event_timeout: float | None = None,
         idle_timeout: float | None = None,
     ) -> None:
@@ -46,7 +48,11 @@ class OpenAICompatProvider(Provider):
         #: Anthropic-style cache_control inside messages for Claude model ids. "auto" sends it to every endpoint but
         #: OpenAI's own (which caches by itself): a Claude id there means a relay to Anthropic (OpenRouter, LiteLLM,
         #: OmniRoute), where an uncached turn re-bills the whole prompt. A relay that rejects the field turns it off.
+        #: "on" marks every model id (a gateway alias such as auto/coding-manual hides the Claude behind it);
+        #: ``cache_models`` globs opt further ids in under "auto".
         self._cache_auto = prompt_cache == "auto"
+        self._cache_always = prompt_cache == "on"
+        self._cache_models = list(cache_models or [])
         self.prompt_cache = prompt_cache == "on" or (
             self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
         )
@@ -62,6 +68,17 @@ class OpenAICompatProvider(Provider):
         if self._owns_client:
             await self._client.aclose()
 
+    def _marks(self, model: str) -> bool:
+        """Whether this request carries cache breakpoints."""
+        if not self.prompt_cache:
+            return False
+        name = model.lower()
+        return (
+            self._cache_always
+            or "claude" in name
+            or any(fnmatch.fnmatchcase(name, pat.lower()) for pat in self._cache_models)
+        )
+
     def _url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
@@ -75,7 +92,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None,
     ) -> dict[str, Any]:
         wire = messages_to_openai(messages)
-        if self.prompt_cache and "claude" in model.lower():
+        if self._marks(model):
             _add_cache_breakpoints(wire)
         payload: dict[str, Any] = {
             "model": model,
@@ -108,7 +125,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         while True:
-            cached = self.prompt_cache and "claude" in model.lower()
+            cached = self._marks(model)
             request = self._client.build_request(
                 "POST",
                 self._url(),
@@ -137,44 +154,50 @@ class OpenAICompatProvider(Provider):
             usage = None
             complete = False  # [DONE] or a finish_reason arrived: the answer is whole
             finish_reason: str | None = None
-            async for line in watchdog.lines(response):
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    complete = True
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(chunk, dict) and chunk.get(
-                    "error"
-                ):  # also OpenRouter's error + finish_reason "error" shape
-                    raise _inband_error(chunk)  # the upstream failed after answering 200
-                if _made_progress(chunk):
-                    watchdog.progress()
-                choices = chunk.get("choices") or []
-                if choices:
-                    if choices[0].get("finish_reason"):
+            try:
+                async for line in watchdog.lines(response):
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
                         complete = True
-                        finish_reason = choices[0]["finish_reason"]
-                    delta = choices[0].get("delta") or {}
-                    if text := delta.get("content"):
-                        content_parts.append(text)
-                        yield StreamEvent(type="text_delta", text=text)
-                    for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
-                        slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": []})
-                        if tc_id := tc.get("id"):
-                            slot["id"] = tc_id
-                        fn = tc.get("function") or {}
-                        if fn_name := fn.get("name"):
-                            slot["name"] += fn_name
-                        if args := fn.get("arguments"):
-                            slot["args"].append(args)
-                if chunk_usage := chunk.get("usage"):
-                    usage = _parse_usage(chunk_usage)
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(chunk, dict) and chunk.get(
+                        "error"
+                    ):  # also OpenRouter's error + finish_reason "error" shape
+                        raise _inband_error(chunk)  # the upstream failed after answering 200
+                    if _made_progress(chunk):
+                        watchdog.progress()
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        if choices[0].get("finish_reason"):
+                            complete = True
+                            finish_reason = choices[0]["finish_reason"]
+                        delta = choices[0].get("delta") or {}
+                        if text := delta.get("content"):
+                            content_parts.append(text)
+                            yield StreamEvent(type="text_delta", text=text)
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": []})
+                            if tc_id := tc.get("id"):
+                                slot["id"] = tc_id
+                            fn = tc.get("function") or {}
+                            if fn_name := fn.get("name"):
+                                slot["name"] += fn_name
+                            if args := fn.get("arguments"):
+                                slot["args"].append(args)
+                    if chunk_usage := chunk.get("usage"):
+                        usage = _parse_usage(chunk_usage)
+            except httpx.HTTPError:
+                if not complete:
+                    raise
+                # The answer is whole: a connection that drops while we wait for the trailing usage chunk (or the
+                # close) must not discard it and trigger a re-request; usage stays whatever arrived so far.
             if not complete:
                 # A proxy closing early or an upstream dying mid-answer ends the body cleanly: without this the
                 # half sentence became a successful turn, was saved to history and never failed over.
@@ -236,7 +259,10 @@ def _made_progress(chunk: dict[str, Any]) -> bool:
 
 
 def _inband_error(chunk: dict[str, Any]) -> ProviderError:
-    """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands."""
+    """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands.
+
+    No numeric status in the chunk means no status: a forced 502 would settle the class as ``server`` before the
+    error-code and message stages see ``insufficient_quota`` or ``rate_limit_exceeded``."""
     err = chunk.get("error")
     status = None
     if isinstance(err, dict):
@@ -248,9 +274,7 @@ def _inband_error(chunk: dict[str, Any]) -> ProviderError:
             if isinstance(value, str) and value.isdigit() and 400 <= int(value) < 600:
                 status = int(value)
                 break
-    return ProviderError(
-        message=_error_message(chunk) or "error in stream", status_code=status or 502, headers={}, body=chunk
-    )
+    return ProviderError(message=_error_message(chunk) or "error in stream", status_code=status, headers={}, body=chunk)
 
 
 def _error_message(body: dict[str, Any]) -> str:

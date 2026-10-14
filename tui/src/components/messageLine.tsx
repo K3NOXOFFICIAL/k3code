@@ -136,6 +136,7 @@ export const MessageLine = memo(function MessageLine({
     ) ? (
       <Box flexDirection="column" marginTop={leadGap ? 1 : 0}>
         <ToolTrail
+          capRows={liveDetails}
           commandOverride={detailsModeCommandOverride}
           detailsMode={detailsMode}
           preferExpandedThinking={liveDetails}
@@ -343,6 +344,7 @@ export const MessageLine = memo(function MessageLine({
       {showDetails && (
         <Box flexDirection="column" marginBottom={1}>
           <ToolTrail
+            capRows={liveDetails}
             commandOverride={detailsModeCommandOverride}
             detailsMode={detailsMode}
             preferExpandedThinking={liveDetails}
