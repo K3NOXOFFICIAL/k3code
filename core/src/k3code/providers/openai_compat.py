@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -35,6 +36,7 @@ class OpenAICompatProvider(Provider):
         keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        cache_models: list[str] | None = None,
         first_event_timeout: float | None = None,
         idle_timeout: float | None = None,
     ) -> None:
@@ -46,7 +48,11 @@ class OpenAICompatProvider(Provider):
         #: Anthropic-style cache_control inside messages for Claude model ids. "auto" sends it to every endpoint but
         #: OpenAI's own (which caches by itself): a Claude id there means a relay to Anthropic (OpenRouter, LiteLLM,
         #: OmniRoute), where an uncached turn re-bills the whole prompt. A relay that rejects the field turns it off.
+        #: "on" marks every model id (a gateway alias such as auto/coding-manual hides the Claude behind it);
+        #: ``cache_models`` globs opt further ids in under "auto".
         self._cache_auto = prompt_cache == "auto"
+        self._cache_always = prompt_cache == "on"
+        self._cache_models = list(cache_models or [])
         self.prompt_cache = prompt_cache == "on" or (
             self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
         )
@@ -62,6 +68,17 @@ class OpenAICompatProvider(Provider):
         if self._owns_client:
             await self._client.aclose()
 
+    def _marks(self, model: str) -> bool:
+        """Whether this request carries cache breakpoints."""
+        if not self.prompt_cache:
+            return False
+        name = model.lower()
+        return (
+            self._cache_always
+            or "claude" in name
+            or any(fnmatch.fnmatchcase(name, pat.lower()) for pat in self._cache_models)
+        )
+
     def _url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
@@ -75,7 +92,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None,
     ) -> dict[str, Any]:
         wire = messages_to_openai(messages)
-        if self.prompt_cache and "claude" in model.lower():
+        if self._marks(model):
             _add_cache_breakpoints(wire)
         payload: dict[str, Any] = {
             "model": model,
@@ -108,7 +125,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         while True:
-            cached = self.prompt_cache and "claude" in model.lower()
+            cached = self._marks(model)
             request = self._client.build_request(
                 "POST",
                 self._url(),

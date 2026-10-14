@@ -42,6 +42,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     api_key=entry.api_key,
                     keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
+                    cache_models=entry.cache_models,
                 )
             )
         elif entry.kind == "anthropic":
