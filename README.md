@@ -156,7 +156,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Models and effort** | `/tune` (one popup for the model, the reasoning effort and the ultracode mode; or typed, for example `/tune strong high ultracode`) · `/model` (bare opens the same popup; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` (bare opens the same popup; `/effort <level>` sets it) · `/output-style` |
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
-| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
+| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/learned` (list what was learned; `/learned forget <id>`; `/learned purge --yes`) · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
@@ -305,6 +305,10 @@ A mode runs one action and returns; press the mode's letter again to stay in it.
 A pane running k3code reports its state (working, needs input, done) to `k3` automatically. To answer its approvals from the Inbox while the pane is out of sight, add `[agents.approvals] enabled = ["k3code"]` to the tuios config (it is off by default). With a daemon running, `/bg --pane <prompt>` and `/fork --pane` open a new pane attached to the session. Setup and manual test steps: [`docs/k3-panes-test.md`](docs/k3-panes-test.md).
 
 ---
+
+### What k3code learns, and where it is kept
+
+With `learning.enabled: true` (the default) k3code stores gotchas, notes and preferences from your sessions. Setting `learning.enabled: false` stops new learning and keeps learned text out of the prompt. Everything lives under `~/.k3code` (or `$K3CODE_HOME`): per-project `projects/<key>/gotchas.md`, `gotchas.auto.md` and `learned.md`; machine-wide `gotchas.md`; `learning/preferences.json` and the auto section of `memory/USER.md`; optimizer `overlays/*.md`. `/learned` lists them with ids, `/learned forget <id>` removes one, and `/learned purge --yes` clears the project's auto gotchas and notes and every overlay not in an active experiment.
 
 ## Running 24/7
 

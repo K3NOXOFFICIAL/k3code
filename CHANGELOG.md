@@ -4,6 +4,10 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ## Unreleased
 
+### Added
+
+- **`/learned` (issue #141).** Lists the project's gotchas, auto gotchas and learned notes plus the machine gotchas, preferences and overlays with an id each; `/learned forget <id>` removes one and `/learned purge --yes` clears auto gotchas, learned notes and overlays outside an active experiment.
+
 ### Changed
 
 - **`learning.enabled: false` also keeps learned text out of the prompt (issue #141).** The switch stopped new learning, but notes in `learned.md` and optimizer overlays (`overlays/*.md`) already on disk still went into every system prompt. With learning off both are now left out; your `USER.md`, the project's instruction files and gotcha cards you accepted are unchanged.
