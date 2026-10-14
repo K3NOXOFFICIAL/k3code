@@ -47,7 +47,7 @@ from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
-from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy import advisor, auto_continue_on, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -280,6 +280,9 @@ class LiveSession:
         self.background = bool(stored.meta.get("background"))
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
+        #: what the scope gate made of the latest prompt (None: no gate ran), so an implicit goal whose prompt it rates
+        #: trivial, or whose plan was refused or fanned out, ends after its first turn, unjudged (see _run_turn_locked)
+        self.turn_gate: GateResult | None = None
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
@@ -1761,6 +1764,7 @@ class GatewayServer:
                 routed = await self._route_typed_prompt(session, text, hooked, pasted)
                 if routed is not None:
                     return routed
+        session.turn_gate = None  # set by this prompt's scope gate, if it runs; never the previous prompt's
         if not blocked:  # a prompt a hook refused is not a task to carry on with
             self._start_implicit_goal(session, mgr, text)
         while True:
@@ -1796,8 +1800,12 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             implicit = bool((state := mgr.state) and state.implicit)
-            if implicit and self._pending_prompts(session):
-                mgr.clear()  # the user typed the next prompt meanwhile: it replaces this one, unjudged
+            # the user typed the next prompt meanwhile (it replaces this one), or the scope gate settled the prompt on
+            # its first turn (see _gate_ended_task): the implicit goal ends unjudged
+            if implicit and (
+                self._pending_prompts(session) or (state.turns_used == 0 and self._gate_ended_task(session.turn_gate))
+            ):
+                mgr.clear()
                 self.emit_goal(session)
                 self._session_finished(session, status)
                 return status, final_text
@@ -1830,19 +1838,39 @@ class GatewayServer:
         (``session.background``/``task_kind``) and goal continuations do not. A /goal, active or paused, is the
         user's own and wins: a paused one waits for /goal resume, and the answer typed meanwhile must not erase it.
         A leftover implicit goal (a daemon that died mid-loop) is replaced, or cleared with the setting off.
+
+        On by default in the auto and yolo permission modes (``auto_continue: auto``), capped at
+        ``auto_continue_max_turns`` judged turns. A plain question gets no goal; a prompt the scope gate rates trivial
+        ends after its first turn (see ``_run_turn_locked``).
         """
         if session.background or session.task_kind or session.goal_continuation:
             return
         state = mgr.state
         if state is not None and not state.implicit and state.status in ("active", "paused"):
             return
-        if autonomy_cfg(self.config).get("auto_continue"):
-            mgr.set(text, implicit=True)
+        acfg = autonomy_cfg(self.config)
+        if auto_continue_on(acfg, session.perms.mode) and not is_plain_question(text):
+            mgr.set(text, implicit=True, max_turns=max(0, int(acfg["auto_continue_max_turns"])))
         elif state is not None and state.implicit:
             mgr.clear()
         else:
             return
         self.emit_goal(session)
+
+    def _implicit_continuation(self, session: LiveSession) -> bool:
+        """The turn running is an implicit goal's continuation (not a /goal's: those keep their scope gate)."""
+        if not session.goal_continuation:
+            return False
+        state = self.goal_manager(session).state
+        return state is not None and state.implicit
+
+    @staticmethod
+    def _gate_ended_task(gate: GateResult | None) -> bool:
+        """The scope gate settled the prompt: rated it trivial (an answer, one located edit), or ran no task (the plan
+        was refused) or the whole of it (a fan-out). Nothing is left for an implicit goal to continue."""
+        if gate is None:
+            return False
+        return not gate.proceed or (gate.verdict is not None and gate.verdict.scope == "trivial")
 
     # ── wake words and the ultracode mode ──
 
@@ -2178,8 +2206,10 @@ class GatewayServer:
                 hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
-                if not hooked.blocked:
+                # an implicit goal's continuation is the same task: its prompt was gated (and any plan approved) once
+                if not hooked.blocked and not self._implicit_continuation(session):
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                    session.turn_gate = gate
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value

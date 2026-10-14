@@ -730,6 +730,10 @@ class GoalManager:
         return Decision(cur.status if cur else None, False, None, "inactive", "goal changed during evaluation", "")
 
     def _budget_pause(self, s: GoalState, verdict: str, reason: str) -> Decision:
+        if s.implicit:  # the auto-continue cap: say so, or a stop at the cap reads like the model giving up
+            self.clear()
+            message = f"↻ Auto-continue stopped at its {s.turns_used}-turn cap. Send 'continue' or set a /goal."
+            return Decision("cleared", False, None, verdict, reason, message)
         return self._pause_decision(
             s,
             f"turn budget exhausted ({s.turns_used}/{s.max_turns})",

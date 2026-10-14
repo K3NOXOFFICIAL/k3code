@@ -377,7 +377,9 @@ permission_mode: default            # default | accept-edits | plan | auto | yol
 autonomy:
   plan_first: true
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
-  auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
+  auto_continue: auto               # auto (default): in auto/yolo mode a prompt runs as an implicit goal until the
+                                    #   judge says done; true/false force it on/off in every mode
+  auto_continue_max_turns: 8        # judged turns per implicit goal (0 = no cap)
   fanout: {max_parallel: 3}
 ultracode:
   min_scope: small                  # with the ultracode mode on: a prompt rated at least this runs the pipeline
