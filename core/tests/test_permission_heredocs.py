@@ -525,6 +525,14 @@ def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
     assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
 
 
+@pytest.mark.parametrize("depth", [1, 32, 33, 40, 200])
+def test_a_launcher_argument_is_read_past_any_brackets_depth(tmp_path: Path, depth: int) -> None:
+    # K3NOX-614: past a cap on ${...} nesting the argument was split by shlex again and the escaped backtick was text
+    cmd = 'bash -c "' + "${x:+" * depth + "y" + "}" * depth + r' \`rm -rf ~\`"'
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    assert _bash(cmd, "yolo", tmp_path).action == "deny"
+
+
 def test_a_launcher_argument_nested_in_brackets_is_decided_quickly(tmp_path: Path) -> None:
     # reading a ${...} as one unit must not recurse once per level (RecursionError) or rescan the text per level
     for cmd in ('bash -c "' + "${" * 5000 + 'x"', 'bash -c "' + "${x:+" * 5000 + "x" + "}" * 5000 + '"'):

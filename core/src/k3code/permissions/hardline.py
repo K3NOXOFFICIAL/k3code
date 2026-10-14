@@ -369,13 +369,10 @@ def _tokens(sub: str) -> list[str]:
         return sub.split()
 
 
-#: how deep ``_unit_end`` follows a ``${...}`` nested in a ``${...}``; deeper, the unit is unresolved
-_UNIT_MAX_DEPTH = 32
-
-
-def _unit_end(text: str, i: int, _depth: int = 0) -> int:
+def _unit_end(text: str, i: int) -> int:
     """Index of the last character of the ``$(...)``, backtick or ``${...}`` at ``i``, read as one unit as the shell
-    reads it (the quotes in it are its own); -1 when none starts there, -2 when it does not close."""
+    reads it (the quotes in it are its own); -1 when none starts there, -2 when it does not close. Nested ``${`` are
+    counted, not recursed into, so no depth of them is left unread."""
     if text.startswith("$(", i):
         end = _match_paren(text, i + 1)
         return end if end >= 0 else -2
@@ -384,9 +381,7 @@ def _unit_end(text: str, i: int, _depth: int = 0) -> int:
         return end if end >= 0 else -2
     if not text.startswith("${", i):
         return -1
-    if _depth >= _UNIT_MAX_DEPTH:
-        return -2
-    j, n = i + 2, len(text)
+    depth, j, n = 1, i + 2, len(text)
     while j < n:
         c = text[j]
         if c == "\\":
@@ -396,9 +391,16 @@ def _unit_end(text: str, i: int, _depth: int = 0) -> int:
             if k < 0:
                 return -2
             j = k + 1
+        elif text.startswith("${", j):
+            depth += 1
+            j += 2
         elif c == "}":
-            return j
-        elif (end := _unit_end(text, j, _depth + 1)) != -1:
+            depth -= 1
+            if depth == 0:
+                return j
+            j += 1
+        elif text.startswith("$(", j) or c == "`":
+            end = _unit_end(text, j)  # _match_paren or _backtick_end: no recursion
             if end < 0:
                 return -2
             j = end + 1
