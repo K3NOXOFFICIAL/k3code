@@ -31,6 +31,12 @@ DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
 DAEMON_NOT_STARTED = "daemon not running, not started"
+#: A unit file is installed but the systemd user manager does not answer (WSL without systemd, a container, `su`):
+#: there is no daemon systemd could run, so the switch stands and only this is said (#115).
+MANAGER_UNREACHABLE = (
+    "warning: the systemd user manager is not reachable, so the daemon was not restarted "
+    "(`k3code service uninstall` removes the unit on a box without systemd)"
+)
 
 
 def versions_dir() -> Path:
@@ -289,6 +295,7 @@ def activate(
     healthy: Callable[[], bool] = daemon_healthy,
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
+    manager_reachable: Callable[[], bool] = service.manager_reachable,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
     carry: Callable[[Path, Path], str | None] = carry_playwright,
@@ -306,7 +313,9 @@ def activate(
         log.append(carried)
     ok, detail = smoke(vdir)
     if not ok:
-        if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
+        # a staged build that never ran: do not leave it behind. The installer reuses an installed build of the same
+        # commit, so the staged dir can be one that a daemon or TUI still runs from: that one stays (#158).
+        if version not in {prev, previous_version(), *running_versions()}:
             shutil.rmtree(vdir, ignore_errors=True)
         return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
     stopped = daemon_installed() and daemon_stopped()  # asked before the switch, as the installer asks before its own
@@ -320,7 +329,10 @@ def activate(
             up = wait(healthy)
         except service.ServiceError as e:
             log.append(str(e))
-            up = False
+            # asked only once systemd refused: an unreachable manager means no daemon to restart, not an unhealthy one
+            up = not manager_reachable()
+            if up:
+                log.append(MANAGER_UNREACHABLE)
         if not up:
             if prev:
                 switch_to(prev)
@@ -341,6 +353,7 @@ def rollback(
     restart: Callable[[], None] = restart_daemon,
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
+    manager_reachable: Callable[[], bool] = service.manager_reachable,
 ) -> UpdateResult:
     """Switch back to the previous version, under the install lock: an update that is building (or install.sh) would
     otherwise switch ``current`` again once it is done and silently undo the rollback.
@@ -360,6 +373,9 @@ def rollback(
                 try:
                     restart()
                 except service.ServiceError as e:
+                    if not manager_reachable():
+                        msg = f"rolled back {cur} -> {prev}\n{MANAGER_UNREACHABLE}"
+                        return UpdateResult(True, prev, msg, rolled_back=True)
                     return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
             return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
     except InstallLockHeld as e:
@@ -491,6 +507,13 @@ def fetch_latest(
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
     base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
     r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
+    if r.status_code == 429 or (r.status_code == 403 and r.headers.get("x-ratelimit-remaining") == "0"):
+        wait = r.headers.get("retry-after")
+        raise RuntimeError(
+            f"GitHub API {r.status_code}: rate limit exceeded"
+            + (f" (retry after {wait}s)" if wait else "")
+            + "; set GITHUB_TOKEN (or `gh auth login`) for a higher limit"
+        )
     if r.status_code in (401, 403, 404):
         raise PermissionError(
             f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "
@@ -667,6 +690,8 @@ def _take_over_stale_lock(lock: Path) -> None:
         if not now or now == started:
             raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
     _remove_recorded_tmp(lock)
+    # install.sh builds in <root>/tmp (stage_dir) and only while it holds the lock: what is left there is the dead run's
+    shutil.rmtree(lock.parent / "tmp", ignore_errors=True)
     # Not atomic, as in install.sh's take_lock: two runs that find the same stale lock can interleave (one removes it
     # and makes its own, the other then removes that one) and both go on; only a run that arrives between the rmtree
     # and the mkdir is stopped, by the mkdir. It takes two installs started within the same few milliseconds over a

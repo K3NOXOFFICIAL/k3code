@@ -96,6 +96,21 @@ def test_k3code_update_takes_over_the_lock_of_a_killed_install_sh(
     assert not lock.exists()
 
 
+def test_k3code_update_takes_the_stage_dir_of_a_killed_install_sh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # install.sh builds in <root>/tmp only under the lock (issue #116): a dead holder's leftovers there go with it
+    data = tmp_path / DATA_REL
+    lock = data / upd.INSTALL_LOCK
+    lock.mkdir(parents=True)
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    (lock / "pid").write_text(f"{dead}\n")
+    (data / "tmp" / "k3code-src.Ab12Cd" / "src").mkdir(parents=True)
+    monkeypatch.setenv("K3CODE_DATA", str(data))
+    with upd.install_lock():
+        assert not (data / "tmp").exists()
+
+
 def test_both_sides_clean_the_temp_kinds_install_sh_records() -> None:
     # a kind install.sh records but one side does not clean would leak again, quietly
     text = INSTALL.read_text()

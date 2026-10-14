@@ -70,3 +70,51 @@ def test_headless_run_passes_its_session_id_to_the_system_prompt(tmp_path, monke
         )
     )
     assert seen == ["s-42"]
+
+
+def test_each_headless_run_without_a_session_gets_its_own_session_id(tmp_path, monkeypatch):
+    # every -p run used to be the session "headless": one pooled A/B sample for all of them
+    config = _setup(monkeypatch, tmp_path)
+    import k3code.prompting as prompting_mod
+
+    seen: list[str | None] = []
+    real = prompting_mod.build_system_prompt
+
+    def spy(*a, **kw):
+        seen.append(kw.get("session_id"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(prompting_mod, "build_system_prompt", spy)
+    for _ in range(2):
+        r = asyncio.run(
+            cli_mod._run_headless(
+                "hi", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True
+            )
+        )
+        assert r is not None and r["text"] == "done", r
+    assert len(set(seen)) == 2 and all(s and s.startswith("headless-") for s in seen), seen
+
+    from k3code.usage import UsageDB
+
+    db = UsageDB(tmp_path / "home" / "usage.db")
+    assert {r["session"] for r in db.rows()} == set(seen)  # the usage rows (the A/B samples) carry the same ids
+
+
+def test_a_named_headless_session_keeps_its_name_and_the_default_resume_name(tmp_path, monkeypatch):
+    config = _setup(monkeypatch, tmp_path)
+
+    names: list[str] = []
+    real = cli_mod._build_reliability
+
+    def spy(cfg, session):
+        names.append(session)
+        return real(cfg, session)
+
+    monkeypatch.setattr(cli_mod, "_build_reliability", spy)
+    for kw in ({}, {"session": "s-42"}):
+        asyncio.run(
+            cli_mod._run_headless(
+                "hi", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True, **kw
+            )
+        )
+    assert names == ["headless", "s-42"]  # --resume still finds the default transcript
