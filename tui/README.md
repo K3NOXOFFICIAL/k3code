@@ -369,6 +369,8 @@ Current color overrides:
 - banner title, accent, border, body, dim
 - label, ok, error, warn
 
+`NO_COLOR` (non-empty, see no-color.org) turns off all foreground and background colour at the one place colour is applied (`colorize()` in `packages/hermes-ink/src/ink/colorize.ts`); bold, dim and inverse stay.
+
 `branding.tsx` uses those values for the logo, session panel, and update notice.
 
 ## File map
