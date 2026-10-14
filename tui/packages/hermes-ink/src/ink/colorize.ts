@@ -18,8 +18,9 @@ import type { Color, TextStyles } from "./styles.js";
  * VS Code) renders 24-bit color, so WT_SESSION and WSL_DISTRO_NAME count as
  * truecolor evidence unless COLORTERM or FORCE_COLOR says something.
  *
- * Gated on level === 2 (not < 3) to respect NO_COLOR / FORCE_COLOR=0 —
- * those yield level 0 and are an explicit "no colors" request. Desktop VS
+ * Gated on level === 2 (not < 3) to respect FORCE_COLOR=0 — that yields
+ * level 0 and is an explicit "no colors" request (NO_COLOR is handled in
+ * colorize()). Desktop VS
  * Code sets COLORTERM=truecolor itself, so this is a no-op there (already 3).
  *
  * Never inside tmux: its passthrough limitation wins and we want level 2
@@ -60,7 +61,7 @@ export function shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
 ): boolean {
   const termProgram = (env.TERM_PROGRAM ?? "").trim();
   const truecolorOverride = /^(?:1|true|yes|on)$/i.test(
-    (env.HERMES_TUI_TRUECOLOR ?? "").trim(),
+    (env.K3CODE_TUI_TRUECOLOR ?? env.HERMES_TUI_TRUECOLOR ?? "").trim(),
   );
   const advertisesTruecolor = /^(?:truecolor|24bit)$/i.test(
     (env.COLORTERM ?? "").trim(),
@@ -148,6 +149,14 @@ export const CHALK_CLAMPED_FOR_TMUX = clampChalkLevelForTmux();
 export const CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE =
   shouldUseRichEightBitDowngradeForLegacyAppleTerminal();
 
+/**
+ * no-color.org: a non-empty NO_COLOR asks for output without colour. chalk's
+ * supports-color does not read it, and dropping to level 0 would also strip
+ * bold / dim / inverse, so colorize() skips colour instead and the modifiers
+ * keep working. Computed once at load, like the terminal level above.
+ */
+export const NO_COLOR_REQUESTED = (process.env.NO_COLOR ?? "") !== "";
+
 export type ColorType = "foreground" | "background";
 
 const RGB_REGEX = /^rgb\(\s?(\d+),\s?(\d+),\s?(\d+)\s?\)$/;
@@ -159,7 +168,7 @@ export const colorize = (
   color: string | undefined,
   type: ColorType,
 ): string => {
-  if (!color) {
+  if (!color || NO_COLOR_REQUESTED) {
     return str;
   }
 
