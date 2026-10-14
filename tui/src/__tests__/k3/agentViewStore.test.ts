@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildViewRows,
   IDLE_VIEW_NAV,
+  NEW_AGENT_ROW,
   type PastSessionRow,
   reduceViewKey,
+  routeViewInput,
   selectedIndex,
   type ViewKey,
   type ViewNav,
@@ -16,6 +18,8 @@ import type { SessionActiveItem } from "../../gatewayTypes.js";
 import type { SubagentProgress } from "../../types.js";
 
 const NOW = 2_000_000_000_000;
+const CTRL_N: ViewKey = { ch: "n", ctrl: true };
+const CTRL_X: ViewKey = { ch: "x", ctrl: true };
 const CWD = "/work/proj";
 
 const agent = (
@@ -154,15 +158,15 @@ describe("buildViewRows", () => {
       ["f1", "completed", "failed"],
     ]);
 
-    // Enter on it closes the view; x does not arm a stop on the current session.
+    // → on it closes the view; Ctrl+X does not arm a stop on the current session.
     const idx = rows.indexOf(cur);
 
     expect(
-      reduceViewKey({ confirmKey: null, index: idx }, rows, { return: true }, 5)
+      reduceViewKey({ confirmKey: null, index: idx }, rows, { right: true }, 5)
         .effect,
     ).toEqual({ type: "close" });
     expect(
-      reduceViewKey({ confirmKey: null, index: idx }, rows, { ch: "x" }, 5).nav
+      reduceViewKey({ confirmKey: null, index: idx }, rows, CTRL_X, 5).nav
         .confirmKey,
     ).toBeNull();
   });
@@ -348,8 +352,8 @@ const ROWS: ViewRow[] = [
   vrow("s2"),
 ];
 
-const press = (nav: ViewNav, key: ViewKey, rows = ROWS, page = 2) =>
-  reduceViewKey(nav, rows, key, page);
+const press = (nav: ViewNav, key: ViewKey, rows = ROWS, page = 2, draft = "") =>
+  reduceViewKey(nav, rows, key, page, draft);
 const at = (index: number): ViewNav => ({ confirmKey: null, index });
 
 describe("reduceViewKey", () => {
@@ -370,19 +374,17 @@ describe("reduceViewKey", () => {
     expect(press(at(0), { pageDown: true }, ROWS, 0).nav.index).toBe(1);
   });
 
-  it("⏎ attaches to the selected row, and closes on the current one", () => {
-    expect(press(at(1), { return: true }).effect).toEqual({
-      row: ROWS[1],
-      type: "activate",
-    });
-    expect(press(at(3), { return: true }).effect).toEqual({
-      row: ROWS[3],
-      type: "activate",
-    });
-    expect(press(at(0), { return: true }).effect).toEqual({ type: "close" });
+  it("leaves ⏎ to the composer: the reducer does not consume it", () => {
+    for (const i of [0, 1, 3]) {
+      expect(press(at(i), { return: true })).toEqual({
+        consumed: false,
+        effect: null,
+        nav: at(i),
+      });
+    }
   });
 
-  it("→ attaches to the selected row like ⏎, and closes on the current one", () => {
+  it("→ attaches to the selected row with an empty draft, and closes on the current one", () => {
     expect(press(at(1), { right: true }).effect).toEqual({
       row: ROWS[1],
       type: "activate",
@@ -400,15 +402,11 @@ describe("reduceViewKey", () => {
       effect: { type: "close" },
       nav: at(0),
     });
-    expect(press(at(1), { right: true }, [])).toEqual({
-      consumed: true,
-      effect: null,
-      nav: at(0),
-    });
+    expect(press(at(1), { right: true }, []).effect).toBeNull();
   });
 
   it("→ cancels a pending stop confirmation instead of stopping or attaching", () => {
-    const ask = press(at(1), { ch: "x" }).nav;
+    const ask = press(at(1), CTRL_X).nav;
     const r = press(ask, { right: true });
 
     expect(r.effect).toBeNull();
@@ -420,11 +418,18 @@ describe("reduceViewKey", () => {
     });
   });
 
-  it("x asks first; y or ⏎ stops", () => {
-    const ask = press(at(1), { ch: "x" });
+  it("Ctrl+X asks first, with or without a draft; y or ⏎ stops", () => {
+    const ask = press(at(1), CTRL_X);
 
     expect(ask.effect).toBeNull();
-    expect(ask.nav).toEqual({ confirmKey: "session:s1", index: 1 });
+    expect(ask.nav).toEqual({
+      confirmAction: "stop",
+      confirmKey: "session:s1",
+      index: 1,
+    });
+    expect(press(at(1), CTRL_X, ROWS, 2, "draft").nav.confirmKey).toBe(
+      "session:s1",
+    );
 
     for (const key of [{ ch: "y" }, { ch: "Y" }, { return: true }]) {
       const r = press(ask.nav, key);
@@ -433,14 +438,41 @@ describe("reduceViewKey", () => {
       expect(r.nav.confirmKey).toBeNull();
     }
 
-    expect(press(at(2), { ch: "x" }).nav.confirmKey).toBe("agent:a1");
+    expect(press(at(2), CTRL_X).nav.confirmKey).toBe("agent:a1");
+  });
+
+  it("a pending confirmation eats y (consumed), so it is never typed into the draft", () => {
+    const ask = press(at(1), CTRL_X).nav;
+
+    expect(press(ask, { ch: "y" }, ROWS, 2, "half").consumed).toBe(true);
+    expect(press(ask, { ch: "q" }, ROWS, 2, "half").consumed).toBe(true);
+  });
+
+  it("the confirmation covers delete as well as stop", () => {
+    const ask: ViewNav = {
+      confirmAction: "delete",
+      confirmKey: "past:p1",
+      index: 3,
+    };
+
+    for (const key of [{ ch: "y" }, { return: true }]) {
+      expect(press(ask, key).effect).toEqual({ row: ROWS[3], type: "delete" });
+    }
+
+    for (const key of [{ ch: "n" }, { escape: true }, { left: true }]) {
+      const r = press(ask, key);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual(at(3));
+    }
   });
 
   it("any other key cancels the confirmation and does nothing else", () => {
-    const ask = press(at(1), { ch: "x" }).nav;
+    const ask = press(at(1), CTRL_X).nav;
 
     for (const key of [
       { ch: "n" },
+      CTRL_N,
       { escape: true },
       { left: true },
       { down: true },
@@ -448,60 +480,105 @@ describe("reduceViewKey", () => {
     ]) {
       const r = press(ask, key);
 
+      expect(r.consumed).toBe(true);
       expect(r.effect).toBeNull();
       expect(r.nav).toEqual(at(1));
     }
   });
 
-  it("ignores x on past rows and on the current session", () => {
+  it("ignores Ctrl+X on past rows, on the current session and on + New agent", () => {
     for (const i of [0, 3]) {
-      const r = press(at(i), { ch: "x" });
+      const r = press(at(i), CTRL_X);
 
       expect(r.effect).toBeNull();
       expect(r.nav).toEqual(at(i));
     }
+
+    expect(press(at(0), CTRL_X, [NEW_AGENT_ROW]).nav.confirmKey).toBeNull();
   });
 
-  it("n starts a new session; esc and ← close", () => {
-    expect(press(at(2), { ch: "n" }).effect).toEqual({ type: "new" });
+  it("Ctrl+N starts a new session with an empty draft and a background agent with text; esc and ← close", () => {
+    expect(press(at(2), CTRL_N).effect).toEqual({ type: "new" });
+    expect(press(at(2), { ch: "N", ctrl: true }).effect).toEqual({
+      type: "new",
+    });
+    expect(press(at(2), CTRL_N, ROWS, 2, "   ").effect).toEqual({
+      type: "new",
+    });
+    expect(press(at(2), CTRL_N, ROWS, 2, "  fix the build ").effect).toEqual({
+      text: "fix the build",
+      type: "dispatch",
+    });
     expect(press(at(2), { escape: true }).effect).toEqual({ type: "close" });
     expect(press(at(2), { left: true }).effect).toEqual({ type: "close" });
   });
 
-  it("ignores n, x and y chords with Ctrl or Meta; arrows, ⏎ and esc still work", () => {
-    for (const mod of [{ ctrl: true }, { meta: true }]) {
-      for (const ch of ["n", "x", "y", "N"]) {
-        const r = press(at(1), { ch, ...mod });
-
-        expect(r.effect).toBeNull();
-        expect(r.nav).toEqual(at(1));
-      }
-
-      const ask = press(at(1), { ch: "x" }).nav;
-
-      expect(press(ask, { ch: "y", ...mod }).effect).toBeNull();
-      expect(press(at(1), { down: true, ...mod }).nav).toEqual(at(2));
-      expect(press(at(1), { return: true, ...mod }).effect).toEqual({
-        row: ROWS[1],
-        type: "activate",
+  it("with a draft, Home/End/←/→ edit the text and Esc clears it; ↑/↓/PgUp/PgDn still move", () => {
+    for (const key of [
+      { home: true },
+      { end: true },
+      { left: true },
+      { right: true },
+    ]) {
+      expect(press(at(2), key, ROWS, 2, "hi")).toEqual({
+        consumed: false,
+        effect: null,
+        nav: at(2),
       });
+    }
+
+    expect(press(at(2), { escape: true }, ROWS, 2, "hi")).toEqual({
+      consumed: true,
+      effect: { type: "clearDraft" },
+      nav: at(2),
+    });
+    expect(press(at(2), { up: true }, ROWS, 2, "hi").nav).toEqual(at(1));
+    expect(press(at(2), { down: true }, ROWS, 2, "hi").nav).toEqual(at(3));
+    expect(press(at(2), { pageUp: true }, ROWS, 2, "hi").nav).toEqual(at(0));
+    expect(press(at(2), { pageDown: true }, ROWS, 2, "hi").nav).toEqual(at(4));
+  });
+
+  it("bare n, x and y are text; Alt+letter is the composer's; arrows and esc work with Ctrl or Meta", () => {
+    for (const ch of ["n", "x", "y", "N"]) {
+      for (const mod of [{}, { meta: true }]) {
+        expect(press(at(1), { ch, ...mod })).toEqual({
+          consumed: false,
+          effect: null,
+          nav: at(1),
+        });
+      }
+    }
+
+    for (const mod of [{ ctrl: true }, { meta: true }]) {
+      expect(press(at(1), { down: true, ...mod }).nav).toEqual(at(2));
       expect(press(at(1), { escape: true, ...mod }).effect).toEqual({
         type: "close",
       });
     }
+
+    // Ctrl+Y is no view command either.
+    expect(press(at(1), { ch: "y", ctrl: true }).consumed).toBe(false);
   });
 
-  it("swallows every other key without an effect", () => {
-    for (const key of [{ ch: "q" }, { ch: "y" }, {}]) {
-      const r = press(at(2), key);
+  it("returns consumed:false for printable keys so the composer types them", () => {
+    for (const key of [
+      { ch: "q" },
+      { ch: "y" },
+      { ch: "x" },
+      { ch: "n" },
+      {},
+    ]) {
+      for (const draft of ["", "some text"]) {
+        const r = press(at(2), key, ROWS, 2, draft);
 
-      expect(r.consumed).toBe(true);
-      expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(at(2));
+        expect(r.consumed).toBe(false);
+        expect(r.effect).toBeNull();
+        expect(r.nav).toEqual(at(2));
+      }
     }
   });
 
-  it("with no rows only n, esc and ← do anything", () => {
+  it("with no rows only Ctrl+N, esc and ← do anything", () => {
     const none: ViewRow[] = [];
 
     for (const key of [
@@ -511,15 +588,15 @@ describe("reduceViewKey", () => {
       { pageDown: true },
       { return: true },
       { ch: "x" },
+      CTRL_X,
     ]) {
       const r = press(IDLE_VIEW_NAV, key, none);
 
-      expect(r.consumed).toBe(true);
       expect(r.effect).toBeNull();
       expect(r.nav).toEqual(at(0));
     }
 
-    expect(press(IDLE_VIEW_NAV, { ch: "n" }, none).effect).toEqual({
+    expect(press(IDLE_VIEW_NAV, CTRL_N, none).effect).toEqual({
       type: "new",
     });
     expect(press(IDLE_VIEW_NAV, { escape: true }, none).effect).toEqual({
@@ -535,7 +612,7 @@ describe("reduceViewKey", () => {
 
     expect(press(at(4), { ch: "q" }, short).nav.index).toBe(1);
     expect(press(at(4), { up: true }, short).nav.index).toBe(0);
-    expect(press(at(4), { return: true }, short).effect).toEqual({
+    expect(press(at(4), { right: true }, short).effect).toEqual({
       row: short[1],
       type: "activate",
     });
@@ -559,12 +636,13 @@ describe("reduceViewKey", () => {
     });
   });
 
-  it("a stale confirmation eats ⏎ instead of attaching to the row under the cursor", () => {
+  it("a stale confirmation eats ⏎ instead of letting the composer attach to the row under the cursor", () => {
     const r = press({ confirmKey: "agent:gone", index: 1 }, { return: true });
 
+    expect(r.consumed).toBe(true);
     expect(r.effect).toBeNull();
     expect(r.nav.confirmKey).toBeNull();
-    expect(press(r.nav, { return: true }).effect).toEqual({
+    expect(press(r.nav, { right: true }).effect).toEqual({
       row: ROWS[1],
       type: "activate",
     });
@@ -609,5 +687,137 @@ describe("visibleWindow", () => {
     expect(visibleWindow(10, -3, 4, 3)).toEqual({ end: 4, start: 0 });
     expect(visibleWindow(10, 2, 4, 99)).toEqual({ end: 6, start: 2 });
     expect(visibleWindow(5, 4, 0)).toEqual({ end: 5, start: 4 });
+  });
+});
+
+describe("routeViewInput", () => {
+  const [CUR, S1, A1, P1] = ROWS as [ViewRow, ViewRow, ViewRow, ViewRow];
+  const NEW = NEW_AGENT_ROW;
+  const refused = (text: string, row: ViewRow) =>
+    expect(routeViewInput(text, row)).toMatchObject({
+      notice: { tone: "error" },
+      type: "notice",
+    });
+
+  it("/bg starts a background agent from any row, and needs a prompt", () => {
+    for (const row of [NEW, CUR, S1, A1, P1]) {
+      expect(routeViewInput("/bg fix the build", row)).toEqual({
+        text: "fix the build",
+        type: "dispatch",
+      });
+    }
+
+    refused("/bg", S1);
+  });
+
+  it("/new starts a new session; /agents does nothing; /attach and /resume activate the row", () => {
+    expect(routeViewInput("/new", S1)).toEqual({ type: "new" });
+    expect(routeViewInput("/agents", S1)).toEqual({ type: "none" });
+    expect(routeViewInput("/attach", S1)).toEqual({
+      row: S1,
+      type: "activate",
+    });
+    expect(routeViewInput("/resume", P1)).toEqual({
+      row: P1,
+      type: "activate",
+    });
+  });
+
+  it("/stop arms the stop confirmation on a stoppable row only", () => {
+    for (const row of [S1, A1]) {
+      expect(routeViewInput("/stop", row)).toEqual({
+        action: "stop",
+        row,
+        type: "confirm",
+      });
+    }
+
+    for (const row of [CUR, P1, NEW]) {
+      refused("/stop", row);
+    }
+  });
+
+  it("/rename (and /title) renames session and past rows only", () => {
+    for (const row of [CUR, S1, P1]) {
+      expect(routeViewInput("/rename  new name ", row)).toEqual({
+        row,
+        title: "new name",
+        type: "rename",
+      });
+    }
+
+    expect(routeViewInput("/title t", S1)).toEqual({
+      row: S1,
+      title: "t",
+      type: "rename",
+    });
+    refused("/rename t", A1);
+    refused("/rename t", NEW);
+    refused("/rename", S1);
+  });
+
+  it("/delete arms the delete confirmation on a past row or another live session, never on this one", () => {
+    for (const row of [P1, S1]) {
+      expect(routeViewInput("/delete", row)).toEqual({
+        action: "delete",
+        row,
+        type: "confirm",
+      });
+    }
+
+    expect(routeViewInput("/delete", CUR)).toEqual({
+      notice: { text: "you are in this session", tone: "error" },
+      type: "notice",
+    });
+    refused("/delete", A1);
+    refused("/delete", NEW);
+  });
+
+  it("/close closes another live session only", () => {
+    expect(routeViewInput("/close", S1)).toEqual({
+      row: S1,
+      type: "closeSession",
+    });
+
+    for (const row of [CUR, P1, A1, NEW]) {
+      refused("/close", row);
+    }
+  });
+
+  it("sends any other /cmd and every !cmd to this session", () => {
+    expect(routeViewInput(" /model gpt-x ", S1)).toEqual({
+      text: "/model gpt-x",
+      type: "main",
+    });
+    expect(routeViewInput("!ls -la", NEW)).toEqual({
+      text: "!ls -la",
+      type: "main",
+    });
+  });
+
+  it("sends plain text to the selected row", () => {
+    expect(routeViewInput(" hello ", NEW)).toEqual({
+      text: "hello",
+      type: "dispatch",
+    });
+    expect(routeViewInput("hello", CUR)).toEqual({
+      text: "hello",
+      type: "sendCurrent",
+    });
+    expect(routeViewInput("hello", S1)).toEqual({
+      row: S1,
+      text: "hello",
+      type: "sendTo",
+    });
+    expect(routeViewInput("hello", A1)).toEqual({
+      row: A1,
+      text: "hello",
+      type: "steer",
+    });
+    expect(routeViewInput("hello", P1)).toEqual({
+      row: P1,
+      text: "hello",
+      type: "resumeAndSend",
+    });
   });
 });

@@ -40,8 +40,12 @@ import {
   withNewAgentRow,
 } from "./agentViewStore.js";
 
+/** Fits 80 columns. */
 export const AGENT_VIEW_HINT =
-  "type to send · ⏎ attach/send · ↑↓ select · ^N new · ^X stop · /rename /delete /close /bg · other /cmd !cmd run in this session · esc back";
+  "type to send · ⏎ attach/send · ↑↓ select · ^N new · ^X stop · esc back";
+
+/** The hint with the view's commands, shown instead when the terminal is wide enough for it. */
+export const AGENT_VIEW_HINT_WIDE = `${AGENT_VIEW_HINT} · /rename /delete /close /bg · other /cmd !cmd run in this session`;
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
@@ -275,7 +279,9 @@ export function AgentViewView({
       {composer}
       {compact && composer ? null : (
         <Text color={t.color.muted} wrap="truncate-end">
-          {AGENT_VIEW_HINT}
+          {cols >= AGENT_VIEW_HINT_WIDE.length
+            ? AGENT_VIEW_HINT_WIDE
+            : AGENT_VIEW_HINT}
         </Text>
       )}
     </Box>
