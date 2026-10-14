@@ -96,6 +96,13 @@ def _audit(event: str, args: tuple) -> None:
 sys.addaudithook(_audit)
 
 
+def pytest_collection_modifyitems(items):
+    """A test on the host's real systemd programs runs in the serial lane (``-m serial``), not next to the others."""
+    for item in items:
+        if item.get_closest_marker("real_systemd") is not None:
+            item.add_marker(pytest.mark.serial)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def home_sentinel(tmp_path_factory):
     """Suite-level sentinel: every test's writes are checked against the real home (see ``_audit``)."""
