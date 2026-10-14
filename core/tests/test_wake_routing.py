@@ -271,7 +271,7 @@ async def test_goal_kicks_and_unattended_prompts_never_trigger(tmp_path, monkeyp
     live = server.session
     live.ultra_mode = "ultracode"  # not even the mode applies to them
 
-    async def done(goal: str, last: str) -> tuple[str, str, bool, bool]:
+    async def done(goal: str, last: str, evidence: str = "") -> tuple[str, str, bool, bool]:
         return "done", "ok", False, False
 
     server.goal_judge = done  # type: ignore[assignment]
@@ -933,7 +933,7 @@ async def test_a_blocked_typed_prompt_does_not_reach_the_goal_judge(tmp_path, mo
     server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
     judged: list[str] = []
 
-    async def judge(goal: str, last: str) -> tuple[str, str, bool, bool]:
+    async def judge(goal: str, last: str, evidence: str = "") -> tuple[str, str, bool, bool]:
         judged.append(last)
         return "continue", "keep going", False, False
 

@@ -15,7 +15,7 @@ AUTO = {"advisor_on_goal": False, "auto_continue": True}
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
@@ -167,10 +167,10 @@ async def test_a_queued_prompt_after_a_continued_turn_is_a_goal_of_its_own(tmp_p
     server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "step 2", "third"])
     inner = scripted_judge(["continue", "done"])
 
-    async def judge(goal, response):
+    async def judge(goal, response, evidence=""):
         if not inner.calls:
             live.pending_prompts.append("then do this")  # typed while the first turn ran
-        return await inner(goal, response)
+        return await inner(goal, response, evidence)
 
     server.goal_judge = judge
     await server._run_turn(live, "first task")
