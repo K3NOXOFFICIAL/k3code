@@ -1312,6 +1312,12 @@ presetup_sandbox() {
   if have "$(bwrap_cmd)"; then
     log "presetup: WARNING: bubblewrap is installed but cannot create a sandbox here (user namespaces blocked?)"
     say "      unattended runs (auto, yolo, background) are not sandboxed until this is fixed"
+    # Ubuntu 23.10+ (24.04 LTS): AppArmor lets an unprivileged program create a user namespace only under a profile
+    # that allows it, and bwrap has none. Same text as doctor.py _unusable_bwrap_fix; K3_APPARMOR_USERNS is for tests.
+    if [ "$(cat "${K3_APPARMOR_USERNS:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}" 2>/dev/null)" = 1 ]; then
+      b=$(command -v "$(bwrap_cmd)" 2>/dev/null) || b=$(bwrap_cmd)
+      say "      Ubuntu restricts user namespaces with AppArmor. Allow bwrap: write these 3 lines to /etc/apparmor.d/bwrap: \`abi <abi/4.0>,\` \`include <tunables/global>\` \`profile bwrap $b flags=(unconfined) { userns, }\`, then \`sudo apparmor_parser -r /etc/apparmor.d/bwrap\`; or lift the restriction for every program: \`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\` (persist it in /etc/sysctl.d/)"
+    fi
     return 0
   fi
   log "presetup: WARNING: bubblewrap is not installed; unattended runs (auto, yolo, background) are not sandboxed"

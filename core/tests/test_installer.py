@@ -549,6 +549,31 @@ def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
     assert "installed but cannot create a sandbox" in r.stderr
 
 
+APPARMOR_TEXT = "Ubuntu restricts user namespaces with AppArmor"
+
+
+@linux_only
+@pytest.mark.parametrize(("value", "named"), [("1", True), ("0", False)])
+def test_bwrap_unusable_names_the_apparmor_restriction(tmp_path: Path, value: str, named: bool) -> None:
+    # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1; the text is the one `k3code doctor` prints
+    bwrap = stub_bin(tmp_path, "bwrap", "exit 1\n")
+    sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+    sysctl.write_text(value + "\n")
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--from-source",
+        "--yes",
+        env_extra={"K3_BWRAP": str(bwrap / "bwrap"), "K3_APPARMOR_USERNS": str(sysctl)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "installed but cannot create a sandbox" in r.stderr
+    assert (APPARMOR_TEXT in r.stderr) is named
+    if named:
+        assert f"profile bwrap {bwrap / 'bwrap'} flags=(unconfined) {{ userns, }}" in r.stderr
+        assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in r.stderr
+
+
 @linux_only
 def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
     bwrap = stub_bin(tmp_path, "bwrap", "exit 0\n")
@@ -1421,31 +1446,6 @@ def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path
         assert "needs root to install" in text
 
 
-def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
-    calls = tmp_path / "systemctl.log"
-    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
-    assert run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=stubs).returncode == 0
-    assert not calls.exists()
-
-
-def test_purge_without_yes_and_without_a_terminal_is_refused(tmp_path: Path) -> None:
-    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
-    (tmp_path / ".k3code").mkdir(exist_ok=True)
-    (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
-    r = run(tmp_path, UNINSTALL, "--purge")  # a new session: no terminal to confirm on
-    assert r.returncode != 0
-    assert "--yes" in r.stderr
-    assert (tmp_path / ".k3code" / "config.yaml").is_file()
-    assert (tmp_path / DATA_REL / "current").is_symlink()  # refused before anything was removed
-
-
-def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
-    # no k3code to run `k3code service uninstall`: the script disables and removes the daemon and its recovery unit
-    units = tmp_path / ".config" / "systemd" / "user"
-    units.mkdir(parents=True)
-    for name in ("k3code.service", "k3code-recover.service"):
-        (units / name).write_text("[Unit]\n")
-    calls = tmp_path / "systemctl.log"
 @linux_only
 @pytest.mark.serial  # a pty as the controlling terminal
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
@@ -1491,6 +1491,31 @@ def test_bwrap_install_is_not_asked_when_stdout_and_stderr_are_redirected(tmp_pa
     assert "needs root to install" in text
 
 
+def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=stubs).returncode == 0
+    assert not calls.exists()
+
+
+def test_purge_without_yes_and_without_a_terminal_is_refused(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
+    (tmp_path / ".k3code").mkdir(exist_ok=True)
+    (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
+    r = run(tmp_path, UNINSTALL, "--purge")  # a new session: no terminal to confirm on
+    assert r.returncode != 0
+    assert "--yes" in r.stderr
+    assert (tmp_path / ".k3code" / "config.yaml").is_file()
+    assert (tmp_path / DATA_REL / "current").is_symlink()  # refused before anything was removed
+
+
+def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
+    # no k3code to run `k3code service uninstall`: the script disables and removes the daemon and its recovery unit
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    calls = tmp_path / "systemctl.log"
     stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
     r = run(tmp_path, UNINSTALL, path_front=stubs)
     assert r.returncode == 0, r.stderr

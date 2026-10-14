@@ -53,6 +53,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
   - a private Node 22, from nodejs.org and checked against its published checksums, to build and run the TUI;
   - the Go toolchain `panes/go.mod` asks for, from go.dev (the installer checks the download against the sha256 go.dev lists), to build the `k3` binary. The build then fetches the `k3` module dependencies through the Go module proxy; that module cache is deleted after the build.
 - `bubblewrap` (`bwrap`), which sandboxes unattended runs on Linux, comes from your package manager. The installer installs it only when that needs no password (root or passwordless sudo); otherwise it prints the command to run (presetup repeats it after the install). `--no-install-deps` turns off that install and every toolchain download (uv, Python, Node, Go, Chromium); the packages (PyPI for the core, npm for the TUI, Go modules for the `k3` binary) are still fetched, so the install needs network access.
+  - On Ubuntu 23.10+ (including 24.04 LTS) AppArmor blocks user namespaces for programs without a profile, so an installed `bwrap` still cannot sandbox. The installer and `k3code doctor` detect this (`kernel.apparmor_restrict_unprivileged_userns=1`) and print the fix: an AppArmor profile for `bwrap`, or `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
 - Optional: `systemd --user` for the 24/7 service.
 
 ### Install
