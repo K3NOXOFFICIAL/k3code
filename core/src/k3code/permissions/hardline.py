@@ -881,6 +881,8 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
     # bracket); the last two never close. A closer that does not match the innermost is ignored, so an unsure bracket
     # stays open: a << then needs a person instead of hiding the next lines
     ctx: list[tuple[str, int]] = []
+    array_op = False  # set once an a=(...) gains an operator ("=(!"); that bracket never leaves ctx, so a flag
+    #                   replaces an O(len(ctx)) scan of ctx on every character (it was quadratic on a long run of `${`)
     i, n = 0, len(text)
     if budget is None:
         budget = [_SCAN_BUDGET]  # top-level call: one budget shared with every nested scan below
@@ -941,7 +943,8 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         c = text[i]
         if ctx and ctx[-1][0] == "=(" and (c in ";|&" or (c in "<>" and text[i + 1 : i + 2] != "(")):
             ctx[-1] = ("=(!", -1)  # an operator in a=(...): bash drops the rest of the line, heredocs included
-        in_array_op = any(kind == "=(!" for kind, _ in ctx)
+            array_op = True
+        in_array_op = array_op
         if in_array_op and (c in "\"'`" or text.startswith(("$(", "<(", ">("), i)):
             # inside an array a=(...) that holds an operator (R2), bash does not read a substitution, backtick or
             # quoted string here as one token, and dash errors: the two shells diverge. Flatten the opener so the
@@ -951,6 +954,15 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             # above it) and a `#` starts no comment, or a flattened `"x #"` or `"it's"` would hide the rest.
             out.unterminated = True
             subst_open = text.startswith(("$(", "<(", ">("), i)
+            if subst_open or c == "`":
+                # the opener is flattened to text, but its payload still runs (bash keeps going past the array's
+                # syntax error), so collect it as a payload for the hardline to scan, like a normal substitution
+                if subst_open:
+                    end = _match_paren(text, i + 1, budget=budget)
+                    cur_payloads.append(_subst_payload(text, i, end if end >= 0 else n))
+                else:
+                    end = text.find("`", i + 1)
+                    cur_payloads.append(text[i + 1 : end if end >= 0 else n])
             emit(text[i : i + 2] if subst_open else c)
             i += 2 if subst_open else 1
         elif c == "\\" and i + 1 < n:
@@ -967,6 +979,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         elif c == '"':
             piece, j, closed = ['"'], i + 1, False
             qbr: list[str] = []  # ${ / $[ opened inside this quoted string, still open (its } / ] not yet seen here)
+            qbr_unsure = False  # a ' protecting a } / ] inside the expansion: bash and dash differ, so keep it open
             while j < n:
                 d = text[j]
                 if d == '"':
@@ -986,7 +999,30 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                     qbr.append("${" if text[j + 1] == "{" else "[")
                     piece.append(text[j : j + 2])
                     j += 2
-                elif (d == "}" and qbr and qbr[-1] == "${") or (d == "]" and qbr and qbr[-1] == "["):
+                elif d == "[" and qbr and qbr[-1] == "[":
+                    qbr.append("[")  # a [ nested in a quote-opened $[ (or [): its ] closes this one, not the $[
+                    piece.append(d)
+                    j += 1
+                elif d == "'" and qbr:
+                    # bash keeps the expansion open past a } or ] that sits inside a '...' in it (the } in `'}'` is
+                    # quoted); dash does not. Where such a closer is quoted, the shells differ, so the command is
+                    # unsure: keep the bracket open (K3NOX-499 Decision). A '...' with no } or ] is an ordinary
+                    # default value (`"${x:-'a'}"`) and closes as before. The whole '...' is consumed as one piece.
+                    end_q = text.find('"', j + 1)  # the likely end of this double-quoted string
+                    end_q = n if end_q < 0 else end_q
+                    match = text.find("'", j + 1)  # the matching single quote, if any, before that end
+                    if 0 <= match < end_q:
+                        if "}" in text[j + 1 : match] or "]" in text[j + 1 : match]:
+                            out.unterminated = qbr_unsure = True
+                        piece.append(text[j : match + 1])
+                        j = match + 1
+                    else:  # an unpaired ' inside the expansion: the shells differ, so keep the bracket open
+                        out.unterminated = qbr_unsure = True
+                        piece.append(d)
+                        j += 1
+                elif not qbr_unsure and (
+                    (d == "}" and qbr and qbr[-1] == "${") or (d == "]" and qbr and qbr[-1] == "[")
+                ):
                     qbr.pop()
                     piece.append(d)
                     j += 1
@@ -1089,6 +1125,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             if c == "(":
                 if top == "=(":
                     ctx[-1] = ("=(!", -1)
+                    array_op = True
                 elif cur and cur[-1] == "=":
                     ctx.append(("=(", -1))  # a=(...), also a=((...)): no arithmetic
                 elif top != "((" and text.startswith("((", i):
