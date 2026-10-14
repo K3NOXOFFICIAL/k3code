@@ -384,6 +384,7 @@ def build_argv(
     network: bool = True,
     home_readonly: Iterable[str] | None = None,
     readonly_home: bool = False,
+    cache_dir: Path | None = None,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
 
@@ -400,6 +401,9 @@ def build_argv(
     and there is no network: ``$HOME`` and the added dirs are bound read-only, with the credential folders and files
     hidden (:data:`HOME_RO_HIDDEN`). For the plain builtin readers of a session started in the home directory (see
     :func:`k3code.permissions.engine.home_read_only`).
+
+    ``cache_dir`` is the host directory shown as ``~/.cache`` (default: ``<k3code home>/sandbox-cache``, created on
+    demand). The probes pass a scratch one so that asking whether bwrap works never creates state under the real home.
     """
     home = Path(home or Path.home())
     roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
@@ -447,7 +451,7 @@ def build_argv(
     # $HOME hidden behind an empty tmpfs, then only the sandbox's own cache and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
-    own_cache = _sandbox_cache_dir()
+    own_cache = cache_dir if cache_dir is not None else _sandbox_cache_dir()
     if own_cache is not None:
         argv += ["--bind", str(own_cache), str(cache)]
     for entry in HOME_UV:
@@ -644,7 +648,7 @@ def _probe_bwrap() -> bool:
     try:
         with tempfile.TemporaryDirectory(prefix="k3code-bwrap-") as scratch:
             r = subprocess.run(
-                [*build_argv(scratch, bwrap=path), "/bin/true"],
+                [*build_argv(scratch, bwrap=path, cache_dir=Path(scratch)), "/bin/true"],
                 capture_output=True,
                 timeout=10,
                 check=False,
@@ -666,7 +670,7 @@ def hidden_name_lookup_files() -> list[str]:
     try:
         with tempfile.TemporaryDirectory(prefix="k3code-bwrap-") as scratch:
             r = subprocess.run(
-                [*build_argv(scratch, bwrap=path), "/bin/sh", "-c", script, "sh", *wanted],
+                [*build_argv(scratch, bwrap=path, cache_dir=Path(scratch)), "/bin/sh", "-c", script, "sh", *wanted],
                 capture_output=True,
                 text=True,
                 timeout=10,

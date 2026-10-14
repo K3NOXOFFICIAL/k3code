@@ -379,3 +379,13 @@ async def test_the_huggingface_token_is_unreadable_inside_the_sandbox(tmp_path):
         )
         assert "fake-hf-token" not in res["stdout"] and "fake-index-pass" not in res["stdout"]
         assert "fake-hf-token" not in res["stderr"] and "fake-index-pass" not in res["stderr"]
+
+
+def test_probing_bwrap_creates_nothing_under_the_k3code_home(tmp_path, monkeypatch):
+    """`usable()` runs at import time of a test module (skipif), before any fixture has moved K3CODE_HOME."""
+    k3home = tmp_path / "k3home"
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    monkeypatch.setattr(sandbox, "_probe", None)
+    sandbox.usable()
+    sandbox.hidden_name_lookup_files()
+    assert not k3home.exists()
