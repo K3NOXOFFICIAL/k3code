@@ -7,6 +7,11 @@ candidate applied and sent through :class:`FakeProvider`, whose usage step is th
 The same records always give the same token totals. A record holds the size of each message (and the tool name of a
 tool result, which decides its clip), never its text.
 
+A record holds the sizes of the turn's own messages only. The history before the turn is a constant-size summary: its
+total characters and the ``HISTORY_BIG_KEEP`` largest tool results (the only entries a clip candidate can change).
+A turn's record therefore does not grow with the length of the session. Records written before this kept a size entry
+for every message of the history (no ``history`` key); they still replay, with the history inside ``entries``.
+
 The replay cannot re-run the model, so the verifier pass rate is bounded rather than measured: a passing turn whose
 inputs the candidate changed counts as a possible failure. That bound is conservative, and it is what the auto-apply
 gate reads.
@@ -32,6 +37,10 @@ from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
 RECORD_PARTS = ("learning", "replay", "turns.jsonl")
 #: A turn record larger than this is not kept (records hold sizes only, so this is a guard, not a norm).
 MAX_RECORD_CHARS = 200_000
+#: The history before a turn is summarised: this many of its largest tool results are kept one by one, so the clip
+#: candidates see them; the rest of the history is only counted (a result past these is replayed unclipped, which
+#: understates a reduction and never overstates one).
+HISTORY_BIG_KEEP = 16
 #: The file is cut back to its newest half past this size.
 MAX_FILE_BYTES = 40_000_000
 
@@ -100,14 +109,16 @@ def build_record(
     skill_lines: list[int],
     ts: float,
 ) -> dict[str, Any]:
-    """One turn as the replay reads it: the size of every message (never its text), the request boundaries and the
-    answer sizes. Request ``k`` of the turn saw ``entries[:boundaries[k]]``; its answer is the assistant message there.
+    """One turn as the replay reads it: the size of each of its own messages (never its text), the request boundaries
+    and the answer sizes. Request ``k`` of the turn saw the summarised history and ``entries[:boundaries[k]]``; its
+    answer is the assistant message there.
 
     ``first`` is the index of the turn's own first message (its prompt): the history before it made no request of
-    this turn, so its assistant messages are not boundaries (they are still part of every request's input).
+    this turn, so its assistant messages are not boundaries (they are still part of every request's input). It is
+    kept as ``history`` (see :func:`_summarise_history`), not entry by entry.
     """
-    entries = [_entry(m) for m in messages]
-    boundaries = [i for i, m in enumerate(messages) if m.role == "assistant" and i >= first]
+    entries = [_entry(m) for m in messages[first:]]
+    boundaries = [i for i, e in enumerate(entries) if e["r"] == "assistant"]
     completions = [_entry_chars(entries[i]) for i in boundaries]
     return {
         "turn": turn,
@@ -121,6 +132,7 @@ def build_record(
         "tokens_out": tokens_out,
         "memory_chars": memory_chars,
         "skill_lines": list(skill_lines),
+        "history": _summarise_history([_entry(m) for m in messages[:first]]),
         "entries": entries,
         "boundaries": boundaries,
         "completions": completions,
@@ -135,6 +147,26 @@ def _entry(m: Message) -> dict[str, Any]:
     if m.tool_calls:
         out["c"] = [len(tc.name) + len(json.dumps(tc.arguments, ensure_ascii=False)) for tc in m.tool_calls]
     return out
+
+
+def _summarise_history(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """The history before a turn in constant size: the message count, the characters of everything but the
+    ``HISTORY_BIG_KEEP`` largest tool results (``rest``), and those results themselves (``big``, in order)."""
+    ranked = sorted((i for i, e in enumerate(entries) if e["r"] == "tool"), key=lambda i: (-int(entries[i]["n"]), i))
+    keep = sorted(ranked[:HISTORY_BIG_KEEP])
+    kept = set(keep)
+    rest = sum(_entry_chars(e) for i, e in enumerate(entries) if i not in kept)
+    return {"messages": len(entries), "rest": rest, "big": [entries[i] for i in keep]}
+
+
+def _history_entries(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    """The earlier history as entries for the replay: the kept tool results and one entry for the rest. A record in
+    the old format has no summary (its history is inside ``entries``)."""
+    history = turn.get("history")
+    if not history:
+        return []
+    rest = int(history["rest"])
+    return [*history["big"], {"r": "user", "n": rest}] if rest else list(history["big"])
 
 
 def _entry_chars(e: dict[str, Any]) -> int:
@@ -192,9 +224,10 @@ def _apply(
 async def _replay_turn(provider: FakeProvider, turn: dict[str, Any], cand: Candidate | None) -> dict[str, Any]:
     tok_in = tok_out = 0
     changed = False
-    entries = turn["entries"]
+    entries = _history_entries(turn) + turn["entries"]
+    prefix = len(entries) - len(turn["entries"])
     for boundary, answer_chars in zip(turn["boundaries"], turn["completions"], strict=True):
-        sent, ch, cut = _apply(cand, entries[:boundary], turn)
+        sent, ch, cut = _apply(cand, entries[: prefix + boundary], turn)
         changed = changed or ch
         chars = sum(_entry_chars(e) for e in sent) - cut
         # the messages carry roles only: the fake provider needs their shape, the sizes come from the usage step

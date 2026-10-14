@@ -9,8 +9,9 @@
  *  - the prompt is not a slash command (`/ultracode fix x` already runs the command itself);
  *  - the word stands alone: not part of a longer word (in any script), a path (`src/ultracode.py`), a flag
  *    (`--ultracode`), an `@mention` or a `#tag`;
- *  - it is not quoted or in code: a fenced (``` or ~~~) or indented block, an inline code span, or wrapped in quotes
- *    or backticks, and it is not in pasted text;
+ *  - it is not quoted or in code: a fenced (``` or ~~~) or indented block, an inline code span, wrapped in quotes or
+ *    backticks, or inside a '...' / "..." span on one line (a quoted or @"..." path with spaces in it), and it is not
+ *    in pasted text;
  *  - the prompt does not name two different modes.
  */
 
@@ -36,7 +37,7 @@ export interface WakeMatch {
 // copy (re.ASCII) does not. A letter, digit or combining mark of any script next to the word is checked separately
 // (`glued`), with Unicode properties that both copies read the same way.
 const WORD = new RegExp(
-  `(?<![A-Za-z0-9_/.@#$:\\\\-])(${Object.keys(WAKE_WORDS).join("|")})(?![A-Za-z0-9_/\\\\-])(?!\\.[A-Za-z0-9_])`,
+  `(?<![A-Za-z0-9_/.@#$:\\\\-])(?<!\\\\ )(${Object.keys(WAKE_WORDS).join("|")})(?![A-Za-z0-9_/\\\\-])(?!\\.[A-Za-z0-9_])`,
   "gi",
 );
 const GLUED_BEFORE = /[\p{L}\p{N}\p{M}]$/u;
@@ -85,6 +86,11 @@ const INDENTED = new RegExp(
   "g",
 );
 const INLINE_CODE = /`[^`\n]*`/g;
+const QUOTE_MARK = /["']/g;
+// A quote opens a span unless it follows a word character (don't, 5") and closes it when it follows a non-blank and
+// does not precede one (it's and 'cause close nothing). ASCII on purpose, like WORD.
+const WORD_CHAR = /[A-Za-z0-9_]/;
+const QUOTE_CLOSE = /(?<=\S)["'](?![A-Za-z0-9_])/g;
 const QUOTES = "`\"'“”‘’„‚«»‹›「」『』";
 // Brackets and emphasis wrapped straight around the word go with it: "(ultracode) fix it" -> "fix it".
 const WRAPPERS: Readonly<Record<string, string>> = {
@@ -138,6 +144,60 @@ const inSpans = (spans: readonly Span[], pos: number): boolean => {
 };
 
 /**
+ * Spans between a matching pair of ' or " on one line. A quote that finds no partner on its line leaves that line's
+ * later quotes of the same kind unpaired too, so the scan stays linear.
+ */
+const quotedSpans = (scan: string): Span[] => {
+  const spans: Span[] = [];
+  const dead = new Map<string, number>(); // quote -> end of the line on which no closing quote was found
+  let pos = 0;
+  let eol = 0;
+
+  for (const m of scan.matchAll(QUOTE_MARK)) {
+    const i = m.index;
+
+    if (i < pos || (i > 0 && WORD_CHAR.test(scan[i - 1]!))) {
+      continue;
+    }
+
+    if (i >= eol) {
+      const nl = scan.indexOf("\n", i);
+
+      eol = nl < 0 ? scan.length : nl;
+    }
+
+    if ((dead.get(m[0]) ?? -1) >= eol) {
+      continue;
+    }
+
+    let end = -1;
+
+    QUOTE_CLOSE.lastIndex = i + 1;
+
+    for (let c = QUOTE_CLOSE.exec(scan); c && c.index < eol;) {
+      if (c[0] === m[0]) {
+        end = c.index + 1;
+
+        break;
+      }
+
+      c = QUOTE_CLOSE.exec(scan);
+    }
+
+    if (end < 0) {
+      dead.set(m[0], eol);
+
+      continue;
+    }
+
+    spans.push([i, end]);
+    pos = end;
+  }
+
+  return spans;
+};
+
+/**
  * Everything a wake word does not count in: `skip` (pasted text), fenced and indented code blocks, and the inline code
  * spans that do not start inside one of those. Pasted text is blanked out before the code is looked for, so a backtick
  * in a paste never opens a fence over what was typed after it.
@@ -171,7 +231,18 @@ const maskedSpans = (text: string, skip: readonly Span[]): Span[] => {
     .filter((m) => !inSpans(blocks, m.index))
     .map((m) => [m.index, m.index + m[0].length] as const);
 
-  return merge([...blocks, ...inline]);
+  const code = merge([...blocks, ...inline]);
+  // Quotes are paired on the text with code and pastes blanked out, so a quote in a code span never pairs with one
+  // outside it and swallows what was typed in between.
+  const parts: string[] = [];
+  let at = 0;
+
+  for (const [a, b] of code) {
+    parts.push(text.slice(at, a), "\0".repeat(b - a));
+    at = b;
+  }
+
+  return merge([...code, ...quotedSpans(parts.join("") + text.slice(at))]);
 };
 
 const taskWithout = (text: string, from: number, to: number): string => {
