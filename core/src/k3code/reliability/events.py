@@ -17,6 +17,8 @@ PAUSED = "reliability.paused"
 RESUMED = "reliability.resumed"
 PARKED = "reliability.parked"
 UNPARKED = "reliability.unparked"
+#: The paused/parked wait reached ``max_wait``: the original failure surfaces next (data: ``waited`` seconds).
+GAVE_UP = "reliability.gave_up"
 INTERRUPTED_TOOL = "reliability.interrupted_tool"
 BUDGET_EXCEEDED = "reliability.budget_exceeded"
 LOOP_DETECTED = "reliability.loop_detected"

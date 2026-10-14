@@ -93,7 +93,7 @@ async def test_goal_cleared_or_replaced_during_the_judge_is_not_resurrected():
     for meddle in (mgr.clear, mgr.pause, lambda: mgr.set("another goal")):
         mgr.set("ship it")
 
-        async def judge(goal, response, meddle=meddle):
+        async def judge(goal, response, evidence="", meddle=meddle):
             meddle()
             return "continue", "keep going", False, False
 
@@ -109,7 +109,7 @@ async def test_goal_cleared_or_replaced_during_the_judge_is_not_resurrected():
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
