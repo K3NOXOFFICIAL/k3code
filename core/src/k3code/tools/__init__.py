@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -557,10 +557,18 @@ def _sandbox_hint(
 
 
 async def _spawn_shell(
-    cmd: str, workdir: Path, sandbox: list[str] | None, *, merge_stderr: bool = False
+    cmd: str,
+    workdir: Path,
+    sandbox: list[str] | None,
+    *,
+    merge_stderr: bool = False,
+    env_extra: Mapping[str, str] | None = None,
+    stdin: int = asyncio.subprocess.DEVNULL,
+    pass_fds: Sequence[int] = (),
 ) -> asyncio.subprocess.Process:
     """``bash -c cmd`` (``sh -c`` where there is no bash) in its own process group (so the whole tree can be killed),
-    inside ``sandbox`` if given."""
+    inside ``sandbox`` if given. ``env_extra`` goes through :func:`child_env` (which still drops the gateway's socket
+    variables), ``stdin`` is DEVNULL unless a caller feeds it, ``pass_fds`` stay open in the child."""
     stderr = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE
     # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
     return await asyncio.create_subprocess_exec(
@@ -569,11 +577,12 @@ async def _spawn_shell(
         "-c",
         _LEFTOVER_TRAP + cmd if sandbox and not merge_stderr else cmd,
         cwd=workdir,
-        stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
+        stdin=stdin,  # DEVNULL by default: the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
         stdout=asyncio.subprocess.PIPE,
         stderr=stderr,
         start_new_session=True,
-        env=child_env(),  # the daemon's provider keys never reach a tool
+        env=child_env(env_extra),  # the daemon's provider keys never reach a tool
+        pass_fds=tuple(pass_fds),
     )
 
 
@@ -959,13 +968,24 @@ def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS, wind
     return out
 
 
-async def _drain(stream: asyncio.StreamReader | None, cap: _Capture, proc: asyncio.subprocess.Process) -> None:
-    """Read ``stream`` to EOF into ``cap``; kill the command's group when it floods past MAX_OUTPUT_BYTES."""
+async def _drain(
+    stream: asyncio.StreamReader | None,
+    cap: _Capture,
+    proc: asyncio.subprocess.Process,
+    *,
+    on_chunk: Callable[[bytes], None] | None = None,
+    limit: int | None = None,
+) -> None:
+    """Read ``stream`` to EOF into ``cap`` (each chunk also to ``on_chunk``); kill the command's group when it floods
+    past ``limit`` bytes (MAX_OUTPUT_BYTES)."""
     if stream is None:
         return
+    limit = MAX_OUTPUT_BYTES if limit is None else limit
     while chunk := await stream.read(64 * 1024):
         cap.feed(chunk)
-        if cap.total > MAX_OUTPUT_BYTES:
+        if on_chunk is not None:
+            on_chunk(chunk)
+        if cap.total > limit:
             cap.overflowed = True
             await _kill_group(proc)
             return

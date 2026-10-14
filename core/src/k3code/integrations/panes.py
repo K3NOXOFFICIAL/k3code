@@ -83,6 +83,7 @@ READONLY_BLOCKED = frozenset(
         "session.save",  # writes the transcript into the session's working directory
         "session.workspace.move",
         "shell.exec",  # runs the user's command
+        "shell.cancel",  # stops the user's command
         "reload.mcp",  # restarts the daemon's MCP servers
         "reload.env",  # re-reads config.yaml and the key file into the running gateway
         "delegation.pause",

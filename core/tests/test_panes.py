@@ -366,6 +366,7 @@ READONLY_ALLOWED = frozenset(
     [
         *("prompt.submit", "prompt.background", "session.interrupt", "session.steer", "session.delete", "tune.set"),
         *("session.undo", "session.close", "session.save", "session.workspace.move", "shell.exec", "reload.mcp"),
+        *("shell.cancel",),
         *("reload.env", "delegation.pause", "subagent.steer", "subagent.interrupt", "browser.manage", "config.set"),
     ],
 )

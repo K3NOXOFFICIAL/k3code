@@ -272,6 +272,8 @@ class LiveSession:
         self.run_lock = asyncio.Lock()
         #: Prompts submitted while a turn was running; each runs as its own turn when the current one ends.
         self.pending_prompts: list[str] = []
+        #: `!cmd` commands running now (shell.exec): exec_id -> the event shell.cancel sets
+        self.user_shells: dict[str, asyncio.Event] = {}
         #: session.steer messages for the running turn: the live AgentLoop takes them before its next model call;
         #: what no loop took (a job ran, or the loop had already answered) runs as the next prompt.
         self.steer_queue: list[str] = []
@@ -1240,8 +1242,9 @@ class GatewayServer:
     #: A peer that stopped reading (SIGSTOPped TUI, hung ssh) is dropped once this many bytes are queued for it.
     MAX_CLIENT_BACKLOG = 8 * 1024 * 1024
     #: Methods whose handler may wait for the client's own answer (clarify / approval): run as tasks, so the read loop
-    #: keeps reading and can deliver that answer. Awaited inline they deadlocked their own connection.
-    CONCURRENT_METHODS = frozenset({"command.dispatch", "slash.exec"})
+    #: keeps reading and can deliver that answer. Awaited inline they deadlocked their own connection. shell.exec runs
+    #: for minutes: inline, it held every other frame of its client (session.interrupt, shell.cancel) until it ended.
+    CONCURRENT_METHODS = frozenset({"command.dispatch", "slash.exec", "shell.exec"})
 
     async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -5094,31 +5097,95 @@ async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict
 
 # ── TUI conveniences the Ink UI calls directly (each used to answer "Method not found", shown as "out of sync") ──
 
-#: `!cmd` and `{!cmd}`: the user's own command, so it gets a terminal's timeout, not an agent tool's
-USER_SHELL_TIMEOUT_S = 300
+#: shell.exec: the longest command accepted, and what an exec_id may be (the client picks it to match shell.output)
+MAX_SHELL_COMMAND_BYTES = 32 * 1024
+_EXEC_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """`!cmd` in the composer and `{!cmd}` inside a prompt: run the user's own command in the session's directory.
 
-    Not sandboxed (the user typed it, as in a terminal), but the hardline rules, including the user's own
-    ``permissions.hardline`` patterns, still refuse it."""
+    Not sandboxed and not approved (the user typed it, as in a terminal), but the hardline rules, including the
+    user's own ``permissions.hardline`` patterns, still refuse it (code 126, not run). A concurrent method: other
+    frames of the client are answered while it runs, and ``shell.cancel`` stops it (code 130; 124 on a timeout) with
+    the reply still sent. ``stream: true`` sends the output as ``shell.output`` events while it runs."""
     from k3code.permissions import hardline
-    from k3code.tools import tool_bash
+    from k3code.tools.usershell import ShellStreamer, run_user_command
 
-    command = str(_require(params, "command"))
-    session = server._session_for(params.get("session_id"))
-    cwd = Path(session.perms.cwd) if session is not None else Path.cwd()
-    extra = list(session.perms.hardline_extra) if session is not None else []
-    if denied := hardline.check(command, extra):
-        return {"code": 126, "stdout": "", "stderr": f"denied by hardline rule: {denied}"}
-    res = await tool_bash({"command": command, "timeout": USER_SHELL_TIMEOUT_S}, cwd=cwd)
-    code = res.get("exit_code")
+    command = _require(params, "command")
+    if not isinstance(command, str):
+        raise _InvalidParams("command must be a string")
+    if len(command.encode("utf-8")) > MAX_SHELL_COMMAND_BYTES:
+        raise _InvalidParams(f"command is longer than {MAX_SHELL_COMMAND_BYTES // 1024} KB")
+    exec_id = params.get("exec_id") or f"x{uuid.uuid4().hex[:12]}"
+    if not isinstance(exec_id, str) or not _EXEC_ID.fullmatch(exec_id):
+        raise _InvalidParams("exec_id must be 1 to 64 of A-Z, a-z, 0-9, _ and -")
+    sid = params.get("session_id")
+    session = server._session_for(sid)
+    if session is None:
+        raise _InvalidParams(f"unknown session: {sid}" if sid else "no active session: start or resume one first")
+    if exec_id in session.user_shells:
+        raise _InvalidParams(f"exec_id {exec_id} is already running")
+    cwd = Path(session.perms.cwd)
+    reply: dict[str, Any] = {"exec_id": exec_id, "cwd": str(cwd), "recorded": False}
+    if denied := hardline.check(command, list(session.perms.hardline_extra), cwd=str(cwd)):
+        return {"code": 126, "stdout": "", "stderr": f"denied by hardline rule: {denied}", **reply}
+    cancel = asyncio.Event()
+    session.user_shells[exec_id] = cancel
+    streamer = pacer = None
+    if params.get("stream"):
+        streamer = ShellStreamer(lambda payload: session.emit("shell.output", {"exec_id": exec_id, **payload}))
+        pacer = asyncio.ensure_future(streamer.run())
+    try:
+        run = await run_user_command(
+            command,
+            cwd=cwd,
+            session_id=session.session_id,
+            cancel=cancel,
+            on_output=streamer.feed if streamer is not None else None,
+        )
+    finally:
+        session.user_shells.pop(exec_id, None)
+        if pacer is not None:
+            pacer.cancel()
+    if streamer is not None:
+        streamer.finish()
+    code = run.exit_code if run.exit_code is not None else 1
+    if run.cancelled:
+        code = 130
+    elif run.timed_out:
+        code = 124
+    elif code < 0:  # killed by a signal, as a shell reports it
+        code = 128 - code
+    stderr = run.stderr
+    if run.error:
+        stderr += ("\n" if stderr and not stderr.endswith("\n") else "") + run.error
+    if params.get("record"):
+        pass  # B1b: record the command and its output into the conversation here and set "recorded"
     return {
-        "code": int(code) if code is not None else 1,
-        "stdout": res.get("stdout") or "",
-        "stderr": (res.get("stderr") or "") + (res.get("error") or ""),
+        "code": code,
+        "stdout": run.stdout,
+        "stderr": stderr,
+        **reply,
+        **({"cancelled": True} if run.cancelled else {}),
+        **({"timed_out": True} if run.timed_out else {}),
     }
+
+
+async def _shell_cancel(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Stop `!cmd` commands: the one ``exec_id`` names, else every one of the session. Sets their cancel events (the
+    runner kills the process group and shell.exec still replies); never cancels the shell.exec handler itself."""
+    sid = params.get("session_id")
+    session = server._session_for(sid)
+    if session is None:
+        raise _InvalidParams(f"unknown session: {sid}" if sid else "no active session: start or resume one first")
+    exec_id = params.get("exec_id")
+    events = [session.user_shells[exec_id]] if exec_id in session.user_shells else []
+    if not exec_id:
+        events = list(session.user_shells.values())
+    for event in events:
+        event.set()
+    return {"cancelled": len(events)}
 
 
 async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -5389,6 +5456,7 @@ _HANDLERS: dict[str, Any] = {
     "browser.manage": _browser_manage,
     "commands.catalog": _commands_catalog,
     "shell.exec": _shell_exec,
+    "shell.cancel": _shell_cancel,
     "session.undo": _session_undo,
     "session.usage": _session_usage,
     "session.status": _session_status,

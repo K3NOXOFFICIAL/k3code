@@ -4,11 +4,20 @@ and the k3code backend are out of sync": `!cmd`, /undo, /retry, /usage, /status,
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from pathlib import Path
 
+import pytest
+
+from k3code.gateway.protocol import TOO_MANY_REQUESTS
 from k3code.gateway.server import _HANDLERS
-from test_autonomy_gateway import call, make, run_turn, start
+from k3code.tools import jobs
+from m1cmd_helpers import make_server
+from test_autonomy_gateway import call, events, make, run_turn, start
+from test_gateway_socket import Peer
+from test_usershell import gone, kill_leftovers
 
 NO_GATE = {"autonomy": {"plan_first": False, "proposals": False}}
 REPLY = [{"type": "text", "text": "hello back"}]
@@ -52,6 +61,138 @@ async def test_shell_exec_runs_in_the_session_directory_and_keeps_the_hardline(t
     assert "err" in res["stderr"]
     denied = await call(server, "shell.exec", {"command": "rm -rf /"})
     assert denied["code"] == 126 and "hardline" in denied["stderr"]
+
+
+async def test_shell_exec_needs_a_session_and_checks_its_params(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, REPLY, **NO_GATE)
+    assert await _error(server, "shell.exec", {"command": "true"}) == "no active session: start or resume one first"
+    await start(server, tmp_path)
+    assert await _error(server, "shell.exec", {"command": "true", "session_id": "nope"}) == "unknown session: nope"
+    for bad in ("has space", "x" * 65, "semi;colon"):
+        msg = await _error(server, "shell.exec", {"command": "true", "exec_id": bad})
+        assert msg.startswith("exec_id must be"), bad
+    assert "longer than 32 KB" in await _error(server, "shell.exec", {"command": "x" * (32 * 1024 + 1)})
+    res = await call(server, "shell.exec", {"command": "true", "exec_id": "A_b-9", "record": True})
+    assert (res["code"], res["exec_id"], res["cwd"], res["recorded"]) == (0, "A_b-9", str(tmp_path), False)
+    assert "cancelled" not in res and "timed_out" not in res
+    assert (await call(server, "shell.exec", {"command": "true"}))["exec_id"]  # generated when absent
+
+
+async def test_shell_exec_hardline_sees_the_session_directory(tmp_path, monkeypatch):
+    """Relative rm targets ($PWD, ..) are only judged right with the cwd: the check must get it."""
+    from k3code.permissions import hardline
+
+    server = await _server(tmp_path, monkeypatch)
+    marker = tmp_path / "ran"
+
+    def spy(command, extra=None, *, cwd=None, home=None):
+        return "needs-cwd" if cwd == str(tmp_path) else None
+
+    monkeypatch.setattr(hardline, "check", spy)
+    res = await call(server, "shell.exec", {"command": f"touch {marker}"})
+    assert res["code"] == 126 and "needs-cwd" in res["stderr"] and not marker.exists()
+
+
+async def test_shell_output_streams_as_events_when_asked(tmp_path, monkeypatch):
+    server = await _server(tmp_path, monkeypatch)
+    res = await call(server, "shell.exec", {"command": "echo one; echo two >&2", "exec_id": "s1", "stream": True})
+    got = events(server, "shell.output")
+    assert {(e["exec_id"], e["stream"], e["text"]) for e in got} == {
+        ("s1", "stdout", "one\n"),
+        ("s1", "stderr", "two\n"),
+    }
+    assert res["stdout"] == "one\n"
+    await call(server, "shell.exec", {"command": "echo quiet"})
+    assert len(events(server, "shell.output")) == 2  # no stream: no events
+
+
+@pytest.fixture
+async def daemon(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sock = tmp_path / "run" / "gw.sock"
+    await server.start_socket(sock)
+    server._running = True
+    peer = await Peer.connect(sock)
+    rid = await peer.send("session.create", {"cwd": str(tmp_path)})
+    sid = (await peer.until(lambda f: f.get("id") == rid and "method" not in f))["result"]["session_id"]
+    yield server, sock, peer, sid
+    await server.stop_socket()
+    await server.close()
+
+
+async def _reply(peer: Peer, rid: int, timeout: float = 10.0) -> dict:
+    return await peer.until(lambda f: f.get("id") == rid and "method" not in f, timeout)
+
+
+async def test_shell_exec_does_not_hold_the_connection(daemon):
+    """Awaited inline, a running `!cmd` kept every other frame of its client (session.interrupt, shell.cancel)
+    unread until it ended."""
+    _server, _sock, peer, sid = daemon
+    slow = await peer.send("shell.exec", {"command": "sleep 1", "session_id": sid})
+    started = time.monotonic()
+    quick = await peer.send("process.list", {"session_id": sid})
+    first = await peer.until(lambda f: f.get("id") in (slow, quick) and "method" not in f)
+    assert first["id"] == quick and time.monotonic() - started < 0.3
+    assert (await _reply(peer, slow))["result"]["code"] == 0
+
+
+async def test_shell_cancel_stops_the_command_and_its_reply_still_arrives(daemon):
+    server, _sock, peer, sid = daemon
+    run = await peer.send("shell.exec", {"command": "sleep 30", "session_id": sid, "exec_id": "c1"})
+    for _ in range(200):
+        if "c1" in server.live[sid].user_shells:
+            break
+        await asyncio.sleep(0.02)
+    pgid = jobs.REGISTRY.processes(sid)[0]["pid"]
+    try:
+        cancel = await peer.send("shell.cancel", {"session_id": sid, "exec_id": "c1"})
+        replies = {}
+        while len(replies) < 2:
+            f = await peer.until(lambda f: f.get("id") in (run, cancel) and "method" not in f, 5)
+            replies[f["id"]] = f["result"]
+        assert replies[cancel] == {"cancelled": 1}
+        assert replies[run]["code"] == 130 and replies[run]["cancelled"] is True
+        assert server.live[sid].user_shells == {}
+        assert await gone(pgid, 3)
+    finally:
+        kill_leftovers(pgid)
+
+
+async def test_at_most_eight_commands_per_connection_and_cancel_all_of_a_session(daemon):
+    server, _sock, peer, sid = daemon
+    ids = [await peer.send("shell.exec", {"command": "sleep 30", "session_id": sid}) for _ in range(8)]
+    extra = await peer.send("shell.exec", {"command": "true", "session_id": sid})
+    refused = await _reply(peer, extra)
+    assert refused["error"] == {
+        "code": TOO_MANY_REQUESTS,
+        "message": "too many concurrent requests on this connection (at most 8)",
+    }
+    for _ in range(200):
+        if len(server.live[sid].user_shells) == 8:
+            break
+        await asyncio.sleep(0.02)
+    cancel = await peer.send("shell.cancel", {"session_id": sid})
+    replies: dict[int, dict] = {}
+    while len(replies) < 9:
+        f = await peer.until(lambda f: f.get("id") in (cancel, *ids) and "method" not in f, 5)
+        replies[f["id"]] = f["result"]
+    assert replies.pop(cancel) == {"cancelled": 8}
+    assert [r["code"] for r in replies.values()] == [130] * 8
+
+
+async def test_a_client_that_leaves_mid_command_takes_the_command_with_it(daemon):
+    server, _sock, peer, sid = daemon
+    await peer.send("shell.exec", {"command": "sleep 30 >/dev/null 2>&1 & sleep 31", "session_id": sid})
+    for _ in range(200):
+        if jobs.REGISTRY.processes(sid):
+            break
+        await asyncio.sleep(0.02)
+    pgid = jobs.REGISTRY.processes(sid)[0]["pid"]
+    try:
+        peer.writer.close()
+        assert await gone(pgid, 5)
+    finally:
+        kill_leftovers(pgid)
 
 
 async def test_undo_drops_the_last_exchange_and_retry_finds_nothing_left(tmp_path, monkeypatch):
