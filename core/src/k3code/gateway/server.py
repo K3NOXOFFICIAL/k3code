@@ -27,9 +27,11 @@ import hmac
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -138,7 +140,6 @@ OPEN_METHODS = frozenset(
         "system.battery",
         "commands.catalog",
         "complete.slash",
-        "input.detect_drop",
         "model.options",
         "tune.get",
         "settings.get",
@@ -3717,8 +3718,8 @@ async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    # M1: no clipboard integration; the TUI pastes text inline instead.
-    return {"text": "", "images": [], "files": []}
+    # M1: no clipboard integration and no image input (text-only providers); `message` is what /paste shows.
+    return {"attached": False, "message": "Image paste is not supported yet (text-only providers)"}
 
 
 async def _process_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3764,9 +3765,49 @@ async def _image_detach(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {"detached": 0, "count": 0}
 
 
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".heic"})
+#: Longest text ``input.detect_drop`` looks at; every submitted prompt passes through it, a dropped path is short.
+MAX_DROP_CHARS = 4096
+
+
+def _dropped_file(server: GatewayServer, params: dict[str, Any]) -> Path | None:
+    """The one existing file ``params["text"]`` names (quoted, backslash-escaped, ``~``, ``file://`` or relative to the
+    session directory), else None: a prompt that merely mentions a path is not a drop."""
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_DROP_CHARS or "\n" in text.strip():
+        return None
+    try:
+        words = shlex.split(text.strip())
+    except ValueError:  # an unbalanced quote: ordinary prose
+        return None
+    if len(words) != 1:
+        return None
+    word = words[0]
+    if word.startswith("file://"):
+        word = urllib.parse.unquote(urllib.parse.urlparse(word).path)
+    try:
+        path = Path(word).expanduser()
+        if not path.is_absolute():
+            path = _session_dir(server, params) / path
+        return path if path.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 async def _input_detect_drop(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    paths = params.get("paths") or []
-    return {"images": [], "files": [str(p) for p in paths if p]}
+    """The TUI's drop check (every submit, and a pasted path): ``{matched, text}`` where ``text`` is ``@path`` for a
+    dropped file (``@"path"`` if the path has whitespace). Images are not attached (no image input yet), so an image
+    drop is just a reference the model can open with its tools."""
+    path = _dropped_file(server, params)
+    if path is None:
+        return {"matched": False}
+    shown = f'"{path}"' if any(c.isspace() for c in str(path)) else str(path)
+    return {
+        "matched": True,
+        "text": f"@{shown}",
+        "name": path.name,
+        "is_image": path.suffix.lower() in IMAGE_SUFFIXES,
+    }
 
 
 async def _command_dispatch(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
