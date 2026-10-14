@@ -36,8 +36,13 @@ from k3code.permissions.engine import sensitive_path, windows_drives
 
 logger = logging.getLogger(__name__)
 
-#: ``$HOME`` entries that stay visible inside the sandbox (rw cache, ro uv-managed pythons).
+#: ``$HOME`` entries that stay visible inside the sandbox (a cache of its own, ro uv-managed pythons).
+#: The sandbox sees ``~/.cache`` as :data:`SANDBOX_CACHE` below the k3code home, never the host's: uv installs by
+#: hard-linking from ``~/.cache/uv``, so a write in place to a cached file would change code that runs outside the
+#: sandbox (every environment uv built from it, ``~/.cache/pre-commit`` hooks), and ``~/.cache/huggingface/token``
+#: is a credential.
 HOME_CACHE = ".cache"
+SANDBOX_CACHE = "sandbox-cache"
 HOME_UV = ".local/share/uv"
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
@@ -438,11 +443,12 @@ def build_argv(
     argv += _name_lookup_argv(shown, [*private, *(Path(os.path.realpath(p)) for p in private)])
     if readonly_home:
         return [*argv, *_readonly_home_argv(home, roots[1:], xdg)]
-    # $HOME hidden behind an empty tmpfs, then only the cache dirs and the project are bound back.
+    # $HOME hidden behind an empty tmpfs, then only the sandbox's own cache and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
-    if cache.is_dir():
-        argv += ["--bind", str(cache), str(cache)]
+    own_cache = _sandbox_cache_dir()
+    if own_cache is not None:
+        argv += ["--bind", str(own_cache), str(cache)]
     uv = home / HOME_UV
     if uv.is_dir():
         argv += ["--ro-bind", str(uv), str(uv)]
@@ -471,6 +477,18 @@ def build_argv(
     return argv
 
 
+def _sandbox_cache_dir() -> Path | None:
+    """The directory the sandbox shows as ``~/.cache`` (created 0700), or None when it cannot be made: the command
+    then gets the empty ``$HOME`` tmpfs there, so a build still runs and just keeps nothing between commands."""
+    try:
+        return paths.ensure_private_dir(paths.home() / SANDBOX_CACHE)
+    except (OSError, RuntimeError):
+        logger.warning(
+            "sandbox: no cache directory under the k3code home; ~/.cache is empty and not kept", exc_info=True
+        )
+        return None
+
+
 #: What a read-only ``$HOME`` view hides on top of :data:`HOME_SECRETS`, :data:`HOME_READONLY_REFUSED`, the k3code
 #: home and the top-level dotenv files: well-known credential files and folders (tokens, registry logins, keyrings,
 #: cloud and agent logins, browser profiles) and shell/REPL histories (pasted tokens, ``export KEY=...``). A dotenv
@@ -490,6 +508,8 @@ HOME_RO_HIDDEN = (
     ".config/gh",
     ".config/hub",
     ".config/rclone",
+    ".config/uv",
+    ".cache/huggingface",
     ".password-store",
     ".local/share/keyrings",
     ".local/share/k3code",
