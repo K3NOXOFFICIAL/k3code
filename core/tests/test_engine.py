@@ -356,6 +356,26 @@ def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
     assert d.action == "ask" and d.needs_human
 
 
+def test_uv_credentials_are_never_auto_allowed(tmp_path, monkeypatch) -> None:
+    # `uv auth dir` is ~/.local/share/uv/credentials: only uv's interpreters and tools count as a toolchain read
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    proj = str(tmp_path / "proj")
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+        ("read", "~/.local/share/uv/python/../credentials/credentials.toml"),
+    ):
+        # auto mode refuses it like any read outside the roots (never auto-allowed, never resolved without a person)
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert (d.action == "deny" or d.needs_human) and not d.auto_allowed, (tool, path, d)
+        d = decide(mode="default", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+    for rel in ("python/cpython-3.12-linux/lib/python3.12/os.py", "tools/ruff/bin/ruff"):
+        d = decide(mode="auto", tool="read", args={"path": f"~/.local/share/uv/{rel}"}, cwd=proj)
+        assert d.action == "allow" and d.auto_allowed, (rel, d)
+
+
 def test_a_blank_extra_hardline_pattern_matches_nothing_and_is_reported() -> None:
     from k3code.permissions.state import parse_permissions
 
