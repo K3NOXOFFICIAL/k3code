@@ -190,6 +190,11 @@ _HOME_RECURSIVE: dict[str, tuple[str, tuple[str, ...]]] = {
     "diff": ("r", ("recursive",)),
     "git": ("", ("no-index",)),
 }
+#: git subcommands that print file contents (a $HOME repo tracking dotenv or .bashrc would show them unprompted), and
+#: the ``git log`` options that turn it into a patch dump.
+_HOME_GIT_CONTENT = frozenset({"show", "diff", "blame"})
+_HOME_GIT_PATCH_SHORT = "puc"
+_HOME_GIT_PATCH_LONG = ("patch", "cc", "remerge-diff", "diff", "textconv", "ext-diff")
 
 
 def home_read_only(command: str) -> bool:
@@ -208,6 +213,22 @@ def home_read_only(command: str) -> bool:
         if not words or words[0] not in _HOME_READERS:
             return False
         letters, longs = _HOME_RECURSIVE.get(words[0], ("", ()))
+        if words[0] == "git":
+            if any(word in _HOME_GIT_CONTENT for word in words[1:]):
+                return False
+            if "log" in words[1:] and any(
+                (
+                    word.startswith("--")
+                    and any(full.startswith(word[2:].split("=", 1)[0]) for full in _HOME_GIT_PATCH_LONG)
+                )
+                or (
+                    word.startswith("-")
+                    and not word.startswith("--")
+                    and any(c in word[1:] for c in _HOME_GIT_PATCH_SHORT)
+                )
+                for word in words[1:]
+            ):
+                return False
         for word in words[1:]:
             if word.startswith("--"):
                 name = word[2:].split("=", 1)[0]

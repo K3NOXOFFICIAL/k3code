@@ -138,7 +138,12 @@ def test_toolchain_reads_never_prompt_in_any_mode(mode: PermissionMode, tmp_path
         ("wc -l src/a.py", True),
         ("git status", True),
         ("git log --oneline -10", True),
-        ("git show HEAD --stat", True),
+        ("git show HEAD", False),  # prints file contents: a $HOME repo may track dotenv/.bashrc
+        ("git diff", False),
+        ("git blame .bashrc", False),
+        ("git log -p", False),
+        ("git log --patch", False),
+        ("git log --pat", False),
         ("git branch -a", True),
         ("git branch -r", True),
         ("pwd", True),
@@ -222,3 +227,14 @@ async def test_auto_mode_at_home_still_asks_for_a_tree_walker(tmp_path, monkeypa
     loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
     await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "rg KEY"}))
     assert len(asked) == 1 and "home directory" in asked[0] and built == []
+
+
+@pytest.mark.parametrize("command", ["git show HEAD", "git diff", "git log -p", "git log --patch"])
+async def test_auto_mode_at_home_asks_for_git_commands_that_print_file_contents(
+    command: str, tmp_path, monkeypatch
+) -> None:
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": command}))
+    assert len(asked) == 1 and built == [], command
