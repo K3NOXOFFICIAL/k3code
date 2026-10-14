@@ -171,22 +171,33 @@ BUILTIN_BASH_ASK = [
     "git tag* --local-user*",
 ]
 
-#: The builtin read-only programs a session started in ``$HOME`` runs without a person (see :func:`home_read_only`).
-#: ``rg`` searches recursively by default and ``git diff --no-index DIR other`` dumps a tree: both keep the ask there.
-_HOME_READERS = frozenset({"ls", "cat", "grep"})
+#: The builtin read-only programs a session started in ``$HOME`` runs without a person (see :func:`home_read_only`):
+#: they print only what is named on the command line (a named credential file is refused first). Not the tree walkers
+#: (``rg`` prints every match below ``$HOME``; ``find``, ``tree``, ``du`` list it) and not ``jq``/``yq`` (a program).
+_HOME_READERS = frozenset(
+    {"ls", "cat", "head", "tail", "wc", "grep", "file", "stat", "df", "pwd", "which", "type", "command", "whoami"}
+    | {"id", "uname", "date", "sort", "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath"}
+    | {"readlink", "sha256sum", "sha1sum", "sha512sum", "md5sum", "git"}
+)
 #: What such a command may be spelled with: words and the ``; | &`` separators. No glob, brace, quote, escape, ``$``,
 #: ``~``, redirect, substitution, comment or newline, so the words the shell runs are the words written.
 _HOME_PLAIN = re.compile(r"[A-Za-z0-9._/@+=,: |;&-]+")
-#: Long options (GNU getopt takes any unambiguous prefix) that make ``ls``/``grep`` walk a directory tree.
-_RECURSIVE_LONG = ("recursive", "dereference-recursive", "directories")
+#: The options that make a reader walk or dump a directory tree: (short letters, long options; GNU getopt takes any
+#: unambiguous prefix of a long one). ``git diff --no-index DIR other`` dumps two trees.
+_HOME_RECURSIVE: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ls": ("R", ("recursive",)),
+    "grep": ("rRd", ("recursive", "dereference-recursive", "directories")),
+    "diff": ("r", ("recursive",)),
+    "git": ("", ("no-index",)),
+}
 
 
 def home_read_only(command: str) -> bool:
     """``command`` may run without a person in the read-only ``$HOME`` sandbox of a session started in the home
-    directory: every part is a plain, non-recursive ``ls``, ``cat`` or ``grep``. Dotenv files lie anywhere below
-    ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``) or
-    expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by :func:`decide` first.
-    Over-matching only costs a prompt."""
+    directory: every part is a plain, non-recursive reader of :data:`_HOME_READERS`. Dotenv files lie anywhere below
+    ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``,
+    ``diff -r``) or expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by
+    :func:`decide` first. Over-matching only costs a prompt."""
     if not _HOME_PLAIN.fullmatch(command):
         return False
     parsed = hardline.parse(command)
@@ -196,12 +207,13 @@ def home_read_only(command: str) -> bool:
         words = sub.split()
         if not words or words[0] not in _HOME_READERS:
             return False
+        letters, longs = _HOME_RECURSIVE.get(words[0], ("", ()))
         for word in words[1:]:
             if word.startswith("--"):
                 name = word[2:].split("=", 1)[0]
-                if any(full.startswith(name) for full in _RECURSIVE_LONG):
+                if any(full.startswith(name) for full in longs):
                     return False
-            elif word.startswith("-") and any(ch in word[1:] for ch in ("R" if words[0] == "ls" else "rRd")):
+            elif word.startswith("-") and any(ch in word[1:] for ch in letters):
                 return False
     return True
 
@@ -523,6 +535,7 @@ def _voids_allow(
 #: getopt would accept (``sort --out=f``). Over-asking (``rg --pretty``) is the safe side.
 _READONLY_RISKY: dict[str, tuple[str, tuple[str, ...]]] = {
     "rg": ("", ("--pre", "--hostname-bin")),
+    "tail": ("fF", ("--follow",)),  # follows forever: the call never returns
     "sort": ("o", ("--output", "--compress-program")),
     "tree": ("o", ()),
     "file": ("C", ("--compile",)),
@@ -537,7 +550,21 @@ _READONLY_RISKY: dict[str, tuple[str, tuple[str, ...]]] = {
 #: ``find`` primaries that run a program, delete or write a file.
 _FIND_RISKY = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
 #: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules, or run a command.
-_QUERY_RISKY = re.compile(r"env|load|system|import|include", re.IGNORECASE)
+#: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
+_QUERY_RISKY = re.compile(r"env|load|system|import|include|eval", re.IGNORECASE)
+#: The ``make`` targets of BUILTIN_SANDBOXED_ALLOW: ``make test install`` runs every target named, so only these may.
+_MAKE_TARGETS = frozenset({"test", "check", "lint"})
+#: make options whose value is the next word (``-j``/``-l`` take an attached value only: ``-j install`` would hide a
+#: target). ``-f``/``-C`` values are path arguments: _voids_allow keeps them inside the project.
+_MAKE_VALUE_OPTS = (
+    "fCIoWE",
+    frozenset({"--file", "--makefile", "--directory", "--include-dir", "--old-file", "--assume-old"})
+    | frozenset({"--new-file", "--assume-new", "--what-if", "--eval"}),
+)
+#: git subcommands that take a ``REV:path`` argument (``git show HEAD:.env``, ``git cat-file -p :.env``).
+_GIT_REV_PATH = frozenset(
+    {"show", "log", "diff", "blame", "cat-file", "grep", "ls-tree", "restore", "checkout", "rev-parse", "archive"}
+)
 #: ``git branch``/``git tag`` in list mode: (flags allowed, flags whose value is the next word, short letters allowed).
 #: Anything else (``-d``, ``-m``, a new name) changes refs and asks; a pattern argument needs ``--list``/``-l``.
 _REF_LIST_FLAGS = frozenset(
@@ -600,6 +627,9 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         name = f"git {sub}"
     if name == "find":
         return not any(a in _FIND_RISKY for a in args)
+    if name == "make":
+        _, positional = _options(args, *_MAKE_VALUE_OPTS)
+        return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
     if name == "uniq":
         # `uniq IN OUT` writes OUT
         _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
@@ -968,7 +998,11 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     if name in _COPIERS:
         reads, writes = _copier_roles(args)
         return reads, writes, []
-    return _words(args), [], []
+    words = _words(args)
+    if name == "git" and args[:1] and args[0] in _GIT_REV_PATH:
+        # `git show HEAD:.env.production`, `git cat-file -p :.env`: the path half of a REV:path is read too
+        words += [w.split(":", 1)[1] for w in words if ":" in w and "://" not in w and w.split(":", 1)[1]]
+    return words, [], []
 
 
 def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
@@ -1130,12 +1164,18 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
+        elif not is_edit and rule.action == "ask" and rule.layer == 0 and _toolchain_read(path):
+            # a read of the toolchain dirs (/usr, site-packages, node_modules ...) is never worth a prompt: every
+            # mode allows it (auto logs it as an auto allow, see _finish, and alone takes /etc too). A
+            # user/project/session rule still wins; credential paths were refused above.
+            if mode != PermissionMode.AUTO and not _inside(path, ["/etc"]):
+                dec.action = "allow"
+            elif mode != PermissionMode.AUTO:
+                dec.needs_human = True  # /etc outside auto: a person approves it, as before
         elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
-            # auto mode does not stop for a wandering read: the system and toolchain dirs are allowed (_finish logs
-            # it as an auto allow), anything else is refused with a hint. A user/project/session rule still wins.
-            if not _toolchain_read(path):
-                dec.action = "deny"
-                dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
+            # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
+            dec.action = "deny"
+            dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
