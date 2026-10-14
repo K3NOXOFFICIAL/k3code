@@ -22,7 +22,7 @@ def test_context_windows_by_config_and_by_family():
     assert context_window(cfg, "claude-sonnet-4-5") == 200_000
     assert context_window(cfg, "anthropic/claude-haiku") == 200_000
     assert context_window(cfg, "gpt-4o-mini") == 128_000
-    assert context_window(cfg, "gpt-4.1") == 128_000
+    assert context_window(cfg, "gpt-4.1") == 1_047_576  # #168: a 1M-token model
     assert context_window(cfg, "llama-3-8b") == 128_000  # no known family: the fallback
     assert compact_threshold(cfg, "claude-x") == 140_000  # 0.7 of the window
     cfg.context = {"compact_at_ratio": 0.5}
