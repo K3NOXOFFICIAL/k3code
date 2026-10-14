@@ -1965,6 +1965,7 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                attended=not (session.background or session.goal_continuation),
             ),
             max_turns=self.config.max_turns,
             headless=False,

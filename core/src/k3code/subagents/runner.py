@@ -412,6 +412,7 @@ class SubagentManager:
             config=server.config,
             session_meta=parent.stored.meta,
             mcp=server.mcp,
+            attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
         )
         note = ""
         if h.isolation == "worktree":
