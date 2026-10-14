@@ -109,6 +109,7 @@ from k3code.routing.tiers import (
     TaskKind,
     Tier,
     TierRouters,
+    active_provider,
     next_tier,
     router_options,
     tier_for,
@@ -631,7 +632,7 @@ class GatewayServer:
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
-        self._router_cache: dict[str, TierRouters] = {}  # one TierRouters per model key (see _ensure_router)
+        self._router_cache: dict[Any, TierRouters] = {}  # one TierRouters per model key [and first block]
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
         self._idle_sweeper: asyncio.Task[None] | None = None
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
@@ -1470,7 +1471,7 @@ class GatewayServer:
 
     # ── router wiring ─────────────────────────────────────────────────
 
-    def _ensure_router(self, model: str | None = None) -> TierRouters:
+    def _ensure_router(self, model: str | None = None, provider: str = "") -> TierRouters:
         """Provider chain + routers, built once per provider config and once per model key.
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
@@ -1481,25 +1482,38 @@ class GatewayServer:
 
         Returns the key's routers. ``self.router`` / ``self._tiers`` follow whichever turn called this last, so a
         turn keeps the returned value instead of reading them again after an await (#130).
+
+        ``provider``: the session's /provider pick. That block (else ``default_provider``) goes first in the chain;
+        routers are cached per key and first block, and a first block that is the first in config order shares the
+        plain key's routers.
         """
         key = model or self.config.default_model
+        first = active_provider(self.config, provider)
+        if self.config.providers and first == self.config.providers[0].name:
+            first = ""
         # _router_cfg None: a router injected from outside (tests) is taken as is
         current = self._router_cfg is None or self._router_cfg is self.config.providers
-        if self.router is not None and self._chain_key == key and current:
+        if self.router is not None and self._chain_key == key and self._chain_provider == first and current:
             return self.tier_routers()
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
             self._swap_providers()
             self._router_cache = {}
             self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains with the old model specs
             self._router_cfg = self.config.providers
-        tiers = self._router_cache.get(key)
+        cache_key = (key, first) if first else key
+        tiers = self._router_cache.get(cache_key)
         if tiers is None:
-            tiers = self._router_cache[key] = TierRouters(
-                self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
+            tiers = self._router_cache[cache_key] = TierRouters(
+                self.providers,
+                self.config,
+                cooldowns=self.cooldowns,
+                on_event=self._on_router_event,
+                main_key=key,
+                first_provider=first,
             )
         self._tiers = tiers
         self.router = tiers.get(Tier.MAIN)
-        self._chain_key = key
+        self._chain_key, self._chain_provider = key, first
         return tiers
 
     def _swap_providers(self) -> None:
@@ -1560,6 +1574,7 @@ class GatewayServer:
                 logger.warning("closing retired provider %s failed", getattr(p, "name", "?"), exc_info=True)
 
     _chain_key: str | None = None
+    _chain_provider: str = ""  # the first block of the cached chain ('' = config order); see _ensure_router
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
 
     def reset_tier_routers(self) -> None:
@@ -2049,7 +2064,8 @@ class GatewayServer:
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
         specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
-        first = specs[0] if specs else ""
+        name = active_provider(self.config, session.stored.provider)  # /provider: that block's model goes first
+        first = next((s for p, s in zip(self.config.providers, specs, strict=False) if p.name == name), "")
         if isinstance(first, list):
             first = first[0] if first else ""
         return str(first or session.stored.model or self.config.default_model)
@@ -2086,7 +2102,7 @@ class GatewayServer:
         ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
-        tiers = self._ensure_router(session.stored.model or None)
+        tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
@@ -4269,7 +4285,18 @@ HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "Model and settings",
-        ("tune", "model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
+        (
+            "tune",
+            "model",
+            "effort",
+            "provider",
+            "settings",
+            "config",
+            "output-style",
+            "permissions",
+            "update-config",
+            "focus",
+        ),
     ),
     (
         "Autonomy",
