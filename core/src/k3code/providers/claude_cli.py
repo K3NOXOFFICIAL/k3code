@@ -51,7 +51,7 @@ from typing import Any
 
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.providers import effort
-from k3code.providers.base import Provider, ProviderError
+from k3code.providers.base import Provider, ProviderDeadline, ProviderError
 from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, ToolSpec, Usage
 
 DEFAULT_COMMAND = "claude"
@@ -430,7 +430,7 @@ class ClaudeCliProvider(Provider):
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(proc.pid, 9)
                 await proc.wait()
-                raise ProviderError(f"claude -p timed out after {self.timeout:g}s", status_code=504) from exc
+                raise ProviderDeadline(f"claude -p timed out after {self.timeout:g}s") from exc
             yield {"type": _EXIT, "rc": rc or 0, "stderr": err.decode("utf-8", "replace")}
         finally:
             feeder.cancel()
@@ -613,7 +613,7 @@ class ClaudeCliProvider(Provider):
                     if event.get("type") == "result":
                         return
         except TimeoutError as exc:
-            raise ProviderError(f"claude -p timed out after {self.timeout:g}s", status_code=504) from exc
+            raise ProviderDeadline(f"claude -p timed out after {self.timeout:g}s") from exc
 
     async def _reap(self) -> None:
         """Drop idle processes that have exited or idled longer than ``idle_seconds`` (the idle timer normally gets
