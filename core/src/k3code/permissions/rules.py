@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from k3code.toolnames import MAX_WIRE_NAME, wire_name
+
 from . import wildcard
 
 Action = Literal["allow", "ask", "deny"]
@@ -86,7 +88,11 @@ def evaluate(tool: str, pattern: str, ruleset: list[Rule], *, default: Action = 
     best_key: tuple[int, ...] = (-1, -1, -1, -1)
     vetoes: list[tuple[tuple[int, ...], Rule]] = []  # user/session denies that a project allow must not override
     for index, rule in enumerate(ruleset):
-        if not wildcard.match(tool, rule.tool):
+        # an MCP tool whose name is over the wire limit goes by its shortened name: a rule written with the full name
+        # (a deny above all) must still apply to it
+        if not wildcard.match(tool, rule.tool) and not (
+            len(rule.tool) > MAX_WIRE_NAME and wildcard.match(tool, wire_name(rule.tool))
+        ):
             continue
         if rule.tool == "*" and rule.pattern == "*":
             specificity = 0

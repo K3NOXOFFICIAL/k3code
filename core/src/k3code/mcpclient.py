@@ -19,6 +19,7 @@ from typing import Any
 
 from k3code.config import McpServerConfig, env_value
 from k3code.reliability.sandbox import child_env
+from k3code.toolnames import wire_name
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,58 @@ def _expand_names(query: str) -> str:
     return _BRACES.sub(lambda m: ", ".join(m.group(1) + n.strip() for n in m.group(2).split(",") if n.strip()), q)
 
 
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, msg: str, *args: Any) -> None:
+    if key not in _WARNED:
+        _WARNED.add(key)
+        logger.warning(msg, *args)
+
+
+def _local_ref(root: dict[str, Any], schema: Any) -> Any:
+    """``schema``, or what its ``#/...`` ``$ref`` points at inside ``root`` (a few hops; else left as it is)."""
+    for _ in range(5):
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if not isinstance(ref, str) or not ref.startswith("#/"):
+            break
+        node: Any = root
+        for part in ref[2:].split("/"):
+            node = node.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(node, dict) else None
+        schema = node
+    return schema
+
+
+def flatten_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """``schema`` as an object schema without a top-level ``anyOf``/``oneOf``/``allOf`` (Anthropic refuses them, and one
+    refused tool fails every request of the session): the object variants' ``properties`` merged, ``required`` kept only
+    where every variant has it, ``{"type": "object", "properties": {}}`` when nothing usable is left."""
+    variants = [
+        v for k in ("anyOf", "oneOf", "allOf") for v in (schema.get(k) if isinstance(schema.get(k), list) else [])
+    ]
+    out = {k: v for k, v in schema.items() if k not in ("anyOf", "oneOf", "allOf")}
+    objects = [
+        v
+        for v in (_local_ref(schema, v) for v in variants)
+        if isinstance(v, dict) and isinstance(v.get("properties"), dict)
+    ]
+    props: dict[str, Any] = dict(out.get("properties") if isinstance(out.get("properties"), dict) else {})
+    for v in objects:
+        for name, sub in v["properties"].items():
+            props.setdefault(name, sub)
+    if not props:
+        return {"type": "object", "properties": {}}
+    required = [r for r in (out.get("required") if isinstance(out.get("required"), list) else []) if isinstance(r, str)]
+    if objects:
+        common = set.intersection(*({r for r in v.get("required") or [] if isinstance(r, str)} for v in objects))
+        required += [r for r in props if r in common and r not in required]
+    out.update(type="object", properties=props)
+    out.pop("required", None)
+    if required:
+        out["required"] = required
+    return out
+
+
 @dataclass
 class McpToolInfo:
     server: str
@@ -66,9 +119,34 @@ class McpToolInfo:
     description: str
     schema: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        schema = self.schema
+        if isinstance(schema, dict) and any(isinstance(schema.get(k), list) for k in ("anyOf", "oneOf", "allOf")):
+            _warn_once(
+                self.full_name, "mcp tool %s: top-level anyOf/oneOf/allOf in its input schema flattened", self.name
+            )
+            self.schema = flatten_input_schema(schema)
+        elif isinstance(schema, dict) and schema and "type" not in schema:
+            self.schema = {**schema, "type": "object"}
+
+    @property
+    def full_name(self) -> str:
+        return qualified_name(self.server, self.name)
+
     @property
     def qualified(self) -> str:
-        return qualified_name(self.server, self.name)
+        """The name the model sees and calls: ``full_name``, shortened (``wire_name``) when it is over 64 characters."""
+        return wire_name(self.full_name)
+
+    def problem(self) -> str:
+        """Why this tool cannot be advertised (empty when it can)."""
+        if not isinstance(self.name, str) or not self.name.strip():
+            return "empty tool name"
+        if not isinstance(self.schema, dict) or self.schema.get("type", "object") != "object":
+            return "input schema is not an object schema"
+        if "properties" in self.schema and not isinstance(self.schema["properties"], dict):
+            return "input schema properties is not an object"
+        return ""
 
 
 @dataclass
@@ -253,6 +331,9 @@ async def _list_all_tools(session: Any, server: str) -> list[McpToolInfo]:
         listed = await session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
         for t in listed.tools:
             info = McpToolInfo(server, t.name, t.description or "", dict(_attr(t, "input_schema", "inputSchema") or {}))
+            if why := info.problem():
+                logger.warning("mcp server %s: tool %r skipped (%s)", server, t.name, why)
+                continue
             if info.qualified in seen:
                 logger.warning("mcp server %s: tool %r collides with an earlier tool after renaming", server, t.name)
                 continue
@@ -463,7 +544,7 @@ class McpManager:
         return out
 
     def find(self, qualified: str) -> McpToolInfo | None:
-        return next((t for t in self.tools() if t.qualified == qualified), None)
+        return next((t for t in self.tools() if qualified in (t.qualified, t.full_name)), None)
 
     async def call(self, qualified: str, args: dict[str, Any]) -> dict[str, Any]:
         info = self.find(qualified)
@@ -497,14 +578,15 @@ class McpManager:
         q = _expand_names(query)
         words = [w for w in re.split(r"[\s,]+", q) if w]
         tools = self.tools()
-        qualified = {t.qualified.lower() for t in tools}
+        qualified = {n.lower() for t in tools for n in (t.qualified, t.full_name)}
         # activating a tool sends its schema with every later request: a name asked for must not pull in others
         keywords = [] if query.strip().lower().startswith("select:") else [w for w in words if w not in qualified]
         scored = []
         for t in tools:
             hay = f"{t.qualified} {t.description}".lower()
             # the server's own name, and the sanitized one the prompt prints after the prefix (``search.docs``)
-            names = {t.qualified.lower(), t.name.lower(), t.qualified[len(qualified_name(t.server, "")) :].lower()}
+            names = {t.qualified.lower(), t.full_name.lower(), t.name.lower()}
+            names.add(t.qualified[len(qualified_name(t.server, "")) :].lower())
             if q in names or names.intersection(words):
                 score = 100
             else:

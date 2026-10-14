@@ -129,10 +129,14 @@ def mcp_prompt(mcp: McpManager, limit: int = 150) -> str:
     if not tools:
         return ""
     groups: dict[str, list[str]] = {}
+    loose: list[str] = []
     for t in tools[:limit]:
         prefix = qualified_name(t.server, "")
+        if not t.qualified.startswith(prefix):  # a server name so long that the shortened name has lost its prefix
+            loose.append(t.qualified)
+            continue
         groups.setdefault(prefix, []).append(t.qualified[len(prefix) :])
-    shown = "\n".join(f"{prefix}{{{', '.join(names)}}}" for prefix, names in groups.items())
+    shown = "\n".join([f"{prefix}{{{', '.join(names)}}}" for prefix, names in groups.items()] + loose)
     more = f"\n…(+{len(tools) - limit} more)" if len(tools) > limit else ""
     return (
         "## MCP tools (deferred)\n\n"
