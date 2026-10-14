@@ -36,14 +36,15 @@ from k3code.permissions.engine import sensitive_path, windows_drives
 
 logger = logging.getLogger(__name__)
 
-#: ``$HOME`` entries that stay visible inside the sandbox (a cache of its own, ro uv-managed pythons).
+#: ``$HOME`` entries that stay visible inside the sandbox (a cache of its own, ro uv-managed pythons and tools).
 #: The sandbox sees ``~/.cache`` as :data:`SANDBOX_CACHE` below the k3code home, never the host's: uv installs by
 #: hard-linking from ``~/.cache/uv``, so a write in place to a cached file would change code that runs outside the
 #: sandbox (every environment uv built from it, ``~/.cache/pre-commit`` hooks), and ``~/.cache/huggingface/token``
-#: is a credential.
+#: is a credential. uv counts only with its interpreters and tools: ``~/.local/share/uv/credentials``
+#: (``uv auth dir``) holds index tokens.
 HOME_CACHE = ".cache"
 SANDBOX_CACHE = "sandbox-cache"
-HOME_UV = ".local/share/uv"
+HOME_UV = (".local/share/uv/python", ".local/share/uv/tools")
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
@@ -449,9 +450,10 @@ def build_argv(
     own_cache = _sandbox_cache_dir()
     if own_cache is not None:
         argv += ["--bind", str(own_cache), str(cache)]
-    uv = home / HOME_UV
-    if uv.is_dir():
-        argv += ["--ro-bind", str(uv), str(uv)]
+    for entry in HOME_UV:
+        uv = home / entry
+        if uv.is_dir():
+            argv += ["--ro-bind", str(uv), str(uv)]
     seen: set[str] = set()
     for root in roots:
         p = str(root)

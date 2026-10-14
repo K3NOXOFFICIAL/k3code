@@ -238,6 +238,46 @@ def test_read_only_home_view_hides_top_level_dotenv_and_symlink_targets(tmp_path
     assert str(home / ".bash_history") not in masked  # a bind onto the link would follow it anyway
 
 
+def _uv_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    uv = home / ".local" / "share" / "uv"
+    for sub in ("python", "tools", "credentials"):
+        (uv / sub).mkdir(parents=True)
+    (uv / "credentials" / "credentials.toml").write_text('token = "fake-uv-token"\n')
+    return home
+
+
+def test_uv_credentials_are_never_bound_into_the_sandbox(tmp_path):
+    """`uv auth dir` is ~/.local/share/uv/credentials (index tokens): only uv's interpreters and tools are bound."""
+    home = _uv_home(tmp_path)
+    uv = home / ".local" / "share" / "uv"
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    binds = _binds(argv)
+    assert str(uv / "python") in binds and str(uv / "tools") in binds
+    assert str(uv) not in binds and str(uv / "credentials") not in binds
+    assert not any(str(uv / "credentials") in a for a in argv)
+
+
+def test_uv_dirs_are_bound_only_when_they_exist(tmp_path):
+    home = tmp_path / "home"
+    (home / ".local" / "share" / "uv" / "tools").mkdir(parents=True)
+    binds = _binds(sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[]))
+    assert str(home / ".local/share/uv/tools") in binds
+    assert str(home / ".local/share/uv/python") not in binds
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_uv_credentials_are_unreadable_inside_the_real_sandbox(tmp_path):
+    home = _uv_home(tmp_path)
+    proj = _proj(tmp_path)
+    creds = home / ".local" / "share" / "uv" / "credentials" / "credentials.toml"
+    argv = sandbox.build_argv(proj, home=home, home_readonly=[])
+    res = await tool_bash({"command": f"cat {creds}; ls {home}/.local/share/uv/python"}, cwd=proj, sandbox=argv)
+    assert "fake-uv-token" not in res["stdout"]
+    assert "No such file" in res["stderr"]
+    assert res["stderr"].count("No such file") == 1  # python/ is still there
+
+
 # ── ~/.cache is not shared with processes outside the sandbox (K3NOX-639) ──
 
 

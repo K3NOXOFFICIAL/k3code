@@ -178,7 +178,7 @@ def test_unattended_sessions_are_sandboxed_in_any_mode():
 def test_bwrap_argv_policy(tmp_path):
     home = tmp_path / "home"
     (home / ".cache").mkdir(parents=True)
-    (home / ".local/share/uv").mkdir(parents=True)
+    (home / ".local/share/uv/python").mkdir(parents=True)
     proj, extra = tmp_path / "proj", tmp_path / "extra"
     proj.mkdir()
     extra.mkdir()
@@ -190,7 +190,8 @@ def test_bwrap_argv_policy(tmp_path):
     assert f"--tmpfs {home}" in joined  # $HOME hidden …
     assert f"--bind {home}/.cache {home}/.cache" not in joined  # … except a cache of its own, not the host's
     assert f" {home}/.cache" in joined and f"--bind {paths.home() / 'sandbox-cache'} {home}/.cache" in joined
-    assert f"--ro-bind {home}/.local/share/uv {home}/.local/share/uv" in joined
+    assert f"--ro-bind {home}/.local/share/uv/python {home}/.local/share/uv/python" in joined
+    assert f"--ro-bind {home}/.local/share/uv {home}/.local/share/uv " not in joined + " "  # not the credentials
     assert f"--bind {proj.resolve()} {proj.resolve()}" in joined and f"--bind {extra.resolve()}" in joined
     assert argv.index("--tmpfs") < argv.index(f"{proj.resolve()}")  # project is bound after the home tmpfs
 
