@@ -856,6 +856,14 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
+        elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
+            # auto mode does not stop for a wandering read: the system and toolchain dirs are allowed (_finish logs
+            # it as an auto allow), anything else is refused with a hint. A user/project/session rule still wins.
+            if not _toolchain_read(path):
+                dec.action = "deny"
+                dec.message = (
+                    f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
+                )
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
@@ -865,6 +873,24 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         dec.action, dec.needs_human = "ask", True
         dec.message = f"Writes into a key or credential store; confirm it yourself: {path}"
     return dec
+
+
+#: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person: the
+#: system dirs the sandbox shows bash anyway, and the language package caches under ``$HOME``. Credential paths are
+#: refused before this is consulted (sensitive_path).
+_TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
+_TOOLCHAIN_HOME = (".cargo/registry", ".cargo/git", ".rustup", "go/pkg/mod", ".npm", ".local/share/uv", ".m2/repository")
+#: Path segments of installed packages of a known toolchain (Python, Node).
+_TOOLCHAIN_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
+
+
+def _toolchain_read(path: str) -> bool:
+    """``path`` (absolute) lies in a read-only system or toolchain location (see _TOOLCHAIN_SYSTEM), after resolving
+    symlinks: a link from there into ``$HOME`` does not count."""
+    home = os.path.expanduser("~")
+    if _inside(path, [*_TOOLCHAIN_SYSTEM, *(os.path.join(home, rel) for rel in _TOOLCHAIN_HOME)]):
+        return True
+    return any(seg in _TOOLCHAIN_SEGMENTS for seg in os.path.realpath(path).split(os.sep))
 
 
 #: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).

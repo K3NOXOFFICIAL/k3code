@@ -329,13 +329,45 @@ def test_reads_of_key_and_daemon_env_files_are_denied_in_every_mode(tmp_path, mo
     assert decide(mode="default", tool="read", args={"path": ".env.example"}, cwd=proj).action == "allow"
 
 
-def test_auto_mode_reads_outside_the_roots_are_not_silently_allowed() -> None:
+def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
+    # system/toolchain locations: allowed (and logged as an auto allow), also headless
     d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD)
-    assert d.action == "ask" and not d.auto_allowed and d.needs_human
-    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD).action == "ask"
-    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "deny"
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "allow"
+    assert decide(mode="auto", tool="grep", args={"path": "/usr/lib/python3/x.py"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="read", args={"path": "~/.cargo/registry/src/x/lib.rs"}, cwd=CWD).action == "allow"
+    site = "/srv/venv/lib/site-packages/a.py"
+    assert decide(mode="auto", tool="read", args={"path": site}, cwd=CWD).action == "allow"
+    # anything else: refused with guidance, no prompt
+    for tool, path in (("grep", "/var/log"), ("read", "/tmp/bootstrap.py"), ("glob", "~/.keno")):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "deny" and not d.needs_human, (tool, path, d)
+        assert "outside the project" in (d.message or "") and "/add-dir" in (d.message or "")
+    # credential paths stay hard-denied, a user rule still wins (allow and ask), default mode still asks a person
+    assert decide(mode="auto", tool="read", args={"path": "~/.ssh/id_rsa"}, cwd=CWD).hardline == "sensitive-path"
     user = [_r("read", "/etc/hosts", "allow")]
     assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/var/log*", "allow")]
+    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/etc/hosts", "ask")]
+    d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user)
+    assert d.action == "ask" and d.needs_human
+    d = decide(mode="default", tool="read", args={"path": "/tmp/bootstrap.py"}, cwd=CWD)
+    assert d.action == "ask" and d.needs_human
+
+
+def test_a_blank_extra_hardline_pattern_matches_nothing_and_is_reported() -> None:
+    from k3code.permissions.state import parse_permissions
+
+    # the owner's config had `hardline: ['']`: '' matched every command, so plain `ls` was a hardline deny
+    for mode in ("default", "auto"):
+        d = decide(mode=mode, tool="bash", args={"command": "ls"}, cwd=CWD, hardline_extra=["", "  "])
+        assert d.action == "allow" and d.hardline is None, (mode, d)
+    _, hard, problems = parse_permissions("permissions:\n  hardline: ['', 'ssh \\S+ reboot']\n")
+    assert hard == [r"ssh \S+ reboot"]
+    assert any("permissions.hardline[0]" in p and "blank" in p for p in problems), problems
+    d = decide(mode="auto", tool="bash", args={"command": "ssh box reboot"}, cwd=CWD, hardline_extra=hard)
+    assert d.action == "deny" and d.hardline == "config-hardline-0"  # a real pattern still denies
     assert decide(mode="auto", tool="read", args={"path": "src/a.py"}, cwd=CWD).action == "allow"
     assert decide(mode="yolo", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
 

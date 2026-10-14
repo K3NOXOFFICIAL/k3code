@@ -74,8 +74,13 @@ def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str
     if not isinstance(section, dict):
         return list(UNREADABLE), [], ["permissions: is not a mapping; every call no rule allows is denied"]
     section = dict(section)
-    hard = [str(h) for h in section.pop("hardline", None) or []]
     problems: list[str] = []
+    hard: list[str] = []
+    for i, h in enumerate(section.pop("hardline", None) or []):
+        if str(h).strip():
+            hard.append(str(h))
+        else:  # '' matches every command: one stray empty entry denied all bash
+            problems.append(f"permissions.hardline[{i}] is blank: ignored (it would match every command)")
     return from_config(section, problems), hard, problems
 
 
