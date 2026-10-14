@@ -4,6 +4,7 @@ import {
   buildSettingsItems,
   initSettingsState,
   settingsKey,
+  settingsSnapshot,
   type SettingsSnapshot,
   visibleItems,
 } from "../domain/settings.js";
@@ -25,7 +26,7 @@ const snap: SettingsSnapshot = {
   showReasoning: false,
   statusBar: "top",
   statusLines: ["x", "y"],
-  theme: "default",
+  theme: "auto",
 };
 
 describe("settings panel state", () => {
@@ -107,5 +108,44 @@ describe("settings panel state", () => {
     expect(settingsKey(s, "", { ctrl: true, escape: true }).action.type).toBe(
       "none",
     );
+  });
+});
+
+describe("settings panel theme row", () => {
+  const local = {
+    busy: "queue",
+    compact: false,
+    details: "expanded",
+    indicator: "kaomoji",
+    indicators: ["kaomoji"],
+    mouse: true,
+    showReasoning: false,
+    statusBar: "top",
+  };
+
+  it("shows the saved display.tui_theme pin, not the gateway skin name", () => {
+    const raw = { settings: { theme: "default" } };
+
+    expect(settingsSnapshot(raw, { ...local, theme: "light" }).theme).toBe(
+      "light",
+    );
+    expect(settingsSnapshot(raw, { ...local, theme: "dark" }).theme).toBe(
+      "dark",
+    );
+  });
+
+  it("falls back to auto when no pin is saved", () => {
+    const raw = { settings: { theme: "default" } };
+
+    expect(settingsSnapshot(raw, local).theme).toBe("auto");
+    expect(settingsSnapshot(raw, { ...local, theme: "" }).theme).toBe("auto");
+  });
+
+  it("cycles only values /theme accepts", () => {
+    const theme = buildSettingsItems({ ...snap, theme: "auto" }).find(
+      (i) => i.id === "theme",
+    );
+
+    expect(theme?.options).toEqual(["auto", "light", "dark"]);
   });
 });
