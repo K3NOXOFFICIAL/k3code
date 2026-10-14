@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from k3code.providers.base import Provider, ProviderError, error_from_http, request_headers, to_provider_error
-from k3code.providers.effort import anthropic_effort
+from k3code.providers.effort import anthropic_effort, usable_temperature
 from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     Message,
@@ -96,7 +96,7 @@ class AnthropicProvider(Provider):
             # two system messages (the text agents of one type share, then the part that is theirs) stay two blocks, so
             # the shared one can be cached by itself: one block made every sibling's request a different cache entry
             payload["system"] = [{"type": "text", "text": p} for p in parts] if len(parts) > 1 else system
-        if temperature is not None:
+        if (temperature := usable_temperature(model, temperature)) is not None:
             payload["temperature"] = temperature
         if effort := anthropic_effort(model):
             payload["output_config"] = {"effort": effort}
@@ -257,7 +257,11 @@ def _add_cache_breakpoints(payload: dict[str, Any], ttl: str = "5m") -> None:
     # A call without tools (title, classifier, judge, compaction summary...) is asked once: the newest message is never
     # read back, so marking it only added the 25% cache-write surcharge to its whole input.
     if messages and payload.get("tools"):
-        messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"], ttl)}
+        for i in range(len(messages) - 1, -1, -1):  # a newest message with nothing to carry it (an empty tool result)
+            marked = with_cache_breakpoint(messages[i]["content"], ttl)  # hands the breakpoint to the one before
+            if marked is not messages[i]["content"]:
+                messages[i] = {**messages[i], "content": marked}
+                break
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:

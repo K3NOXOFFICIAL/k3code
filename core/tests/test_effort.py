@@ -39,7 +39,8 @@ def test_anthropic_sends_effort_only_to_models_that_take_it(model: str, sent: bo
         effort.REASONING_EFFORT.reset(token)
     assert ("output_config" in payload) is sent
     if sent:
-        assert payload["output_config"] == {"effort": "xhigh"}
+        # Sonnet 4.6 has no xhigh (it arrived with Opus 4.7): the API would answer it with HTTP 400, so max is sent
+        assert payload["output_config"] == {"effort": "max" if model == "claude-sonnet-4-6" else "xhigh"}
     assert "thinking" not in payload
 
 

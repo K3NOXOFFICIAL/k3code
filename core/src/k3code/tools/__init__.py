@@ -749,7 +749,9 @@ def _format_tool_result(result: dict[str, Any]) -> Any:
     if "content" in result and "first" in result:  # read
         return _numbered_read(result)
     if "content" in result:
-        return result["content"]
+        content = result["content"]
+        # an MCP result with no text is '': a tool result with nothing in it, which no cache breakpoint can sit on
+        return "(no output)" if isinstance(content, str) and not content.strip() else content
     if "stdout" in result or "stderr" in result:  # bash
         out = _collapse_redraws(_ANSI.sub("", str(result.get("stdout") or ""))).rstrip("\n")
         err = _collapse_redraws(_ANSI.sub("", str(result.get("stderr") or ""))).rstrip("\n")

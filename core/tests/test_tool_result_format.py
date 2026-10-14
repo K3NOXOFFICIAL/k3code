@@ -77,7 +77,7 @@ def test_write_edit_and_plain_errors_are_one_readable_line():
 
 def test_everything_else_is_unchanged():
     assert format_tool_result({"content": "line 1\nline 2", "lines": "1-2"}) == "line 1\nline 2"
-    assert format_tool_result({"content": ""}) == ""
+    assert format_tool_result({"content": ""}) == "(no output)"  # nothing to carry a cache breakpoint otherwise
     # an unknown shape is JSON, not a repr
     assert format_tool_result({"ok": True, "note": "n"}) == '{"ok": true, "note": "n"}'
     assert format_tool_result({"error": "x", "extra": 1}) == '{"error": "x", "extra": 1}'

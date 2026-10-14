@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -48,17 +50,25 @@ def cache_marker(ttl: str = "5m") -> dict[str, str]:
     return EPHEMERAL if ttl in ("", "5m") else {**EPHEMERAL, "ttl": ttl}
 
 
+def _can_carry(block: Any) -> bool:
+    """Whether a content block can carry a cache breakpoint: not blank text (the API rejects it) and not a tool result
+    with nothing in it."""
+    body = {"text": "text", "tool_result": "content"}.get(str(block.get("type")))
+    value = block.get(body) if body else True
+    return bool(value.strip()) if isinstance(value, str) else bool(value)
+
+
 def with_cache_breakpoint(content: Any, ttl: str = "5m") -> Any:
-    """``content`` (a message's string or block list) with a cache breakpoint on its last block; unchanged when it has
-    no block that can carry one (empty text is rejected by the API; an empty tool result is skipped the same way)."""
+    """``content`` (a message's string or block list) with a cache breakpoint on its last block that can carry one
+    (blank text and an empty tool result are skipped, the breakpoint goes on the block before); unchanged (the same
+    object) when it has none."""
     marker = cache_marker(ttl)
     if isinstance(content, str):
-        return [{"type": "text", "text": content, "cache_control": marker}] if content else content
-    if isinstance(content, list) and content:
-        last = content[-1]
-        body = {"text": "text", "tool_result": "content"}.get(str(last.get("type")))
-        if body is None or last.get(body):
-            return [*content[:-1], {**last, "cache_control": marker}]
+        return [{"type": "text", "text": content, "cache_control": marker}] if content.strip() else content
+    if isinstance(content, list):
+        for i in range(len(content) - 1, -1, -1):
+            if _can_carry(content[i]):
+                return [*content[:i], {**content[i], "cache_control": marker}, *content[i + 1 :]]
     return content
 
 
@@ -233,6 +243,22 @@ def _attach_reminders(entry: dict[str, Any], reminders: list[dict[str, Any]]) ->
     entry["content"] = blocks + reminders if has_results else reminders + blocks
 
 
+_ANTHROPIC_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def anthropic_tool_id(tool_id: str) -> str:
+    """``tool_id`` as the Anthropic API takes it (letters, digits, ``_`` and ``-``, at most 64 characters).
+
+    A history that crosses providers on failover holds ids the other API made (``functions.read:0``, ``call_9Zx.1``):
+    every request after that was refused with HTTP 400. An id that already fits is not touched. Any other becomes its
+    characters made safe plus a short hash of the original, so the same id gives the same result in the tool call and
+    in its result, in every request, and two different ids never meet."""
+    if _ANTHROPIC_ID.fullmatch(tool_id):
+        return tool_id
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", tool_id)[:55]
+    return f"{safe}_{hashlib.sha256(tool_id.encode()).hexdigest()[:8]}"
+
+
 def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
     """Split messages into (system, rest) for the Anthropic messages API.
 
@@ -246,6 +272,7 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
     rest: list[dict[str, Any]] = []
     leading = True
     pending: list[dict[str, Any]] = []
+    results: dict[str, Any] | None = None  # the user message the newest tool results went into
     for m in normalize_tool_pairs(messages):
         if m.role == "system":
             if not m.content:
@@ -262,30 +289,36 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
         leading = False
         if m.role == "assistant":
             blocks: list[dict[str, Any]] = []
-            if m.content:
+            if (m.content or "").strip():  # a whitespace-only text block is refused: HTTP 400 on every later request
                 blocks.append({"type": "text", "text": m.content})
             for tc in m.tool_calls:
-                blocks.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments})
+                blocks.append(
+                    {"type": "tool_use", "id": anthropic_tool_id(tc.id), "name": tc.name, "input": tc.arguments}
+                )
             if blocks:
                 rest.append({"role": "assistant", "content": blocks})
+                results = None
             continue
         if m.role == "tool":
-            entry: dict[str, Any] = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": m.tool_call_id or "",
-                        "content": m.content or "",
-                    }
-                ],
+            result = {
+                "type": "tool_result",
+                "tool_use_id": anthropic_tool_id(m.tool_call_id or ""),
+                "content": m.content or "",
             }
+            if results is not None:  # the results of one assistant turn belong in ONE user message, in call order
+                blocks = results["content"]
+                blocks.insert(1 + max(i for i, b in enumerate(blocks) if b.get("type") == "tool_result"), result)
+                continue
+            entry: dict[str, Any] = {"role": "user", "content": [result]}
         else:
-            entry = {"role": "user", "content": m.content or ""}
+            entry = {"role": "user", "content": m.content if (m.content or "").strip() else ""}
         if pending:
             _attach_reminders(entry, pending)
             pending = []
+        if entry["content"] == "":
+            continue  # a blank user message: the API refuses it, and the turns around it merge anyway
         rest.append(entry)
+        results = entry if m.role == "tool" else None
     if pending:  # notes after an assistant message with no user message after them yet
         rest.append({"role": "user", "content": pending})
     return "\n\n".join(system_parts), rest
