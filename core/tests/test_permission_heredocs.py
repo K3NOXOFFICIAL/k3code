@@ -8,6 +8,7 @@ quoted delimiter (``<<'EOF'``) keeps the body data.
 
 from __future__ import annotations
 
+import re
 import shlex
 import time
 from pathlib import Path
@@ -441,6 +442,72 @@ def test_nesting_the_parser_follows_is_still_checked(tmp_path: Path) -> None:
         assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home", cmd
     for cmd in (_substs(6, "date"), _launched(6, "git status")):
         assert check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# K3NOX-586: bash ends a backtick payload at the first backtick that is not escaped and drops the backslash of `\``,
+# `\\` and `\$` (in double quotes also of `\"`) before it runs the payload. The parser ended the payload at an escaped
+# backtick and never unescaped it, so a command in backticks nested in backticks reached no check (yolo ran it), and
+# backticks never counted as nesting for scan-depth.
+def _backticks(depth: int, inner: str) -> str:
+    """``inner`` nested in ``depth`` pairs of backticks, escaped at every level as bash unescapes it."""
+    for _ in range(depth):
+        inner = "echo `" + re.sub(r"([\\`$])", r"\\\1", inner) + "`"
+    return inner
+
+
+NESTED_BACKTICKS = [
+    r"echo `echo \`rm -rf ~\``",
+    r"x=`echo \`rm -rf ~\``",
+    r'echo "`echo \`rm -rf ~\``"',
+    "cat <<EOF\n" + r"`echo \`rm -rf ~\``" + "\nEOF",
+    r"bash -c 'echo `echo \`rm -rf ~\``'",
+    r"echo $(echo `echo \`rm -rf ~\``)",
+    # `\$` in backticks is a `$`: the $(...) runs
+    r"echo `echo \$(rm -rf ~)`",
+    "cat <<EOF\n" + r"`echo \$(rm -rf ~)`" + "\nEOF",
+    # in double quotes `\"` in backticks is a `"`, so the payload is not single-quoted
+    r'''echo "`echo \"'\"\`rm -rf ~\`\"'\"`"''',
+]
+
+
+@pytest.mark.parametrize("cmd", NESTED_BACKTICKS)
+def test_a_command_in_nested_backticks_is_checked(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    for mode in MODES:
+        dec = _bash(cmd, mode, tmp_path)
+        assert dec.action == "deny" and dec.hardline == "rm-rf-home", (mode, dec)
+
+
+#: bash runs no `rm` in these: the backtick is escaped, in single quotes, or its backslash is itself escaped
+BACKTICK_TEXT = [
+    r"echo $(echo \`rm -rf ~\`)",
+    r"echo '`echo \`rm -rf ~\``'",
+    r"echo `echo \\\`rm -rf ~\\\``",
+    r"echo `echo '\`rm -rf ~\`'`",
+    r"echo `echo \"'\"\`rm -rf ~\`\"'\"`",  # out of double quotes `\"` stays: the payload is single-quoted
+    "cat <<EOF\n" + r"`echo \\\`rm -rf ~\\\``" + "\nEOF",
+]
+
+
+@pytest.mark.parametrize("cmd", BACKTICK_TEXT)
+def test_an_escaped_backtick_in_backticks_stays_text(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) is None
+    assert _bash(cmd, "yolo", tmp_path).action == "allow"
+
+
+def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
+    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\""]]
+    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"']]
+    assert parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF").heredocs[0][0].payloads == [r"a `b` \"d\""]
+
+
+def test_backticks_count_as_nesting(tmp_path: Path) -> None:
+    for depth in range(2, 7):
+        assert check(_backticks(depth, HIDDEN), cwd=str(tmp_path)) == "rm-rf-home", depth
+        assert check(_backticks(depth, "date"), cwd=str(tmp_path)) is None, depth
+    for depth in (7, 8):
+        assert check(_backticks(depth, HIDDEN), cwd=str(tmp_path)) == "scan-depth", depth
+        assert _bash(_backticks(depth, HIDDEN), "yolo", tmp_path).action == "deny", depth
 
 
 # a command the parser gives up on (past the budget or the nesting) was still tokenised at every nesting level by the

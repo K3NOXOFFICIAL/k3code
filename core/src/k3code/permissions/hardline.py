@@ -295,6 +295,21 @@ def _subst_payload(text: str, at: int, end: int) -> str:
     return text[at + 1 : end + 1] if text.startswith("$((", at) else text[at + 2 : end]
 
 
+def _backtick_end(text: str, at: int) -> int:
+    """Index of the backtick that closes the one at ``at``: the first one no backslash escapes; -1 when none does."""
+    j, n = at + 1, len(text)
+    while j < n and text[j] != "`":
+        j += 2 if text[j] == "\\" else 1
+    return j if j < n else -1
+
+
+def _unescape_backticks(payload: str, dquoted: bool = False) -> str:
+    """The command bash runs for a backtick ``payload``: a backslash before `` ` ``, ``\\`` or ``$`` (in double quotes
+    also before ``"``) is dropped, any other stays (``\\x`` is ``\\x``)."""
+    escaped = '\\`$"' if dquoted else "\\`$"
+    return re.sub(r"\\([\s\S])", lambda m: m.group(1) if m.group(1) in escaped else m.group(0), payload)
+
+
 def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str], bool]:
     """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
     unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
@@ -313,12 +328,10 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
             out.append(_subst_payload(body, i, end))
             i = end + 1
         elif c == "`":
-            j = i + 1
-            while j < n and body[j] != "`":
-                j += 2 if body[j] == "\\" else 1
-            if j >= n:
-                return [*out, body[i + 1 :]], True
-            out.append(body[i + 1 : j])
+            j = _backtick_end(body, i)
+            if j < 0:
+                return [*out, _unescape_backticks(body[i + 1 :])], True
+            out.append(_unescape_backticks(body[i + 1 : j]))
             i = j + 1
         else:
             i += 1
@@ -924,13 +937,15 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             ctx.append(("$(", -1))
         return end + 1, text[at : at + open_len] + inner.clean.strip() + ")"
 
-    def backtick(at: int) -> tuple[int, str]:
-        end = text.find("`", at + 1)
+    def backtick(at: int, dquoted: bool = False) -> tuple[int, str]:
+        """`` ` `` at ``at``: (index after the closing backtick, cleaned text). bash runs the payload unescaped."""
+        end = _backtick_end(text, at)
         if end < 0:
             out.unterminated = True
             end = n
-        cur_payloads.append(text[at + 1 : end])
-        inner_bt = _scan(text[at + 1 : end], budget, _depth + 1)
+        payload = _unescape_backticks(text[at + 1 : end], dquoted)
+        cur_payloads.append(payload)
+        inner_bt = _scan(payload, budget, _depth + 1)
         out.too_deep = out.too_deep or inner_bt.too_deep
         out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
         return end + 1, text[at : end + 1]
@@ -967,7 +982,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                     j, s = subst(j, 2)
                     piece.append(s)
                 elif d == "`":
-                    j, s = backtick(j)
+                    j, s = backtick(j, dquoted=True)
                     piece.append(s)
                 else:
                     piece.append(d)
