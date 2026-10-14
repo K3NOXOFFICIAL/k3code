@@ -351,6 +351,8 @@ def _match(text: str, extra_patterns: list[str] | None) -> str | None:
         if rx.search(text):
             return name
     for i, rx in enumerate(extra_patterns or []):
+        if not rx.strip():
+            continue  # a blank pattern would match every command (config load and doctor name it)
         if re.search(rx, text):
             return f"config-hardline-{i}"
     return None

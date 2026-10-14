@@ -82,7 +82,7 @@ async def test_a_small_conversation_is_left_alone(tmp_path, monkeypatch):
 async def test_a_context_overflow_compacts_and_retries_once(tmp_path, monkeypatch):
     """The provider rejects the long conversation (HTTP 400, context length): fold the history and run the turn again
     instead of failing it - and every later tick of a loop with it."""
-    provider = Recording(overflow_over=6000)
+    provider = Recording(overflow_over=10000)
     big = {"compact_at_tokens": 10_000_000, "keep_messages": 6}  # proactive compaction off: only the retry fires
     server, live = await seed(tmp_path, monkeypatch, provider, context=big)
     status, text = await server._run_turn(live, "NEWPROMPT please")

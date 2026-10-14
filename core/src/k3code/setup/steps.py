@@ -424,7 +424,8 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
             "permissions.more", "Add an extra hardline regex (e.g. 'ssh \\S+ systemctl')?", False
         ):
             extra.append(c.p.text("permissions.rx", "Regex"))
-    return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
+    # an empty answer is no entry: a blank pattern would match (and deny) every command
+    return {"mode": mode, "extra_hardline": [str(x) for x in extra if str(x).strip()]}
 
 
 def step_integrations(c: Ctx) -> dict[str, Any]:

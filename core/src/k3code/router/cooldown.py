@@ -35,9 +35,19 @@ logger = logging.getLogger(__name__)
 # rate_limit/quota use the exponential reset ladder below; network uses a flat
 # window (same provider being unreachable is chain-wide news) — still configurable;
 # auth has its own short ladder (a revoked key is otherwise posted to on every step).
-_COOLDOWN_REASONS = frozenset(
-    {FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network, FailoverReason.auth}
+#: The entry's circuit breaker (issue #125): one failed call (its in-walk retries included) opens the entry for a
+#: short window so the next calls go straight to the backup instead of paying 3 requests and ~7 s of backoff each;
+#: a window that ends with another failure doubles the next one. Never persisted: a restart is a reset.
+BREAKER_REASONS = frozenset({FailoverReason.server, FailoverReason.timeout, FailoverReason.unknown})
+_COOLDOWN_REASONS = (
+    frozenset({FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network, FailoverReason.auth})
+    | BREAKER_REASONS
 )
+
+# Breaker ladder: 15 s → 30 s → 60 s → 2 min. The cap bounds how long a one-entry chain (the common single-gateway
+# config) parks an interactive turn between half-open probes; a declared Retry-After (503/529) seeds the window.
+_BREAKER_BASE_COOLDOWN_SECONDS = 15.0
+_BREAKER_MAX_COOLDOWN_SECONDS = 120.0
 
 # Auth ladder: 5 min → 10 min … capped at 1 h. A replaced key skips it (the credential fingerprint changes).
 _AUTH_BASE_COOLDOWN_SECONDS = 300.0
@@ -118,6 +128,8 @@ class CooldownStore:
     strikes: dict[_Key, int] = field(default_factory=dict)
     #: consecutive auth arms per entry (the auth ladder's step), reset by ``record_success``
     auth_strikes: dict[_Key, int] = field(default_factory=dict)
+    #: consecutive breaker arms per entry (the breaker ladder's step), reset by ``record_success``
+    breaker_strikes: dict[_Key, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.path is not None:
@@ -154,7 +166,10 @@ class CooldownStore:
             | ({"account": k[3]} if k[3] else {})
             | ({"fingerprint": e.fingerprint} if e.fingerprint else {})
             for k, e in self.entries.items()
-            if e.reason is not FailoverReason.network and e.until > now_mono and e.until_wall > now_wall
+            if e.reason is not FailoverReason.network
+            and e.reason not in BREAKER_REASONS
+            and e.until > now_mono
+            and e.until_wall > now_wall
         ]
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -193,7 +208,7 @@ class CooldownStore:
         if reason not in _COOLDOWN_REASONS:
             return None
         key = _identity(provider, model, base_url, account)
-        auth_step = 0
+        auth_step = breaker_step = 0
         if reason is FailoverReason.auth:
             if keyless:
                 return None
@@ -202,6 +217,9 @@ class CooldownStore:
             if strikes < _AUTH_STRIKES_TO_ARM:
                 return None
             auth_step = strikes - _AUTH_STRIKES_TO_ARM
+        elif reason in BREAKER_REASONS:
+            breaker_step = self.breaker_strikes.get(key, 0)
+            self.breaker_strikes[key] = breaker_step + 1
         elif reason is not FailoverReason.network:
             if backoff_count is None:
                 backoff_count = self.strikes.get(key, 0)
@@ -213,6 +231,8 @@ class CooldownStore:
             seconds = math.ceil(window)
         elif reason is FailoverReason.auth:
             seconds = min(_AUTH_BASE_COOLDOWN_SECONDS * (2 ** min(auth_step, 16)), _AUTH_MAX_COOLDOWN_SECONDS)
+        elif reason in BREAKER_REASONS and not _provider_reset_delay(retry_after):
+            seconds = min(_BREAKER_BASE_COOLDOWN_SECONDS * (2 ** min(breaker_step, 16)), _BREAKER_MAX_COOLDOWN_SECONDS)
         elif provider_delta := _provider_reset_delay(retry_after):
             seconds = math.ceil(provider_delta)
         else:
@@ -294,6 +314,12 @@ class CooldownStore:
         """The entry answered: its next rate limit starts the ladder from the bottom again."""
         self.strikes.pop(_identity(provider, model, base_url, account), None)
         self.auth_strikes.pop(_identity(provider, model, base_url, account), None)
+        self.breaker_strikes.pop(_identity(provider, model, base_url, account), None)
+
+    def tripped(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> bool:
+        """Whether the entry's breaker opened before and the entry has not answered since: the call after a window
+        ends is the half-open probe, and its failure reopens the breaker at once instead of retrying inline."""
+        return self.breaker_strikes.get(_identity(provider, model, base_url, account), 0) > 0
 
     def clear(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> None:
         self.entries.pop(_identity(provider, model, base_url, account), None)

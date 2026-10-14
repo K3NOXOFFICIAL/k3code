@@ -42,7 +42,7 @@ async def test_an_active_goal_pauses_at_the_cap_instead_of_being_judged(tmp_path
     await call(server, "session.create", {"cwd": str(tmp_path)})
     judged: list[str] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         judged.append(response)
         return "continue", "keep going", False, False
 
