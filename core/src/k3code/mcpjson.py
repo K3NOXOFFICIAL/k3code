@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from k3code.config import McpServerConfig
 from k3code.paths import project_state_dir
@@ -49,6 +50,23 @@ def parse(text: str) -> dict[str, McpServerConfig]:
         else:
             logger.info("%s: server %s (type %s) is not supported, skipped", FILE, name, kind)
     return out
+
+
+def as_config(project_dir: str | Path) -> dict[str, Any] | None:
+    """The file as written, trusted or not, as a config's ``mcp`` section with each server's ``env`` and ``headers``
+    only, whatever its type: the values a session may quote, for ``debugdump.secret_values`` (k3code.bundle).
+    ``{}`` without a file; None when it exists but cannot be read or parsed (a caller must not guess its values)."""
+    path = Path(project_dir) / FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    items = servers.items() if isinstance(servers, dict) else []
+    kept = {str(name): {k: spec.get(k) for k in ("env", "headers")} for name, spec in items if isinstance(spec, dict)}
+    return {"mcp": {"servers": kept}}
 
 
 def declared(project_dir: str | Path) -> dict[str, McpServerConfig]:

@@ -164,6 +164,28 @@ def versions() -> dict[str, str]:
     return {"k3code": k3, "python": sys.version.split()[0], "platform": platform.platform(), "node": node_v}
 
 
+def _mcp_json_values(server: Any, events: list[dict[str, Any]]) -> set[str]:
+    """The certain secret values (``guesses=False``) of the ``.mcp.json`` of the gateway's project and of each
+    session the ``events`` name, as written, trusted or not: an event can quote one (K3NOX-581, as
+    ``bundle.write_bundle``). One that does not parse refuses the dump with its path only."""
+    from k3code import mcpjson
+    from k3code.config import default_project_dir
+
+    projects = {default_project_dir()}
+    for sid in {e.get("session") for e in events} - {None}:
+        stored = server.store.get(sid)
+        if stored is not None and stored.cwd:
+            projects.add(Path(stored.cwd))
+    values: set[str] = set()
+    for project in sorted(projects):
+        data = mcpjson.as_config(project)
+        if data is None:
+            path = project / mcpjson.FILE
+            raise ValueError(f"{path} does not parse: fix it first, or the dump cannot tell which values to hide")
+        values.update(secret_values(data, guesses=False))
+    return values
+
+
 async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, probe: bool = True) -> Path:
     """Write ``$K3CODE_HOME/debug/<ts>.tar.gz`` and return its path."""
     from k3code import doctor
@@ -171,8 +193,8 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
     from k3code.prompting import prompt_fingerprints
 
     home = home or k3_home()
-    secrets = secret_values(server.config)
     events = list(server.event_log)[-n:]
+    secrets = sorted({*secret_values(server.config), *_mcp_json_values(server, events)}, key=len, reverse=True)
     checks = await doctor.run_checks(server.config, probe=probe, home=home)
     parts = {
         "events.json": json.dumps(events, indent=2, default=str),
