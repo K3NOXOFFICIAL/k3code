@@ -696,7 +696,7 @@ async def test_a_turn_keeps_its_model_key_when_another_session_switches_the_rout
             providers=[prov],
             default_model="default",
             permission_mode="yolo",
-            autonomy={"plan_first": False, "proposals": False},
+            autonomy={"plan_first": False, "proposals": False, "auto_continue": False},  # one call per turn
         ),
         store=SessionStore(tmp_path / "s.db"),
     )
@@ -797,7 +797,10 @@ async def test_a_prompt_submitted_mid_turn_is_queued_and_runs_after_it(tmp_path,
     script.write_text(_json.dumps([{"type": "text", "text": "done"}]))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
-    server = make_server(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"))
+    settings = Settings(  # one turn per prompt: no auto-continue (on by default in yolo)
+        providers=[prov], default_model="default", permission_mode="yolo", autonomy={"auto_continue": False}
+    )
+    server = make_server(config=settings)
     created = await rpc(server, "session.create", {"cwd": str(tmp_path)})
     live = server.session
     assert live is not None and created["result"]["session_id"] == live.session_id

@@ -95,6 +95,8 @@ def make(tmp: Path, monkeypatch, steps: list[dict], mode: str = "auto", **cfg: A
         models={"default": "m-main"},
         tiers={"strong": "m-strong", "cheap": "m-cheap", "fast": "m-fast"},
     )
+    # the scripts answer one turn: auto-continue (on by default in auto/yolo) would add judge calls and turns
+    cfg["autonomy"] = {"auto_continue": False, **(cfg.get("autonomy") or {})}
     server = GatewayServer(
         config=Settings(providers=[provider], permission_mode=mode, **cfg), store=SessionStore(tmp / "sessions.db")
     )

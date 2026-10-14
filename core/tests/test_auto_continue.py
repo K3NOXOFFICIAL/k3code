@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
+from k3code import autonomy
 from k3code.agent.loop import AgentLoop
 from k3code.automation.server_runner import ServerRunner
+from k3code.autonomy.plan_first import PlanFirst
+from k3code.autonomy.scope import ScopeVerdict
 from k3code.goals import GoalState
 from k3code.reliability import BudgetExceeded
 from k3code.reliability.persistent_retry import TurnCancelled
@@ -15,7 +20,7 @@ AUTO = {"advisor_on_goal": False, "auto_continue": True}
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
@@ -35,9 +40,9 @@ def _implicit_goal_shown(server) -> bool:
     return any(isinstance(g := u["control"].get("goal"), dict) and g.get("implicit") for u in updates)
 
 
-async def _setup(tmp_path, monkeypatch, replies=None, autonomy=AUTO):
+async def _setup(tmp_path, monkeypatch, replies=None, autonomy=AUTO, **settings):
     repo = git_repo(tmp_path / "repo")
-    server, provider = make_server(tmp_path, monkeypatch, replies=replies, autonomy=autonomy)
+    server, provider = make_server(tmp_path, monkeypatch, replies=replies, autonomy=autonomy, **settings)
     sid = await new_session(server, repo)
     live = server.live[sid]
     return server, provider, live, server.goal_manager(live)
@@ -56,9 +61,9 @@ async def test_an_ordinary_prompt_continues_until_the_judge_says_done_then_the_g
 
 
 async def test_a_chat_reply_judged_done_is_one_turn_and_sends_no_goal_notice(tmp_path, monkeypatch):
-    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["4"])
+    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["hi there"])
     judge = server.goal_judge = scripted_judge(["done"])
-    await server._run_turn(live, "what is 2+2?")
+    await server._run_turn(live, "say hello")
     assert provider.n == 1 and len(judge.calls) == 1
     assert mgr.state is None
     assert _goal_notices(server) == []
@@ -167,10 +172,10 @@ async def test_a_queued_prompt_after_a_continued_turn_is_a_goal_of_its_own(tmp_p
     server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "step 2", "third"])
     inner = scripted_judge(["continue", "done"])
 
-    async def judge(goal, response):
+    async def judge(goal, response, evidence=""):
         if not inner.calls:
             live.pending_prompts.append("then do this")  # typed while the first turn ran
-        return await inner(goal, response)
+        return await inner(goal, response, evidence)
 
     server.goal_judge = judge
     await server._run_turn(live, "first task")
@@ -187,6 +192,117 @@ async def test_kicks_never_resurrect_an_implicit_goal(tmp_path, monkeypatch):
     assert await server.watchdog_tick(source="boot") == []
     assert provider.n == 0 and mgr.state is None
     await server.close()
+
+
+# ── the default: "auto" = on in the auto and yolo permission modes ──
+
+#: the shipped default for auto_continue ("auto"); no scope gate, so the scripted replies are the turns' only calls
+DEFAULT = {"advisor_on_goal": False, "plan_first": False}
+
+
+def _classify_as(monkeypatch, scope: str) -> list[str]:
+    """Stub the scope classifier; returns the prompts it was asked about."""
+    asked: list[str] = []
+
+    async def classify(self, session, text):
+        asked.append(text)
+        return ScopeVerdict(scope=scope, reason="stub")
+
+    monkeypatch.setattr(PlanFirst, "_classify", classify)
+    return asked
+
+
+@pytest.mark.parametrize("mode", ["auto", "yolo"])
+async def test_auto_and_yolo_mode_continue_an_unfinished_turn_by_default(tmp_path, monkeypatch, mode):
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "all built"], autonomy=DEFAULT, permission_mode=mode
+    )
+    judge = server.goal_judge = scripted_judge(["continue", "done"])
+    status, text = await server._run_turn(live, "build the parser")
+    assert status == "done" and text == "all built"
+    assert provider.n == 2 and [goal for goal, _ in judge.calls] == ["build the parser", "build the parser"]
+    assert mgr.state is None
+    await server.close()
+
+
+async def test_default_mode_does_not_auto_continue_by_default(tmp_path, monkeypatch):
+    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1"], autonomy=DEFAULT)
+    assert live.perms.mode.value == "default"
+    judge = server.goal_judge = scripted_judge(["continue"])
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 1 and judge.calls == []
+    assert mgr.state is None and not _implicit_goal_shown(server)
+    await server.close()
+
+
+async def test_a_prompt_the_scope_gate_rates_trivial_is_not_continued(tmp_path, monkeypatch):
+    asked = _classify_as(monkeypatch, "trivial")
+    autonomy = {"advisor_on_goal": False, "degrade_trivial": False, "proposals": False}
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["fixed the typo"], autonomy=autonomy, permission_mode="auto"
+    )
+    judge = server.goal_judge = scripted_judge(["continue"])
+    await server._run_turn(live, "fix the typo in README line 3")
+    assert asked == ["fix the typo in README line 3"]
+    assert provider.n == 1 and judge.calls == []
+    assert mgr.state is None and _implicit_goal_shown(server)  # it started, and ended unjudged after one turn
+    await server.close()
+
+
+async def test_a_plain_question_gets_no_implicit_goal(tmp_path, monkeypatch):
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["it returns a dict"], autonomy=DEFAULT, permission_mode="auto"
+    )
+    judge = server.goal_judge = scripted_judge(["continue"])
+    await server._run_turn(live, "what does parse() return?")
+    assert provider.n == 1 and judge.calls == []
+    assert mgr.state is None and not _implicit_goal_shown(server)
+    await server.close()
+
+
+async def test_continuations_of_an_implicit_goal_skip_the_scope_gate(tmp_path, monkeypatch):
+    asked = _classify_as(monkeypatch, "small")
+    autonomy = {"advisor_on_goal": False, "proposals": False}
+    server, provider, live, _ = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "all built"], autonomy=autonomy, permission_mode="auto"
+    )
+    server.goal_judge = scripted_judge(["continue", "done"])
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 2 and asked == ["build the parser"]  # gated once, not again for the continuation
+    await server.close()
+
+
+async def test_the_turn_cap_ends_an_implicit_goal_with_a_notice(tmp_path, monkeypatch):
+    autonomy = {**DEFAULT, "auto_continue_max_turns": 2}
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["a", "b", "c"], autonomy=autonomy, permission_mode="auto"
+    )
+    judge = server.goal_judge = scripted_judge(["continue"])
+    await server._run_turn(live, "build everything")
+    assert provider.n == 2 and len(judge.calls) == 2
+    assert mgr.state is None
+    assert [n["text"] for n in _goal_notices(server)][-1].startswith("↻ Auto-continue stopped at its 2-turn cap")
+    await server.close()
+
+
+def test_auto_continue_setting_resolves_per_permission_mode():
+    auto_continue_on, DEFAULTS = autonomy.auto_continue_on, autonomy.DEFAULTS  # noqa: N806
+    for mode in ("auto", "yolo"):
+        assert auto_continue_on({"auto_continue": "auto"}, mode)
+    for mode in ("default", "accept-edits", "plan"):
+        assert not auto_continue_on({"auto_continue": "auto"}, mode)
+        assert auto_continue_on({"auto_continue": True}, mode)
+    assert not auto_continue_on({"auto_continue": False}, "yolo")
+    assert DEFAULTS["auto_continue"] == "auto" and DEFAULTS["auto_continue_max_turns"] == 8
+
+
+def test_plain_question_is_narrow():
+    is_plain_question = autonomy.is_plain_question
+    assert is_plain_question("what does parse() return?")
+    assert not is_plain_question("can you fix the parser?")
+    assert not is_plain_question("Please add tests?")
+    assert not is_plain_question("fix the parser")
+    assert not is_plain_question("look at this:\nwhy does it fail?")
 
 
 def test_implicit_is_persisted_in_the_snapshot_and_old_states_load_without_it():
