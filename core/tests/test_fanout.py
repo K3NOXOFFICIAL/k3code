@@ -417,6 +417,113 @@ async def test_fanout_disabled_by_config(tmp_path, monkeypatch):
     assert server.session.stored.messages[-1]["content"] == "sequential"
 
 
+# ── the auto fan-out's budget (issue #136): the gateway passed none, so children ran without an agent/token cap ──
+
+#: the parent takes over the subtasks a budget stop left (escalation_prompt names them ``needs you (skipped)``)
+PARENT_TAKES_OVER = {"type": "text", "match": "needs you (skipped)", "text": "parent handled it"}
+
+
+def starts(server, agent_type: str | None = None) -> int:
+    return sum(1 for p in events(server, "subagent.start") if agent_type in (None, p.get("agent_type")))
+
+
+async def test_auto_fanout_stops_starting_children_at_max_agents(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # one at a time, so the stop point is exact: t1's worker and reviewer are the two agents, t2 and t3 never start
+    steps = steps_for(SUBS, extra=[PARENT_TAKES_OVER], sleep=0)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=1, max_agents=2, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server) == 2
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 2
+    assert "Stopped early: agent budget exhausted (2/2 agents)" in done["summary"]
+    skipped = [p for p in events(server, "fanout.progress") if p["state"] == "skipped"]
+    assert {p["subtask_id"] for p in skipped} == {"t2", "t3"}
+    assert all("agent budget exhausted" in p["detail"] for p in skipped)
+    assert (repo / "f1.txt").exists() and not (repo / "f2.txt").exists()
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"
+
+
+async def test_auto_fanout_keeps_a_reviewer_slot_for_every_worker(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # 3 agents: t1's worker + reviewer use two; t2's worker would start with one slot left and have no reviewer
+    steps = steps_for(SUBS, extra=[PARENT_TAKES_OVER], sleep=0)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=1, max_agents=3, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server) == 2 and starts(server, "worker") == 1
+    done = events(server, "fanout.done")[0]
+    assert done["merged"] == 1
+    assert "Stopped early: agent budget exhausted (2/3 agents)" in done["summary"]
+    skipped = [p for p in events(server, "fanout.progress") if p["state"] == "skipped"]
+    assert {p["subtask_id"] for p in skipped} == {"t2", "t3"}
+
+
+async def test_auto_fanout_token_cap_stops_it(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # t1's worker spends 2 calls x 350 tokens; with a 300-token cap its reviewer and every later child is refused
+    usage = {"type": "usage", "match": "YOUR subtask (t1)", "prompt_tokens": 200, "completion_tokens": 150}
+    steps = steps_for(SUBS, extra=[usage, PARENT_TAKES_OVER], sleep=0)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=1, max_tokens=300, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server) == 1 and starts(server, "reviewer") == 0
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 0
+    assert "Stopped early: token budget exhausted (700/300 tokens)" in done["summary"]
+    assert not (repo / "f1.txt").exists()  # the unreviewed work was not merged
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"
+
+
+async def test_fanout_stops_starting_children_once_the_session_budget_is_spent(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # no fan-out cap: the parent's reliability.session_tokens (children are charged to it) is what stops it. Each of
+    # t1's two children stays inside its own 300-token session budget; together they spend 400 of the parent's
+    spend = [
+        {
+            "type": "usage",
+            "match": "YOUR subtask (t1)",
+            "when": "after_tool",
+            "prompt_tokens": 150,
+            "completion_tokens": 50,
+        },
+        {"type": "usage", "match": f"Subtask: {SUBS[0]}", "prompt_tokens": 150, "completion_tokens": 50},
+    ]
+    steps = steps_for(SUBS, extra=[*spend, PARENT_TAKES_OVER], sleep=0)
+    autonomy = {
+        "plan_first": True,
+        "proposals": False,
+        "advisor_on_plan": False,
+        "fanout": {"enabled": True, "max_parallel": 1, "max_tokens": 0, "test_command": "true"},
+    }
+    server = make(tmp_path, monkeypatch, steps, mode="auto", autonomy=autonomy, reliability={"session_tokens": 300})
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server) == 2  # t1's worker and reviewer; t2's worker is refused
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1
+    assert "Stopped early: session token budget exceeded: 400 > 300" in done["summary"]
+
+
+def test_fanout_budget_defaults_and_derivation():
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor
+
+    def budget(n: int, **fan):
+        return FanoutExecutor(SimpleNamespace(config=SimpleNamespace(autonomy={"fanout": fan}))).budget(n)
+
+    assert (budget(3).max_agents, budget(3).max_tokens) == (12, 1_000_000)  # 4 children per subtask
+    assert budget(8).max_agents == 16  # capped
+    assert budget(8, max_agents=5).max_agents == 5
+    assert budget(2, max_tokens=0).max_tokens is None  # 0 = no token cap
+    # negative and non-numeric values count as 0 (default agents, no token cap), never a negative cap
+    for bad in (-5, None, "lots", True):
+        b = budget(3, max_agents=bad, max_tokens=bad)
+        assert (b.max_agents, b.max_tokens) == (12, None), bad
+
+
 def test_extract_subtasks_and_verdict_parsing():
     v = ScopeVerdict(scope="large", parallelizable=True, suggested_subtasks=["a", "b"])
     assert extract_subtasks(v, "") == ["a", "b"]

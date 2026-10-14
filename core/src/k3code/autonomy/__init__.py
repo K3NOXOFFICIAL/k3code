@@ -45,6 +45,10 @@ DEFAULTS: dict[str, Any] = {
     "advisor_compact_chars": 24000,
     #: M4b: parallel sub-agent execution of large/huge plans
     #: ``panes``: inside k3 panes, open one read-only pane per child
+    #: ``max_tokens``/``max_agents``: the budget of one auto fan-out (issue #136; /ultracode passes its own). Children
+    #: are not started once their tokens reach ``max_tokens`` (0 = no token cap) or ``max_agents`` children ran
+    #: (workers, reviewers and reworks each count; a worker only starts while a reviewer slot is left; 0 = 4 per
+    #: subtask, at most 16); what is left goes to the parent
     "fanout": {
         "enabled": True,
         "panes": False,
@@ -52,6 +56,8 @@ DEFAULTS: dict[str, Any] = {
         "require_tests": True,
         "test_command": "",
         "test_timeout": 600,
+        "max_tokens": 1_000_000,
+        "max_agents": 0,
     },
 }
 
