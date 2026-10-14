@@ -460,6 +460,23 @@ async def test_auto_fanout_keeps_a_reviewer_slot_for_every_worker(tmp_path, monk
     assert {p["subtask_id"] for p in skipped} == {"t2", "t3"}
 
 
+async def test_auto_fanout_keeps_a_reviewer_slot_for_every_parallel_worker(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # 3 workers at once with 4 agents: a third worker would leave one slot for two finished workers, whose results
+    # would be discarded unreviewed. Two workers start, and each keeps its reviewer slot.
+    steps = steps_for(SUBS, extra=[PARENT_TAKES_OVER], sleep=0)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=3, max_agents=4, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server, "worker") == 2 and starts(server, "reviewer") == 2
+    done = events(server, "fanout.done")[0]
+    assert done["merged"] == 2 and done["escalated"] == 1
+    assert "Stopped early: agent budget exhausted (2/4 agents, 2 kept for reviewers)" in done["summary"]
+    skipped = [p for p in events(server, "fanout.progress") if p["state"] == "skipped"]
+    assert {p["subtask_id"] for p in skipped} == {"t3"}
+    assert (repo / "f1.txt").exists() and (repo / "f2.txt").exists() and not (repo / "f3.txt").exists()
+
+
 async def test_auto_fanout_token_cap_stops_it(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     # t1's worker spends 2 calls x 350 tokens; with a 300-token cap its reviewer and every later child is refused
@@ -518,10 +535,13 @@ def test_fanout_budget_defaults_and_derivation():
     assert budget(8).max_agents == 16  # capped
     assert budget(8, max_agents=5).max_agents == 5
     assert budget(2, max_tokens=0).max_tokens is None  # 0 = no token cap
-    # negative and non-numeric values count as 0 (default agents, no token cap), never a negative cap
-    for bad in (-5, None, "lots", True):
+    # anything that is not a non-negative whole number falls back to the default (4 agents per subtask, 1,000,000
+    # tokens): a typo must not remove the cap; 0 is the one way to say "no token cap"
+    assert budget(2, max_tokens=1e6).max_tokens == 1_000_000  # a whole float is a whole number
+    assert budget(2, max_tokens=250).max_tokens == 250
+    for bad in (-5, -1, None, "lots", "500k", "1e6", "", True, False, 1.5, float("nan"), float("inf"), [], {}):
         b = budget(3, max_agents=bad, max_tokens=bad)
-        assert (b.max_agents, b.max_tokens) == (12, None), bad
+        assert (b.max_agents, b.max_tokens) == (12, 1_000_000), bad
 
 
 def test_extract_subtasks_and_verdict_parsing():

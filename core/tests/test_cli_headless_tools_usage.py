@@ -55,6 +55,7 @@ def test_headless_json_lists_tools_and_usage_db_gets_rows(tmp_path: Path):
     rows = db.execute("SELECT kind, session, provider, model, tokens_in, tokens_out, detail FROM events").fetchall()
     db.close()
     calls = [r for r in rows if r[0] == "call"]
-    assert len(calls) == 2 and all(r[1] == "headless" and r[2] == "fake" and r[3] == "m" for r in calls)
+    assert len(calls) == 2 and all(r[1].startswith("headless-") and r[2] == "fake" and r[3] == "m" for r in calls)
+    assert len({r[1] for r in calls}) == 1  # one run, one session id
     assert calls[0][4:6] == (12, 3)
     assert [r[6] for r in rows if r[0] == "tool"] == ["write"]
