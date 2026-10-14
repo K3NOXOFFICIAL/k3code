@@ -317,6 +317,7 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.memory_cmd import MemoryCommand
     from k3code.commands.output_style import OutputStyleCommand
     from k3code.commands.project_cmd import ProjectCommand
+    from k3code.commands.recall_cmd import RecallCommand
     from k3code.commands.research_cmd import UltraResearchCommand
     from k3code.commands.review import ReviewCommand
     from k3code.commands.schedule import ScheduleCommand
@@ -328,6 +329,7 @@ def build_registry() -> CommandRegistry:
     for extra in (
         ExportCommand(),
         HandoffCommand(),
+        RecallCommand(),
         ImportCommand(),
         ForkCommand(),
         BranchCommand(),
