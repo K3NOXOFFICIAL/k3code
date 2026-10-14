@@ -9,8 +9,9 @@ A mention triggers only when it is unambiguous:
 * the prompt is not a slash command (``/ultracode fix x`` already runs the command itself);
 * the word stands alone: not part of a longer word (in any script), a path (``src/ultracode.py``), a flag
   (``--ultracode``), an ``@mention`` or a ``#tag``;
-* it is not quoted or in code: a fenced (backtick or ``~~~``) or indented block, an inline code span, or wrapped in
-  quotes or backticks, and it is not in pasted text (``skip``);
+* it is not quoted or in code: a fenced (backtick or ``~~~``) or indented block, an inline code span, wrapped in
+  quotes or backticks, or inside a ``'...'`` / ``"..."`` span on one line (a quoted or ``@"..."`` path with spaces in
+  it), and it is not in pasted text (``skip``);
 * the prompt does not name two different modes ("what is the difference between ultracode and ultraplan?").
 """
 
@@ -34,7 +35,7 @@ WAKE_WORDS: dict[str, str] = {
 # characters such as the long s onto "s". A non-ASCII letter, digit or combining mark next to the word is checked
 # separately (_glued), with Unicode categories that both copies read the same way.
 _WORD = re.compile(
-    r"(?<![A-Za-z0-9_/.@#$:\\-])(" + "|".join(WAKE_WORDS) + r")(?![A-Za-z0-9_/\\-])(?!\.[A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_/.@#$:\\-])(?<!\\ )(" + "|".join(WAKE_WORDS) + r")(?![A-Za-z0-9_/\\-])(?!\.[A-Za-z0-9_])",
     re.IGNORECASE | re.ASCII,
 )
 #: Whitespace, spelled out so both copies agree: Python's str.isspace() set plus U+FEFF (JavaScript's \s and trim()
@@ -55,6 +56,11 @@ _INDENTED = re.compile(
     r"(?:^|\n[ \t]*\n)((?:" + _INDENT + r"[^\n]*(?:\n|" + _END + r")|[ \t]*\n(?=" + _INDENT + r"))+)"
 )
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
+_QUOTE_MARK = re.compile(r"[\"']")
+#: A quote opens a span unless it follows a word character (``don't``, ``5"``) and closes it when it follows a
+#: non-blank and does not precede one (``it's`` and ``'cause`` close nothing). ASCII on purpose, like ``_WORD``.
+_WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
+_QUOTE_CLOSE = re.compile(r"(?<=\S)[\"'](?![A-Za-z0-9_])", re.ASCII)
 _QUOTES = "`\"'“”‘’„‚«»‹›「」『』"
 #: brackets and emphasis wrapped straight around the word go with it: "(ultracode) fix it" -> "fix it"
 _WRAPPERS = {"(": ")", "[": "]", "{": "}", "<": ">", "*": "*", "~": "~"}
@@ -114,7 +120,41 @@ def _masked(text: str, skip: list[tuple[int, int]]) -> _Spans:
     blocks = _merge([*skip, *(m.span() for m in _FENCE.finditer(scan)), *(m.span(1) for m in _INDENTED.finditer(scan))])
     in_block = _Spans(blocks)
     inline = [m.span() for m in _INLINE_CODE.finditer(scan) if m.start() not in in_block]
-    return _Spans(_merge([*blocks, *inline]))
+    code = _merge([*blocks, *inline])
+    # Quotes are paired on the text with code and pastes blanked out, so a quote in a code span never pairs with one
+    # outside it and swallows what was typed in between.
+    parts, pos = [], 0
+    for a, b in code:
+        parts += [text[pos:a], "\0" * (b - a)]
+        pos = b
+    return _Spans(_merge([*code, *_quoted("".join([*parts, text[pos:]]))]))
+
+
+def _quoted(scan: str) -> list[tuple[int, int]]:
+    """Spans between a matching pair of ``'`` or ``"`` on one line. A quote that finds no partner on its line leaves
+    that line's later quotes of the same kind unpaired too, so the scan stays linear."""
+    spans: list[tuple[int, int]] = []
+    pos = eol = 0
+    dead: dict[str, int] = {}  # quote -> end of the line on which no closing quote was found
+    for m in _QUOTE_MARK.finditer(scan):
+        i = m.start()
+        if i < pos or (i > 0 and _WORD_CHAR.match(scan[i - 1])):
+            continue
+        quote = m.group()
+        if i >= eol:
+            eol = scan.find("\n", i)
+            eol = len(scan) if eol < 0 else eol
+        if dead.get(quote, -1) >= eol:
+            continue
+        end = _QUOTE_CLOSE.search(scan, i + 1, eol)
+        while end is not None and end.group() != quote:
+            end = _QUOTE_CLOSE.search(scan, end.end(), eol)
+        if end is None:
+            dead[quote] = eol
+            continue
+        spans.append((i, end.end()))
+        pos = end.end()
+    return spans
 
 
 def _glued(ch: str) -> bool:
