@@ -79,12 +79,18 @@ async def test_openai_in_band_error_chunk_raises_with_the_upstream_message():
 @pytest.mark.parametrize(
     ("error", "reason"),
     [
-        ({"message": "You exceeded your current quota", "type": "insufficient_quota", "code": "insufficient_quota"},
-         FailoverReason.quota),
-        ({"message": "Too many requests", "type": "requests", "code": "rate_limit_exceeded"},
-         FailoverReason.rate_limit),
-        ({"message": "Incorrect key provided", "type": "invalid_request_error", "code": "invalid_api_key"},
-         FailoverReason.auth),
+        (
+            {"message": "You exceeded your current quota", "type": "insufficient_quota", "code": "insufficient_quota"},
+            FailoverReason.quota,
+        ),
+        (
+            {"message": "Too many requests", "type": "requests", "code": "rate_limit_exceeded"},
+            FailoverReason.rate_limit,
+        ),
+        (
+            {"message": "Incorrect key provided", "type": "invalid_request_error", "code": "invalid_api_key"},
+            FailoverReason.auth,
+        ),
     ],
 )
 async def test_openai_in_band_string_code_classifies_by_the_code_not_as_server(error, reason):

@@ -274,9 +274,7 @@ def _inband_error(chunk: dict[str, Any]) -> ProviderError:
             if isinstance(value, str) and value.isdigit() and 400 <= int(value) < 600:
                 status = int(value)
                 break
-    return ProviderError(
-        message=_error_message(chunk) or "error in stream", status_code=status, headers={}, body=chunk
-    )
+    return ProviderError(message=_error_message(chunk) or "error in stream", status_code=status, headers={}, body=chunk)
 
 
 def _error_message(body: dict[str, Any]) -> str:
