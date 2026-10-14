@@ -41,6 +41,10 @@ _REQUIRED = {
     "idle": ("minutes",),
 }
 _ACTION_REQUIRED = {"prompt": "prompt", "shell": "command", "notify": "text", "goal": "objective"}
+#: ``max_per_hour`` for a prompt or goal action on an event trigger when the policy sets none (``0`` = no limit): an
+#: event that the run itself causes (a file it edits, a commit it makes) must not loop model runs for ever. A cron
+#: schedule is its own rate and gets no default.
+DEFAULT_MAX_PER_HOUR = 6
 
 
 class AutomationError(ValueError):
@@ -84,6 +88,12 @@ def validate(trigger: dict[str, Any], action: dict[str, Any]) -> None:
                 raise ValueError
         except (TypeError, ValueError) as e:
             raise AutomationError("idle.minutes must be a positive number") from e
+
+
+def _default_max_per_hour(row: dict[str, Any]) -> int:
+    if row["trigger"]["type"] != "cron" and row["action"]["type"] in ("prompt", "goal"):
+        return DEFAULT_MAX_PER_HOUR
+    return 0
 
 
 class AutomationManager:
@@ -280,7 +290,8 @@ class AutomationManager:
             if cd and row["last_fired_at"] and now - row["last_fired_at"] < cd:
                 logger.info("automation %s: skipped (cooldown)", aid)
                 return None
-            per_hour = int(policy.get("max_per_hour") or 0)
+            limit = policy.get("max_per_hour")
+            per_hour = int(_default_max_per_hour(row) if limit is None else limit or 0)
             if per_hour:
                 recent = self.db.rows("job_runs", "owner=? AND started_at>?", (aid, now - 3600))
                 if len(recent) >= per_hour:

@@ -1959,6 +1959,29 @@ def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: b
         assert (current / ".degraded").read_text().startswith("k3:")
 
 
+def test_a_failed_k3_build_is_retried_when_the_same_version_is_installed_again(tmp_path: Path) -> None:
+    """#95: the version was complete, so every later run for the same commit said "already installed" and the k3
+    binary never came back."""
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    args = ("--from-source", "--minimal")
+    fail = stub_bin(tmp_path / "fail", "go", 'case "$1" in build) echo "go: GOPROXY=off" >&2; exit 1 ;; esac\n')
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=fail)
+    assert r.returncode == 0, r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".degraded").is_file() and not (current / "bin" / "k3").exists()
+    # no go now: a skip keeps the record of the failure
+    r = run(tmp_path, src / "install" / "install.sh", *args)
+    assert r.returncode == 0, r.stderr
+    assert (current / ".degraded").is_file()
+    build = 'case "$1" in build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    good = stub_bin(tmp_path / "good", "go", build)
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=good)
+    assert r.returncode == 0, r.stderr
+    assert "already installed" in r.stderr
+    assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+
+
 def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
     # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
     # (next test) must not promise an offline install
@@ -2052,6 +2075,28 @@ def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> N
     assert mark.read_text().strip() == "start-first"
 
 
+def _link_farm(farm: Path, dirs: list[str], skip: tuple[str, ...]) -> Path:
+    """FARM: a directory linking every entry of DIRS (first one wins) except the SKIP names."""
+    farm.mkdir()
+    for d in dirs:
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                # lexists: a dangling link in a directory listed twice is already there, however exists() sees it
+                if entry.name not in skip and not os.path.lexists(farm / entry.name):
+                    (farm / entry.name).symlink_to(entry)
+    return farm
+
+
+def test_link_farm_takes_a_dangling_link_in_a_directory_listed_twice_once(tmp_path: Path) -> None:
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "tool").write_text("")
+    (d / "gone").symlink_to(tmp_path / "missing")  # dangling, like /usr/local/bin/orca on kokadock
+    farm = _link_farm(tmp_path / "farm", [str(d), str(d)], skip=("tool",))
+    assert [p.name for p in farm.iterdir()] == ["gone"]
+    assert os.readlink(farm / "gone") == str(d / "gone")
+
+
 def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
     # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
     nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
@@ -2061,13 +2106,7 @@ def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) ->
     (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     (src / "VERSION").write_text("9.9.9\n")
     shutil.copy(INSTALL, src / "install" / "install.sh")
-    farm = tmp_path / "farm"
-    farm.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        if d and Path(d).is_dir():
-            for entry in Path(d).iterdir():
-                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
-                    (farm / entry.name).symlink_to(entry)
+    farm = _link_farm(tmp_path / "farm", os.environ["PATH"].split(os.pathsep), skip=("sha256sum", "shasum", "git"))
     home = tmp_path / "home"
     home.mkdir()
     r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})

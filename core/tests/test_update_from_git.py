@@ -154,6 +154,21 @@ def test_an_up_to_date_git_install_says_so_and_runs_no_installer(remote, data, n
     assert no_release == [] and not (remote["logs"] / "args").exists()
 
 
+def test_an_unreachable_github_api_falls_back_to_the_git_ref(remote, data, no_release, monkeypatch):
+    """#143: a proxy that blocks api.github.com (or a timeout, a 5xx) must not stop a git install from updating."""
+    _install(data, remote["head"])
+
+    def offline(*_a, **_k):
+        raise upd.httpx.ConnectError("api.github.com unreachable")
+
+    monkeypatch.setattr(upd, "fetch_latest", offline)
+    monkeypatch.setattr(upd, "update_from_git", _no_update)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert "api.github.com unreachable" in r.output and "made from git (main of " in r.output
+    assert "Already up to date." in r.output
+
+
 def test_a_newer_head_is_staged_by_the_refs_own_installer_and_activated(remote, data, no_release):
     _install(data, "1234567aaaa")
     r = CliRunner().invoke(cli, ["update", "--yes"])
