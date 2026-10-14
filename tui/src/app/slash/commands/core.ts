@@ -22,12 +22,10 @@ import type {
   SessionUndoResponse,
   SystemBatteryResponse,
 } from "../../../gatewayTypes.js";
-import { writeClipboardText } from "../../../lib/clipboard.js";
-import { writeOsc52Clipboard } from "../../../lib/osc52.js";
+import { copyText } from "../../../lib/copyText.js";
 import {
   configureDetectedTerminalKeybindings,
   configureTerminalKeybindings,
-  isRemoteShellSession,
 } from "../../../lib/terminalSetup.js";
 import type { Msg, PanelSection } from "../../../types.js";
 import type { StatusBarMode } from "../../interfaces.js";
@@ -467,26 +465,17 @@ export const coreCommands: SlashCommand[] = [
         return sys("nothing to copy — start a conversation first");
       }
 
-      const shouldUseTerminalClipboard = isRemoteShellSession(process.env);
-
-      if (shouldUseTerminalClipboard) {
-        writeOsc52Clipboard(target.text);
-
-        return sys("sent OSC52 copy sequence (terminal support required)");
-      }
-
-      void writeClipboardText(target.text)
-        .then((nativeOk) => {
+      void copyText(target.text)
+        .then((via) => {
           if (ctx.stale()) {
             return;
           }
 
-          if (nativeOk) {
-            sys("copied to clipboard");
-          } else {
-            writeOsc52Clipboard(target.text);
-            sys("sent OSC52 copy sequence (terminal support required)");
-          }
+          sys(
+            via === "native"
+              ? "copied to clipboard"
+              : "sent OSC52 copy sequence (terminal support required)",
+          );
         })
         .catch((error) => {
           if (!ctx.stale()) {

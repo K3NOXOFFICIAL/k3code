@@ -8,6 +8,7 @@ import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import type * as EnvModule from "../config/env.js";
 import { TUI_SESSION_MODEL_FLAG } from "../domain/slash.js";
 import * as ClipboardModule from "../lib/clipboard.js";
+import * as CopyTextModule from "../lib/copyText.js";
 import * as Osc52Module from "../lib/osc52.js";
 import * as TerminalSetupModule from "../lib/terminalSetup.js";
 
@@ -439,6 +440,116 @@ describe("createSlashHandler", () => {
       await vi.waitFor(() => expect(getUiState().showReasoning).toBe(true));
       expect(getUiState().sections.thinking, String(before)).toBe(after);
     }
+  });
+
+  describe("slash.exec clipboard field", () => {
+    const withReply = (reply: unknown) => {
+      const ctx = buildCtx({
+        gateway: {
+          ...buildGateway(),
+          gw: {
+            ...buildGateway().gw,
+            request: vi.fn(() => Promise.resolve(reply)),
+          },
+        },
+      });
+
+      patchUiState({ sid: "sid-abc" });
+
+      return ctx;
+    };
+
+    it("copies the reply's clipboard text and reports it", async () => {
+      const copyText = vi
+        .spyOn(CopyTextModule, "copyText")
+        .mockResolvedValue("native");
+      const ctx = withReply({
+        clipboard: "full handoff script",
+        output: "Handoff ready",
+        type: "message",
+      });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          "copied 19 characters to the clipboard",
+        );
+      });
+      expect(copyText).toHaveBeenCalledWith("full handoff script");
+      expect(ctx.transcript.sys).toHaveBeenCalledWith("Handoff ready");
+    });
+
+    it("copies even when the output goes to the pager", async () => {
+      const copyText = vi
+        .spyOn(CopyTextModule, "copyText")
+        .mockResolvedValue("native");
+      const ctx = withReply({ clipboard: "abc", output: "x\ny\nz\nw" });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() => expect(copyText).toHaveBeenCalledWith("abc"));
+      expect(ctx.transcript.page).toHaveBeenCalled();
+    });
+
+    it("does not copy when the reply has no clipboard", async () => {
+      const copyText = vi
+        .spyOn(CopyTextModule, "copyText")
+        .mockResolvedValue("native");
+      const ctx = withReply({ output: "hello" });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() =>
+        expect(ctx.transcript.sys).toHaveBeenCalledWith("hello"),
+      );
+      expect(copyText).not.toHaveBeenCalled();
+    });
+
+    it("falls back to OSC52 when the native clipboard fails", async () => {
+      vi.spyOn(TerminalSetupModule, "isRemoteShellSession").mockReturnValue(
+        false,
+      );
+      vi.spyOn(ClipboardModule, "writeClipboardText").mockResolvedValue(false);
+      const osc = vi
+        .spyOn(Osc52Module, "writeOsc52Clipboard")
+        .mockReturnValue(true);
+      const ctx = withReply({ clipboard: "abc", output: "ok" });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          "sent OSC52 copy sequence (terminal support required)",
+        );
+      });
+      expect(osc).toHaveBeenCalledWith("abc");
+    });
+
+    it("uses OSC52 only in a remote shell", async () => {
+      vi.spyOn(TerminalSetupModule, "isRemoteShellSession").mockReturnValue(
+        true,
+      );
+      const native = vi
+        .spyOn(ClipboardModule, "writeClipboardText")
+        .mockResolvedValue(true);
+      const osc = vi
+        .spyOn(Osc52Module, "writeOsc52Clipboard")
+        .mockReturnValue(true);
+      const ctx = withReply({ clipboard: "abc", output: "ok" });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() => expect(osc).toHaveBeenCalledWith("abc"));
+      expect(native).not.toHaveBeenCalled();
+    });
+
+    it("reports a failed copy", async () => {
+      vi.spyOn(CopyTextModule, "copyText").mockRejectedValue(new Error("boom"));
+      const ctx = withReply({ clipboard: "abc", output: "ok" });
+
+      createSlashHandler(ctx)("/handoff");
+      await vi.waitFor(() => {
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          "clipboard copy failed — the text is in the pager (Error: boom)",
+        );
+      });
+    });
   });
 
   describe("commands sent together", () => {

@@ -47,6 +47,7 @@ export interface CompletionResponse {
 }
 
 export interface SlashExecResponse {
+  clipboard?: string;
   output?: string;
   warning?: string;
 }

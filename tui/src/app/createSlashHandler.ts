@@ -1,6 +1,7 @@
 import { parseCommandDispatch, parseSlashCommand } from "@k3code/shared/slash";
 
 import type { SlashExecResponse } from "../gatewayTypes.js";
+import { copyText } from "../lib/copyText.js";
 import { rpcErrorMessage } from "../lib/rpc.js";
 import { launchWidget } from "../sdk/host.js";
 import { getWidgetApp } from "../sdk/registry.js";
@@ -226,6 +227,30 @@ export function createSlashHandler(
           page(text, parsed.name[0]!.toUpperCase() + parsed.name.slice(1));
         } else {
           sys(text);
+        }
+
+        // A command may also hand back text for the clipboard (e.g. /handoff).
+        // `output` stays the display text; `clipboard` is only copied.
+        const clip = r?.clipboard;
+
+        if (typeof clip === "string" && clip.length) {
+          copyText(clip)
+            .then((via) => {
+              if (!stale()) {
+                sys(
+                  via === "native"
+                    ? `copied ${clip.length} characters to the clipboard`
+                    : "sent OSC52 copy sequence (terminal support required)",
+                );
+              }
+            })
+            .catch((err: unknown) => {
+              if (!stale()) {
+                sys(
+                  `clipboard copy failed — the text is in the pager (${String(err)})`,
+                );
+              }
+            });
         }
       })
       .catch((execErr: unknown) => {
