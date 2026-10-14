@@ -107,7 +107,8 @@ const TEXT_RE = /[^\x00-\x1f\x7f-\x9f]/;
  *
  * Esc and number keys both terminate the prompt; Esc maps to deny (parity
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
- * for approvals).  One typed digit 1..opts.length picks the labelled choice.
+ * for approvals).  One typed digit 1..opts.length picks the labelled choice;
+ * any other digit is text.
  * Enter confirms the current selection.  ↑/↓ moves the selection within
  * bounds.  `[` / `]` page the change preview of an edit/write when it is
  * `scrollable` (PgUp/PgDn already scroll the transcript while a prompt is
@@ -160,10 +161,8 @@ export function approvalAction(
     return disarmed ? { kind: "arm" } : { kind: "noop" };
   }
 
-  if (
-    key.isPasted ||
-    (Number.isNaN(n) && !key.ctrl && !key.meta && TEXT_RE.test(ch))
-  ) {
+  // A digit outside 1..opts.length is no quick pick: it is text and disarms.
+  if (key.isPasted || (!key.ctrl && !key.meta && TEXT_RE.test(ch))) {
     return { kind: "disarm" };
   }
 

@@ -39,10 +39,12 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
     });
   });
 
-  it("ignores out-of-range numbers", () => {
-    expect(approvalAction("0", {}, 1)).toEqual({ kind: "noop" });
-    expect(approvalAction("5", {}, 1)).toEqual({ kind: "noop" });
-    expect(approvalAction("9", {}, 1)).toEqual({ kind: "noop" });
+  it("disarms on a digit that is not a quick pick", () => {
+    // An out-of-range digit is typed text, not an answer: the prompt must not
+    // stay armed for the Enter that follows it.
+    expect(approvalAction("0", {}, 1)).toEqual({ kind: "disarm" });
+    expect(approvalAction("5", {}, 1)).toEqual({ kind: "disarm" });
+    expect(approvalAction("9", {}, 1)).toEqual({ kind: "disarm" });
   });
 
   it("confirms the current selection on Enter", () => {
@@ -111,7 +113,7 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
       kind: "choose",
       choice: "deny",
     });
-    expect(approvalAction("4", {}, 0, opts)).toEqual({ kind: "noop" });
+    expect(approvalAction("4", {}, 0, opts)).toEqual({ kind: "disarm" });
     expect(approvalAction("", { downArrow: true }, 2, opts)).toEqual({
       kind: "noop",
     });
@@ -134,7 +136,7 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
       kind: "choose",
       choice: "deny",
     });
-    expect(approvalAction("3", {}, 0, opts)).toEqual({ kind: "noop" });
+    expect(approvalAction("3", {}, 0, opts)).toEqual({ kind: "disarm" });
   });
 
   it("quick-picks only on one typed digit, never on a burst or a paste", () => {
