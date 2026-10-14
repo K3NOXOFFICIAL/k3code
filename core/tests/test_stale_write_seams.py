@@ -511,6 +511,7 @@ async def test_clear_forgets_what_the_session_had_read(tmp_path):
     f.write_text("x")
     live = SimpleNamespace(
         messages=[],
+        shell_records=[],
         stored=stored,
         streaming=False,
         reads={},
