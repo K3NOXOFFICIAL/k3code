@@ -382,6 +382,11 @@ providers:                          # the fallback chain, in order (add as many 
 permission_mode: default            # default | accept-edits | plan | auto | yolo
 autonomy:
   plan_first: true
+  advisor_on_plan: true             # strong-tier critique of an approved plan, for a large/huge or high-risk one only
+  advisor_on_goal: true             # strong-tier review before a /goal is declared done
+  proposals: true                   # one proposer pass after a finished task (none on the plan)
+  advisor_compact_chars: 24000      # transcript size past which the advisor, goal review and planner get the old
+                                    #   part summarized on the cheap tier instead of verbatim
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
   auto_continue: auto               # auto (default): in auto/yolo mode a prompt runs as an implicit goal until the
                                     #   judge says done; true/false force it on/off in every mode

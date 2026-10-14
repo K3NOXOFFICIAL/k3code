@@ -14,14 +14,15 @@ DEFAULTS: dict[str, Any] = {
     #: unattended bash (goal continuations, sub-agents, background runs) keeps the network inside the sandbox;
     #: off = no network (bwrap cannot filter by host, so this is all or nothing)
     "unattended_network": False,
-    #: advisor critique after plan approval / before a goal is declared done (auto mode)
+    #: advisor critique after plan approval (large/huge scope or high risk only) / before a goal is declared done
+    #: (auto mode)
     "advisor_on_plan": True,
     "advisor_on_goal": True,
     "advisor_modes": ["auto"],
     #: session advisor the main model can consult through the ``advisor`` tool: a model key, "strong" (the strong
     #: tier) or "" (off). ``/advisor <key>`` sets it per session; ``/advisor <key> --default`` writes this key
     "advisor": "",
-    #: proposer pass after a plan and after a task
+    #: proposer pass after a finished task (none on the plan)
     "proposals": True,
     #: an interactive task the scope gate calls "trivial" starts on the cheap tier and escalates when it stalls
     #: (GOAL B5: route unimportant work to cheaper models, escalating when they struggle)
