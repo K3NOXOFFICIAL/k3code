@@ -2075,6 +2075,28 @@ def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> N
     assert mark.read_text().strip() == "start-first"
 
 
+def _link_farm(farm: Path, dirs: list[str], skip: tuple[str, ...]) -> Path:
+    """FARM: a directory linking every entry of DIRS (first one wins) except the SKIP names."""
+    farm.mkdir()
+    for d in dirs:
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                # lexists: a dangling link in a directory listed twice is already there, however exists() sees it
+                if entry.name not in skip and not os.path.lexists(farm / entry.name):
+                    (farm / entry.name).symlink_to(entry)
+    return farm
+
+
+def test_link_farm_takes_a_dangling_link_in_a_directory_listed_twice_once(tmp_path: Path) -> None:
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "tool").write_text("")
+    (d / "gone").symlink_to(tmp_path / "missing")  # dangling, like /usr/local/bin/orca on kokadock
+    farm = _link_farm(tmp_path / "farm", [str(d), str(d)], skip=("tool",))
+    assert [p.name for p in farm.iterdir()] == ["gone"]
+    assert os.readlink(farm / "gone") == str(d / "gone")
+
+
 def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
     # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
     nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
@@ -2084,13 +2106,7 @@ def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) ->
     (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     (src / "VERSION").write_text("9.9.9\n")
     shutil.copy(INSTALL, src / "install" / "install.sh")
-    farm = tmp_path / "farm"
-    farm.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        if d and Path(d).is_dir():
-            for entry in Path(d).iterdir():
-                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
-                    (farm / entry.name).symlink_to(entry)
+    farm = _link_farm(tmp_path / "farm", os.environ["PATH"].split(os.pathsep), skip=("sha256sum", "shasum", "git"))
     home = tmp_path / "home"
     home.mkdir()
     r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})
