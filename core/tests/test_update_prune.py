@@ -183,3 +183,29 @@ def test_prune_does_not_hoard_old_k3_builds_while_the_current_version_has_it(dat
     upd.switch_to("1.2.0")
     upd.switch_to("1.3.0")
     assert sorted(upd.prune(keep=2)) == ["1.0.0", "1.1.0"]
+
+
+# -- a staged version that fails its smoke test ------------------------------------------
+
+
+def test_a_staged_version_that_fails_the_smoke_test_is_removed(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    build(data, "1.0.0", age=2000)
+    build(data, "1.1.0", age=1000)
+    upd.switch_to("1.0.0")
+    monkeypatch.setattr(upd, "running_versions", lambda: set())
+    res = upd.activate("1.1.0", smoke=lambda _v: (False, "broken"), carry=lambda *_a: None)
+    assert not res.ok and names(data) == {"1.0.0"}
+
+
+def test_a_failed_staged_version_that_a_process_runs_from_is_kept(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#158: the installer reuses an installed build of the same commit, so the staged dir can be the one an old TUI
+    or daemon still runs from; removing it after a failed smoke test broke that process's lazy imports."""
+    build(data, "1.0.0", age=3000)
+    build(data, "1.1.0", age=2000)
+    build(data, "1.2.0", age=1000)
+    upd.switch_to("1.1.0")
+    upd.switch_to("1.2.0")  # previous 1.1.0; a TUI still runs 1.0.0, which the installer handed back as staged
+    monkeypatch.setattr(upd, "running_versions", lambda: {"1.0.0"})
+    res = upd.activate("1.0.0", smoke=lambda _v: (False, "broken"), carry=lambda *_a: None)
+    assert not res.ok and upd.current_version() == "1.2.0"
+    assert names(data) == {"1.0.0", "1.1.0", "1.2.0"}

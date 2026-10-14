@@ -59,29 +59,218 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
         ) from None
 
 
-#: Builtin read-only bash allowlist: safe to run without asking.
+#: Builtin read-only bash allowlist: safe to run without asking, in every mode but plan. It covers the project only
+#: (see _voids_allow: an argument outside the roots, a redirect or a substitution asks), and the flags of these commands
+#: that write a file or run a program ask (BUILTIN_BASH_ASK, checked again on the argv by _readonly_argv_ok).
+#: ``env``/``printenv`` are not here: they print the secrets in the environment.
 BUILTIN_BASH_ALLOW = [
     "ls *",
     "cat *",
+    "head *",
+    "tail *",
+    "wc *",
     "grep *",
     "rg *",
+    "find *",
+    "tree *",
+    "file *",
+    "stat *",
+    "du *",
+    "df *",
+    "pwd *",
+    "which *",
+    "type *",
+    "command -v *",
+    "command -V *",
+    "whoami",
+    "id *",
+    "uname *",
+    "date *",
+    "sort *",
+    "uniq *",
+    "cut *",
+    "tr *",
+    "jq *",
+    "yq *",
+    "diff *",
+    "cmp *",
+    "sha256sum *",
+    "sha1sum *",
+    "sha512sum *",
+    "md5sum *",
+    "basename *",
+    "dirname *",
+    "realpath *",
+    "readlink *",
     "git status *",
     "git diff *",
     "git log *",
+    "git show *",
+    "git branch *",
+    "git tag *",
+    "git remote",
+    "git remote -v",
+    "git remote --verbose",
+    "git remote get-url *",
+    "git rev-parse *",
+    "git blame *",
+    "git ls-files *",
+    "git describe *",
+    "python --version",
+    "python3 --version",
+    "node --version",
+    "go version",
+    "cargo --version",
 ]
 
 #: ``rg --pre CMD`` runs CMD on every file; ``git diff|log --output=FILE`` writes FILE; ``--ext-diff``/``--textconv``
-#: run configured external programs.
+#: run configured external programs; ``find -exec``/``-delete``/``-fprint``, ``sort -o``, ``tree -o``, ``file -C``
+#: run or write; ``date -s`` sets the clock; ``git branch``/``git tag`` with these flags change refs. Longer patterns
+#: win, so these ask over the allows above (and over a shorter user allow). _readonly_argv_ok also catches the
+#: spellings a pattern cannot see (``sort -uo f``, ``"-exec"``, ``--out=f``, ``git branch new``, ``jq -n env``).
 BUILTIN_BASH_ASK = [
     "rg* --pre*",
     "rg* --hostname-bin*",
     "git diff* --output*",
     "git log* --output*",
+    "git show* --output*",
     "git diff* --ext-diff*",
     "git diff* --textconv*",
     "git log* --ext-diff*",
     "git log* --textconv*",
+    "git show* --ext-diff*",
+    "git show* --textconv*",
+    "git blame* --textconv*",
+    "find* -exec*",
+    "find* -ok*",
+    "find* -delete*",
+    "find* -fprint*",
+    "find* -fls*",
+    "sort* -o*",
+    "sort* --output*",
+    "sort* --compress-program*",
+    "tree* -o*",
+    "file* -C*",
+    "file* --compile*",
+    "date* -s*",
+    "date* --set*",
+    "diff* --output*",
+    "jq* -f*",
+    "jq* --from-file*",
+    "jq* -L*",
+    "yq* -i*",
+    "yq* --inplace*",
+    "yq* --in-place*",
+    "yq* -s*",
+    "yq* --split-exp*",
+    *(f"git branch* {f}*" for f in ("-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "-t")),
+    *(f"git branch* {f}*" for f in ("--delete", "--move", "--copy", "--force", "--set-upstream", "--unset-upstream")),
+    *(f"git branch* {f}*" for f in ("--edit-description", "--track", "--create-reflog")),
+    *(f"git tag* {f}*" for f in ("-d", "-a", "-s", "-f", "-m", "-F", "-u", "-e")),
+    *(f"git tag* {f}*" for f in ("--delete", "--annotate", "--sign", "--force", "--message", "--file", "--edit")),
+    "git tag* --local-user*",
 ]
+
+#: The builtin read-only programs a session started in ``$HOME`` runs without a person (see :func:`home_read_only`):
+#: they print only what is named on the command line (a named credential file is refused first). Not the tree walkers
+#: (``rg`` prints every match below ``$HOME``; ``find``, ``tree``, ``du`` list it) and not ``jq``/``yq`` (a program).
+_HOME_READERS = frozenset(
+    {"ls", "cat", "head", "tail", "wc", "grep", "file", "stat", "df", "pwd", "which", "type", "command", "whoami"}
+    | {"id", "uname", "date", "sort", "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath"}
+    | {"readlink", "sha256sum", "sha1sum", "sha512sum", "md5sum", "git"}
+)
+#: What such a command may be spelled with: words and the ``; | &`` separators. No glob, brace, quote, escape, ``$``,
+#: ``~``, redirect, substitution, comment or newline, so the words the shell runs are the words written.
+_HOME_PLAIN = re.compile(r"[A-Za-z0-9._/@+=,: |;&-]+")
+#: A path component that starts with a dot (``.config``, ``..x``), not the ``.`` and ``..`` steps.
+_DOT_SEGMENT = re.compile(r"(?:^|/)\.(?!\.?(?:/|$))")
+#: The options that make a reader walk or dump a directory tree: (short letters, long options; GNU getopt takes any
+#: unambiguous prefix of a long one). ``git diff --no-index DIR other`` dumps two trees.
+_HOME_RECURSIVE: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ls": ("R", ("recursive",)),
+    "grep": ("rRd", ("recursive", "dereference-recursive", "directories")),
+    "diff": ("r", ("recursive",)),
+    "git": ("", ("no-index",)),
+}
+#: git subcommands that print file contents (a $HOME repo tracking dotenv or .bashrc would show them unprompted), and
+#: the ``git log`` options that turn it into a patch dump.
+_HOME_GIT_CONTENT = frozenset({"show", "diff", "blame"})
+_HOME_GIT_PATCH_SHORT = "puc"
+_HOME_GIT_PATCH_LONG = ("patch", "cc", "remerge-diff", "diff", "textconv", "ext-diff")
+
+
+def home_read_only(command: str) -> bool:
+    """``command`` may run without a person in the read-only ``$HOME`` sandbox of a session started in the home
+    directory: every part is a plain, non-recursive reader of :data:`_HOME_READERS`. Dotenv files lie anywhere below
+    ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``,
+    ``diff -r``) or expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by
+    :func:`decide` first. Credential stores sit in dot folders no list names in full (``~/.config/git/credentials``,
+    ``~/.cache/huggingface/token``), so no argument may have a dot-segment, nor an option a dot at all
+    (``--file=.x``, ``-f.x``). Over-matching only costs a prompt."""
+    if not _HOME_PLAIN.fullmatch(command):
+        return False
+    parsed = hardline.parse(command)
+    if not parsed.subs or parsed.nested or parsed.children or parsed.unterminated:
+        return False
+    for sub in parsed.subs:
+        words = sub.split()
+        if not words or words[0] not in _HOME_READERS:
+            return False
+        letters, longs = _HOME_RECURSIVE.get(words[0], ("", ()))
+        if words[0] == "git":
+            if any(word in _HOME_GIT_CONTENT for word in words[1:]):
+                return False
+            if "log" in words[1:] and any(
+                (
+                    word.startswith("--")
+                    and any(full.startswith(word[2:].split("=", 1)[0]) for full in _HOME_GIT_PATCH_LONG)
+                )
+                or (
+                    word.startswith("-")
+                    and not word.startswith("--")
+                    and any(c in word[1:] for c in _HOME_GIT_PATCH_SHORT)
+                )
+                for word in words[1:]
+            ):
+                return False
+        for word in words[1:]:
+            if ("." in word) if word.startswith("-") else bool(_DOT_SEGMENT.search(word)):
+                return False
+            if word.startswith("--"):
+                name = word[2:].split("=", 1)[0]
+                if any(full.startswith(name) for full in longs):
+                    return False
+            elif word.startswith("-") and any(ch in word[1:] for ch in letters):
+                return False
+    return True
+
+
+#: Test, build and lint commands that run without asking in accept-edits and auto mode, and only there: they run the
+#: project's code, so the decision carries ``sandbox_only`` and the agent loop runs them in the bwrap sandbox, or asks
+#: when the sandbox cannot contain them (no usable bwrap, a root it refuses such as ``$HOME``). Like the read-only
+#: allowlist they cover the project only (an argument outside the roots, a redirect or a substitution asks).
+BUILTIN_SANDBOXED_ALLOW = [
+    "pytest *",
+    "python -m pytest *",
+    "python3 -m pytest *",
+    "uv run pytest *",
+    "uv run ruff *",
+    "uv run mypy *",
+    *(f"{pm} test *" for pm in ("npm", "pnpm", "yarn")),
+    *(f"{pm} run {s} *" for pm in ("npm", "pnpm", "yarn") for s in ("test", "lint", "build")),
+    *(f"{pm} {s} *" for pm in ("pnpm", "yarn") for s in ("lint", "build")),
+    *(f"npx {t} *" for t in ("tsc", "eslint", "vitest", "jest")),
+    *(f"go {s} *" for s in ("test", "build", "vet")),
+    *(f"cargo {s} *" for s in ("test", "build", "check", "clippy")),
+    *(f"make {s} *" for s in ("test", "check", "lint")),
+    "ruff *",
+    "mypy *",
+    "eslint *",
+    "tsc *",
+]
+#: The modes BUILTIN_SANDBOXED_ALLOW applies in.
+SANDBOXED_ALLOW_MODES = frozenset({"accept-edits", "auto"})
+_SANDBOXED = frozenset(BUILTIN_SANDBOXED_ALLOW)
 
 #: bash_output / bash_kill only reach background jobs of the calling session (the job registry enforces it); starting
 #: one is ``bash`` with ``background: true`` and goes through the bash decision like any command.
@@ -120,12 +309,18 @@ class Decision:
     needs_human: bool = False
     #: an ask that no mode and no rule converts, yolo included (see protected_path); headless it is a deny
     always_ask: bool = False
+    #: an allow that holds only inside the sandbox (BUILTIN_SANDBOXED_ALLOW): the caller runs the command sandboxed,
+    #: or asks when the sandbox cannot contain it
+    sandbox_only: bool = False
 
 
-def builtin_defaults() -> list[Rule]:
-    """Builtin ruleset: pure tools + safe bash allow, writes/other bash ask."""
+def builtin_defaults(mode: PermissionMode | str | None = None) -> list[Rule]:
+    """Builtin ruleset: pure tools + safe bash allow, writes/other bash ask. In accept-edits and auto mode the test,
+    build and lint commands of BUILTIN_SANDBOXED_ALLOW are allowed too (sandboxed, see Decision.sandbox_only)."""
     rules: list[Rule] = [Rule(tool=t, pattern="*", action="allow") for t in sorted(PURE_TOOLS - READ_TOOLS)]
     rules += [Rule(tool="bash", pattern=p, action="allow") for p in BUILTIN_BASH_ALLOW]
+    if mode is not None and PermissionMode(mode).value in SANDBOXED_ALLOW_MODES:
+        rules += [Rule(tool="bash", pattern=p, action="allow") for p in BUILTIN_SANDBOXED_ALLOW]
     # Flags that make an allowed read-only command execute or write something: longer patterns win, so these ask.
     rules += [Rule(tool="bash", pattern=p, action="ask") for p in BUILTIN_BASH_ASK]
     rules.append(Rule(tool=EXIT_PLAN_TOOL, pattern="*", action="allow"))
@@ -232,7 +427,7 @@ def decide(
     args = args or {}
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
-    ruleset = merge(builtin_defaults(), user_rules or [], project_rules or [], session_rules or [])
+    ruleset = merge(builtin_defaults(mode), user_rules or [], project_rules or [], session_rules or [])
 
     if tool == "bash":
         # The command runs in args["cwd"] (relative to the session cwd): redirects resolve against it.
@@ -343,7 +538,12 @@ def _voids_allow(
     has_subst = bool(_SUBSTITUTION.search(plain)) or bool(body_payloads)
     if rule.layer == 0:
         # the builtin read-only allowlist covers the project only: `cat /etc/x`, `grep -r k ~` and `ls $DIR` ask
-        return has_redirect or has_subst or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
+        return (
+            has_redirect
+            or has_subst
+            or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
+            or not _readonly_argv_ok(hardline.tokens(sub))
+        )
     if has_redirect and not _redirects_ok(plain, roots, cwd):
         return True
     if not has_subst:
@@ -355,6 +555,128 @@ def _voids_allow(
     return not nested or any(
         evaluate("bash", n, ruleset, default="ask").action != "allow" or hardline.is_launcher(n) for n in nested
     )
+
+
+#: Options of the builtin read-only commands that write a file, run a program or change state: (short option letters,
+#: long options). A short letter counts anywhere in a cluster (``sort -uo f``); a long option also by an abbreviation
+#: getopt would accept (``sort --out=f``). Over-asking (``rg --pretty``) is the safe side.
+_READONLY_RISKY: dict[str, tuple[str, tuple[str, ...]]] = {
+    "rg": ("", ("--pre", "--hostname-bin")),
+    "tail": ("fF", ("--follow",)),  # follows forever: the call never returns
+    "sort": ("o", ("--output", "--compress-program")),
+    "tree": ("o", ()),
+    "file": ("C", ("--compile",)),
+    "diff": ("", ("--output",)),
+    "jq": ("fL", ("--from-file", "--library-path")),
+    "yq": ("is", ("--inplace", "--in-place", "--split-exp", "--from-file", "--security")),
+    "git diff": ("", ("--output", "--ext-diff", "--textconv")),
+    "git log": ("", ("--output", "--ext-diff", "--textconv")),
+    "git show": ("", ("--output", "--ext-diff", "--textconv")),
+    "git blame": ("", ("--textconv",)),
+}
+#: ``find`` primaries that run a program, delete or write a file.
+_FIND_RISKY = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
+#: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules, or run a command.
+#: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
+_QUERY_RISKY = re.compile(r"env|load|system|import|include|eval", re.IGNORECASE)
+#: The ``make`` targets of BUILTIN_SANDBOXED_ALLOW: ``make test install`` runs every target named, so only these may.
+_MAKE_TARGETS = frozenset({"test", "check", "lint"})
+#: make options whose value is the next word (``-j``/``-l`` take an attached value only: ``-j install`` would hide a
+#: target). ``-f``/``-C`` values are path arguments: _voids_allow keeps them inside the project.
+_MAKE_VALUE_OPTS = (
+    "fCIoWE",
+    frozenset({"--file", "--makefile", "--directory", "--include-dir", "--old-file", "--assume-old"})
+    | frozenset({"--new-file", "--assume-new", "--what-if", "--eval"}),
+)
+#: git subcommands that take a ``REV:path`` argument (``git show HEAD:.env``, ``git cat-file -p :.env``).
+_GIT_REV_PATH = frozenset(
+    {"show", "log", "diff", "blame", "cat-file", "grep", "ls-tree", "restore", "checkout", "rev-parse", "archive"}
+)
+#: ``git branch``/``git tag`` in list mode: (flags allowed, flags whose value is the next word, short letters allowed).
+#: Anything else (``-d``, ``-m``, a new name) changes refs and asks; a pattern argument needs ``--list``/``-l``.
+_REF_LIST_FLAGS = frozenset(
+    {"--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
+    | {"--color", "--no-color", "--column", "--no-column", "--ignore-case", "--abbrev", "--no-abbrev"}
+)
+_REF_LIST_VALUE = frozenset(
+    {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
+)
+_REF_LIST: dict[str, tuple[frozenset[str], str]] = {
+    "branch": (_REF_LIST_FLAGS | {"--all", "--remotes", "--verbose", "--show-current", "--quiet"}, "arlvqi"),
+    "tag": (_REF_LIST_FLAGS, "li"),
+}
+
+
+def _long_hit(name: str, risky: tuple[str, ...]) -> bool:
+    return any(name.startswith(r) or (len(name) > 3 and r.startswith(name)) for r in risky)
+
+
+def _ref_list_ok(sub: str, args: list[str]) -> bool:
+    """``git branch|tag ARGS`` only lists refs."""
+    allowed, letters = _REF_LIST[sub]
+    listing = False
+    positional = 0
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        name = a.split("=", 1)[0]
+        if a.startswith("--"):
+            if name not in allowed:
+                return False
+            listing = listing or name == "--list"
+            if "=" not in a and name in _REF_LIST_VALUE and i < len(args) and not args[i].startswith("-"):
+                i += 1  # its value
+        elif a.startswith("-") and len(a) > 1:
+            if sub == "tag" and re.fullmatch(r"-n\d*", a):
+                continue
+            if any(ch not in letters for ch in a[1:]):
+                return False
+            listing = listing or "l" in a
+        else:
+            positional += 1
+    return positional == 0 or listing
+
+
+def _readonly_argv_ok(tokens: list[str]) -> bool:
+    """``tokens`` (one simple command, as written) uses none of the options of a builtin read-only command that write,
+    run or change something (see _READONLY_RISKY). Commands not listed there pass."""
+    if not tokens:
+        return True
+    name = os.path.basename(tokens[0])
+    args = tokens[1:]
+    if name == "git":
+        if not args:
+            return True
+        sub, args = args[0], args[1:]
+        if sub in _REF_LIST:
+            return _ref_list_ok(sub, args)
+        name = f"git {sub}"
+    if name == "find":
+        return not any(a in _FIND_RISKY for a in args)
+    if name == "make":
+        _, positional = _options(args, *_MAKE_VALUE_OPTS)
+        return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
+    if name == "uniq":
+        # `uniq IN OUT` writes OUT
+        _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
+        return len(positional) <= 1
+    if name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args):
+        return False
+    if name == "date":
+        # `date -Iseconds` is a format, `date -s X` sets the clock
+        opts, _ = _options(args, "dfrsI", frozenset({"--date", "--file", "--reference", "--set"}))
+        return not any(o == "-s" or _long_hit(o, ("--set",)) for o, _ in opts)
+    letters, longs = _READONLY_RISKY.get(name, ("", ()))
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("--"):
+            if _long_hit(a.split("=", 1)[0], longs):
+                return False
+        elif a.startswith("-") and any(ch in letters for ch in a[1:]):
+            return False
+    return True
 
 
 def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
@@ -387,6 +709,37 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     if arg.startswith("$"):
         return True  # a variable: an unknown path
     return not _inside(_abs(arg, cwd), roots)
+
+
+def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
+    """``sub`` names a path below a dot folder of ``$HOME`` (``~/.config/git/credentials``,
+    ``~/.cache/huggingface/token``) that a root at or above ``$HOME`` covers, i.e. not one inside a project root below
+    it (``.gitignore`` there is ordinary). Credential stores live in such folders and no denylist names them all, so
+    the builtin read-only allowlist does not cover these reads. Checked on the path as written and on its realpath (a
+    symlink in ``$HOME`` into a dot folder); a short option with a dot (``-f.config/x``) may attach such a path."""
+    home = os.path.normpath(os.path.expanduser("~"))
+    homes = list(dict.fromkeys((home, os.path.realpath(home))))
+    if not _inside(home, roots):
+        return False  # no root covers $HOME: a path there is outside the roots, which voids a builtin allow already
+    projects = [r for r in roots if not _inside(home, [r])]
+    for t in _argv(sub)[1:]:
+        if t.startswith("-"):
+            if "=" in t:
+                t = t.split("=", 1)[1]
+            elif not t.startswith("--") and "." in t:
+                return True
+            else:
+                continue
+        if not t or t.startswith("$"):
+            continue
+        lexical = _abs(t, cwd)
+        for p in dict.fromkeys((lexical, os.path.realpath(os.path.join(cwd, os.path.expanduser(t))))):
+            if projects and _inside(p, projects):
+                continue
+            for h in homes:
+                if p.startswith(h.rstrip("/") + "/") and any(c.startswith(".") for c in p[len(h) :].split("/")):
+                    return True
+    return False
 
 
 # ── credential files named on a command line ──
@@ -703,7 +1056,11 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     if name in _COPIERS:
         reads, writes = _copier_roles(args)
         return reads, writes, []
-    return _words(args), [], []
+    words = _words(args)
+    if name == "git" and args[:1] and args[0] in _GIT_REV_PATH:
+        # `git show HEAD:.env.production`, `git cat-file -p :.env`: the path half of a REV:path is read too
+        words += [w.split(":", 1)[1] for w in words if ":" in w and "://" not in w and w.split(":", 1)[1]]
+    return words, [], []
 
 
 def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
@@ -789,8 +1146,19 @@ def _decide_bash(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
         )
     worst: Rule | None = None
+    home_dot = False
+    sandbox_only = False
     for k, sub in enumerate(subs):
         rule = evaluate("bash", sub, ruleset, default="ask")
+        if rule.layer == 0 and rule.pattern in _SANDBOXED:
+            # a user/project/session rule that names it (`make *: allow|ask`) decides: an allow is the user's own (not
+            # sandbox-bound), an ask is kept; only a bare `*` catch-all is less specific than this allowlist
+            mine = evaluate("bash", sub, [r for r in ruleset if r.layer > 0], default="ask")
+            rule = mine if mine.layer > 0 and mine.pattern != "*" else rule
+        if rule.action == "allow" and rule.layer == 0 and _home_dot_path(sub, roots, cwd):
+            home_dot = True  # a person answers it, in auto mode too (see below)
+            rule = Rule(tool="bash", pattern="*", action="ask")
+        sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
         # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
         # command line does not say what runs
         if rule.action == "allow" and (
@@ -825,11 +1193,21 @@ def _decide_bash(
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
+    if home_dot and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Reads a dot folder of the home directory, where credentials live; confirm it yourself: "
+            f"{command[:120]}",
+        )
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     if worst.action == "allow" and not _inside(cwd, roots):
         return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
-    return Decision(action=worst.action, patterns=prefixes, rule=worst)
+    return Decision(
+        action=worst.action, patterns=prefixes, rule=worst, sandbox_only=sandbox_only and worst.action == "allow"
+    )
 
 
 def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], ruleset: list[Rule]) -> Decision:
@@ -851,11 +1229,27 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
     rule = evaluate("edit" if is_edit else "read", path, ruleset, default=fallback)
     dec = Decision(action=rule.action, patterns=[path], rule=rule)
     if not inside:
+        uv_credentials = _inside(path, [os.path.join(os.path.expanduser("~"), _UV_CREDENTIALS)])
         if rule.layer == 0:
             dec.message = f"Outside project roots: {path}"
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
+        elif not is_edit and rule.action == "ask" and rule.layer == 0 and uv_credentials:
+            # uv's credential store: a person approves the read in every mode, auto included (see _UV_CREDENTIALS)
+            dec.needs_human = True
+        elif not is_edit and rule.action == "ask" and rule.layer == 0 and _toolchain_read(path):
+            # a read of the toolchain dirs (/usr, site-packages, node_modules ...) is never worth a prompt: every
+            # mode allows it (auto logs it as an auto allow, see _finish, and alone takes /etc too). A
+            # user/project/session rule still wins; credential paths were refused above.
+            if mode != PermissionMode.AUTO and not _inside(path, ["/etc"]):
+                dec.action = "allow"
+            elif mode != PermissionMode.AUTO:
+                dec.needs_human = True  # /etc outside auto: a person approves it, as before
+        elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
+            # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
+            dec.action = "deny"
+            dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
@@ -865,6 +1259,37 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         dec.action, dec.needs_human = "ask", True
         dec.message = f"Writes into a key or credential store; confirm it yourself: {path}"
     return dec
+
+
+#: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person:
+#: ``/usr`` and ``/etc`` (the sandbox shows bash those anyway), the system package trees ``/opt`` and ``/nix/store``
+#: (the sandbox does not bind them: only these in-process reads see them), and the language package caches under
+#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path).
+_TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
+_TOOLCHAIN_HOME = (
+    ".cargo/registry",
+    ".cargo/git",
+    ".rustup",
+    "go/pkg/mod",
+    ".npm",
+    ".local/share/uv/python",
+    ".local/share/uv/tools",
+    ".m2/repository",
+)
+#: uv's credential store (``uv auth dir``): an auto-mode read there asks a person, as every out-of-roots read does
+#: in the other modes, instead of being refused like any other path outside the toolchain dirs.
+_UV_CREDENTIALS = ".local/share/uv/credentials"
+#: Path segments of installed packages of a known toolchain (Python, Node).
+_TOOLCHAIN_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
+
+
+def _toolchain_read(path: str) -> bool:
+    """``path`` (absolute) lies in a read-only system or toolchain location (see _TOOLCHAIN_SYSTEM), after resolving
+    symlinks: a link from there into ``$HOME`` does not count."""
+    home = os.path.expanduser("~")
+    if _inside(path, [*_TOOLCHAIN_SYSTEM, *(os.path.join(home, rel) for rel in _TOOLCHAIN_HOME)]):
+        return True
+    return any(seg in _TOOLCHAIN_SEGMENTS for seg in os.path.realpath(path).split(os.sep))
 
 
 #: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).

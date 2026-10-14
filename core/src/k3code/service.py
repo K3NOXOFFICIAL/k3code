@@ -173,6 +173,15 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
         raise ServiceError("systemd user manager not available (no systemctl)") from None
 
 
+def manager_reachable() -> bool:
+    """True when the systemd user manager answers (``systemctl --user show-environment``). ``systemctl`` alone proves
+    nothing: WSL without systemd, containers and ``su``/``sudo -u`` shells have it but no user bus (#115)."""
+    try:
+        return _systemctl("show-environment").returncode == 0
+    except ServiceError:
+        return False
+
+
 def restart(unit: str = UNIT_NAME) -> None:
     """``reset-failed`` then ``restart``: after a crash loop the start limit refuses a bare restart
     (start-limit-hit), and the daemon would stay down until the recovery unit runs."""
@@ -209,6 +218,11 @@ def install(dry_run: bool = False) -> list[str]:
         ]
     if not systemd_available():  # checked before anything is written
         raise ServiceError("systemd user manager not available: run `k3code daemon` directly instead")
+    if not manager_reachable():  # a unit it cannot load would only make every update roll back (#115)
+        raise ServiceError(
+            "systemd user manager not reachable (`systemctl --user show-environment` failed): "
+            "run `k3code daemon` directly instead"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit)
     recover.write_text(render_recover_unit())

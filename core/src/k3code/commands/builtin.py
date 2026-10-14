@@ -324,6 +324,7 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
     from k3code.commands.import_ import ImportCommand
+    from k3code.commands.learned_cmd import LearnedCommand
     from k3code.commands.learning_cmd import (
         LearnCommand,
         OptimizerCommand,
@@ -372,6 +373,7 @@ def build_registry() -> CommandRegistry:
         OptimizerCommand(),
         SelfImproveCommand(),
         LearnCommand(),
+        LearnedCommand(),
     ):
         reg.register(extra)
     for cmd in (

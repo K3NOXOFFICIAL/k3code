@@ -470,6 +470,7 @@ async def test_bash_capture_keeps_the_head_and_the_tail_and_counts_what_it_dropp
     assert result["stdout"].endswith("30000\n")
 
 
+@pytest.mark.serial  # load-sensitive under the 8-worker run; passes alone
 async def test_bash_flood_is_killed_instead_of_filling_daemon_memory(temp_dir, monkeypatch):
     """communicate() buffered every byte: `yes` took the daemon to 1 GB/s of RSS until the OOM killer ran."""
     import resource

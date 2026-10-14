@@ -27,6 +27,9 @@ def connect(path: Path | str, **kwargs: Any) -> sqlite3.Connection:
     db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     db.execute("PRAGMA auto_vacuum=INCREMENTAL")  # only takes effect on a database with no tables yet
     db.execute("PRAGMA journal_mode=WAL")
+    # FULL (the default) fsyncs the WAL on every commit, on the event loop. In WAL mode NORMAL cannot corrupt the
+    # database; a power loss can only lose the last commits.
+    db.execute("PRAGMA synchronous=NORMAL")
     return db
 
 

@@ -33,7 +33,7 @@ class RepeatingTool:
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
@@ -90,7 +90,7 @@ async def test_closing_a_session_whose_goal_is_being_judged_keeps_it_live(tmp_pa
     server.goal_manager(live).set("ship it")
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def slow_judge(goal: str, response: str):
+    async def slow_judge(goal: str, response: str, evidence: str = ""):
         entered.set()
         await release.wait()
         return "done", "shipped", False, False

@@ -424,7 +424,8 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
             "permissions.more", "Add an extra hardline regex (e.g. 'ssh \\S+ systemctl')?", False
         ):
             extra.append(c.p.text("permissions.rx", "Regex"))
-    return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
+    # an empty answer is no entry: a blank pattern would match (and deny) every command
+    return {"mode": mode, "extra_hardline": [str(x) for x in extra if str(x).strip()]}
 
 
 def step_integrations(c: Ctx) -> dict[str, Any]:
@@ -478,8 +479,12 @@ def step_service(c: Ctx) -> dict[str, Any]:
     want = c.p.confirm("service.install", "Install the 24/7 systemd user service now?", False)
     out: dict[str, Any] = {"install": want}
     if want:
-        for line in service.install():
-            c.say("  " + line)
+        try:
+            for line in service.install():
+                c.say("  " + line)
+        except service.ServiceError as e:  # nothing was written
+            c.say(f"  {e}")
+            out["install"] = False
     c.say("To keep it running after logout: `loginctl enable-linger $USER` (needs sudo; run it yourself).")
     return out
 
