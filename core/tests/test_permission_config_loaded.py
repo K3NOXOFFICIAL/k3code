@@ -15,6 +15,7 @@ from k3code import cli as cli_mod
 from k3code import trust
 from k3code.config import ProviderEntry, Settings
 from k3code.permissions import PermissionMode
+from k3code.permissions.rules import Rule
 from k3code.permissions.state import PermissionState
 from k3code.providers.fake import FakeProvider
 
@@ -199,6 +200,26 @@ async def test_a_sub_agent_applies_the_user_config(tmp_path, monkeypatch) -> Non
     (child,) = built
     assert child.permissions.decide("bash", {"command": "touch ran"}).action == "deny"
     assert child.permissions.decide("bash", {"command": "make all"}).action == "deny"
+
+
+async def test_a_sub_agent_refuses_what_the_parents_session_rules_deny(tmp_path, monkeypatch) -> None:
+    """A session deny (`/permissions … --session`) outranks a config allow in the parent: the child honours it too."""
+    from test_autonomy_gateway import k3home, make, run_turn, start
+    from test_subagents import NO_GATE, final, task_call
+
+    built = _spy_children(monkeypatch)
+    steps = [task_call("CHILD-S publish it"), final("ok"), {"type": "text", "match": "CHILD-S", "text": "s"}]
+    server = make(tmp_path, monkeypatch, steps, mode="default", **NO_GATE)
+    k3home(tmp_path).mkdir(parents=True, exist_ok=True)
+    allow = 'permissions:\n  bash:\n    "npm publish*": allow\n'
+    (k3home(tmp_path) / "config.yaml").write_text(allow, encoding="utf-8")
+    (tmp_path / "proj").mkdir()
+    await start(server, tmp_path / "proj")
+    server.session.perms.session_rules.append(Rule("bash", "npm publish*", "deny"))
+    assert server.session.perms.decide("bash", {"command": "npm publish"}).action == "deny"
+    await run_turn(server, "PARENT: delegate it", answers=[{"choice": "once"}])
+    (child,) = built
+    assert child.permissions.decide("bash", {"command": "npm publish"}).action == "deny"
 
 
 async def test_a_worktree_sub_agent_applies_the_parents_trusted_project_config(tmp_path, monkeypatch) -> None:
