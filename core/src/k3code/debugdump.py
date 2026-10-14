@@ -18,6 +18,7 @@ from k3code.daemon import k3_home
 from k3code.redact import (
     REDACTED,
     _token_shaped,
+    drop_after_shapes,
     drop_values,
     is_secret_key,
     looks_like_secret,
@@ -194,7 +195,9 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
 
     home = home or k3_home()
     events = list(server.event_log)[-n:]
-    secrets = sorted({*secret_values(server.config), *_mcp_json_values(server, events)}, key=len, reverse=True)
+    secrets = secret_values(server.config)
+    # known from a file the user may never have trusted: dropped after the shape passes (drop_after_shapes)
+    untrusted = sorted(_mcp_json_values(server, events) - set(secrets), key=len, reverse=True)
     checks = await doctor.run_checks(server.config, probe=probe, home=home)
     parts = {
         "events.json": json.dumps(events, indent=2, default=str),
@@ -209,7 +212,8 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
     path = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
     with tarfile.open(path, "w:gz") as tar:
         for name, body in parts.items():
-            data = redact_text(scrub_json(body, secrets), secrets).encode("utf-8")
+            text = redact_text(scrub_json(body, secrets), secrets)
+            data = drop_after_shapes(text, [v for v in untrusted if v in body]).encode("utf-8")
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mtime = int(time.time())

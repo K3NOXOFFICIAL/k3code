@@ -44,9 +44,12 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
-    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
-    return redact_session_json(drop_values(asdict(s), secrets or []))
+def session_to_dict(
+    s: StoredSession, secrets: list[str] | None = None, untrusted: list[str] | None = None
+) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind. The
+    ``untrusted`` ones, known only from a file the user may never have trusted, after it (``drop_after_shapes``)."""
+    return redact_session_json(drop_values(asdict(s), secrets or []), untrusted)
 
 
 def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
@@ -185,13 +188,13 @@ def write_bundle(
         sessions.append((sid, stored))
     # the project config, and the .mcp.json of this project and of each exported session's own, as written, trusted or
     # not, hide their values in the sessions: the certain ones only, so a file the user never trusted cannot blank out
-    # a region or path their transcripts name (a guess, see secret_values)
+    # a region or path their transcripts name (a guess, see secret_values), and after the shape pass (session_to_dict)
     projects = {cwd, *(Path(stored.cwd) for _, stored in sessions if stored.cwd)} if sessions else set()
     mcp = [_mcp_json(project) for project in sorted(projects)]
-    secrets = sorted({*secrets, *_known_secrets(written, *mcp)[1]}, key=len, reverse=True)
+    untrusted = sorted(set(_known_secrets(written, *mcp)[1]) - set(secrets), key=len, reverse=True)
     exported: list[str] = []
     for sid, stored in sessions:
-        session = session_to_dict(stored, secrets)
+        session = session_to_dict(stored, secrets, untrusted)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {

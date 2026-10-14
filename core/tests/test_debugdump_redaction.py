@@ -1043,3 +1043,111 @@ async def test_the_debug_dump_refuses_a_project_mcp_json_that_does_not_parse(tmp
         await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False)
     assert refused.value.__cause__ is None and refused.value.__context__ is None
     assert not (tmp_path / "home" / "debug").exists() or not list((tmp_path / "home" / "debug").iterdir())
+
+
+# A value only an untrusted file names must not blank the word a shape needs and so keep the credential after it
+
+SHAPE_TOK = "Zq81" + "xYw9Pq2L" + "mN7tK3vB" + "Lw5"
+#: (the word a file names as a secret, a line whose credential only the shape pass hides)
+ANCHORS = [
+    ("Bearer", f'curl -H "Authorization: Bearer {SHAPE_TOK}" https://api.example.com/v1/x'),
+    ("token=", f"GET https://api.example.com/x?token={SHAPE_TOK} 401"),
+    ("password", f'password: "{SHAPE_TOK}"'),
+]
+
+
+def _poisoned_project(tmp_path, source: str, word: str):
+    import yaml
+
+    project = tmp_path / "proj"
+    if source == ".mcp.json":
+        return _project_with_mcp_json(tmp_path, {"mcpServers": {"x": {"command": "y", "env": {"API_KEY": word}}}})
+    (project / ".k3code").mkdir(parents=True)
+    servers = {"x": {"command": "y", "env": {"API_KEY": word}}}
+    (project / ".k3code" / "config.yaml").write_text(yaml.safe_dump({"mcp": {"servers": servers}}))
+    return project
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+@pytest.mark.parametrize(("word", "line"), ANCHORS, ids=[a[0] for a in ANCHORS])
+def test_an_untrusted_value_cannot_blank_the_word_a_shape_needs_in_the_export(source, word, line, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, line)
+    clean = tmp_path / "clean.k3bundle"
+    bundle.write_bundle(clean, store=store, cwd=tmp_path, session_ids=[sid], settings=False)
+    assert SHAPE_TOK not in _export_blob(clean)  # the shape pass alone hides it
+    project = _poisoned_project(tmp_path, source, word)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    blob = _export_blob(out)
+    assert SHAPE_TOK not in blob
+    assert word not in blob  # still hidden: only later
+
+
+@pytest.mark.parametrize(("word", "line"), ANCHORS, ids=[a[0] for a in ANCHORS])
+async def test_an_untrusted_mcp_json_value_cannot_blank_the_word_a_shape_needs_in_the_debug_dump(
+    word, line, tmp_path, monkeypatch
+):
+    project = _poisoned_project(tmp_path, ".mcp.json", word)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": line})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert SHAPE_TOK not in files["events.json"]
+
+
+#: An untrusted value with a character a shape stops at, each in a line where that shape hides part of it.
+CUT_HEAD, CUT_TAIL = "Hq7" + "Lm2Xw9", "Tz4" + "Pk8Rv1"
+CUT_LINES = [
+    "API_TOKEN={v}",
+    "export API_TOKEN='{v}'",
+    'API_TOKEN="{v}"',
+    "--token {v}",
+    "?token={v}&x=1",
+    "Authorization: Bearer {v}",
+    "the password is {v}",
+    '{{"api_token": "{v}"}}',
+]
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+@pytest.mark.parametrize("sep", [",", " ", '"', "'", ";", "<"])
+def test_an_untrusted_value_a_shape_cuts_is_still_hidden_whole_in_the_export(source, sep, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    value = CUT_HEAD + sep + CUT_TAIL
+    project = _poisoned_project(tmp_path, source, value)
+    store = SessionStore(tmp_path / "s.db")
+    sids = [_session_with(store, line.format(v=value)) for line in CUT_LINES]
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=sids, settings=False)
+    blob = _export_blob(out)
+    assert CUT_HEAD not in blob and CUT_TAIL not in blob
+
+
+@pytest.mark.parametrize("sep", [",", " ", '"', "'", ";"])
+async def test_an_untrusted_mcp_json_value_a_shape_cuts_is_still_hidden_whole_in_the_debug_dump(
+    sep, tmp_path, monkeypatch
+):
+    value = CUT_HEAD + sep + CUT_TAIL
+    project = _poisoned_project(tmp_path, ".mcp.json", value)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    for line in CUT_LINES:
+        server.emit("tool_result", {"output": line.format(v=value)})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert CUT_HEAD not in files["events.json"] and CUT_TAIL not in files["events.json"]
+
+
+def test_drop_after_shapes_hides_what_a_shape_left_of_a_value_on_either_side_or_between_two():
+    from k3code.redact import drop_after_shapes
+
+    value = "ab12 cd34;ef56,gh78"
+    shaped = f"x={REDACTED} cd34;ef56,gh78 | ab12 {REDACTED} | ab12 cd34;{REDACTED};ef56{REDACTED},gh78 | s {REDACTED}s"
+    out = drop_after_shapes(shaped, [value])
+    assert not any(p in out for p in ("ab12", "cd34", "ef56", "gh78"))
+    assert out.endswith(f"| s {REDACTED}s")  # beside a marker but no part of the value: kept

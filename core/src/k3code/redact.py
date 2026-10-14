@@ -206,6 +206,41 @@ def drop_values(obj: Any, secrets: list[str]) -> Any:
     return obj
 
 
+#: A longer value is only dropped whole after the shape pass: finding what a shape left of it is quadratic in it.
+_MAX_CUT = 512
+
+
+def _lead(value: str, text: str) -> int:
+    """The length of the longest suffix of ``value`` that ``text`` starts with."""
+    i = value.find(text[0]) if text else -1
+    while i != -1:
+        if text.startswith(value[i:]):
+            return len(value) - i
+        i = value.find(text[0], i + 1)
+    return 0
+
+
+def drop_after_shapes(text: str, values: list[str]) -> str:
+    """``text``, through the shape pass already, without ``values``: each whole, and what is left of one a shape cut
+    (at a `,`, a quote or a space): the part of it beside, or between two of, the shapes' ``REDACTED``. For the values
+    known only from a file the user may never have trusted: dropped before the shape pass (``drop_values``), one could
+    blank the word a shape needs (`Bearer`, `token=`) and leave the credential after it in clear."""
+    values = [v for v in values if v]
+    for v in values:
+        text = text.replace(v, REDACTED)
+    parts = text.split(REDACTED)
+    for v in (v for v in values if len(v) <= _MAX_CUT):
+        for n in range(1, len(parts) - 1):
+            if parts[n] in v:
+                parts[n] = ""
+        for n in range(1, len(parts)):
+            parts[n] = parts[n][_lead(v, parts[n][: len(v)]) :]
+        for n in range(len(parts) - 1):
+            tail = parts[n][-len(v) :]
+            parts[n] = parts[n][: len(parts[n]) - _lead(v[::-1], tail[::-1])]
+    return REDACTED.join(parts)
+
+
 def _flag_value(flag: str, value: str) -> bool:
     """``value`` follows ``flag`` in an argv list and is its credential (after a bare ``--key``: if token-shaped)."""
     return bool(_SECRET_FLAG.fullmatch(flag)) or (bool(_KEY_FLAG.fullmatch(flag)) and _token_shaped(value, 8))
@@ -245,12 +280,14 @@ def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
     return obj
 
 
-def redact_session_json(obj: Any) -> Any:
-    """Session payloads: scrub credential-shaped substrings in every string."""
+def redact_session_json(obj: Any, untrusted: list[str] | None = None) -> Any:
+    """Session payloads: scrub credential-shaped substrings in every string, then drop the ``untrusted`` values
+    (``drop_after_shapes``; in a key, which has no shape pass, as ``drop_values``)."""
     if isinstance(obj, dict):
-        return {k: redact_session_json(v) for k, v in obj.items()}
+        return {drop_values(k, untrusted or []): redact_session_json(v, untrusted) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [redact_session_json(v) for v in obj]
+        return [redact_session_json(v, untrusted) for v in obj]
     if isinstance(obj, str):
-        return scrub_text(obj)
+        present = [v for v in untrusted or [] if v in obj]
+        return drop_after_shapes(scrub_text(obj), present) if present else scrub_text(obj)
     return obj
