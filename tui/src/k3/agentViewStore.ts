@@ -1,4 +1,5 @@
 import type { SessionListRow } from "@k3code/shared/gateway-events";
+import { atom } from "nanostores";
 
 import { resumableHistory } from "../components/activeSessionSwitcher.js";
 import type { SessionActiveItem } from "../gatewayTypes.js";
@@ -7,9 +8,11 @@ import type { SubagentProgress } from "../types.js";
 import { buildStripRows, sessionRow } from "./agentStrip.js";
 import type { StripRow, StripState } from "./agentStripStore.js";
 
-export type ViewGroup = "completed" | "input" | "working";
+export type ViewGroup = "completed" | "input" | "new" | "working";
 
+/** `new` holds only the synthetic "+ New agent" row; it has no header and no count. */
 export const VIEW_GROUPS: readonly ViewGroup[] = [
+  "new",
   "input",
   "working",
   "completed",
@@ -18,19 +21,55 @@ export const VIEW_GROUPS: readonly ViewGroup[] = [
 export const VIEW_GROUP_LABEL: Record<ViewGroup, string> = {
   completed: "Completed",
   input: "Needs input",
+  new: "",
   working: "Working",
 };
 
 export interface ViewRow extends Omit<StripRow, "kind"> {
   current: boolean;
   group: ViewGroup;
-  kind: "agent" | "past" | "session";
+  kind: "agent" | "new" | "past" | "session";
   lastActive?: null | number;
   model?: string;
 }
 
 /** `session.list` row. The k3code gateway adds `cwd` (null when unknown); the generated Hermes contract lacks it. */
 export type PastSessionRow = SessionListRow & { cwd?: null | string };
+
+/** The row above every session: text typed on it starts a new background agent. */
+export const NEW_AGENT_ROW: ViewRow = {
+  activity: "",
+  current: false,
+  elapsedSeconds: null,
+  group: "new",
+  id: "",
+  key: "new",
+  kind: "new",
+  state: "idle",
+  title: "+ New agent",
+};
+
+/** The view's rows: "+ New agent" first, then every session (`buildViewRows`). */
+export const withNewAgentRow = (rows: readonly ViewRow[]): ViewRow[] => [
+  NEW_AGENT_ROW,
+  ...rows,
+];
+
+/**
+ * Where the selection rests until the user moves: this session's row, else the first live row, else "+ New agent". An
+ * earlier session is never the default, so typed text does not resume one by surprise.
+ */
+export const defaultViewKey = (rows: readonly ViewRow[]): null | string =>
+  (
+    rows.find((r) => r.current) ??
+    rows.find((r) => r.kind === "session" || r.kind === "agent") ??
+    rows[0]
+  )?.key ?? null;
+
+/** The view's composer draft. An atom, so it survives the view closing (an approval closes it) and reopening. */
+export const $agentViewDraft = atom<string>("");
+export const getAgentViewDraft = () => $agentViewDraft.get();
+export const setAgentViewDraft = (v: string) => $agentViewDraft.set(v);
 
 /** Idle, done and failed all land in Completed; each row keeps its own glyph. */
 const groupOf = (state: StripState): ViewGroup =>
@@ -114,8 +153,12 @@ export function buildViewRows({
   ];
 }
 
+export type ConfirmAction = "delete" | "stop";
+
 export interface ViewNav {
-  /** Row key awaiting a y/n stop confirmation. */
+  /** What the pending y/n confirmation does; `stop` when unset. */
+  confirmAction?: ConfirmAction;
+  /** Row key awaiting a y/n confirmation. */
   confirmKey: null | string;
   index: number;
 }
@@ -139,9 +182,9 @@ export type ViewKey = {
 };
 
 export type ViewEffect =
-  | { row: ViewRow; type: "activate" | "stop" }
-  | { type: "close" }
-  | { type: "new" };
+  | { row: ViewRow; type: "activate" | ConfirmAction }
+  | { text: string; type: "dispatch" }
+  | { type: "clearDraft" | "close" | "new" };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -161,45 +204,70 @@ export function selectedIndex(
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);
 
-/** Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. */
+/** Earlier sessions and live sessions other than this one can be deleted (after a y/n). */
+export const isDeletable = (row: ViewRow) =>
+  row.kind === "past" || (row.kind === "session" && !row.current);
+
+/**
+ * Pure key reducer for the full-screen view. The view's composer (a TextInput) sees every key first, so text keys and
+ * Enter are left to it (`consumed: false`); ←/→/Home/End only act on the list while `draft` is empty. A pending y/n
+ * confirmation eats the next key (the composer is unfocused meanwhile).
+ */
 export function reduceViewKey(
   nav: ViewNav,
   rows: readonly ViewRow[],
   key: ViewKey,
   pageSize: number,
-): { consumed: true; effect: null | ViewEffect; nav: ViewNav } {
+  draft = "",
+): { consumed: boolean; effect: null | ViewEffect; nav: ViewNav } {
   const last = rows.length - 1;
   const index = Math.max(0, Math.min(nav.index, last));
-  // With Ctrl/Meta held the letter is a chord (Ctrl+N, Ctrl+X), not a view command.
+  // Only Ctrl chords are view commands (Ctrl+N, Ctrl+X); Alt+letter belongs to the composer.
+  const chord = key.ctrl && !key.meta ? (key.ch ?? "").toLowerCase() : "";
   const ch = key.ctrl || key.meta ? "" : (key.ch ?? "").toLowerCase();
-  const done = (effect: null | ViewEffect, next: Partial<ViewNav> = {}) => ({
-    consumed: true as const,
-    effect,
-    nav: { confirmKey: null, index, ...next },
-  });
-  // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops (→ cancels like any
-  // other key); when the row has gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to
+  const done = (
+    effect: null | ViewEffect,
+    next: Partial<ViewNav> = {},
+    consumed = true,
+  ) => ({ consumed, effect, nav: { confirmKey: null, index, ...next } });
+  const pass = () => done(null, {}, false);
+  // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed acts (→ cancels like any
+  // other key); when the row has gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot act on
   // whatever row moved under it.
   if (nav.confirmKey) {
     const target = rows.find((r) => r.key === nav.confirmKey);
 
     return done(
       target && !key.escape && !key.left && (ch === "y" || key.return)
-        ? { row: target, type: "stop" }
+        ? { row: target, type: nav.confirmAction ?? "stop" }
         : null,
     );
   }
 
-  if (key.escape || key.left) {
+  const typed = draft.trim();
+
+  if (chord === "n") {
+    // Ctrl+N: an empty composer starts a new foreground session; with text it starts a background agent on it.
+    return done(typed ? { text: typed, type: "dispatch" } : { type: "new" });
+  }
+
+  if (key.escape) {
+    return done(draft ? { type: "clearDraft" } : { type: "close" });
+  }
+
+  // With text in the composer ←/→/Home/End edit it.
+  if (draft && (key.left || key.right || key.home || key.end)) {
+    return pass();
+  }
+
+  if (key.left) {
     return done({ type: "close" });
   }
 
-  if (ch === "n") {
-    return done({ type: "new" });
-  }
-
   if (!rows.length) {
-    return done(null);
+    return key.up || key.down || key.pageUp || key.pageDown
+      ? done(null)
+      : pass();
   }
 
   const step = Math.max(1, pageSize);
@@ -232,15 +300,18 @@ export function reduceViewKey(
 
   const row = rows[index]!;
 
-  if (key.return || key.right) {
+  if (key.right) {
     return done(row.current ? { type: "close" } : { row, type: "activate" });
   }
 
-  if (ch === "x" && isStoppable(row)) {
-    return done(null, { confirmKey: row.key });
+  if (chord === "x") {
+    return isStoppable(row)
+      ? done(null, { confirmAction: "stop", confirmKey: row.key })
+      : done(null);
   }
 
-  return done(null);
+  // Enter is the composer's (its onSubmit), and every other key is text.
+  return pass();
 }
 
 /**
@@ -266,4 +337,110 @@ export function visibleWindow(
   );
 
   return { end: start + h, start };
+}
+
+/** A result line under the list: the transcript is hidden while the view is open, so view actions report here. */
+export interface ViewNotice {
+  /** A background agent's new session, so the selection can follow it once the poll lists it. */
+  sessionId?: string;
+  text: string;
+  tone: "error" | "info";
+}
+
+/** What a submitted composer line does, decided from the text and the selected row. */
+export type ViewAction =
+  | { action: ConfirmAction; row: ViewRow; type: "confirm" }
+  | { notice: ViewNotice; type: "notice" }
+  | { row: ViewRow; text: string; type: "resumeAndSend" | "sendTo" | "steer" }
+  | { row: ViewRow; title: string; type: "rename" }
+  | { row: ViewRow; type: "activate" | "closeSession" }
+  | { text: string; type: "dispatch" | "main" | "sendCurrent" }
+  | { type: "new" | "none" };
+
+const refuse = (text: string): ViewAction => ({
+  notice: { text, tone: "error" },
+  type: "notice",
+});
+
+const IN_THIS_SESSION = "you are in this session";
+
+/** The commands the view runs itself, on the selected row; `null` for any other name. */
+function viewCommand(
+  name: string,
+  arg: string,
+  row: ViewRow,
+): null | ViewAction {
+  const session = row.kind === "session" || row.kind === "past";
+
+  switch (name) {
+    case "agents":
+      return { type: "none" };
+    case "attach":
+    case "resume":
+      return { row, type: "activate" };
+    case "bg":
+      return arg
+        ? { text: arg, type: "dispatch" }
+        : refuse("usage: /bg <prompt>");
+    case "close":
+      return row.kind !== "session"
+        ? refuse("only a running session can be closed")
+        : row.current
+          ? refuse(IN_THIS_SESSION)
+          : { row, type: "closeSession" };
+    case "delete":
+      return row.current
+        ? refuse(IN_THIS_SESSION)
+        : isDeletable(row)
+          ? { action: "delete", row, type: "confirm" }
+          : refuse("only a session can be deleted");
+    case "new":
+      return { type: "new" };
+    case "rename":
+    case "title":
+      return !session
+        ? refuse("only a session can be renamed")
+        : arg
+          ? { row, title: arg, type: "rename" }
+          : refuse(`usage: /${name} <title>`);
+    case "stop":
+      return isStoppable(row)
+        ? { action: "stop", row, type: "confirm" }
+        : refuse("nothing to stop on this row");
+  }
+
+  return null;
+}
+
+/**
+ * Route a submitted, non-empty composer line. View commands act on `row`; other `/cmd` and `!cmd` leave the view and
+ * run in the attached session; plain text goes to the selected row (new agent, this session, another session, a
+ * sub-agent as steering, or an earlier session that is resumed first).
+ */
+export function routeViewInput(text: string, row: ViewRow): ViewAction {
+  const line = text.trim();
+
+  if (line.startsWith("/")) {
+    const m = /^\/(\S+)\s*([\s\S]*)$/.exec(line);
+    const own = m ? viewCommand(m[1]!.toLowerCase(), m[2]!.trim(), row) : null;
+
+    return own ?? { text: line, type: "main" };
+  }
+
+  if (line.startsWith("!")) {
+    return { text: line, type: "main" };
+  }
+
+  switch (row.kind) {
+    case "new":
+      return { text: line, type: "dispatch" };
+    case "agent":
+      return { row, text: line, type: "steer" };
+    case "past":
+      return { row, text: line, type: "resumeAndSend" };
+    case "session":
+      return row.current
+        ? { text: line, type: "sendCurrent" }
+        : { row, text: line, type: "sendTo" };
+  }
 }

@@ -860,20 +860,14 @@ export function useMainApp(gw: GatewayClient) {
           });
         }
       },
-      stop: (row) => {
-        const sid = getUiState().sid;
-
-        if (row.kind === "agent") {
-          gw.request("subagent.interrupt", {
-            session_id: sid,
-            subagent_id: row.id,
-          }).catch(() => {});
-        } else {
-          gw.request("session.interrupt", { session_id: row.id }).catch(
-            () => {},
-          );
-        }
-      },
+      // The request is returned, so the agent view can show a failed stop instead of it being swallowed.
+      stop: (row) =>
+        row.kind === "agent"
+          ? gw.request("subagent.interrupt", {
+              session_id: getUiState().sid,
+              subagent_id: row.id,
+            })
+          : gw.request("session.interrupt", { session_id: row.id }),
     });
 
     return () => setStripHandlers(null);
@@ -1652,7 +1646,26 @@ export function useMainApp(gw: GatewayClient) {
 
         void session.resumeById(id, { dropSid });
       },
+      // Agent view: text on an earlier session resumes it (the view closes) and sends once this client is attached;
+      // `session.resume` hands back the stored id as `session_id`, so `sid === id` means the resume landed.
+      resumeAndSend: async (id: string, text: string, dropSid?: string) => {
+        if (session.guardBusySessionSwitch("switch sessions")) {
+          return "busy" as const;
+        }
+
+        const outcome = await session.resumeById(id, { dropSid });
+
+        if (outcome === "unknown-session" || getUiState().sid !== id) {
+          return "failed" as const;
+        }
+
+        dispatchSubmission(text);
+
+        return "sent" as const;
+      },
+      sendToCurrent: (text: string) => dispatchSubmission(text),
       setStickyPrompt,
+      submitFromView: (text: string) => dispatchSubmission(text),
     }),
     [
       answerApproval,
@@ -1662,6 +1675,7 @@ export function useMainApp(gw: GatewayClient) {
       answerSudo,
       clearSelection,
       closeLiveSession,
+      dispatchSubmission,
       newPromptSession,
       onDashboardSave,
       onModelSelect,

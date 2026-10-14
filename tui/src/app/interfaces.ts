@@ -459,7 +459,20 @@ export interface AppLayoutActions {
   onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
   resumeById: (id: string, dropSid?: string) => void;
+  /**
+   * Agent view: resume an earlier session (busy-guarded, like `resumeById`) and send `text` to it once attached.
+   * Resolves to what happened, so the view can keep the draft when nothing was sent.
+   */
+  resumeAndSend: (
+    id: string,
+    text: string,
+    dropSid?: string,
+  ) => Promise<"busy" | "failed" | "sent">;
+  /** Agent view: `text` to the attached session through the normal submission pipeline; the view stays open. */
+  sendToCurrent: (text: string) => void;
   setStickyPrompt: (value: string) => void;
+  /** Agent view: a `/cmd` or `!cmd` it does not run itself, submitted on the attached session (the view is closed). */
+  submitFromView: (text: string) => void;
 }
 
 export interface AppLayoutComposerProps {

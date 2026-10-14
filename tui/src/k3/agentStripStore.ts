@@ -24,7 +24,8 @@ export const $stripSessions = atom<SessionActiveItem[]>([]);
 /** Row actions the agent view calls (attach a session or open an agent, stop a row); registered by useMainApp. */
 export interface StripHandlers {
   activate: (row: StripRow) => void;
-  stop: (row: StripRow) => void;
+  /** Resolves when the gateway took the stop; rejects with why it did not. */
+  stop: (row: StripRow) => Promise<unknown> | void;
 }
 
 let handlers: StripHandlers | null = null;

@@ -18,6 +18,7 @@ import {
 import { computeWheelStep, initWheelAccelForHost } from "../lib/wheelAccel.js";
 import { closeWidget, dispatchWidgetInput } from "../sdk/host.js";
 
+import { getAgentViewDraft, setAgentViewDraft } from "../k3/agentViewStore.js";
 import { toggleFocusMode } from "../k3/focusPolicy.js";
 import { handleProposalKey } from "../k3/proposalsStore.js";
 
@@ -154,6 +155,15 @@ export const ctrlCOverlayTarget = (
   overlay: Pick<OverlayState, (typeof CTRL_C_ORDER)[number]>,
 ): (typeof CTRL_C_ORDER)[number] | null =>
   CTRL_C_ORDER.find((k) => Boolean(overlay[k])) ?? null;
+
+/** Ctrl+C in the agent view: text in its composer is cleared first, an empty composer closes the view. */
+export function cancelAgentViewFromCtrlC() {
+  if (getAgentViewDraft()) {
+    return setAgentViewDraft("");
+  }
+
+  patchOverlayState({ agentView: false });
+}
 
 export function handleInputSelectionClipboard(
   selection: ReturnType<typeof getInputSelection>,
@@ -348,7 +358,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   const cancelOverlayFromCtrlC = () => {
     switch (ctrlCOverlayTarget(overlay)) {
       case "agentView":
-        return patchOverlayState({ agentView: false });
+        return cancelAgentViewFromCtrlC();
       case "clarify":
         return actions.answerClarify("");
       case "approval":

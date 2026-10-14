@@ -13,6 +13,7 @@ import {
 } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
+import { backgroundCwd } from "../app/backgroundSession.js";
 import type { AppLayoutProps } from "../app/interfaces.js";
 import {
   $isBlocked,
@@ -20,7 +21,7 @@ import {
   patchOverlayState,
 } from "../app/overlayStore.js";
 import { $petEnabled, $petParty } from "../app/petStore.js";
-import { $uiState, getUiState } from "../app/uiStore.js";
+import { $uiState, getUiState, patchUiState } from "../app/uiStore.js";
 import { $wakeWordConfig } from "../app/wakeWordStore.js";
 import {
   INLINE_MODE,
@@ -52,6 +53,16 @@ import { AgentStrip } from "../k3/agentStrip.js";
 import { ProposalCards } from "../k3/proposalCards.js";
 import { getStripHandlers } from "../k3/agentStripStore.js";
 import { AgentViewPane } from "../k3/agentView.js";
+import {
+  closeSession,
+  deleteSession,
+  dispatchBackground,
+  renameSession,
+  sendToSession,
+  steerAgent,
+  stopNotice,
+  type ViewActionDeps,
+} from "../k3/agentViewActions.js";
 import { type ViewRow } from "../k3/agentViewStore.js";
 import { focusVisibleMessages } from "../k3/focusPolicy.js";
 import {
@@ -645,10 +656,26 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
 
     return originSid && originSid !== targetSid ? originSid : undefined;
   };
+  // Read at call time: the attached session changes while the view is open (`k3code agents` starts without one).
+  const deps: ViewActionDeps = {
+    cwd: backgroundCwd,
+    gw,
+    onCurrentTitle: (sessionTitle) => patchUiState({ sessionTitle }),
+    sid: () => getUiState().sid,
+  };
+
+  const newSession = () => {
+    actions.newLiveSession(dropSid());
+    close();
+  };
 
   const activate = ({ kind, ...row }: ViewRow) => {
     // A live session attaches like Enter in the strip; an earlier one is resumed like the session switcher does
     // (busy-guarded); an in-turn agent opens its detail view, as Enter on it in the strip does.
+    if (kind === "new") {
+      return newSession();
+    }
+
     if (kind === "session") {
       actions.activateLiveSession(row.id, dropSid(row.id));
     } else if (kind === "past") {
@@ -665,15 +692,42 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
       gw={gw}
       onActivate={activate}
       onClose={close}
-      onNew={() => {
-        actions.newLiveSession(dropSid());
+      onCloseSession={(row) => closeSession(deps, row)}
+      onDelete={(row) => deleteSession(deps, row)}
+      onDispatch={(text) => dispatchBackground(deps, text)}
+      // Commands the view does not run itself go through the normal pipeline, with the view closed first so their
+      // pickers, confirmations and prompts are visible.
+      onMain={(text) => {
         close();
+        actions.submitFromView(text);
       }}
-      onStop={({ kind, ...row }) => {
-        if (kind !== "past") {
-          getStripHandlers()?.stop({ ...row, kind });
-        }
+      onNew={newSession}
+      onRename={(row, title) => renameSession(deps, row, title)}
+      onResumeAndSend={async (row, text) => {
+        const r = await actions.resumeAndSend(row.id, text, dropSid(row.id));
+
+        return r === "sent"
+          ? { text: `sent to ${row.title}`, tone: "info" }
+          : {
+              text:
+                r === "busy"
+                  ? "interrupt the current turn before switching sessions"
+                  : `could not resume ${row.title}`,
+              tone: "error",
+            };
       }}
+      onSendCurrent={(text) => {
+        actions.sendToCurrent(text);
+
+        return Promise.resolve({ text: "sent to this session", tone: "info" });
+      }}
+      onSendTo={(row, text) => sendToSession(deps, row, text)}
+      onSteer={(row, text) => steerAgent(deps, row, text)}
+      onStop={({ kind, ...row }) =>
+        kind === "past" || kind === "new"
+          ? undefined
+          : stopNotice(getStripHandlers()?.stop({ ...row, kind }))
+      }
     />
   );
 });
