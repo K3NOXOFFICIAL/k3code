@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import json
 import os
 import shutil
@@ -79,18 +80,37 @@ def _split_lines(text: str) -> list[str]:
     return lines
 
 
+#: Errors of the temp-file path that say "this directory or mount cannot do a rename here", not "the disk is broken":
+#: a read-only directory (EACCES/EPERM), a file held open by another OS (WSL on /mnt/c) or bind-mounted (EBUSY), a
+#: rename across mounts (EXDEV). ENOSPC, EIO and EROFS are not in it: rewriting in place would not help.
+_IN_PLACE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY, errno.EXDEV})
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` atomically (temp file in the same directory + rename), keeping its mode.
 
     A plain write_text() truncates first: a kill -9 or a full disk in the middle left a half-written source file.
     Symlinks are written through (the link itself is not replaced). A new file gets 0666 minus the umask, like any
-    other program's (mkstemp made every new file 0600).
+    other program's (mkstemp made every new file 0600). Run as root, the new file keeps the old file's owner.
+
+    When the temp-file path is refused (see ``_IN_PLACE_ERRNOS``) and the file exists, it is rewritten in place
+    instead: not crash-safe, but the only way into a writable file in a read-only directory or on a bind mount.
     """
+    target = path.resolve() if path.is_symlink() else path
+    old = target.stat() if target.exists() else None
+    try:
+        _write_via_temp(target, data, old)
+    except OSError as exc:
+        if old is None or exc.errno not in _IN_PLACE_ERRNOS:
+            raise
+        _write_in_place(target, data, exc)
+
+
+def _write_via_temp(target: Path, data: bytes, old: os.stat_result | None) -> None:
     import secrets
     import stat
 
-    target = path.resolve() if path.is_symlink() else path
-    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    mode = stat.S_IMODE(old.st_mode) if old is not None else None
     for _ in range(100):
         tmp = str(target.parent / f".{target.name}.k3tmp-{secrets.token_hex(4)}")
         try:  # O_EXCL never follows or reuses an existing name; the kernel applies the umask to the new-file 0o666
@@ -107,13 +127,38 @@ def _atomic_write(path: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        if mode is not None:
+        if old is not None:
             os.chmod(tmp, mode)
+            if getattr(os, "geteuid", lambda: -1)() == 0:
+                with contextlib.suppress(OSError):
+                    os.chown(tmp, old.st_uid, old.st_gid)
         os.replace(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _write_in_place(target: Path, data: bytes, refused: OSError) -> None:
+    """Truncate-and-write ``target`` itself. The old bytes are kept in memory and put back if the write fails."""
+    try:
+        before = target.read_bytes()
+    except OSError:
+        raise refused from None  # the original error is the useful one
+    try:
+        _overwrite(target, data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _overwrite(target, before)
+        raise
+
+
+def _overwrite(target: Path, data: bytes) -> None:
+    with open(target, "r+b") as f:
+        f.write(data)
+        f.truncate()
+        f.flush()
+        os.fsync(f.fileno())
 
 
 #: The tools FileStamps guards: they change a file, so the model must have seen what is in it now.
