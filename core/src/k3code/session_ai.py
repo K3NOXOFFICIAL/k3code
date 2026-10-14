@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 
 TITLE_SYSTEM = "Write a 3-6 word title for this coding session. Reply with the title only: no quotes, no period."
 SUMMARY_PREFIX = "[summary of earlier conversation]\n"
+#: A `!cmd` the user ran (shell.exec with record): one user message, the command, its output and SHELL_RECORD_NOTE.
+SHELL_RECORD_PREFIX = "<bash-input>"
+SHELL_RECORD_NOTE = (
+    "[The user ran this in their own shell via k3code's ! mode; it is context, not a request. Do not act on it unless"
+    " asked.]"
+)
+#: The most of the command a record keeps (the output has its own limit, context.tool_output_chars)
+SHELL_RECORD_COMMAND_CHARS = 2000
+_SHELL_RECORD = re.compile(r"\A<bash-input>(.*?)</bash-input>\n<bash-output>\n(.*)\n</bash-output>\n", re.S)
 #: What the summary model reads of the folded part: this many characters (the head and the tail, the middle is cut)
 COMPACT_INPUT_CHARS = 60_000
 #: Of those, the head: the start of the conversation holds the task statement.
@@ -152,11 +161,46 @@ def _anchor_gist(content: str, limit: int = TASK_ANCHOR_CHARS) -> str:
     )
 
 
+def is_shell_record(message: Any) -> bool:
+    """``message`` (a stored dict or a Message) is a `!cmd` record: context the user added, not a request."""
+    get = message.get if isinstance(message, dict) else lambda k: getattr(message, k, None)
+    content = get("content")
+    return get("role") == "user" and isinstance(content, str) and content.startswith(SHELL_RECORD_PREFIX)
+
+
+def shell_record(command: str, run: Any, limit: int) -> str:
+    """The user message a `!cmd` adds to the conversation: the command, its output as the bash tool's result reads
+    (clipped to ``limit``) and SHELL_RECORD_NOTE. Built once, when it is stored: user messages are never clipped again,
+    so its bytes stay the same in every later request (the provider's prompt cache holds). Secret shapes are masked
+    (it goes to the provider, and into bundles and handoffs) before any cut."""
+    from k3code.tools import _format_tool_result, clip_for_model
+
+    command = scrub_text(command)
+    if len(command) > SHELL_RECORD_COMMAND_CHARS:
+        command = command[:SHELL_RECORD_COMMAND_CHARS] + "…"
+    stopped = run.cancelled or run.timed_out
+    result = {
+        "stdout": scrub_text(run.stdout or ""),
+        "stderr": scrub_text(run.stderr or ""),
+        "exit_code": None if stopped else run.exit_code,
+        "error": run.error,  # the timeout ("timed out after N s ..."), the output limit, a failed start
+        "note": "cancelled by the user" if run.cancelled else "",
+    }
+    output = clip_for_model("bash", _format_tool_result(result), limit)
+    return f"<bash-input>{command}</bash-input>\n<bash-output>\n{output}\n</bash-output>\n{SHELL_RECORD_NOTE}"
+
+
+def shell_record_parts(content: str) -> tuple[str, str]:
+    """(command, output) of a record's content; ("", content) when it has not the record's shape."""
+    hit = _SHELL_RECORD.match(content)
+    return (hit.group(1), hit.group(2)) if hit else ("", content)
+
+
 def task_anchor(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The first user message that is a real task, not an earlier summary."""
+    """The first user message that is a real task, not an earlier summary or a `!cmd` record."""
     for m in messages:
         content = str(m.get("content") or "")
-        if m.get("role") == "user" and content and not content.startswith(SUMMARY_PREFIX):
+        if m.get("role") == "user" and content and not content.startswith((SUMMARY_PREFIX, SHELL_RECORD_PREFIX)):
             return m
     return None
 
@@ -286,6 +330,10 @@ def work_ledger(folded: list[dict[str, Any]]) -> str:
             for line in block.group(0).splitlines():
                 if hit := _LEDGER_LINE.match(line):
                     add(hit.group(1), hit.group(2))
+        if is_shell_record(m) and (command := shell_record_parts(content)[0].strip()):
+            first, *rest = command.splitlines()
+            first = scrub_text(first)  # before the cut: a secret cut in two no longer has its shape
+            add("ran", first[:100] + ("…" if rest or len(first) > 100 else "") + " (user)")
         for call in m.get("tool_calls") or []:
             args = call.get("arguments") or {}
             name, path = call.get("name"), args.get("path") or args.get("file_path")

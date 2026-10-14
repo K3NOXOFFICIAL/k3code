@@ -73,7 +73,7 @@ async def test_shell_exec_needs_a_session_and_checks_its_params(tmp_path, monkey
         assert msg.startswith("exec_id must be"), bad
     assert "longer than 32 KB" in await _error(server, "shell.exec", {"command": "x" * (32 * 1024 + 1)})
     res = await call(server, "shell.exec", {"command": "true", "exec_id": "A_b-9", "record": True})
-    assert (res["code"], res["exec_id"], res["cwd"], res["recorded"]) == (0, "A_b-9", str(tmp_path), False)
+    assert (res["code"], res["exec_id"], res["cwd"], res["recorded"]) == (0, "A_b-9", str(tmp_path), "now")
     assert "cancelled" not in res and "timed_out" not in res
     assert (await call(server, "shell.exec", {"command": "true"}))["exec_id"]  # generated when absent
 

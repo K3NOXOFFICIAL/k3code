@@ -115,6 +115,8 @@ def transcript_text(
 
     ``per_message`` is how much of one message is shown; ``per_role`` overrides it for a role, and a tool result is cut
     keeping its start and its end. A message that starts with ``whole_prefix`` (an earlier summary) is shown whole."""
+    from k3code.session_ai import is_shell_record
+
     lines: list[str] = []
     for m in messages:
         get = m.get if isinstance(m, dict) else lambda k, _m=m: getattr(_m, k, None)
@@ -128,6 +130,9 @@ def transcript_text(
             limit = (per_role or {}).get(role, per_message)
             if whole_prefix and text.startswith(whole_prefix):
                 shown = text
+            elif is_shell_record(m):  # a `!cmd` the user ran: command output, cut as a tool result is
+                label = "user ran (shell)"
+                shown = _clip_middle(text, (per_role or {}).get("tool", per_message))
             elif role == "tool" and per_role and role in per_role:
                 shown = _clip_middle(text, limit)
             else:

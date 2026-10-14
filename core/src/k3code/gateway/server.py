@@ -147,7 +147,14 @@ from k3code.routing.tiers import (
     tier_for,
     tier_model_specs,
 )
-from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
+from k3code.session_ai import (
+    SUMMARY_PREFIX,
+    compact_messages,
+    is_shell_record,
+    make_title,
+    shell_record,
+    shell_record_parts,
+)
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import MAX_TOOL_RESULT_CHARS, FileStamps, clip_for_model, register_todo, render_todos, shrink_result
@@ -274,6 +281,9 @@ class LiveSession:
         self.pending_prompts: list[str] = []
         #: `!cmd` commands running now (shell.exec): exec_id -> the event shell.cancel sets
         self.user_shells: dict[str, asyncio.Event] = {}
+        #: `!cmd` records (user messages) not yet in the transcript: a running turn's persist would overwrite them, so
+        #: they wait for the turn's end or the next turn's start (GatewayServer._flush_shell_records)
+        self.shell_records: list[dict[str, Any]] = []
         #: session.steer messages for the running turn: the live AgentLoop takes them before its next model call;
         #: what no loop took (a job ran, or the loop had already answered) runs as the next prompt.
         self.steer_queue: list[str] = []
@@ -2006,6 +2016,8 @@ class GatewayServer:
         if not blocked:  # a prompt a hook refused is not a task to carry on with
             self._start_implicit_goal(session, mgr, text)
         while True:
+            # `!cmd` records made while the last turn ran go in before this one: its history (and n_before) has them
+            self._flush_shell_records(session, force=True)
             try:
                 if not blocked:
                     await self._maybe_compact(session)  # a blocked prompt reaches no model, not even the summary one
@@ -2121,6 +2133,17 @@ class GatewayServer:
                 return status, final_text
             prompt = decision.prompt
             session.goal_continuation = True  # unattended from here on: the goal drives the next turn
+
+    def _flush_shell_records(self, session: LiveSession, *, force: bool = False) -> bool:
+        """Put the session's pending `!cmd` records at the end of its transcript and save it; True when they went in.
+        Never while a turn runs (its persist and checkpoints rewrite the list from the loop's messages, so they would
+        be lost) unless ``force``: only the top of _run_turn_locked's loop, before the turn's history is read."""
+        if not session.shell_records or (session.turn_in_flight and not force):
+            return False
+        records, session.shell_records = session.shell_records, []
+        session.stored.messages = [*session.stored.messages, *records]
+        self.store.save(session.stored)
+        return True
 
     async def _fold_after_overflow(
         self, session: LiveSession, failed_attempt: list[dict[str, Any]], n_before: int, pin: dict[str, Any] | None
@@ -4432,6 +4455,18 @@ async def _session_active_list(server: GatewayServer, params: dict[str, Any]) ->
     return out
 
 
+_RECORD_EXIT = re.compile(r"\[exit code (-?\d+)\]\Z")
+
+
+def _record_code(output: str) -> int:
+    """The exit code a `!cmd` record shows: its ``[exit code N]`` line, 130 cancelled, 124 timed out, else 0."""
+    if hit := _RECORD_EXIT.search(output):
+        return int(hit.group(1))
+    if output.endswith("[cancelled by the user]"):
+        return 130
+    return 124 if "\n[timed out after " in f"\n{output}" else 0
+
+
 def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Stored (OpenAI-shaped) messages -> the ``{role, text, name, context}`` rows the TUI renders on resume.
 
@@ -4457,6 +4492,17 @@ def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role == "tool":
             name, ctx = names.get(str(m.get("tool_call_id")), (str(m.get("name") or "tool"), ""))
             rows.append({"role": "tool", "name": name, "context": ctx})
+        elif is_shell_record(m):  # a `!cmd`: the command as the user typed it, then its output as the TUI shows it
+            command, output = shell_record_parts(str(content))
+            rows.append({"role": "user", "text": f"!{command}"})
+            rows.append(
+                {
+                    "role": "system",
+                    "display_kind": "shell",
+                    "text": output,
+                    "display_metadata": {"command": command, "code": _record_code(output)},
+                }
+            )
         elif role in ("user", "assistant") and isinstance(content, str) and content.strip():
             rows.append({"role": role, "text": content})
     return rows
@@ -5161,7 +5207,14 @@ async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
     if run.error:
         stderr += ("\n" if stderr and not stderr.endswith("\n") else "") + run.error
     if params.get("record"):
-        pass  # B1b: record the command and its output into the conversation here and set "recorded"
+        limit = tool_output_limit(server.config) or MAX_TOOL_RESULT_CHARS
+        session.shell_records.append({"role": "user", "content": shell_record(command, run, limit)})
+        if server._flush_shell_records(session):
+            reply["recorded"] = "now"
+        else:  # a turn runs: in at the next turn's start, else when this one ends
+            reply["recorded"] = "after_turn"
+            if (task := session.turn_task) is not None and not task.done():
+                task.add_done_callback(lambda _t: server._flush_shell_records(session))
     return {
         "code": code,
         "stdout": run.stdout,
@@ -5196,7 +5249,15 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     if session.turn_in_flight:
         raise _InvalidParams("a turn is running in this session; /undo when it ends")
     messages = list(session.messages)
-    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    # the last prompt, not a `!cmd` record: the records after it go with it, the ones before it stay
+    last_user = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if messages[i].get("role") == "user" and not is_shell_record(messages[i])
+        ),
+        None,
+    )
     if last_user is None:
         return {"removed": 0}
     session.messages = messages[:last_user]

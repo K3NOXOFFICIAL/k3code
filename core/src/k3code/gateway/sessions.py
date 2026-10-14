@@ -92,11 +92,18 @@ def dump_messages(messages: list[dict[str, Any]]) -> str:
 
 
 def summarize_messages(messages: list[dict[str, Any]]) -> tuple[int, str]:
-    """``(message count, preview)``: the preview is the first non-empty user message, cut to ``PREVIEW_CHARS``."""
+    """``(message count, preview)``: the preview is the first non-empty user message, cut to ``PREVIEW_CHARS``; a
+    `!cmd` record is shown as ``!<command>`` only when no prompt follows it."""
+    from k3code.session_ai import is_shell_record, shell_record_parts
+
+    fallback = ""
     for m in messages:
         if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
+            if is_shell_record(m):
+                fallback = fallback or "!" + shell_record_parts(str(m["content"]))[0]
+                continue
             return len(messages), scrub_surrogates(str(m["content"])[:PREVIEW_CHARS])  # bound as plain text
-    return len(messages), ""
+    return len(messages), scrub_surrogates(fallback[:PREVIEW_CHARS])
 
 
 _SCHEMA = """

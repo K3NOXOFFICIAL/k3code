@@ -25,7 +25,7 @@ from k3code import __version__ as k3_version
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.redact import drop_values, scrub_text
 from k3code.reliability.sandbox import harness_git_argv, harness_git_env
-from k3code.session_ai import SUMMARY_PREFIX, head_and_tail, task_anchor, work_ledger
+from k3code.session_ai import SUMMARY_PREFIX, head_and_tail, is_shell_record, task_anchor, work_ledger
 
 #: The whole text, the embedded bundle aside (the conversation tail goes first, then the memory is clipped).
 MAX_TEXT_CHARS = 60_000
@@ -249,6 +249,14 @@ def _is_summary(m: dict[str, Any]) -> bool:
     return str(m.get("content") or "").startswith(SUMMARY_PREFIX)
 
 
+def _without_trailing_records(convo: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``convo`` without the `!cmd` records at its end: one added after the last answer is no open request."""
+    end = len(convo)
+    while end and is_shell_record(convo[end - 1]):
+        end -= 1
+    return convo[:end]
+
+
 def _cut_mid_turn(convo: list[dict[str, Any]]) -> tuple[bool, bool]:
     """(interrupted, unanswered) of a transcript without its system messages. Interrupted: it ends on a user message
     (unanswered), an assistant message with tool calls or a tool result (cut mid-step). Not: it is empty, it ends on an
@@ -295,7 +303,13 @@ def gather(
     convo = [m for m in messages if m.get("role") != "system"]
     anchor = task_anchor(convo)
     task = str(anchor.get("content") or "") if anchor else ""
-    users = [m for m in convo if m.get("role") == "user" and not str(m.get("content") or "").startswith(SUMMARY_PREFIX)]
+    users = [
+        m
+        for m in convo
+        if m.get("role") == "user"
+        and not str(m.get("content") or "").startswith(SUMMARY_PREFIX)
+        and not is_shell_record(m)  # a `!cmd` the user ran is context, not a request
+    ]
     last_user = users[-1] if users else None
     last_request = str(last_user.get("content") or "") if last_user is not None and last_user is not anchor else None
     summaries = [str(m.get("content") or "") for m in convo if str(m.get("content") or "").startswith(SUMMARY_PREFIX)]
@@ -315,7 +329,7 @@ def gather(
         git = dataclasses.replace(
             git, **{f: _scrubbed(getattr(git, f), secrets) for f in ("dirty", "recent", "since_start", "origin")}
         )
-    interrupted, unanswered = _cut_mid_turn(convo)
+    interrupted, unanswered = _cut_mid_turn(_without_trailing_records(convo))
     return Handoff(
         session_id=stored.session_id,
         title=_scrubbed(stored.title, secrets),

@@ -19,7 +19,7 @@ from k3code.paths import ensure_private_dir, home
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
-from k3code.session_ai import SUMMARY_PREFIX
+from k3code.session_ai import SUMMARY_PREFIX, is_shell_record, shell_record_parts
 
 #: The heading earlier versions wrote into the repo's K3CODE.md/AGENTS.md; facts now go to learned.md (k3code.memory).
 FACTS_HEADING = "## Learned project notes (auto)"
@@ -39,7 +39,7 @@ SUMMARY_CLIP = 3000
 
 
 def user_turns(messages: list[dict[str, Any]]) -> int:
-    return sum(1 for m in messages if m.get("role") == "user")
+    return sum(1 for m in messages if m.get("role") == "user" and not is_shell_record(m))  # a `!cmd` is no turn
 
 
 def session_turns(meta: dict[str, Any], messages: list[dict[str, Any]]) -> int:
@@ -62,7 +62,9 @@ def transcript(messages: list[dict[str, Any]], limit: int = 9000) -> str:
     lines = []
     for m in messages:
         c = m.get("content")
-        if isinstance(c, str) and m.get("role") in ("user", "assistant"):
+        if is_shell_record(m):  # the command, never its output
+            lines.append(f"user ran: {shell_record_parts(c)[0][:600]}")
+        elif isinstance(c, str) and m.get("role") in ("user", "assistant"):
             lines.append(f"{m['role']}: {c[: SUMMARY_CLIP if c.startswith(SUMMARY_PREFIX) else 600]}")
     return "\n".join(lines)[-limit:]
 

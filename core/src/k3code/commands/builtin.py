@@ -145,6 +145,7 @@ class _ClearCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
+        live.shell_records.clear()  # `!cmd` records waiting for a turn to end belong to the old conversation
         live.refresh_prompt_inputs()  # a new conversation: show what was learned since this prompt was built
         live.reads.clear()
         live.file_stamps.clear()  # the new conversation has seen none of these files (and the saved ones go below)

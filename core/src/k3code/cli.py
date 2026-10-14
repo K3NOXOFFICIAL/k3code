@@ -407,10 +407,15 @@ def _trim_history(history: list[Any]) -> list[Any]:
     """``history`` without its older part (the first message at least), cut at a user message so that no tool result
     is left without the call it answers. When the last turn is more than half of it (no user message after the middle),
     the turns before it are what is kept: they fitted before it began."""
-    start = next((i for i in range(max(1, len(history) // 2), len(history)) if history[i].role == "user"), None)
+    from k3code.session_ai import is_shell_record
+
+    def turn_start(m: Any) -> bool:  # a `!cmd` record is no turn: its prompt (if any) follows it
+        return m.role == "user" and not is_shell_record(m)
+
+    start = next((i for i in range(max(1, len(history) // 2), len(history)) if turn_start(history[i])), None)
     if start is not None:
         return history[start:]
-    return history[: max((i for i, m in enumerate(history) if m.role == "user"), default=0)]
+    return history[: max((i for i, m in enumerate(history) if turn_start(m)), default=0)]
 
 
 def _chars(messages: list[Any]) -> int:
