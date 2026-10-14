@@ -801,7 +801,7 @@ def check_permissions(home: Path, project_dir: Path) -> Check:
     if problems:
         fix = (
             "fix each named entry (an action is allow, ask or deny, lower case; permissions.hardline is a list of"
-            " quoted regexes); until then it is a deny"
+            " quoted regexes); until then it is a deny (a blank hardline pattern is ignored instead)"
         )
         status = FAIL if UNREADABLE_HARDLINE in hard else WARN
         return Check("permissions", status, "; ".join(problems), fix, {"problems": len(problems)})

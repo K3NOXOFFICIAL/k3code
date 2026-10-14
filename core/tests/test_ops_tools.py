@@ -900,6 +900,102 @@ async def test_bash_at_home_asks_per_command_in_an_interactive_session(tmp_path,
 
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_rule_allowed_bash_at_home_runs_read_only_sandboxed_without_a_prompt(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_rsa").write_text("SECRET-KEY\n")
+    (home / ".git-credentials").write_text("https://u:TOKEN@host\n")
+    (home / "notes.txt").write_text("hello\n")
+    (home / ".env").write_text("API_KEY=TOP-DOTENV\n")
+    (home / "proj").mkdir()
+    (home / "proj" / ".env").write_text("API_KEY=SUB-DOTENV\n")
+    (home / ".bash_history").write_text("export TOKEN=HIST-SECRET\n")
+    (home / "dotfiles").mkdir()
+    (home / "dotfiles" / "netrc").write_text("machine h password LINKED-SECRET\n")
+    (home / ".netrc").symlink_to("dotfiles/netrc")  # a dotfile manager's link: hidden at its target
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+
+    class _R:
+        chain: list = []
+
+    asked: list[str] = []
+
+    class _No:
+        allowed, reason = False, ""
+
+    async def refuse(name, args, decision):
+        asked.append(args["command"])
+        return _No()
+
+    notices: list[str] = []
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="auto")  # type: ignore[arg-type]
+    loop.approval_callback = refuse
+    loop.on_home_started = lambda: notices.append("home")
+    loop._tell_home_started()
+    loop._tell_home_started()
+    assert notices == ["home"]  # one notice, not one per call
+
+    res = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "ls -a"}))
+    assert "notes.txt" in res.get("stdout", ""), res
+    res = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": "ls .ssh"}))
+    assert "id_rsa" not in res.get("stdout", "")  # the credential folder is hidden
+    res = await loop._execute_tool(ToolCall(id="c3", name="bash", arguments={"command": "cat .git-credentials"}))
+    assert "TOKEN" not in res.get("stdout", "")
+    for i, command in enumerate(("cat .bash_history", "cat .netrc", "cat dotfiles/netrc")):
+        res = await loop._execute_tool(ToolCall(id=f"h{i}", name="bash", arguments={"command": command}))
+        assert "SECRET" not in str(res), (command, res)  # shell history and a symlinked credential are hidden
+    assert asked == []  # rule-allowed read-only commands ran without a prompt
+    # anything only the mode allowed still asks a person (and here is refused)
+    res = await loop._execute_tool(ToolCall(id="c4", name="bash", arguments={"command": "touch x"}))
+    assert asked == ["touch x"] and "User denied" in res["error"] and not (home / "x").exists()
+    # dotenv files lie anywhere below $HOME: a recursive search or a glob over it asks, though the builtin allows grep
+    asked.clear()
+    walkers = ("grep -rn API_KEY .", "cat notes.txt; grep -r API_KEY proj", "rg API_KEY", "cat proj/*")
+    for i, command in enumerate(walkers):
+        res = await loop._execute_tool(ToolCall(id=f"w{i}", name="bash", arguments={"command": command}))
+        assert "DOTENV" not in str(res), (command, res)
+    assert asked == list(walkers)
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_user_allow_rule_at_home_still_asks_a_person(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.permissions.rules import Rule
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+
+    class _R:
+        chain: list = []
+
+    asked: list[str] = []
+
+    class _No:
+        allowed, reason = False, ""
+
+    async def refuse(name, args, decision):
+        asked.append(args["command"])
+        return _No()
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="auto")  # type: ignore[arg-type]
+    loop.approval_callback = refuse
+    # a user allow rule may run anything (python3 reads all of $HOME, with network): at $HOME a person approves it,
+    # also when a builtin-allowed part comes first and wins the decision (`ls -a; ...`)
+    loop.permissions.user_rules = [Rule(tool="bash", pattern="python3 *", action="allow", layer=1)]
+    for i, command in enumerate(("python3 -c pass", "ls -a; python3 -c pass")):
+        res = await loop._execute_tool(ToolCall(id=f"u{i}", name="bash", arguments={"command": command}))
+        assert "User denied" in res["error"], res
+    assert asked == ["python3 -c pass", "ls -a; python3 -c pass"]
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
 async def test_escape_a_hook_planted_from_the_sandbox_never_runs_under_harness_git(tmp_path):
     from k3code.subagents import worktree
     from m1cmd_helpers import git_repo

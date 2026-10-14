@@ -96,23 +96,32 @@ def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str
 
 def _hardline(value: object, problems: list[str]) -> list[str]:
     """The extra regexes of ``permissions.hardline``, or :data:`UNREADABLE_HARDLINE` in place of all of them when any
-    part is not a regex; each problem names the entry, never its text (a pattern may hold a secret)."""
+    part is not a regex; each problem names the entry, never its text (a pattern may hold a secret). A blank entry is
+    left out and reported, not failed closed."""
     if value is None:
         return []
     consequence = "every bash command is hardline-denied"
     if not isinstance(value, list):  # a string was split into one regex per character
         problems.append(f"permissions.hardline: must be a list of regexes; {consequence}")
         return [UNREADABLE_HARDLINE]
-    found = len(problems)
+    hard: list[str] = []
+    failed = False
     for n, rx in enumerate(value, 1):
         if not isinstance(rx, str):  # 5 became the regex "5", null the regex "None"
             problems.append(f"permissions.hardline entry {n}: not text (quote it); {consequence}")
+            failed = True
+            continue
+        if not rx.strip():  # '' matches every command: one stray empty entry denied all bash
+            problems.append(f"permissions.hardline[{n - 1}] is blank: ignored (it would match every command)")
             continue
         try:
             re.compile(rx)
         except (re.error, OverflowError, RecursionError):  # raised again on every bash call
             problems.append(f"permissions.hardline entry {n}: not a valid regex; {consequence}")
-    return [UNREADABLE_HARDLINE] if len(problems) > found else list(value)
+            failed = True
+            continue
+        hard.append(rx)
+    return [UNREADABLE_HARDLINE] if failed else hard
 
 
 def _warn_once(source: str, problems: list[str]) -> None:
