@@ -1976,6 +1976,7 @@ class GatewayServer:
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
                 attended=not (session.background or session.goal_continuation),
+                session_id=session.session_id,
             ),
             max_turns=self.config.max_turns,
             headless=False,
@@ -2531,6 +2532,7 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                session_id=session.session_id,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
