@@ -38,7 +38,7 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("K3_TEST_KEY", "sk-should-never-appear-123")
     checks = await doctor.run_checks(_config(_entry()), probe=False, home=tmp_path)
     data = json.loads(doctor.to_json(checks))
-    assert set(data) == {"summary", "checks"} and set(data["summary"]) == {"ok", "warn", "fail"}
+    assert set(data) == {"summary", "checks"} and set(data["summary"]) == {"ok", "warn", "fail", "skip"}
     names = {c["name"] for c in data["checks"]}
     for want in (
         "provider:p1",
@@ -56,7 +56,7 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
         "hermes-isolation",
     ):
         assert want in names, want
-    assert all(c["status"] in ("ok", "warn", "fail") and {"detail", "fix"} <= set(c) for c in data["checks"])
+    assert all(c["status"] in ("ok", "warn", "fail", "skip") and {"detail", "fix"} <= set(c) for c in data["checks"])
     assert sum(data["summary"].values()) == len(data["checks"])
     assert "sk-should-never-appear-123" not in doctor.to_json(checks)
     assert "omniroute-bypass" not in names  # only shown when the chain has an OmniRoute entry
@@ -100,6 +100,37 @@ def test_doctor_journal_unresolved_intent(tmp_path):
     j.close()
     assert doctor.check_journal(tmp_path).status == "warn"
     assert doctor.check_journal(tmp_path / "empty").status == "ok"
+
+
+def _old_pending_journal_and_two_new(tmp_path):
+    import os
+
+    from k3code.reliability.journal import ToolJournal
+
+    j = ToolJournal(tmp_path, "old")
+    j.record_intent("c1", "bash", {"command": "echo"}, side_effect=True)
+    j.close()
+    os.utime(tmp_path / "journal" / "old.jsonl", (1_000_000, 1_000_000))
+    for name in ("new1", "new2"):
+        (tmp_path / "journal" / f"{name}.jsonl").write_text("")
+
+
+def test_doctor_journal_reads_only_newest_files(tmp_path, monkeypatch):
+    # #82: the check parses whole journals, so it stops at the newest JOURNAL_MAX_FILES and says what it skipped.
+    _old_pending_journal_and_two_new(tmp_path)
+    monkeypatch.setattr(doctor, "JOURNAL_MAX_FILES", 2, raising=False)
+    c = doctor.check_journal(tmp_path)
+    assert c.status == "ok" and "1 older journal(s) not checked" in c.detail
+    assert c.data["unchecked"] == 1
+    monkeypatch.setattr(doctor, "JOURNAL_MAX_FILES", 3, raising=False)
+    assert doctor.check_journal(tmp_path).status == "warn"
+
+
+def test_doctor_journal_stops_when_budget_spent(tmp_path, monkeypatch):
+    _old_pending_journal_and_two_new(tmp_path)
+    monkeypatch.setattr(doctor, "JOURNAL_BUDGET_S", -1.0, raising=False)
+    c = doctor.check_journal(tmp_path)
+    assert c.status == "ok" and c.data["unchecked"] == 3
 
 
 def test_doctor_isolation_flags_hermes_env(monkeypatch):
@@ -693,16 +724,17 @@ def test_sandbox_refuses_roots_that_expose_home_ssh_or_the_k3code_home(tmp_path,
     assert sandbox.build_argv(home / "project", home=home, bwrap="/usr/bin/bwrap")[0] == "/usr/bin/bwrap"
 
 
-def test_git_metadata_is_bound_read_only(tmp_path):
+def test_git_metadata_is_bound_read_only_when_git_writable_is_off(tmp_path):
     from m1cmd_helpers import git_repo
 
     repo = git_repo(tmp_path / "repo").resolve()
-    joined = " ".join(sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap", git_writable=False)
+    joined = " ".join(argv)
     assert f"--bind {repo} {repo}" in joined
     assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined
 
 
-def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
+def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only_when_git_writable_is_off(tmp_path):
     from m1cmd_helpers import git_repo
 
     repo = git_repo(tmp_path / "repo").resolve()
@@ -710,7 +742,8 @@ def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
     subprocess.run(
         ["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True, capture_output=True
     )
-    joined = " ".join(sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    argv = sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap", git_writable=False)
+    joined = " ".join(argv)
     gitdir = (repo / ".git" / "worktrees" / "child1").resolve()
     assert f"--ro-bind {gitdir} {gitdir}" in joined  # the linked worktree's admin dir lives outside the checkout
     assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined  # the common dir holds the objects

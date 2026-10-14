@@ -21,7 +21,7 @@ FAMILY_WINDOWS: tuple[tuple[str, int], ...] = (
     ("opus", 200_000),
     ("haiku", 200_000),
     ("gpt-4o", 128_000),
-    ("gpt-4.1", 128_000),
+    ("gpt-4.1", 1_047_576),
 )
 #: Window of an id with no config entry and no known family, mostly a gateway alias (auto/coding-manual) in front of a
 #: large model. It was 32k, which compacted those sessions at ~22k tokens. 128k is the floor of current models; a

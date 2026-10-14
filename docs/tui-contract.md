@@ -52,11 +52,11 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `input.detect_drop` | `{session_id, text}` | `{matched, text?, name?, is_image?}` | ✅ | Is `text` one existing file (quoted, escaped, `~`, `file://` or relative to the session directory)? Then `text` is `@path` (`@"path"` with whitespace). Needs the daemon token on a socket (it reads the filesystem) |
 | `command.dispatch` | `{name, arg?, session_id}` | `CommandResult` | ✅ | Slash commands |
 | `slash.exec` | `{command, session_id}` | `SlashExecResponse` | ✅ | Internal slash exec |
-| `model.options` | `{provider?, profile?, session_id?}` | `ModelOptionsResult` | ✅ | Model picker (the session switcher). `model` is the key the session is on, not only `default_model`. The `/tune` popup uses `tune.get` instead |
+| `model.options` | `{provider?, profile?, session_id?}` | `ModelOptionsResult` | ✅ | Model picker (the session switcher). `model` is the key the session is on, not only `default_model`; `provider` is the block its turns try first (its `/provider` pick, else `default_provider`, else the first block) and that row has `is_current: true`. Each row's `models` lists the model keys; k3code adds `model_ids` (key → the model id it sends to on that block, the first of a list). The `/tune` popup uses `tune.get` instead |
 | `model.save_key` | `{provider, key, profile?}` | `{provider?}` | ✅ | Save API key |
 | `model.disconnect` | `{provider, profile?}` | `{disconnected?}` | ✅ | Remove API key |
 | `config.get` | `{key: "full" \| "mtime" \| ...}` | `ConfigFullResponse \| ConfigMtimeResponse` | ✅ | Config polling |
-| `config.set` | `{key, value, profile?}` | `{ok: boolean}` | | Write config. `key: "model"` takes `<model-key> [--reasoning <level>] [--global]` (the old picker's string; `--provider` is ignored): the key is set on the session, `--reasoning` also sets its effort, `--global` also saves it as the default model (see `tune.set`) |
+| `config.set` | `{key, value, profile?}` | `{ok: boolean}` | | Write config. `key: "model"` takes `<model-key> [--provider <name>] [--reasoning <level>] [--global]` (the old picker's string): the key is set on the session, `--provider` pins the session to that provider block like `/provider` (an unknown name is an invalid-params error and nothing changes), `--reasoning` also sets its effort, `--global` also saves it as the default model (see `tune.set`) |
 | `setup.status` | `{}` | `{provider_configured, free_tier, ...}` | | Setup status |
 | `system.battery` | `{}` | `{percent?, charging?, ...}` | ✅ | Battery status |
 
@@ -400,14 +400,14 @@ commands, which own the grammar (`core/src/k3code/commands/tune.py`).
   (`has_session` false) `effort` is `null`, `ultra_mode` is `"off"` and the model is the configured default.
 - `wake_words` lists the words that are switched on in the config; `wake_words_enabled` is `wake_words.enabled`.
 
-**`tune.set {session_id?, model?, effort?, ultra_mode?, scope?}`** changes any of the three. `effort` is a level or
+**`tune.set {session_id?, model?, effort?, ultra_mode?, provider?, scope?}`** changes any of the three, and `provider` pins the session to a provider block like `/provider` (without a session: the daemon's default provider, not saved, also with `scope: "default"`). `effort` is a level or
 `"default"`, `ultra_mode` is `"off"` or `"ultracode"`, `scope` is `"session"` (default) or `"default"`. Missing or
 `null` fields are left alone. All values are checked first and applied all or nothing; an invalid one (unknown model
 key, effort, mode or scope, or `effort` / `ultra_mode` without a session) is an invalid-params error (-32602) and
 nothing changes. With `scope: "default"` a `model` is also written as `default_model` to the user `config.yaml` (validated,
 backed up first) and set in memory; if the file cannot be written, the call fails and nothing else is applied. The result
 is the `tune.get` shape plus `{"ok": true, "changed": [...]}`, where `changed` lists what really differs now (`model`,
-`default_model`, `effort`, `ultra_mode`). A `session.info` event follows when a session exists and something changed.
+`default_model`, `effort`, `ultra_mode`, `provider`, `default_provider`). A `session.info` event follows when a session exists and something changed.
 Model and effort apply from the next turn, `ultra_mode` from the next prompt. `tune.set` changes the session and the user config, so a read-only attach (`k3code attach --readonly`, panes) is refused; `tune.get` is forwarded.
 
 **`prompt.submit {automated?}`.** The TUI sets `automated: true` for text it generated and the user did not type: a

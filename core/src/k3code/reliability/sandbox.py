@@ -2,7 +2,10 @@
 
 Sandboxed: auto/yolo sessions, and every unattended session (background run, loop tick, cron job, goal continuation,
 sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (only the cache dirs come back), the
-project is writable, and its git metadata is read-only so a command cannot plant a hook. The network stays on for
+project is writable, and its git metadata is read-only so a command cannot plant a hook. ``sandbox.git_writable: true``
+makes the git metadata writable (``git add``/``commit``/``branch`` work) except the parts git runs as code or reads to
+pick what it runs (hooks, config, ``info/``: see :data:`GIT_CODE_ENTRIES`); it leaves one hole open (a planted
+``commondir``, see :func:`_git_metadata_argv`), so it is off by default. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
 Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
@@ -53,9 +56,10 @@ ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "T
 #: or an include, defined in the repository's own config (``.git/config``, ``.git/config.worktree``) still runs when
 #: git touches a file it applies to (``status``, ``add``, ``merge``, ``commit``), because git has no switch that
 #: ignores a configured driver by name. That is closed at the source: the write and edit tools always ask before they
-#: change those files (see :func:`k3code.permissions.engine.protected_path`) and the sandbox binds the git metadata
-#: read-only. It stays open for a repository config changed by anything else (an unsandboxed command someone
-#: approved, a process outside k3code) and for a driver the user keeps in the repository on purpose.
+#: change those files (see :func:`k3code.permissions.engine.protected_path`) and the sandbox binds the git config,
+#: hooks and ``info/`` read-only (see :data:`GIT_CODE_ENTRIES`). It stays open for a repository config changed by
+#: anything else (an unsandboxed command someone approved, a process outside k3code) and for a driver the user keeps
+#: in the repository on purpose.
 HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 #: Environment of harness git: no system or global config (``~/.gitconfig`` could define a driver or an alias too).
 #: The cost is that the user's own settings do not apply to it either (``safe.directory``, LFS filters, a global
@@ -85,6 +89,21 @@ class SandboxUnavailable(SandboxRefused):
 
 #: ``$HOME`` entries masked again after the project binds (a project bind can re-expose them: credentials, keys).
 HOME_SECRETS = (".config/k3code", ".ssh")
+
+
+def configured_git_writable() -> bool:
+    """``sandbox.git_writable`` from the user's ``config.yaml`` (never a project's): True lets ``git add``/``commit``/
+    ``branch`` write the git metadata in the sandbox (see :func:`_git_metadata_argv` for what stays open). False, the
+    git metadata fully read-only, when unset or not a boolean."""
+    try:
+        from k3code import config
+
+        section = config.load_user_section("sandbox")
+    except Exception:  # an unreadable config must not break bash: the sandbox then keeps its default view
+        logger.warning("sandbox: could not read sandbox.git_writable from the user config", exc_info=True)
+        return False
+    value = section.get("git_writable") if isinstance(section, dict) else None
+    return value if isinstance(value, bool) else False
 
 
 def configured_home_readonly() -> list[str]:
@@ -290,8 +309,116 @@ def _git_metadata(root: Path) -> list[Path]:
     return [p for p in found if p.exists()]
 
 
-#: Entries of a project root the sandbox shows read-only, like its git metadata: the files git runs as code or reads
-#: for its drivers (``.gitattributes``, ``.gitmodules``, husky's ``.husky`` hooks), direnv's ``.envrc`` and the
+#: Entries of a git dir that stay read-only when the rest of it is writable (``sandbox.git_writable``): what git runs
+#: as code or reads to decide what it runs. ``hooks``; ``config`` and ``config.worktree`` (drivers, ``core.hooksPath``,
+#: aliases); ``info`` (``info/attributes`` picks the drivers); ``commondir`` (where a linked worktree's config and
+#: hooks come from); ``modules`` (each submodule's own git dir, hooks and config included). The same entries of every
+#: linked worktree's admin dir (``worktrees/<name>/``) too.
+GIT_CODE_ENTRIES = ("hooks", "config", "config.worktree", "info", "commondir", "modules")
+
+
+#: Stand-ins for the :data:`GIT_CODE_ENTRIES` a git dir lacks, made on the host before the sandbox starts so a
+#: read-only bind can cover them and the command cannot create them: an empty directory or file reads as git's default.
+#: A common dir gets all of them; a linked worktree's admin dir (it has a ``commondir``) only ``config.worktree``, the
+#: one of them git reads there. ``commondir`` has none: git dies on every stand-in (empty file, directory, dangling
+#: link), and ``.`` breaks commits with the reftable backend.
+_GIT_STANDIN_DIRS = ("hooks", "info", "modules")
+_GIT_STANDIN_FILES = ("config", "config.worktree")
+
+
+def _make_git_standins(gitdir: Path) -> None:
+    admin = (gitdir / "commondir").exists() or (gitdir / "commondir").is_symlink()
+    made = [(gitdir / name, False) for name in (("config.worktree",) if admin else _GIT_STANDIN_FILES)]
+    made += [] if admin else [(gitdir / name, True) for name in _GIT_STANDIN_DIRS]
+    for path, is_dir in made:
+        try:  # O_EXCL / mkdir: neither follows a link at the path
+            if is_dir:
+                path.mkdir()
+            else:
+                path.touch(exist_ok=False)
+        except FileExistsError:
+            pass
+        except OSError:
+            logger.warning("sandbox: could not create %s; the command can create it", path, exc_info=True)
+
+
+def _git_code_entries(gitdir: Path) -> list[Path] | None:
+    """The :data:`GIT_CODE_ENTRIES` of ``gitdir`` and of each ``worktrees/<name>/`` below it, missing ones made first
+    (:func:`_make_git_standins`), or None when one of them (or a ``worktrees/<name>``) is a symlink: a read-only bind
+    lands on the link's target, and the command could replace the link itself."""
+    dirs = [gitdir]
+    with contextlib.suppress(OSError):
+        dirs += sorted(d for d in (gitdir / "worktrees").iterdir() if d.is_dir() or d.is_symlink())
+    if any(d.is_symlink() for d in dirs):
+        return None
+    for d in dirs:
+        _make_git_standins(d)
+    found = [d / e for d in dirs for e in GIT_CODE_ENTRIES if (d / e).exists() or (d / e).is_symlink()]
+    if any(p.is_symlink() for p in found):
+        return None
+    return found
+
+
+def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: bool) -> list[str]:
+    """bwrap ops for the git metadata of ``root`` (bound read-write before this).
+
+    Read-only metadata (``writable`` False) is bound read-only whole. Writable metadata stays as the project bind
+    left it; only its :data:`GIT_CODE_ENTRIES` are bound read-only, so ``git add``/``commit``/``branch`` work and a
+    command still cannot plant a hook or a driver. A linked worktree's ``.git`` file (the pointer to its git dir)
+    stays read-only, and its git dir and common dir, which live outside the checkout, are bound read-write only when
+    they are a real worktree admin dir below a real common dir (``<common>/worktrees/<name>`` with a ``HEAD``, next to
+    ``<common>/objects``); a pointer anywhere else would hand the command a writable host folder, so that metadata
+    stays read-only as before.
+
+    A missing entry is made empty on the host first (:func:`_make_git_standins`), so the command cannot create it.
+
+    Not covered, and the reason ``sandbox.git_writable`` is off by default: a ``commondir`` file in the main ``.git``.
+    git dies on any stand-in for it, and the ``.git`` root must stay writable for git's lock files (``index.lock``,
+    ``HEAD.lock``), so the command can create one; the next git run outside the sandbox then takes its config and
+    hooks from wherever it points.
+    """
+    meta = _git_metadata(root)
+    if not writable:
+        return [op for m in meta for op in ("--ro-bind", str(m), str(m))]
+    argv: list[str] = []
+    rw: list[Path] = []
+    readonly: list[Path] = []
+    gitdirs = [m for m in meta if m.is_dir() and not m.is_symlink()]
+    readonly += [m for m in meta if m not in gitdirs]  # the worktree's .git file, or a symlinked .git
+    outside = [d for d in gitdirs if not any(d.resolve().is_relative_to(r) for r in roots)]
+    if outside and not _linked_worktree_dirs(outside, home):
+        readonly += outside
+    else:
+        rw += outside
+    for d in sorted(rw, key=lambda p: len(p.parts)):  # the common dir before the worktree admin dir inside it
+        argv += ["--bind", str(d), str(d)]
+    for d in gitdirs:
+        if d not in readonly:
+            entries = _git_code_entries(d)
+            readonly += [d] if entries is None else entries
+    for p in dict.fromkeys(readonly):
+        argv += ["--ro-bind", str(p), str(p)]
+    return argv
+
+
+def _linked_worktree_dirs(dirs: Sequence[Path], home: Path) -> bool:
+    """``dirs`` are a linked worktree's git dir and its common dir (``<common>/worktrees/<name>`` with a ``HEAD``,
+    ``<common>/objects``), none of which is a root :func:`_refuse_root` refuses."""
+    if len(dirs) != 2:
+        return False
+    gitdir, common = (d.resolve() for d in dirs)
+    if gitdir.parent != common / "worktrees" or not (gitdir / "HEAD").is_file() or not (common / "objects").is_dir():
+        return False
+    try:
+        for d in (gitdir, common):
+            _refuse_root(d, home)
+    except SandboxRefused:
+        return False
+    return True
+
+
+#: Entries of a project root the sandbox shows read-only, like its git hooks and config: the files git runs as code or
+#: reads for its drivers (``.gitattributes``, ``.gitmodules``, husky's ``.husky`` hooks), direnv's ``.envrc`` and the
 #: project's k3code config (``.k3code/config*``: permission rules and hooks). The set
 #: :func:`k3code.permissions.engine.protected_path` keeps the edit tools from; a sandboxed ``npm test`` could plant a
 #: ``.husky/pre-commit`` the user's next commit runs otherwise.
@@ -379,11 +506,16 @@ def build_argv(
     network: bool = True,
     home_readonly: Iterable[str] | None = None,
     readonly_home: bool = False,
+    git_writable: bool | None = None,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
 
     ``home_readonly`` lists ``$HOME`` entries that stay visible read-only (default: ``sandbox.home_readonly`` of the
     user's config). It exists for small marker files a tool must be able to read, e.g. ``.myapp``.
+
+    ``git_writable`` (default: ``sandbox.git_writable`` of the user's config, false) lets ``git add``/``commit``/
+    ``branch`` write the git metadata; its hooks, config and ``info/`` stay read-only (see :func:`_git_metadata_argv`).
+    False binds all of it read-only.
 
     A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
     command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case.
@@ -448,6 +580,8 @@ def build_argv(
         uv = home / entry
         if uv.is_dir():
             argv += ["--ro-bind", str(uv), str(uv)]
+    if git_writable is None:
+        git_writable = configured_git_writable()
     seen: set[str] = set()
     for root in roots:
         p = str(root)
@@ -457,8 +591,10 @@ def build_argv(
                 logger.warning("sandbox: not binding %s (it would expose $HOME)", p)
                 continue
             argv += ["--bind", p, p]
-            # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
-            for meta in [*_git_metadata(root), *protected_entries(root)]:
+            # the git metadata is read-only (only its hooks, config and info with sandbox.git_writable true): a
+            # sandboxed command cannot plant a hook or change core.* config
+            argv += _git_metadata_argv(root, roots, home, git_writable)
+            for meta in protected_entries(root):
                 argv += ["--ro-bind", str(meta), str(meta)]
     # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
     extra = configured_home_readonly() if home_readonly is None else list(home_readonly)

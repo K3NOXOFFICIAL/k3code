@@ -15,7 +15,7 @@ from k3code import chain_config
 from k3code.commands import CommandDef
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
 from k3code.providers.effort import takes_effort
-from k3code.routing.tiers import Tier, tier_model_specs
+from k3code.routing.tiers import Tier, active_provider, tier_model_specs
 from k3code.wakewords import WAKE_WORDS
 
 #: ``LiveSession.ultra_mode`` values: ``ultracode`` runs the ultracode pipeline on typed prompts.
@@ -28,7 +28,7 @@ LEGACY_EFFORT = {"minimal": "low", "ultra": "max", "none": "default"}
 _ON = frozenset({"on", "true", "yes", "1"})
 _OFF = frozenset({"off", "false", "no", "0"})
 
-USAGE = "/tune [model <key> | <key>] [effort <level> | <level>] [ultracode [on|off]] [--global]"
+USAGE = "/tune [model <key> | <key>] [effort <level> | <level>] [ultracode [on|off]] [--provider <name>] [--global]"
 _USAGE_NOTE = f"levels: {', '.join(EFFORT_WORDS)}; --global also makes the model the default for new sessions"
 
 
@@ -43,12 +43,13 @@ class TuneRequest:
     model: str | None = None
     effort: str | None = None
     ultra_mode: str | None = None
+    provider: str | None = None  #: a provider block name: the session's turns try it first (what /provider sets)
     scope: str = "session"
     reason: str = ""  # free text after ``/model <key>``, kept with the model_switch record
 
     @property
     def empty(self) -> bool:
-        return self.model is None and self.effort is None and self.ultra_mode is None
+        return self.model is None and self.effort is None and self.ultra_mode is None and self.provider is None
 
 
 @dataclass
@@ -63,6 +64,16 @@ def known_model_keys(config: Any) -> set[str]:
 
 def unknown_model_message(config: Any, key: str) -> str:
     return f"Unknown model key: {key} (known: {', '.join(sorted(known_model_keys(config)))})"
+
+
+def provider_name(config: Any, value: str) -> str:
+    """The configured provider block called ``value`` (names are unique regardless of case, so the match is
+    case-insensitive, as in /provider). Raises :class:`TuneError` for a name no block has."""
+    names = [p.name for p in config.providers]
+    name = next((n for n in names if n.lower() == value.lower()), None)
+    if name is None:
+        raise TuneError(f"Unknown provider: {value} (valid: {', '.join(names) or 'none configured'})")
+    return name
 
 
 def normalize_effort(value: str, *, legacy: bool = False) -> str:
@@ -85,7 +96,7 @@ def parse_tune(config: Any, arg: str) -> TuneRequest:
     """The ``/tune`` grammar: tokens in any order, nothing applied here. Raises :class:`TuneError`."""
     known = known_model_keys(config)
     tokens = arg.split()
-    model = effort = ultra = scope = None
+    model = effort = ultra = scope = provider = None
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -107,7 +118,9 @@ def parse_tune(config: Any, arg: str) -> TuneRequest:
                 if value not in known:
                     raise TuneError(unknown_model_message(config, value))
                 model = _once(model, value, "model")
-            elif low != "--provider":  # --provider <slug> is accepted and ignored, like the old picker's string
+            elif low == "--provider":
+                provider = _once(provider, provider_name(config, value), "provider")
+            else:
                 effort = _once(effort, normalize_effort(value, legacy=True), "effort")
         elif low == "ultracode":
             word = "on"
@@ -123,13 +136,13 @@ def parse_tune(config: Any, arg: str) -> TuneRequest:
             raise TuneError(f"Unknown token: {tok}")
     if scope == "default" and model is None:
         raise TuneError("--global needs a model: it makes the model the default for new sessions")
-    return TuneRequest(model=model, effort=effort, ultra_mode=ultra, scope=scope or "session")
+    return TuneRequest(model=model, effort=effort, ultra_mode=ultra, provider=provider, scope=scope or "session")
 
 
 def request_from_params(params: dict[str, Any]) -> TuneRequest:
     """The ``tune.set`` params as a request (types checked; values are validated by :func:`apply_tune`)."""
     values: dict[str, str | None] = {}
-    for field in ("model", "effort", "ultra_mode", "scope"):
+    for field in ("model", "effort", "ultra_mode", "provider", "scope"):
         value = params.get(field)
         if value is not None and not isinstance(value, str):
             raise TuneError(f"{field} must be a string")
@@ -137,38 +150,46 @@ def request_from_params(params: dict[str, Any]) -> TuneRequest:
     scope = values["scope"] or "session"
     if scope not in SCOPES:
         raise TuneError(f"unknown scope: {scope} (one of {', '.join(SCOPES)})")
-    return TuneRequest(model=values["model"], effort=values["effort"], ultra_mode=values["ultra_mode"], scope=scope)
+    return TuneRequest(
+        model=values["model"],
+        effort=values["effort"],
+        ultra_mode=values["ultra_mode"],
+        provider=values["provider"],
+        scope=scope,
+    )
 
 
 def current_model(config: Any, live: Any) -> str:
     return (live.stored.model if live is not None else "") or config.default_model
 
 
-def _chain_for(config: Any, key: str) -> list[tuple[Any, str]]:
+def _chain_for(config: Any, key: str, provider: str = "") -> list[tuple[Any, str]]:
     """(provider, model id) pairs a turn on ``key`` sends to, in chain order.
 
     Exactly the specs the routers are built from (``TierRouters``, ``GatewayServer._active_model``): every provider
     contributes one, and one that does not define ``key`` falls back to its ``default`` model, so the first pair is the
-    model the turn goes to first even when only a later provider defines the key.
+    model the turn goes to first even when only a later provider defines the key. ``provider`` (the session's /provider
+    pick, else ``default_provider``) moves that block to the front, as the routers do.
     """
     specs = tier_model_specs(config, Tier.MAIN, key=key)  # one per provider
-    return [
-        (p, model)
-        for p, spec in zip(config.providers, specs, strict=True)
-        for model in ([spec] if isinstance(spec, str) else spec)
-        if model
-    ]
+    first = active_provider(config, provider)
+    blocks = sorted(zip(config.providers, specs, strict=True), key=lambda ps: ps[0].name != first)
+    return [(p, model) for p, spec in blocks for model in ([spec] if isinstance(spec, str) else spec) if model]
 
 
-def _label(config: Any, key: str) -> str:
-    """The first model id ``key`` routes to, '' when none."""
-    pairs = _chain_for(config, key)
+def _label(config: Any, key: str, provider: str = "") -> str:
+    """The first model id ``key`` routes to (on the ``provider`` block when one is pinned), '' when none."""
+    pairs = _chain_for(config, key, provider)
     return pairs[0][1] if pairs else ""
+
+
+def _pinned(live: Any) -> str:
+    return live.stored.provider if live is not None else ""
 
 
 def state_line(config: Any, live: Any) -> str:
     key = current_model(config, live)
-    label = _label(config, key)
+    label = _label(config, key, _pinned(live))
     model = f"{key} ({label})" if label and label != key else key
     if live is None:
         return f"Model: {model} · Effort and ultracode need an active session"
@@ -190,6 +211,7 @@ def apply_tune(ctx: Any, live: Any, req: TuneRequest) -> TuneOutcome:
         raise TuneError(f"unknown scope: {req.scope} (one of {', '.join(SCOPES)})")
     if (req.effort is not None or req.ultra_mode is not None) and live is None:
         raise TuneError("No active session.")
+    provider = provider_name(config, req.provider) if req.provider is not None else None
 
     saved = ""
     wrote = False
@@ -228,6 +250,19 @@ def apply_tune(ctx: Any, live: Any, req: TuneRequest) -> TuneOutcome:
         lines.append(f"Model key set to: {key}")
         if req.scope == "default":
             lines.append(f"Default model for new sessions: {key}{saved}")
+    if provider is not None:
+        # Like /provider: the session's turns try that block first from the next turn on; without a session it is the
+        # default of this daemon (not saved, also with --global).
+        if live is not None:
+            if live.stored.provider != provider:
+                changed.append("provider")
+            live.stored.provider = provider
+            session_changed = True
+        else:
+            if config.default_provider != provider:
+                changed.append("default_provider")
+            config.default_provider = provider
+        lines.append(f"Provider set to: {provider}")
     if req.effort is not None:
         # Sent from the next turn on: as output_config.effort to Claude models that take it, and as
         # reasoning_effort to OpenAI reasoning models. Other models ignore it.
@@ -265,7 +300,7 @@ def _takes(takes: list[bool | None]) -> bool | None:
     return False if takes and all(t is False for t in takes) else None
 
 
-def _model_rows(config: Any, current: str) -> list[dict[str, Any]]:
+def _model_rows(config: Any, current: str, provider: str = "") -> list[dict[str, Any]]:
     keys = [config.default_model]
     for p in config.providers:
         keys.extend(k for k in p.models if k not in keys)
@@ -273,7 +308,7 @@ def _model_rows(config: Any, current: str) -> list[dict[str, Any]]:
         keys.append(current)
     rows = []
     for key in keys:
-        pairs = _chain_for(config, key)
+        pairs = _chain_for(config, key, provider)
         takes = [takes_effort(model, p.kind) for p, model in pairs]
         rows.append(
             {
@@ -297,7 +332,7 @@ def snapshot(ctx: Any, live: Any) -> dict[str, Any]:
         "model": current_model(config, live),
         "default_model": config.default_model,
         "has_session": live is not None,
-        "models": _model_rows(config, current_model(config, live)),
+        "models": _model_rows(config, current_model(config, live), _pinned(live)),
         "efforts": list(EFFORT_LEVELS),
         "effort": live.reasoning_effort if live is not None else None,
         "ultra_modes": list(ULTRA_MODES),

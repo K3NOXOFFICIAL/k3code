@@ -638,3 +638,47 @@ async def test_claude_cli_on_path_but_not_logged_in_is_a_warning(fake_claude):
     fake_claude("out")
     row = next(c for c in await doctor.check_providers(cfg, probe=False) if c.name == "provider:claude-cli")
     assert row.status == doctor.OK  # --no-probe: claude is not run
+
+
+async def test_offline_is_a_warning_not_a_failure(monkeypatch):
+    """#163: no network made `k3code doctor` exit 1 even for a chain that works offline; k3code pauses by itself."""
+    from k3code import doctor
+    from k3code.reliability.netwatch import InternetProbeResult
+
+    async def offline(_config):
+        return InternetProbeResult(ok=False)
+
+    monkeypatch.setattr(doctor, "default_internet_probe", offline)
+    row = await doctor.check_netwatch_async()
+    assert (row.status, row.detail) == (doctor.WARN, "offline")
+    assert doctor.summary([row])[doctor.FAIL] == 0
+
+
+async def test_skipped_probes_are_counted_as_skipped_not_ok(tmp_path):
+    """#163: `--no-probe` reported the providers, the network and the daemon as ok without having looked at them."""
+    import json
+
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    entry = ProviderEntry(name="p", kind="openai", base_url="http://p", api_key_env="", models={"default": "m"})
+    checks = await doctor.run_checks(Settings(providers=[entry]), probe=False, home=tmp_path)
+    by_name = {c.name: c for c in checks}
+    for name in ("provider:p", "netwatch", "daemon"):
+        assert (by_name[name].status, by_name[name].detail) == (doctor.SKIP, "probe skipped"), name
+    counts = doctor.summary(checks)
+    assert counts[doctor.SKIP] == 3 and sum(counts.values()) == len(checks)
+    report = doctor.format_report(checks)
+    assert "- netwatch: probe skipped" in report and report.endswith(", 3 skipped")
+    assert json.loads(doctor.to_json(checks))["summary"]["skip"] == 3
+
+
+def test_readme_names_every_setup_step():
+    """#163: the README said the wizard has 12 steps after `project` made it 13."""
+    from pathlib import Path
+
+    from k3code.setup.steps import STEP_NAMES
+
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+    names = ", ".join(f"`{n}`" for n in STEP_NAMES)
+    assert f"The full wizard has {len(STEP_NAMES)} steps: {names}." in readme

@@ -690,6 +690,8 @@ def _take_over_stale_lock(lock: Path) -> None:
         if not now or now == started:
             raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
     _remove_recorded_tmp(lock)
+    # install.sh builds in <root>/tmp (stage_dir) and only while it holds the lock: what is left there is the dead run's
+    shutil.rmtree(lock.parent / "tmp", ignore_errors=True)
     # Not atomic, as in install.sh's take_lock: two runs that find the same stale lock can interleave (one removes it
     # and makes its own, the other then removes that one) and both go on; only a run that arrives between the rmtree
     # and the mkdir is stopped, by the mkdir. It takes two installs started within the same few milliseconds over a
