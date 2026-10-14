@@ -80,7 +80,7 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence_digest
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -598,7 +598,7 @@ class GatewayServer:
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
-        self.goal_judge: Any = None  # test hook: a goals.Judge, async (goal, last_text, evidence) -> verdict tuple
+        self.goal_judge: Any = None  # test hook: a goals.Judge, async (goal, last_text, TurnEvidence) -> verdict tuple
         self.providers: list[Any] = []
         self._provider_sigs: list[dict[str, Any]] = []  # provider_signature of the entries self.providers came from
         self._retiring: dict[int, Any] = {}  # replaced providers not closed yet (id -> provider), see _retire_providers
@@ -1809,7 +1809,7 @@ class GatewayServer:
                 judge,
                 cwd=session.stored.cwd or None,
                 reviewer=reviewer,
-                evidence=turn_evidence_digest(session.stored.messages[n_before:]),
+                evidence=turn_evidence(session.stored.messages[n_before:]),
             )
             self.emit_goal(session)
             if decision.message:

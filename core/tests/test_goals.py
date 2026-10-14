@@ -238,8 +238,8 @@ async def test_the_judge_receives_the_turns_evidence_digest(tmp_path, monkeypatc
     await call(server, "session.create", {"cwd": str(tmp_path)})
     got: list[tuple[str, str, str]] = []
 
-    async def judge(goal: str, response: str, evidence: str = ""):
-        got.append((goal, response, evidence))
+    async def judge(goal: str, response: str, evidence):
+        got.append((goal, response, evidence.render()))
         return "continue", "no test ran", False, False
 
     server.goal_judge = judge

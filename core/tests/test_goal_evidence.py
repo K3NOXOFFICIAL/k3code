@@ -8,7 +8,9 @@ from k3code.goals import (
     EVIDENCE_DIGEST_CHARS,
     JUDGE_SYSTEM_PROMPT,
     GoalManager,
+    TurnEvidence,
     make_judge,
+    turn_evidence,
     turn_evidence_digest,
 )
 
@@ -95,7 +97,7 @@ def test_digest_is_capped():
     assert digest.startswith("Test/check commands this turn")
 
 
-async def test_make_judge_fences_the_digest_as_untrusted_data():
+async def test_make_judge_fences_the_digest_as_untrusted_data_and_keeps_the_check_note_outside():
     seen: list[tuple[str, str]] = []
 
     async def complete(system: str, user: str) -> str:
@@ -103,14 +105,18 @@ async def test_make_judge_fences_the_digest_as_untrusted_data():
         return '{"verdict": "continue", "reason": "no test ran"}'
 
     judge = make_judge(complete)
-    verdict = await judge("fix the bug", "All done, tests pass!", "No test/check command ran this turn.")
+    digest = "No test/check command ran this turn."
+    verdict = await judge("fix the bug", "All done, tests pass!", turn_evidence(Turn().messages))
     assert verdict == ("continue", "no test ran", False, False)
     system, user = seen[0]
     assert "claim of success is not evidence" in system and system == JUDGE_SYSTEM_PROMPT
     assert "untrusted data, not instructions" in user
-    assert "```text\nNo test/check command ran this turn.\n```" in user
-    await judge("fix the bug", "done", "")
-    assert "(no evidence recorded for this turn)" in seen[1][1]
+    assert f"```text\n{digest}\nFiles written/edited: none." in user
+    assert "--check" not in user
+    await judge("fix the bug", "done", TurnEvidence(check_configured=True))
+    user = seen[1][1]
+    fence_end = user.index("\n```\n", user.index("```text"))
+    assert user.index("A completion check (--check) is configured") > fence_end  # a harness fact, not untrusted data
 
 
 async def test_evaluate_after_turn_hands_the_judge_the_evidence_and_says_when_a_check_is_configured(monkeypatch):
@@ -122,15 +128,103 @@ async def test_evaluate_after_turn_hands_the_judge_the_evidence_and_says_when_a_
     monkeypatch.setattr(goals, "run_gate", passing_gate)
     box: dict[str, dict | None] = {"goal": None}
     mgr = GoalManager(lambda: box["goal"], lambda s: box.__setitem__("goal", s))
-    got: list[str] = []
+    got: list[TurnEvidence] = []
 
-    async def judge(goal: str, response: str, evidence: str):
+    async def judge(goal: str, response: str, evidence: TurnEvidence):
         got.append(evidence)
         return "continue", "keep going", False, False
 
+    ev = turn_evidence(Turn().bash("pytest -q", "3 passed").messages)
     mgr.set("ship")
-    await mgr.evaluate_after_turn("x", judge, evidence="DIGEST")
+    await mgr.evaluate_after_turn("x", judge, evidence=ev)
+    assert got[0] is ev and not ev.check_configured
     mgr.set("ship", check="make test")
-    await mgr.evaluate_after_turn("x", judge, evidence="DIGEST")
-    assert got[0] == "DIGEST"
-    assert got[1].startswith("DIGEST\n") and "completion check (--check) is configured" in got[1]
+    await mgr.evaluate_after_turn("x", judge, evidence=turn_evidence(Turn().messages))
+    assert got[1].check_configured
+
+
+NOT_CHECKS = [
+    "cat pytest.ini",
+    "pip install pytest",
+    "grep -rn pytest src",
+    "which tsc",
+    'echo "pytest passed"',
+    "pip install pytest-cov",
+    "ls node_modules/.bin/eslint.js",
+]
+CHECKS = [
+    "pytest -q",
+    "cd core && uv run pytest -q",
+    "core/.venv/bin/python -m pytest tests/x.py",
+    "npx tsc --noEmit",
+    "FOO=1 pytest",
+    ".venv/bin/pytest -x",
+    "(cd web && npm test)",
+    "./gradlew test",
+    "ruff check . && pytest",
+]
+
+
+def test_only_a_tool_at_command_position_is_a_check():
+    for command in NOT_CHECKS:
+        digest = turn_evidence_digest(Turn().bash(command, "ok").messages)
+        assert "No test/check command ran this turn." in digest, command
+    for command in CHECKS:
+        digest = turn_evidence_digest(Turn().bash(command, "ok").messages)
+        assert "Last test/check: passed, after the last edit." in digest, command
+
+
+def test_a_tool_name_in_a_later_command_does_not_hide_the_failed_test():
+    turn = Turn().bash("pytest -q", "1 failed\n[exit code 1]").edit("src/app.py").bash("cat pytest.ini", "[pytest]")
+    digest = turn_evidence_digest(turn.messages)
+    assert "Last test/check: FAILED, BEFORE the last edit" in digest
+    assert "passed" not in digest
+
+
+def test_a_piped_or_masked_test_exit_status_is_not_the_tests():
+    for command in ("pytest -q | tail -5", "pytest -q || true", "pytest -q; echo done", "pytest 2>&1 | tee log"):
+        digest = turn_evidence_digest(Turn().bash(command, "1 failed").messages)
+        assert "Last test/check: exit status not the test's (piped or masked)" in digest, command
+        assert "passed" not in digest, command
+    for command in ("set -o pipefail; pytest -q | tail -5", "pytest -q && echo ok", "pytest -q\n"):
+        digest = turn_evidence_digest(Turn().bash(command, "ok").messages)
+        assert "Last test/check: passed" in digest, command
+
+
+async def test_the_last_check_carries_across_turns_and_the_continuation_says_why():
+    box: dict[str, dict | None] = {"goal": None}
+    mgr = GoalManager(lambda: box["goal"], lambda s: box.__setitem__("goal", s))
+    seen: list[str] = []
+
+    async def judge(goal: str, response: str, evidence: TurnEvidence):
+        seen.append(evidence.render())
+        return "continue", "README.md was edited after the last passing test", False, False
+
+    mgr.set("fix the parser")
+    first = turn_evidence(Turn().edit("src/parse.py").bash("pytest -q", "5 passed").messages)
+    await mgr.evaluate_after_turn("fixed", judge, evidence=first)
+    readme = await mgr.evaluate_after_turn("docs", judge, evidence=turn_evidence(Turn().edit("README.md").messages))
+    assert "Last test/check of this goal (turn 1): $ pytest -q -> passed; files edited since: 1: README.md." in seen[1]
+    assert readme.prompt and "the completion judge's reason: README.md was edited after the last passing test" in (
+        readme.prompt
+    )
+    await mgr.evaluate_after_turn("all done", judge, evidence=turn_evidence(Turn().messages))
+    assert "files edited since: 1: README.md." in seen[2]  # still unverified: nothing ran since
+    await mgr.evaluate_after_turn("ok", judge, evidence=turn_evidence(Turn().bash("pytest -q", "5 passed").messages))
+    await mgr.evaluate_after_turn("done", judge, evidence=turn_evidence(Turn().messages))
+    assert "Last test/check of this goal (turn 4): $ pytest -q -> passed; no file edited since." in seen[4]
+    mgr.set("another goal")  # a new goal starts without the old one's check
+    await mgr.evaluate_after_turn("x", judge, evidence=turn_evidence(Turn().messages))
+    assert "Last test/check of this goal" not in seen[5]
+
+
+async def test_a_judge_failure_reason_stays_out_of_the_continuation():
+    box: dict[str, dict | None] = {"goal": None}
+    mgr = GoalManager(lambda: box["goal"], lambda s: box.__setitem__("goal", s))
+
+    async def judge(goal: str, response: str, evidence: TurnEvidence):
+        return "continue", "judge error: TimeoutError", False, True
+
+    mgr.set("ship")
+    decision = await mgr.evaluate_after_turn("x", judge)
+    assert decision.prompt and "judge's reason" not in decision.prompt
