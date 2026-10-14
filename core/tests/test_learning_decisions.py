@@ -88,3 +88,74 @@ def test_scrub_catches_every_secret_shape(tmp_path):
         log.record("config", subject=text, detail={"cmd": text})
     dumped = json.dumps(log.query("config"))
     assert not [s for s in SECRET_SHAPES.values() if s in dumped]
+
+
+def test_tool_error_sightings_count_one_signature_of_one_tool_in_one_project_inside_the_window(tmp_path):
+    clock = FakeClock()
+    log = DecisionLog(tmp_path, clock)
+    sig = "npm: exit <n>: sh: <n>: npm: not found"
+    now = clock()
+
+    def add(ts, *, subject=sig, tool="bash", project="p", choice="exit 127", actor="user", **detail):
+        log.record(
+            "tool_error",
+            subject=subject,
+            choice=choice,
+            detail={"tool": tool, **detail},
+            ts=ts,
+            project=project,
+            actor=actor,
+        )
+
+    add(now - 15 * 86400, followup="`old` worked instead")  # older than the window
+    add(now - 3 * 86400, project="other", followup="`other` worked instead")
+    add(now - 3 * 86400, tool="read")
+    add(now - 3 * 86400, subject="other signature")
+    log.record("approval", subject=sig, detail={"tool": "bash"}, ts=now - 3 * 86400, project="p")  # not a tool_error
+    since = now - 14 * 86400
+    assert log.tool_error_sightings("p", "bash", sig, since, 3) == (0, "", "")
+
+    add(now - 2 * 86400, choice="exit 1", followup="`pnpm test` worked instead")
+    add(now - 86400, choice="exit 2", actor="auto")  # any actor counts; no retry noted on it
+    add(now - 3600, choice="exit 127", followup="")
+    seen = log.tool_error_sightings("p", "bash", sig, since, 10)
+    assert seen.count == 3 and seen.choice == "exit 127"  # the newest row's class
+    assert seen.followup == "`pnpm test` worked instead"  # the newest retry that was noted, not the newest row's
+    assert log.tool_error_sightings("p", "bash", sig, since, 2).count == 2  # capped
+    assert log.tool_error_sightings("p", "read", sig, since, 10).count == 1
+
+
+def test_tool_error_sightings_use_the_composite_index_and_decode_no_row(tmp_path, monkeypatch):
+    from k3code.learning import decisions
+
+    log = DecisionLog(tmp_path)
+    sig = "npm: exit <n>: sh: <n>: npm: not found"
+    for i in range(300):
+        log.record("tool_error", subject=f"s{i}", choice="exit 1", detail={"tool": "bash"}, project="p", ts=1000.0 + i)
+    log.record(
+        "tool_error", subject=sig, choice="exit 127", detail={"tool": "bash", "followup": "x"}, project="p", ts=1500.0
+    )
+    plan = " ".join(
+        str(r[3])
+        for r in log._db.execute(
+            "EXPLAIN QUERY PLAN SELECT choice FROM decisions WHERE kind='tool_error' AND project=? AND subject=?"
+            " AND ts>=? AND json_extract(detail, '$.tool')=? ORDER BY ts DESC, id DESC LIMIT 1",
+            ("p", sig, 0.0, "bash"),
+        )
+    )
+    assert "decisions_kind_project_subject_ts" in plan and "SCAN" not in plan
+    monkeypatch.setattr(decisions, "json", None)  # any json.loads/dumps in the lookup would raise
+    assert log.tool_error_sightings("p", "bash", sig, 0.0, 3) == (1, "exit 127", "x")
+
+
+def test_an_older_database_gets_the_signature_index_when_it_is_opened(tmp_path):
+    DecisionLog(tmp_path).close()
+    import sqlite3
+
+    db = sqlite3.connect(tmp_path / "learning" / "decisions.db")
+    db.execute("DROP INDEX decisions_kind_project_subject_ts")
+    db.commit()
+    db.close()
+    log = DecisionLog(tmp_path)
+    names = {r[1] for r in log._db.execute("PRAGMA index_list(decisions)")}
+    assert "decisions_kind_project_subject_ts" in names

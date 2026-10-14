@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, redact, redact_session_json
+from k3code.redact import REDACTED, drop_values, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -42,12 +42,14 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession) -> dict[str, Any]:
-    return redact_session_json(asdict(s))
+def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
+    return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _known_secrets(config: Any, cwd: Path) -> list[str]:
-    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first."""
+def _known_secrets(config: Any, cwd: Path) -> tuple[list[str], list[str]]:
+    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first; and
+    the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
     from k3code.debugdump import secret_values
 
     if config is None:
@@ -57,20 +59,30 @@ def _known_secrets(config: Any, cwd: Path) -> list[str]:
             config = load_config(project_dir=cwd)
         except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
             config = None
-    return secret_values(config)
+    return secret_values(config), secret_values(config, guesses=False)
 
 
-def _drop_values(obj: Any, secrets: list[str]) -> Any:
-    """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
-    if isinstance(obj, dict):
-        return {k: _drop_values(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_drop_values(v, secrets) for v in obj]
-    if isinstance(obj, str):
-        for s in secrets:
-            if s in obj:
-                obj = obj.replace(s, REDACTED)
-    return obj
+def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
+    if not isinstance(rules, dict):  # `bash: ask`, or the hardline regexes
+        return drop_values(rules, certain if tool == "hardline" else secrets)
+    # only an exact `deny` or `ask` is a rule that hiding a guessed value would break (rules.Rule rejects any other)
+    drop = {p: certain if a in ("deny", "ask") else secrets for p, a in rules.items()}
+    return {drop_values(p, drop[p]): drop_values(a, secrets) for p, a in rules.items()}
+
+
+def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]) -> dict[str, Any]:
+    """``settings`` without the known secret values (``drop_values``). A deny or ask rule's pattern and a hardline
+    regex lose only the ``certain`` ones: hiding a guessed value (an MCP root path, a region) there leaves a rule that
+    never matches, and the import then allows what it denied. Every other rule (allow, or an action no rule accepts)
+    and every key, tool names included, loses every known value: an allow rule then only asks again."""
+    return {
+        drop_values(key, secrets): {
+            drop_values(tool, secrets): _drop_rules(tool, rules, secrets, certain) for tool, rules in value.items()
+        }
+        if key == "permissions" and isinstance(value, dict)
+        else drop_values(value, secrets)
+        for key, value in settings.items()
+    }
 
 
 def write_bundle(
@@ -83,20 +95,20 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    secrets = _known_secrets(config, cwd)
+    secrets, certain = _known_secrets(config, cwd)
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = _drop_values(redact(confio.read_yaml(src)), secrets)
+                data = redact(_drop_known(confio.read_yaml(src), secrets, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = _drop_values(session_to_dict(stored), secrets)
+        session = session_to_dict(stored, secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
@@ -176,11 +188,12 @@ def read_bundle(path: Path) -> Bundle:
 
 
 def _strip_redacted(obj: Any) -> Any:
-    """Drop ``<redacted>`` placeholders anywhere inside ``obj`` (they must never be written to config)."""
+    """Drop ``<redacted>`` values from the dicts inside ``obj``. A list keeps the marker in place: without it every
+    later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
     if isinstance(obj, dict):
         return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
     if isinstance(obj, list):
-        return [_strip_redacted(v) for v in obj if v != REDACTED]
+        return [_strip_redacted(v) for v in obj]
     return obj
 
 

@@ -306,7 +306,8 @@ export function settingsKey(
     state: { ...state, ...patch },
   });
 
-  if (opts.locked || key.ctrl || key.meta) {
+  // Ink flags every Esc as meta (a bare ESC byte parses as meta+escape): let it through, or the panel cannot be closed.
+  if (opts.locked || key.ctrl || (key.meta && !key.escape)) {
     return same;
   }
 
