@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from k3code.autonomy import autonomy_cfg
+from k3code.autonomy import DEFAULTS, autonomy_cfg
 from k3code.autonomy.plan_first import parse_plan
 from k3code.reliability.governor import Governor
 from k3code.subagents import worktree as wt_mod
@@ -148,6 +148,7 @@ class Subtask:
     detail: str = ""
     review: str = ""
     worktree: wt_mod.Worktree | None = None
+    reserved: int = 0  # reviewer slots its running worker keeps in the agent budget
 
     def row(self) -> dict[str, Any]:
         return {
@@ -215,21 +216,22 @@ class FanoutExecutor:
         return extract_subtasks(v, gate.plan)
 
     def budget(self, n_subtasks: int) -> AgentBudget:
-        """The budget of an auto fan-out: ``autonomy.fanout.max_tokens`` (0 = no cap) and ``max_agents`` (0 = 4 agents
-        per subtask, at most 16; a worker only starts while a reviewer slot is left for it). Negative or non-numeric
-        values count as 0. /ultracode builds its own, shared with its planners."""
-        max_agents = self._count("max_agents") or min(4 * n_subtasks, 16)
-        return AgentBudget(max_agents, self._count("max_tokens") or None)
+        """The budget of an auto fan-out: ``autonomy.fanout.max_tokens`` (0 = no cap; default 1,000,000) and
+        ``max_agents`` (0 = 4 agents per subtask, at most 16; a worker only starts while a reviewer slot is kept for
+        it and for every worker already running). A value that is not a non-negative whole number (``"500k"``, ``-1``,
+        ``null``, ``true``) counts as unset, so a typo never removes the cap. /ultracode builds its own, shared with
+        its planners."""
+        max_agents = self._count("max_agents", 0) or min(4 * n_subtasks, 16)
+        return AgentBudget(max_agents, self._count("max_tokens", DEFAULTS["fanout"]["max_tokens"]) or None)
 
-    def _count(self, key: str) -> int:
+    def _count(self, key: str, default: int) -> int:
         v = self.cfg[key]
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            n = 0
-        else:
-            n = max(int(v), 0)
-        if n != v:
-            logger.warning("autonomy.fanout.%s=%r is not a non-negative number; using %d", key, v, n)
-        return n
+        if isinstance(v, float) and v.is_integer():  # YAML reads ``1.0e+6`` as a float
+            v = int(v)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            return v
+        logger.warning("autonomy.fanout.%s=%r is not a non-negative whole number; using %d", key, v, default)
+        return default
 
     # ── the run ──
 
@@ -354,12 +356,23 @@ class FanoutExecutor:
         if (rel := getattr(ctx.session, "reliability", None)) is not None and (err := rel.check_budgets()) is not None:
             raise BudgetStop(str(err))
         if ctx.budget is not None:
-            if agent_type == "worker" and ctx.budget.max_agents is not None:
-                # a worker's result is useless unmerged-and-unreviewed: keep a slot for its reviewer
+            if ctx.budget.max_agents is not None and agent_type in ("worker", "reviewer"):
+                # a worker's result is useless unmerged-and-unreviewed: it starts only while a slot is left for its
+                # reviewer on top of the slots kept for the reviewers of the workers already running. A reviewer uses
+                # its worker's slot; a second try of a reviewer has none and must not eat another worker's
                 ctx.budget.check()
-                if ctx.budget.max_agents - ctx.budget.agents < 2:
-                    raise BudgetStop(f"agent budget exhausted ({ctx.budget.agents}/{ctx.budget.max_agents} agents)")
+                own = st.reserved if agent_type == "reviewer" else 0
+                need = 2 if agent_type == "worker" else 1 - own
+                free = ctx.budget.max_agents - ctx.budget.agents - ctx.reserved
+                if free < need:
+                    kept = f", {ctx.reserved} kept for reviewers" if ctx.reserved else ""
+                    b = ctx.budget
+                    raise BudgetStop(f"agent budget exhausted ({b.agents}/{b.max_agents} agents{kept})")
             ctx.budget.take_agent()
+            if agent_type == "worker":
+                st.reserved, ctx.reserved = st.reserved + 1, ctx.reserved + 1
+            elif agent_type == "reviewer":
+                self._release(ctx, st)
         mgr = self.server.subagents
         idx = int(st.id[1:]) - 1
         h = mgr.spawn(
@@ -378,6 +391,12 @@ class FanoutExecutor:
         if ctx.budget is not None:
             ctx.budget.charge(h)
         return h
+
+    @staticmethod
+    def _release(ctx: _Ctx, st: Subtask) -> None:
+        """Give back the reviewer slot a worker kept (its reviewer started, or the worker has nothing to review)."""
+        ctx.reserved -= st.reserved
+        st.reserved = 0
 
     def worker_prompt(self, ctx: _Ctx, st: Subtask) -> str:
         files = parse_plan(ctx.plan).get("Files", "").strip()
@@ -434,6 +453,8 @@ class FanoutExecutor:
         except Exception as e:  # noqa: BLE001 - one subtask must not take the others down
             logger.exception("fan-out subtask %s crashed", st.id)
             self.progress(ctx, st, "failed", f"{type(e).__name__}: {e}")
+        finally:
+            self._release(ctx, st)  # a worker that failed or changed nothing never reaches its reviewer
 
     def review_prompt(self, ctx: _Ctx, st: Subtask, worker: Handle) -> str:
         verification = parse_plan(ctx.plan).get("Verification", "").strip()
@@ -569,3 +590,4 @@ class _Ctx:
     sem: asyncio.Semaphore
     merge_lock: asyncio.Lock
     executor: FanoutExecutor
+    reserved: int = 0  # reviewer slots kept for the workers that started and have not been reviewed yet
