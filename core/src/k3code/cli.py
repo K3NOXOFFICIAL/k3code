@@ -1170,12 +1170,20 @@ def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
 @click.option("--session", "session_id", help="Export one session by id")
 @click.option("--settings-only", is_flag=True)
 @click.option("--session-only", is_flag=True)
+@click.option("--memory-only", is_flag=True, help="Export the memory alone (no settings, no sessions)")
+@click.option("--no-memory", is_flag=True, help="Leave the memory (USER.md, learned notes, gotchas) out")
 def export_cmd(
-    path: Path | None, all_sessions: bool, session_id: str | None, settings_only: bool, session_only: bool
+    path: Path | None,
+    all_sessions: bool,
+    session_id: str | None,
+    settings_only: bool,
+    session_only: bool,
+    memory_only: bool,
+    no_memory: bool,
 ) -> None:
-    """Write a .k3bundle (settings with secrets redacted + sessions)."""
+    """Write a .k3bundle (settings with secrets redacted + sessions + memory)."""
     from k3code.bundle import BundleError
-    from k3code.commands.export import run_export
+    from k3code.commands.export import export_summary, run_export
     from k3code.gateway.sessions import SessionStore
     from k3code.paths import home
 
@@ -1191,15 +1199,14 @@ def export_cmd(
             current=recent.session_id if recent else None,
             settings_only=settings_only,
             session_only=session_only,
+            memory_only=memory_only,
+            no_memory=no_memory,
         )
     except BundleError as e:
         raise click.ClickException(str(e)) from e
     finally:
         store.close()
-    c = manifest["contents"]
-    click.echo(
-        f"Exported {len(c['sessions'])} session(s), {len(c['settings'])} settings file(s) to {out} (secrets redacted)."
-    )
+    click.echo(export_summary(out, manifest))
 
 
 @cli.command("import")
@@ -1207,23 +1214,40 @@ def export_cmd(
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (headless)")
 @click.option("--settings-only", is_flag=True)
 @click.option("--session-only", is_flag=True)
+@click.option("--memory-only", is_flag=True, help="Import the memory alone (no settings, no sessions)")
+@click.option("--no-memory", is_flag=True, help="Leave the bundle's memory out")
 @click.option(
     "--trust-bundle",
     is_flag=True,
-    help="Also apply MCP servers, permission rules, provider endpoints and hooks without asking (--yes does not)",
+    help="Also apply MCP servers, permission rules, provider endpoints, hooks and the user memory without asking "
+    "(--yes does not)",
 )
-def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool, trust_bundle: bool) -> None:
-    """Import a .k3bundle: merge settings (existing config backed up) and sessions.
+def import_cmd(
+    path: Path,
+    yes: bool,
+    settings_only: bool,
+    session_only: bool,
+    memory_only: bool,
+    no_memory: bool,
+    trust_bundle: bool,
+) -> None:
+    """Import a .k3bundle: merge settings (existing config backed up), sessions and memory.
 
-    MCP servers, permission rules, provider endpoints and hooks are asked for one by one in a terminal; without one
-    (and without --trust-bundle) they are skipped with a warning.
+    MCP servers, permission rules, provider endpoints, hooks and the user memory (USER.md lines) are asked for one by
+    one in a terminal; without one (and without --trust-bundle) they are skipped with a warning. Learned notes and
+    gotchas are merged (gotchas as auto-learned lines, never into the system prompt).
     """
     from k3code.bundle import BundleError, apply_bundle, read_bundle
+    from k3code.commands.import_ import import_parts
     from k3code.gateway.sessions import SessionStore
     from k3code.paths import home
 
-    if settings_only and session_only:
-        raise click.UsageError("--settings-only and --session-only exclude each other")
+    parts = import_parts(settings_only, session_only, memory_only, no_memory)
+    if parts is None:
+        raise click.UsageError(
+            "--settings-only, --session-only and --memory-only exclude each other, and --memory-only excludes "
+            "--no-memory"
+        )
     try:
         bundle = read_bundle(path)
     except BundleError as e:
@@ -1237,10 +1261,11 @@ def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool, t
             bundle,
             store=store,
             cwd=Path.cwd(),
-            settings=not session_only,
-            sessions=not settings_only,
+            settings=parts["settings"],
+            sessions=parts["sessions"],
             accept=_confirm_item if _is_interactive() else None,
             trust_bundle=trust_bundle,
+            memory=parts["memory"],
         )
     except (BundleError, ValueError) as e:
         raise click.ClickException(str(e)) from e

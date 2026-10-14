@@ -1,4 +1,4 @@
-"""``.k3bundle``: tar.gz with manifest.json, redacted settings/ and sessions/<id>.json."""
+"""``.k3bundle``: tar.gz with manifest.json, redacted settings/, sessions/<id>.json and memory.json."""
 
 from __future__ import annotations
 
@@ -19,12 +19,20 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, drop_values, redact, redact_session_json
+from k3code.redact import REDACTED, drop_values, redact, redact_session_json, scrub_text
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
 _SETTINGS_FILES = {"settings/user.config.yaml": "user", "settings/project.config.yaml": "project"}
 _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
+_MEMORY_FILE = "memory.json"
+MEMORY_VERSION = 1
+#: entries a memory.json list keeps (on export and on read), and the longest single entry read from one
+MAX_MEMORY_ENTRIES = 200
+MAX_MEMORY_ENTRY_CHARS = 2000
+#: learned notes a project keeps after an import merged the bundle's into them
+MAX_IMPORTED_LEARNED = 60
+_MEMORY_LISTS = ("learned", "gotchas", "gotchas_auto", "user_gotchas")
 #: Session meta an imported bundle must not carry over: a permission mode (yolo), extra writable roots, and the
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose), and the
@@ -73,8 +81,10 @@ def write_bundle(
     session_ids: list[str],
     settings: bool = True,
     config: Any = None,
+    memory: bool = False,
 ) -> dict[str, Any]:
-    """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
+    """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``).
+    ``memory``: add memory.json (see :func:`collect_memory`), redacted the same way."""
     secrets = _known_secrets(config, cwd)
     files: dict[str, bytes] = {}
     if settings:
@@ -91,12 +101,21 @@ def write_bundle(
         session = session_to_dict(stored, secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
+    mem = collect_memory(cwd, secrets) if memory else {}
+    present = _memory_keys(mem)
+    if present:
+        files[_MEMORY_FILE] = json.dumps(mem, ensure_ascii=False, indent=1).encode()
     manifest = {
         "version": BUNDLE_VERSION,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "k3code": k3_version,
         "redacted": True,
-        "contents": {"settings": sorted(n for n in files if n.startswith("settings/")), "sessions": exported},
+        "contents": {
+            "settings": sorted(n for n in files if n.startswith("settings/")),
+            "sessions": exported,
+            "memory": present,
+        },
+        "memory_counts": _memory_counts(mem),
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,15 +127,113 @@ def write_bundle(
     return manifest
 
 
+def _instruction_files(cwd: Path) -> list[dict[str, Any]]:
+    """The project's instruction files at the repository root and its rules, by name and size (never their text)."""
+    from k3code.memory import PROJECT_FILES, RULES_DIR, project_root
+
+    root = project_root(cwd)
+    paths = [root / name for name in PROJECT_FILES]
+    rules = root.joinpath(*RULES_DIR)
+    if rules.is_dir():
+        paths += sorted(rules.glob("*.md"))
+    out = []
+    for p in paths:
+        if p.is_file():
+            out.append({"name": p.relative_to(root).as_posix(), "bytes": p.stat().st_size})
+    return out[:MAX_MEMORY_ENTRIES]
+
+
+def collect_memory(cwd: Path, secrets: list[str]) -> dict[str, Any]:
+    """memory.json for ``cwd``'s project: the user's USER.md, the learned notes, the gotchas (accepted, auto-learned,
+    user-level) and the names of the instruction files. Every string scrubbed by shape and stripped of ``secrets``."""
+    from k3code.learning.decisions import project_id
+    from k3code.learning.gotchas import _entries, auto_gotchas_path, gotchas_path, user_gotchas_path
+    from k3code.memory import MAX_MEMORY_TOTAL, read_learned, user_memory_path
+
+    pid = project_id(cwd)
+    user_file = user_memory_path()
+    user = user_file.read_text(encoding="utf-8", errors="replace")[:MAX_MEMORY_TOTAL] if user_file.is_file() else None
+    mem: dict[str, Any] = {
+        "version": MEMORY_VERSION,
+        "project_id": pid,
+        "user": user if user and user.strip() else None,
+        "learned": read_learned(cwd),
+        "gotchas": _entries(gotchas_path(pid)),
+        "gotchas_auto": _entries(auto_gotchas_path(pid)),
+        "user_gotchas": _entries(user_gotchas_path()),
+    }
+    for key in _MEMORY_LISTS:
+        mem[key] = [scrub_text(x) for x in mem[key][-MAX_MEMORY_ENTRIES:]]
+    mem["project_id"] = scrub_text(pid)
+    if mem["user"] is not None:
+        mem["user"] = scrub_text(mem["user"])
+    mem["instructions"] = [{**x, "name": scrub_text(x["name"])} for x in _instruction_files(cwd)]
+    return drop_values(mem, secrets)
+
+
+def _memory_keys(mem: dict[str, Any]) -> list[str]:
+    """The keys of memory.json that hold something (the manifest lists them)."""
+    return [k for k in ("user", *_MEMORY_LISTS, "instructions") if mem.get(k)]
+
+
+def _memory_counts(mem: dict[str, Any]) -> dict[str, int]:
+    return {
+        "user": int(bool(mem.get("user"))),
+        "learned": len(mem.get("learned") or []),
+        "gotchas": sum(len(mem.get(k) or []) for k in ("gotchas", "gotchas_auto", "user_gotchas")),
+        "instructions": len(mem.get("instructions") or []),
+    }
+
+
+def describe_memory(counts: dict[str, int]) -> str:
+    """``user, 12 learned notes, 3 gotchas`` from :func:`_memory_counts` (``none`` when it is all empty)."""
+    parts = ["user"] if counts.get("user") else []
+    if n := counts.get("learned"):
+        parts.append(f"{n} learned note{'s' if n != 1 else ''}")
+    if n := counts.get("gotchas"):
+        parts.append(f"{n} gotcha{'s' if n != 1 else ''}")
+    if n := counts.get("instructions"):
+        parts.append(f"{n} instruction file name{'s' if n != 1 else ''}")
+    return ", ".join(parts) or "none"
+
+
+def _memory_from(obj: Any) -> dict[str, Any]:
+    """memory.json as read: values of the wrong type are dropped, lists and text capped; never raises."""
+    from k3code.memory import MAX_MEMORY_TOTAL
+
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(obj.get("project_id"), str):
+        out["project_id"] = obj["project_id"][:MAX_MEMORY_ENTRY_CHARS]
+    if isinstance(obj.get("user"), str) and obj["user"].strip():
+        out["user"] = obj["user"][:MAX_MEMORY_TOTAL]
+    for key in _MEMORY_LISTS:
+        value = obj.get(key)
+        if isinstance(value, list):
+            entries = [x[:MAX_MEMORY_ENTRY_CHARS] for x in value if isinstance(x, str) and x.strip()]
+            out[key] = entries[-MAX_MEMORY_ENTRIES:]
+    value = obj.get("instructions")
+    if isinstance(value, list):
+        out["instructions"] = [
+            {"name": x["name"][:300], "bytes": x["bytes"] if isinstance(x.get("bytes"), int) else 0}
+            for x in value
+            if isinstance(x, dict) and isinstance(x.get("name"), str) and x["name"].strip()
+        ][:MAX_MEMORY_ENTRIES]
+    return out
+
+
 @dataclass
 class Bundle:
     manifest: dict[str, Any]
     settings: dict[str, dict[str, Any]] = field(default_factory=dict)  # "user"|"project" → config
     sessions: list[dict[str, Any]] = field(default_factory=list)
+    memory: dict[str, Any] = field(default_factory=dict)  # memory.json, validated (see _memory_from)
 
     def describe(self) -> str:
         lines = [f"k3bundle v{self.manifest.get('version')} created {self.manifest.get('created')}"]
         lines.append("settings: " + (", ".join(sorted(self.settings)) or "(none)"))
+        lines.append("memory: " + describe_memory(_memory_counts(self.memory)))
         lines.append(f"sessions: {len(self.sessions)}")
         for s in self.sessions[:10]:
             title = s.get("title") or "(untitled)"
@@ -179,6 +296,11 @@ def _read_bundle(path: Path) -> Bundle:
                     raise BundleError(f"bad {name}: {e}") from e
                 if isinstance(obj, dict) and obj.get("session_id"):
                     out.sessions.append(obj)
+            elif name == _MEMORY_FILE:
+                try:
+                    out.memory = _memory_from(json.loads(load(name)))
+                except json.JSONDecodeError as e:
+                    raise BundleError(f"bad {name}: {e}") from e
     return out
 
 
@@ -429,6 +551,10 @@ class ImportReport:
     hidden: list[str] = field(default_factory=list)
     #: providers left out because the bundle hides their endpoint (or key variable) and this machine has none
     incomplete: list[str] = field(default_factory=list)
+    #: what the memory import did, one line each
+    memory: list[str] = field(default_factory=list)
+    #: which prompt inputs it wrote ("user", "learned"): a live session reads them again
+    memory_changed: set[str] = field(default_factory=set)
 
     def describe(self) -> str:
         lines = []
@@ -440,9 +566,14 @@ class ImportReport:
                 "api_key_env and this machine has no entry of that name; add it here (it is not a failed import)"
             )
         for key in self.skipped:
+            why = (
+                "it goes into every session's system prompt"
+                if key == "memory.user"
+                else "runs code, approves tools or sends keys"
+            )
             lines.append(
-                f"warning: skipped {key} from the bundle (runs code, approves tools or sends keys; accept it item by "
-                "item in an interactive import, or pass --trust-bundle)"
+                f"warning: skipped {key} from the bundle ({why}; accept it item by item in an interactive import, "
+                "or pass --trust-bundle)"
             )
         if self.hidden:
             shown = ", ".join(self.hidden[:5]) + (f" and {len(self.hidden) - 5} more" if len(self.hidden) > 5 else "")
@@ -457,6 +588,7 @@ class ImportReport:
             lines.append(f"backup: {b}")
         for old, new in self.sessions.items():
             lines.append(f"session {old}" + (f" → {new} (id collided)" if old != new else " imported"))
+        lines.extend(self.memory)
         if self.untrusted_project:
             lines.append(
                 f"{self.untrusted_project} is not trusted yet: `k3code trust` shows what it changes and applies it"
@@ -556,15 +688,116 @@ def _targets(bundle: Bundle, cwd: Path) -> list[tuple[str, dict[str, Any], Path,
     ]
 
 
-def pending_sensitive(bundle: Bundle, cwd: Path) -> list[SensitiveItem]:
+_NOTHING_YET = "- (nothing learned yet)"  # the distiller's placeholder line, not a note
+
+
+def _user_lines(bundle: Bundle) -> list[str]:
+    """The bullet lines of the bundle's USER.md (as the model sees it) that the local USER.md does not have yet."""
+    from k3code.memory import _user_body, user_memory_path
+
+    text = bundle.memory.get("user")
+    if not isinstance(text, str):
+        return []
+    local = user_memory_path()
+    have = (
+        {ln.strip() for ln in local.read_text(encoding="utf-8", errors="replace").splitlines()}
+        if local.is_file()
+        else set()
+    )
+    out: list[str] = []
+    for line in _user_body(text).splitlines():
+        line = scrub_text(line.strip())
+        if not line.startswith("- ") or not line[2:].strip() or line == _NOTHING_YET:
+            continue
+        if line not in have and line not in out:
+            out.append(line)
+    return out
+
+
+def memory_items(bundle: Bundle) -> list[SensitiveItem]:
+    """The bundle's user memory as one gated item (it goes into every session's system prompt), or none when it adds
+    no line the local USER.md lacks."""
+    lines = _user_lines(bundle)
+    return [SensitiveItem("memory.user", ("memory", "user"), [f"+ {ln}" for ln in lines])] if lines else []
+
+
+def pending_sensitive(bundle: Bundle, cwd: Path, *, settings: bool = True, memory: bool = True) -> list[SensitiveItem]:
     """The sensitive items :func:`apply_bundle` will ask about (or skip), for a caller that asks before it applies: the
-    same items, from the same settings and files, so a yes can be matched to the item it was given for."""
-    return [
+    same items, from the same settings and files, so a yes can be matched to the item it was given for. ``settings``
+    and ``memory``: what the caller will apply (the items of a part it leaves out are not listed)."""
+    items = [
         item
-        for _kind, incoming, target, gated in _targets(bundle, cwd)
+        for _kind, incoming, target, gated in (_targets(bundle, cwd) if settings else [])
         if gated
         for item in sensitive_items(bundle, confio.read_yaml(target), incoming=incoming)
     ]
+    return items + (memory_items(bundle) if memory else [])
+
+
+def _append_user_memory(lines: list[str]) -> Path:
+    """Append ``lines`` to USER.md under a dated heading; private file and directory, as append_memory keeps them."""
+    from k3code.memory import user_memory_path
+    from k3code.paths import ensure_private_dir, private_file
+
+    path = user_memory_path()
+    ensure_private_dir(path.parent)
+    private_file(path)
+    existing = path.read_text(encoding="utf-8", errors="replace")
+    sep = "" if not existing or existing.endswith("\n") else "\n"
+    gap = "\n" if existing.strip() else ""
+    block = f"{gap}## Imported from bundle ({time.strftime('%Y-%m-%d')})\n\n" + "".join(f"{ln}\n" for ln in lines)
+    path.write_text(existing + sep + block, encoding="utf-8")
+    return path
+
+
+def _plain_entry(line: str) -> str:
+    """A gotcha entry without its ``- `` and with its whitespace folded ('' when nothing is left)."""
+    text = " ".join(line.split())
+    return " ".join(text[2:].split()) if text.startswith("- ") else text
+
+
+def _apply_memory(
+    bundle: Bundle, cwd: Path, rep: ImportReport, accept: Callable[[SensitiveItem], bool] | None, trust_bundle: bool
+) -> None:
+    from k3code.learning.decisions import project_id
+    from k3code.learning.gotchas import MAX_LINES, _entries, append_gotcha, auto_gotchas_path
+    from k3code.memory import clean_fact, read_learned, write_learned
+
+    mem = bundle.memory
+    for item in memory_items(bundle):
+        if trust_bundle or (accept is not None and accept(item)):
+            path = _append_user_memory(_user_lines(bundle))
+            rep.memory.append(f"user memory: {len(item.diff)} line(s) added to {path}")
+            rep.memory_changed.add("user")
+        else:
+            rep.skipped.append(item.key)
+    incoming = [f for f in (clean_fact(x) for x in mem.get("learned") or []) if f]
+    if incoming:
+        have = read_learned(cwd)
+        merged = list(dict.fromkeys([*have, *incoming]))[-MAX_IMPORTED_LEARNED:]
+        added = len([f for f in merged if f not in have])
+        if added:
+            path = write_learned(cwd, merged)
+            rep.memory.append(f"learned notes: {added} added to {path}")
+            rep.memory_changed.add("learned")
+    lines = [_plain_entry(x) for key in ("gotchas", "gotchas_auto", "user_gotchas") for x in mem.get(key) or []]
+    lines = list(dict.fromkeys(x for x in lines if x))[-MAX_LINES:]
+    if lines:
+        # every gotcha from a bundle is someone else's: the auto file feeds the in-turn reminder only, never the
+        # system prompt (gotchas.md holds the lines a person here accepted)
+        path = auto_gotchas_path(project_id(cwd))
+        before = set(_entries(path))
+        fresh = [x for x in lines if "- " + " ".join(scrub_text(x).split()) not in before]
+        for line in fresh:
+            append_gotcha(path, line)
+        if fresh:
+            rep.memory.append(f"gotchas: {len(fresh)} added to {path} (in-turn reminders only)")
+    if names := mem.get("instructions"):
+        shown = ", ".join(f"{x['name']} ({x['bytes']} bytes)" for x in names[:10])
+        more = f" and {len(names) - 10} more" if len(names) > 10 else ""
+        rep.memory.append(
+            f"bundle's project instruction files: {shown}{more}; not written, they live in the repository"
+        )
 
 
 def apply_bundle(
@@ -576,9 +809,11 @@ def apply_bundle(
     sessions: bool = True,
     accept: Callable[[SensitiveItem], bool] | None = None,
     trust_bundle: bool = False,
+    memory: bool = True,
 ) -> ImportReport:
-    """Merge the bundle. Each sensitive user setting (sensitive_items) is applied only with ``trust_bundle`` or
-    when ``accept(item)`` says yes; without either it is skipped and the report says so."""
+    """Merge the bundle. Each sensitive user setting (sensitive_items) and the user memory (memory_items) is applied
+    only with ``trust_bundle`` or when ``accept(item)`` says yes; without either it is skipped and the report says so.
+    ``memory``: merge memory.json (learned notes, gotchas as auto-learned lines; instruction files are only named)."""
     rep = ImportReport()
     if settings:
         for kind, incoming, target, gated in _targets(bundle, cwd):
@@ -615,4 +850,6 @@ def apply_bundle(
                 sess.session_id = store.new_id()
             store.insert(sess)
             rep.sessions[old] = sess.session_id
+    if memory and bundle.memory:
+        _apply_memory(bundle, cwd, rep, accept, trust_bundle)
     return rep
