@@ -71,4 +71,17 @@ export const appendShellOutput = (ev: ShellOutputEvent): boolean => {
   return true;
 };
 
-export const resetShellRunsForTests = () => $shellRuns.set({});
+/** The `!cmd` blocks the user expanded, by exec id. A store, not component state: transcript rows remount on resize,
+ *  on a patch and when virtualized away, and the height estimator has to read it for rows that are not mounted. */
+export const $shellExpanded = atom<Record<string, true>>({});
+
+export const toggleShellExpanded = (execId: string) => {
+  const { [execId]: was, ...rest } = $shellExpanded.get();
+
+  $shellExpanded.set(was ? rest : { ...rest, [execId]: true });
+};
+
+export const resetShellRunsForTests = () => {
+  $shellRuns.set({});
+  $shellExpanded.set({});
+};

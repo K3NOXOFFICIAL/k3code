@@ -2,6 +2,7 @@ import { TERMUX_TUI_MODE } from "../config/env.js";
 import type { Msg } from "../types.js";
 
 import { transcriptBodyWidth } from "./inputMetrics.js";
+import { shellBlockHeight, shellBlockModel } from "./shellBlock.js";
 
 const hashText = (text: string) => {
   let h = 5381;
@@ -27,6 +28,18 @@ export const messageHeightKey = (msg: Msg) => {
 
   const introSig = msg.kind === "intro" ? (msg.info?.version ?? "") : "";
 
+  // A `!cmd` block changes height when it finishes: the reply patches state and output into an empty-text message.
+  const shellSig = msg.shell
+    ? [
+        msg.shell.running ? "r" : "",
+        msg.shell.code ?? "",
+        msg.shell.cancelled ? "c" : "",
+        msg.shell.timedOut ? "t" : "",
+        msg.shell.stdout ?? "",
+        msg.shell.stderr ?? "",
+      ].join("\u0001")
+    : "";
+
   return [
     msg.role,
     msg.kind ?? "",
@@ -38,6 +51,7 @@ export const messageHeightKey = (msg: Msg) => {
         todoSig,
         panelSig,
         introSig,
+        shellSig,
       ].join("\0"),
     ),
   ].join(":");
@@ -90,6 +104,8 @@ export const estimatedMsgHeight = (
     compact,
     details,
     leadGap = false,
+    shellExpanded = false,
+    shellLiveLines,
     thinkingVisible = details,
     thinkingExpanded = thinkingVisible,
     toolsVisible = details,
@@ -99,6 +115,10 @@ export const estimatedMsgHeight = (
     compact: boolean;
     details: boolean;
     leadGap?: boolean;
+    /** This row's `!cmd` block is expanded (per row, from `$shellExpanded`). */
+    shellExpanded?: boolean;
+    /** A running `!cmd` block's live lines (from `$shellRuns`). */
+    shellLiveLines?: readonly string[];
     thinkingExpanded?: boolean;
     thinkingVisible?: boolean;
     toolsVisible?: boolean;
@@ -110,9 +130,13 @@ export const estimatedMsgHeight = (
     return msg.info?.version ? 9 : 5;
   }
 
-  // One dim `$ cmd  (exit N)` line until the shell block lands.
+  // The block draws one terminal row per model row: its height is exact.
   if (msg.kind === "shell") {
-    return 1;
+    return msg.shell
+      ? shellBlockHeight(
+          shellBlockModel(msg.shell, shellLiveLines, shellExpanded),
+        )
+      : 1;
   }
 
   if (msg.kind === "panel") {

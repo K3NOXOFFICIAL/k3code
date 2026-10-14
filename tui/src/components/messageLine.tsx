@@ -28,6 +28,7 @@ import type {
 } from "../types.js";
 
 import { Md } from "./markdown.js";
+import { ShellBlock } from "./shellBlock.js";
 import { StreamingMd } from "./streamingMarkdown.js";
 import { ToolTrail } from "./thinking.js";
 import { TodoPanel } from "./todoPanel.js";
@@ -190,21 +191,9 @@ export const MessageLine = memo(function MessageLine({
     );
   }
 
-  // A `!cmd` run: one dim line until the shell block lands.
+  // A `!cmd` run: its own block (header, output, exit code), no gutter.
   if (msg.kind === "shell") {
-    const run = msg.shell;
-    const state = run?.running
-      ? "  (running)"
-      : run?.code === undefined
-        ? ""
-        : `  (exit ${run.code})`;
-
-    return (
-      <Text color={t.color.muted} dimColor>
-        $ {run?.command ?? ""}
-        {state}
-      </Text>
-    );
+    return msg.shell ? <ShellBlock shell={msg.shell} t={t} /> : null;
   }
 
   // Timeline events (model switches, delegation completions) render as

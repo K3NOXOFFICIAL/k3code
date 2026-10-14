@@ -94,6 +94,7 @@ import { $goodVibesTick } from "./petFlashStore.js";
 import { applyProcessSnapshot, type ProcessEntry } from "./processRoster.js";
 import { scrollWithSelectionBy } from "./scroll.js";
 import { respondToServerRequest } from "./serverRequestStore.js";
+import { $shellExpanded, $shellRuns } from "./shellRunStore.js";
 import { turnController } from "./turnController.js";
 import { patchTurnState, useTurnSelector } from "./turnStore.js";
 import { $uiState, getUiState, patchUiState } from "./uiStore.js";
@@ -528,6 +529,8 @@ export function useMainApp(gw: GatewayClient) {
     [virtualRows],
   );
 
+  const shellExpanded = useStore($shellExpanded);
+
   const estimateRowHeight = useCallback(
     (index: number) =>
       estimatedMsgHeight(virtualRows[index]!.msg, cols, {
@@ -541,6 +544,13 @@ export function useMainApp(gw: GatewayClient) {
           }),
           virtualRows[index]!.msg,
         ),
+        shellExpanded: Boolean(
+          shellExpanded[virtualRows[index]!.msg.shell?.execId ?? ""],
+        ),
+        // Read, not subscribed: a running block is mounted, so Yoga measures it; a subscription would rebuild
+        // the estimator on every output chunk.
+        shellLiveLines:
+          $shellRuns.get()[virtualRows[index]!.msg.shell?.execId ?? ""]?.lines,
         thinkingExpanded: historyThinkingExpanded,
         thinkingVisible: thinkingDetailsVisible,
         toolsVisible: toolsDetailsVisible,
@@ -555,6 +565,7 @@ export function useMainApp(gw: GatewayClient) {
       detailsVisible,
       firstUserIdx,
       historyThinkingExpanded,
+      shellExpanded,
       thinkingDetailsVisible,
       toolsDetailsVisible,
       ui.compact,

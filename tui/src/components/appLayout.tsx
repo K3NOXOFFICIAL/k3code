@@ -32,6 +32,7 @@ import {
 import { PLACEHOLDER } from "../content/placeholders.js";
 import { prevRenderedMsg } from "../domain/blockLayout.js";
 import { composerLineHighlights } from "../domain/composerHighlights.js";
+import { isShellInput, shellHintLine } from "../domain/shellHint.js";
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -321,7 +322,14 @@ const ComposerPane = memo(function ComposerPane({
   const ui = useStore($uiState);
   const isBlocked = useStore($isBlocked);
   const wake = useStore($wakeWordConfig);
-  const sh = (composer.inputBuf[0] ?? composer.input).startsWith("!");
+  const firstLine = composer.inputBuf[0] ?? composer.input;
+  const sh = isShellInput(firstLine);
+  // paddingX={1} on the pane: the row has cols - 2 cells.
+  const shellHint = shellHintLine(
+    firstLine,
+    ui.info?.cwd || process.env.K3CODE_CWD || process.cwd(),
+    composer.cols - 2,
+  );
   // The wake word accent judges the whole prompt (every line), like the
   // gateway does, and paints the word on whichever line it is.
   const highlightContext = useMemo(
@@ -484,6 +492,12 @@ const ComposerPane = memo(function ComposerPane({
 
         {!isBlocked && (
           <>
+            {shellHint && (
+              <Text color={ui.theme.color.muted} dimColor wrap="truncate-end">
+                {shellHint}
+              </Text>
+            )}
+
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
                 <Box width={promptWidth}>
