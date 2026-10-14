@@ -38,7 +38,7 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("K3_TEST_KEY", "sk-should-never-appear-123")
     checks = await doctor.run_checks(_config(_entry()), probe=False, home=tmp_path)
     data = json.loads(doctor.to_json(checks))
-    assert set(data) == {"summary", "checks"} and set(data["summary"]) == {"ok", "warn", "fail"}
+    assert set(data) == {"summary", "checks"} and set(data["summary"]) == {"ok", "warn", "fail", "skip"}
     names = {c["name"] for c in data["checks"]}
     for want in (
         "provider:p1",
@@ -56,7 +56,7 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
         "hermes-isolation",
     ):
         assert want in names, want
-    assert all(c["status"] in ("ok", "warn", "fail") and {"detail", "fix"} <= set(c) for c in data["checks"])
+    assert all(c["status"] in ("ok", "warn", "fail", "skip") and {"detail", "fix"} <= set(c) for c in data["checks"])
     assert sum(data["summary"].values()) == len(data["checks"])
     assert "sk-should-never-appear-123" not in doctor.to_json(checks)
     assert "omniroute-bypass" not in names  # only shown when the chain has an OmniRoute entry

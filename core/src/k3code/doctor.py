@@ -32,6 +32,8 @@ from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe,
 from k3code.router.cooldown import clear_auth_cooldowns
 
 OK, WARN, FAIL = "ok", "warn", "fail"
+#: A probe that did not run (--no-probe, no network): neither ok nor a problem, counted on its own.
+SKIP = "skip"
 #: Hosts that mean "this chain entry goes through OmniRoute".
 OMNIROUTE_MARKERS = ("omniroute", ":20128")
 MIN_FREE_GB = 5.0
@@ -117,7 +119,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             )
             continue
         if not probe:
-            checks.append(Check(f"provider:{p.name}", OK, "probe skipped", data={"base_url": p.base_url}))
+            checks.append(Check(f"provider:{p.name}", SKIP, "probe skipped", data={"base_url": p.base_url}))
             continue
         ok, ms, detail = results[i]
         status = OK if ok else FAIL
@@ -270,7 +272,8 @@ async def check_netwatch_async() -> Check:
         return Check("netwatch", WARN, "captive portal detected", "log in to the network's portal page")
     if res.ok:
         return Check("netwatch", OK, f"online ({res.latency_ms:.0f} ms)" if res.latency_ms else "online")
-    return Check("netwatch", FAIL, "offline", "k3code pauses and resumes by itself; check Wi-Fi / cable")
+    # a warning, not a failure: k3code pauses and resumes by itself, and a local-only chain (claude-cli) works offline
+    return Check("netwatch", WARN, "offline", "k3code pauses and resumes by itself; check Wi-Fi / cable")
 
 
 def check_disk(home: Path) -> Check:
@@ -867,9 +870,9 @@ async def run_checks(
     checks.append(check_keys(config))
     checks += check_context_windows(config)
     checks += check_prompt_cache(config)
-    checks.append(await check_netwatch_async() if probe and network else Check("netwatch", OK, "probe skipped"))
+    checks.append(await check_netwatch_async() if probe and network else Check("netwatch", SKIP, "probe skipped"))
     checks += [check_disk(home), check_psi()]
-    daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
+    daemon_check = await check_daemon() if probe else Check("daemon", SKIP, "probe skipped")
     checks.append(daemon_check)
     checks += [
         check_halt(home),
@@ -893,7 +896,7 @@ async def run_checks(
 
 
 def summary(checks: list[Check]) -> dict[str, int]:
-    return {s: sum(1 for c in checks if c.status == s) for s in (OK, WARN, FAIL)}
+    return {s: sum(1 for c in checks if c.status == s) for s in (OK, WARN, FAIL, SKIP)}
 
 
 def to_json(checks: list[Check]) -> str:
@@ -901,12 +904,12 @@ def to_json(checks: list[Check]) -> str:
 
 
 def format_report(checks: list[Check]) -> str:
-    marks = {OK: "✓", WARN: "!", FAIL: "✗"}
+    marks = {OK: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
     lines = []
     for c in checks:
         lines.append(f"{marks[c.status]} {c.name}: {c.detail}")
-        if c.fix and c.status != OK:
+        if c.fix and c.status not in (OK, SKIP):
             lines.append(f"    fix: {c.fix}")
     s = summary(checks)
-    lines.append(f"\n{s[OK]} ok, {s[WARN]} warn, {s[FAIL]} fail")
+    lines.append(f"\n{s[OK]} ok, {s[WARN]} warn, {s[FAIL]} fail" + (f", {s[SKIP]} skipped" if s[SKIP] else ""))
     return "\n".join(lines)
