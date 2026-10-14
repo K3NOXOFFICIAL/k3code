@@ -101,7 +101,10 @@ cleanup() {
   if [ -n "$UV_TMP" ]; then rm -rf "$UV_TMP"; fi
   if [ -n "$TUI_TMP" ]; then rm -rf "$TUI_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
-  if [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
+  if [ -n "$LOCK" ]; then
+    rmdir "$DATA/tmp" 2>/dev/null || true # empty once the build dirs above are gone
+    rm -rf "$LOCK"
+  fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
@@ -206,6 +209,19 @@ tui_tmp_root() { # the temp dir the TUI build uses, without trailing slashes (ma
   printf '%s\n' "$root"
 }
 
+# Builds run in DATA/tmp, not in TMPDIR: a noexec /tmp (hardened and CIS-style hosts) can run neither the Go just
+# unpacked nor the binaries npm ci's postinstall scripts start. Only a run that holds the install lock uses it.
+stage_dir() { # stage_dir KIND: a new k3code-KIND.* in DATA/tmp (0700)
+  mkdir -p "$DATA/tmp" && chmod 700 "$DATA/tmp" && mktemp -d "$DATA/tmp/k3code-$1.XXXXXX"
+}
+
+clean_stage() { # under the lock, whatever DATA/tmp holds was left by a killed run
+  if [ -n "$(ls -A "$DATA/tmp" 2>/dev/null)" ]; then
+    rm -rf "${DATA:?}/tmp"
+    log "removed $DATA/tmp, the build scratch an interrupted install left"
+  fi
+}
+
 record_tmp() { # record_tmp KIND PATH: a k3code-KIND.* this run made in the temp dir, noted in the lock for a takeover after SIGKILL
   if [ -n "$LOCK" ]; then printf '%s\n' "$2" >"$LOCK/${1}_tmp"; fi
 }
@@ -276,11 +292,13 @@ take_lock() { # one installer at a time per install root; the lock goes when thi
     proc_start "$$" >"$LOCK/start" # before the pid: a kill between the two must not leave a pid without its start time
     printf '%s\n' "$$" >"$LOCK/pid"
     clean_unfinished_versions
+    clean_stage
     return 0
   fi
   LOCK=$lock
   proc_start "$$" >"$LOCK/start" # before the pid, as above
   printf '%s\n' "$$" >"$LOCK/pid"
+  clean_stage # a lock removed by hand (the hint above) leaves no other trace of the killed run
 }
 
 # ---- platform and package manager ------------------------------------------
@@ -624,23 +642,25 @@ ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked again
   if [ "$NO_DEPS" = 1 ] || ! can_fetch || [ -z "$GO_WANT" ]; then return 0; fi
   gv=$GO_WANT
   name="go$gv.$GO_OS-$GO_ARCH.tar.gz"
-  t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
+  t=$(stage_dir go)
   record_tmp go "$t"
   log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary${GO:+ ($GO is older)}"
   want=""
   if fetch "https://go.dev/dl/?mode=json&include=all" "$t/releases.json"; then want=$(go_sha256 "$t/releases.json" "$name"); fi
   if [ -z "$want" ]; then
     log "WARNING: no sha256 for $name from go.dev (unreachable, or no such release); Go is not downloaded"
-  elif fetch "https://go.dev/dl/$name" "$t/$name" && [ "$(sha256_of "$t/$name")" = "$want" ] &&
-    tar -xzf "$t/$name" -C "$t" && [ -x "$t/go/bin/go" ]; then
+  elif ! { fetch "https://go.dev/dl/$name" "$t/$name" && [ "$(sha256_of "$t/$name")" = "$want" ] &&
+    tar -xzf "$t/$name" -C "$t"; }; then
+    log "WARNING: the Go download failed or did not match the sha256 go.dev lists; nothing was installed"
+  elif [ -z "$(go_version_of "$t/go/bin/go")" ]; then # run it: [ -x ] says no on a noexec mount even when go works
+    log "WARNING: the downloaded Go does not run here ('$t/go/bin/go version' failed); nothing was installed"
+  else
     mkdir -p "$DATA/go"
     rm -rf "$DATA/go/go$gv"
     mv "$t/go" "$DATA/go/go$gv"
     for d in "$DATA"/go/go*; do # keep only this toolchain
       if [ "$d" != "$DATA/go/go$gv" ]; then rm -rf "$d"; fi
     done
-  else
-    log "WARNING: the Go download failed or did not match the sha256 go.dev lists; nothing was installed"
   fi
   rm -rf "$t"
   find_go || true
@@ -922,7 +942,7 @@ acquire_source() {
         fi
         ;;
     esac
-    TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
+    TMP=$(stage_dir src) # the TUI and the k3 binary build in this checkout
     record_tmp src "$TMP"
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
@@ -976,7 +996,7 @@ build_tui() {
   log "building the TUI (npm ci; this takes a minute)"
   tui=$SRC_ROOT/tui
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
-    TUI_TMP=$(mktemp -d "$(tui_tmp_root)/k3code-tui.XXXXXX")
+    TUI_TMP=$(stage_dir tui)
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
     record_tmp tui "$TUI_TMP"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then

@@ -624,7 +624,8 @@ def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> N
     private = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
     cases = {offline: "no network", private: "private or needs credentials"}
     for i, (text, phrase) in enumerate(cases.items()):
-        body = f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
+        # the subcommand only: the checkout now sits under HOME, whose path (this test's name) holds "fetch" too
+        body = f'case "$*" in *" fetch "*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
         stubs = stub_bin(tmp_path / f"case{i}", "git", body)
         home = tmp_path / f"home{i}"
         home.mkdir()
@@ -656,6 +657,93 @@ def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> N
     assert r.returncode != 0
     assert "could not download uv" in r.stderr
     assert list(tmpdir.glob("k3code-uv.*")) == []
+
+
+def _go_wanted() -> str:
+    """The Go release panes/go.mod asks for, named as install.sh's go_wanted names it."""
+    m = re.search(r"^go (\d+\.\d+(?:\.\d+)?)$", (REPO / "panes" / "go.mod").read_text(), re.MULTILINE)
+    assert m is not None
+    v = m.group(1)
+    return v if v.count(".") == 2 else f"{v}.0"
+
+
+@linux_only
+@pytest.mark.parametrize("runs", [True, False], ids=["go-runs", "go-does-not-run"])
+def test_a_fetched_go_is_staged_in_the_install_root_and_checked_by_running_it(tmp_path: Path, runs: bool) -> None:
+    # Issue #116: on a noexec TMPDIR, `[ -x go ]` said no for a good download, and the warning blamed the checksum.
+    # Go is now unpacked under DATA/tmp and accepted only when `go version` runs.
+    gv = _go_wanted()
+    home = tmp_path / "home"
+    home.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    ran = tmp_path / "go-ran.log"
+    pkg = tmp_path / "pkg"
+    (pkg / "go" / "bin").mkdir(parents=True)
+    fake_go = pkg / "go" / "bin" / "go"
+    version = f'echo "go version go{gv} linux/amd64"' if runs else "exit 1"
+    fake_go.write_text(
+        f'#!/bin/sh\necho "$0" >>"{ran}"\n'
+        f'if [ "$1" = version ]; then {version}; exit 0; fi\n'
+        'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then : >"$2"; chmod 755 "$2"; fi; shift; done\n'
+    )
+    fake_go.chmod(0o755)
+    tarballs = {}
+    for arch in ("amd64", "arm64"):
+        name = f"go{gv}.linux-{arch}.tar.gz"
+        subprocess.run(["tar", "-czf", str(tmp_path / name), "-C", str(pkg), "go"], check=True)
+        tarballs[name] = subprocess.run(
+            ["sha256sum", str(tmp_path / name)], capture_output=True, text=True, check=True
+        ).stdout.split()[0]
+    releases = tmp_path / "releases.json"
+    releases.write_text(
+        "".join(f'{{\n"filename": "{n}",\n"sha256": "{s}"\n}}\n' for n, s in tarballs.items()),
+    )
+    curl = stub_bin(
+        tmp_path,
+        "curl",
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        'case "$url" in\n'
+        f'  *mode=json*) cp "{releases}" "$out" ;;\n'
+        f'  https://go.dev/dl/go*) cp "{tmp_path}/${{url##*/}}" "$out" ;;\n'
+        "  *) exit 22 ;;\n"
+        "esac\n",
+    )
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _path_without(tmp_path, "go"), "TMPDIR": str(tmpdir)},
+        drop=("K3_SKIP_GO", "K3_NO_DOWNLOAD"),
+        path_front=curl,
+    )
+    assert r.returncode == 0, r.stderr
+    data = home / DATA_REL
+    probes = ran.read_text().splitlines() if ran.exists() else []
+    assert probes and probes[0].startswith(f"{data}/tmp/k3code-go."), probes  # run where it was unpacked
+    assert list(tmpdir.iterdir()) == []
+    assert not (data / "tmp").exists()  # the stage dir goes with the run
+    if runs:
+        assert (data / "go" / f"go{gv}" / "bin" / "go").is_file()
+        assert "WARNING" not in r.stderr.split("fetching Go", 1)[1].split("\n", 2)[1]
+    else:
+        assert not (data / "go" / f"go{gv}").exists()
+        assert "the downloaded Go does not run here" in r.stderr
+        assert "did not match the sha256" not in r.stderr
+
+
+def test_a_stale_lock_takes_the_stage_dir_the_killed_install_left(tmp_path: Path) -> None:
+    # SIGKILL skips the trap: a from-git checkout or a Go unpacked in DATA/tmp stays until the next run takes the lock
+    lock = _stale_lock(tmp_path)
+    left = tmp_path / DATA_REL / "tmp" / "k3code-go.Ab12Cd" / "go"
+    left.mkdir(parents=True)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "the build scratch an interrupted install left" in r.stderr
+    assert not (tmp_path / DATA_REL / "tmp").exists()
+    assert not lock.exists()
 
 
 def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
@@ -1055,12 +1143,16 @@ def test_a_sigkilled_from_git_install_leaves_nothing_in_tmpdir_once_the_next_run
     killed = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env, path_front=killer)
     assert killed.returncode == -signal.SIGKILL, killed.stderr
     left = sorted(p.name.rpartition(".")[0] for p in tmp.iterdir())
-    assert left == ["k3code-giterr", "k3code-src"], left  # the run really was killed with its scratch in place
+    assert left == ["k3code-giterr"], left  # the run really was killed with its scratch in place
+    # the checkout, where the TUI and k3 build, is staged in DATA/tmp (a noexec TMPDIR cannot run them, issue #116)
+    stage = tmp_path / DATA_REL / "tmp"
+    assert sorted(p.name.rpartition(".")[0] for p in stage.iterdir()) == ["k3code-src"]
     assert (tmp_path / DATA_REL / ".install.lock").is_dir()
     again = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env)
     assert again.returncode == 0, again.stderr
     assert "taking over the install lock" in again.stderr
     assert list(tmp.iterdir()) == []
+    assert not stage.exists()
     assert not (tmp_path / DATA_REL / ".install.lock").exists()
 
 
@@ -2002,9 +2094,9 @@ def test_no_install_deps_docs_say_toolchains_only(tmp_path: Path) -> None:
         assert not re.search(r"fetch(es)? nothing|install nothing|all fetching", text, re.I), text
 
 
-def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
-    # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
-    # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
+def test_the_tui_builds_in_the_stage_dir_not_in_tmpdir(tmp_path: Path) -> None:
+    # npm ci runs the postinstall binaries it unpacks, which a noexec TMPDIR refuses (issue #116): the build dir is a
+    # k3code-tui.X in DATA/tmp, recorded in the lock, and a TMPDIR ending in "/" plays no part
     src = _mini_checkout(tmp_path)
     (src / "tui").mkdir()
     (src / "tui" / "package.json").write_text("{}\n")
@@ -2031,8 +2123,10 @@ def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path:
     )
     assert r.returncode == 0, r.stderr
     recorded = (seen / "tui_tmp").read_text().strip()
-    assert re.fullmatch(re.escape(f"{tmp}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
+    stage = tmp_path / DATA_REL / "tmp"
+    assert re.fullmatch(re.escape(f"{stage}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
     assert (seen / "cwd").read_text().strip().startswith(recorded + "/")
+    assert list(tmp.iterdir()) == []
 
 
 @linux_only
