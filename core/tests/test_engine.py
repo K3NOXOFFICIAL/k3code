@@ -356,6 +356,22 @@ def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
     assert d.action == "ask" and d.needs_human
 
 
+def test_auto_mode_reads_of_the_uv_credentials_store_ask_a_person(tmp_path, monkeypatch) -> None:
+    # PR 347 review: `uv auth dir` is ~/.local/share/uv/credentials; the uv toolchain allow must not cover it
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+    ):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human and not d.auto_allowed, (tool, path, d)
+    # uv's interpreters and tools stay a toolchain read; the uv root itself (it holds credentials/) does not
+    for path in ("~/.local/share/uv/python/cpython-3.12/lib/os.py", "~/.local/share/uv/tools/ruff/bin/ruff"):
+        assert decide(mode="auto", tool="read", args={"path": path}, cwd=CWD).action == "allow", path
+    d = decide(mode="auto", tool="grep", args={"path": "~/.local/share/uv", "pattern": "."}, cwd=CWD)
+    assert d.action != "allow", d
+
+
 def test_a_blank_extra_hardline_pattern_matches_nothing_and_is_reported() -> None:
     from k3code.permissions.state import parse_permissions
 

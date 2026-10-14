@@ -940,7 +940,13 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
-        elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
+        elif (
+            not is_edit
+            and rule.action == "ask"
+            and mode == PermissionMode.AUTO
+            and rule.layer == 0
+            and not _inside(path, [os.path.join(os.path.expanduser("~"), _UV_CREDENTIALS)])
+        ):
             # auto mode does not stop for a wandering read: the system and toolchain dirs are allowed (_finish logs
             # it as an auto allow), anything else is refused with a hint. A user/project/session rule still wins.
             if not _toolchain_read(path):
@@ -968,9 +974,13 @@ _TOOLCHAIN_HOME = (
     ".rustup",
     "go/pkg/mod",
     ".npm",
-    ".local/share/uv",
+    ".local/share/uv/python",
+    ".local/share/uv/tools",
     ".m2/repository",
 )
+#: uv's credential store (``uv auth dir``): an auto-mode read there asks a person, as every out-of-roots read does
+#: in the other modes, instead of being refused like any other path outside the toolchain dirs.
+_UV_CREDENTIALS = ".local/share/uv/credentials"
 #: Path segments of installed packages of a known toolchain (Python, Node).
 _TOOLCHAIN_SEGMENTS = ("site-packages", "dist-packages", "node_modules")
 
