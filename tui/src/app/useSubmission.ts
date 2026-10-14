@@ -25,13 +25,14 @@ import type {
 import { queueItem, type QueueItem } from "../hooks/useQueue.js";
 import { asRpcResult } from "../lib/rpc.js";
 import { INTERPOLATION_RE } from "../protocol/interpolation.js";
-import type { Msg } from "../types.js";
+import type { Msg, ShellRun } from "../types.js";
 
 import type {
   ComposerActions,
   ComposerRefs,
   ComposerState,
   ComposerToken,
+  StateSetter,
 } from "./interfaces.js";
 import { finishShellRun, startShellRun } from "./shellRunStore.js";
 import { submitPrompt } from "./submissionCore.js";
@@ -49,6 +50,18 @@ let execSeq = 0;
 // The id the gateway tags this run's `shell.output` events and its record with ([A-Za-z0-9_-]{1,64}).
 const newExecId = () =>
   `sh-${Date.now().toString(36)}-${(++execSeq).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+// Runs overlap, so a reply patches only the shell message carrying its own exec id.
+const patchShellRun = (
+  prev: Msg[],
+  execId: string,
+  fields: Partial<ShellRun>,
+): Msg[] =>
+  prev.map((msg) =>
+    msg.kind === "shell" && msg.shell?.execId === execId
+      ? { ...msg, shell: { ...msg.shell, ...fields } }
+      : msg,
+  );
 
 const spliceMatches = (
   text: string,
@@ -161,6 +174,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
     composerState,
     gw,
     scrollRef,
+    setHistoryItems,
     setLastUserMsg,
     slashRef,
     submitRef,
@@ -294,7 +308,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const execId = newExecId();
 
       appendMessage({ role: "user", text: `!${cmd}` });
+      appendMessage({
+        kind: "shell",
+        role: "system",
+        shell: { command: cmd, execId, running: true },
+        text: "",
+      });
       startShellRun(execId);
+
+      const patch = (fields: Partial<ShellRun>) =>
+        setHistoryItems((prev) => patchShellRun(prev, execId, fields));
 
       if (runs.count++ === 0) {
         runs.ownsBusy = !turnRunning;
@@ -319,26 +342,25 @@ export function useSubmission(opts: UseSubmissionOptions) {
           const r = asRpcResult<ShellExecResponse>(raw);
 
           if (!r) {
+            patch({ running: false });
+
             return sys("error: invalid response: shell.exec");
           }
 
-          const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
-
-          if (out) {
-            sys(out);
-          }
-
-          const tag = r.cancelled
-            ? " · cancelled"
-            : r.timed_out
-              ? " · timed out"
-              : "";
-
-          if (r.code !== 0 || !out) {
-            sys(`exit ${r.code}${tag}`);
-          }
+          // A run the hardline rules deny comes back as code 126 with the reason in stderr: the block shows it.
+          patch({
+            cancelled: r.code === 130 || r.cancelled === true,
+            code: r.code,
+            running: false,
+            stderr: r.stderr,
+            stdout: r.stdout,
+            timedOut: r.code === 124 || r.timed_out === true,
+          });
         })
-        .catch((e: Error) => sys(`error: ${e.message}`))
+        .catch((e: Error) => {
+          patch({ running: false });
+          sys(`error: ${e.message}`);
+        })
         .finally(() => {
           finishShellRun(execId);
 
@@ -347,7 +369,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
           }
         });
     },
-    [appendMessage, gw, sys],
+    [appendMessage, gw, setHistoryItems, sys],
   );
 
   // `pasted`: spans of `text` the user did not type; a `{!cmd}` in or across one is left as it is. `then` gets the
@@ -759,6 +781,7 @@ export interface UseSubmissionOptions {
   composerState: ComposerState;
   gw: GatewayClient;
   scrollRef?: RefObject<null | ScrollBoxHandle>;
+  setHistoryItems: StateSetter<Msg[]>;
   setLastUserMsg: (value: string) => void;
   slashRef: MutableRefObject<(cmd: string) => boolean>;
   submitRef: MutableRefObject<(value: string) => void>;

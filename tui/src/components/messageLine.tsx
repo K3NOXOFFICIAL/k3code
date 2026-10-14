@@ -190,6 +190,23 @@ export const MessageLine = memo(function MessageLine({
     );
   }
 
+  // A `!cmd` run: one dim line until the shell block lands.
+  if (msg.kind === "shell") {
+    const run = msg.shell;
+    const state = run?.running
+      ? "  (running)"
+      : run?.code === undefined
+        ? ""
+        : `  (exit ${run.code})`;
+
+    return (
+      <Text color={t.color.muted} dimColor>
+        $ {run?.command ?? ""}
+        {state}
+      </Text>
+    );
+  }
+
   // Timeline events (model switches, delegation completions) render as
   // dim ◈ markers with no gutter — not as opaque user messages.
   if (msg.kind === "event") {

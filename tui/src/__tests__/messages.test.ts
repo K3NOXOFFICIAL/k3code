@@ -58,6 +58,54 @@ describe("toTranscriptMessages", () => {
     expect(result.every((m) => !m.text?.includes("COMPACTION"))).toBe(true);
   });
 
+  it("maps a stored !cmd run to its bubble and a finished shell message, even with no output", () => {
+    const rows = [
+      { role: "user", text: "!ls" },
+      {
+        display_kind: "shell",
+        display_metadata: { code: 0, command: "ls" },
+        role: "system",
+        text: "a\nb",
+      },
+      { role: "user", text: "!true" },
+      {
+        display_kind: "shell",
+        display_metadata: { code: 1, command: "true" },
+        role: "system",
+        text: "",
+      },
+    ];
+
+    expect(toTranscriptMessages(rows)).toEqual([
+      { role: "user", text: "!ls" },
+      {
+        kind: "shell",
+        role: "system",
+        shell: {
+          code: 0,
+          command: "ls",
+          execId: "resumed-1",
+          running: false,
+          stdout: "a\nb",
+        },
+        text: "",
+      },
+      { role: "user", text: "!true" },
+      {
+        kind: "shell",
+        role: "system",
+        shell: {
+          code: 1,
+          command: "true",
+          execId: "resumed-3",
+          running: false,
+          stdout: "",
+        },
+        text: "",
+      },
+    ]);
+  });
+
   it("projects model_switch as an event with replaced text", () => {
     const rows = [
       { role: "user", text: "hello" },

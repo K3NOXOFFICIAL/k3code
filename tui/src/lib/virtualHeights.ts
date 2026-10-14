@@ -110,6 +110,11 @@ export const estimatedMsgHeight = (
     return msg.info?.version ? 9 : 5;
   }
 
+  // One dim `$ cmd  (exit N)` line until the shell block lands.
+  if (msg.kind === "shell") {
+    return 1;
+  }
+
   if (msg.kind === "panel") {
     return Math.max(3, (msg.panelData?.sections.length ?? 1) * 2 + 1);
   }

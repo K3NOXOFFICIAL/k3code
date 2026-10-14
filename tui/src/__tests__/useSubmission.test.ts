@@ -17,6 +17,7 @@ import {
   useSubmission,
 } from "../app/useSubmission.js";
 import type { GatewayClient } from "../gatewayClient.js";
+import type { Msg } from "../types.js";
 
 describe("prepareSubmission", () => {
   it("keeps the collapsed paste for display and expands the model payload", () => {
@@ -82,6 +83,15 @@ function mountSubmission(slash = vi.fn(() => true)) {
   const enqueue = vi.fn();
   const pushHistory = vi.fn();
   const sys = vi.fn();
+  // The transcript the hook appends to and patches.
+  const messages: Msg[] = [];
+  const appendMessage = (msg: Msg) => messages.push(msg);
+  const setHistoryItems = (value: ((prev: Msg[]) => Msg[]) | Msg[]) =>
+    messages.splice(
+      0,
+      messages.length,
+      ...(typeof value === "function" ? value([...messages]) : value),
+    );
 
   const gw = {
     request: vi.fn((method: string, params?: Record<string, unknown>) => {
@@ -103,7 +113,7 @@ function mountSubmission(slash = vi.fn(() => true)) {
 
   function Probe() {
     const submission = useSubmission({
-      appendMessage: vi.fn(),
+      appendMessage,
       composerActions: {
         clearIn,
         enqueue,
@@ -123,6 +133,7 @@ function mountSubmission(slash = vi.fn(() => true)) {
         queuedDisplay: [],
       } as never,
       gw,
+      setHistoryItems,
       setLastUserMsg: vi.fn(),
       slashRef: { current: slash },
       submitRef: { current: () => {} },
@@ -150,6 +161,7 @@ function mountSubmission(slash = vi.fn(() => true)) {
     clearIn,
     enqueue,
     gw,
+    messages,
     prompts,
     pushHistory,
     shells,
@@ -302,7 +314,69 @@ describe("a typed !cmd", () => {
     expect(mounted.pushHistory).toHaveBeenCalledWith("!ls");
   });
 
-  it("shows the gateway's reason when the hardline rules deny it", async () => {
+  const shellMsgs = (messages: Msg[]) =>
+    messages.filter((msg) => msg.kind === "shell");
+
+  it("shows the !cmd bubble and one live shell message, patched in place when the reply lands", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!ls -la");
+
+    const execId = String(execCalls(mounted.gw)[0]![1]!.exec_id);
+
+    expect(mounted.messages).toEqual([
+      { role: "user", text: "!ls -la" },
+      {
+        kind: "shell",
+        role: "system",
+        shell: { command: "ls -la", execId, running: true },
+        text: "",
+      },
+    ]);
+
+    mounted.shells[0]!({ code: 0, stderr: "", stdout: "a\nb" });
+    await settle();
+
+    expect(mounted.messages).toEqual([
+      { role: "user", text: "!ls -la" },
+      {
+        kind: "shell",
+        role: "system",
+        shell: {
+          cancelled: false,
+          code: 0,
+          command: "ls -la",
+          execId,
+          running: false,
+          stderr: "",
+          stdout: "a\nb",
+          timedOut: false,
+        },
+        text: "",
+      },
+    ]);
+    expect(mounted.sys).not.toHaveBeenCalled();
+  });
+
+  it("patches only the run whose exec id the reply carries", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!first");
+    sub.dispatchSubmission("!second");
+    mounted.shells[1]!({ code: 2, stdout: "two" });
+    await settle();
+    mounted.shells[0]!({ code: 0, stdout: "one" });
+    await settle();
+
+    expect(shellMsgs(mounted.messages).map((msg) => msg.shell)).toMatchObject([
+      { code: 0, command: "first", running: false, stdout: "one" },
+      { code: 2, command: "second", running: false, stdout: "two" },
+    ]);
+  });
+
+  it("shows the gateway's reason in the block when the hardline rules deny it", async () => {
     const mounted = mountSubmission();
     const sub = await mounted.sub();
 
@@ -310,11 +384,16 @@ describe("a typed !cmd", () => {
     mounted.shells[0]!({ code: 126, stderr: "denied: env dumps secrets" });
     await settle();
 
-    expect(mounted.sys).toHaveBeenCalledWith("denied: env dumps secrets");
-    expect(mounted.sys).toHaveBeenCalledWith("exit 126");
+    expect(shellMsgs(mounted.messages)[0]?.shell).toMatchObject({
+      code: 126,
+      command: "env",
+      running: false,
+      stderr: "denied: env dumps secrets",
+    });
+    expect(mounted.sys).not.toHaveBeenCalled();
   });
 
-  it("shows a transport error and forgets the run", async () => {
+  it("shows a transport error, stops the block and forgets the run", async () => {
     const mounted = mountSubmission();
     const sub = await mounted.sub();
 
@@ -324,12 +403,17 @@ describe("a typed !cmd", () => {
     sub.dispatchSubmission("!ls");
     await settle();
 
+    expect(shellMsgs(mounted.messages)[0]?.shell).toMatchObject({
+      command: "ls",
+      running: false,
+    });
+    expect(shellMsgs(mounted.messages)[0]?.shell?.code).toBeUndefined();
     expect(mounted.sys).toHaveBeenCalledWith("error: gateway not running");
     expect(shellRunCount()).toBe(0);
     expect(getUiState().busy).toBe(false);
   });
 
-  it("tags a cancelled run", async () => {
+  it("marks a cancelled run", async () => {
     const mounted = mountSubmission();
     const sub = await mounted.sub();
 
@@ -337,7 +421,27 @@ describe("a typed !cmd", () => {
     mounted.shells[0]!({ cancelled: true, code: 130, stdout: "" });
     await settle();
 
-    expect(mounted.sys).toHaveBeenCalledWith("exit 130 · cancelled");
+    expect(shellMsgs(mounted.messages)[0]?.shell).toMatchObject({
+      cancelled: true,
+      code: 130,
+      running: false,
+      timedOut: false,
+    });
+  });
+
+  it("marks a timed-out run by its 124", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!sleep 999");
+    mounted.shells[0]!({ code: 124, stdout: "" });
+    await settle();
+
+    expect(shellMsgs(mounted.messages)[0]?.shell).toMatchObject({
+      cancelled: false,
+      code: 124,
+      timedOut: true,
+    });
   });
 });
 

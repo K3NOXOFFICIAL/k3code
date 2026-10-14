@@ -32,7 +32,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
   const out: Msg[] = [];
   let pending: string[] = [];
 
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     if (!row || typeof row !== "object") {
       continue;
     }
@@ -49,6 +49,28 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     if (role === "tool") {
       pending.push(buildToolTrailLine(name ?? "tool", context ?? ""));
+
+      continue;
+    }
+
+    // A stored `!cmd` run: the row's text is its output, which may be empty, so this comes before the empty-text skip.
+    if (display_kind === "shell") {
+      const meta = (row as TranscriptRow).display_metadata;
+
+      out.push({
+        kind: "shell",
+        role: "system",
+        shell: {
+          code: typeof meta?.code === "number" ? meta.code : undefined,
+          command: typeof meta?.command === "string" ? meta.command : "",
+          execId: `resumed-${index}`,
+          running: false,
+          stdout: typeof text === "string" ? text : "",
+        },
+        text: "",
+        ...(createdAt !== undefined && { createdAt }),
+      });
+      pending = [];
 
       continue;
     }

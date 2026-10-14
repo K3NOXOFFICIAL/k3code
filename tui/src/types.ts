@@ -148,11 +148,24 @@ export interface ClarifyReq {
   answers?: Record<string, string>;
 }
 
+export interface ShellRun {
+  cancelled?: boolean;
+  code?: number;
+  command: string;
+  execId: string;
+  running: boolean;
+  stderr?: string;
+  stdout?: string;
+  timedOut?: boolean;
+}
+
 export interface Msg {
   info?: SessionInfo;
-  kind?: "diff" | "event" | "intro" | "panel" | "slash" | "trail";
+  kind?: "diff" | "event" | "intro" | "panel" | "shell" | "slash" | "trail";
   panelData?: PanelData;
   role: Role;
+  // A `!cmd` run (kind "shell"): live while `running`, patched by exec id when the gateway replies.
+  shell?: ShellRun;
   text: string;
   // Unix seconds the message was authored (persisted transcript timestamp on
   // rehydrate, wall clock at append time for live rows). Rendered as a dim
