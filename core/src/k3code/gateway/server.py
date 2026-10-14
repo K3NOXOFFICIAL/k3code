@@ -86,7 +86,7 @@ from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
-from k3code.prompting import build_system_prompt
+from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
@@ -172,15 +172,8 @@ _DEFAULT_SKIN = {
     "tool_prefix": "k3",
 }
 
-_SYSTEM_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system.md"
 #: How long an approval, plan or clarify request may wait for an answer before it is denied and the goal pauses.
 APPROVAL_TIMEOUT_S = 1800.0
-
-
-def _load_system_prompt() -> str:
-    if _SYSTEM_PROMPT_PATH.is_file():
-        return _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    return "You are a helpful coding assistant."
 
 
 def _turn_status(result: Any) -> str | None:
@@ -225,7 +218,7 @@ class LiveSession:
         self.session_id = session_id
         self.stored = stored
         self.server = server
-        self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
+        self.system_prompt = base_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self._tools_cache: dict[str, list[str]] | None = None  # banner info, see live_info
