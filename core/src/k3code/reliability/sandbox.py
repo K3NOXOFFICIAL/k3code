@@ -289,6 +289,21 @@ def _git_metadata(root: Path) -> list[Path]:
     return [p for p in found if p.exists()]
 
 
+#: Entries of a project root the sandbox shows read-only, like its git metadata: the files git runs as code or reads
+#: for its drivers (``.gitattributes``, ``.gitmodules``, husky's ``.husky`` hooks), direnv's ``.envrc`` and the
+#: project's k3code config (``.k3code/config*``: permission rules and hooks). The set
+#: :func:`k3code.permissions.engine.protected_path` keeps the edit tools from; a sandboxed ``npm test`` could plant a
+#: ``.husky/pre-commit`` the user's next commit runs otherwise.
+PROTECTED_ENTRIES = (".gitattributes", ".gitmodules", ".husky", ".envrc")
+
+
+def protected_entries(root: Path) -> list[Path]:
+    """The existing :data:`PROTECTED_ENTRIES` of ``root`` plus its ``.k3code/config*`` files."""
+    found = [root / e for e in PROTECTED_ENTRIES]
+    found += sorted((root / ".k3code").glob("config*"))
+    return [p for p in found if p.exists()]
+
+
 def exposes_home(path: Path | str, home: Path | None = None) -> bool:
     """True when binding ``path`` would bring back all of ``$HOME``: it is ``$HOME`` or contains it (``/``)."""
     home = Path(home or Path.home()).resolve()
@@ -441,7 +456,7 @@ def build_argv(
                 continue
             argv += ["--bind", p, p]
             # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
-            for meta in _git_metadata(root):
+            for meta in [*_git_metadata(root), *protected_entries(root)]:
                 argv += ["--ro-bind", str(meta), str(meta)]
     # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
     extra = configured_home_readonly() if home_readonly is None else list(home_readonly)
