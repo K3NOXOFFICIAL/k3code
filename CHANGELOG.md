@@ -10,7 +10,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
-- **uv credentials are never auto-allowed.** The toolchain read list held all of `~/.local/share/uv`, which includes `credentials/` (`uv auth dir`, index tokens), so an auto-mode `read` or `grep` of it from a project ran in the daemon, outside the sandbox, with no prompt. Only uv's `python/` and `tools/` subdirectories count as toolchain reads now; the credentials directory is refused in auto mode like any read outside the roots and asks a person in the other modes.
+- **uv credentials are never auto-allowed.** The toolchain read list held all of `~/.local/share/uv`, which includes `credentials/` (`uv auth dir`, index tokens), so an auto-mode `read` or `grep` of it from a project ran in the daemon, outside the sandbox, with no prompt. Only uv's `python/` and `tools/` subdirectories count as toolchain reads now; a read of the credentials directory asks a person in every mode, auto included.
 
 - **A planning turn that produces no plan no longer drops the task.** In auto mode, a strong-tier planner that spent its turns reading and never called `exit_plan` (nor answered with text) ended the turn with "Plan not approved; nothing was executed" and the implicit goal ended unjudged: the task was silently dropped. Below high risk the task now runs directly, with a notice ("The planner produced no plan; running the task directly"); a plan the user refused stays refused. A planner stopped by the loop guard or by repeated tool errors also no longer has its stop notice ("I stopped because I was repeating myself…") approved as the plan the executor must follow.
 

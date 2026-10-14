@@ -1959,6 +1959,29 @@ def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: b
         assert (current / ".degraded").read_text().startswith("k3:")
 
 
+def test_a_failed_k3_build_is_retried_when_the_same_version_is_installed_again(tmp_path: Path) -> None:
+    """#95: the version was complete, so every later run for the same commit said "already installed" and the k3
+    binary never came back."""
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    args = ("--from-source", "--minimal")
+    fail = stub_bin(tmp_path / "fail", "go", 'case "$1" in build) echo "go: GOPROXY=off" >&2; exit 1 ;; esac\n')
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=fail)
+    assert r.returncode == 0, r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".degraded").is_file() and not (current / "bin" / "k3").exists()
+    # no go now: a skip keeps the record of the failure
+    r = run(tmp_path, src / "install" / "install.sh", *args)
+    assert r.returncode == 0, r.stderr
+    assert (current / ".degraded").is_file()
+    build = 'case "$1" in build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    good = stub_bin(tmp_path / "good", "go", build)
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=good)
+    assert r.returncode == 0, r.stderr
+    assert "already installed" in r.stderr
+    assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+
+
 def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
     # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
     # (next test) must not promise an offline install
