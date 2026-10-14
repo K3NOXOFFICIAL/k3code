@@ -8,6 +8,7 @@ quoted delimiter (``<<'EOF'``) keeps the body data.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -351,6 +352,17 @@ def test_a_shift_needs_no_person(tmp_path: Path) -> None:
         assert _bash(cmd, "auto", tmp_path).action == "allow", cmd
 
 
+def test_the_arithmetic_end_scan_is_bounded_not_quadratic() -> None:
+    # H2: the scan that finds a ((...)) end ran at every `(` and read to the end of the text each time, so a run of
+    # `(` was quadratic on the loop that decides a command (a few thousand `(` took tens of seconds). It is now
+    # bounded well under a second, and a run too long to resolve is left unterminated so a person confirms it.
+    cmd = "(" * 100_000
+    start = time.perf_counter()
+    parsed = parse(cmd)
+    assert time.perf_counter() - start < 1.0
+    assert parsed.unterminated
+
+
 # a << bash may read as something else (in ${...} or a[...]) or a word bash versions read differently: no body is
 # skipped and no rule vouches for the command
 UNSURE = [
@@ -461,6 +473,34 @@ def test_a_heredoc_after_a_closed_bracket_or_brace_keeps_its_body(tmp_path: Path
     assert not p.unterminated, cmd
     assert [h.body for hs in p.heredocs for h in hs] == [f"{HIDDEN}\n"], cmd
     assert check(cmd, cwd=str(tmp_path)) is None
+
+
+# R1: a `#` directly after a substitution opener (`$(`, `<(`, `>(`) is a comment in bash and dash, so it swallows the
+# `)` on its line; the substitution stays open and the lines below are the commands it holds, not a heredoc body. The
+# parser used to close the substitution at that `)`, read `<<y` as a heredoc and hide the next line (auto and yolo
+# allowed it). The hardline must see the command the substitution really runs.
+COMMENT_AFTER_SUBST = [
+    f"echo $(#) <<y\n{HIDDEN}\ny\n)",
+    f"echo $(#)# <<y\n{HIDDEN}\ny\n)",
+    f"echo $(# )# <<y\n{HIDDEN}\ny\n)",
+    f'"$(#)# <<y\n{HIDDEN}\ny\n)',
+    f"echo >(#)# <<y\n{HIDDEN}\ny\n)",
+]
+
+
+@pytest.mark.parametrize("cmd", COMMENT_AFTER_SUBST)
+def test_a_comment_after_a_substitution_open_does_not_hide_a_body(tmp_path: Path, cmd: str) -> None:
+    _not_allowed(cmd, tmp_path)
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    # yolo runs whatever the hardline lets through: it must see the command the substitution really holds
+    assert _bash(cmd, "yolo", tmp_path).hardline == "rm-rf-home"
+
+
+def test_a_hash_inside_a_word_in_a_substitution_is_not_a_comment() -> None:
+    # `#` is a comment only at a word start; `a#b` keeps the `#`, so the substitution still closes on its own line
+    for cmd in ("echo $(echo a#b)", "echo $(printf %s x#y)"):
+        p = parse(cmd)
+        assert not p.unterminated and p.subs == [cmd], cmd
 
 
 QUOTED_WORDS = ["\\EOF", "E'OF'", 'E"O"F', "'E'OF", "'EOF'"]

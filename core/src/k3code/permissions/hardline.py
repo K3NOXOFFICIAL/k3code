@@ -769,8 +769,12 @@ class Parsed:
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
 
+#: a cap on the total characters scanned to resolve ``((...))`` arithmetic ends in one command line; past it an
+#: open ``((`` is left unresolved (the command is unterminated, a person confirms) instead of rescanning quadratically
+_ARITH_SCAN_BUDGET = 100_000
 
-def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
+
+def _match_paren(text: str, open_idx: int, arith: bool | None = None, budget: list[int] | None = None) -> int:
     """Index of the ``)`` that closes the ``(`` at ``open_idx`` (quote, escape, comment and heredoc aware); -1 when
     unbalanced. In arithmetic (``arith``; by default when the text there is ``((``) a ``<<`` is a shift and a ``#``
     starts no comment."""
@@ -779,6 +783,10 @@ def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
     if arith is None:
         arith = text.startswith("((", open_idx)  # $((...)): a << in it is a shift
     while i < n:
+        if budget is not None:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return -2  # scanned too far: the caller treats the ((...)) as unresolved
         c = text[i]
         if c == "\\":
             i += 2
@@ -809,7 +817,7 @@ def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
         if c == "\n" and heredocs:
             i = _skip_heredoc_bodies(text, i + 1, heredocs)
             continue
-        if c == "#" and not arith and i > open_idx + 1 and text[i - 1] in " \t\n;&|()<>":
+        if c == "#" and not arith and i > open_idx and text[i - 1] in " \t\n;&|()<>":
             eol = text.find("\n", i)
             i = n if eol < 0 else eol
             continue
@@ -823,10 +831,12 @@ def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
     return -1
 
 
-def _arith_end(text: str, i: int) -> int:
+def _arith_end(text: str, i: int, budget: list[int] | None = None) -> int:
     """Index of the last ``)`` of the arithmetic command ``((...))`` at ``i``, where ``<<`` is a shift, or -1 when it
     is not one: as in bash, the inner ``(`` must close right before a ``)`` (``((a) )`` is two subshells)."""
-    inner = _match_paren(text, i + 1, arith=True)
+    inner = _match_paren(text, i + 1, arith=True, budget=budget)
+    if inner == -2:
+        return -2
     return inner + 1 if inner > 0 and text.startswith(")", inner + 1) else -1
 
 
@@ -851,6 +861,7 @@ def _scan(text: str) -> Parsed:
     # stays open: a << then needs a person instead of hiding the next lines
     ctx: list[tuple[str, int]] = []
     i, n = 0, len(text)
+    arith_budget = [_ARITH_SCAN_BUDGET]
 
     def emit(s: str) -> None:
         cur.append(s)
@@ -1030,8 +1041,13 @@ def _scan(text: str) -> Parsed:
                     ctx[-1] = ("=(!", -1)
                 elif cur and cur[-1] == "=":
                     ctx.append(("=(", -1))  # a=(...), also a=((...)): no arithmetic
-                elif top != "((" and text.startswith("((", i) and (end := _arith_end(text, i)) > 0:
-                    ctx.append(("((", end))
+                elif top != "((" and text.startswith("((", i):
+                    end = _arith_end(text, i, arith_budget)
+                    if end == -2:  # too long to resolve: an open (( that never closes, so the command is unterminated
+                        out.unterminated = True
+                        ctx.append(("((", n))
+                    elif end > 0:
+                        ctx.append(("((", end))
             elif top == "=(":
                 ctx.pop()
             flush(c)
