@@ -499,6 +499,27 @@ def test_a_command_in_nested_backticks_is_checked(tmp_path: Path, cmd: str) -> N
         assert dec.action == "deny" and dec.hardline == "rm-rf-home", (mode, dec)
 
 
+# K3NOX-620: the shell removes the quotes and backslashes of the word of an unquoted ${...} before the inner shell or
+# eval reads it. Reading the unit only as written made these text; Main (shlex) denied them.
+UNQUOTED_BRACE_WORDS = [
+    r"x=1; bash -c ${x:+'`rm -rf ~`'}",
+    r"bash -c ${x:-'`rm -rf ~`'}",
+    r"x=1; sh -c ${x:+'`rm -rf ~`'}",
+    r"x=1; bash -c ${x:+'$(rm -rf ~)'}",
+    r"x=1; eval ${x:+\`rm -rf ~\`}",
+    r"eval ${x:-\`rm -rf ~\`}",
+    r"x=1; eval ${x:+'`rm -rf ~`'}",
+    r"x=1; sudo bash -c ${x:+'`rm -rf ~`'}",
+]
+
+
+@pytest.mark.parametrize("cmd", UNQUOTED_BRACE_WORDS)
+def test_the_word_of_an_unquoted_brace_is_checked_unquoted(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    for mode in MODES:
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+
+
 #: bash runs no `rm` in these: the backtick is escaped, in single quotes, or its backslash is itself escaped
 BACKTICK_TEXT = [
     r"echo $(echo \`rm -rf ~\`)",

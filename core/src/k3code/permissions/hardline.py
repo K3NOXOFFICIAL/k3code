@@ -409,11 +409,51 @@ def _unit_end(text: str, i: int) -> int:
     return -2
 
 
-def _shell_words(sub: str) -> list[str]:
+def _unquoted_brace(unit: str) -> str:
+    """The text an unquoted ``${...}`` gives the command it is an argument of when its word is used: the shell removes
+    the quotes and backslashes of the word (``${x:+'`a`'}`` hands on `` `a` ``); ``$(...)`` and backticks stay as
+    written, and ``"..."`` drops only the backslashes it drops on the command line."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\":
+            out.append(unit[i + 1 : i + 2])
+            i += 2
+        elif c == "'":
+            j = unit.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(unit[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and unit[j] != '"':
+                if unit[j] == "\\" and j + 1 < n:
+                    nxt = unit[j + 1]
+                    out.append(nxt if nxt in '$`"\\' else unit[j : j + 2])
+                    j += 2
+                elif not unit.startswith("${", j) and (end := _unit_end(unit, j)) >= 0:
+                    out.append(unit[j : end + 1])
+                    j = end + 1
+                else:
+                    out.append(unit[j])
+                    j += 1
+            i = j + 1
+        elif not unit.startswith("${", i) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _shell_words(sub: str, unquote_braces: bool = False) -> list[str]:
     """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
     double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
     ``bash -c "echo \\`x\\`"`` is the line the inner shell runs, and a ``$(...)``, backtick or ``${...}`` is one unit
-    whose quotes are its own (see _unit_end). An open quote or unit falls back to :func:`_tokens`."""
+    whose quotes are its own (see _unit_end). With ``unquote_braces`` an unquoted ``${...}`` is read as the text its
+    word gives instead (see _unquoted_brace). An open quote or unit falls back to :func:`_tokens`."""
     words: list[str] = []
     word: list[str] | None = None
     i, n = 0, len(sub)
@@ -432,7 +472,8 @@ def _shell_words(sub: str) -> list[str]:
         elif (end := _unit_end(sub, i)) != -1:
             if end < 0:
                 return _tokens(sub)
-            word.append(sub[i : end + 1])  # kept as written: parse reads it
+            unit = sub[i : end + 1]
+            word.append(_unquoted_brace(unit) if unquote_braces and unit.startswith("${") else unit)
             i = end + 1
         elif c == "'":
             j = sub.find("'", i + 1)
@@ -1283,18 +1324,19 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
     the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
-    shell unquotes them (see _shell_words)."""
-    toks = _shell_words(sub)
+    shell unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word
+    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), and every reading is checked."""
     out: list[str] = []
-    pre = _strip_wrappers(toks)
-    if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
-        out.append(" ".join(pre[1:]))
-    real = normalize_argv(toks)
-    if real and real[0] in LAUNCHERS:
-        out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
-    if real:
-        out += ssh_option_commands(real[0], real[1:])
-    return out
+    for toks in dict.fromkeys(tuple(_shell_words(sub, unquote)) for unquote in (False, True)):
+        pre = _strip_wrappers(list(toks))
+        if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
+            out.append(" ".join(pre[1:]))
+        real = normalize_argv(list(toks))
+        if real and real[0] in LAUNCHERS:
+            out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real:
+            out += ssh_option_commands(real[0], real[1:])
+    return list(dict.fromkeys(out))
 
 
 def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Parsed:
