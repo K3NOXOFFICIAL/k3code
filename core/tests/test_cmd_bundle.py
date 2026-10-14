@@ -117,6 +117,23 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     await server2.close()
 
 
+async def test_export_refuses_a_project_config_that_does_not_parse_without_quoting_its_line(tmp_path, monkeypatch):
+    """K3NOX-575: a YAML error quotes the line, which may hold a secret; `dispatch` puts any error that is not a
+    BundleError into the chat reply, so the export must refuse such a file with its path only, trusted or not."""
+    server, _ = make_server(tmp_path / "a", monkeypatch)
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    proj = tmp_path / "proj"
+    (proj / ".k3code").mkdir(parents=True)
+    (proj / ".k3code" / "config.yaml").write_text(f"mcp:\n  servers:\n    s:\n      env:\n        X_TOKEN: {tok}: x\n")
+    sid = await new_session(server, proj)
+    for flags in ("", " --session-only"):
+        out = tmp_path / "x.k3bundle"
+        res = await cmd(server, f"/export {out}{flags}", sid)
+        refused = "does not parse" in res["output"] and tok not in json.dumps(res)
+        assert refused and not out.exists()
+    await server.close()
+
+
 async def test_import_asks_for_confirmation(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path / "a", monkeypatch)
     sid = await new_session(server, tmp_path)
