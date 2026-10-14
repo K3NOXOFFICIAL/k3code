@@ -858,7 +858,8 @@ async def test_goal_judge_sees_the_failing_test_in_the_evidence_digest(tmp_path,
     judge_calls = [c for p in server.providers for c in p.log if _EVIDENCE_LABEL in c["text"]]
     assert len(judge_calls) == 1 and judge_calls[0]["model"] == "m-cheap"
     digest = judge_calls[0]["text"]
-    assert "-m pytest -q -p no:cacheprovider test_fail.py -> exit 1" in digest
+    # the command line is clipped to 160 characters in the digest (the interpreter path is long): pin the outcome
+    assert "-> exit 1" in digest and "pytest" in digest
     assert "Last test/check: FAILED, after the last edit." in digest
 
 
