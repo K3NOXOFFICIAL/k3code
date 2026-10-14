@@ -137,44 +137,50 @@ class OpenAICompatProvider(Provider):
             usage = None
             complete = False  # [DONE] or a finish_reason arrived: the answer is whole
             finish_reason: str | None = None
-            async for line in watchdog.lines(response):
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    complete = True
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(chunk, dict) and chunk.get(
-                    "error"
-                ):  # also OpenRouter's error + finish_reason "error" shape
-                    raise _inband_error(chunk)  # the upstream failed after answering 200
-                if _made_progress(chunk):
-                    watchdog.progress()
-                choices = chunk.get("choices") or []
-                if choices:
-                    if choices[0].get("finish_reason"):
+            try:
+                async for line in watchdog.lines(response):
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
                         complete = True
-                        finish_reason = choices[0]["finish_reason"]
-                    delta = choices[0].get("delta") or {}
-                    if text := delta.get("content"):
-                        content_parts.append(text)
-                        yield StreamEvent(type="text_delta", text=text)
-                    for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
-                        slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": []})
-                        if tc_id := tc.get("id"):
-                            slot["id"] = tc_id
-                        fn = tc.get("function") or {}
-                        if fn_name := fn.get("name"):
-                            slot["name"] += fn_name
-                        if args := fn.get("arguments"):
-                            slot["args"].append(args)
-                if chunk_usage := chunk.get("usage"):
-                    usage = _parse_usage(chunk_usage)
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(chunk, dict) and chunk.get(
+                        "error"
+                    ):  # also OpenRouter's error + finish_reason "error" shape
+                        raise _inband_error(chunk)  # the upstream failed after answering 200
+                    if _made_progress(chunk):
+                        watchdog.progress()
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        if choices[0].get("finish_reason"):
+                            complete = True
+                            finish_reason = choices[0]["finish_reason"]
+                        delta = choices[0].get("delta") or {}
+                        if text := delta.get("content"):
+                            content_parts.append(text)
+                            yield StreamEvent(type="text_delta", text=text)
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": []})
+                            if tc_id := tc.get("id"):
+                                slot["id"] = tc_id
+                            fn = tc.get("function") or {}
+                            if fn_name := fn.get("name"):
+                                slot["name"] += fn_name
+                            if args := fn.get("arguments"):
+                                slot["args"].append(args)
+                    if chunk_usage := chunk.get("usage"):
+                        usage = _parse_usage(chunk_usage)
+            except httpx.HTTPError:
+                if not complete:
+                    raise
+                # The answer is whole: a connection that drops while we wait for the trailing usage chunk (or the
+                # close) must not discard it and trigger a re-request; usage stays whatever arrived so far.
             if not complete:
                 # A proxy closing early or an upstream dying mid-answer ends the body cleanly: without this the
                 # half sentence became a successful turn, was saved to history and never failed over.
