@@ -5,6 +5,11 @@ import React, { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ComposerToken } from "../app/interfaces.js";
+import {
+  appendShellOutput,
+  resetShellRunsForTests,
+  shellRunCount,
+} from "../app/shellRunStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import {
   prepareSubmission,
@@ -74,6 +79,9 @@ function mountSubmission(slash = vi.fn(() => true)) {
   const shells: ((reply: unknown) => void)[] = [];
   const prompts: Record<string, unknown>[] = [];
   const clearIn = vi.fn();
+  const enqueue = vi.fn();
+  const pushHistory = vi.fn();
+  const sys = vi.fn();
 
   const gw = {
     request: vi.fn((method: string, params?: Record<string, unknown>) => {
@@ -98,9 +106,9 @@ function mountSubmission(slash = vi.fn(() => true)) {
       appendMessage: vi.fn(),
       composerActions: {
         clearIn,
-        enqueue: vi.fn(),
+        enqueue,
         prependQueue: vi.fn(),
-        pushHistory: vi.fn(),
+        pushHistory,
         setQueueEdit: vi.fn(),
       } as never,
       composerRefs: {
@@ -118,7 +126,7 @@ function mountSubmission(slash = vi.fn(() => true)) {
       setLastUserMsg: vi.fn(),
       slashRef: { current: slash },
       submitRef: { current: () => {} },
-      sys: vi.fn(),
+      sys,
     });
 
     useEffect(() => {
@@ -140,9 +148,13 @@ function mountSubmission(slash = vi.fn(() => true)) {
 
   return {
     clearIn,
+    enqueue,
+    gw,
     prompts,
+    pushHistory,
     shells,
     slash,
+    sys,
     sub: async () => {
       await vi.waitFor(() => expect(api).toBeTruthy());
 
@@ -233,5 +245,134 @@ describe("a queued item sent early (Ctrl+K, a double Enter)", () => {
     expect(mounted.slash).not.toHaveBeenCalled();
     expect(mounted.clearIn).not.toHaveBeenCalled();
     expect(mounted.prompts[0]).toMatchObject({ text: "/clear all of it" });
+  });
+});
+
+describe("a typed !cmd", () => {
+  beforeEach(() => {
+    resetUiState();
+    resetShellRunsForTests();
+    patchUiState({ sid: "sess-1" });
+  });
+
+  const execCalls = (gw: GatewayClient) =>
+    vi
+      .mocked(gw.request)
+      .mock.calls.filter(([method]) => method === "shell.exec");
+
+  it("runs in the session, streamed and recorded, with a timeout past the gateway's 300 s", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!ls -la");
+
+    const [[, params, timeout]] = execCalls(mounted.gw) as [
+      [string, Record<string, unknown>, number],
+    ];
+
+    expect(params).toMatchObject({
+      command: "ls -la",
+      record: true,
+      session_id: "sess-1",
+      stream: true,
+    });
+    expect(params.exec_id).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    expect(timeout).toBeGreaterThanOrEqual(330_000);
+    expect(mounted.pushHistory).toHaveBeenCalledWith("!ls -la");
+    // known to the run store until it replies, so its shell.output lands
+    expect(shellRunCount()).toBe(1);
+    expect(
+      appendShellOutput({ exec_id: String(params.exec_id), text: "a\n" }),
+    ).toBe(true);
+
+    mounted.shells[0]!({ code: 0, stdout: "a" });
+    await settle();
+    expect(shellRunCount()).toBe(0);
+  });
+
+  it("with no session yet is queued, not run", async () => {
+    patchUiState({ sid: null });
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!ls");
+
+    expect(execCalls(mounted.gw)).toHaveLength(0);
+    expect(mounted.enqueue).toHaveBeenCalledWith("!ls", "!ls", []);
+    expect(mounted.pushHistory).toHaveBeenCalledWith("!ls");
+  });
+
+  it("shows the gateway's reason when the hardline rules deny it", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!env");
+    mounted.shells[0]!({ code: 126, stderr: "denied: env dumps secrets" });
+    await settle();
+
+    expect(mounted.sys).toHaveBeenCalledWith("denied: env dumps secrets");
+    expect(mounted.sys).toHaveBeenCalledWith("exit 126");
+  });
+
+  it("shows a transport error and forgets the run", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    vi.mocked(mounted.gw.request).mockImplementationOnce(() =>
+      Promise.reject(new Error("gateway not running")),
+    );
+    sub.dispatchSubmission("!ls");
+    await settle();
+
+    expect(mounted.sys).toHaveBeenCalledWith("error: gateway not running");
+    expect(shellRunCount()).toBe(0);
+    expect(getUiState().busy).toBe(false);
+  });
+
+  it("tags a cancelled run", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("!sleep 30");
+    mounted.shells[0]!({ cancelled: true, code: 130, stdout: "" });
+    await settle();
+
+    expect(mounted.sys).toHaveBeenCalledWith("exit 130 · cancelled");
+  });
+});
+
+describe("{!cmd} interpolation", () => {
+  beforeEach(() => {
+    resetUiState();
+    resetShellRunsForTests();
+    patchUiState({ sid: "sess-1" });
+  });
+
+  it("runs one at a time in the session, unrecorded", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+
+    sub.dispatchSubmission("compare {!date} with {!uptime}");
+    await settle();
+
+    // the second waits for the first: the gateway refuses more than 8 at once
+    expect(mounted.shells).toHaveLength(1);
+    mounted.shells[0]!({ code: 0, stdout: "Tue" });
+    await vi.waitFor(() => expect(mounted.shells).toHaveLength(2));
+
+    const calls = vi
+      .mocked(mounted.gw.request)
+      .mock.calls.filter(([method]) => method === "shell.exec");
+
+    expect(calls.map(([, params]) => params)).toEqual([
+      { command: "date", record: false, session_id: "sess-1" },
+      { command: "uptime", record: false, session_id: "sess-1" },
+    ]);
+
+    mounted.shells[1]!({ code: 0, stdout: "up 3 days" });
+    await vi.waitFor(() => expect(mounted.prompts).toHaveLength(1));
+    expect(mounted.prompts[0]).toMatchObject({
+      text: "compare Tue with up 3 days",
+    });
   });
 });

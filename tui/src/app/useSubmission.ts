@@ -33,11 +33,22 @@ import type {
   ComposerState,
   ComposerToken,
 } from "./interfaces.js";
+import { finishShellRun, startShellRun } from "./shellRunStore.js";
 import { submitPrompt } from "./submissionCore.js";
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
 
 const DOUBLE_ENTER_MS = 450;
+
+// The gateway stops a `!cmd` after USER_SHELL_TIMEOUT_S (300 s); the request waits longer, so the reply (code 124) is
+// what ends it, not the client's default 120 s RPC timeout.
+export const SHELL_EXEC_TIMEOUT_MS = (300 + 30) * 1000;
+
+let execSeq = 0;
+
+// The id the gateway tags this run's `shell.output` events and its record with ([A-Za-z0-9_-]{1,64}).
+const newExecId = () =>
+  `sh-${Date.now().toString(36)}-${(++execSeq).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 const spliceMatches = (
   text: string,
@@ -280,8 +291,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
   const shellExec = useCallback(
     (cmd: string, turnRunning = getUiState().busy) => {
       const runs = shellRuns.current;
+      const execId = newExecId();
 
       appendMessage({ role: "user", text: `!${cmd}` });
+      startShellRun(execId);
 
       if (runs.count++ === 0) {
         runs.ownsBusy = !turnRunning;
@@ -291,7 +304,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
         patchUiState({ busy: true, status: "running…" });
       }
 
-      gw.request<ShellExecResponse>("shell.exec", { command: cmd })
+      gw.request<ShellExecResponse>(
+        "shell.exec",
+        {
+          command: cmd,
+          exec_id: execId,
+          record: true,
+          session_id: getUiState().sid,
+          stream: true,
+        },
+        SHELL_EXEC_TIMEOUT_MS,
+      )
         .then((raw) => {
           const r = asRpcResult<ShellExecResponse>(raw);
 
@@ -305,12 +328,20 @@ export function useSubmission(opts: UseSubmissionOptions) {
             sys(out);
           }
 
+          const tag = r.cancelled
+            ? " · cancelled"
+            : r.timed_out
+              ? " · timed out"
+              : "";
+
           if (r.code !== 0 || !out) {
-            sys(`exit ${r.code}`);
+            sys(`exit ${r.code}${tag}`);
           }
         })
         .catch((e: Error) => sys(`error: ${e.message}`))
         .finally(() => {
+          finishShellRun(execId);
+
           if (--runs.count === 0 && runs.ownsBusy) {
             patchUiState({ busy: false, status: "ready" });
           }
@@ -329,24 +360,38 @@ export function useSubmission(opts: UseSubmissionOptions) {
     ) => {
       patchUiState({ status: "interpolating…" });
       const matches = typedInterpolations(text, pasted);
+      const sid = getUiState().sid;
 
-      Promise.all(
-        matches.map((m) =>
-          gw
-            .request<ShellExecResponse>("shell.exec", { command: m[1]! })
-            .then((raw) => {
-              const r = asRpcResult<ShellExecResponse>(raw);
+      // One at a time: the gateway refuses more than 8 concurrent shell.exec per client. Not recorded: the output is
+      // already in the prompt.
+      const run = (command: string) =>
+        gw
+          .request<ShellExecResponse>(
+            "shell.exec",
+            { command, record: false, session_id: sid },
+            SHELL_EXEC_TIMEOUT_MS,
+          )
+          .then((raw) => {
+            const r = asRpcResult<ShellExecResponse>(raw);
 
-              return [r?.stdout, r?.stderr].filter(Boolean).join("\n").trim();
-            })
-            .catch(() => "(error)"),
-        ),
-      ).then((results) =>
-        then(
-          spliceMatches(text, matches, results),
-          shiftSpans(pasted, matches, results),
-        ),
-      );
+            return [r?.stdout, r?.stderr].filter(Boolean).join("\n").trim();
+          })
+          .catch(() => "(error)");
+
+      matches
+        .reduce<Promise<string[]>>(
+          (acc, m) =>
+            acc.then((results) =>
+              run(m[1]!).then((result) => [...results, result]),
+            ),
+          Promise.resolve([]),
+        )
+        .then((results) =>
+          then(
+            spliceMatches(text, matches, results),
+            shiftSpans(pasted, matches, results),
+          ),
+        );
     },
     [gw],
   );
@@ -513,15 +558,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return;
       }
 
-      // a shell escape is what the user typed: with a paste in it, it is a prompt
-      if (full.startsWith("!") && !labelSpans(full, submissionTokens).length) {
-        composerActions.clearIn();
-
-        return shellExec(full.slice(1).trim());
-      }
-
       const live = getUiState();
 
+      // With no session yet a `!cmd` queues like a prompt (the gateway runs it in the session's directory, and there
+      // is none): the drain sends it through sendQueued.
       if (!live.sid) {
         composerActions.pushHistory(toHistory);
         // The tokens are cleared below, so queue the expansion (and where its
@@ -530,6 +570,14 @@ export function useSubmission(opts: UseSubmissionOptions) {
         composerActions.clearIn();
 
         return;
+      }
+
+      // a shell escape is what the user typed: with a paste in it, it is a prompt
+      if (full.startsWith("!") && !labelSpans(full, submissionTokens).length) {
+        composerActions.pushHistory(toHistory);
+        composerActions.clearIn();
+
+        return shellExec(full.slice(1).trim());
       }
 
       const editIdx = composerRefs.queueEditRef.current;

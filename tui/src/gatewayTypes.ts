@@ -393,10 +393,30 @@ export interface ClarifyLockResponse {
 
 // ── Shell / clipboard / input ────────────────────────────────────────
 
+/** `shell.exec`: code 130 = cancelled, 124 = timed out, 126 = denied by the hardline rules (the reason in stderr). */
 export interface ShellExecResponse {
+  cancelled?: boolean;
   code: number;
+  cwd?: string;
+  exec_id?: string;
+  /** With `record: true`: the output joins the context now, after the running turn, or not at all. */
+  recorded?: "after_turn" | "now" | false;
   stderr?: string;
   stdout?: string;
+  timed_out?: boolean;
+}
+
+/** `shell.output`: a `!cmd` run with `stream: true`, coalesced; `notice` once past the stream cap (the rest arrives
+ *  with the reply). Not in the generated event map yet, so the handler narrows it by hand. */
+export interface ShellOutputEvent {
+  exec_id: string;
+  notice?: string;
+  stream?: "stderr" | "stdout";
+  text?: string;
+}
+
+export interface ShellCancelResponse {
+  cancelled: number;
 }
 
 export interface ClipboardPasteResponse {

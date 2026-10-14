@@ -401,7 +401,9 @@ describe("paste spans on the queue, retry and edit paths", () => {
     sub.sendQueued(`{!date} ${pasted}`, [[8, 8 + pasted.length]]);
     await vi.waitFor(() => expect(calls("prompt.submit")).toHaveLength(1));
 
-    expect(calls("shell.exec")).toEqual([{ command: "date" }]);
+    expect(calls("shell.exec")).toEqual([
+      { command: "date", record: false, session_id: "sess-1" },
+    ]);
     expect(calls("prompt.submit")[0]).toMatchObject({
       paste_spans: [[3, 3 + pasted.length]],
       text: `ok ${pasted}`,
@@ -433,7 +435,9 @@ describe("paste spans on the queue, retry and edit paths", () => {
     sub.dispatchSubmission(`{!date} ${label}`);
     await vi.waitFor(() => expect(calls("prompt.submit")).toHaveLength(1));
 
-    expect(calls("shell.exec")).toEqual([{ command: "date" }]);
+    expect(calls("shell.exec")).toEqual([
+      { command: "date", record: false, session_id: "sess-1" },
+    ]);
     expect(calls("prompt.submit")[0]).toMatchObject({
       paste_spans: [[3, 3 + text.length]],
       text: `ok ${text}`,

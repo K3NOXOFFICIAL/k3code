@@ -9,6 +9,13 @@ import {
 } from "../app/overlayStore.js";
 import { $streamedOutputChars } from "../app/outputTokensStore.js";
 import { resetServerRequestsForTests } from "../app/serverRequestStore.js";
+import {
+  $shellRuns,
+  appendShellOutput,
+  resetShellRunsForTests,
+  SHELL_LIVE_LINES,
+  startShellRun,
+} from "../app/shellRunStore.js";
 import { submitPrompt } from "../app/submissionCore.js";
 import { turnController } from "../app/turnController.js";
 import { getTurnState, resetTurnState } from "../app/turnStore.js";
@@ -3155,5 +3162,51 @@ describe("createGatewayEventHandler", () => {
       expect(getUiState().busy).toBe(true);
       expect(appended).toHaveLength(0);
     });
+  });
+});
+
+describe("shell.output", () => {
+  beforeEach(() => {
+    resetUiState();
+    resetShellRunsForTests();
+  });
+
+  it("appends live output only to a run this client started", () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]));
+
+    startShellRun("mine");
+    onEvent({
+      payload: { exec_id: "mine", stream: "stdout", text: "one\ntw" },
+      type: "shell.output",
+    } as never);
+    onEvent({
+      payload: { exec_id: "mine", stream: "stdout", text: "o\n" },
+      type: "shell.output",
+    } as never);
+    onEvent({
+      payload: { exec_id: "theirs", stream: "stdout", text: "nope\n" },
+      type: "shell.output",
+    } as never);
+
+    expect($shellRuns.get()).toEqual({
+      mine: { lines: ["one", "two"], open: false },
+    });
+  });
+
+  it("keeps the last SHELL_LIVE_LINES lines of a run", () => {
+    startShellRun("x");
+    appendShellOutput({
+      exec_id: "x",
+      text: Array.from(
+        { length: SHELL_LIVE_LINES + 5 },
+        (_, i) => `l${i}\n`,
+      ).join(""),
+    });
+
+    const lines = $shellRuns.get().x!.lines;
+
+    expect(lines).toHaveLength(SHELL_LIVE_LINES);
+    expect(lines[0]).toBe("l5");
+    expect(lines.at(-1)).toBe(`l${SHELL_LIVE_LINES + 4}`);
   });
 });

@@ -26,6 +26,7 @@ import type {
   DelegationStatusResponse,
   GatewaySkin,
   SessionMostRecentResponse,
+  ShellOutputEvent,
 } from "../gatewayTypes.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { topLevelSubagents } from "../lib/subagentTree.js";
@@ -72,6 +73,7 @@ import {
   forgetAllServerRequests,
   forgetServerRequest,
 } from "./serverRequestStore.js";
+import { appendShellOutput } from "./shellRunStore.js";
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
 import {
@@ -944,6 +946,17 @@ export function createGatewayEventHandler(
       ev.session_id !== sid &&
       !ev.type.startsWith("gateway.")
     ) {
+      return;
+    }
+
+    // Only for the runs this client started: another client's `!cmd` streams to every client of the session.
+    if ((ev.type as string) === "shell.output") {
+      const payload = ev.payload as ShellOutputEvent | undefined;
+
+      if (payload?.exec_id) {
+        appendShellOutput(payload);
+      }
+
       return;
     }
 
