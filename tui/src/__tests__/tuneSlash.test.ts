@@ -138,6 +138,32 @@ describe("/tune, /model and /effort", () => {
     );
   });
 
+  it("/provider is listed with its usage and goes to the gateway, bare too", async () => {
+    expect(findSlashCommand("provider")?.usage).toBe(
+      "/provider [<name> [--save]]",
+    );
+    const ctx = buildCtx(() =>
+      Promise.resolve({ output: "Providers (* = active):\n* a\n  b" }),
+    );
+
+    run(ctx, "/provider");
+
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "provider",
+      session_id: "sid-abc",
+    });
+    await vi.waitFor(() =>
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        "Providers (* = active):\n* a\n  b",
+      ),
+    );
+    run(ctx, "/provider b --save");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "provider b --save",
+      session_id: "sid-abc",
+    });
+  });
+
   it("shows the gateway's error instead of swallowing it", async () => {
     const ctx = buildCtx(() => Promise.reject(new Error("unknown effort")));
 

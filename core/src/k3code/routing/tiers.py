@@ -108,6 +108,16 @@ def tier_model_specs(config: Any, tier: Tier | str, *, key: str | None = None) -
     return resolved
 
 
+def active_provider(config: Any, chosen: str = "") -> str:
+    """The provider block turns try first: ``chosen`` (the session's /provider pick), else ``default_provider``, else
+    the first block. A name that no block has (any more) is passed over; '' when there are no blocks."""
+    names = [p.name for p in config.providers]
+    for name in (chosen, getattr(config, "default_provider", "")):
+        if name and name in names:
+            return name
+    return names[0] if names else ""
+
+
 def router_options(config: Any) -> dict[str, float]:
     """``router:`` settings (max_inline_wait, quota_cooldown) as Router keyword arguments."""
     raw = getattr(config, "router", None) or {}
@@ -126,6 +136,7 @@ class TierRouters:
         on_event: Callable[[RouterEvent], None] | None = None,
         main_key: str | None = None,
         fallback_router: Router | None = None,
+        first_provider: str = "",
     ) -> None:
         #: when set, every tier uses this router (a single pre-built chain)
         self.fallback_router = fallback_router
@@ -134,6 +145,8 @@ class TierRouters:
         self.cooldowns = cooldowns if cooldowns is not None else CooldownStore()
         self.on_event = on_event
         self.main_key = main_key
+        #: /provider: this block's models come first, the other blocks follow in config order ('' = config order)
+        self.first_provider = first_provider
         self._routers: dict[Tier, Router] = {}
 
     def get(self, tier: Tier | str) -> Router:
@@ -141,7 +154,14 @@ class TierRouters:
         if self.fallback_router is not None:
             return self.fallback_router
         if tier not in self._routers:
-            chain = build_chain(self.providers, tier_model_specs(self.config, tier, key=self.main_key))
+            providers, specs = self.providers, tier_model_specs(self.config, tier, key=self.main_key)
+            if self.first_provider:  # move provider and spec together: each block keeps its own models
+                pairs = sorted(
+                    zip(providers, specs, strict=False),
+                    key=lambda ps: getattr(ps[0], "name", "") != self.first_provider,
+                )
+                providers, specs = [p for p, _ in pairs], [s for _, s in pairs]
+            chain = build_chain(providers, specs)
             self._routers[tier] = Router(
                 chain, cooldowns=self.cooldowns, on_event=self.on_event, tier=tier.value, **router_options(self.config)
             )

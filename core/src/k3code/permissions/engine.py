@@ -54,7 +54,7 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
         return PermissionMode(value)
     except ValueError:
         raise InvalidPermissionMode(
-            f"{key} {value!r} is not one of: ask, auto-edit, plan, auto, yolo "
+            f"{key} {value!r} is not one of: default, accept-edits, plan, auto, yolo (or ask, auto-edit) "
             f"(set in config.yaml or K3CODE_{key.upper()})"
         ) from None
 

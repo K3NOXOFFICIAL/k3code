@@ -430,7 +430,8 @@ class SubagentManager:
                 "change branches."
             )
         system = subagent_system_prompt(base, name=atype.name, description=h.description, body=atype.prompt, note=note)
-        router = server._ensure_router(parent.stored.model or None).get(Tier(h.tier))  # the parent's key (#130)
+        # the parent's key (#130) and its /provider pick
+        router = server._ensure_router(parent.stored.model or None, parent.stored.provider).get(Tier(h.tier))
         loop = AgentLoop(
             router,
             system_prompt=system,
@@ -477,7 +478,7 @@ class SubagentManager:
 
     async def _drive(self, parent: Any, h: Handle, atype: AgentType, prompt: str, cwd: Path) -> None:
         server = self.server
-        server._ensure_router(parent.stored.model or None)
+        server._ensure_router(parent.stored.model or None, parent.stored.provider)
         reliability = child_reliability(server.config, h.id, server._home())
         parent_approval = await server._approval_callback_for(parent)
         parent._approval_cb = parent_approval  # noqa: SLF001 - shared with every child of this session
