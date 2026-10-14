@@ -171,7 +171,6 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 | `K3CODE_PYTHON_SRC_ROOT`        | **Yes** (for spawn) | `import.meta.dirname + '/../../'` | Root where `tui_gateway` package is importable.                                                                                     |
 | `K3CODE_TUI_STARTUP_TIMEOUT_MS` | No                  | `15000`                           | Max wait for `gateway.ready`.                                                                                                       |
 | `K3CODE_TUI_RPC_TIMEOUT_MS`     | No                  | `120000`                          | RPC request timeout.                                                                                                                |
-| `HERMES_VOICE`                  | No                  | `0`                               | Set to `1` to enable voice features.                                                                                                |
 
 ---
 
