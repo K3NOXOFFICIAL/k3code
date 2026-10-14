@@ -445,6 +445,21 @@ async def test_auto_fanout_stops_starting_children_at_max_agents(tmp_path, monke
     assert server.session.stored.messages[-1]["content"] == "parent handled it"
 
 
+async def test_auto_fanout_keeps_a_reviewer_slot_for_every_worker(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    # 3 agents: t1's worker + reviewer use two; t2's worker would start with one slot left and have no reviewer
+    steps = steps_for(SUBS, extra=[PARENT_TAKES_OVER], sleep=0)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=1, max_agents=3, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+    assert starts(server) == 2 and starts(server, "worker") == 1
+    done = events(server, "fanout.done")[0]
+    assert done["merged"] == 1
+    assert "Stopped early: agent budget exhausted (2/3 agents)" in done["summary"]
+    skipped = [p for p in events(server, "fanout.progress") if p["state"] == "skipped"]
+    assert {p["subtask_id"] for p in skipped} == {"t2", "t3"}
+
+
 async def test_auto_fanout_token_cap_stops_it(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     # t1's worker spends 2 calls x 350 tokens; with a 300-token cap its reviewer and every later child is refused
@@ -503,6 +518,10 @@ def test_fanout_budget_defaults_and_derivation():
     assert budget(8).max_agents == 16  # capped
     assert budget(8, max_agents=5).max_agents == 5
     assert budget(2, max_tokens=0).max_tokens is None  # 0 = no token cap
+    # negative and non-numeric values count as 0 (default agents, no token cap), never a negative cap
+    for bad in (-5, None, "lots", True):
+        b = budget(3, max_agents=bad, max_tokens=bad)
+        assert (b.max_agents, b.max_tokens) == (12, None), bad
 
 
 def test_extract_subtasks_and_verdict_parsing():

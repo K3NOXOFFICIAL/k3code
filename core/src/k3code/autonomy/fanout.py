@@ -215,10 +215,21 @@ class FanoutExecutor:
         return extract_subtasks(v, gate.plan)
 
     def budget(self, n_subtasks: int) -> AgentBudget:
-        """The budget of an auto fan-out: ``autonomy.fanout.max_tokens`` (0 = no cap) and ``max_agents`` (0 = worker,
-        reviewer, rework and re-review per subtask, at most 16). /ultracode builds its own, shared with its planners."""
-        max_agents = int(self.cfg["max_agents"]) or min(4 * n_subtasks, 16)
-        return AgentBudget(max_agents, int(self.cfg["max_tokens"]) or None)
+        """The budget of an auto fan-out: ``autonomy.fanout.max_tokens`` (0 = no cap) and ``max_agents`` (0 = 4 agents
+        per subtask, at most 16; a worker only starts while a reviewer slot is left for it). Negative or non-numeric
+        values count as 0. /ultracode builds its own, shared with its planners."""
+        max_agents = self._count("max_agents") or min(4 * n_subtasks, 16)
+        return AgentBudget(max_agents, self._count("max_tokens") or None)
+
+    def _count(self, key: str) -> int:
+        v = self.cfg[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            n = 0
+        else:
+            n = max(int(v), 0)
+        if n != v:
+            logger.warning("autonomy.fanout.%s=%r is not a non-negative number; using %d", key, v, n)
+        return n
 
     # ── the run ──
 
@@ -343,6 +354,11 @@ class FanoutExecutor:
         if (rel := getattr(ctx.session, "reliability", None)) is not None and (err := rel.check_budgets()) is not None:
             raise BudgetStop(str(err))
         if ctx.budget is not None:
+            if agent_type == "worker" and ctx.budget.max_agents is not None:
+                # a worker's result is useless unmerged-and-unreviewed: keep a slot for its reviewer
+                ctx.budget.check()
+                if ctx.budget.max_agents - ctx.budget.agents < 2:
+                    raise BudgetStop(f"agent budget exhausted ({ctx.budget.agents}/{ctx.budget.max_agents} agents)")
             ctx.budget.take_agent()
         mgr = self.server.subagents
         idx = int(st.id[1:]) - 1
