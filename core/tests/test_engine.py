@@ -400,3 +400,36 @@ def test_an_always_rule_never_carries_an_inline_environment_value() -> None:
         assert not any("sk-live" in p for p in patterns)
     d = decide(mode="default", tool="bash", args={"command": "API_KEY=sk-live-123"}, cwd=CWD)
     assert all("sk-live" not in r.pattern for r in suggest_rules("bash", d))
+
+
+@pytest.mark.parametrize(
+    ("command", "ok"),
+    [
+        ("ls -la", True),
+        ("cat notes.txt; ls", True),
+        ("grep -n KEY notes.txt | cat", True),
+        ("grep -rn KEY .", False),
+        ("grep -nR KEY .", False),
+        ("grep -d recurse KEY .", False),
+        ("grep --dir=recurse KEY .", False),
+        ("grep --recur KEY .", False),
+        ("grep --deref KEY .", False),
+        ("ls -R", False),
+        ("ls --recursive", False),
+        ("rg KEY", False),
+        ("git status", False),
+        ("cat */notes", False),
+        ("cat .e{n,}v", False),
+        ("cat 'notes'", False),
+        ("cat ~/notes", False),
+        ("cat $F", False),
+        ("cat notes > out", False),
+        ("ls; python3 x", False),
+        ("FOO=1 cat notes", False),
+        ("", False),
+    ],
+)
+def test_home_read_only_takes_only_plain_non_recursive_readers(command, ok):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is ok

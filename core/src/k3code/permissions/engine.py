@@ -83,6 +83,41 @@ BUILTIN_BASH_ASK = [
     "git log* --textconv*",
 ]
 
+#: The builtin read-only programs a session started in ``$HOME`` runs without a person (see :func:`home_read_only`).
+#: ``rg`` searches recursively by default and ``git diff --no-index DIR other`` dumps a tree: both keep the ask there.
+_HOME_READERS = frozenset({"ls", "cat", "grep"})
+#: What such a command may be spelled with: words and the ``; | &`` separators. No glob, brace, quote, escape, ``$``,
+#: ``~``, redirect, substitution, comment or newline, so the words the shell runs are the words written.
+_HOME_PLAIN = re.compile(r"[A-Za-z0-9._/@+=,: |;&-]+")
+#: Long options (GNU getopt takes any unambiguous prefix) that make ``ls``/``grep`` walk a directory tree.
+_RECURSIVE_LONG = ("recursive", "dereference-recursive", "directories")
+
+
+def home_read_only(command: str) -> bool:
+    """``command`` may run without a person in the read-only ``$HOME`` sandbox of a session started in the home
+    directory: every part is a plain, non-recursive ``ls``, ``cat`` or ``grep``. Dotenv files lie anywhere below
+    ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``) or
+    expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by :func:`decide` first.
+    Over-matching only costs a prompt."""
+    if not _HOME_PLAIN.fullmatch(command):
+        return False
+    parsed = hardline.parse(command)
+    if not parsed.subs or parsed.nested or parsed.children or parsed.unterminated:
+        return False
+    for sub in parsed.subs:
+        words = sub.split()
+        if not words or words[0] not in _HOME_READERS:
+            return False
+        for word in words[1:]:
+            if word.startswith("--"):
+                name = word[2:].split("=", 1)[0]
+                if any(full.startswith(name) for full in _RECURSIVE_LONG):
+                    return False
+            elif word.startswith("-") and any(ch in word[1:] for ch in ("R" if words[0] == "ls" else "rRd")):
+                return False
+    return True
+
+
 #: bash_output / bash_kill only reach background jobs of the calling session (the job registry enforces it); starting
 #: one is ``bash`` with ``background: true`` and goes through the bash decision like any command.
 PURE_TOOLS = frozenset(
@@ -873,9 +908,10 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
     return dec
 
 
-#: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person: the
-#: system dirs the sandbox shows bash anyway, and the language package caches under ``$HOME``. Credential paths are
-#: refused before this is consulted (sensitive_path).
+#: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person:
+#: ``/usr`` and ``/etc`` (the sandbox shows bash those anyway), the system package trees ``/opt`` and ``/nix/store``
+#: (the sandbox does not bind them: only these in-process reads see them), and the language package caches under
+#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path).
 _TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
 _TOOLCHAIN_HOME = (
     ".cargo/registry",

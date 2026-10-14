@@ -17,6 +17,7 @@ model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import logging
 import os
@@ -31,7 +32,7 @@ from pathlib import Path
 from k3code import paths
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.permissions import PermissionMode
-from k3code.permissions.engine import windows_drives
+from k3code.permissions.engine import sensitive_path, windows_drives
 
 logger = logging.getLogger(__name__)
 
@@ -374,9 +375,10 @@ def build_argv(
     Raises :class:`SandboxRefused` when the cwd or an added dir is ``$HOME``, a directory above it, or a directory
     above ``~/.ssh`` or the k3code home.
 
-    ``readonly_home``: the cwd is ``$HOME`` itself (see :func:`readonly_home_ok`). Nothing is writable but ``/tmp``:
-    ``$HOME`` and the added dirs are bound read-only, with the credential folders and files hidden
-    (:data:`HOME_RO_HIDDEN`). For the commands a rule allows in a session started in the home directory.
+    ``readonly_home``: the cwd is ``$HOME`` itself (see :func:`readonly_home_ok`). Nothing is writable but ``/tmp``
+    and there is no network: ``$HOME`` and the added dirs are bound read-only, with the credential folders and files
+    hidden (:data:`HOME_RO_HIDDEN`). For the plain builtin readers of a session started in the home directory (see
+    :func:`k3code.permissions.engine.home_read_only`).
     """
     home = Path(home or Path.home())
     roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
@@ -385,7 +387,7 @@ def build_argv(
     for root in roots[1:] if readonly_home else roots:
         _refuse_root(root, home)
     argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
-    if not network:
+    if not network or readonly_home:  # a read-only home view never has the network: nothing it reads leaves the host
         argv.append("--unshare-net")
     # The command gets a minimal environment, not the daemon's: it carries the provider API keys (OMNIROUTE_API_KEY,
     # ANTHROPIC_API_KEY, ...), so any command run by a prompt-injected turn could print them.
@@ -454,18 +456,56 @@ def build_argv(
     return argv
 
 
-#: What a read-only ``$HOME`` view hides on top of :data:`HOME_SECRETS`, :data:`HOME_READONLY_REFUSED` and the k3code
-#: home: well-known credential files and folders (tokens, registry logins, keyrings).
+#: What a read-only ``$HOME`` view hides on top of :data:`HOME_SECRETS`, :data:`HOME_READONLY_REFUSED`, the k3code
+#: home and the top-level dotenv files: well-known credential files and folders (tokens, registry logins, keyrings,
+#: cloud and agent logins, browser profiles) and shell/REPL histories (pasted tokens, ``export KEY=...``). A dotenv
+#: file deeper down cannot be hidden this way: :func:`k3code.permissions.engine.home_read_only` keeps every command
+#: that walks a tree or expands a glob out of this sandbox, and an explicitly named one is refused before it runs.
 HOME_RO_HIDDEN = (
     ".netrc",
     ".git-credentials",
     ".npmrc",
     ".pypirc",
+    ".pgpass",
+    ".vault-token",
     ".docker",
     ".kube",
+    ".azure",
+    ".config/gcloud",
     ".config/gh",
+    ".config/hub",
+    ".config/rclone",
     ".password-store",
     ".local/share/keyrings",
+    ".local/share/k3code",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".gem/credentials",
+    ".terraform.d",
+    ".claude",
+    ".claude.json",
+    ".codex",
+    ".mozilla",
+    ".thunderbird",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".var/app",
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".histfile",
+    ".sh_history",
+    ".local/share/fish",
+    ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".rediscli_history",
+    ".lesshst",
 )
 
 
@@ -486,18 +526,44 @@ def readonly_home_ok(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, ho
 def _readonly_home_argv(home: Path, add_dirs: Sequence[Path], xdg: str | None) -> list[str]:
     """bwrap ops of :func:`build_argv` with ``readonly_home``: $HOME and the added dirs read-only, secrets hidden."""
     argv = ["--ro-bind", str(home), str(home)]
+    # where each host directory shows inside the sandbox: (its realpath, the path it is mounted at)
+    shown = [(os.path.realpath(home), str(home))]
     for d in add_dirs:
         if d.is_dir() and not d.is_relative_to(home.resolve()) and not exposes_home(d, home):
             argv += ["--ro-bind", str(d), str(d)]
+            shown.append((os.path.realpath(d), str(d)))
+    shown += [(os.path.realpath(p), p) for p in ("/usr", "/etc") if os.path.isdir(p)]
     hidden = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED, *HOME_RO_HIDDEN)] + [paths.home()]
     if xdg:
         hidden.append(Path(xdg) / "k3code")
-    for path in dict.fromkeys(str(p) for p in hidden):
-        if os.path.isdir(path):
-            argv += ["--tmpfs", path]
-        elif os.path.isfile(path) and not os.path.islink(path):
-            argv += ["--ro-bind", os.devnull, path]
+    with contextlib.suppress(OSError):
+        hidden += [Path(e.path) for e in os.scandir(home) if sensitive_path(e.path)]  # ~/.env, ~/.env.local, ...
+    # Hidden where the file really is: a symlinked ~/.netrc (dotfile managers) is masked at its target, which is also
+    # what the link reaches inside the sandbox. A target the sandbox does not show is unreachable there anyway.
+    masked: set[str] = set()
+    for p in hidden:
+        real = os.path.realpath(p)
+        at = _shown_at(real, shown)
+        if at is None or at in masked:
+            continue
+        if os.path.isdir(real):
+            argv += ["--tmpfs", at]
+        elif os.path.exists(real):
+            argv += ["--ro-bind", os.devnull, at]
+        else:
+            continue
+        masked.add(at)
     return [*argv, "--chdir", str(home)]
+
+
+def _shown_at(real: str, shown: Sequence[tuple[str, str]]) -> str | None:
+    """The path inside the sandbox at which the host path ``real`` (a realpath) shows, or None."""
+    for host, inside in sorted(shown, key=lambda s: len(s[0]), reverse=True):
+        if real == host:
+            return inside
+        if real.startswith(host.rstrip("/") + "/"):
+            return os.path.join(inside, os.path.relpath(real, host))
+    return None
 
 
 def with_chdir(argv: Sequence[str], cwd: Path | str) -> list[str]:

@@ -13,6 +13,7 @@ from typing import Any
 from k3code import context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
+from k3code.permissions.engine import home_read_only
 from k3code.permissions.state import PermissionState
 from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
@@ -532,15 +533,19 @@ class AgentLoop:
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
-        # A command a rule allows (the builtin read-only allowlist, or the user's own allow rule; never one only the
-        # mode allowed: yolo has no rule, auto's conversions are auto_allowed) runs in a sandbox that shows $HOME
-        # read-only with the credential folders hidden, without a prompt. It cannot write anything but /tmp.
+        # A command the builtin read-only allowlist allows (never a user/project/session allow such as `python3 *`,
+        # which could read all of $HOME; never one only the mode allowed: yolo has no rule, auto's conversions are
+        # auto_allowed) and that is a plain, non-recursive ls/cat/grep in every part (home_read_only: the winning rule
+        # of `ls; python3 x` is the builtin `ls *`) runs without a prompt in a sandbox that shows $HOME read-only with
+        # the credential folders hidden and no network. It cannot write anything but /tmp.
         readonly_home = (
             home_rooted
             and decision.action == "allow"
             and not decision.auto_allowed
             and decision.rule is not None
             and decision.rule.action == "allow"
+            and decision.rule.layer == 0
+            and home_read_only(str(args.get("command", "")))
             and sandbox.readonly_home_ok(self.cwd, self.permissions.add_dirs)
         )
         if home_rooted and not readonly_home:
