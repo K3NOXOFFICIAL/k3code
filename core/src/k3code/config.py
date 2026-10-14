@@ -47,9 +47,16 @@ class ProviderEntry(BaseModel):
     persistent: bool = True
     max_sessions: int = 4
     idle_seconds: float = 600.0
+    #: claude-cli only: seconds one model step (one call, or one turn of a live process) may take in all before it is
+    #: killed and counts as a timeout. The router then fails over to the next entry without retrying this one.
+    timeout_seconds: float = Field(default=300.0, gt=0)
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
-    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    #: marks messages Anthropic-style when the model id looks like Claude (a relay to Anthropic passes it on); ``on``
+    #: marks every model id, which a gateway alias in front of Claude needs.
     prompt_cache: str = "auto"
+    #: openai kind, ``prompt_cache: auto``: globs (case-insensitive, whole id, e.g. ``auto/*``) of further model ids
+    #: that get the breakpoints.
+    cache_models: list[str] = Field(default_factory=list)
 
     @field_validator("prompt_cache")
     @classmethod
@@ -228,6 +235,19 @@ class Settings(BaseModel):
     # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
     # see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("providers")
+    @classmethod
+    def _unique_provider_names(cls, v: list[ProviderEntry]) -> list[ProviderEntry]:
+        """The name is how /model, doctor, NetWatch and the cooldown store find an entry: two blocks sharing one would
+        be edited, cleared and parked together. A second account of a provider gets its own name."""
+        seen: set[str] = set()
+        for p in v:
+            name = p.name.strip().lower()
+            if name in seen:
+                raise ValueError(f"duplicate provider name {p.name.strip()!r}: give each provider block its own name")
+            seen.add(name)
+        return v
 
     @model_validator(mode="before")
     @classmethod

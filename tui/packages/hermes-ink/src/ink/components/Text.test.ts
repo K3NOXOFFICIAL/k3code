@@ -42,6 +42,24 @@ describe("shouldUseAnsiDim", () => {
       false,
     );
   });
+
+  it("reads K3CODE_TUI_DIM first and HERMES_TUI_DIM as a fallback", () => {
+    expect(
+      shouldUseAnsiDim({
+        K3CODE_TUI_DIM: "1",
+        VTE_VERSION: "7603",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(shouldUseAnsiDim({ K3CODE_TUI_DIM: "0" } as NodeJS.ProcessEnv)).toBe(
+      false,
+    );
+    expect(
+      shouldUseAnsiDim({
+        HERMES_TUI_DIM: "1",
+        K3CODE_TUI_DIM: "0",
+      } as NodeJS.ProcessEnv),
+    ).toBe(false);
+  });
 });
 
 describe("dimColorFallback", () => {

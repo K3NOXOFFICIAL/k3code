@@ -30,6 +30,14 @@ class ProviderError(Exception):
         return self.message
 
 
+class ProviderDeadline(ProviderError):
+    """A call that used its whole wall-clock limit and was killed. A ``timeout`` (408), and the router fails over at
+    once instead of retrying: a retry would spend the same limit again on a call that just spent all of it."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message=message, status_code=408)
+
+
 class Provider(abc.ABC):
     """One provider entry: a base_url, a credential and a chat API flavor."""
 
