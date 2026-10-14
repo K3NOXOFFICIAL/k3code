@@ -104,7 +104,7 @@ def test_a_tool_name_that_is_not_text_does_not_crash_or_drop_the_rest(tmp_path):
 def test_a_permissions_file_that_cannot_be_read_denies_what_no_rule_allows(tmp_path, body):
     st = _state(tmp_path, body, PermissionMode.AUTO)
     assert _bash(st, "git push origin main") == "deny"
-    assert _bash(st, "ls") == "allow"  # the builtin read-only allowlist still applies
+    assert st.decide("bash", {"command": "ls"}).hardline  # the read-only allowlist too: its hardline is lost
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file, so it cannot be made unreadable")
@@ -118,7 +118,7 @@ def test_a_permissions_file_the_os_refuses_to_read_denies_what_no_rule_allows(tm
         st = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path, user_config=path)
         st.reload()
         assert _bash(st, "git push origin main") == "deny"
-        assert _bash(st, "ls") == "allow"  # the builtin read-only allowlist still applies
+        assert st.decide("bash", {"command": "ls"}).hardline  # the read-only allowlist too: its hardline is lost
     finally:
         path.chmod(0o600)
 
@@ -131,7 +131,7 @@ def test_a_permissions_file_that_is_not_utf8_denies_what_no_rule_allows(tmp_path
     st = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path, user_config=path)
     st.reload()
     assert _bash(st, "git push origin main") == "deny"
-    assert _bash(st, "ls") == "allow"
+    assert st.decide("bash", {"command": "ls"}).hardline  # the read-only allowlist too: its hardline is lost
 
 
 def test_an_accepted_recipe_rules_file_with_an_invalid_action_fails_closed(tmp_path):
@@ -227,7 +227,58 @@ def test_yaml_the_parser_cannot_build_denies_what_no_rule_allows_without_raising
     assert parse_permissions(body)[0] == list(UNREADABLE)
     st = _state(tmp_path, body, PermissionMode.AUTO)
     assert _bash(st, "git push origin main") == "deny"
-    assert _bash(st, "ls") == "allow"
+    assert st.decide("bash", {"command": "ls"}).hardline  # the read-only allowlist too: its hardline is lost
+
+
+#: Config text whose ``permissions:`` cannot be read at all, each holding a hardline the user wrote: it is lost with it.
+UNPARSEABLE_WITH_HARDLINE = [
+    pytest.param("permissions:\n  hardline: ['^ssh ']\nx: 2026-13-45\n", id="date"),
+    pytest.param("permissions:\n  hardline: ['^ssh ']\n  bash: !!int deny\n", id="int-tag"),
+    pytest.param("permissions:\n  hardline: ['^ssh ']\nx: " + "[" * 1000 + "]" * 1000 + "\n", id="deep"),
+    pytest.param("permissions:\n  hardline: ['^ssh ']\n  edit: [\n", id="syntax-error"),
+    pytest.param("- permissions:\n    hardline: ['^ssh ']\n", id="file-not-a-mapping"),
+    pytest.param("permissions:\n- hardline: ['^ssh ']\n", id="section-not-a-mapping"),
+]
+
+
+@pytest.mark.parametrize("body", UNPARSEABLE_WITH_HARDLINE)
+def test_a_config_that_cannot_be_parsed_hardline_denies_bash_in_yolo(tmp_path, body):
+    """Yolo skips the rules for bash, so the UNREADABLE deny rule alone let the user's own hardline lapse."""
+    assert parse_permissions(body)[:2] == (list(UNREADABLE), [UNREADABLE_HARDLINE])
+    st = _state(tmp_path, body, PermissionMode.YOLO)
+    decision = st.decide("bash", {"command": "ssh host systemctl stop x"})
+    assert decision.action == "deny" and decision.hardline
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file, so it cannot be made unreadable")
+def test_a_config_the_os_refuses_to_read_hardline_denies_bash_in_yolo(tmp_path):
+    path = _config(tmp_path, "permissions:\n  hardline: ['^ssh ']\n")
+    path.chmod(0o000)
+    try:
+        assert load_permissions_config(path) == (list(UNREADABLE), [UNREADABLE_HARDLINE])
+        st = PermissionState(mode=PermissionMode.YOLO, cwd=tmp_path, user_config=path)
+        st.reload()
+        assert st.decide("bash", {"command": "ssh host systemctl stop x"}).hardline
+    finally:
+        path.chmod(0o600)
+
+
+def test_a_config_that_is_not_utf8_hardline_denies_bash_in_yolo(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"permissions:\n  hardline: ['^ssh ']\n# \xff\xfe\n")
+    assert load_permissions_config(path) == (list(UNREADABLE), [UNREADABLE_HARDLINE])
+    st = PermissionState(mode=PermissionMode.YOLO, cwd=tmp_path, user_config=path)
+    st.reload()
+    assert st.decide("bash", {"command": "ssh host systemctl stop x"}).hardline
+
+
+@pytest.mark.parametrize("body", UNPARSEABLE_WITH_HARDLINE)
+def test_doctor_fails_the_permissions_check_on_a_config_that_cannot_be_parsed(tmp_path, body):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(body, encoding="utf-8")
+    check = doctor.check_permissions(home, tmp_path)
+    assert check.status == doctor.FAIL and str(home / "config.yaml") in check.detail
 
 
 @pytest.mark.parametrize("bad", BAD_HARDLINES)

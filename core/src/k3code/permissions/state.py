@@ -27,13 +27,20 @@ def _home() -> Path:
 
 
 #: What a config whose ``permissions:`` cannot be read at all contributes: a deny for every call that no more specific
-#: rule decides (the builtin read-only allowlist still applies). Contributing nothing let auto allow what it denied.
+#: rule decides, with :data:`UNREADABLE_HARDLINE` for bash. Contributing nothing let auto allow what it denied.
 UNREADABLE: tuple[Rule, ...] = (Rule(tool="*", pattern="*", action="deny"),)
-#: What a ``permissions.hardline`` that is not a list of regexes contributes in their place: one that matches every
-#: command (a regex comment matches the empty string), so every bash command is hardline-denied in every mode. A deny
-#: rule would not do: yolo skips the rules for bash. The builtin hardline list still runs first.
+#: What a ``permissions.hardline`` that is not a list of regexes, or that sits in a config whose ``permissions:``
+#: cannot be read at all, contributes in their place: one that matches every command (a regex comment matches the
+#: empty string), so every bash command is hardline-denied in every mode. A deny rule would not do: yolo skips the
+#: rules for bash, so the user's own hardline lapsed. The builtin hardline list still runs first.
 UNREADABLE_HARDLINE = "(?#permissions.hardline cannot be read: every bash command is denied)"
 _warned: set[tuple[str, str]] = set()
+
+
+def _unreadable(why: str) -> tuple[list[Rule], list[str], list[str]]:
+    """What a config whose ``permissions:`` cannot be read at all gives: its rules and its hardline both fail closed."""
+    problem = f"{why}; every bash command is hardline-denied, every other call no rule allows is denied"
+    return list(UNREADABLE), [UNREADABLE_HARDLINE], [problem]
 
 
 def load_permissions_config(path: Path) -> tuple[list[Rule], list[str]]:
@@ -57,7 +64,7 @@ def read_permissions(path: Path) -> tuple[list[Rule], list[str], list[str]]:
     except FileNotFoundError:
         text = None
     except (OSError, UnicodeDecodeError):
-        return list(UNREADABLE), [], ["cannot read the file; every call no rule allows is denied"]
+        return _unreadable("cannot read the file")
     return parse_permissions(text)
 
 
@@ -66,21 +73,21 @@ def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str
 
     Fails closed and says so in ``problems``: an invalid entry is a deny (``from_config``), an invalid
     ``permissions.hardline`` gives :data:`UNREADABLE_HARDLINE`, and text whose ``permissions:`` cannot be read at all
-    gives :data:`UNREADABLE`. No text, or no ``permissions:``, has no rules. Never raises: the gateway re-reads the
-    config before every turn, and doctor reads it to say what is wrong.
+    gives :data:`UNREADABLE` and :data:`UNREADABLE_HARDLINE`. No text, or no ``permissions:``, has no rules. Never
+    raises: the gateway re-reads the config before every turn, and doctor reads it to say what is wrong.
     """
     try:
         data = yaml.safe_load(text) if text is not None else None
     # safe_load raises ValueError for a date or an !!int it cannot build and RecursionError for deep nesting
     except (yaml.YAMLError, ValueError, RecursionError):
-        return list(UNREADABLE), [], ["not valid YAML; every call no rule allows is denied"]
+        return _unreadable("not valid YAML")
     if data is not None and not isinstance(data, dict):
-        return list(UNREADABLE), [], ["the file is not a mapping; every call no rule allows is denied"]
+        return _unreadable("the file is not a mapping")
     section = (data or {}).get("permissions")
     if section is None:
         return [], [], []
     if not isinstance(section, dict):
-        return list(UNREADABLE), [], ["permissions: is not a mapping; every call no rule allows is denied"]
+        return _unreadable("permissions: is not a mapping")
     section = dict(section)
     problems: list[str] = []
     hard = _hardline(section.pop("hardline", None), problems)
