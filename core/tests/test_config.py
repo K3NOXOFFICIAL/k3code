@@ -181,3 +181,16 @@ def test_resolve_model_specs_falls_back_when_key_missing(project_config: Path):
     specs = _resolve_model_specs(config)
     # Falls back to each provider's "default" entry.
     assert specs == ["gpt-test", ["claude-test-1", "claude-test-2"]]
+
+
+def test_duplicate_provider_names_are_rejected():
+    from pydantic import ValidationError
+
+    from k3code.config import Settings
+
+    def block(name: str) -> dict:
+        return {"name": name, "kind": "openai", "base_url": "https://x", "api_key_env": "K", "models": {"default": "m"}}
+
+    with pytest.raises(ValidationError, match="duplicate provider name 'Relay'"):
+        Settings(providers=[block("relay"), block("Relay ")])
+    assert len(Settings(providers=[block("relay"), block("relay-backup")]).providers) == 2

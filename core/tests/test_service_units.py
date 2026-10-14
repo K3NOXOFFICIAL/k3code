@@ -74,6 +74,51 @@ def test_install_dry_run_prints_every_unit_it_would_write(tmp_path: Path, monkey
     assert not service.unit_path().exists() and not service.recover_unit_path().exists()
 
 
+def test_the_second_daemon_hint_names_commands_that_exist(monkeypatch) -> None:
+    # #106: the hint sent users to `k3code service restart`, which did not exist ("No such command", rc 2)
+    import logging
+    import re
+
+    from click.testing import CliRunner
+
+    from k3code import daemon
+    from k3code.cli import cli
+
+    async def taken() -> None:
+        raise daemon.DaemonAlreadyRunning("another k3code daemon is already running (/run/gateway.sock)")
+
+    monkeypatch.setattr(daemon, "run_daemon", taken)
+    monkeypatch.setattr(logging, "basicConfig", lambda **_: None)  # keep the test's log handlers
+    r = CliRunner().invoke(cli, ["daemon"])
+    assert r.exit_code == 75, r.output
+    named = re.findall(r"`k3code ([^`]+)`", r.stderr)
+    assert "service restart" in named, r.stderr
+    for command in named:
+        h = CliRunner().invoke(cli, [*command.split(), "--help"])
+        assert h.exit_code == 0, f"`k3code {command}`: {h.output}"
+
+
+def test_service_restart_resets_the_start_limit_and_reports_failure(monkeypatch) -> None:
+    from click.testing import CliRunner
+
+    from k3code.cli import cli
+
+    calls: list[tuple[str, ...]] = []
+    rc = {"restart": 0}
+
+    def fake(*args: str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, rc.get(args[0], 0), "", "start-limit-hit")
+
+    monkeypatch.setattr(service, "_systemctl", fake)
+    r = CliRunner().invoke(cli, ["service", "restart"])
+    assert r.exit_code == 0, r.output
+    assert calls == [("reset-failed", service.UNIT_NAME), ("restart", service.UNIT_NAME)]
+    rc["restart"] = 1
+    r = CliRunner().invoke(cli, ["service", "restart"])
+    assert r.exit_code == 1 and "start-limit-hit" in r.output, r.output
+
+
 def environment_file(unit: str) -> str:
     (line,) = (ln for ln in unit.splitlines() if ln.startswith("EnvironmentFile="))
     return line.removeprefix("EnvironmentFile=-")

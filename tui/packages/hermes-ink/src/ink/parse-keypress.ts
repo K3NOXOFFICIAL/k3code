@@ -836,6 +836,11 @@ function parseKeypress(s: string = ""): ParsedKey {
   } else if (s === "\b" || s === "\x1b\b") {
     key.name = "backspace";
     key.meta = s.charAt(0) === "\x1b";
+    // Windows Terminal (also under WSL) sends a bare 0x08 for Ctrl+Backspace
+    // and 0x7f for plain Backspace; elsewhere 0x08 stays Ctrl+H/Backspace.
+    if (s === "\b" && process.env.WT_SESSION) {
+      key.ctrl = true;
+    }
   } else if (s === "\x7f" || s === "\x1b\x7f") {
     key.name = "backspace";
     key.meta = s.charAt(0) === "\x1b";

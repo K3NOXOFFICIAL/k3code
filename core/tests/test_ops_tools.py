@@ -17,6 +17,7 @@ from k3code.config import ProviderEntry, Settings
 from k3code.permissions import PermissionMode
 from k3code.reliability import sandbox
 from k3code.router.classifier import FailoverReason
+from k3code.router.cooldown import key_fingerprint
 from k3code.tools import tool_bash
 from k3code.usage import UsageDB
 from test_gateway import make_server
@@ -524,7 +525,14 @@ async def test_model_chain_command_shows_cooldown(chain_home):
         ]
     )
     server = make_server(config=cfg)
-    server.cooldowns.arm(FailoverReason.rate_limit, provider="omni", model="a", base_url="http://o/v1", retry_after=90)
+    server.cooldowns.arm(
+        FailoverReason.rate_limit,
+        provider="omni",
+        model="a",
+        base_url="http://o/v1",
+        account=key_fingerprint(""),  # the entry has no key here; the router and /model chain key by its fingerprint
+        retry_after=90,
+    )
     text = (await server.dispatch_command("model", "chain", None))["message"]
     assert "1. omni/a [cooldown]" in text and "2. omni/b" in text and "3. direct/c" in text
     out = (await server.dispatch_command("model", "chain move direct 1", None))["message"]
