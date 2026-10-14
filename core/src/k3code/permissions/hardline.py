@@ -312,10 +312,12 @@ def _unescape_backticks(payload: str, dquoted: bool = False) -> str:
 
 def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str], bool]:
     """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
-    unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
-    ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)`` runs)."""
+    unterminated or read differently by bash and dash. Quotes mean nothing in a body, a backslash escapes the next
+    character (``\\$(x)`` is text) and ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)``
+    runs)."""
     body = re.sub(r"\\([\s\S])", lambda m: "" if m.group(1) == "\n" else m.group(0), body)
     out: list[str] = []
+    unsure = False
     i, n = 0, len(body)
     while i < n:
         c = body[i]
@@ -329,13 +331,18 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
             i = end + 1
         elif c == "`":
             j = _backtick_end(body, i)
+            # bash keeps the backslash of `\"` in the backticks of a body, dash drops it: both readings are checked,
+            # and a payload the two read differently is unsure
+            raw = body[i + 1 :] if j < 0 else body[i + 1 : j]
+            readings = list(dict.fromkeys([_unescape_backticks(raw), _unescape_backticks(raw, dquoted=True)]))
+            out += readings
             if j < 0:
-                return [*out, _unescape_backticks(body[i + 1 :])], True
-            out.append(_unescape_backticks(body[i + 1 : j]))
+                return out, True
+            unsure = unsure or len(readings) > 1
             i = j + 1
         else:
             i += 1
-    return out, False
+    return out, unsure
 
 
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
@@ -360,6 +367,52 @@ def _tokens(sub: str) -> list[str]:
         return shlex.split(sub, posix=True)
     except ValueError:
         return sub.split()
+
+
+def _shell_words(sub: str) -> list[str]:
+    """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
+    double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
+    ``bash -c "echo \\`x\\`"`` is the line the inner shell runs. An open quote falls back to :func:`_tokens`."""
+    words: list[str] = []
+    word: list[str] | None = None
+    i, n = 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c in " \t\n":
+            if word is not None:
+                words.append("".join(word))
+                word = None
+            i += 1
+            continue
+        word = [] if word is None else word
+        if c == "\\":
+            word.append(sub[i + 1 : i + 2].replace("\n", ""))  # \<newline> joins lines
+            i += 2
+        elif c == "'":
+            j = sub.find("'", i + 1)
+            if j < 0:
+                return _tokens(sub)
+            word.append(sub[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and sub[j] != '"':
+                if sub[j] == "\\" and j + 1 < n:
+                    nxt = sub[j + 1]
+                    word.append(nxt if nxt in '$`"\\' else "" if nxt == "\n" else sub[j : j + 2])
+                    j += 2
+                else:
+                    word.append(sub[j])
+                    j += 1
+            if j >= n:
+                return _tokens(sub)
+            i = j + 1
+        else:
+            word.append(c)
+            i += 1
+    if word is not None:
+        words.append("".join(word))
+    return words
 
 
 def _strip_wrappers(tokens: list[str]) -> list[str]:
@@ -1178,8 +1231,9 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
-    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands."""
-    toks = _tokens(sub)
+    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
+    shell unquotes them (see _shell_words)."""
+    toks = _shell_words(sub)
     out: list[str] = []
     pre = _strip_wrappers(toks)
     if len(pre) > 1 and os.path.basename(pre[0]) == "eval":

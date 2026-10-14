@@ -465,8 +465,21 @@ NESTED_BACKTICKS = [
     # `\$` in backticks is a `$`: the $(...) runs
     r"echo `echo \$(rm -rf ~)`",
     "cat <<EOF\n" + r"`echo \$(rm -rf ~)`" + "\nEOF",
+    r'echo `echo "\$(rm -rf ~)"`',
     # in double quotes `\"` in backticks is a `"`, so the payload is not single-quoted
     r'''echo "`echo \"'\"\`rm -rf ~\`\"'\"`"''',
+    # in a heredoc body dash drops the backslash of `\"` in backticks too (bash keeps it): sh runs the rm
+    "sh <<'EOF'\ncat <<X\n" + r"""`echo \"'\"\`rm -rf ~\`\"'\"`""" + "\nX\nEOF",
+    "cat <<'EOF' | sh\ncat <<X\n" + r"""`echo \"'\"\`rm -rf ~\`\"'\"`""" + "\nX\nEOF",
+    # in a double-quoted `bash -c`/`eval` argument the shell drops the backslash of `\``, `\$` and `\"`
+    r'bash -c "echo \`rm -rf ~\`"',
+    r'sh -c "echo \`rm -rf ~\`"',
+    r'timeout 5 bash -c "echo \`rm -rf ~\`"',
+    r'echo x | xargs sh -c "echo \`rm -rf ~\`"',
+    r'eval "echo \`rm -rf ~\`"',
+    r'bash -c "echo \"\`rm -rf ~\`\""',
+    r'echo $(bash -c "echo \`rm -rf ~\`")',
+    r'bash -c "echo \"\$(rm -rf ~)\""',
 ]
 
 
@@ -498,7 +511,10 @@ def test_an_escaped_backtick_in_backticks_stays_text(tmp_path: Path, cmd: str) -
 def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
     assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\""]]
     assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"']]
-    assert parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF").heredocs[0][0].payloads == [r"a `b` \"d\""]
+    # in a heredoc body bash keeps the backslash of `\"`, dash drops it: both are checked and no rule vouches for it
+    body = parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF")
+    assert body.heredocs[0][0].payloads == [r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
+    assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
 
 
 def test_backticks_count_as_nesting(tmp_path: Path) -> None:
