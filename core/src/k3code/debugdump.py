@@ -75,25 +75,35 @@ def secret_values(config: Any = None, *, guesses: bool = True) -> list[str]:
     in its JSON-escaped form, for JSON text inside a tool result, and percent-encoded, for a URL.
 
     ``guesses=False`` leaves out the MCP values known only because they are no ordinary word, path or address (a
-    region, a database name): a deny rule that names one must keep it (see ``bundle.write_bundle``)."""
+    region, a database name): a deny rule that names one must keep it (see ``bundle.write_bundle``).
+
+    ``config`` is a loaded config or a config file as written (a dict, any shape): one that does not load still names
+    its secrets (K3NOX-519)."""
     from k3code.config import env_value
 
     values: set[str] = set()
     for name, value in os.environ.items():
         if value and len(value) >= 6 and _SECRET_NAME.search(name):
             values.add(value)
-    for p in getattr(config, "providers", None) or []:
-        if getattr(p, "api_key", ""):
-            values.add(p.api_key)
-    dump = config.model_dump(mode="json") if hasattr(config, "model_dump") else {}
+    if isinstance(config, dict):
+        dump = config
+        providers = dump.get("providers") if isinstance(dump.get("providers"), list) else []
+        keys = [p.get("api_key") for p in providers if isinstance(p, dict)]
+    else:
+        dump = config.model_dump(mode="json") if hasattr(config, "model_dump") else {}
+        keys = [getattr(p, "api_key", "") for p in getattr(config, "providers", None) or []]
+    values.update(k for k in keys if isinstance(k, str) and k)
     values.update(env_value(name) for name in _env_refs(dump))
     # MCP env/headers are hidden in place whatever they hold; out of place only a value secret by name or not an
     # ordinary word, path or address (an MCP `HOST=127.0.0.1` must not hide a provider's `http://127.0.0.1:4000/v1`)
-    for server in getattr(getattr(config, "mcp", None), "servers", None) or {}:
-        cfg = config.mcp.servers[server]
-        for name, value in [*(getattr(cfg, "env", None) or {}).items(), *(getattr(cfg, "headers", None) or {}).items()]:
+    mcp = dump.get("mcp")
+    servers = mcp.get("servers") if isinstance(mcp, dict) else None
+    for cfg in servers.values() if isinstance(servers, dict) else []:
+        parts = [cfg.get("env"), cfg.get("headers")] if isinstance(cfg, dict) else []
+        for name, value in [item for part in parts if isinstance(part, dict) for item in part.items()]:
             if not isinstance(value, str):
                 continue
+            name = str(name)
             known = _SECRET_NAME.search(name) or is_secret_key(name) or _secret_shape(value)
             if known or (guesses and len(value) >= 8 and not _ordinary(value)):
                 values.add(value)

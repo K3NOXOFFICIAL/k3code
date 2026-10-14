@@ -47,19 +47,38 @@ def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[
     return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _known_secrets(config: Any, cwd: Path) -> tuple[list[str], list[str]]:
-    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first; and
-    the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
-    from k3code.debugdump import secret_values
-
+def _configs(config: Any, cwd: Path) -> list[Any]:
+    """Where the export learns the secret values: the loaded config (default: loaded for ``cwd``), and the user config
+    and the trusted project config as written. A file that does not load still names its secrets, and so does a
+    section ``load_config`` drops (a project's ``providers``): with the env vars alone a copy of an MCP value elsewhere
+    in the settings would leave in clear (K3NOX-519)."""
     if config is None:
         from k3code.config import load_config
 
         try:
             config = load_config(project_dir=cwd)
-        except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
+        except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
-    return secret_values(config), secret_values(config, guesses=False)
+    try:
+        user = confio.read_yaml(user_config_path())
+    except (OSError, ValueError, yaml.YAMLError):  # it does not parse: exporting it fails on its own
+        user = None
+    try:
+        project = yaml.safe_load(trust.trusted_text(cwd) or "")
+    except yaml.YAMLError:
+        project = None
+    return [config, user, project]
+
+
+def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:
+    """Every secret value the ``configs`` and this process know (provider keys, secret-named env vars, MCP values),
+    longest first; and the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
+    from k3code.debugdump import secret_values
+
+    def known(guesses: bool) -> list[str]:
+        return sorted(set().union(*(secret_values(c, guesses=guesses) for c in configs)), key=len, reverse=True)
+
+    return known(True), known(False)
 
 
 def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
@@ -95,13 +114,17 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    secrets, certain = _known_secrets(config, cwd)
+    configs = _configs(config, cwd)
+    secrets = _known_secrets(*configs)[0]
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = redact(_drop_known(confio.read_yaml(src), secrets, certain))
+                raw = confio.read_yaml(src)
+                # its own values hide their copies in it even when nothing else counts it (an untrusted project
+                # config), but only in it: a file the user never trusted must not hide part of one of their rules
+                data = redact(_drop_known(raw, *_known_secrets(*configs, raw)))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
