@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import re
@@ -48,11 +49,15 @@ def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[
     return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _configs(config: Any, cwd: Path) -> list[Any]:
+def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
     """Where the export learns the secret values: the loaded config (default: loaded for ``cwd``), and the user config
     and the trusted project config as written. A file that does not load still names its secrets, and so does a
     section ``load_config`` drops (a project's ``providers``): with the env vars alone a copy of an MCP value elsewhere
-    in the settings would leave in clear (K3NOX-519)."""
+    in the settings would leave in clear (K3NOX-519).
+
+    Also the project config as written whatever its trust state, for the sessions only: a session can quote one never
+    trusted, or changed after it was (K3NOX-575). It loads no setting and hides nothing in the user's settings file: a
+    file the user never trusted must not hide part of one of their rules."""
     if config is None:
         from k3code.config import load_config
 
@@ -60,17 +65,21 @@ def _configs(config: Any, cwd: Path) -> list[Any]:
             config = load_config(project_dir=cwd)
         except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
-    # a file that exists but does not parse names no secrets: refuse rather than export its copies in clear
-    # (the error text is left out: a YAML error quotes the line, which may hold the secret)
-    try:
-        user = confio.read_yaml(user_config_path())
-    except (OSError, ValueError, yaml.YAMLError) as e:
-        raise BundleError(_unparsed(user_config_path())) from e
-    try:
-        project = yaml.safe_load(trust.trusted_text(cwd) or "")
-    except yaml.YAMLError as e:
-        raise BundleError(_unparsed(project_config_path(cwd))) from e
-    return [config, user, project]
+    user = _read(user_config_path())
+    written = _read(project_config_path(cwd))
+    trusted = trust.trusted_text(cwd)
+    project = None if trusted is None else _read(project_config_path(cwd), trusted)
+    return [config, user, project], written
+
+
+def _read(path: Path, text: str | None = None) -> Any:
+    """The config file ``path`` as written, or ``text``, its trusted copy. One that exists but does not parse names no
+    secrets: refuse rather than export its copies in clear. The error carries no parser text, not even chained (it is
+    raised after the ``suppress``): a YAML error quotes the line, which may hold the secret, and a traceback or
+    ``logger.exception`` prints the whole chain."""
+    with contextlib.suppress(OSError, ValueError, yaml.YAMLError):
+        return confio.read_yaml(path) if text is None else yaml.safe_load(text)
+    raise BundleError(_unparsed(path))
 
 
 def _unparsed(path: Path) -> str:
@@ -146,19 +155,22 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    configs = _configs(config, cwd)
+    configs, written = _configs(config, cwd)
     secrets = _known_secrets(*configs)[0]
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                raw = confio.read_yaml(src)
+                raw = _read(src)
                 # its own values hide their copies in it even when nothing else counts it (an untrusted project
                 # config), but only in it: a file the user never trusted must not hide part of one of their rules
                 secrets_here, certain = _known_secrets(*configs, raw)
                 data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
+    # the project config as written, trusted or not, hides its values in the sessions: the certain ones only, so a file
+    # the user never trusted cannot blank out a region or path their transcripts name (a guess, see secret_values)
+    secrets = sorted({*secrets, *_known_secrets(written)[1]}, key=len, reverse=True)
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)

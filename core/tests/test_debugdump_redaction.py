@@ -808,3 +808,86 @@ def test_a_short_unquoted_number_under_a_secret_named_key_anywhere_in_the_export
 def test_secret_values_knows_a_number_written_unquoted(where, value):
     known = str(value) in debugdump.secret_values(where(value), guesses=False)
     assert known
+
+
+# K3NOX-575: a project config not (or no longer) trusted still names the secrets the sessions must not carry
+
+#: How a project config can stop matching its trust record, or never have one.
+NOT_TRUSTED = ["edited after trust", "agent added after trust", "never trusted"]
+
+
+def _project_with(tmp_path, text: str, state: str):
+    from k3code import trust
+
+    project = tmp_path / "proj"
+    (project / ".k3code").mkdir(parents=True)
+    path = project / ".k3code" / "config.yaml"
+    path.write_text(text)
+    if state != "never trusted":
+        assert trust.record(project, trusted=True)
+    if state == "edited after trust":
+        path.write_text(text + "# note\n")
+    elif state == "agent added after trust":
+        (project / ".k3code" / "agents").mkdir()
+        (project / ".k3code" / "agents" / "a.md").write_text("an agent\n")
+    return project
+
+
+@pytest.mark.parametrize("settings", [False, True], ids=["session-only", "with-settings"])
+@pytest.mark.parametrize("state", NOT_TRUSTED)
+def test_a_project_config_that_is_not_trusted_still_hides_its_mcp_values_in_the_sessions(state, settings, tmp_path):
+    import yaml
+
+    from k3code import bundle, trust
+    from k3code.gateway.sessions import SessionStore
+
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    hdr = "Hdr" + "Va1ue" + "Mn27vB5qLp"
+    servers = {
+        "s": {"command": "srv", "env": {"SERVICE_ACCESS_TOKEN": tok}},
+        "r": {"url": "https://mcp.example.com/mcp", "headers": {"X-Api-Key": hdr}},
+    }
+    project = _project_with(tmp_path, yaml.safe_dump({"mcp": {"servers": servers}}), state)
+    assert trust.trusted_text(project) is None
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the values are {tok} and {hdr}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=settings)
+    assert ("project" in bundle.read_bundle(out).settings) is settings
+    blob = _export_blob(out)
+    assert tok not in blob and hdr not in blob
+
+
+@pytest.mark.parametrize("settings", [False, True], ids=["session-only", "with-settings"])
+@pytest.mark.parametrize("where", ["user config", "trusted", *NOT_TRUSTED])
+def test_a_config_that_does_not_parse_refuses_the_export_without_its_parser_text(where, settings, tmp_path):
+    import traceback
+
+    import yaml
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    text = f"mcp:\n  servers:\n    s:\n      command: srv\n      env:\n        SERVICE_ACCESS_TOKEN: {tok}: x\n"
+    with pytest.raises(yaml.YAMLError) as parser:
+        yaml.safe_load(text)
+    quoted = tok in str(parser.value)  # the parser's error quotes the line, and so the value
+    assert quoted
+    if where == "user config":
+        user_config_path().parent.mkdir(parents=True, exist_ok=True)
+        user_config_path().write_text(text)
+        cwd = tmp_path
+    else:
+        cwd = _project_with(tmp_path, text, where)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {tok}")
+    out = tmp_path / "x.k3bundle"
+    with pytest.raises(bundle.BundleError, match="does not parse") as refused:
+        bundle.write_bundle(out, store=store, cwd=cwd, session_ids=[sid], settings=settings)
+    assert not out.exists()
+    # nothing chained: a traceback or `logger.exception` prints the whole chain
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
+    shown = tok in "".join(traceback.format_exception(refused.value))
+    assert not shown
