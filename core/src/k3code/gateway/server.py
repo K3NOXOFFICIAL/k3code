@@ -40,7 +40,7 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import confio, mcpjson, userhooks, wakewords
+from k3code import confio, mcpjson, recall, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -115,7 +115,7 @@ from k3code.goals import (
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
-from k3code.memory import MemoryFile, fenced, read_learned
+from k3code.memory import MemoryFile, fenced, identity_root, read_learned
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
@@ -4511,6 +4511,53 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {"sessions": rows, "has_more": has_more}
 
 
+#: ``session.search``: results per call (default, most).
+SEARCH_LIMIT, SEARCH_MAX = 20, 50
+
+
+async def _session_search(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Every stored session's archived text that matches ``query``'s words, best first (read-only). ``since`` is an ISO
+    date or an age (``90d``); ``project`` (default: the project of ``cwd``, when given) is not a filter but ranks its
+    hits first. Titles and snippets are scrubbed of credentials. ``indexing``: stored sessions not archived yet."""
+    query = params.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise _InvalidParams("query must be a non-empty string: the words to look for")
+    limit = params.get("limit")
+    limit = SEARCH_LIMIT if limit is None else limit
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= SEARCH_MAX:
+        raise _InvalidParams(f"limit must be a whole number from 1 to {SEARCH_MAX}")
+    for key in ("cwd", "project", "since"):
+        if params.get(key) is not None and not isinstance(params[key], str):
+            raise _InvalidParams(f"{key} must be a string")
+    since = None
+    if params.get("since"):
+        try:
+            since = recall.parse_since(params["since"])
+        except ValueError as e:
+            raise _InvalidParams(str(e)) from None
+    cwd, project = params.get("cwd") or None, params.get("project") or None
+
+    def run() -> recall.Found:
+        current = project or (str(identity_root(Path(cwd))) if cwd else None)
+        return recall.search_file(server.store.path, query, current_project=current, since=since, limit=limit)
+
+    found = await asyncio.to_thread(run)
+    results = [
+        {
+            "session_id": hit.session_id,
+            "title": scrub_text(hit.title or ""),
+            "cwd": hit.cwd,
+            "at": hit.at,
+            "role": hit.role,
+            "seq": hit.seq,
+            "snippet": scrub_text(hit.snippet),
+            "approximate": hit.approximate,
+        }
+        for hit in found.hits
+    ]
+    return {"results": results, "indexing": found.pending}
+
+
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     current = server.session
     out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None)}
@@ -5533,6 +5580,7 @@ async def _subagent_steer(server: GatewayServer, params: dict[str, Any]) -> dict
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
+    "session.search": _session_search,
     "session.active_list": _session_active_list,
     "session.resume": _session_resume,
     "session.activate": _session_activate,

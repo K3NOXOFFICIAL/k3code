@@ -108,6 +108,7 @@ async def test_every_method_but_the_open_reads_needs_the_daemon_token(gw, tmp_pa
         refused = reply.get("error", {}).get("code") == UNAUTHORIZED
         assert refused == (method not in open_methods), (method, reply)
     assert "setup.status" in open_methods and "session.list" in open_methods  # k3code doctor, scripts/e2e_tui_file.py
+    assert "session.search" not in open_methods  # every earlier transcript's text: never without the token
     for action, refused in (("status", False), ("connect", True), ("disconnect", True), (" Status ", False)):
         reply = await _call(stranger, "browser.manage", {"action": action})
         assert (reply.get("error", {}).get("code") == UNAUTHORIZED) == refused, (action, reply)

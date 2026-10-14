@@ -345,6 +345,7 @@ READONLY_ALLOWED = frozenset(
         "session.events.since",
         "session.events.stats",
         "session.list",
+        "session.search",
         "session.most_recent",
         "session.resume",
         "session.status",
