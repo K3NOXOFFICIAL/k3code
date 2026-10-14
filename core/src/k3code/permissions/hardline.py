@@ -286,7 +286,7 @@ def _subst_payload(text: str, at: int, end: int) -> str:
     return text[at + 1 : end + 1] if text.startswith("$((", at) else text[at + 2 : end]
 
 
-def _body_payloads(body: str) -> tuple[list[str], bool]:
+def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str], bool]:
     """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
     unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
     ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)`` runs)."""
@@ -298,8 +298,8 @@ def _body_payloads(body: str) -> tuple[list[str], bool]:
         if c == "\\":
             i += 2
         elif body.startswith("$(", i):
-            end = _match_paren(body, i + 1)
-            if end < 0:
+            end = _match_paren(body, i + 1, budget=budget)
+            if end < 0:  # unbalanced, or past the scan budget
                 return [*out, body[i + 2 :]], True
             out.append(_subst_payload(body, i, end))
             i = end + 1
@@ -769,9 +769,15 @@ class Parsed:
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
 
-#: a cap on the total characters scanned to resolve ``((...))`` arithmetic ends in one command line; past it an
-#: open ``((`` is left unresolved (the command is unterminated, a person confirms) instead of rescanning quadratically
-_ARITH_SCAN_BUDGET = 100_000
+#: a cap on the total characters ``_match_paren`` scans in one top-level ``parse`` (shared by every nested scan, so
+#: substitutions, quotes and arithmetic cannot multiply it); past it an open ``(`` is left unresolved (the command is
+#: unterminated, a person confirms) instead of rescanning quadratically
+_SCAN_BUDGET = 100_000
+
+#: how deep ``_scan`` follows nested ``$(...)``/backticks before it stops and marks the command unterminated. Real
+#: commands nest a handful deep; a long run of substitutions bash never closes is what reaches this (``parse`` caps its
+#: own recursion at 6, so deeper payloads are not read as commands anyway).
+_SCAN_MAX_DEPTH = 24
 
 
 def _match_paren(text: str, open_idx: int, arith: bool | None = None, budget: list[int] | None = None) -> int:
@@ -783,51 +789,45 @@ def _match_paren(text: str, open_idx: int, arith: bool | None = None, budget: li
     if arith is None:
         arith = text.startswith("((", open_idx)  # $((...)): a << in it is a shift
     while i < n:
-        if budget is not None:
-            budget[0] -= 1
-            if budget[0] < 0:
-                return -2  # scanned too far: the caller treats the ((...)) as unresolved
-        c = text[i]
-        if c == "\\":
+        if budget is not None and budget[0] < 0:
+            return -2  # scanned too far already: the caller treats the ((...)) as unresolved
+        start = i
+        if text[i] == "\\":
             i += 2
-            continue
-        if c == "'":
+        elif text[i] == "'":
             j = text.find("'", i + 1)
             if j < 0:
                 return -1
             i = j + 1
-            continue
-        if c == '"':
+        elif text[i] == '"':
             i += 1
             while i < n and text[i] != '"':
                 i += 2 if text[i] == "\\" else 1
             if i >= n:
                 return -1
             i += 1
-            continue
-        if text.startswith("<<<", i):
+        elif text.startswith("<<<", i):
             i += 3
-            continue
-        if text.startswith("<<", i) and not arith:
+        elif text.startswith("<<", i) and not arith:
             i, heredoc = _heredoc_word(text, i)
             if heredoc is None:
                 return -1  # where the body ends is unknown
             heredocs.append(heredoc)
-            continue
-        if c == "\n" and heredocs:
+        elif text[i] == "\n" and heredocs:
             i = _skip_heredoc_bodies(text, i + 1, heredocs)
-            continue
-        if c == "#" and not arith and i > open_idx and text[i - 1] in " \t\n;&|()<>":
+        elif text[i] == "#" and not arith and i > open_idx and text[i - 1] in " \t\n;&|()<>":
             eol = text.find("\n", i)
             i = n if eol < 0 else eol
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
+        else:
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        if budget is not None:
+            budget[0] -= (i - start) or 1  # charge the characters scanned, quote/comment/heredoc jumps included
     return -1
 
 
@@ -840,7 +840,7 @@ def _arith_end(text: str, i: int, budget: list[int] | None = None) -> int:
     return inner + 1 if inner > 0 and text.startswith(")", inner + 1) else -1
 
 
-def _scan(text: str) -> Parsed:
+def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed:
     """Quote-aware split into simple commands and pipelines, plus the payloads of the substitutions found on the way.
     ``#`` starts a comment only at the start of a word outside quotes; ``\\<newline>`` joins lines; ``<<`` starts a
     heredoc only outside quotes and outside an open ``((...))``, ``${...}``, ``$[...]``, ``[...]`` or ``a=(...)``,
@@ -849,6 +849,12 @@ def _scan(text: str) -> Parsed:
     end bash may see elsewhere (in the other brackets, an odd delimiter word), makes the command unterminated and the
     next lines stay commands."""
     out = Parsed()
+    if _depth > _SCAN_MAX_DEPTH:
+        # too deeply nested to resolve: leave it unterminated (a person confirms) rather than recurse further. The
+        # raw text still reaches the regex checks as `clean`, and open_bracket makes the enclosing substitution unsure.
+        out.unterminated = out.open_bracket = True
+        out.clean = text
+        return out
     cur: list[str] = []
     cur_payloads: list[str] = []
     clean: list[str] = []
@@ -861,7 +867,8 @@ def _scan(text: str) -> Parsed:
     # stays open: a << then needs a person instead of hiding the next lines
     ctx: list[tuple[str, int]] = []
     i, n = 0, len(text)
-    arith_budget = [_ARITH_SCAN_BUDGET]
+    if budget is None:
+        budget = [_SCAN_BUDGET]  # top-level call: one budget shared with every nested scan below
 
     def emit(s: str) -> None:
         cur.append(s)
@@ -886,13 +893,13 @@ def _scan(text: str) -> Parsed:
 
     def subst(at: int, open_len: int) -> tuple[int, str]:
         """``$(``, ``<(`` or ``>(`` at ``at``: (index after the closing paren, cleaned text)."""
-        end = _match_paren(text, at + open_len - 1)
-        if end < 0:
+        end = _match_paren(text, at + open_len - 1, budget=budget)
+        if end < 0:  # unbalanced, or past the scan budget: the substitution is unterminated
             out.unterminated = True
             end = n
         payload = _subst_payload(text, at, end)
         cur_payloads.append(payload)
-        inner = _scan(payload)
+        inner = _scan(payload, budget, _depth + 1)
         # `$(cat <<EOF)`: bash reads the body from the lines after the substitution
         out.unterminated = out.unterminated or inner.open_heredoc
         if inner.open_bracket:
@@ -907,7 +914,8 @@ def _scan(text: str) -> Parsed:
             out.unterminated = True
             end = n
         cur_payloads.append(text[at + 1 : end])
-        out.unterminated = out.unterminated or _scan(text[at + 1 : end]).open_heredoc
+        inner_bt = _scan(text[at + 1 : end], budget, _depth + 1)
+        out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
         return end + 1, text[at : end + 1]
 
     while i < n:
@@ -1009,7 +1017,7 @@ def _scan(text: str) -> Parsed:
             bodies: list[str] = []
             i = _skip_heredoc_bodies(text, i + 1, heredocs, bodies)
             for (quoted, k), body in zip(heredoc_info, bodies, strict=True):
-                payloads, open_ = ([], False) if quoted else _body_payloads(body)
+                payloads, open_ = ([], False) if quoted else _body_payloads(body, budget)
                 out.heredocs[k].append(Heredoc(body, quoted, payloads))
                 out.sub_payloads[k].extend(payloads)
                 out.unterminated = out.unterminated or open_
@@ -1042,7 +1050,7 @@ def _scan(text: str) -> Parsed:
                 elif cur and cur[-1] == "=":
                     ctx.append(("=(", -1))  # a=(...), also a=((...)): no arithmetic
                 elif top != "((" and text.startswith("((", i):
-                    end = _arith_end(text, i, arith_budget)
+                    end = _arith_end(text, i, budget)
                     if end == -2:  # too long to resolve: an open (( that never closes, so the command is unterminated
                         out.unterminated = True
                         ctx.append(("((", n))
@@ -1152,16 +1160,18 @@ def _launcher_payloads(sub: str) -> list[str]:
     return out
 
 
-def parse(command: str, _depth: int = 0) -> Parsed:
+def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Parsed:
     """Split ``command`` into simple commands and collect every command nested inside it (recursively)."""
-    parsed = _scan(command)
+    if budget is None:
+        budget = [_SCAN_BUDGET]  # one budget for the whole command, so nesting cannot multiply the paren scan
+    parsed = _scan(command, budget)
     if _depth >= 6:  # pathological nesting is cut off; the caller still checks the cleaned text
         return parsed
     payloads = [p for ps in parsed.sub_payloads for p in ps]
     for sub in parsed.subs:
         payloads.extend(_launcher_payloads(sub))
     for payload in payloads:
-        inner = parse(payload, _depth + 1)
+        inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
@@ -1171,13 +1181,15 @@ def parse(command: str, _depth: int = 0) -> Parsed:
     # interpreter is not shell: such a heredoc is only kept out of the allowlist (see engine._decide_bash).
     for k, bodies in enumerate(parsed.heredocs):
         for heredoc in bodies if parsed.code_heredoc[k] == "shell" else ():
-            inner = parse(heredoc.body, _depth + 1)
+            inner = parse(heredoc.body, _depth + 1, budget)
             parsed.children.append(inner)
             parsed.nested.extend([*inner.subs, *inner.nested])
             # `ssh host <<EOF` runs the body on host: each command is also checked as `ssh host '<command>'`, the
             # spelling the rules about remote hosts match
             remote = [*inner.subs, *inner.nested]
-            parsed.children += [_scan(f"{ssh} {shlex.quote(c)}") for ssh in parsed.remote_heredoc[k] for c in remote]
+            parsed.children += [
+                _scan(f"{ssh} {shlex.quote(c)}", budget) for ssh in parsed.remote_heredoc[k] for c in remote
+            ]
     return parsed
 
 
