@@ -13,10 +13,12 @@ piped runs never ask: an untrusted project config is ignored and ``main()`` says
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -68,12 +70,37 @@ def _key(project_dir: str | Path) -> str:
     return str(main_checkout(path) or path)
 
 
+#: A project config larger than this is not read: a repo you clone chooses the file, and a real one is a few KB.
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def read_bounded(path: Path) -> bytes:
+    """``path``'s bytes when it is a regular file of at most ``MAX_CONFIG_BYTES``; OSError otherwise. A FIFO would
+    block a plain read for good (it is opened non-blocking and refused on its type), a device or a huge file would
+    fill memory."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        if st.st_size > MAX_CONFIG_BYTES:
+            raise OSError(errno.EFBIG, "file too large", str(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:  # grew while it was read
+        raise OSError(errno.EFBIG, "file too large", str(path))
+    return data
+
+
 def _read(project_dir: str | Path) -> bytes | None:
     path = config_path(project_dir)
     if _is_user_config(path):
         return None
     try:
-        return path.read_bytes()
+        return read_bounded(path)
     except OSError:
         return None
 

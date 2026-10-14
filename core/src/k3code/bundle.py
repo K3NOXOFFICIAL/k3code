@@ -66,18 +66,61 @@ def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
         except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
     user = _read(user_config_path())
-    written = _read(project_config_path(cwd))
+    written = _read(project_config_path(cwd), project=cwd)
     trusted = trust.trusted_text(cwd)
-    project = None if trusted is None else _read(project_config_path(cwd), trusted)
+    project = None if trusted is None else _read(project_config_path(cwd), trusted, project=cwd)
     return [config, user, project], written
 
 
-def _read(path: Path, text: str | None = None) -> Any:
+#: Deepest nesting a project config may have (a real one has 4 or 5 levels).
+_MAX_DEPTH = 64
+
+
+class _TreeLoader(yaml.SafeLoader):
+    """``safe_load`` for a file someone else wrote: no aliases (a few lines of them expand to billions of nodes, and
+    every walk over the tree below would follow each one) and a bounded depth (past it the parser overflows the
+    stack)."""
+
+    _depth = 0
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.composer.ComposerError(None, None, "aliases are not read in a project config", None)
+        self._depth += 1
+        try:
+            if self._depth > _MAX_DEPTH:
+                raise yaml.composer.ComposerError(None, None, "nested too deeply", None)
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
+
+
+def _read_project(path: Path, project: Path, text: str | None) -> Any:
+    """A project's config file (or ``text``, its trusted copy) through ``_TreeLoader``: a regular file of bounded size
+    that, if it is a symlink, stays inside ``project``. A missing one is ``{}``, as with ``confio.read_yaml``."""
+    if text is None:
+        if not path.is_file():
+            return {}
+        if not path.resolve().is_relative_to(Path(project).resolve()):
+            raise OSError(f"{path} leaves the project")
+        text = trust.read_bounded(path).decode("utf-8")
+    data = yaml.load(text, Loader=_TreeLoader) or {}  # noqa: S506 - a SafeLoader subclass
+    if not isinstance(data, dict):
+        raise confio.ConfigError(f"{path}: top level must be a mapping")
+    return data
+
+
+def _read(path: Path, text: str | None = None, *, project: Path | None = None) -> Any:
     """The config file ``path`` as written, or ``text``, its trusted copy. One that exists but does not parse names no
     secrets: refuse rather than export its copies in clear. The error carries no parser text, not even chained (it is
     raised after the ``suppress``): a YAML error quotes the line, which may hold the secret, and a traceback or
-    ``logger.exception`` prints the whole chain."""
-    with contextlib.suppress(OSError, ValueError, yaml.YAMLError):
+    ``logger.exception`` prints the whole chain.
+
+    ``project`` is the project directory when ``path`` is its config, which a cloned repo may have made hostile: it is
+    read as ``_read_project`` does, and a file that hangs, overflows or points out of the project is refused too."""
+    with contextlib.suppress(OSError, ValueError, yaml.YAMLError, RecursionError):
+        if project is not None:
+            return _read_project(path, project, text)
         return confio.read_yaml(path) if text is None else yaml.safe_load(text)
     raise BundleError(_unparsed(path))
 
@@ -162,7 +205,7 @@ def write_bundle(
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                raw = _read(src)
+                raw = _read(src, project=cwd if kind == "project" else None)
                 # its own values hide their copies in it even when nothing else counts it (an untrusted project
                 # config), but only in it: a file the user never trusted must not hide part of one of their rules
                 secrets_here, certain = _known_secrets(*configs, raw)
