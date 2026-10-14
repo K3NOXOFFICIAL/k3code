@@ -35,6 +35,11 @@ describe("completionRequestForInput", () => {
     });
   });
 
+  it("does not ask the gateway to complete URLs as paths", () => {
+    expect(completionRequestForInput("see https://example.com/a/b")).toBeNull();
+    expect(completionRequestForInput("open file:///home/d/x")).toBeNull();
+  });
+
   it("leaves plain text alone", () => {
     expect(completionRequestForInput("hello there")).toBeNull();
   });

@@ -17,9 +17,7 @@ import { MaskedPrompt } from "./maskedPrompt.js";
 import { ModelPicker } from "./modelPicker.js";
 import { OverlayHint } from "./overlayControls.js";
 import { listRowStyle } from "./overlayPrimitives.js";
-import { PluginsHub } from "./pluginsHub.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
-import { SkillsHub } from "./skillsHub.js";
 import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
@@ -312,38 +310,6 @@ export function FloatingOverlays({
             onApply={onTuneApply}
             onCancel={() => patchOverlayState({ tunePicker: false })}
             sessionId={sid}
-            t={theme}
-          />
-        </FloatBox>
-      ),
-    });
-  }
-
-  if (overlay.skillsHub) {
-    widgets.push({
-      id: "skills-hub",
-      render: (width) => (
-        <FloatBox color={theme.color.border}>
-          <SkillsHub
-            gw={gw}
-            maxWidth={width}
-            onClose={() => patchOverlayState({ skillsHub: false })}
-            t={theme}
-          />
-        </FloatBox>
-      ),
-    });
-  }
-
-  if (overlay.pluginsHub) {
-    widgets.push({
-      id: "plugins-hub",
-      render: (width) => (
-        <FloatBox color={theme.color.border}>
-          <PluginsHub
-            gw={gw}
-            maxWidth={width}
-            onClose={() => patchOverlayState({ pluginsHub: false })}
             t={theme}
           />
         </FloatBox>

@@ -22,6 +22,12 @@ import { clampOverlayWidth, listRowStyle } from "./overlayPrimitives.js";
 import { TextInput } from "./textInput.js";
 
 const VISIBLE = 12;
+// Fits "· completed" (the longest status) plus a separating space.
+const STATUS_COLUMN_WIDTH = 12;
+// Rows the switcher draws besides the session list: the double border, the
+// float margin, the two headers, the pinned "+ new" row, both "more"
+// markers, the longest footer (new-row prompt) and one error line.
+const CHROME_ROWS = 14;
 const MIN_WIDTH = 64;
 const MAX_WIDTH = 128;
 const TITLE_MAX = 64;
@@ -45,6 +51,10 @@ const CTRL_OFFSET = 96;
 const shortModel = (model = "") => model.replace(/^.*\//, "") || "model?";
 const ctrlChar = (letter: string) =>
   String.fromCharCode(letter.charCodeAt(0) - CTRL_OFFSET);
+
+/** How many session rows fit above the footer on a terminal `rows` tall. */
+export const sessionListVisibleRows = (rows: number) =>
+  Math.max(1, Math.min(VISIBLE, rows - CHROME_ROWS));
 
 export const fixedSessionColumnStyle = () => ({ flexShrink: 0 });
 
@@ -762,8 +772,9 @@ export function ActiveSessionSwitcher({
   // The "+ new" row (sel 0) is pinned at the top so it's always visible; the
   // live + history list is windowed beneath it.
   const listSel = sel > 0 ? sel - 1 : 0;
-  const offset = windowOffset(listLen, listSel, VISIBLE);
-  const visibleCount = Math.max(0, Math.min(VISIBLE, listLen - offset));
+  const visible = sessionListVisibleRows(stdout?.rows ?? 24);
+  const offset = windowOffset(listLen, listSel, visible);
+  const visibleCount = Math.max(0, Math.min(visible, listLen - offset));
   const visibleRows = Array.from(
     { length: visibleCount },
     (_, k) => offset + k + 1,
@@ -812,7 +823,7 @@ export function ActiveSessionSwitcher({
           </Text>
         </Box>
 
-        <Box {...fixedSessionColumnStyle()} width={11}>
+        <Box {...fixedSessionColumnStyle()} width={STATUS_COLUMN_WIDTH}>
           <Text color={newRowTextColor ?? t.color.muted} wrap="truncate-end">
             ✎ draft
           </Text>
@@ -886,7 +897,7 @@ export function ActiveSessionSwitcher({
                 </Text>
               </Box>
 
-              <Box {...fixedSessionColumnStyle()} width={11}>
+              <Box {...fixedSessionColumnStyle()} width={STATUS_COLUMN_WIDTH}>
                 <Text color={rowTextColor ?? t.color.muted} wrap="truncate-end">
                   {relativeSessionAge(h.started_at)}
                 </Text>
@@ -953,7 +964,7 @@ export function ActiveSessionSwitcher({
               </Text>
             </Box>
 
-            <Box {...fixedSessionColumnStyle()} width={11}>
+            <Box {...fixedSessionColumnStyle()} width={STATUS_COLUMN_WIDTH}>
               <Text
                 color={
                   rowTextColor ??
@@ -988,8 +999,8 @@ export function ActiveSessionSwitcher({
         );
       })}
 
-      {offset + VISIBLE < listLen && (
-        <Text color={t.color.muted}> ↓ {listLen - offset - VISIBLE} more</Text>
+      {offset + visible < listLen && (
+        <Text color={t.color.muted}> ↓ {listLen - offset - visible} more</Text>
       )}
 
       {newSelected ? (
