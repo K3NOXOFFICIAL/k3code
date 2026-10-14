@@ -218,7 +218,8 @@ class Settings(BaseModel):
         default_factory=lambda: {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
     )
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
-    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
+    # the exact origin of research.searxng_url is always allowed. While the guard is on, web_fetch connects directly
+    # and ignores HTTP(S)_PROXY/ALL_PROXY (a proxy would resolve names again). See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
     # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",
