@@ -538,11 +538,13 @@ def test_an_escaped_backtick_in_backticks_stays_text(tmp_path: Path, cmd: str) -
 
 
 def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
-    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\""]]
-    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"']]
+    # next to the unescaped payload comes the text up to the next backtick, escaped or not, as Main read it
+    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\"", "a \\"]]
+    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"', "a \\"]]
     # in a heredoc body bash keeps the backslash of `\"`, dash drops it: both are checked and no rule vouches for it
     body = parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF")
-    assert body.heredocs[0][0].payloads == [r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
+    # and the raw text of the payload, as Main read it
+    assert body.heredocs[0][0].payloads == [r"a \`b\` \"d\"", r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
     assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
 
 
@@ -818,3 +820,20 @@ def test_the_parser_marks_what_ssh_runs_from_its_stdin() -> None:
     for cmd, expected in marks.items():
         assert parse(cmd).code_heredoc == expected, cmd
     assert parse("cat <<'EOF' | ssh -p 22 h | ssh g ls\nx\nEOF").remote_heredoc[0] == ["ssh -p 22 h"]
+
+
+#: commands the test file on Main already pinned as denied: the extraction of nested commands only ever adds to what
+#: Main read (the unescaped backtick, body and launcher readings are checked next to Main's raw ones)
+STILL_DENIED = [
+    *(f"cat <<EOF\n{payload}\nEOF" for payload, _ in HARDLINE_PAYLOADS),
+    'echo "$(cat <<EOF\n$(rm -rf ~)\nEOF\n)"',
+    *SHELL_SCRIPTS,
+    "cat <<EOF\n`\\\nrm -rf ~`\nEOF",
+]
+
+
+@pytest.mark.parametrize("cmd", STILL_DENIED)
+def test_what_main_denied_is_still_denied(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd) is not None, cmd
+    for mode in ("auto", "yolo"):
+        assert _bash(cmd, mode, tmp_path).action == "deny", (mode, cmd)

@@ -335,7 +335,7 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
             # and a payload the two read differently is unsure
             raw = body[i + 1 :] if j < 0 else body[i + 1 : j]
             readings = list(dict.fromkeys([_unescape_backticks(raw), _unescape_backticks(raw, dquoted=True)]))
-            out += readings
+            out += dict.fromkeys([raw, *readings])  # the raw text too, as before the unescaping
             if j < 0:
                 return out, True
             unsure = unsure or len(readings) > 1
@@ -1089,10 +1089,14 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             out.unterminated = True
             end = n
         payload = _unescape_backticks(text[at + 1 : end], dquoted)
-        cur_payloads.append(payload)
-        inner_bt = _scan(payload, budget, _depth + 1)
-        out.too_deep = out.too_deep or inner_bt.too_deep
-        out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        # the text up to the next backtick, escaped or not, is read too, as before the unescaping;
+        # it holds no backtick, so it adds one flat scan per backtick and no nesting
+        upto_next = text[at + 1 : n if (nxt := text.find("`", at + 1)) < 0 else nxt]
+        for p in dict.fromkeys([payload, upto_next]):
+            cur_payloads.append(p)
+            inner_bt = _scan(p, budget, _depth + 1)
+            out.too_deep = out.too_deep or inner_bt.too_deep
+            out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
         return end + 1, text[at : end + 1]
 
     while i < n:
@@ -1325,9 +1329,10 @@ def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
     the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
     shell unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word
-    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), and every reading is checked."""
+    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), and shlex's reading is checked as well."""
     out: list[str] = []
-    for toks in dict.fromkeys(tuple(_shell_words(sub, unquote)) for unquote in (False, True)):
+    readings = [tuple(_shell_words(sub, unquote)) for unquote in (False, True)]
+    for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
         pre = _strip_wrappers(list(toks))
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
             out.append(" ".join(pre[1:]))
