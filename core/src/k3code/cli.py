@@ -116,8 +116,9 @@ async def _run_headless(
     from k3code.autonomy import autonomy_cfg
     from k3code.context_budget import router_window, tool_output_limit
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-    from k3code.extratools import register_skill_tool
+    from k3code.extratools import register_recall_tools, register_skill_tool
     from k3code.memory import fenced
+    from k3code.paths import home
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -127,7 +128,7 @@ async def _run_headless(
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config, recall=True)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -159,6 +160,9 @@ async def _run_headless(
         max_tool_errors=int(autonomy_cfg(config)["max_tool_errors"]),
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    # the `recall` tool the prompt names: earlier sessions' text from the store the gateway keeps (this run's label
+    # is not one of its session ids, so no hit is marked as this session's)
+    register_recall_tools(loop.tools, home() / "sessions.db", Path.cwd())
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
     final_text = ""
@@ -435,8 +439,9 @@ async def _run_repl(
     from k3code.autonomy import autonomy_cfg
     from k3code.context_budget import router_window, tool_output_limit
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-    from k3code.extratools import register_skill_tool
+    from k3code.extratools import register_recall_tools, register_skill_tool
     from k3code.memory import fenced
+    from k3code.paths import home
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -447,7 +452,7 @@ async def _run_repl(
     if model and (err := _use_model_key(config, model)):
         print(f"[Error] {err}; using {config.default_model}")
         model = None
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config, recall=True)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -481,6 +486,9 @@ async def _run_repl(
         max_tool_errors=int(autonomy_cfg(config)["max_tool_errors"]),
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    # the `recall` tool the prompt names: earlier sessions' text from the store the gateway keeps (this run's label
+    # is not one of its session ids, so no hit is marked as this session's)
+    register_recall_tools(loop.tools, home() / "sessions.db", Path.cwd())
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
 
