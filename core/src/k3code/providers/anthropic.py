@@ -220,9 +220,12 @@ class AnthropicProvider(Provider):
 
 
 def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
-    """Mark three prompt-cache breakpoints (the API allows four): the system prompt, the last tool definition, and the
-    last block of the newest message. The last one moves forward every call, so each request reads the prefix the
-    request before it wrote instead of paying for the whole conversation again on every tool-loop step."""
+    """Mark the four prompt-cache breakpoints the API allows: the system prompt, the last tool definition, the last
+    block of the newest message, and the last block of the message before the newest assistant message. The newest
+    one moves forward every call, so each request reads the prefix the request before it wrote instead of paying for
+    the whole conversation again on every tool-loop step. The API looks for an earlier entry only about 20 blocks back
+    from a breakpoint, and a step with 10 parallel tool calls appends more than that; the fourth breakpoint sits where
+    the previous request ended, so its entry is always found (#168)."""
     if payload.get("system"):
         payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
     if payload.get("tools"):
@@ -230,6 +233,10 @@ def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
     messages = payload["messages"]
     if messages:
         messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}
+    newest_assistant = next((i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"), 0)
+    if newest_assistant > 0:
+        prev = messages[newest_assistant - 1]
+        messages[newest_assistant - 1] = {**prev, "content": with_cache_breakpoint(prev["content"])}
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
