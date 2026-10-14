@@ -396,7 +396,7 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     const clearSpy = vi.spyOn(globalThis, "clearInterval");
 
-    patchOverlayState({ pluginsHub: true });
+    patchOverlayState({ sessions: true });
     await flush();
 
     // Each running clock is cleared as the overlay goes up …
@@ -420,13 +420,11 @@ describe("status-chrome timers track the current overlay model", () => {
   const occluding: Array<[string, Partial<OverlayState>]> = [
     ["modelPicker", { modelPicker: true }],
     ["pager", { pager: { lines: ["a"], offset: 0 } }],
-    ["pluginsHub", { pluginsHub: true }],
     ["sessions", { sessions: true }],
-    ["skillsHub", { skillsHub: true }],
     ["widget", { widget: { appId: "demo", state: null } }],
   ];
 
-  // In `$isBlocked` but NOT occluding.  `agents` / `agentView` / `journey`
+  // In `$isBlocked` but NOT occluding.  `agents` / `agentView`
   // unmount the whole ComposerPane subtree, so React's effect cleanup already
   // stops the clocks and gating on them would be dead code; the rest are
   // PromptZone states that render in normal flow and push the rule down
@@ -461,7 +459,6 @@ describe("status-chrome timers track the current overlay model", () => {
         } as OverlayState["confirm"],
       },
     ],
-    ["journey", { journey: true }],
     [
       "secret",
       {

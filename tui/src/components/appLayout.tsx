@@ -65,7 +65,6 @@ import { Banner, Panel, SessionPanel } from "./branding.js";
 import { FpsOverlay } from "./fpsOverlay.js";
 import { GoalBar } from "./goalBar.js";
 import { HelpHint } from "./helpHint.js";
-import { Journey } from "./journey.js";
 import { MessageLine } from "./messageLine.js";
 import { QueuedMessages } from "./queuedMessages.js";
 import { SectionRule } from "./sectionRule.js";
@@ -619,19 +618,6 @@ const AgentsOverlayPane = memo(function AgentsOverlayPane() {
   );
 });
 
-const JourneyPane = memo(function JourneyPane() {
-  const { gw } = useGateway();
-  const ui = useStore($uiState);
-
-  return (
-    <Journey
-      gw={gw}
-      onClose={() => patchOverlayState({ journey: false })}
-      t={ui.theme}
-    />
-  );
-});
-
 const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
   actions,
 }: Pick<AppLayoutProps, "actions">) {
@@ -748,7 +734,7 @@ export const AppLayout = memo(function AppLayout({
   const overlay = useStore($overlayState);
   const ui = useStore($uiState);
   // These replace the transcript, rails, pet, prompt zone and composer with one full-screen pane.
-  const fullScreen = overlay.agents || overlay.journey || overlay.agentView;
+  const fullScreen = overlay.agents || overlay.agentView;
 
   const cursorSnapshotRef = useRef<InputCursorSnapshot | null>(null);
   useEffect(() => {
@@ -773,10 +759,6 @@ export const AppLayout = memo(function AppLayout({
           {overlay.agents ? (
             <PerfPane id="agents">
               <AgentsOverlayPane />
-            </PerfPane>
-          ) : overlay.journey ? (
-            <PerfPane id="journey">
-              <JourneyPane />
             </PerfPane>
           ) : overlay.agentView ? (
             <PerfPane id="agentView">
