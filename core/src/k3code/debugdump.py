@@ -196,8 +196,11 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
     home = home or k3_home()
     events = list(server.event_log)[-n:]
     secrets = secret_values(server.config)
-    # known from a file the user may never have trusted: dropped after the shape passes (drop_after_shapes)
-    untrusted = sorted(_mcp_json_values(server, events) - set(secrets), key=len, reverse=True)
+    # known from a file the user may never have trusted: dropped after the shape passes (drop_after_shapes), in the
+    # JSON text of each part, where a string that holds JSON (`cat .mcp.json`) escapes such a value once more
+    mcp = _mcp_json_values(server, events) - set(secrets)
+    escaped = {e for v in mcp for e in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1])}
+    untrusted = sorted(escaped, key=len, reverse=True)
     checks = await doctor.run_checks(server.config, probe=probe, home=home)
     parts = {
         "events.json": json.dumps(events, indent=2, default=str),

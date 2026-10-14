@@ -1219,3 +1219,38 @@ def test_a_mcp_json_nested_deep_in_an_env_value_exports_without_a_recursion_erro
     out = tmp_path / "x.k3bundle"
     bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
     assert MCP_TOK not in _export_blob(out)
+
+
+async def test_the_debug_dump_hides_an_untrusted_value_quoted_in_json_inside_an_event(tmp_path, monkeypatch):
+    value = 'Svc"' + "Fake" + "Qz81xW4pLm"  # a quote: JSON in an event string escapes it twice in events.json
+    data = {"mcpServers": {"x": {"command": "y", "env": {"API_TOKEN": value}}}}
+    project = _project_with_mcp_json(tmp_path, data)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": "$ cat .mcp.json\n" + json.dumps(data)})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert "Qz81xW4pLm" not in files["events.json"]
+
+
+def test_many_untrusted_values_a_shape_hides_beside_each_other_do_not_stall_the_export(tmp_path):
+    import random
+    import time
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    rnd = random.Random(581)
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    values = {f"API_KEY_{i}": "sk-" + "".join(rnd.choice(alphabet) for _ in range(57)) for i in range(4000)}
+    data = {"mcpServers": {"x": {"command": "y", "env": values}}}
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(json.dumps(data))
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, "$ cat .mcp.json\n" + json.dumps(data, indent=1))
+    out = tmp_path / "x.k3bundle"
+    start = time.monotonic()
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert time.monotonic() - start < 5
+    blob = _export_blob(out)
+    assert not any(v[3:] in blob for v in values.values())

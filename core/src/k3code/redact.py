@@ -240,7 +240,9 @@ def drop_after_shapes(shaped: str, original: str, values: list[str]) -> str:
     if not cut:
         return text
     parts = text.split(REDACTED)
-    left = [16 * len(original) + 65_536]
+    left = [16 * len(original) + 65_536 - 24 * len(cut) * len(parts)]  # every value beside every marker, three times
+    if left[0] < 0:
+        return REDACTED
     try:
         for v in cut:
             for n in range(1, len(parts) - 1):
