@@ -10,7 +10,7 @@ import {
 } from "react";
 import spinners, { type BrailleSpinnerName } from "unicode-animations";
 
-import { THINKING_COT_MAX } from "../config/limits.js";
+import { LIVE_TOOL_ROWS_MAX, THINKING_COT_MAX } from "../config/limits.js";
 import { sectionMode } from "../domain/details.js";
 import {
   buildSubagentTree,
@@ -779,6 +779,7 @@ interface Group {
 
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
+  capRows = false,
   commandOverride = false,
   detailsMode = "collapsed",
   outcome = "",
@@ -797,6 +798,8 @@ export const ToolTrail = memo(function ToolTrail({
   activity = [],
 }: {
   busy?: boolean;
+  // Paint only the newest LIVE_TOOL_ROWS_MAX tool rows (live area only).
+  capRows?: boolean;
   commandOverride?: boolean;
   detailsMode?: DetailsMode;
   outcome?: string;
@@ -1254,6 +1257,11 @@ export const ToolTrail = memo(function ToolTrail({
   }
 
   if (hasTools && visible.tools !== "hidden") {
+    const folded = capRows
+      ? Math.max(0, groups.length - LIVE_TOOL_ROWS_MAX)
+      : 0;
+    const shown = folded ? groups.slice(folded) : groups;
+
     panels.push({
       header: (
         <Chevron
@@ -1275,9 +1283,19 @@ export const ToolTrail = memo(function ToolTrail({
       open: openTools,
       render: (rails) => (
         <Box flexDirection="column">
-          {groups.map((group, index) => {
+          {folded ? (
+            <TreeTextRow
+              branch="mid"
+              color={t.color.muted}
+              content={`… ${folded} earlier tool calls`}
+              dimColor
+              rails={rails}
+              t={t}
+            />
+          ) : null}
+          {shown.map((group, index) => {
             const branch: TreeBranch =
-              index === groups.length - 1 ? "last" : "mid";
+              index === shown.length - 1 ? "last" : "mid";
             const childRails = nextTreeRails(rails, branch);
             const hasInlineSubagents = inlineDelegateKey === group.key;
             // Surface the /agents tree hint the moment a delegate group appears —

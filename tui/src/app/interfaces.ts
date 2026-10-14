@@ -137,13 +137,10 @@ export interface OverlayState {
   ambient: ActiveWidget[];
   /** Modal widget app — owns input, blocks the composer. */
   widget: ActiveWidget | null;
-  journey: boolean;
   modelPicker: boolean | { refresh?: boolean };
   pager: null | PagerState;
-  pluginsHub: boolean;
   secret: null | SecretReq;
   sessions: boolean;
-  skillsHub: boolean;
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
   settingsPanel: boolean;
