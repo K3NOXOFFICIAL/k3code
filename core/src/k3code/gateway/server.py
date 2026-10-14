@@ -433,7 +433,7 @@ class LiveSession:
         config = self.server.config
         key = self.stored.model or config.default_model
         return {
-            "model": _model_label(config, key),
+            "model": _model_label(config, key, self.stored.provider),
             "model_key": key,
             "version": build_version(),  # the banner: which build this daemon started as
             "tools": self._tools_info(),
@@ -524,13 +524,17 @@ _TOOL_GROUPS = {
 }
 
 
-def _model_label(config: Any, key: str) -> str:
-    """The model id the first provider uses for ``key`` (what the user recognises), else the key itself."""
+def _first_model_id(spec: str | list[str]) -> str:
+    return (spec[0] if spec else "") if isinstance(spec, list) else spec
+
+
+def _model_label(config: Any, key: str, provider: str = "") -> str:
+    """The model id the active provider block (``provider``, the session's /provider pick, else ``default_provider``,
+    else the first block) uses for ``key`` (what the user recognises), else the key itself."""
     specs = _resolve_model_specs(config, key) if config.providers else []
-    first = specs[0] if specs else ""
-    if isinstance(first, list):
-        first = first[0] if first else ""
-    return str(first or key)
+    name = active_provider(config, provider)
+    first = next((s for p, s in zip(config.providers, specs, strict=False) if p.name == name), "")
+    return str(_first_model_id(first) or key)
 
 
 #: How many recent messages stay when a session's older messages are folded into a summary. When that happens is
@@ -3903,19 +3907,22 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
 
 
 async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    # the session asked about (else the current one): its model key and its /provider pick, not only the defaults
+    session = server._session_for(params.get("session_id"))
+    active = active_provider(server.config, session.stored.provider if session is not None else "")
     providers = []
     for p in server.config.providers:
         providers.append(
             {
                 "slug": p.name,
                 "name": p.name,
-                "models": sorted(p.models.keys()),
+                "models": sorted(p.models.keys()),  # the keys /model and --provider take
+                "model_ids": {k: _first_model_id(spec) for k, spec in p.models.items()},  # key -> the model id it sends
                 "api_url": p.base_url,
+                "is_current": p.name == active,
             }
         )
-    # the model key of the session asked about (else the current one), not only the configured default
-    session = server._session_for(params.get("session_id"))
-    return {"providers": providers, "model": tune_cmd.current_model(server.config, session)}
+    return {"providers": providers, "model": tune_cmd.current_model(server.config, session), "provider": active}
 
 
 async def _tune_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -4067,14 +4074,16 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
     """``config.set model``: value is ``<model-key> [--provider p] [--reasoning <level>] [--session|--global]``.
 
     ``--global`` also makes the key the saved default of new sessions; ``--reasoning`` sets the session's effort
-    (ignored without a session); ``--provider`` and the other picker flags are ignored."""
+    (ignored without a session); ``--provider`` pins the session to that provider block like /provider (without a
+    session: the daemon's default provider, not saved); the other picker flags are ignored."""
     parts = iter(str(params.get("value") or "").split())
     keys: list[str] = []
     reasoning: str | None = None
+    provider: str | None = None
     scope = "session"
     for part in parts:
         if part == "--provider":
-            next(parts, None)  # its value
+            provider = next(parts, None)
         elif part == "--reasoning":
             reasoning = next(parts, "")
         elif part == "--global":
@@ -4090,7 +4099,8 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
     session = server._session_for(params.get("session_id"))
     try:
         effort = tune_cmd.normalize_effort(reasoning, legacy=True) if reasoning is not None and session else None
-        tune_cmd.apply_tune(server, session, tune_cmd.TuneRequest(model=key, effort=effort, scope=scope))
+        req = tune_cmd.TuneRequest(model=key, effort=effort, provider=provider, scope=scope)
+        tune_cmd.apply_tune(server, session, req)
     except tune_cmd.TuneError as e:
         raise _InvalidParams(str(e)) from None
     return {"ok": True, "key": "model", "value": key}
