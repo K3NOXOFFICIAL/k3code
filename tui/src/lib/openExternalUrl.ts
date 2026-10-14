@@ -20,15 +20,18 @@ import { platform } from "node:os";
  *   containing shell metacharacters (`;`, `&`, backticks) cannot be
  *   interpreted as a command.
  *
- * Returns `true` if the spawn was attempted, `false` if the open could
- * not proceed — covers (a) URL rejected by `parseSafeUrl` (non-http(s),
- * malformed, etc.), (b) no known opener for the current platform
- * (`openCommand` returned null), or (c) `spawn()` threw synchronously
- * before the child was created. Async failures after spawn (`'error'`
- * event because the binary couldn't exec) still return `true` because
- * the spawn was attempted — the no-op error listener absorbs the event
- * so the TUI doesn't crash, and the user just doesn't see their browser
- * pop.
+ * Under WSL `process.platform` is "linux" but WSL images usually ship no
+ * xdg-open or browser, so `openCommands` tries `wslview`, then
+ * `explorer.exe`, before `xdg-open`; a missing binary (async ENOENT) moves on
+ * to the next opener. When every opener fails, the failure is reported via
+ * `onOpenFailure` listeners (the app shows it in the transcript).
+ *
+ * Returns `true` if a spawn was attempted, `false` if the open could not
+ * proceed — covers (a) URL rejected by `parseSafeUrl` (non-http(s),
+ * malformed, etc.), (b) no known opener for the current platform, or (c)
+ * every `spawn()` threw synchronously before a child was created. (b) and
+ * (c) are also reported through `onOpenFailure`. Async failures after spawn
+ * still return `true`; the error listener keeps the TUI alive.
  */
 export function openExternalUrl(
   rawUrl: string,
@@ -42,49 +45,87 @@ export function openExternalUrl(
 
   const spawnFn = dependencies.spawn ?? spawn;
   const platformId = dependencies.platform?.() ?? platform();
+  const commands = openCommands(platformId, dependencies.env ?? process.env);
+  const report = dependencies.onFailure ?? emitOpenFailure;
 
-  const command = openCommand(platformId);
+  const fail = () => {
+    const tried = commands.map((c) => c.command).join(", ");
 
-  if (!command) {
-    return false;
-  }
+    report(
+      `could not open link${tried ? ` (tried ${tried})` : ": no opener for this platform"}: ${url.toString()}`,
+    );
+  };
 
-  try {
-    const child = spawnFn(command.command, [...command.args, url.toString()], {
-      // Detach so closing the TUI later doesn't kill the browser process,
-      // and ignore stdio so we don't leak FDs into our raw-mode terminal.
-      // Without `ignore` here, Chrome's stderr can land in the alt screen.
-      detached: true,
-      stdio: "ignore",
-    } satisfies SpawnOptions);
+  // Try opener `index`; on a sync throw or an async 'error' (binary missing,
+  // EACCES) fall through to the next one. Returns whether a spawn was made.
+  const attempt = (index: number): boolean => {
+    const command = commands[index];
 
-    // Async failure path: spawn returns a ChildProcess synchronously even
-    // when the binary is missing (ENOENT on `xdg-open` / `explorer.exe`),
-    // unreachable (EACCES), or otherwise unusable — the failure surfaces
-    // later as an 'error' event. Without a handler, an unhandled 'error'
-    // on an EventEmitter crashes Node, which would tear down the whole
-    // TUI. Attach a no-op listener BEFORE unref() so the event has a
-    // consumer; we already returned `true` synchronously, so the user
-    // just won't see their browser open — same as if the URL had been
-    // rejected upstream.
-    child.once("error", () => {
-      // Intentional no-op. The TUI keeps running; user gets no browser
-      // pop, which is the failure mode we promised in the doc comment.
-    });
+    if (!command) {
+      fail();
 
-    child.unref();
+      return false;
+    }
 
-    return true;
-  } catch {
-    // spawn can also throw synchronously on argv-validation failures
-    // (e.g. NUL in the path). Treat it as a no-op rather than crashing.
-    return false;
+    try {
+      const child = spawnFn(
+        command.command,
+        [...command.args, url.toString()],
+        {
+          // Detach so closing the TUI later doesn't kill the browser process,
+          // and ignore stdio so we don't leak FDs into our raw-mode terminal.
+          // Without `ignore` here, Chrome's stderr can land in the alt screen.
+          detached: true,
+          stdio: "ignore",
+        } satisfies SpawnOptions,
+      );
+
+      // spawn returns a ChildProcess synchronously even when the binary is
+      // missing; the failure surfaces later as an 'error' event. Without a
+      // handler an unhandled 'error' crashes Node and the whole TUI, so
+      // attach one BEFORE unref(). Exit codes are ignored on purpose:
+      // explorer.exe exits 1 even when it opened the URL.
+      child.once("error", () => {
+        attempt(index + 1);
+      });
+
+      child.unref();
+
+      return true;
+    } catch {
+      // spawn can also throw synchronously on argv-validation failures
+      // (e.g. NUL in the path); try the next opener.
+      return attempt(index + 1);
+    }
+  };
+
+  return attempt(0);
+}
+
+type OpenFailureListener = (message: string) => void;
+
+const openFailureListeners = new Set<OpenFailureListener>();
+
+/** Subscribe to "could not open link" reports; returns the unsubscribe. */
+export function onOpenFailure(listener: OpenFailureListener): () => void {
+  openFailureListeners.add(listener);
+
+  return () => {
+    openFailureListeners.delete(listener);
+  };
+}
+
+function emitOpenFailure(message: string): void {
+  for (const listener of openFailureListeners) {
+    listener(message);
   }
 }
 
 export type OpenDependencies = {
-  spawn?: typeof spawn;
+  env?: NodeJS.ProcessEnv;
+  onFailure?: OpenFailureListener;
   platform?: () => string;
+  spawn?: typeof spawn;
 };
 
 /**
@@ -164,4 +205,27 @@ export function openCommand(platformId: string): OpenCommand | null {
   }
 
   return null;
+}
+
+/**
+ * Ordered openers to try. Same as `openCommand` except under WSL (platform
+ * "linux" with WSL_INTEROP or WSL_DISTRO_NAME set, the same check
+ * lib/clipboard.ts uses), where `wslview` and `explorer.exe` (both reach the
+ * Windows browser, no shell involved) come before `xdg-open`.
+ */
+export function openCommands(
+  platformId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): OpenCommand[] {
+  const base = openCommand(platformId);
+  const commands: OpenCommand[] = base ? [base] : [];
+
+  if (platformId === "linux" && (env.WSL_INTEROP || env.WSL_DISTRO_NAME)) {
+    commands.unshift(
+      { command: "wslview", args: [] },
+      { command: "explorer.exe", args: [] },
+    );
+  }
+
+  return commands;
 }
