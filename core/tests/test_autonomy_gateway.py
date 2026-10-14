@@ -171,7 +171,8 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     plans = events(server, "plan.show")
     assert [p["status"] for p in plans] == ["proposed", "approved"]
     assert plans[-1]["auto_approved"] is True and plans[-1]["sections"]["Goal"] == "Add flag"
-    assert "watch edge case X" in plans[-1]["advisor"]  # brief advisor critique appended
+    assert "advisor" not in plans[-1]  # a medium plan gets no critique (the strong call is for large/huge or high risk)
+    assert "brief critique" not in "".join(c["text"] for p in server.providers for c in p.log)
     assert server.session.stored.messages[-1]["content"] == "implemented"
     # the executor saw the plan; planning ran read-only (no edit tools offered in plan mode)
     main_call = next(c for p in server.providers for c in p.log if c["model"] == "m-main")
@@ -185,6 +186,57 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     assert rows[1]["outcome"] == "done" and rows[1]["planned"] is True
     assert "verbose" not in json.dumps(rows)
     assert server.session.perms.mode.value == "auto"  # plan approval did not leave auto mode
+
+
+async def test_large_and_high_risk_plans_get_the_advisor_critique(tmp_path, monkeypatch):
+    """The brief strong-tier critique after approval costs a strong call per plan: only a large/huge or high-risk
+    plan gets one (a medium plan is approved and run as is, see the test above)."""
+    server = make(tmp_path, monkeypatch, [verdict("large"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    plans = events(server, "plan.show")
+    assert plans[-1]["status"] == "approved" and "watch edge case X" in plans[-1]["advisor"]
+    steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR]
+    server2 = make(sub(tmp_path, "h"), monkeypatch, steps, autonomy={"proposals": False})
+    await start(server2, tmp_path / "h")
+    await run_turn(server2, "tidy things", [{"choice": "once"}])
+    assert "watch edge case X" in events(server2, "plan.show")[-1]["advisor"]
+
+
+async def test_medium_risk_in_auto_is_approved_without_asking(tmp_path, monkeypatch):
+    """Only high risk asks in auto mode: a medium-risk plan is auto-approved like a low-risk one."""
+    steps = [verdict("medium", risk="med"), *PLANNER, *EXECUTOR]
+    server = make(tmp_path, monkeypatch, steps, autonomy={"proposals": False})
+    await start(server, tmp_path)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []
+    plans = events(server, "plan.show")
+    assert [p["status"] for p in plans] == ["proposed", "approved"] and plans[-1]["auto_approved"] is True
+    assert plans[-1]["risk"] == "med"
+    assert server.session.stored.messages[-1]["content"] == "implemented"
+
+
+async def test_planner_gets_the_conversation_condensed_not_as_history(tmp_path, monkeypatch):
+    """The planning turn carried the whole message history (every tool result in full) into the strong-tier call.
+    It now gets the condensed transcript the advisor gets: clipped messages, the old part summarized on the cheap
+    tier past ``advisor_compact_chars``."""
+    steps = [
+        verdict("medium"),
+        {"type": "text", "model": "m-cheap", "match": "Summarize this coding conversation", "text": "SUMMARY"},
+        *PLANNER,
+        *EXECUTOR,
+    ]
+    cfg = {"advisor_compact_chars": 500, "proposals": False}
+    server = make(tmp_path, monkeypatch, steps, autonomy=cfg)
+    await start(server, tmp_path)
+    server.session.messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300} for i in range(10)
+    ]
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    assert "Conversation so far:" in planner_call["text"] and "SUMMARY" in planner_call["text"]
+    assert "message 9 " in planner_call["text"]  # the recent tail stays verbatim
+    assert "message 0 " not in planner_call["text"]  # the old part went in summarized, not as history
 
 
 async def test_planner_sees_the_project_memory_the_executor_sees(tmp_path, monkeypatch):
@@ -599,7 +651,8 @@ async def test_proposer_emits_dedups_and_accept_sends_action(tmp_path, monkeypat
     await start(server, tmp_path)
     await run_turn(server, "add a flag")
     shown = events(server, "proposal.show")
-    assert len(shown) == 1  # after the plan; the post-task pass produced the same dedup key
+    assert len(shown) == 1  # one pass, after the task (none on the plan: a result is what proposals come from)
+    assert len([c for p in server.providers for c in p.log if "one step ahead" in c["text"]]) == 1
     assert shown[0]["kind"] == "also_setup" and shown[0]["action"] == "set up CI for this repo"
     lst = await call(server, "command.dispatch", {"name": "proposals", "arg": ""})
     assert shown[0]["id"] in lst["message"]
@@ -754,11 +807,11 @@ async def test_advisor_model_key_and_default_persist(tmp_path, monkeypatch):
 
 
 async def test_advisor_auto_hooks_follow_config(tmp_path, monkeypatch):
-    # off in config: the plan event carries no critique
+    # off in config: the plan event carries no critique (large: a scope that gets one when the hook is on)
     server = make(
         tmp_path,
         monkeypatch,
-        [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
+        [verdict("large"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
         autonomy={"advisor_on_plan": False},
     )
     await start(server, tmp_path)
@@ -776,6 +829,37 @@ class _FakeSession:
         from types import SimpleNamespace
 
         self.perms = SimpleNamespace(mode=SimpleNamespace(value=mode))
+
+
+async def test_goal_judge_sees_the_failing_test_in_the_evidence_digest(tmp_path, monkeypatch):
+    """End to end through the gateway: the executor really runs a failing pytest, and the cheap-tier judge call of
+    the implicit goal carries that command and its exit code in the evidence digest."""
+    import sys
+
+    from k3code.goals import _EVIDENCE_LABEL
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
+    (tmp_path / "test_fail.py").write_text("def test_it():\n    assert False\n")
+    run_tests = {
+        "type": "tool_call",
+        "model": "m-main",
+        "when": "turn_first",
+        "id": "c1",
+        "name": "bash",
+        "arguments": {"command": f"{sys.executable} -m pytest -q -p no:cacheprovider test_fail.py"},
+    }
+    claim = {"type": "text", "model": "m-main", "when": "turn_after_tool", "text": "all green, done"}
+    judge = {"type": "text", "model": "m-cheap", "match": _EVIDENCE_LABEL, "text": '{"verdict": "done", "reason": "r"}'}
+    cfg = {"auto_continue": True, "advisor_on_goal": False, "proposals": False, "degrade_trivial": False}
+    server = make(tmp_path, monkeypatch, [verdict("small"), run_tests, claim, judge], autonomy=cfg)
+    await start(server, tmp_path)
+    await run_turn(server, "make the tests pass")
+    judge_calls = [c for p in server.providers for c in p.log if _EVIDENCE_LABEL in c["text"]]
+    assert len(judge_calls) == 1 and judge_calls[0]["model"] == "m-cheap"
+    digest = judge_calls[0]["text"]
+    assert "-m pytest -q -p no:cacheprovider test_fail.py -> exit 1" in digest
+    assert "Last test/check: FAILED, after the last edit." in digest
 
 
 async def test_review_done_blocks_goal_only_on_blocking_issues(tmp_path, monkeypatch):
@@ -804,7 +888,8 @@ async def test_review_done_blocks_goal_only_on_blocking_issues(tmp_path, monkeyp
 
 
 async def test_stats_shows_tokens_and_calls_per_tier(tmp_path, monkeypatch):
-    steps = [verdict("medium"), usage("m-cheap", "You classify", 11, 3), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER]
+    # large: the plan gets the advisor critique, so the strong tier is called twice
+    steps = [verdict("large"), usage("m-cheap", "You classify", 11, 3), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER]
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
     await run_turn(server, "add a flag")

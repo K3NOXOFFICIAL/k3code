@@ -289,6 +289,21 @@ async def test_continuations_of_an_explicit_goal_skip_the_scope_gate_too(tmp_pat
     await server.close()
 
 
+async def test_the_system_prompt_is_byte_identical_across_the_turns_of_an_implicit_goal(tmp_path, monkeypatch):
+    """A continuation turn must reuse the first turn's system prompt byte for byte: any difference (a clock, a goal
+    line, a reordered section) breaks the provider's prompt cache on every judged turn."""
+    server, provider, live, _ = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "all built"], autonomy=DEFAULT, permission_mode="auto"
+    )
+    server.goal_judge = scripted_judge(["continue", "done"])
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 2
+    first, second = provider.seen[0][0], provider.seen[1][0]
+    assert first.role == "system" and second.role == "system"
+    assert first.content == second.content
+    await server.close()
+
+
 async def test_the_turn_cap_ends_an_implicit_goal_with_a_notice(tmp_path, monkeypatch):
     autonomy = {**DEFAULT, "auto_continue_max_turns": 2}
     server, provider, live, mgr = await _setup(

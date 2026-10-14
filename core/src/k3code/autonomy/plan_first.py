@@ -196,9 +196,8 @@ class PlanFirst:
                 scope_hash=h,
                 message="Plan not approved; nothing was executed. Rephrase the task or send it again.",
             )
+        # no proposer pass on the plan: ``finish`` runs one after the task, when there is a result to propose from
         prompt = f"{text}\n\nApproved plan (follow it):\n{captured.plan}"
-        if self.cfg["proposals"]:
-            self.spawn(self.propose_from(session, f"Task: {text}\n\nPlan:\n{captured.plan}"))
         return GateResult(prompt=prompt, verdict=verdict, plan=captured.plan, scope_hash=h)
 
     @staticmethod
@@ -291,8 +290,19 @@ class PlanFirst:
         if verdict.suggested_subtasks:
             mark = " (parallelizable)" if verdict.parallelizable else ""
             prompt += f"\nSuggested subtasks{mark}: " + "; ".join(verdict.suggested_subtasks)
+        # The conversation so far goes in as a condensed transcript (long tool results clipped, the old part
+        # summarized on the cheap tier past ``advisor_compact_chars``), not as the full message history: the planner
+        # needs the context, not every byte of it.
+        ctx = await advisor_mod.condensed_context(
+            server.model_caller,
+            session.stored.messages,
+            threshold=int(self.cfg["advisor_compact_chars"]),
+            session_id=sid,
+        )
+        if ctx:
+            prompt += f"\n\nConversation so far:\n{ctx}"
         last_text = ""
-        async for event in loop.run(prompt, max_tokens=server.config.max_tokens, history=session.history):
+        async for event in loop.run(prompt, max_tokens=server.config.max_tokens, history=[]):
             server._on_stream_event(session, event)
             if event.type == "done" and event.message and event.message.role == "assistant" and event.message.content:
                 last_text = event.message.content
@@ -305,7 +315,9 @@ class PlanFirst:
             return cap
 
         extra: dict[str, Any] = {"auto_approved": cap.auto}
-        if self.advisor_applies(session, "advisor_on_plan"):
+        # a strong-tier critique is worth its call for a large/huge or high-risk plan; a medium one runs as approved
+        weighty = verdict.scope in ("large", "huge") or verdict.risk == "high"
+        if weighty and self.advisor_applies(session, "advisor_on_plan"):
             try:
                 extra["advisor"] = await advisor_mod.advise(
                     server.model_caller,
