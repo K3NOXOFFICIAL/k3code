@@ -20,7 +20,40 @@ describe("shouldPreserveCtrlJNewline", () => {
   });
 
   it("keeps bare local POSIX LF-compatible prompts submitting on Ctrl+J", () => {
-    expect(shouldPreserveCtrlJNewline({ TERM: "xterm-256color" })).toBe(false);
+    expect(
+      shouldPreserveCtrlJNewline({ TERM: "xterm-256color" }, () => ""),
+    ).toBe(false);
+  });
+
+  it("detects WSL through WSL_INTEROP, whatever WSL_DISTRO_NAME holds", () => {
+    expect(
+      shouldPreserveCtrlJNewline(
+        { WSL_DISTRO_NAME: "Ubuntu", WSL_INTEROP: "/run/WSL/8_interop" },
+        () => "",
+      ),
+    ).toBe(true);
+  });
+
+  it("detects WSL through /proc/version containing 'microsoft' in any case", () => {
+    expect(
+      shouldPreserveCtrlJNewline(
+        { WSL_DISTRO_NAME: "Ubuntu" },
+        () => "Linux version 5.15.153.1-microsoft-standard-WSL2 (root@x)",
+      ),
+    ).toBe(true);
+    expect(
+      shouldPreserveCtrlJNewline({}, () => "Linux version 4.4.0-Microsoft"),
+    ).toBe(true);
+  });
+
+  it("does not treat a plain Linux kernel or a distro name as WSL", () => {
+    expect(
+      shouldPreserveCtrlJNewline(
+        { WSL_DISTRO_NAME: "Ubuntu" },
+        () => "Linux version 6.8.0-generic (buildd@lcy02)",
+      ),
+    ).toBe(false);
+    expect(shouldPreserveCtrlJNewline({}, () => "")).toBe(false);
   });
 });
 

@@ -85,7 +85,7 @@ def test_unknown_config_permission_is_a_usage_error_not_a_traceback(tmp_path, mo
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n")
     assert_usage_error(
         res,
-        "permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
+        "permission_mode 'bypass' is not one of: default, accept-edits, plan, auto, yolo (or ask, auto-edit) "
         "(set in config.yaml or K3CODE_PERMISSION_MODE)",
     )
     assert seen == []
@@ -95,7 +95,7 @@ def test_unknown_headless_permission_names_its_own_key(tmp_path, monkeypatch, se
     res = invoke(tmp_path, monkeypatch, PROV + "headless_permission: bypass\n")
     assert_usage_error(
         res,
-        "headless_permission 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
+        "headless_permission 'bypass' is not one of: default, accept-edits, plan, auto, yolo (or ask, auto-edit) "
         "(set in config.yaml or K3CODE_HEADLESS_PERMISSION)",
     )
     assert seen == []
@@ -105,7 +105,7 @@ def test_unknown_config_permission_fails_the_repl_path_too(tmp_path, monkeypatch
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n", prompt=False)
     assert_usage_error(
         res,
-        "permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
+        "permission_mode 'bypass' is not one of: default, accept-edits, plan, auto, yolo (or ask, auto-edit) "
         "(set in config.yaml or K3CODE_PERMISSION_MODE)",
     )
 
@@ -137,7 +137,8 @@ async def test_bad_configured_permission_mode_fails_session_start_not_the_daemon
     )
     reply = next(f for f in frames_of(server) if f.get("id") == 1)
     assert reply["error"]["message"].startswith(
-        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo"
+        "InvalidPermissionMode: permission_mode 'bypass' is not one of: "
+        "default, accept-edits, plan, auto, yolo (or ask, auto-edit)"
     ), reply
     await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}}))
     assert any(f.get("id") == 2 and "result" in f for f in frames_of(server))
@@ -150,7 +151,7 @@ def test_headless_runs_take_auto_from_the_flag(tmp_path, monkeypatch, seen):
     run(tmp_path, monkeypatch, PROV + "headless_permission: auto-edit\n", "--permission", "auto", command=cli_mod.cli)
     assert seen == ["auto", "auto"]
     out = CliRunner().invoke(cli_mod.cli, ["--help"]).output
-    assert "auto-edit, auto (" in " ".join(out.split())
+    assert "plan (read-only), auto (" in " ".join(out.split())
 
 
 @pytest.mark.parametrize(
@@ -171,3 +172,47 @@ def test_headless_auto_decides_like_interactive_auto(tmp_path, command, expected
         for h in (True, False)
     ]
     assert got == [expected, expected]
+
+
+#: Every name `permission_mode` accepts: the five modes and the two older names (issue #170/11, K3NOX-288).
+CONFIG_MODE_NAMES = ["default", "accept-edits", "plan", "auto", "yolo", "ask", "auto-edit"]
+
+
+@pytest.mark.parametrize("name", CONFIG_MODE_NAMES)
+@pytest.mark.parametrize("command", [cli_mod.main, cli_mod.cli])
+def test_flag_takes_every_mode_the_config_takes(tmp_path, monkeypatch, seen, name, command):
+    """`--permission plan` was rejected as an invalid choice, and the flag knew only the older names `ask` and
+    `auto-edit` while the TUI shows `default` and `accept-edits`."""
+    from k3code.permissions import PermissionMode
+
+    run(tmp_path, monkeypatch, PROV, "--permission", name, command=command)
+    assert seen == [PermissionMode(name).value]
+
+
+def test_every_permission_mode_is_a_flag_choice():
+    """A mode added to PermissionMode must reach the flag too, or flag and config drift apart again."""
+    from k3code.permissions import PermissionMode
+
+    assert {m.value for m in PermissionMode} <= set(cli_mod.PERMISSION_CHOICES)
+    assert all(PermissionMode(c) for c in cli_mod.PERMISSION_CHOICES)
+
+
+def test_help_names_the_modes_as_the_tui_does():
+    out = " ".join(CliRunner().invoke(cli_mod.cli, ["--help"]).output.split())
+    assert "default, accept-edits, plan (read-only), auto (" in out
+    assert "ask and auto-edit are older names for default and accept-edits" in out
+
+
+async def test_headless_plan_from_the_flag_stays_read_only(tmp_path):
+    """`-p --permission plan` must not be a way out of plan mode: nobody can approve exit_plan, so edits and shell
+    commands stay denied for the whole run."""
+    from k3code.agent.loop import AgentLoop
+    from k3code.permissions import PermissionMode
+
+    loop = AgentLoop(object(), system_prompt="t", permission_mode="plan", headless=True, cwd=tmp_path)  # type: ignore[arg-type]
+    res = await loop._exit_plan({"plan": "write hello.py"})
+    assert "no interactive approver" in res["error"]
+    assert loop.permissions.mode is PermissionMode.PLAN
+    for tool, args in [("write", {"path": "hello.py"}), ("edit", {"path": "x"}), ("bash", {"command": "make"})]:
+        assert loop.permissions.decide(tool, args, headless=True).action == "deny", tool
+    assert loop.permissions.decide("read", {"path": "x"}, headless=True).action == "allow"

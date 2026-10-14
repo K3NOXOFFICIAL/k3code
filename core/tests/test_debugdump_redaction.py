@@ -558,3 +558,253 @@ def test_a_rule_whose_action_is_not_deny_or_ask_loses_a_guessed_value(action, tm
     with tarfile.open(out) as tar:
         blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
     assert guessed not in blob
+
+
+# K3NOX-519: a config that does not load still names its secrets; the export must not fall back to the env vars alone
+
+#: Settings `load_config` rejects, each beside an otherwise valid user config.
+NOT_LOADING = [{"max_turns": "many"}, {"providers": "openai"}, {"permissions": ["bash"]}]
+
+
+def _export_blob(out) -> str:
+    with tarfile.open(out) as tar:
+        return "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+
+
+@pytest.mark.parametrize("broken", NOT_LOADING)
+def test_a_user_config_that_does_not_load_still_hides_its_mcp_values_everywhere(broken, tmp_path):
+    from k3code import bundle
+    from k3code.config import load_config
+    from k3code.gateway.sessions import SessionStore
+
+    # no shape the scrubber knows: only the known-value pass can hide them outside their MCP entry
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    hdr = "Hdr" + "Va1ue" + "Mn27vB5qLp"
+    servers = {
+        "s": {"command": "srv", "env": {"SERVICE_ACCESS_TOKEN": tok}},
+        "r": {"url": "https://mcp.example.com/mcp", "headers": {"X-Api-Key": hdr}},
+    }
+    copies = {"hooks": {"PreToolUse": [{"matcher": "*", "command": f"check --key {hdr}"}]}, "theme": f"t-{tok}"}
+    if "permissions" not in broken:
+        copies["permissions"] = {"bash": {f"curl {tok} *": "deny"}}
+    _write_user_config({"mcp": {"servers": servers}, **copies, **broken})
+    with pytest.raises(ValueError):
+        load_config(project_dir=tmp_path)
+    store = SessionStore(tmp_path / "s.db")
+    sess = store.create(title="t")
+    sess.messages = [{"role": "tool", "content": f"the values are {tok} and {hdr}"}]
+    store.save(sess)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=tmp_path, session_ids=[sess.session_id])
+    blob = _export_blob(out)
+    assert tok not in blob and hdr not in blob
+
+
+def test_a_user_config_that_does_not_load_still_hides_the_values_its_env_references_name(tmp_path, monkeypatch):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    key, bearer = "plain" + "provider" + "9x", "plain" + "bearer" + "7y"
+    monkeypatch.setenv("MYAPP_PROVIDER", key)  # not secret by name: only the `*_env` reference makes it known
+    monkeypatch.setenv("MYAPP_LLAT", bearer)
+    provider = {"name": "p", "kind": "openai", "base_url": "http://x/v1", "api_key_env": "MYAPP_PROVIDER"}
+    server = {"url": "https://ha.example.com/api/mcp", "bearer_env": "MYAPP_LLAT"}
+    _write_user_config({"providers": [provider], "mcp": {"servers": {"ha": server}}, "max_turns": "many"})
+    store = SessionStore(tmp_path / "s.db")
+    sess = store.create(title="t")
+    sess.messages = [{"role": "tool", "content": f"the values are {key} and {bearer}"}]
+    store.save(sess)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=tmp_path, session_ids=[sess.session_id])
+    blob = _export_blob(out)
+    assert key not in blob and bearer not in blob
+
+
+def test_a_trusted_project_config_that_does_not_load_still_hides_its_mcp_values_everywhere(tmp_path):
+    import yaml
+
+    from k3code import bundle, trust
+    from k3code.gateway.sessions import SessionStore
+
+    hdr = "Hdr" + "Va1ue" + "Mn27vB5qLp"
+    project = tmp_path / "proj"
+    (project / ".k3code").mkdir(parents=True)
+    server = {"url": "https://mcp.example.com/mcp", "headers": {"X-Api-Key": hdr}}
+    data = {"mcp": {"servers": {"r": server}}, "permissions": {"bash": {f"curl -H {hdr} *": "deny"}}, "max_turns": "x"}
+    (project / ".k3code" / "config.yaml").write_text(yaml.safe_dump(data))
+    assert trust.record(project, trusted=True)
+    # the hook's copy follows a secret-shaped flag; the theme's and the session's copies do not: only the project
+    # config's known value can hide those
+    hook = {"PreToolUse": [{"matcher": "*", "command": f"check --key {hdr}"}]}
+    _write_user_config({"hooks": hook, "theme": f"t-{hdr}"})
+    store = SessionStore(tmp_path / "s.db")
+    sess = store.create(title="t")
+    sess.messages = [{"role": "tool", "content": f"the value is {hdr}"}]
+    store.save(sess)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sess.session_id])
+    files = bundle.read_bundle(out).settings
+    assert set(files) == {"user", "project"}
+    assert hdr not in _export_blob(out)
+
+
+def test_an_untrusted_project_config_hides_its_own_values_but_never_part_of_a_user_rule(tmp_path):
+    import yaml
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    project = tmp_path / "proj"
+    (project / ".k3code").mkdir(parents=True)
+    server = {"command": "srv", "env": {"API_TOKEN": tok, "DEPLOY_TOKEN": "git push"}}
+    data = {"mcp": {"servers": {"x": server}}, "permissions": {"bash": {f"curl {tok} *": "allow"}}}
+    (project / ".k3code" / "config.yaml").write_text(yaml.safe_dump(data))  # never trusted
+    _write_user_config({"permissions": {"bash": {"git push *": "deny"}}, "theme": "git push"})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=project, session_ids=[])
+    files = bundle.read_bundle(out).settings
+    assert tok not in json.dumps(files["project"])
+    # a file the user never trusted names `git push` a secret: that hides nothing of the user's own settings
+    assert files["user"] == {"permissions": {"bash": {"git push *": "deny"}}, "theme": "git push"}
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        {"mcp": "x"},
+        {"mcp": {"servers": ["s"]}},
+        {"mcp": {"servers": {"s": "srv"}}},
+        {"mcp": {"servers": {"s": {"env": ["A=b"], "headers": None}}}},
+        {"mcp": {"servers": {"s": {"env": {1: 2, "X_TOKEN": None}}}}},
+        {"providers": 5},
+        {"providers": ["p", {"api_key": 7}]},
+        ["not", "a", "mapping"],
+        "text",
+    ],
+)
+def test_secret_values_reads_a_config_as_written_whatever_its_shape(written):
+    assert debugdump.secret_values(written) == debugdump.secret_values(None)
+
+
+def test_secret_values_knows_the_mcp_values_and_provider_keys_of_a_config_as_written():
+    tok, key = "Svc" + "AccessTok" + "Qz81xW4p", "plain" + "provider" + "9x"
+    written = {
+        "providers": [{"name": "p", "api_key": key}],
+        "mcp": {"servers": {"s": {"env": {"SERVICE_ACCESS_TOKEN": tok}}}},
+        "max_turns": "many",
+    }
+    values = debugdump.secret_values(written, guesses=False)
+    known = tok in values and key in values  # a bool: a failure must not print the host's env
+    assert known
+
+
+def _session_with(store, text: str) -> str:
+    sess = store.create(title="t")
+    sess.messages = [{"role": "tool", "content": text}]
+    store.save(sess)
+    return sess.session_id
+
+
+def test_a_user_config_that_does_not_parse_refuses_the_export(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    user_config_path().write_text(f"mcp:\n  servers:\n    s: {{env: {{SERVICE_ACCESS_TOKEN: {tok}}}}}\nhooks: [\n")
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {tok}")
+    out = tmp_path / "x.k3bundle"
+    with pytest.raises(bundle.BundleError, match="does not parse"):
+        bundle.write_bundle(out, store=store, cwd=tmp_path, session_ids=[sid], settings=False)
+    assert not out.exists()
+
+
+def test_a_trusted_project_config_that_does_not_parse_refuses_the_export(tmp_path):
+    from k3code import bundle, trust
+    from k3code.gateway.sessions import SessionStore
+
+    hdr = "Hdr" + "Va1ue" + "Mn27vB5qLp"
+    project = tmp_path / "proj"
+    (project / ".k3code").mkdir(parents=True)
+    text = f"mcp:\n  servers:\n    r: {{headers: {{X-Api-Key: {hdr}}}}}\npermissions: [\n"
+    (project / ".k3code" / "config.yaml").write_text(text)
+    assert trust.record(project, trusted=True)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {hdr}")
+    out = tmp_path / "x.k3bundle"
+    with pytest.raises(bundle.BundleError, match="does not parse"):
+        bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert not out.exists()
+
+
+def test_an_unquoted_number_in_a_user_config_that_does_not_load_is_still_hidden_everywhere(tmp_path):
+    from k3code import bundle
+    from k3code.config import load_config
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    num, key = "8274619305", "61839274055"
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    text = f"mcp:\n  servers:\n    s: {{command: srv, env: {{SERVICE_TOKEN: {num}}}}}\n"
+    text += f"providers:\n  - {{name: p, kind: openai, base_url: 'http://x/v1', api_key: {key}}}\n"
+    user_config_path().write_text(text)
+    with pytest.raises(ValueError):
+        load_config(project_dir=tmp_path)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the values are {num} and {key}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=tmp_path, session_ids=[sid], settings=False)
+    blob = _export_blob(out)
+    assert num not in blob and key not in blob
+
+
+def test_an_unquoted_number_secret_in_the_exported_settings_is_hidden_and_other_numbers_keep_their_type(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    num, key = "8274619305", "61839274055"
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    text = f"max_turns: 7\nmcp:\n  servers:\n    s: {{command: srv, env: {{SERVICE_TOKEN: {num}}}}}\n"
+    text += f"providers:\n  - {{name: p, kind: openai, base_url: 'http://x/v1', api_key: {key}}}\n"
+    user_config_path().write_text(text)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[], settings=True)
+    blob = _export_blob(out)
+    assert num not in blob and key not in blob
+    assert bundle.read_bundle(out).settings["user"]["max_turns"] == 7
+
+
+def test_a_short_unquoted_number_under_a_secret_named_key_anywhere_in_the_exported_settings_is_hidden(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    top, provider = "58217", "73946"  # too short to count as a known secret value
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    text = f"max_tokens: 4096\napi_key: {top}\n"
+    text += f"providers:\n  - {{name: p, kind: openai, base_url: 'http://x/v1', api_key: {provider}}}\n"
+    user_config_path().write_text(text)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[], settings=True)
+    blob = _export_blob(out)
+    assert top not in blob and provider not in blob
+    assert bundle.read_bundle(out).settings["user"]["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize("value", [8274619305, 82746.19305])
+@pytest.mark.parametrize(
+    "where",
+    [
+        lambda v: {"mcp": {"servers": {"s": {"env": {"SERVICE_TOKEN": v}}}}},
+        lambda v: {"mcp": {"servers": {"s": {"headers": {"X-Api-Key": v}}}}},
+        lambda v: {"providers": [{"api_key": v}]},
+    ],
+    ids=["mcp-env", "mcp-header", "provider-key"],
+)
+def test_secret_values_knows_a_number_written_unquoted(where, value):
+    known = str(value) in debugdump.secret_values(where(value), guesses=False)
+    assert known

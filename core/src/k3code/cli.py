@@ -583,12 +583,14 @@ async def _run_repl(
 
 #: ``--permission`` values. ``auto`` is what an unattended ``-p`` run needs: it allows what would only ask (bash
 #: included, run in the sandbox), while the hardline list and deny rules still refuse, exactly as in an interactive
-#: auto session; ``ask`` and ``auto-edit`` deny every shell command that would ask, since nobody can answer.
-PERMISSION_CHOICES = ["ask", "auto-edit", "auto", "yolo"]
+#: auto session; ``default`` and ``accept-edits`` deny every shell command that would ask, since nobody can answer.
+#: Every name ``permission_mode`` accepts: the modes as the TUI shows them, then the older names ``ask``/``auto-edit``.
+PERMISSION_CHOICES = ["default", "accept-edits", "plan", "auto", "yolo", "ask", "auto-edit"]
 PERMISSION_HELP = (
-    "Permission mode: ask, auto-edit, auto (runs what is not denied, bash in the sandbox; the hardline list and deny "
-    "rules still refuse; the mode for unattended -p runs) or yolo. Default: permission_mode from the config (ask), "
-    "or headless_permission for -p"
+    "Permission mode: default, accept-edits, plan (read-only), auto (runs what is not denied, bash in the sandbox; "
+    "the hardline list and deny rules still refuse; the mode for unattended -p runs) or yolo; ask and auto-edit are "
+    "older names for default and accept-edits. Default: permission_mode from the config, or headless_permission "
+    "for -p"
 )
 
 
