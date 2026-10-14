@@ -92,7 +92,9 @@ def test_the_estimate_counts_a_cut_off_call_as_the_start_the_model_is_sent():
 
 
 async def test_a_prompt_larger_than_the_window_does_not_brick_the_session(tmp_path, monkeypatch):
-    provider = Recording(overflow_over=6000)
+    # between the follow-up request (~6.0k chars: the system prompt, with its recall line, and the clipped prompt) and
+    # the retry of the clipped prompt with its history (~6.4k), which must still overflow
+    provider = Recording(overflow_over=6240)
     server, live = await seed(
         tmp_path, monkeypatch, provider, context={"compact_at_tokens": 10_000_000, "keep_messages": 6}
     )
