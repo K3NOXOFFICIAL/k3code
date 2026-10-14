@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -342,9 +343,9 @@ def test_install_hooks_sets_a_repo_local_hooks_path_idempotently(tmp_path: Path)
 # --- merge-pr.sh ---------------------------------------------------------------------------------------------------
 
 
-def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
+def _pr_setup(tmp: Path, files: dict[str, str] | None = None, merges: int = 0) -> tuple[Path, dict[str, str], str]:
     """A bare origin with Main and a PR branch (one commit each side, so origin/Main must be merged in), a clone of it,
-    and stub tools on PATH."""
+    and stub tools on PATH. The PR adds `files` (feature.txt by default) and `merges` merge commits of side branches."""
     env = _env(tmp)
     origin = tmp / "origin.git"
     _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
@@ -356,9 +357,18 @@ def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
     _git(repo, env, "remote", "add", "origin", str(origin))
     _git(repo, env, "push", "-q", "origin", "Main")
     _git(repo, env, "switch", "-q", "-c", "feat/x")
-    (repo / "feature.txt").write_text("f\n")
+    for name, text in (files or {"feature.txt": "f\n"}).items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
     _git(repo, env, "add", "-A")
     _git(repo, env, "commit", "-q", "-m", "feature")
+    for i in range(merges):
+        _git(repo, env, "switch", "-q", "-c", f"side{i}", "Main")
+        (repo / f"side{i}.txt").write_text("s\n")
+        _git(repo, env, "add", "-A")
+        _git(repo, env, "commit", "-q", "-m", f"side {i}")
+        _git(repo, env, "switch", "-q", "feat/x")
+        _git(repo, env, "merge", "-q", "--no-ff", "--no-edit", f"side{i}")
     _git(repo, env, "push", "-q", "origin", "feat/x")
     head = _git(repo, env, "rev-parse", "HEAD")
     _git(repo, env, "switch", "-q", "Main")
@@ -370,8 +380,17 @@ def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
     return repo, env, head
 
 
-def _pr_tsv(head: str, *, state: str = "OPEN", base: str = "Main", cross: str = "false", draft: str = "true") -> str:
-    return "\t".join([state, base, "feat/x", head, cross, draft, "https://example.invalid/pr/7"])
+def _pr_tsv(
+    head: str,
+    *,
+    state: str = "OPEN",
+    base: str = "Main",
+    cross: str = "false",
+    draft: str = "true",
+    title: str = "fix: a thing",
+    labels: str = "",
+) -> str:
+    return "\t".join([state, base, "feat/x", head, cross, draft, "https://example.invalid/pr/7", title, labels])
 
 
 @pytest.mark.parametrize(
@@ -408,17 +427,123 @@ def test_merge_pr_pushes_the_checked_merge_posts_and_merges(tmp_path: Path) -> N
     calls = [c for c in _gh_calls(tmp_path) if not c.startswith(("pr view", "repo view"))]
     assert calls[0].startswith(f"api --silent repos/owner/repo/statuses/{merged} ")
     assert "state=success" in calls[0] and "context=local-ci" in calls[0]
+    assert "description=scoped: secrets passed on " in calls[0]  # the status says what was checked
     assert calls[1:] == ["pr ready 7", f"pr merge 7 --merge --match-head-commit {merged}"]
 
 
 def test_merge_pr_stops_when_the_check_fails(tmp_path: Path) -> None:
-    repo, env, head = _pr_setup(tmp_path)
+    repo, env, head = _pr_setup(tmp_path, files={"core/feature.py": "x\n"})  # core is in the scoped check
     env["FAKE_PR_TSV"] = _pr_tsv(head)
     (tmp_path / "bin" / "uv").write_text("#!/bin/sh\nexit 1\n")
     r = _run(["bash", str(MERGE_PR), "7"], repo, env)
-    assert r.returncode == 2 and "the full check failed" in r.stderr and "Logs: " in r.stderr
+    assert r.returncode == 2 and "the scoped (secrets,core) check failed" in r.stderr and "Logs: " in r.stderr
     assert _git(repo, env, "ls-remote", "origin", "refs/heads/feat/x").split()[0] == head
     assert [c for c in _gh_calls(tmp_path) if not c.startswith("pr view")] == []
+
+
+ALL = ",".join(AREAS)
+
+
+def _scope(
+    tmp: Path,
+    files: list[str],
+    *,
+    force: str = "0",
+    title: str = "fix: x",
+    labels: str = "",
+    lines: int = 10,
+    merges: int = 0,
+) -> list[str]:
+    """merge_scope (lib.sh) on these inputs: [full|scoped, areas, reason]."""
+    script = f'. "{REPO}/scripts/ci/lib.sh"; merge_scope "$@"'
+    args = ["bash", "-c", script, "merge_scope", force, title, labels, str(lines), str(merges)]
+    r = _run(args, tmp, _env(tmp), stdin="".join(f + "\n" for f in files))
+    assert r.returncode == 0, r.stderr
+    return r.stdout.rstrip("\n").split("\t")
+
+
+@pytest.mark.parametrize(
+    ("files", "areas"),
+    [
+        (["core/src/k3code/doctor.py", "tui/shared/x.ts", "README.md"], "vendor,secrets,core,tui"),
+        (["README.md", "docs/x.md"], "secrets"),
+        (["panes/internal/app/a.go"], "vendor,secrets,panes"),
+        (["scripts/dev/install-hooks.sh", ".githooks/pre-push"], "shell,secrets,core"),
+        ([f"core/f{i}.py" for i in range(40)], "secrets,core"),  # 40 files is still small
+    ],
+)
+def test_merge_scope_runs_only_the_areas_a_small_pr_touches(tmp_path: Path, files: list[str], areas: str) -> None:
+    scope, got, why = _scope(tmp_path, files, lines=1500)
+    assert (scope, got) == ("scoped", areas)
+    assert why == f"{len(files)} files, 1500 changed lines, nothing that needs the full check"
+
+
+@pytest.mark.parametrize(
+    ("files", "kw", "why"),
+    [
+        (["core/a.py"], {"force": "1"}, "--full"),
+        (["core/a.py"], {"labels": "bug,full-ci"}, "label full-ci"),
+        (["core/a.py"], {"title": "feat(tui): a pane"}, "the title names a feature"),
+        (["core/a.py"], {"title": "Add the Feature flag"}, "the title names a feature"),
+        ([f"core/f{i}.py" for i in range(41)], {}, "41 files (over 40)"),
+        (["core/a.py"], {"lines": 1501}, "1501 changed lines (over 1500)"),
+        (["core/a.py"], {"merges": 2}, "2 merge commits over Main (an integration branch)"),
+        (["README.md", "scripts/ci/check.sh"], {}, "touches scripts/ci/check.sh"),
+        (["install/install.sh"], {}, "touches install/install.sh"),
+        (["VENDOR.toml"], {}, "touches VENDOR.toml"),
+        (["core/uv.lock"], {}, "touches core/uv.lock"),
+        (["tui/package-lock.json"], {}, "touches tui/package-lock.json"),
+        (["panes/go.mod"], {}, "touches panes/go.mod"),
+        (["panes/go.sum"], {}, "touches panes/go.sum"),
+    ],
+)
+def test_merge_scope_runs_the_full_check_for_big_or_risky_prs(
+    tmp_path: Path, files: list[str], kw: dict[str, Any], why: str
+) -> None:
+    assert _scope(tmp_path, files, **kw) == ["full", ALL, why]
+
+
+def test_merge_scope_names_every_reason_and_honours_the_threshold_variables(tmp_path: Path) -> None:
+    scope, _, why = _scope(tmp_path, ["install/x.sh"], force="1", merges=3)
+    assert why == "--full; 3 merge commits over Main (an integration branch); touches install/x.sh"
+    assert _scope(tmp_path, ["core/a.py"], merges=1)[0] == "scoped"  # one merge of Main into the branch is normal
+    env = _env(tmp_path, K3CODE_CI_FULL_FILES="1", K3CODE_CI_FULL_LINES="5")
+    script = f'. "{REPO}/scripts/ci/lib.sh"; merge_scope 0 fix "" 6 0'
+    r = _run(["bash", "-c", script], tmp_path, env, stdin="a\nb\n")
+    assert r.stdout.split("\t")[2] == "2 files (over 1); 6 changed lines (over 5)\n"
+
+
+@pytest.mark.parametrize(
+    ("setup", "args", "tsv", "extra_env", "expect"),
+    [
+        ({"files": {"core/a.py": "x\n"}}, [], {}, {}, "scoped (secrets,core) check: 1 files, 1 changed lines"),
+        ({}, ["--full"], {}, {}, "full check: --full"),
+        ({}, [], {"labels": "full-ci"}, {}, "full check: label full-ci"),
+        ({}, [], {"title": "feat: x"}, {}, "full check: the title names a feature"),
+        ({"merges": 2}, [], {}, {}, "full check: 2 merge commits over Main"),
+        ({"files": {"core/a.py": "1\n2\n3\n"}}, [], {}, {"K3CODE_CI_FULL_LINES": "2"}, "full check: 3 changed lines"),
+    ],
+)
+def test_merge_pr_dry_run_prints_the_scope_and_checks_only_that(
+    tmp_path: Path,
+    setup: dict[str, Any],
+    args: list[str],
+    tsv: dict[str, str],
+    extra_env: dict[str, str],
+    expect: str,
+) -> None:
+    repo, env, head = _pr_setup(tmp_path, **setup)
+    env.update(extra_env, FAKE_PR_TSV=_pr_tsv(head, **tsv))
+    r = _run(["bash", str(MERGE_PR), "--dry-run", *args, "7"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"merge-pr: {expect}" in r.stdout
+    header = next(line for line in r.stdout.splitlines() if line.startswith("check.sh: full check of "))
+    if expect.startswith("scoped"):
+        assert header.split(": ")[2].split(" (logs")[0] == "secrets core"
+        assert "set local-ci=success on " in r.stdout and ": scoped: secrets,core passed on " in r.stdout
+    else:
+        assert header.split(": ")[2].split(" (logs")[0] == " ".join(AREAS)
+        assert ": full: local check passed on " in r.stdout
 
 
 # --- release.sh and the updater ------------------------------------------------------------------------------------

@@ -6,7 +6,7 @@ they cost no CI minutes:
 | Script | Replaces | What it does |
 | --- | --- | --- |
 | `scripts/ci/check.sh` | `ci.yml`, `gitleaks.yml` | the full local check; `--post` sets the commit status `local-ci` |
-| `scripts/ci/merge-pr.sh N` | waiting for the checks, then pressing merge | merges `Main` into the PR, runs the full check, pushes, posts `local-ci`, merges |
+| `scripts/ci/merge-pr.sh N` | waiting for the checks, then pressing merge | merges `Main` into the PR, runs the scoped or full check, pushes, posts `local-ci`, merges |
 | `scripts/release/release.sh VER` | `release.yml` | checks, builds the assets, publishes the GitHub release (GitHub creates the tag) |
 
 `installer.yml` (macOS and Windows runners) is replaced, as far as Linux can, by `scripts/ci/platforms.sh`; see
@@ -62,11 +62,29 @@ commit everyone can fetch, checked from exactly that tree. A failed run posts `l
 ```sh
 scripts/ci/merge-pr.sh --dry-run 42   # everything except push, status and merge
 scripts/ci/merge-pr.sh 42
+scripts/ci/merge-pr.sh --full 42      # the full check whatever the PR touches
 ```
 
 The PR must be open, based on `Main`, and its branch must be in this repository (a fork's branch cannot be pushed
-to). The script fetches, creates a worktree in `.k3dev/merge-pr/42-<time>/wt` at the PR head, merges `origin/Main` into
-it (`--no-ff`), and runs the full check of the merged tree. When it passes it pushes the merge commit to the PR branch
+to). The script fetches, decides between a scoped and the full check, creates a worktree in
+`.k3dev/merge-pr/42-<time>/wt` at the PR head, merges `origin/Main` into it (`--no-ff`), and runs that check of the
+merged tree.
+
+**Scoped or full.** A scoped check runs only the areas the PR's files touch (`git diff origin/Main...<head>`, mapped to
+areas as `check.sh --changed` does; `secrets` always runs), each area complete with its builds and test suites, never
+`--quick`. The full check runs every area. It is full when any of these holds, and the first output line says which:
+
+- `--full`, or the PR has the label **`full-ci`**
+- the PR title starts with `feat` or contains "feature"
+- more than 40 changed files or more than 1500 changed lines (`K3CODE_CI_FULL_FILES`, `K3CODE_CI_FULL_LINES`)
+- more than one merge commit over `Main` (an integration branch; one merge of `Main` into the branch is normal)
+- a change to `VENDOR.toml`, `install/`, `scripts/ci/` or a lockfile (`uv.lock`, `package-lock.json`, `go.mod`,
+  `go.sum`)
+
+The decision is printed before the check runs (`--dry-run` included), and the `local-ci` description names it:
+`scoped: secrets,core,tui passed on …` or `full: local check passed on …`.
+
+When the check passes it pushes the merge commit to the PR branch
 (a fast-forward; never forced), sets `local-ci=success` on it, marks a draft PR ready and runs
 `gh pr merge 42 --merge --match-head-commit <sha>`, so GitHub merges exactly the commit that was checked. On a
 conflict or a failed check it stops and prints the log folder; nothing is pushed. The worktree is removed in every
