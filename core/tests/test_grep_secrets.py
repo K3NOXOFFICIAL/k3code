@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -200,3 +201,35 @@ async def test_the_fallback_searches_a_symlink_it_was_pointed_at(linked, home, m
     assert _files(res) == {"b.txt"}, res
     res = await tool_grep({"pattern": "API_KEY", "path": str(linked / "dir_link")}, cwd=linked)
     assert _files(res) == {"c.txt"}, res
+
+
+# The index lists a file the work tree no longer has: a directory replaced by a link (the sandbox may write the project
+# but not .git) leaves `cfg/credentials` listed, and the file itself is not a link, only a directory above it.
+
+
+@pytest.fixture
+def swapped_dir(home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    git = shutil.which("git")
+    if not git:
+        pytest.skip("git not installed")
+    proj = home / "swap"
+    (proj / "cfg").mkdir(parents=True)
+    (proj / "ok.txt").write_text("API_KEY = read_it()\n")
+    (proj / "cfg" / "credentials").write_text("API_KEY in the repository\n")
+    for argv in (["init", "-q"], ["add", "-A"]):
+        subprocess.run([git, "-C", str(proj), *argv], check=True, capture_output=True)
+    shutil.rmtree(proj / "cfg")
+    (proj / "cfg").symlink_to(home / ".config" / "git")  # holds a file of the tracked name, outside the project
+    monkeypatch.setenv("PATH", str(home / "git-bin"))  # git, no rg
+    (home / "git-bin").mkdir()
+    (home / "git-bin" / "git").symlink_to(git)
+    return proj
+
+
+@pytest.mark.parametrize("pattern", ["API_KEY", "API_KEY(?=)"])  # the look-around is one rg refuses: it falls back
+async def test_a_search_does_not_follow_a_linked_directory_listed_by_git(swapped_dir, pattern, monkeypatch) -> None:
+    if pattern != "API_KEY":
+        monkeypatch.setenv("PATH", f"{os.environ['PATH']}:/usr/bin")  # rg present, so the fallback is the refusal's
+    res = await tool_grep({"pattern": pattern}, cwd=swapped_dir)
+    assert "not-a-real-value" not in res["matches"]
+    assert _files(res) == {"ok.txt"}, res

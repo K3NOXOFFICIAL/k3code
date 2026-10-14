@@ -1085,6 +1085,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         base, candidates = path.parent, iter([(path.name, False)])
     else:
         base, candidates = path, _iter_tree(path, deadline)
+    real_base = os.path.realpath(base)  # base itself may be a link the engine decided on
     matches: list[str] = []
     skipped = 0
     timed_out = False
@@ -1100,8 +1101,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
-        if not named and os.path.islink(fp):  # rg does not follow links in a walk: one may lead out of the roots
-            continue
+        if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
+            continue  # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots
         if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1
             continue
