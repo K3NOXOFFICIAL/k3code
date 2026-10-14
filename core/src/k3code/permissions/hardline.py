@@ -929,12 +929,14 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         c = text[i]
         if ctx and ctx[-1][0] == "=(" and (c in ";|&" or (c in "<>" and text[i + 1 : i + 2] != "(")):
             ctx[-1] = ("=(!", -1)  # an operator in a=(...): bash drops the rest of the line, heredocs included
-        in_array_op = bool(ctx) and ctx[-1][0] == "=(!"
-        if in_array_op and (c in '"`' or text.startswith(("$(", "<(", ">("), i)):
+        in_array_op = any(kind == "=(!" for kind, _ in ctx)
+        if in_array_op and (c in "\"'`" or text.startswith(("$(", "<(", ">("), i)):
             # inside an array a=(...) that holds an operator (R2), bash does not read a substitution, backtick or
             # quoted string here as one token, and dash errors: the two shells diverge. Flatten the opener so the
             # text inside (a hidden `<<` and the lines after it) is scanned as commands under the open `=(!` bracket
-            # (where `<<` is not a heredoc), and leave the command unterminated so a person confirms it.
+            # (where `<<` is not a heredoc), and leave the command unterminated so a person confirms it. `=(!` never
+            # closes, so the quote parity is lost to the end: every quote is flattened (also under a `[` or `${`
+            # above it) and a `#` starts no comment, or a flattened `"x #"` or `"it's"` would hide the rest.
             out.unterminated = True
             subst_open = text.startswith(("$(", "<(", ">("), i)
             emit(text[i : i + 2] if subst_open else c)
@@ -989,7 +991,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             ctx.extend((kind, -1) for kind in qbr)
             emit("".join(piece))
             i = j
-        elif c == "#" and (not cur or (len(cur[-1]) == 1 and cur[-1] in " \t<>&")):
+        elif c == "#" and not in_array_op and (not cur or (len(cur[-1]) == 1 and cur[-1] in " \t<>&")):
             eol = text.find("\n", i)
             eol = n if eol < 0 else eol
             if any(q in text[i:eol] for q in "'\"`"):
