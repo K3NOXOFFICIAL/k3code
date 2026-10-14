@@ -101,9 +101,7 @@ def _read_project(path: Path, project: Path, text: str | None) -> Any:
     if text is None:
         if not path.is_file():
             return {}
-        if not path.resolve().is_relative_to(Path(project).resolve()):
-            raise OSError(f"{path} leaves the project")
-        text = trust.read_bounded(path).decode("utf-8")
+        text = trust.read_bounded(path, within=project).decode("utf-8")
     data = yaml.load(text, Loader=_TreeLoader) or {}  # noqa: S506 - a SafeLoader subclass
     if not isinstance(data, dict):
         raise confio.ConfigError(f"{path}: top level must be a mapping")
@@ -117,7 +115,11 @@ def _read(path: Path, text: str | None = None, *, project: Path | None = None) -
     ``logger.exception`` prints the whole chain.
 
     ``project`` is the project directory when ``path`` is its config, which a cloned repo may have made hostile: it is
-    read as ``_read_project`` does, and a file that hangs, overflows or points out of the project is refused too."""
+    read as ``_read_project`` does, and a file that hangs, overflows or points out of the project is refused too. Not
+    when ``path`` is the user's own config (a session in ``~`` with ``K3CODE_HOME=~/.k3code`` sees it as the project's):
+    that is theirs, aliases and a link to a dotfiles repo included."""
+    if project is not None and trust.project_dir_of(path) is None:
+        project = None
     with contextlib.suppress(OSError, ValueError, yaml.YAMLError, RecursionError):
         if project is not None:
             return _read_project(path, project, text)

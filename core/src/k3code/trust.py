@@ -74,10 +74,14 @@ def _key(project_dir: str | Path) -> str:
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
-def read_bounded(path: Path) -> bytes:
+def read_bounded(path: Path, *, within: Path | None = None) -> bytes:
     """``path``'s bytes when it is a regular file of at most ``MAX_CONFIG_BYTES``; OSError otherwise. A FIFO would
     block a plain read for good (it is opened non-blocking and refused on its type), a device or a huge file would
-    fill memory."""
+    fill memory.
+
+    ``within`` is a directory the file must be inside once links are followed. It is checked on the file that was
+    opened: the name resolves, after the open, to the same file (device and inode) and to a place inside ``within``. A
+    check by name before the open can be raced by a script that swaps a link between the two."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         st = os.fstat(fd)
@@ -85,6 +89,11 @@ def read_bounded(path: Path) -> bytes:
             raise OSError(errno.EINVAL, "not a regular file", str(path))
         if st.st_size > MAX_CONFIG_BYTES:
             raise OSError(errno.EFBIG, "file too large", str(path))
+        if within is not None:
+            real = Path(path).resolve()
+            now = os.stat(real)
+            if not real.is_relative_to(Path(within).resolve()) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                raise OSError(errno.EXDEV, "file leaves the project", str(path))
     except BaseException:
         os.close(fd)
         raise
