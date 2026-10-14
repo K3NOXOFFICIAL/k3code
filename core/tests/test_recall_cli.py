@@ -92,7 +92,8 @@ def test_the_repl_has_recall_too_even_before_any_session_was_stored(tmp_path, mo
     asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.DEFAULT, config=config))
     assert "recall" in provider.tools and "session_read" in provider.tools
     assert provider.system.count(RECALL_NOTE) == 1
-    assert provider.result  # a fresh home: the tool answers (no matches, or the index is unavailable), the run goes on
+    # a fresh home: the tool answers with the sqlite error it caught (nothing else escapes it) and the run goes on
+    assert provider.result == "Error: recall index unavailable: no such table: message_archive"
 
 
 async def test_a_sub_agent_has_neither_the_tool_nor_the_sentence(tmp_path, monkeypatch):
