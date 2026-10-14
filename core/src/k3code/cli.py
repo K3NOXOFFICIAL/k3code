@@ -1433,10 +1433,8 @@ def update_cmd(
         denied = ""
         try:
             rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token(), cfg["api"])
-        except PermissionError as e:
+        except Exception as e:  # noqa: BLE001  # any API failure: the checkout or the git ref below still works
             denied = str(e)
-        except Exception as e:  # noqa: BLE001
-            raise click.ClickException(str(e)) from e
         if rel is None:
             src = upd.source_checkout()
             if src is not None and (src / ".git").exists():

@@ -201,6 +201,7 @@ def test_answering_in_the_pane_cancels_the_hold(tuios):
 # ── new panes ────────────────────────────────────────────────────────
 
 
+@pytest.mark.serial  # load-sensitive under the 8-worker run; passes alone
 async def test_bg_pane_sends_start_agent(tuios, tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, monkeypatch, replies=["done"])
     server.panes = PaneLink.from_env(environ=tuios.env())

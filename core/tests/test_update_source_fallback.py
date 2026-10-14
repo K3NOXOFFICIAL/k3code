@@ -288,6 +288,19 @@ async def test_slash_update_on_a_git_install_survives_a_private_repo_release_loo
     assert f"latest:  {NEW[:7]} (main)" in await _slash("")
 
 
+async def test_slash_update_on_a_git_install_survives_an_unreachable_github_api(git_install, monkeypatch):
+    """#143: any release-lookup failure (here no route to api.github.com), not only a 404, falls back to git."""
+    git_install()
+
+    def offline(*_a, **_k):
+        raise upd.httpx.ConnectError("api.github.com unreachable")
+
+    monkeypatch.setattr(upd, "fetch_latest", offline)
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: NEW)
+    out = await _slash("")
+    assert "Could not check releases" not in out and f"latest:  {NEW[:7]} (main)" in out
+
+
 async def test_slash_update_on_an_install_pinned_to_a_sha_has_nothing_to_update(git_install, monkeypatch):
     applied = git_install(ref=OLD)
     monkeypatch.setattr(upd, "remote_head", lambda url, ref: ref)
