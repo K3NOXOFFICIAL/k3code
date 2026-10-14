@@ -31,6 +31,12 @@ DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
 DAEMON_NOT_STARTED = "daemon not running, not started"
+#: A unit file is installed but the systemd user manager does not answer (WSL without systemd, a container, `su`):
+#: there is no daemon systemd could run, so the switch stands and only this is said (#115).
+MANAGER_UNREACHABLE = (
+    "warning: the systemd user manager is not reachable, so the daemon was not restarted "
+    "(`k3code service uninstall` removes the unit on a box without systemd)"
+)
 
 
 def versions_dir() -> Path:
@@ -289,6 +295,7 @@ def activate(
     healthy: Callable[[], bool] = daemon_healthy,
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
+    manager_reachable: Callable[[], bool] = service.manager_reachable,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
     carry: Callable[[Path, Path], str | None] = carry_playwright,
@@ -322,7 +329,10 @@ def activate(
             up = wait(healthy)
         except service.ServiceError as e:
             log.append(str(e))
-            up = False
+            # asked only once systemd refused: an unreachable manager means no daemon to restart, not an unhealthy one
+            up = not manager_reachable()
+            if up:
+                log.append(MANAGER_UNREACHABLE)
         if not up:
             if prev:
                 switch_to(prev)
@@ -343,6 +353,7 @@ def rollback(
     restart: Callable[[], None] = restart_daemon,
     daemon_installed: Callable[[], bool] = service.is_installed,
     daemon_stopped: Callable[[], bool] = daemon_is_stopped,
+    manager_reachable: Callable[[], bool] = service.manager_reachable,
 ) -> UpdateResult:
     """Switch back to the previous version, under the install lock: an update that is building (or install.sh) would
     otherwise switch ``current`` again once it is done and silently undo the rollback.
@@ -362,6 +373,9 @@ def rollback(
                 try:
                     restart()
                 except service.ServiceError as e:
+                    if not manager_reachable():
+                        msg = f"rolled back {cur} -> {prev}\n{MANAGER_UNREACHABLE}"
+                        return UpdateResult(True, prev, msg, rolled_back=True)
                     return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
             return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
     except InstallLockHeld as e:
