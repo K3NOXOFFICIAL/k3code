@@ -46,7 +46,10 @@ async def test_gateway_turn_rows_carry_call_and_tool_seconds(tmp_path: Path, mon
     monkeypatch.setattr(FakeProvider, "stream", slow_stream)
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
     srv = GatewayServer(
-        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        # one turn per prompt: auto-continue (on by default in yolo) would add judge calls and their call rows
+        config=Settings(
+            providers=[prov], default_model="default", permission_mode="yolo", autonomy={"auto_continue": False}
+        ),
         store=SessionStore(tmp_path / "s.db"),
     )
     srv._write = lambda s: None
@@ -115,7 +118,10 @@ async def test_a_side_call_after_a_turn_does_not_leak_into_the_next_calls_second
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
     srv = GatewayServer(
-        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        # one turn per prompt: auto-continue (on by default in yolo) would add judge calls and their call rows
+        config=Settings(
+            providers=[prov], default_model="default", permission_mode="yolo", autonomy={"auto_continue": False}
+        ),
         store=SessionStore(tmp_path / "s.db"),
     )
     srv._write = lambda s: None

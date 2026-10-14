@@ -47,7 +47,7 @@ from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
-from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy import advisor, auto_continue_on, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -80,7 +80,7 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -280,11 +280,16 @@ class LiveSession:
         self.background = bool(stored.meta.get("background"))
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
+        #: what the scope gate made of the latest prompt (None: no gate ran), so an implicit goal whose prompt it rates
+        #: trivial, or whose plan was refused or fanned out, ends after its first turn, unjudged (see _run_turn_locked)
+        self.turn_gate: GateResult | None = None
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
         #: the "no sandbox" notice is showing (auto/yolo bash without a usable bwrap); cleared when the mode leaves them
         self.unsandboxed_notice = False
+        #: the "started in your home directory" notice was shown (once per session in this process)
+        self.home_notice = False
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -358,6 +363,21 @@ class LiveSession:
 
     #: Notification key of the "no sandbox" warning (see notify_unsandboxed).
     UNSANDBOXED_KEY = "k3.sandbox.unusable"
+
+    #: Notification key of the "started in your home directory" notice (see notify_home_started).
+    HOME_KEY = "k3.session.home"
+    HOME_NOTICE = "k3code started in your home directory: start it inside a project for full auto mode"
+
+    def notify_home_started(self) -> None:
+        """Tell the clients, once per session, that its cwd is $HOME (bash there asks unless a rule allows it)."""
+        if self.home_notice:
+            return
+        self.home_notice = True
+        self.emit(
+            "notification.show",
+            {"text": self.HOME_NOTICE, "level": "warn", "key": self.HOME_KEY, "session_id": self.session_id},
+            importance="essential",
+        )
 
     def notify_unsandboxed(self) -> None:
         """Tell the clients that this auto/yolo session's bash runs without the sandbox (bwrap is unusable here). The
@@ -598,7 +618,7 @@ class GatewayServer:
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
-        self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
+        self.goal_judge: Any = None  # test hook: a goals.Judge, async (goal, last_text, TurnEvidence) -> verdict tuple
         self.providers: list[Any] = []
         self._provider_sigs: list[dict[str, Any]] = []  # provider_signature of the entries self.providers came from
         self._retiring: dict[int, Any] = {}  # replaced providers not closed yet (id -> provider), see _retire_providers
@@ -1761,6 +1781,7 @@ class GatewayServer:
                 routed = await self._route_typed_prompt(session, text, hooked, pasted)
                 if routed is not None:
                     return routed
+        session.turn_gate = None  # set by this prompt's scope gate, if it runs; never the previous prompt's
         if not blocked:  # a prompt a hook refused is not a task to carry on with
             self._start_implicit_goal(session, mgr, text)
         while True:
@@ -1778,6 +1799,7 @@ class GatewayServer:
                     # history into a summary, and run the prompt once more.
                     session.stored.messages = session.stored.messages[:n_before]
                     if await self._maybe_compact(session, force=True):
+                        n_before = len(session.stored.messages)  # the summary replaced the history
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
                 # /stop and Esc cancel the turn task: the cancellation skips _run_one_turn's outcome mapping, so the
@@ -1795,8 +1817,12 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             implicit = bool((state := mgr.state) and state.implicit)
-            if implicit and self._pending_prompts(session):
-                mgr.clear()  # the user typed the next prompt meanwhile: it replaces this one, unjudged
+            # the user typed the next prompt meanwhile (it replaces this one), or the scope gate settled the prompt on
+            # its first turn (see _gate_ended_task): the implicit goal ends unjudged
+            if implicit and (
+                self._pending_prompts(session) or (state.turns_used == 0 and self._gate_ended_task(session.turn_gate))
+            ):
+                mgr.clear()
                 self.emit_goal(session)
                 self._session_finished(session, status)
                 return status, final_text
@@ -1804,7 +1830,11 @@ class GatewayServer:
             # no strong-tier advisor veto on an implicit goal: it would review every answered question
             reviewer = None if implicit else self._goal_reviewer(session)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer
+                final_text,
+                judge,
+                cwd=session.stored.cwd or None,
+                reviewer=reviewer,
+                evidence=turn_evidence(session.stored.messages[n_before:]),
             )
             self.emit_goal(session)
             if decision.message:
@@ -1825,19 +1855,37 @@ class GatewayServer:
         (``session.background``/``task_kind``) and goal continuations do not. A /goal, active or paused, is the
         user's own and wins: a paused one waits for /goal resume, and the answer typed meanwhile must not erase it.
         A leftover implicit goal (a daemon that died mid-loop) is replaced, or cleared with the setting off.
+
+        On by default in the auto and yolo permission modes (``auto_continue: auto``), capped at
+        ``auto_continue_max_turns`` judged turns. A plain question gets no goal; a prompt the scope gate rates trivial
+        ends after its first turn (see ``_run_turn_locked``).
         """
         if session.background or session.task_kind or session.goal_continuation:
             return
         state = mgr.state
         if state is not None and not state.implicit and state.status in ("active", "paused"):
             return
-        if autonomy_cfg(self.config).get("auto_continue"):
-            mgr.set(text, implicit=True)
+        acfg = autonomy_cfg(self.config)
+        if auto_continue_on(acfg, session.perms.mode) and not is_plain_question(text):
+            mgr.set(text, implicit=True, max_turns=max(0, int(acfg["auto_continue_max_turns"])))
         elif state is not None and state.implicit:
             mgr.clear()
         else:
             return
         self.emit_goal(session)
+
+    def _goal_continuation(self, session: LiveSession) -> bool:
+        """The turn running is a goal's judge-driven continuation (implicit or /goal): the same task, gated once on
+        the goal's first turn. A gate here re-ran the classifier, the strong-tier planner and its hooks every turn."""
+        return session.goal_continuation and self.goal_manager(session).state is not None
+
+    @staticmethod
+    def _gate_ended_task(gate: GateResult | None) -> bool:
+        """The scope gate settled the prompt: rated it trivial (an answer, one located edit), or ran no task (the plan
+        was refused) or the whole of it (a fan-out). Nothing is left for an implicit goal to continue."""
+        if gate is None:
+            return False
+        return not gate.proceed or (gate.verdict is not None and gate.verdict.scope == "trivial")
 
     # ── wake words and the ultracode mode ──
 
@@ -2000,6 +2048,7 @@ class GatewayServer:
             context_window=self._router_window(router, session),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
+        loop.on_home_started = session.notify_home_started
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
@@ -2174,8 +2223,10 @@ class GatewayServer:
                 hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
-                if not hooked.blocked:
+                # a goal's continuation is the same task: its prompt was gated (and any plan approved) once
+                if not hooked.blocked and not self._goal_continuation(session):
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                    session.turn_gate = gate
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value

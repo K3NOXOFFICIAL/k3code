@@ -208,3 +208,29 @@ def test_an_entry_inside_the_project_is_read_only_after_the_project_bind(tmp_pat
     bind = [i for i, a in enumerate(argv) if a == "--bind" and argv[i + 1] == str(proj)][0]
     ro = [i for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == str(proj / ".myapp")][0]
     assert ro > bind  # a later mount wins: the entry is read-only although its parent is writable
+
+
+def test_read_only_home_view_has_no_network(tmp_path):
+    home = _home(tmp_path)
+    assert "--unshare-net" in sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    assert "--unshare-net" not in sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP)
+
+
+def test_read_only_home_view_hides_every_secret_dir_the_engine_refuses():
+    from k3code.permissions import engine
+
+    hidden = {*sandbox.HOME_SECRETS, *sandbox.HOME_READONLY_REFUSED, *sandbox.HOME_RO_HIDDEN}
+    assert set(engine._HOME_SECRETS) <= hidden
+
+
+def test_read_only_home_view_hides_top_level_dotenv_and_symlink_targets(tmp_path, monkeypatch):
+    home = _home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".env.local").write_text("K=V\n")
+    (home / "dot").mkdir()
+    (home / "dot" / "hist").write_text("x\n")
+    (home / ".bash_history").symlink_to("dot/hist")
+    argv = sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    masked = [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == "/dev/null"]
+    assert str(home / ".env.local") in masked and str(home / "dot" / "hist") in masked
+    assert str(home / ".bash_history") not in masked  # a bind onto the link would follow it anyway
