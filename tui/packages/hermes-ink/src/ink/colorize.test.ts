@@ -265,6 +265,15 @@ describe("shouldUseRichEightBitDowngradeForLegacyAppleTerminal", () => {
         3,
       ),
     ).toBe(false);
+    expect(
+      shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
+        {
+          K3CODE_TUI_TRUECOLOR: "1",
+          TERM_PROGRAM: "Apple_Terminal",
+        } as NodeJS.ProcessEnv,
+        2,
+      ),
+    ).toBe(false);
   });
 });
 

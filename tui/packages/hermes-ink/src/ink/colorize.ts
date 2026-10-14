@@ -61,7 +61,7 @@ export function shouldUseRichEightBitDowngradeForLegacyAppleTerminal(
 ): boolean {
   const termProgram = (env.TERM_PROGRAM ?? "").trim();
   const truecolorOverride = /^(?:1|true|yes|on)$/i.test(
-    (env.HERMES_TUI_TRUECOLOR ?? "").trim(),
+    (env.K3CODE_TUI_TRUECOLOR ?? env.HERMES_TUI_TRUECOLOR ?? "").trim(),
   );
   const advertisesTruecolor = /^(?:truecolor|24bit)$/i.test(
     (env.COLORTERM ?? "").trim(),
