@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import os
-import select
+import selectors
 import shlex
 import subprocess
 import sys
@@ -267,8 +267,13 @@ def _read_stdin(wait: float | None) -> str:
         return ""
     if wait is not None:
         try:
-            ready = bool(select.select([stream], [], [], wait)[0])
-        except (OSError, ValueError, TypeError):  # an in-memory stream has no descriptor to poll, and cannot block
+            # epoll where there is one: select() fails on a descriptor >= FD_SETSIZE (1024), which must not turn into a
+            # blocking read of an idle pipe
+            with selectors.DefaultSelector() as sel:
+                sel.register(stream, selectors.EVENT_READ)
+                ready = bool(sel.select(wait))
+        except (AttributeError, OSError, ValueError, TypeError):
+            # no descriptor to poll (an in-memory stream) or one epoll refuses (a regular file): neither can block
             ready = True
         if not ready:
             click.echo(
