@@ -10,6 +10,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
+- **The hardline list also refuses deleting main or master on the remote (issue #159).** `git push --delete main`, `git push -d origin master` and the empty-source refspec `git push origin :main` were allowed, in auto mode without asking; they are now denied in every mode as `git-push-delete-main`. Deleting any other branch is unchanged.
 - **A planning turn that produces no plan no longer drops the task.** In auto mode, a strong-tier planner that spent its turns reading and never called `exit_plan` (nor answered with text) ended the turn with "Plan not approved; nothing was executed" and the implicit goal ended unjudged: the task was silently dropped. Below high risk the task now runs directly, with a notice ("The planner produced no plan; running the task directly"); a plan the user refused stays refused. A planner stopped by the loop guard or by repeated tool errors also no longer has its stop notice ("I stopped because I was repeating myself…") approved as the plan the executor must follow.
 
 - **A `/goal`'s continuation turns no longer re-run the scope gate.** Only an implicit goal's continuations skipped it; a `/goal`'s went through the classifier again on every judged turn, and a medium or larger goal re-ran the strong-tier planner, its advisor critique and the proposer each time. A goal is now gated once, on its first turn (a `/goal resume` or boot kick starts a gated turn as before).

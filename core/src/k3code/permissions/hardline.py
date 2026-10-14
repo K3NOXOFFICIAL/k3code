@@ -52,6 +52,7 @@ HARDLINE_NAMES: list[str] = [
     "sensitive-path",
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
+    "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -654,23 +655,33 @@ _MAIN_REFS = frozenset({"main", "master", "refs/heads/main", "refs/heads/master"
 
 
 def _git_push_check(argv: list[str]) -> str | None:
-    """``git push`` with a force flag or a ``+refspec`` onto main/master, or ``--mirror``. A force push without a
-    refspec (the upstream, unknown here) is left to the regex layer."""
+    """``git push`` with a force flag or a ``+refspec`` onto main/master, ``--delete``/``-d`` or an empty-source
+    refspec (``:main``) deleting main/master, or ``--mirror``. A force push without a refspec (the upstream, unknown
+    here) is left to the regex layer."""
     if argv[:2] != ["git", "push"]:
         return None
     args = argv[2:]
     if "--mirror" in args:
         return "git-push-mirror"
-    force = False
+    force = delete = False
     positional: list[str] = []
     for a in args:
         long_force = a.split("=", 1)[0] in ("--force", "--force-with-lease", "--force-if-includes")
-        if long_force or (a.startswith("-") and not a.startswith("--") and "f" in a[1:]):
+        short = a[1:] if a.startswith("-") and not a.startswith("--") else ""
+        if long_force or "f" in short:
             force = True
-        elif not a.startswith("-"):
+        if a == "--delete" or "d" in short:
+            delete = True
+        if not a.startswith("-"):
             positional.append(a)
+    # with --delete every operand is a ref to delete (a lone `git push --delete main` too, whatever git reads it as)
+    if delete and any(p.lstrip("+") in _MAIN_REFS for p in positional):
+        return "git-push-delete-main"
     for refspec in positional[1:]:
-        if refspec.lstrip("+").split(":")[-1] in _MAIN_REFS and (force or refspec.startswith("+")):
+        src, colon, dst = refspec.lstrip("+").rpartition(":")
+        if dst in _MAIN_REFS and colon and not src:
+            return "git-push-delete-main"
+        if dst in _MAIN_REFS and (force or refspec.startswith("+")):
             return "git-push-force-main"
     return None
 
