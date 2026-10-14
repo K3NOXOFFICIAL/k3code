@@ -78,7 +78,7 @@ from k3code.context_budget import (
 )
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.extratools import register_mcp_tools, register_skill_tool
+from k3code.extratools import register_mcp_tools, register_recall_tools, register_skill_tool
 from k3code.gateway import auth as gw_auth
 from k3code.gateway import tui_display
 from k3code.gateway.protocol import (
@@ -550,6 +550,7 @@ class LiveSession:
             register_skill_tool(reg, self.perms.cwd, list(self.server.config.skills.roots))
             register_web_tools(reg, self.server.config)
             register_task_tools(reg, self.server, self, depth=1)
+            register_recall_tools(reg, self.server.store.path, self.perms.cwd, current_session=self.session_id)
             groups: dict[str, list[str]] = {}
             for name in reg.names():
                 groups.setdefault(_TOOL_GROUPS.get(name, "agent"), []).append(name)
@@ -610,6 +611,8 @@ _TOOL_GROUPS = {
     "exit_plan": "planning",
     "web_search": "web",
     "web_fetch": "web",
+    "recall": "memory",
+    "session_read": "memory",
 }
 
 
@@ -2488,6 +2491,7 @@ class GatewayServer:
             mcp=self.mcp,
             learned=session.learned_notes,
             frozen=session.prompt_frozen,
+            recall=True,
         )
 
     def _build_loop(
@@ -2558,6 +2562,8 @@ class GatewayServer:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
         register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
+        # last, always, whatever the archive holds: the tool list leads every request, a change rewrites the cache
+        register_recall_tools(loop.tools, self.store.path, session.perms.cwd, current_session=session.session_id)
         session.overhead_tokens = overhead_tokens(loop.system_prompt, loop.tool_specs())
         return loop
 

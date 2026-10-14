@@ -17,15 +17,20 @@ whole, deduplicated by digest, at positions after every earlier row.
 
 from __future__ import annotations
 
+import contextlib
+import datetime
 import hashlib
 import json
 import logging
 import re
 import sqlite3
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
 from k3code.redact import scrub_text
 from k3code.session_ai import SUMMARY_PREFIX
 
@@ -51,6 +56,7 @@ _SCHEMA = (
     cwd TEXT NOT NULL DEFAULT '',
     digest TEXT NOT NULL,
     text TEXT NOT NULL,
+    approx INTEGER NOT NULL DEFAULT 0,
     UNIQUE(session_id, digest))""",
     "CREATE INDEX IF NOT EXISTS message_archive_sid ON message_archive (session_id, seq)",
     """CREATE TABLE IF NOT EXISTS archive_state (
@@ -218,6 +224,7 @@ class Hit:
     snippet: str
     score: float
     matched_terms: int
+    approximate: bool = False  # ``at`` is the session's last save before the index existed (archived by the backfill)
 
 
 @dataclass
@@ -229,6 +236,7 @@ class ArchivedMessage:
     kind: str
     at: float
     text: str
+    approximate: bool = False
 
 
 def ensure_schema(db: sqlite3.Connection) -> bool:
@@ -236,6 +244,8 @@ def ensure_schema(db: sqlite3.Connection) -> bool:
     archive still fills and :func:`search` scans it instead."""
     for stmt in _SCHEMA:
         db.execute(stmt)
+    with contextlib.suppress(sqlite3.OperationalError):  # an archive created before the column: it already exists
+        db.execute("ALTER TABLE message_archive ADD COLUMN approx INTEGER NOT NULL DEFAULT 0")
     try:
         had_fts = _has_fts(db)
         for stmt in _FTS:
@@ -299,6 +309,11 @@ def _next_seq(db: sqlite3.Connection, session_id: str) -> int:
 
 
 _INSERT = "INSERT OR IGNORE INTO message_archive (session_id, seq, role, ts, cwd, digest, text) VALUES (?,?,?,?,?,?,?)"
+#: The backfill's rows: their ts is the session's last save, not when the message was written.
+_INSERT_APPROX = (
+    "INSERT OR IGNORE INTO message_archive (session_id, seq, role, ts, cwd, digest, text, approx)"
+    " VALUES (?,?,?,?,?,?,?,1)"
+)
 
 
 def ingest(db: sqlite3.Connection, session_id: str, cwd: str, messages: Sequence[Any], at: float) -> int:
@@ -421,7 +436,7 @@ def _backfill_one(db: sqlite3.Connection, sid: str) -> int:
                 kind, clean = got
                 rows.append((sid, base + int(key), kind, updated_at, cwd or "", _digest(kind, clean), clean))
         if rows:
-            db.executemany(_INSERT, rows)
+            db.executemany(_INSERT_APPROX, rows)
         tail = _boundary(json.loads(last)) if isinstance(last, str) and last.startswith("{") else _boundary(last)
         db.execute(
             "INSERT OR REPLACE INTO archive_state (session_id, indexed, tail, at, base) VALUES (?,?,?,?,?)",
@@ -507,7 +522,7 @@ def search(
         args.append(session_id)
     boost_sql, boost_args = ("0", []) if not current_project else _project_sql("a.cwd", current_project)
     use_fts = _has_fts(db) if fts is None else fts
-    cols = "a.id, a.session_id, a.seq, a.role, a.ts, a.cwd, COALESCE(s.title, ''), a.text"
+    cols = "a.id, a.session_id, a.seq, a.role, a.ts, a.cwd, COALESCE(s.title, ''), a.text, a.approx"
     if use_fts:
         weight = f"(CASE a.role WHEN 'summary' THEN 1.2 ELSE 1.0 END) * (CASE WHEN {boost_sql} THEN 1.5 ELSE 1.0 END)"
         sql = (
@@ -528,7 +543,7 @@ def search(
         )
         rows = db.execute(sql, [*boost_args, *terms, *args, CANDIDATES * 5]).fetchall()
     hits: list[Hit] = []
-    for _rid, sid, seq, kind, ts, cwd, title, text, rank, snip in rows:
+    for _rid, sid, seq, kind, ts, cwd, title, text, approx, rank, snip in rows:
         low = text.lower()
         matched = max(1, sum(1 for t in terms if t in low))
         hits.append(
@@ -544,6 +559,7 @@ def search(
                 snippet=_one_line(snip if snip else _window(text, terms)),
                 score=float(rank) * (1 + 0.5 * (matched - 1)),
                 matched_terms=matched,
+                approximate=bool(approx),
             )
         )
     hits.sort(key=lambda h: (-h.score, -h.at))
@@ -565,7 +581,7 @@ def read_around(
     """The archived messages of ``session_id`` around position ``seq``: up to ``before`` earlier ones, the one at
     ``seq`` (or the next after it) and up to ``after`` later ones, in order. Reads the archive, never the stored
     transcript (whose positions move on compaction)."""
-    cols = "id, session_id, seq, role, ts, text"
+    cols = "id, session_id, seq, role, ts, text, approx"
     earlier = db.execute(
         f"SELECT {cols} FROM message_archive WHERE session_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?",  # noqa: S608
         (session_id, seq, max(0, before)),
@@ -575,6 +591,91 @@ def read_around(
         (session_id, seq, max(0, after) + 1),
     ).fetchall()
     return [
-        ArchivedMessage(f"{sid}:{sq}", sid, sq, "user" if kind == "summary" else kind, kind, ts, t)
-        for _rid, sid, sq, kind, ts, t in [*reversed(earlier), *later]
+        ArchivedMessage(f"{sid}:{sq}", sid, sq, "user" if kind == "summary" else kind, kind, ts, t, bool(approx))
+        for _rid, sid, sq, kind, ts, t, approx in [*reversed(earlier), *later]
     ]
+
+
+# ── what the recall tool, /recall and session.search show ─────────────
+
+#: Relative ages ``since`` takes: days, weeks, months (30 days), years (365 days).
+_AGE_DAYS = {"d": 1, "w": 7, "m": 30, "y": 365}
+#: The longest query text read; the rest is ignored (at most MAX_TERMS words are searched anyway).
+MAX_QUERY_CHARS = 2000
+
+
+def parse_since(text: str, now: float | None = None) -> float:
+    """An epoch from ``90d`` / ``12w`` / ``6m`` / ``1y`` (that long before ``now``) or an ISO date or datetime
+    (``2026-03-01``: local midnight). Raises ValueError naming both forms."""
+    raw = str(text).strip().lower()
+    if m := re.fullmatch(r"(\d{1,5})\s*([dwmy])", raw):
+        return (time.time() if now is None else now) - int(m[1]) * _AGE_DAYS[m[2]] * 86400.0
+    try:
+        return datetime.datetime.fromisoformat(raw).timestamp()
+    except (ValueError, OverflowError, OSError):
+        raise ValueError(
+            f"since must be an ISO date like 2026-03-01 or an age like 90d, 12w or 6m (got {str(text)[:40]!r})"
+        ) from None
+
+
+@dataclass
+class Found:
+    """One search with the state of the index it ran on."""
+
+    hits: list[Hit]
+    indexed: int  # sessions archived
+    pending: int  # stored sessions the backfill has not reached yet
+
+
+def search_file(path: str | Path, query: str, **kwargs: Any) -> Found:
+    """:func:`search` on a connection of its own to the database at ``path``, opened and closed here: for a worker
+    thread (``asyncio.to_thread``), never the event loop's store connection. Raises sqlite3.Error."""
+    db = sqlstore.connect(path)
+    try:
+        return Found(search(db, query[:MAX_QUERY_CHARS], **kwargs), archive_count(db), backfill_pending(db))
+    finally:
+        db.close()
+
+
+def read_file(path: str | Path, session_id: str, seq: int | None, before: int, after: int) -> list[ArchivedMessage]:
+    """:func:`read_around` on a connection of its own (see :func:`search_file`); ``seq=None`` is the session's start."""
+    db = sqlstore.connect(path)
+    try:
+        if seq is None:
+            row = db.execute("SELECT MIN(seq) FROM message_archive WHERE session_id = ?", (session_id,)).fetchone()
+            if row[0] is None:
+                return []
+            seq = int(row[0])
+        return read_around(db, session_id, seq, before, after)
+    finally:
+        db.close()
+
+
+def day(at: float, approximate: bool = False) -> str:
+    """``YYYY-MM-DD`` (local), prefixed ``~`` when the date is only the session's last save before the index."""
+    try:
+        text = datetime.datetime.fromtimestamp(at).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        text = "????-??-??"
+    return ("~" if approximate else "") + text
+
+
+def hit_lines(hit: Hit, *, current_session: str = "") -> str:
+    """``[id] title · date · role · project`` and the snippet below it, every part scrubbed of credentials (the
+    archive was scrubbed on the way in; a pattern added since, or a title, is caught here)."""
+    title = _one_line(scrub_text(hit.title or ""), 80) or "(untitled)"
+    where = Path(hit.cwd).name if hit.cwd else ""
+    parts = [f"[{hit.id}] {title}", day(hit.at, hit.approximate), hit.role]
+    if where:
+        parts.append(scrub_text(where))
+    if current_session and hit.session_id == current_session:
+        parts.append("this session")
+    return " · ".join(parts) + "\n  " + _one_line(scrub_text(hit.snippet))
+
+
+def index_note(found: Found) -> str:
+    note = f"index: {found.indexed} session{'s' if found.indexed != 1 else ''}"
+    if found.pending:
+        note += f", still indexing {found.pending} older session{'s' if found.pending != 1 else ''}:"
+        note += " results may be incomplete"
+    return note

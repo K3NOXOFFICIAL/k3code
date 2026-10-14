@@ -23,6 +23,13 @@ def effective_style(config: Any, session_meta: dict[str, Any] | None) -> str:
     return str((session_meta or {}).get("output_style") or getattr(config, "output_style", "") or "default")
 
 
+#: The one line on the recall tool: static, so the prompt (and the provider cache of it) never moves with the archive.
+RECALL_NOTE = (
+    "All earlier sessions (any age, any project) and learned notes are searchable with `recall`; when the user refers"
+    " to something from before, or assumes context you lack, search before answering."
+)
+
+
 def build_system_prompt(
     base: str,
     *,
@@ -33,6 +40,7 @@ def build_system_prompt(
     skills: bool = True,
     learned: list[str] | None = None,
     frozen: dict[str, Any] | None = None,
+    recall: bool = False,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones last. Every message follows the prompt, so any change to it makes the provider
@@ -48,6 +56,8 @@ def build_system_prompt(
 
     if _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the `advisor` tool exists
         parts.append(_advisor.PROMPT_NOTE)
+    if recall:  # the caller registers the `recall` tool (the gateway's sessions); the same words every time
+        parts.append(RECALL_NOTE)
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
 
     # What background writers change (a re-scan of the stack, the daily distill of USER.md, an accepted gotcha, the

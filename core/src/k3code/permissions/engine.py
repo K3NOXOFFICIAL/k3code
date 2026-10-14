@@ -98,6 +98,8 @@ PURE_TOOLS = frozenset(
         "bash_output",
         "bash_kill",
         "advisor",
+        "recall",
+        "session_read",
     }
 )
 EDIT_TOOLS = frozenset({"write", "edit"})
