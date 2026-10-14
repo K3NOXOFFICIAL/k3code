@@ -363,6 +363,24 @@ def test_the_arithmetic_end_scan_is_bounded_not_quadratic() -> None:
     assert parsed.unterminated
 
 
+# the scan budget is shared across the whole command, so no number of substitutions, quoted strings or nested `$(`
+# can multiply the `((` scan and stall decide() on the event loop. Each of these is about 100 KB.
+BOUNDED = [
+    ("$(" + "(" * 450 + ") ") * 220,  # many substitutions, each a run of `(` bash never closes
+    "(" * 450 + '"' + "x" * 100_000 + '"',  # a run of `(` before a long double-quoted string
+    "cat <<E\n" + ("$(" + "(" * 450 + ") ") * 220 + "\nE",  # the same multiplied inside a heredoc body
+    "echo " + "$(" * 400 + "date" + ")" * 400,  # deeply nested substitutions
+]
+
+
+@pytest.mark.parametrize("cmd", BOUNDED)
+def test_the_paren_scan_cannot_be_multiplied_by_substitutions(cmd: str) -> None:
+    start = time.perf_counter()
+    parsed = parse(cmd)
+    assert time.perf_counter() - start < 1.0
+    assert parsed.unterminated
+
+
 # a << bash may read as something else (in ${...} or a[...]) or a word bash versions read differently: no body is
 # skipped and no rule vouches for the command
 UNSURE = [
