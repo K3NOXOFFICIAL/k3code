@@ -1147,7 +1147,75 @@ def test_drop_after_shapes_hides_what_a_shape_left_of_a_value_on_either_side_or_
     from k3code.redact import drop_after_shapes
 
     value = "ab12 cd34;ef56,gh78"
+    original = f"x={value} | {value} | {value} | s xs"
     shaped = f"x={REDACTED} cd34;ef56,gh78 | ab12 {REDACTED} | ab12 cd34;{REDACTED};ef56{REDACTED},gh78 | s {REDACTED}s"
-    out = drop_after_shapes(shaped, [value])
+    out = drop_after_shapes(shaped, original, [value])
     assert not any(p in out for p in ("ab12", "cd34", "ef56", "gh78"))
     assert out.endswith(f"| s {REDACTED}s")  # beside a marker but no part of the value: kept
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+def test_an_untrusted_value_that_holds_a_trusted_one_is_hidden_whole(source, tmp_path, monkeypatch):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    trusted = "AKIA" + "FAKEFAKE" + "12345678"  # in this process's environment
+    other = "wJal" + "rFAKEsecret" + "/K7MDENG+bPxRfiCY"  # only in the file
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", trusted)
+    project = _poisoned_project(tmp_path, source, f"{trusted}:{other}")
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"creds {trusted}:{other}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    blob = _export_blob(out)
+    assert trusted not in blob and other not in blob
+
+
+def test_a_long_untrusted_value_a_shape_cuts_is_still_hidden_whole(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    session = "user_session=" + "Ck81" + "xYw9Pq2LmN7tK3vB" * 3
+    cookie = "; ".join([f"pref{i}=v{i}x{i}" for i in range(60)] + [session])
+    assert len(cookie) > 800
+    project = _poisoned_project(tmp_path, "config.yaml", cookie)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"curl -H 'Cookie: {cookie}' https://app.example.com/")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert session.split("=")[1] not in _export_blob(out)
+
+
+def test_many_long_untrusted_values_a_shape_cuts_do_not_stall_the_export(tmp_path):
+    import time
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    # each value a suffix of one run a shape hides, beside many markers: finding what is left of each is quadratic
+    values = {f"API_KEY_{k}": "a" * k + "b" for k in range(511, 311, -1)}
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"x": {"command": "y", "env": values}}}))
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, "token=" + "a" * 511 + "b " + ("a" * 40 + "c" + REDACTED) * 2000)
+    out = tmp_path / "x.k3bundle"
+    start = time.monotonic()
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert time.monotonic() - start < 5
+    blob = _export_blob(out)
+    assert not any(v in blob for v in values.values())
+
+
+def test_a_mcp_json_nested_deep_in_an_env_value_exports_without_a_recursion_error(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    deep = "[" * 900 + "]" * 900
+    text = '{"mcpServers": {"s": {"env": {"API_TOKEN": "' + MCP_TOK + '", "X": ' + deep + "}}}}"
+    project = _project_with_mcp_json(tmp_path, text.encode())
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {MCP_TOK}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert MCP_TOK not in _export_blob(out)

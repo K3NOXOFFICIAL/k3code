@@ -213,7 +213,7 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
     with tarfile.open(path, "w:gz") as tar:
         for name, body in parts.items():
             text = redact_text(scrub_json(body, secrets), secrets)
-            data = drop_after_shapes(text, [v for v in untrusted if v in body]).encode("utf-8")
+            data = drop_after_shapes(text, body, untrusted).encode("utf-8")
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mtime = int(time.time())

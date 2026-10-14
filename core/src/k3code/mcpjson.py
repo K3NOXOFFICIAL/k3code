@@ -54,8 +54,9 @@ def parse(text: str) -> dict[str, McpServerConfig]:
 
 def as_config(project_dir: str | Path) -> dict[str, Any] | None:
     """The file as written, trusted or not, as a config's ``mcp`` section with each server's ``env`` and ``headers``
-    only, whatever its type: the values a session may quote, for ``debugdump.secret_values`` (k3code.bundle).
-    ``{}`` without a file; None when it exists but cannot be read or parsed (a caller must not guess its values)."""
+    only (their text, number and bool values), whatever its type: the values a session may quote, for
+    ``debugdump.secret_values`` (k3code.bundle). ``{}`` without a file; None when it exists but cannot be read or
+    parsed (a caller must not guess its values)."""
     path = Path(project_dir) / FILE
     if not path.is_file():
         return {}
@@ -65,8 +66,19 @@ def as_config(project_dir: str | Path) -> dict[str, Any] | None:
         return None
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     items = servers.items() if isinstance(servers, dict) else []
-    kept = {str(name): {k: spec.get(k) for k in ("env", "headers")} for name, spec in items if isinstance(spec, dict)}
+    kept = {
+        str(name): {k: _scalars(spec.get(k)) for k in ("env", "headers")}
+        for name, spec in items
+        if isinstance(spec, dict)
+    }
     return {"mcp": {"servers": kept}}
+
+
+def _scalars(section: object) -> dict[str, object]:
+    """``section``'s text, number and bool values (a nested one is no value a server gets, and walking it can recurse
+    past Python's limit)."""
+    items = section.items() if isinstance(section, dict) else []
+    return {str(k): v for k, v in items if isinstance(v, str | int | float | bool)}
 
 
 def declared(project_dir: str | Path) -> dict[str, McpServerConfig]:

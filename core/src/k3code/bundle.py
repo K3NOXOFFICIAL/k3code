@@ -48,8 +48,8 @@ def session_to_dict(
     s: StoredSession, secrets: list[str] | None = None, untrusted: list[str] | None = None
 ) -> dict[str, Any]:
     """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind. The
-    ``untrusted`` ones, known only from a file the user may never have trusted, after it (``drop_after_shapes``)."""
-    return redact_session_json(drop_values(asdict(s), secrets or []), untrusted)
+    ``untrusted`` ones, known only from a file the user may never have trusted, after it (``redact_session_json``)."""
+    return redact_session_json(asdict(s), secrets, untrusted)
 
 
 def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
