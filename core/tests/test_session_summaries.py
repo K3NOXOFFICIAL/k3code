@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from k3code.gateway.sessions import PREVIEW_CHARS, SessionStore, summarize_messages
 
 
@@ -56,6 +58,7 @@ def test_listing_never_parses_a_transcript(tmp_path, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 def test_a_huge_row_does_not_slow_the_listing(tmp_path):
     store = SessionStore(tmp_path / "s.db")
     big = json.dumps([{"role": "user", "content": "first"}] + [{"role": "tool", "content": "z" * 1_000_000}] * 100)

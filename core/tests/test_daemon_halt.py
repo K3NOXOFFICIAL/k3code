@@ -37,8 +37,8 @@ async def test_halt_blocks_goal_turn_and_loop_tick_with_zero_provider_calls(tmp_
 
     server.resume_daemon()
     for _ in range(100):
-        if provider.n >= 1:
-            break
+        if provider.n >= 1 and server.automation.db.get("loops", loop_id)["ticks"] >= 1:
+            break  # the tick is recorded after the provider call, so wait for both
         await asyncio.sleep(0.05)
     assert provider.n >= 1, "the loop tick runs after /daemon resume"
     assert server.automation.db.get("loops", loop_id)["ticks"] >= 1

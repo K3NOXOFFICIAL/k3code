@@ -353,6 +353,7 @@ def test_a_shift_needs_no_person(tmp_path: Path) -> None:
         assert _bash(cmd, "auto", tmp_path).action == "allow", cmd
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 def test_the_arithmetic_end_scan_is_bounded_not_quadratic() -> None:
     # H2: the scan that finds a ((...)) end ran at every `(` and read to the end of the text each time, so a run of
     # `(` was quadratic on the loop that decides a command (a few thousand `(` took tens of seconds). It is now
@@ -374,6 +375,7 @@ BOUNDED = [
 ]
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 @pytest.mark.parametrize("cmd", BOUNDED)
 def test_the_paren_scan_cannot_be_multiplied_by_substitutions(cmd: str) -> None:
     start = time.perf_counter()
@@ -448,6 +450,7 @@ def test_nesting_the_parser_follows_is_still_checked(tmp_path: Path) -> None:
 GIVES_UP = ["$(" * 50_000, "<(" * 50_000, "$(((" * 30_000, "$((" * 800, "`$(" * 30_000]
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 @pytest.mark.parametrize("cmd", GIVES_UP, ids=["substs", "process-substs", "arith-substs", "arith-800", "backticks"])
 def test_a_command_the_parser_gives_up_on_is_denied_quickly(tmp_path: Path, cmd: str) -> None:
     for mode in MODES:
