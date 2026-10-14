@@ -392,7 +392,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Text color={t.color.muted}> · k3code</Text>
       </Text>
 
-      <Text color={t.color.muted} wrap="truncate-end">
+      <Text color={t.color.muted} wrap="truncate-start">
         {info.cwd || process.cwd()}
       </Text>
 
@@ -423,7 +423,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
             {(info.model ?? "").split("/").pop()}
             <Text color={t.color.muted}> · k3code</Text>
           </Text>
-          <Text color={t.color.muted} wrap="truncate-end">
+          <Text color={t.color.muted} wrap="truncate-start">
             {info.cwd || process.cwd()}
           </Text>
           {sid && (
