@@ -193,10 +193,15 @@ def test_containment_holds_when_a_resolved_name_turns_into_a_link_before_the_sta
     inner.symlink_to(outside)
     (proj / ".k3code" / "config.yaml").symlink_to(inner)
     real_open, real_stat = os.open, os.stat
+    # The name a check by name resolves to while inner is the in-project file. Taken now, before os.stat is patched:
+    # Path.resolve() stats, so resolving inside the patched stat would call it again without end.
+    inner_resolved = str(proj.resolve() / "inner.yaml")
+    opened: list[bool] = []
 
     def open_(path, *a, **kw):
         if not str(path).endswith(".k3code/config.yaml"):
             return real_open(path, *a, **kw)
+        opened.append(True)
         _relink_603(inner, outside)  # every open (trust's own read too) lands outside
         fd = real_open(path, *a, **kw)
         inner.unlink()
@@ -204,16 +209,16 @@ def test_containment_holds_when_a_resolved_name_turns_into_a_link_before_the_sta
         return fd
 
     def stat_(path, *a, **kw):
-        if str(path) == str(inner.resolve()) and not inner.is_symlink():
+        if str(path) == inner_resolved and not os.path.islink(inner):  # lstat: not this patched stat
             _relink_603(inner, outside)  # and a link out again for the stat
         return real_stat(path, *a, **kw)
 
     monkeypatch.setattr(trust.os, "open", open_)
     monkeypatch.setattr(trust.os, "stat", stat_)
-    try:
-        assert not _exported_mark_603(tmp_path, proj)
-    except BundleError as e:
-        assert MARK not in str(e)
+    with pytest.raises(BundleError, match="does not parse") as e:
+        _exported_mark_603(tmp_path, proj)
+    assert opened and MARK not in str(e.value)
+    assert not (tmp_path / "x.k3bundle").exists()
 
 
 def test_a_link_to_the_user_config_while_it_is_checked_does_not_unlock_the_plain_read(
