@@ -475,6 +475,7 @@ _ERROR_CODE_REASONS: dict[str, FailoverReason] = {
     **dict.fromkeys(_QUOTA_ERROR_CODES, _R.quota),
     **dict.fromkeys(_MODEL_NOT_FOUND_ERROR_CODES, _R.bad_request),
     **dict.fromkeys(_CONTEXT_OVERFLOW_ERROR_CODES, _R.context_overflow),
+    **dict.fromkeys(("invalid_api_key", "incorrect_api_key", "authentication_error", "permission_error"), _R.auth),
     "server_error": _R.server,
     "api_error": _R.server,
     "rate_limit_error": _R.rate_limit,

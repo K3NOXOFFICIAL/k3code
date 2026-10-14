@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -72,6 +74,64 @@ async def test_openai_in_band_error_chunk_raises_with_the_upstream_message():
         await run(openai(body))
     assert "overloaded" in exc.value.message and exc.value.status_code == 529
     assert classify_api_error(exc.value, provider="o", model="m").reason == FailoverReason.server
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        ({"message": "You exceeded your current quota", "type": "insufficient_quota", "code": "insufficient_quota"},
+         FailoverReason.quota),
+        ({"message": "Too many requests", "type": "requests", "code": "rate_limit_exceeded"},
+         FailoverReason.rate_limit),
+        ({"message": "Incorrect key provided", "type": "invalid_request_error", "code": "invalid_api_key"},
+         FailoverReason.auth),
+    ],
+)
+async def test_openai_in_band_string_code_classifies_by_the_code_not_as_server(error, reason):
+    body = "data: " + json.dumps({"error": error}) + "\n\n"
+    with pytest.raises(ProviderError) as exc:
+        await run(openai(body))
+    assert exc.value.status_code is None
+    assert classify_api_error(exc.value, provider="o", model="m").reason == reason
+
+
+async def test_openai_in_band_rate_limit_reads_the_retry_hint_from_the_message():
+    error = {"message": "Rate limit reached. Please try again in 6s.", "code": "rate_limit_exceeded"}
+    with pytest.raises(ProviderError) as exc:
+        await run(openai("data: " + json.dumps({"error": error}) + "\n\n"))
+    classified = classify_api_error(exc.value, provider="o", model="m")
+    assert classified.reason == FailoverReason.rate_limit and classified.retry_after == 6.0
+
+
+@pytest.mark.parametrize(
+    ("etype", "status", "reason"),
+    [
+        ("billing_error", 402, FailoverReason.quota),
+        ("permission_error", 403, FailoverReason.auth),
+        ("authentication_error", 401, FailoverReason.auth),
+        ("rate_limit_error", 429, FailoverReason.rate_limit),
+    ],
+)
+async def test_anthropic_in_band_error_types_classify_by_type(etype, status, reason):
+    body = (
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n'
+        f'event: error\ndata: {{"type":"error","error":{{"type":"{etype}","message":"x"}}}}\n\n'
+    )
+    with pytest.raises(ProviderError) as exc:
+        await run(anthropic(body))
+    assert exc.value.status_code == status
+    assert classify_api_error(exc.value, provider="a", model="m").reason == reason
+
+
+async def test_anthropic_in_band_unmapped_type_has_no_forced_status():
+    body = (
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n'
+        'event: error\ndata: {"type":"error","error":{"type":"rate_limit_exceeded","message":"x"}}\n\n'
+    )
+    with pytest.raises(ProviderError) as exc:
+        await run(anthropic(body))
+    assert exc.value.status_code is None
+    assert classify_api_error(exc.value, provider="a", model="m").reason == FailoverReason.rate_limit
 
 
 @pytest.mark.parametrize(
