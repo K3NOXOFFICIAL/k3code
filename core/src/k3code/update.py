@@ -493,6 +493,13 @@ def fetch_latest(
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
     base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
     r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
+    if r.status_code == 429 or (r.status_code == 403 and r.headers.get("x-ratelimit-remaining") == "0"):
+        wait = r.headers.get("retry-after")
+        raise RuntimeError(
+            f"GitHub API {r.status_code}: rate limit exceeded"
+            + (f" (retry after {wait}s)" if wait else "")
+            + "; set GITHUB_TOKEN (or `gh auth login`) for a higher limit"
+        )
     if r.status_code in (401, 403, 404):
         raise PermissionError(
             f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "

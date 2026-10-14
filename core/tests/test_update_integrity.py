@@ -159,3 +159,23 @@ def test_fetch_latest_honours_the_api_override(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("K3CODE_UPDATE_API", "http://127.0.0.1:9/mirror/")
     upd.fetch_latest(repo="o/r")
     assert seen == ["http://127.0.0.1:9/mirror/repos/o/r/releases?per_page=30"]
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [(403, {"x-ratelimit-remaining": "0", "retry-after": "60"}), (429, {"retry-after": "60"})],
+)
+def test_fetch_latest_reports_a_rate_limit_not_a_private_repo(monkeypatch, status, headers) -> None:
+    """#143: GitHub answers an exhausted unauthenticated limit with 403 (or 429); that is not 'private or missing'."""
+    resp = upd.httpx.Response(status, headers=headers, json={"message": "API rate limit exceeded"})
+    monkeypatch.setattr(upd.httpx, "get", lambda url, **k: resp)
+    with pytest.raises(RuntimeError, match="rate limit") as e:
+        upd.fetch_latest(repo="o/r")
+    assert "private" not in str(e.value) and "retry after 60s" in str(e.value)
+
+
+def test_fetch_latest_still_calls_a_plain_403_private(monkeypatch) -> None:
+    resp = upd.httpx.Response(403, headers={"x-ratelimit-remaining": "42"}, json={})
+    monkeypatch.setattr(upd.httpx, "get", lambda url, **k: resp)
+    with pytest.raises(PermissionError, match="private or does not exist"):
+        upd.fetch_latest(repo="o/r")
