@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, drop_values, redact, redact_session_json
+from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -110,6 +110,23 @@ def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]
     }
 
 
+def _secret_scalars_as_text(obj: Any, secrets: list[str], section: bool = False) -> Any:
+    """``obj`` with each number or bool that is a secret as its text, so ``drop_values`` and ``redact`` (strings
+    only) hide it: one in an MCP ``env``/``headers`` section, or one whose text holds a known secret (an unquoted
+    `SERVICE_TOKEN: 8274619305` or provider `api_key: 61839274055`). Any other keeps its type: a secret-named key
+    alone does not make a number secret (`max_tokens: 4096`)."""
+    if isinstance(obj, dict):
+        return {
+            k: _secret_scalars_as_text(v, secrets, section or str(k).lower() in _SECRET_SECTIONS)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_secret_scalars_as_text(v, secrets, section) for v in obj]
+    if isinstance(obj, int | float | bool) and (section or any(s in str(obj) for s in secrets)):
+        return str(obj)
+    return obj
+
+
 def write_bundle(
     path: Path,
     *,
@@ -130,7 +147,8 @@ def write_bundle(
                 raw = confio.read_yaml(src)
                 # its own values hide their copies in it even when nothing else counts it (an untrusted project
                 # config), but only in it: a file the user never trusted must not hide part of one of their rules
-                data = redact(_drop_known(raw, *_known_secrets(*configs, raw)))
+                secrets_here, certain = _known_secrets(*configs, raw)
+                data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:

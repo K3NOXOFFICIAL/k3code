@@ -761,6 +761,23 @@ def test_an_unquoted_number_in_a_user_config_that_does_not_load_is_still_hidden_
     assert num not in blob and key not in blob
 
 
+def test_an_unquoted_number_secret_in_the_exported_settings_is_hidden_and_other_numbers_keep_their_type(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+
+    num, key = "8274619305", "61839274055"
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    text = f"max_turns: 7\nmcp:\n  servers:\n    s: {{command: srv, env: {{SERVICE_TOKEN: {num}}}}}\n"
+    text += f"providers:\n  - {{name: p, kind: openai, base_url: 'http://x/v1', api_key: {key}}}\n"
+    user_config_path().write_text(text)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[], settings=True)
+    blob = _export_blob(out)
+    assert num not in blob and key not in blob
+    assert bundle.read_bundle(out).settings["user"]["max_turns"] == 7
+
+
 @pytest.mark.parametrize("value", [8274619305, 82746.19305])
 @pytest.mark.parametrize(
     "where",
