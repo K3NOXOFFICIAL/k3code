@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
@@ -61,7 +62,8 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
 
 #: Builtin read-only bash allowlist: safe to run without asking, in every mode but plan. It covers the project only
 #: (see _voids_allow: an argument outside the roots, a redirect or a substitution asks), and the flags of these commands
-#: that write a file or run a program ask (BUILTIN_BASH_ASK, checked again on the argv by _readonly_argv_ok).
+#: that are not known to be safe ask (_READONLY_OPTS, checked on the argv by _readonly_argv_ok; BUILTIN_BASH_ASK names
+#: the best-known ones as patterns).
 #: ``env``/``printenv`` are not here: they print the secrets in the environment.
 BUILTIN_BASH_ALLOW = [
     "ls *",
@@ -557,28 +559,209 @@ def _voids_allow(
     )
 
 
-#: Options of the builtin read-only commands that write a file, run a program or change state: (short option letters,
-#: long options). A short letter counts anywhere in a cluster (``sort -uo f``); a long option also by an abbreviation
-#: getopt would accept (``sort --out=f``). Over-asking (``rg --pretty``) is the safe side.
-_READONLY_RISKY: dict[str, tuple[str, tuple[str, ...]]] = {
-    "rg": ("", ("--pre", "--hostname-bin")),
-    "tail": ("fF", ("--follow",)),  # follows forever: the call never returns
-    "sort": ("o", ("--output", "--compress-program")),
-    "tree": ("o", ()),
-    "file": ("C", ("--compile",)),
-    "diff": ("", ("--output",)),
-    "jq": ("fL", ("--from-file", "--library-path")),
-    "yq": ("is", ("--inplace", "--in-place", "--split-exp", "--from-file", "--security")),
-    "git diff": ("", ("--output", "--ext-diff", "--textconv")),
-    "git log": ("", ("--output", "--ext-diff", "--textconv")),
-    "git show": ("", ("--output", "--ext-diff", "--textconv")),
-    "git blame": ("", ("--textconv",)),
+class _Opts(NamedTuple):
+    """The options of one builtin read-only command that are known to be safe, matched exactly."""
+
+    flags: str = ""  # short options without a value; a cluster of them (``-la``) is fine
+    valued: str = ""  # short options with a value that is no path: glued (``-n5``) or the next word
+    longs: frozenset[str] = frozenset()  # ``--name``, exactly (no abbreviation, no ``=value``)
+    longs_val: frozenset[str] = frozenset()  # ``--name``, ``--name=value``, exactly (the value is no path)
+    words: frozenset[str] = frozenset()  # whole words as written (``find -name``)
+    extra: re.Pattern[str] | None = None  # other whole spellings (``date -Iseconds``)
+
+
+_DIGITS = "0123456789"
+
+
+def _opts(flags: str = "", valued: str = "", longs: str = "", longs_val: str = "", words: str = "", extra: str = ""):
+    return _Opts(
+        flags,
+        valued,
+        frozenset(f"--{w}" for w in longs.split()),
+        frozenset(f"--{w}" for w in longs_val.split()),
+        frozenset(words.split()),
+        re.compile(extra) if extra else None,
+    )
+
+
+_GIT_LOG_LONGS = (
+    "stat shortstat numstat summary name-only name-status oneline no-color cached staged graph no-decorate all branches"
+    " tags remotes no-merges merges first-parent abbrev-commit no-abbrev-commit patch no-patch patch-with-stat raw"
+    " reverse follow full-history date-order topo-order author-date-order left-right cherry-pick boundary"
+    " ignore-all-space ignore-space-change ignore-blank-lines minimal patience histogram exit-code quiet check"
+    " no-ext-diff no-textconv merge-base pickaxe-regex no-prefix"
+)
+_GIT_LOG_VAL = (
+    "format pretty date since until after before author committer grep max-count skip abbrev diff-filter unified color"
+    " decorate relative word-diff word-diff-regex color-words find-renames find-copies diff-algorithm stat dirstat"
+)
+
+#: The options of the builtin read-only commands (BUILTIN_BASH_ALLOW) that are known to be safe: they print, filter or
+#: format and name no file. Every other argument that starts with ``-`` makes the command ask, so an option nobody
+#: listed (a list file: ``sort --files0-from=F``, ``sha256sum -c F``; a program or a write: ``jq --run-tests``,
+#: ``tree -R``; a path glued to a letter: ``date -f/PATH``; a short abbreviation: ``sort --o=F``, ``tail --f``) never
+#: runs unasked. ``--`` ends the options. A command with a path option is left out of the safe set on purpose (``grep
+#: -f``, ``date -r``): its path would have to be checked against the roots, and `_path_args` sees only separate words.
+_READONLY_OPTS: dict[str, _Opts] = {
+    "ls": _opts(
+        "aAbBcCdfFgGhHiklLmnNopqQrRsStuUvxX1",
+        "I",
+        "all almost-all human-readable classify directory reverse recursive dereference group-directories-first inode"
+        " size no-group numeric-uid-gid literal hide-control-chars",
+        "color sort format time time-style indicator-style ignore width",
+    ),
+    "cat": _opts(
+        "AbeEnstTuv",
+        longs="number number-nonblank show-all show-ends show-tabs squeeze-blank show-nonprinting",
+    ),
+    "head": _opts("qv" + _DIGITS, "nc", "quiet silent verbose", "lines bytes"),
+    "tail": _opts("qv" + _DIGITS, "nc", "quiet silent verbose", "lines bytes"),
+    "wc": _opts("lwcmL", longs="lines words bytes chars max-line-length"),
+    "grep": _opts(
+        "EFGPivwxcnhHosqIarRlLTzZ",
+        "ABCme",
+        "recursive dereference-recursive ignore-case no-ignore-case invert-match word-regexp line-regexp count"
+        " line-number no-filename with-filename only-matching quiet silent files-with-matches files-without-matches"
+        " fixed-strings extended-regexp basic-regexp perl-regexp text no-messages null null-data initial-tab binary"
+        " byte-offset",
+        "include exclude exclude-dir max-count after-context before-context context regexp color colour binary-files",
+    ),
+    "rg": _opts(
+        "iIsSnNlcvwxFuaoqUHh",
+        "gtTABCmeMj",
+        "ignore-case smart-case case-sensitive fixed-strings files-with-matches files-without-matches count"
+        " line-number no-line-number hidden no-ignore word-regexp line-regexp invert-match only-matching quiet files"
+        " heading no-heading with-filename no-filename column no-column json multiline pretty",
+        "glob type type-not max-count after-context before-context context regexp max-depth threads color sort"
+        " max-columns",
+    ),
+    "find": _opts(
+        words="-name -iname -type -maxdepth -mindepth -path -ipath -wholename -iwholename -size -mtime -mmin -atime"
+        " -amin -ctime -cmin -newer -anewer -cnewer -empty -not -and -or -a -o -prune -print -print0 -printf -depth"
+        " -xdev -mount -perm -user -group -uid -gid -executable -readable -writable -regex -iregex -regextype"
+        " -lname -ilname -true -false -nouser -nogroup -links -inum -samefile -quit -daystart -ls",
+        extra=r"-\d+[A-Za-z]?",
+    ),
+    "tree": _opts("adfiCnNqsDFpugxJ", "LIP", "dirsfirst noreport gitignore"),
+    "file": _opts("bLhiNs", longs="brief mime mime-type mime-encoding dereference no-dereference"),
+    "stat": _opts("LfFt", "c", "dereference terse file-system", "format printf"),
+    "du": _opts(
+        "ahscbkmxLHPS",
+        "dBt",
+        "all human-readable summarize total bytes apparent-size dereference one-file-system si",
+        "max-depth exclude threshold block-size",
+    ),
+    "df": _opts(
+        "hHTiklaP",
+        "tx",
+        "human-readable si print-type local all inodes portability total",
+    ),
+    "pwd": _opts("LP", longs="logical physical"),
+    "which": _opts("as"),
+    "type": _opts("aftpP"),
+    "command": _opts("vV"),
+    "id": _opts("ugGnrzZ", longs="user group groups name real zero context"),
+    "uname": _opts(
+        "asnrvmpio",
+        longs="all kernel-name nodename kernel-release kernel-version machine processor hardware-platform"
+        " operating-system",
+    ),
+    "date": _opts(
+        "uR",
+        "d",
+        "utc universal rfc-email",
+        "date iso-8601 rfc-3339",
+        extra=r"-I(?:date|hours|minutes|seconds|ns)?",
+    ),
+    "sort": _opts(
+        "bdfgiMhnRrsuVzcCm",
+        "ktS",
+        "ignore-leading-blanks dictionary-order ignore-case general-numeric-sort ignore-nonprinting month-sort"
+        " human-numeric-sort numeric-sort random-sort reverse stable unique version-sort zero-terminated check merge",
+        "key field-separator sort buffer-size parallel batch-size",
+    ),
+    "uniq": _opts(
+        "cdDiuz",
+        "fsw",
+        "count repeated unique ignore-case zero-terminated",
+        "skip-fields skip-chars check-chars",
+    ),
+    "cut": _opts(
+        "snz",
+        "bcfd",
+        "only-delimited zero-terminated complement",
+        "bytes characters fields delimiter output-delimiter",
+    ),
+    "tr": _opts("cCdst", longs="complement delete squeeze-repeats truncate-set1"),
+    "jq": _opts(
+        "rcesSnRCMaj" + _DIGITS,
+        longs="raw-output compact-output exit-status slurp sort-keys null-input raw-input color-output"
+        " monochrome-output ascii-output join-output tab stream seq",
+        longs_val="indent",
+    ),
+    "yq": _opts(
+        "rcenyYSMCaRx",
+        longs="raw-output compact-output exit-status sort-keys null-input raw-input color-output monochrome-output"
+        " ascii-output join-output yaml-output yaml-roundtrip xml-output tab",
+        longs_val="indent width",
+    ),
+    "diff": _opts(
+        "qsuciwbBaEZtTNyrde",
+        "UCIxL",
+        "brief report-identical-files ignore-case ignore-all-space ignore-space-change ignore-blank-lines text"
+        " recursive new-file side-by-side ignore-trailing-space expand-tabs no-dereference strip-trailing-cr minimal",
+        "unified context exclude color label",
+    ),
+    "cmp": _opts("bls", "ni", "verbose silent quiet print-bytes", "bytes ignore-initial"),
+    "sha256sum": _opts("btz", longs="binary text zero tag untagged"),
+    "sha1sum": _opts("btz", longs="binary text zero tag untagged"),
+    "sha512sum": _opts("btz", longs="binary text zero tag untagged"),
+    "md5sum": _opts("btz", longs="binary text zero tag untagged"),
+    "basename": _opts("asz", "s", "multiple zero", "suffix"),
+    "dirname": _opts("z", longs="zero"),
+    "realpath": _opts(
+        "emsqLPz",
+        longs="canonicalize-existing canonicalize-missing no-symlinks quiet logical physical strip zero",
+    ),
+    "readlink": _opts(
+        "fenvqsmz",
+        longs="canonicalize canonicalize-existing canonicalize-missing no-newline verbose quiet silent zero",
+    ),
+    "git status": _opts(
+        "sbvz",
+        "u",
+        "short branch long ignored ahead-behind no-ahead-behind renames no-renames column no-column",
+        "porcelain untracked-files ignore-submodules find-renames",
+    ),
+    "git diff": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
+    "git log": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
+    "git show": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
+    "git blame": _opts(
+        "wMCefpslntb", "L", "porcelain line-porcelain incremental show-email show-name show-number root"
+    ),
+    "git ls-files": _opts(
+        "cdmoiskuztvf",
+        "x",
+        "deleted modified others ignored cached stage killed unmerged directory no-empty-directory error-unmatch"
+        " full-name recurse-submodules eol deduplicate exclude-standard",
+        "exclude",
+    ),
+    "git describe": _opts(
+        longs="tags all long always exact-match first-parent contains debug",
+        longs_val="abbrev match exclude candidates",
+    ),
+    "git rev-parse": _opts(
+        "q",
+        longs="show-toplevel git-dir show-cdup show-prefix is-inside-work-tree is-bare-repository verify symbolic"
+        " git-common-dir absolute-git-dir is-inside-git-dir quiet",
+        longs_val="short abbrev-ref symbolic-full-name",
+    ),
+    "git remote": _opts("v", longs="verbose push all"),
 }
-#: ``find`` primaries that run a program, delete or write a file.
-_FIND_RISKY = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
-#: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules, or run a command.
+#: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules (``import``,
+#: ``modulemeta``), or run a command.
 #: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
-_QUERY_RISKY = re.compile(r"env|load|system|import|include|eval", re.IGNORECASE)
+_QUERY_RISKY = re.compile(r"env|load|system|import|include|eval|modulemeta", re.IGNORECASE)
 #: The ``make`` targets of BUILTIN_SANDBOXED_ALLOW: ``make test install`` runs every target named, so only these may.
 _MAKE_TARGETS = frozenset({"test", "check", "lint"})
 #: make options whose value is the next word (``-j``/``-l`` take an attached value only: ``-j install`` would hide a
@@ -607,8 +790,31 @@ _REF_LIST: dict[str, tuple[frozenset[str], str]] = {
 }
 
 
-def _long_hit(name: str, risky: tuple[str, ...]) -> bool:
-    return any(name.startswith(r) or (len(name) > 3 and r.startswith(name)) for r in risky)
+def _opts_ok(spec: _Opts, args: list[str]) -> bool:
+    """Every option in ``args`` is one ``spec`` lists, spelled exactly as listed."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if a in spec.words or (spec.extra and spec.extra.fullmatch(a)):
+            continue
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            if name in spec.longs_val or (name in spec.longs and not eq):
+                continue
+            return False
+        if len(a) > 1 and a.startswith("-"):
+            for k, ch in enumerate(a[1:], 1):
+                if ch in spec.flags:
+                    continue
+                if ch in spec.valued:
+                    if k == len(a) - 1:
+                        i += 1  # its value is the next word
+                    break
+                return False
+    return True
 
 
 def _ref_list_ok(sub: str, args: list[str]) -> bool:
@@ -639,8 +845,8 @@ def _ref_list_ok(sub: str, args: list[str]) -> bool:
 
 
 def _readonly_argv_ok(tokens: list[str]) -> bool:
-    """``tokens`` (one simple command, as written) uses none of the options of a builtin read-only command that write,
-    run or change something (see _READONLY_RISKY). Commands not listed there pass."""
+    """``tokens`` (one simple command, as written) uses only the options of a builtin read-only command that are known
+    to be safe (see _READONLY_OPTS), and no query or argument that writes or runs something. Other commands pass."""
     if not tokens:
         return True
     name = os.path.basename(tokens[0])
@@ -652,8 +858,9 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         if sub in _REF_LIST:
             return _ref_list_ok(sub, args)
         name = f"git {sub}"
-    if name == "find":
-        return not any(a in _FIND_RISKY for a in args)
+    spec = _READONLY_OPTS.get(name)
+    if spec and not _opts_ok(spec, args):
+        return False
     if name == "make":
         _, positional = _options(args, *_MAKE_VALUE_OPTS)
         return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
@@ -661,22 +868,7 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         # `uniq IN OUT` writes OUT
         _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
         return len(positional) <= 1
-    if name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args):
-        return False
-    if name == "date":
-        # `date -Iseconds` is a format, `date -s X` sets the clock
-        opts, _ = _options(args, "dfrsI", frozenset({"--date", "--file", "--reference", "--set"}))
-        return not any(o == "-s" or _long_hit(o, ("--set",)) for o, _ in opts)
-    letters, longs = _READONLY_RISKY.get(name, ("", ()))
-    for a in args:
-        if a == "--":
-            break
-        if a.startswith("--"):
-            if _long_hit(a.split("=", 1)[0], longs):
-                return False
-        elif a.startswith("-") and any(ch in letters for ch in a[1:]):
-            return False
-    return True
+    return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
 def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
