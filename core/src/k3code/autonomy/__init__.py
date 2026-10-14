@@ -47,8 +47,9 @@ DEFAULTS: dict[str, Any] = {
     #: ``panes``: inside k3 panes, open one read-only pane per child
     #: ``max_tokens``/``max_agents``: the budget of one auto fan-out (issue #136; /ultracode passes its own). Children
     #: are not started once their tokens reach ``max_tokens`` (0 = no token cap) or ``max_agents`` children ran
-    #: (workers, reviewers and reworks each count; a worker only starts while a reviewer slot is left; 0 = 4 per
-    #: subtask, at most 16); what is left goes to the parent
+    #: (workers, reviewers and reworks each count; a worker only starts while a reviewer slot is left for it and for
+    #: the workers already running; 0 = 4 per subtask, at most 16); a value that is not a non-negative whole number
+    #: counts as unset; what is left goes to the parent
     "fanout": {
         "enabled": True,
         "panes": False,
