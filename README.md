@@ -156,7 +156,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Models and effort** | `/tune` (one popup for the model, the reasoning effort and the ultracode mode; or typed, for example `/tune strong high ultracode`) · `/model` (bare opens the same popup; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` (bare opens the same popup; `/effort <level>` sets it) · `/output-style` |
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
-| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
+| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/learned` (list what was learned; `/learned forget <id>`; `/learned purge --yes`) · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
@@ -306,6 +306,10 @@ A pane running k3code reports its state (working, needs input, done) to `k3` aut
 
 ---
 
+### What k3code learns, and where it is kept
+
+With `learning.enabled: true` (the default) k3code stores gotchas, notes and preferences from your sessions. Setting `learning.enabled: false` stops new learning and keeps learned text out of the prompt. Everything lives under `~/.k3code` (or `$K3CODE_HOME`): per-project `projects/<key>/gotchas.md`, `gotchas.auto.md` and `learned.md`; machine-wide `gotchas.md`; `learning/preferences.json` and the auto section of `memory/USER.md`; optimizer `overlays/*.md`. `/learned` lists them with ids, `/learned forget <id>` removes one, and `/learned purge --yes` clears the project's auto gotchas and notes and every overlay not in an active experiment.
+
 ## Running 24/7
 
 ```sh
@@ -320,8 +324,8 @@ k3code agents                  # open the TUI on the daemon with the agent view 
 
 What keeps it alive and safe when nobody is watching:
 
-- **Offline handling.** A connectivity monitor distinguishes *online*, *degraded*, *provider down*, *captive portal* and *offline*. Offline: the turn pauses (no error) and resumes by itself once the network is back, usually within a minute (while offline the probe backs off from every 5 s to every 60 s). A single provider being down is a failover, not a pause. A provider that answers its own probe (an Ollama on loopback, a vLLM on the LAN) keeps the state *online* even where the internet probe fails, so a local-only setup on a host with no internet does not pause.
-- **Retry until it works.** Network errors and server errors retry with jittered backoff, then fail over to the next chain entry. If every entry is cooling down, the call parks until the earliest reset (or until connectivity recovers, for network failures) and the status line says when.
+- **Offline handling.** A connectivity monitor distinguishes *online*, *degraded*, *provider down*, *captive portal* and *offline*. Offline: the turn pauses (no error) and resumes by itself once the network is back, usually within a minute (the probe runs every 60 s while things are fine; once the network is bad it probes every 5 s, backing off to every 60 s). A single provider being down is a failover, not a pause. A provider that answers its own probe (an Ollama on loopback, a vLLM on the LAN) keeps the state *online* even where the internet probe fails, so a local-only setup on a host with no internet does not pause.
+- **Retry until it works.** Network errors and server errors retry with jittered backoff, then fail over to the next chain entry. If every entry is cooling down, the call parks until the earliest reset (or until connectivity recovers, for network failures) and the status line says when. A headless `k3code -p` run says on stderr when it pauses or parks and waits at most `--max-wait` seconds (default `reliability.max_wait` from the config, else 300; `0` waits for ever); then it gives up with exit code 75 (`EX_TEMPFAIL`, "try again later") and, with `--json`, `{"error": "gave_up", "waited": 300, ...}`.
 - **Crash safety.** Tool calls are journaled (fsync'd intent and done records). When a crashed headless session is resumed with `k3code -p … --session ID --resume`, side-effect calls that had no `done` record are *not* re-run: the model gets an `INTERRUPTED` result and inspects the state first. The daemon does not resume interrupted turns automatically yet; `k3code doctor` flags unresolved journal intents.
 - **Bounded by design.** A resource governor caps concurrent agents with fixed limits and refuses to start new work when free disk space drops below 2 GB (`k3code doctor` also reports I/O and CPU pressure). Optional token and estimated-spend budgets (`reliability.session_tokens`, `session_usd`, `day_tokens`, `day_usd`; all off by default) stop a turn when exceeded. A loop guard stops repeating agents. Unattended runs execute shell commands in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox when it is installed.
 - **Self-supervision.** The unit uses a systemd watchdog, restarts on failure, and enters a safe mode after a restart storm.
@@ -378,8 +382,15 @@ providers:                          # the fallback chain, in order (add as many 
 permission_mode: default            # default | accept-edits | plan | auto | yolo
 autonomy:
   plan_first: true
+  advisor_on_plan: true             # strong-tier critique of an approved plan, for a large/huge or high-risk one only
+  advisor_on_goal: true             # strong-tier review before a /goal is declared done
+  proposals: true                   # one proposer pass after a finished task (none on the plan)
+  advisor_compact_chars: 24000      # transcript size past which the advisor, goal review and planner get the old
+                                    #   part summarized on the cheap tier instead of verbatim
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
-  auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
+  auto_continue: auto               # auto (default): in auto/yolo mode a prompt runs as an implicit goal until the
+                                    #   judge says done; true/false force it on/off in every mode
+  auto_continue_max_turns: 8        # judged turns per implicit goal (0 = no cap)
   fanout: {max_parallel: 3, max_tokens: 1000000, max_agents: 0}  # max_agents 0 = 4 per subtask, at most 16
 ultracode:
   min_scope: small                  # with the ultracode mode on: a prompt rated at least this runs the pipeline

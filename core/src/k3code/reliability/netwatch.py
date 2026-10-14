@@ -74,10 +74,12 @@ class NetWatchConfig:
     http_timeout: float = 5.0
     tcp_timeout: float = 3.0
 
-    # Polling: 5 s base, rising to 60 s while unhealthy.
+    # Polling: 60 s while healthy (#109: an idle daemon probed the internet and every provider each 5 s); an outage
+    # is watched from 5 s, backing off toward 60 s while it lasts.
     base_interval: float = 5.0
     max_interval: float = 60.0
     backoff_factor: float = 2.0
+    healthy_interval: float = 60.0
 
     # Per-provider probe: HEAD/GET against base_url + path with a short timeout.
     provider_probe_path: str = "/v1/models"
@@ -387,17 +389,23 @@ class NetWatch:
                     self._wakeup.clear()
                 except TimeoutError:
                     pass
+                was_usable = self._state.usable_for_llm
                 await self._probe_all()
-                # 5 s while healthy, backoff (×2) toward 60 s while bad.
-                self._interval = (
-                    self.config.base_interval
-                    if self._state.usable_for_llm
-                    else min(self._interval * self.config.backoff_factor, self.config.max_interval)
-                )
+                self._interval = self._next_interval(was_usable)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - monitor must never crash
                 logger.debug("NetWatch monitor error: %s", e)
+
+    def _next_interval(self, was_usable: bool) -> float:
+        """The wait before the next probe round: ``healthy_interval`` while the state is usable; ``base_interval``
+        right after a usable -> unusable transition (the outage is watched closely at first), then backoff (×factor)
+        toward ``max_interval`` while it lasts."""
+        if self._state.usable_for_llm:
+            return self.config.healthy_interval
+        if was_usable:
+            return self.config.base_interval
+        return min(self._interval * self.config.backoff_factor, self.config.max_interval)
 
     async def _nm_watch_loop(self) -> None:
         """Poll nmcli for NetworkManager state changes; re-probe immediately on change."""
