@@ -119,7 +119,7 @@ def _read(path: Path, text: str | None = None, *, project: Path | None = None) -
     when ``path`` is the user's own config (a session in ``~`` with ``K3CODE_HOME=~/.k3code`` sees it as the project's):
     that is theirs, aliases and a link to a dotfiles repo included."""
     if project is not None and trust.project_dir_of(path) is None:
-        project = None
+        path, project = user_config_path(), None
     with contextlib.suppress(OSError, ValueError, yaml.YAMLError, RecursionError):
         if project is not None:
             return _read_project(path, project, text)

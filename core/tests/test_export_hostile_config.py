@@ -157,3 +157,84 @@ def test_export_from_home_reads_the_user_config_as_the_user_wrote_it(tmp_path: P
     out = _export(tmp_path, home, True)
     with tarfile.open(out) as tar:
         assert b"max_tokens" in tar.extractfile("settings/user.config.yaml").read()
+
+
+def _setup_603(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
+    k3home = tmp_path / "home" / ".k3code"
+    k3home.mkdir(parents=True)
+    (k3home / "config.yaml").write_text("model: x\n")
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    proj = tmp_path / "proj"
+    (proj / ".k3code").mkdir(parents=True)
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text(f"note: {MARK}\n")
+    return k3home, proj, outside
+
+
+def _relink_603(link: Path, target: Path) -> None:
+    link.unlink()
+    link.symlink_to(target)
+
+
+def _exported_mark_603(tmp_path: Path, proj: Path) -> bool:
+    out = tmp_path / "x.k3bundle"
+    write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=proj, session_ids=[], settings=True)
+    with tarfile.open(out) as tar:
+        return MARK.encode() in tar.extractfile("settings/project.config.yaml").read()
+
+
+def test_containment_holds_when_a_resolved_name_turns_into_a_link_before_the_stat(tmp_path: Path, monkeypatch) -> None:
+    """open lands on the outside file through proj/inner.yaml; the name is a regular file while it is resolved and a
+    link out again when the resolved name is stat'ed."""
+    _, proj, outside = _setup_603(tmp_path, monkeypatch)
+    keep = proj / "keep.yaml"
+    keep.write_text("note: inside\n")
+    inner = proj / "inner.yaml"
+    inner.symlink_to(outside)
+    (proj / ".k3code" / "config.yaml").symlink_to(inner)
+    real_open, real_stat = os.open, os.stat
+
+    def open_(path, *a, **kw):
+        if not str(path).endswith(".k3code/config.yaml"):
+            return real_open(path, *a, **kw)
+        _relink_603(inner, outside)  # every open (trust's own read too) lands outside
+        fd = real_open(path, *a, **kw)
+        inner.unlink()
+        os.link(keep, inner)  # a regular in-project file while the name is resolved
+        return fd
+
+    def stat_(path, *a, **kw):
+        if str(path) == str(inner.resolve()) and not inner.is_symlink():
+            _relink_603(inner, outside)  # and a link out again for the stat
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(trust.os, "open", open_)
+    monkeypatch.setattr(trust.os, "stat", stat_)
+    try:
+        assert not _exported_mark_603(tmp_path, proj)
+    except BundleError as e:
+        assert MARK not in str(e)
+
+
+def test_a_link_to_the_user_config_while_it_is_checked_does_not_unlock_the_plain_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """config.yaml points at the user's config while _read asks whether it is the user's, and out of the project
+    when it is read."""
+    k3home, proj, outside = _setup_603(tmp_path, monkeypatch)
+    cfg = proj / ".k3code" / "config.yaml"
+    cfg.symlink_to(outside)
+    real = trust.project_dir_of
+
+    def project_dir_of(path):
+        _relink_603(cfg, k3home / "config.yaml")
+        try:
+            return real(path)
+        finally:
+            _relink_603(cfg, outside)
+
+    monkeypatch.setattr(trust, "project_dir_of", project_dir_of)
+    try:
+        assert not _exported_mark_603(tmp_path, proj)
+    except BundleError as e:
+        assert MARK not in str(e)
