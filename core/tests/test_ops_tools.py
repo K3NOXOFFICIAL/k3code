@@ -723,16 +723,17 @@ def test_sandbox_refuses_roots_that_expose_home_ssh_or_the_k3code_home(tmp_path,
     assert sandbox.build_argv(home / "project", home=home, bwrap="/usr/bin/bwrap")[0] == "/usr/bin/bwrap"
 
 
-def test_git_metadata_is_bound_read_only(tmp_path):
+def test_git_metadata_is_bound_read_only_when_git_writable_is_off(tmp_path):
     from m1cmd_helpers import git_repo
 
     repo = git_repo(tmp_path / "repo").resolve()
-    joined = " ".join(sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap", git_writable=False)
+    joined = " ".join(argv)
     assert f"--bind {repo} {repo}" in joined
     assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined
 
 
-def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
+def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only_when_git_writable_is_off(tmp_path):
     from m1cmd_helpers import git_repo
 
     repo = git_repo(tmp_path / "repo").resolve()
@@ -740,7 +741,8 @@ def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
     subprocess.run(
         ["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True, capture_output=True
     )
-    joined = " ".join(sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    argv = sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap", git_writable=False)
+    joined = " ".join(argv)
     gitdir = (repo / ".git" / "worktrees" / "child1").resolve()
     assert f"--ro-bind {gitdir} {gitdir}" in joined  # the linked worktree's admin dir lives outside the checkout
     assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined  # the common dir holds the objects
