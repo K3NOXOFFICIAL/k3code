@@ -542,12 +542,28 @@ class AgentLoop:
             home_rooted
             and decision.action == "allow"
             and not decision.auto_allowed
+            and not decision.sandbox_only
             and decision.rule is not None
             and decision.rule.action == "allow"
             and decision.rule.layer == 0
             and home_read_only(str(args.get("command", "")))
             and sandbox.readonly_home_ok(self.cwd, self.permissions.add_dirs)
         )
+        # A test/build/lint command the builtin rules allow only inside the sandbox (accept-edits and auto): it runs
+        # sandboxed when the sandbox can contain it, else a person approves it (and it runs as the mode runs bash).
+        contained = (
+            tool_call.name == "bash"
+            and decision.sandbox_only
+            and decision.action == "allow"
+            and await asyncio.to_thread(self._can_contain)
+        )
+        if decision.sandbox_only and decision.action == "allow" and not contained and not home_rooted:
+            decision = replace(
+                decision,
+                action="ask",
+                sandbox_only=False,
+                message="no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host",
+            )
         if home_rooted and not readonly_home:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
@@ -607,6 +623,8 @@ class AgentLoop:
                     argv = await asyncio.to_thread(
                         sandbox.build_argv, self.cwd, self.permissions.add_dirs, readonly_home=True
                     )
+                elif contained:
+                    argv = await asyncio.to_thread(self._contained_argv)
                 else:
                     argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
                 result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
@@ -769,6 +787,16 @@ class AgentLoop:
             self.on_unsandboxed()
         except Exception:  # noqa: BLE001 - a notice must never break a turn
             logger.warning("unsandboxed notice failed", exc_info=True)
+
+    def _can_contain(self) -> bool:
+        """The bwrap sandbox can run a bash call here: bwrap is usable and it accepts the session's roots."""
+        return sandbox.usable() and sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is None
+
+    def _contained_argv(self) -> list[str]:
+        """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode."""
+        unattended = self.background or self.unattended
+        network = self.unattended_network if unattended else True
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
