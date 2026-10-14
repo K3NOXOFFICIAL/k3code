@@ -272,6 +272,23 @@ async def test_continuations_of_an_implicit_goal_skip_the_scope_gate(tmp_path, m
     await server.close()
 
 
+async def test_continuations_of_an_explicit_goal_skip_the_scope_gate_too(tmp_path, monkeypatch):
+    """A /goal's continuation turns re-ran the scope gate (classifier, and for a medium task the strong-tier planner,
+    advisor and proposer) every turn. Like an implicit goal's, they are the same task: gated once, on the first turn."""
+    asked = _classify_as(monkeypatch, "small")
+    autonomy = {"advisor_on_goal": False, "proposals": False}
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "step 2", "all built"], autonomy=autonomy, permission_mode="auto"
+    )
+    server.goal_judge = scripted_judge(["continue", "continue", "done"])
+    mgr.set("build the parser")
+    status, text = await server._run_turn(live, "go")
+    assert status == "done" and text == "all built"
+    assert provider.n == 3 and asked == ["go"]  # gated once, not again for the two continuations
+    assert mgr.state is not None and mgr.state.status == "done" and not mgr.state.implicit
+    await server.close()
+
+
 async def test_the_turn_cap_ends_an_implicit_goal_with_a_notice(tmp_path, monkeypatch):
     autonomy = {**DEFAULT, "auto_continue_max_turns": 2}
     server, provider, live, mgr = await _setup(

@@ -1874,12 +1874,10 @@ class GatewayServer:
             return
         self.emit_goal(session)
 
-    def _implicit_continuation(self, session: LiveSession) -> bool:
-        """The turn running is an implicit goal's continuation (not a /goal's: those keep their scope gate)."""
-        if not session.goal_continuation:
-            return False
-        state = self.goal_manager(session).state
-        return state is not None and state.implicit
+    def _goal_continuation(self, session: LiveSession) -> bool:
+        """The turn running is a goal's judge-driven continuation (implicit or /goal): the same task, gated once on
+        the goal's first turn. A gate here re-ran the classifier, the strong-tier planner and its hooks every turn."""
+        return session.goal_continuation and self.goal_manager(session).state is not None
 
     @staticmethod
     def _gate_ended_task(gate: GateResult | None) -> bool:
@@ -2225,8 +2223,8 @@ class GatewayServer:
                 hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
-                # an implicit goal's continuation is the same task: its prompt was gated (and any plan approved) once
-                if not hooked.blocked and not self._implicit_continuation(session):
+                # a goal's continuation is the same task: its prompt was gated (and any plan approved) once
+                if not hooked.blocked and not self._goal_continuation(session):
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
                     session.turn_gate = gate
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
