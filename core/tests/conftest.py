@@ -96,6 +96,13 @@ def _audit(event: str, args: tuple) -> None:
 sys.addaudithook(_audit)
 
 
+def pytest_collection_modifyitems(items):
+    """A test on the host's real systemd programs runs in the serial lane (``-m serial``), not next to the others."""
+    for item in items:
+        if item.get_closest_marker("real_systemd") is not None:
+            item.add_marker(pytest.mark.serial)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def home_sentinel(tmp_path_factory):
     """Suite-level sentinel: every test's writes are checked against the real home (see ``_audit``)."""
@@ -190,6 +197,17 @@ def _no_real_dns(monkeypatch):
         return [str(i[4][0]) for i in infos]
 
     monkeypatch.setattr(net_guard, "_resolve", resolve)
+
+
+@pytest.fixture(autouse=True)
+def _no_host_secrets(monkeypatch):
+    """No test sees the host's secret-named variables (``*_TOKEN``, ``*_KEY``, ...): ``secret_values()`` reads them,
+    and a failing assertion on its result would print them to the terminal and the CI log (K3NOX-496). A test that
+    needs one sets a fake value of its own."""
+    from k3code.debugdump import _SECRET_NAME
+
+    for name in [n for n in os.environ if _SECRET_NAME.search(n)]:
+        monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
