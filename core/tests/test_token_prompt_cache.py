@@ -37,7 +37,7 @@ def breakpoints(payload: dict) -> int:
     return json.dumps(payload).count('"cache_control"')
 
 
-def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
+def test_the_anthropic_payload_marks_system_last_tool_newest_message_and_previous_request_end():
     p = AnthropicProvider(name="a", api_key="k")
     payload = p._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)
     eph = {"type": "ephemeral"}
@@ -45,8 +45,28 @@ def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
     assert payload["tools"][-1]["cache_control"] == eph and "cache_control" not in payload["tools"][0]
     last = payload["messages"][-1]["content"][-1]
     assert last["type"] == "tool_result" and last["cache_control"] == eph
-    assert all("cache_control" not in b for m in payload["messages"][:-1] for b in m["content"])
-    assert breakpoints(payload) == 3 <= 4
+    # the previous request ended at the message before the newest assistant message (#168)
+    assert payload["messages"][0]["content"] == [{"type": "text", "text": "look at a.py", "cache_control": eph}]
+    assert "cache_control" not in json.dumps(payload["messages"][1])
+    assert breakpoints(payload) == 4
+
+
+def test_a_step_with_many_parallel_tool_calls_keeps_a_breakpoint_where_the_previous_request_ended():
+    """#168: the API looks for an earlier cache entry only about 20 blocks back; 12 parallel calls add 25 blocks."""
+    calls = [ToolCall(id=f"c{i}", name="read", arguments={"path": f"{i}.py"}) for i in range(12)]
+    msgs = [
+        *conversation(),
+        Message(role="assistant", content="reading all", tool_calls=calls),
+        *[Message(role="tool", content=f"r{i}", tool_call_id=f"c{i}", name="read") for i in range(12)],
+    ]
+    payload = AnthropicProvider(name="a", api_key="k")._payload(
+        msgs, TOOLS, "claude-test", max_tokens=100, temperature=None
+    )
+    newest = max(i for i, m in enumerate(payload["messages"]) if m["role"] == "assistant")
+    before = payload["messages"][newest - 1]["content"][-1]
+    assert before["type"] == "tool_result" and before["tool_use_id"] == "c1"
+    assert before["cache_control"] == {"type": "ephemeral"}
+    assert breakpoints(payload) == 4
 
 
 def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_empty_text():
@@ -61,7 +81,8 @@ def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_e
     assert breakpoints(empty) == 0 and "system" not in empty
     silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]
     payload = p._payload(silent, [], "claude-test", max_tokens=100, temperature=None)
-    assert breakpoints(payload) == 1  # the system prompt only: never on an empty tool result
+    # the system prompt and the previous request's end (the user message), never on an empty tool result
+    assert breakpoints(payload) == 2
 
 
 def test_prompt_cache_off_sends_no_breakpoints():

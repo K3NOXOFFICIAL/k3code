@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,9 @@ if TYPE_CHECKING:  # annotations only: the engine is imported inside the functio
 # The gateway and the daemon set their own level (force=True) because this runs first, at import.
 logging.basicConfig(level=os.environ.get("K3CODE_LOG_LEVEL", "WARNING").upper(), format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+#: the journal/transcript name of a headless run that was given no ``--session``
+HEADLESS_SESSION = "headless"
 
 
 def _resolve_model_specs(config: Any) -> list[str | list[str]]:
@@ -161,12 +165,16 @@ async def _run_headless(
     permission_mode: PermissionMode,
     config: Any,
     json_output: bool,
-    session: str = "headless",
+    session: str | None = None,
     resume: bool = False,
     project_dir: Path | None = None,
     max_wait: float | None = None,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict.
+
+    ``session`` names the journal and transcript (default ``headless``, so ``--resume`` finds the last run). The run's
+    own id, which the prompt overlay's A/B arm and the usage rows use, is that name when given and otherwise unique:
+    all unnamed runs used to be one session, one pooled A/B sample.
 
     ``max_wait`` is the ``--max-wait`` flag; see :func:`_headless_max_wait` for the default.
     """
@@ -186,12 +194,14 @@ async def _run_headless(
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config, session_id=session)
+    run_id = session or f"{HEADLESS_SESSION}-{uuid.uuid4().hex[:8]}"
+    session = session or HEADLESS_SESSION
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config, session_id=run_id)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
     cooldowns = CooldownStore(path=_cooldown_path())
-    usage = _HeadlessUsage(session)
+    usage = _HeadlessUsage(run_id)
     router = Router(chain, cooldowns=cooldowns, on_event=usage.on_router_event, **router_options(config))
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
@@ -689,7 +699,7 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
     help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
-@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--session", "session", default=None, help="Session id (journal + transcript name; default: headless)")
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option(
     "--max-wait",
@@ -712,7 +722,7 @@ def main(
     model: str | None,
     permission: str | None,
     json_output: bool,
-    session: str,
+    session: str | None,
     resume: bool,
     max_wait: float | None,
     config_dir: Path | None,
@@ -983,7 +993,7 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
     help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
-@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--session", "session", default=None, help="Session id (journal + transcript name; default: headless)")
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
@@ -1001,7 +1011,7 @@ def cli(
     model: str | None,
     permission: str | None,
     json_output: bool,
-    session: str,
+    session: str | None,
     resume: bool,
     config_dir: Path | None,
     repl: bool,

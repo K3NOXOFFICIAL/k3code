@@ -207,6 +207,30 @@ done
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(("redirect", "passed"), [(True, True), (False, False)], ids=["redirected", "console"])
+def test_install_ps1_passes_yes_when_its_output_is_redirected(tmp_path: Path, redirect: bool, passed: bool) -> None:
+    # wsl.exe hands install.sh a terminal even then, and install.sh would ask about sudo where nobody can answer
+    seen = tmp_path / "wsl-args"
+    wsl = tmp_path / "wsl"
+    wsl.write_text(FAKE_WSL.replace("while [ $# -gt 0 ]", f'printf "%s\\n" "$*" >>"{seen}"\nwhile [ $# -gt 0 ]', 1))
+    wsl.chmod(0o755)
+    script = REPO / "install" / "install.ps1"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{script}' --check; exit $LASTEXITCODE"]
+    if redirect:
+        subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    else:
+        # a pty on input and output is a console as far as .NET can tell
+        master, slave = os.openpty()
+        try:
+            subprocess.run(cmd, env=env, stdin=slave, stdout=slave, stderr=slave, check=False, start_new_session=True)
+        finally:
+            os.close(master)
+            os.close(slave)
+    assert ("--yes" in seen.read_text()) is passed
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
 @pytest.mark.parametrize("docker_default", [False, True], ids=["ubuntu-default", "docker-desktop-default"])
 # Legacy is how Windows PowerShell 5.1 (the `powershell` every Windows has) passes arguments: embedded double quotes
 # unescaped, so the `cd "$(wslpath -a "$1")"` command reached sh cut apart and the install died with a syntax error.
@@ -525,6 +549,31 @@ def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
     assert "installed but cannot create a sandbox" in r.stderr
 
 
+APPARMOR_TEXT = "Ubuntu restricts user namespaces with AppArmor"
+
+
+@linux_only
+@pytest.mark.parametrize(("value", "named"), [("1", True), ("0", False)])
+def test_bwrap_unusable_names_the_apparmor_restriction(tmp_path: Path, value: str, named: bool) -> None:
+    # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1; the text is the one `k3code doctor` prints
+    bwrap = stub_bin(tmp_path, "bwrap", "exit 1\n")
+    sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+    sysctl.write_text(value + "\n")
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--from-source",
+        "--yes",
+        env_extra={"K3_BWRAP": str(bwrap / "bwrap"), "K3_APPARMOR_USERNS": str(sysctl)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "installed but cannot create a sandbox" in r.stderr
+    assert (APPARMOR_TEXT in r.stderr) is named
+    if named:
+        assert f"profile bwrap {bwrap / 'bwrap'} flags=(unconfined) {{ userns, }}" in r.stderr
+        assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in r.stderr
+
+
 @linux_only
 def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
     bwrap = stub_bin(tmp_path, "bwrap", "exit 0\n")
@@ -624,7 +673,8 @@ def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> N
     private = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
     cases = {offline: "no network", private: "private or needs credentials"}
     for i, (text, phrase) in enumerate(cases.items()):
-        body = f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
+        # the subcommand only: the checkout now sits under HOME, whose path (this test's name) holds "fetch" too
+        body = f'case "$*" in *" fetch "*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
         stubs = stub_bin(tmp_path / f"case{i}", "git", body)
         home = tmp_path / f"home{i}"
         home.mkdir()
@@ -656,6 +706,93 @@ def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> N
     assert r.returncode != 0
     assert "could not download uv" in r.stderr
     assert list(tmpdir.glob("k3code-uv.*")) == []
+
+
+def _go_wanted() -> str:
+    """The Go release panes/go.mod asks for, named as install.sh's go_wanted names it."""
+    m = re.search(r"^go (\d+\.\d+(?:\.\d+)?)$", (REPO / "panes" / "go.mod").read_text(), re.MULTILINE)
+    assert m is not None
+    v = m.group(1)
+    return v if v.count(".") == 2 else f"{v}.0"
+
+
+@linux_only
+@pytest.mark.parametrize("runs", [True, False], ids=["go-runs", "go-does-not-run"])
+def test_a_fetched_go_is_staged_in_the_install_root_and_checked_by_running_it(tmp_path: Path, runs: bool) -> None:
+    # Issue #116: on a noexec TMPDIR, `[ -x go ]` said no for a good download, and the warning blamed the checksum.
+    # Go is now unpacked under DATA/tmp and accepted only when `go version` runs.
+    gv = _go_wanted()
+    home = tmp_path / "home"
+    home.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    ran = tmp_path / "go-ran.log"
+    pkg = tmp_path / "pkg"
+    (pkg / "go" / "bin").mkdir(parents=True)
+    fake_go = pkg / "go" / "bin" / "go"
+    version = f'echo "go version go{gv} linux/amd64"' if runs else "exit 1"
+    fake_go.write_text(
+        f'#!/bin/sh\necho "$0" >>"{ran}"\n'
+        f'if [ "$1" = version ]; then {version}; exit 0; fi\n'
+        'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then : >"$2"; chmod 755 "$2"; fi; shift; done\n'
+    )
+    fake_go.chmod(0o755)
+    tarballs = {}
+    for arch in ("amd64", "arm64"):
+        name = f"go{gv}.linux-{arch}.tar.gz"
+        subprocess.run(["tar", "-czf", str(tmp_path / name), "-C", str(pkg), "go"], check=True)
+        tarballs[name] = subprocess.run(
+            ["sha256sum", str(tmp_path / name)], capture_output=True, text=True, check=True
+        ).stdout.split()[0]
+    releases = tmp_path / "releases.json"
+    releases.write_text(
+        "".join(f'{{\n"filename": "{n}",\n"sha256": "{s}"\n}}\n' for n, s in tarballs.items()),
+    )
+    curl = stub_bin(
+        tmp_path,
+        "curl",
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        'case "$url" in\n'
+        f'  *mode=json*) cp "{releases}" "$out" ;;\n'
+        f'  https://go.dev/dl/go*) cp "{tmp_path}/${{url##*/}}" "$out" ;;\n'
+        "  *) exit 22 ;;\n"
+        "esac\n",
+    )
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _path_without(tmp_path, "go"), "TMPDIR": str(tmpdir)},
+        drop=("K3_SKIP_GO", "K3_NO_DOWNLOAD"),
+        path_front=curl,
+    )
+    assert r.returncode == 0, r.stderr
+    data = home / DATA_REL
+    probes = ran.read_text().splitlines() if ran.exists() else []
+    assert probes and probes[0].startswith(f"{data}/tmp/k3code-go."), probes  # run where it was unpacked
+    assert list(tmpdir.iterdir()) == []
+    assert not (data / "tmp").exists()  # the stage dir goes with the run
+    if runs:
+        assert (data / "go" / f"go{gv}" / "bin" / "go").is_file()
+        assert "WARNING" not in r.stderr.split("fetching Go", 1)[1].split("\n", 2)[1]
+    else:
+        assert not (data / "go" / f"go{gv}").exists()
+        assert "the downloaded Go does not run here" in r.stderr
+        assert "did not match the sha256" not in r.stderr
+
+
+def test_a_stale_lock_takes_the_stage_dir_the_killed_install_left(tmp_path: Path) -> None:
+    # SIGKILL skips the trap: a from-git checkout or a Go unpacked in DATA/tmp stays until the next run takes the lock
+    lock = _stale_lock(tmp_path)
+    left = tmp_path / DATA_REL / "tmp" / "k3code-go.Ab12Cd" / "go"
+    left.mkdir(parents=True)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "the build scratch an interrupted install left" in r.stderr
+    assert not (tmp_path / DATA_REL / "tmp").exists()
+    assert not lock.exists()
 
 
 def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
@@ -1055,12 +1192,16 @@ def test_a_sigkilled_from_git_install_leaves_nothing_in_tmpdir_once_the_next_run
     killed = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env, path_front=killer)
     assert killed.returncode == -signal.SIGKILL, killed.stderr
     left = sorted(p.name.rpartition(".")[0] for p in tmp.iterdir())
-    assert left == ["k3code-giterr", "k3code-src"], left  # the run really was killed with its scratch in place
+    assert left == ["k3code-giterr"], left  # the run really was killed with its scratch in place
+    # the checkout, where the TUI and k3 build, is staged in DATA/tmp (a noexec TMPDIR cannot run them, issue #116)
+    stage = tmp_path / DATA_REL / "tmp"
+    assert sorted(p.name.rpartition(".")[0] for p in stage.iterdir()) == ["k3code-src"]
     assert (tmp_path / DATA_REL / ".install.lock").is_dir()
     again = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env)
     assert again.returncode == 0, again.stderr
     assert "taking over the install lock" in again.stderr
     assert list(tmp.iterdir()) == []
+    assert not stage.exists()
     assert not (tmp_path / DATA_REL / ".install.lock").exists()
 
 
@@ -1303,6 +1444,51 @@ def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path
     else:
         assert not sudo_log.exists()
         assert "needs root to install" in text
+
+
+@linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+def test_bwrap_install_is_not_asked_when_stdout_and_stderr_are_redirected(tmp_path: Path) -> None:
+    # wsl.exe gives the Linux side a terminal even for a redirected install.ps1: nobody sees the question, so none is
+    # asked (it used to wait forever)
+    sudo_log = tmp_path / "sudo.log"
+    stubs = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    stub_bin(tmp_path, "dnf", "exit 0\n")
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{_path_without(tmp_path, 'bwrap')}",
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "K3_STUB_VENV": "1",
+        "K3_SKIP_TUI": "1",
+        "K3_SKIP_GO": "1",
+        "K3_NO_GH": "1",
+    }
+    master, slave = os.openpty()
+    log = tmp_path / "install.log"
+    try:
+        with log.open("wb") as out:
+            proc = subprocess.Popen(
+                ["setsid", "--ctty", "sh", str(INSTALL), "--from-source", "--minimal"],
+                stdin=slave,  # the controlling terminal is there and /dev/tty opens; only the output is redirected
+                stdout=out,
+                stderr=out,
+                env=env,
+            )
+            try:
+                rc = proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
+                pytest.fail(f"the installer waited for an answer nobody could see:\n{log.read_text(errors='replace')}")
+    finally:
+        os.close(master)
+        os.close(slave)
+    text = log.read_text(errors="replace")
+    assert rc == 0, text
+    assert "Install bubblewrap now with sudo" not in text
+    assert not sudo_log.exists()
+    assert "needs root to install" in text
 
 
 def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
@@ -2025,9 +2211,9 @@ def test_no_install_deps_docs_say_toolchains_only(tmp_path: Path) -> None:
         assert not re.search(r"fetch(es)? nothing|install nothing|all fetching", text, re.I), text
 
 
-def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
-    # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
-    # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
+def test_the_tui_builds_in_the_stage_dir_not_in_tmpdir(tmp_path: Path) -> None:
+    # npm ci runs the postinstall binaries it unpacks, which a noexec TMPDIR refuses (issue #116): the build dir is a
+    # k3code-tui.X in DATA/tmp, recorded in the lock, and a TMPDIR ending in "/" plays no part
     src = _mini_checkout(tmp_path)
     (src / "tui").mkdir()
     (src / "tui" / "package.json").write_text("{}\n")
@@ -2054,8 +2240,10 @@ def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path:
     )
     assert r.returncode == 0, r.stderr
     recorded = (seen / "tui_tmp").read_text().strip()
-    assert re.fullmatch(re.escape(f"{tmp}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
+    stage = tmp_path / DATA_REL / "tmp"
+    assert re.fullmatch(re.escape(f"{stage}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
     assert (seen / "cwd").read_text().strip().startswith(recorded + "/")
+    assert list(tmp.iterdir()) == []
 
 
 @linux_only
@@ -2075,6 +2263,28 @@ def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> N
     assert mark.read_text().strip() == "start-first"
 
 
+def _link_farm(farm: Path, dirs: list[str], skip: tuple[str, ...]) -> Path:
+    """FARM: a directory linking every entry of DIRS (first one wins) except the SKIP names."""
+    farm.mkdir()
+    for d in dirs:
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                # lexists: a dangling link in a directory listed twice is already there, however exists() sees it
+                if entry.name not in skip and not os.path.lexists(farm / entry.name):
+                    (farm / entry.name).symlink_to(entry)
+    return farm
+
+
+def test_link_farm_takes_a_dangling_link_in_a_directory_listed_twice_once(tmp_path: Path) -> None:
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "tool").write_text("")
+    (d / "gone").symlink_to(tmp_path / "missing")  # dangling, like /usr/local/bin/orca on kokadock
+    farm = _link_farm(tmp_path / "farm", [str(d), str(d)], skip=("tool",))
+    assert [p.name for p in farm.iterdir()] == ["gone"]
+    assert os.readlink(farm / "gone") == str(d / "gone")
+
+
 def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
     # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
     nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
@@ -2084,13 +2294,7 @@ def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) ->
     (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     (src / "VERSION").write_text("9.9.9\n")
     shutil.copy(INSTALL, src / "install" / "install.sh")
-    farm = tmp_path / "farm"
-    farm.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        if d and Path(d).is_dir():
-            for entry in Path(d).iterdir():
-                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
-                    (farm / entry.name).symlink_to(entry)
+    farm = _link_farm(tmp_path / "farm", os.environ["PATH"].split(os.pathsep), skip=("sha256sum", "shasum", "git"))
     home = tmp_path / "home"
     home.mkdir()
     r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})
