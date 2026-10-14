@@ -65,6 +65,17 @@ def _cooldown_path() -> Path:
     return _current_home() / "cooldowns.json"
 
 
+#: Reliability waits a ``-p`` or REPL run reports on stderr: the INFO log line was invisible at the default level, so
+#: a run that paused or parked looked hung (#108).
+_WAIT_NOTICES = {
+    "reliability.paused": "paused",
+    "reliability.parked": "parked",
+    "reliability.resumed": "resumed",
+    "reliability.unparked": "unparked",
+    "reliability.gave_up": "gave up",
+}
+
+
 def _print_event(event: RouterEvent) -> None:
     if event.kind == "router.attempt":
         logger.debug("Attempt %d: %s/%s", event.attempt, event.provider, event.model)
@@ -72,6 +83,14 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("Failover: %s/%s (reason: %s) — %s", event.provider, event.model, event.reason, event.detail)
     elif event.kind == "router.exhausted":
         logger.warning("Chain exhausted: %s", event.detail)
+    elif (word := _WAIT_NOTICES.get(event.kind)) is not None:
+        data = getattr(event, "data", None) or {}  # a ReliabilityEvent
+        line = f"[k3code] {word}: {event.detail}"
+        if event.kind == "reliability.parked" and "delay" in data:
+            line += f"; next try in {data['delay']:.0f}s"
+        elif event.kind == "reliability.gave_up":
+            line += " (--max-wait or reliability.max_wait sets the limit)"
+        sys.stderr.write(line + "\n")
     elif event.kind.startswith(("reliability.", "net.state")):
         # M2: reliability events surface as info lines.
         logger.info("%s %s", event.kind, event.detail)
@@ -100,6 +119,33 @@ def _build_reliability(config: Any, session: str) -> Reliability:
     return build_reliability(config, session=session, home=k3code_home())
 
 
+#: How long a ``-p`` run waits for a provider (paused offline, or parked with every provider down) before it gives up.
+HEADLESS_MAX_WAIT = 300.0
+
+
+def _headless_max_wait(flag: float | None, config: Any) -> float | None:
+    """The wait bound of a headless run: ``--max-wait``, else ``reliability.max_wait`` when the config sets the key,
+    else 5 minutes; 0 (or a null config value) waits for ever, the ``max_turns: 0`` idiom. Waiting for ever used to
+    be the only behaviour, so a cron job whose provider was down hung until something killed it (#108)."""
+    if flag is None:
+        raw = getattr(config, "reliability", None) or {}
+        flag = raw.get("max_wait", HEADLESS_MAX_WAIT)
+    if flag is None:
+        return None
+    return float(flag) or None
+
+
+def _gave_up_result(exc: Exception, event: dict[str, Any], cause: str) -> dict[str, Any]:
+    """The result of a run that waited its bound out; ``main`` exits 75 (EX_TEMPFAIL) on it, so a scheduler retries."""
+    waited = float(event.get("waited") or 0)
+    return {
+        "error": "gave_up",
+        "message": f"gave up after {waited:.0f}s waiting for a provider: {exc}",
+        "waited": waited,
+        "cause": cause,
+    }
+
+
 async def _reap_jobs(session: str) -> None:
     """Kill the run's background bash jobs: their process groups (start_new_session) would outlive the CLI."""
     from k3code.tools import jobs
@@ -118,8 +164,12 @@ async def _run_headless(
     session: str = "headless",
     resume: bool = False,
     project_dir: Path | None = None,
+    max_wait: float | None = None,
 ) -> dict[str, Any] | None:
-    """Run headless mode and return final result dict."""
+    """Run headless mode and return final result dict.
+
+    ``max_wait`` is the ``--max-wait`` flag; see :func:`_headless_max_wait` for the default.
+    """
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -129,6 +179,7 @@ async def _run_headless(
     from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
+    from k3code.reliability.events import GAVE_UP
     from k3code.reliability.persistent_retry import TurnCancelled
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
@@ -146,6 +197,10 @@ async def _run_headless(
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
     reliability = _build_reliability(config, session=session)
     reliability.register_providers(chain)
+    # the retry wrapper is built from retry_config when AgentLoop attaches the router: bound the wait before that
+    reliability.retry_config.max_wait = _headless_max_wait(max_wait, config)
+    gave_up: dict[str, Any] = {}
+    reliability.events.add(lambda ev: gave_up.update(ev.data) if ev.kind == GAVE_UP else None)
 
     loop = AgentLoop(
         router,
@@ -214,8 +269,12 @@ async def _run_headless(
             }
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
+        if gave_up:
+            return _gave_up_result(e, gave_up, "all_providers_unreachable")
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
     except ChainExhausted as e:
+        if gave_up:
+            return _gave_up_result(e, gave_up, "chain_exhausted")
         return {"error": "chain_exhausted", "message": str(e), "last_reason": e.last_reason}
     except ContextOverflow as e:
         return {"error": "context_overflow", "message": str(e)}
@@ -632,6 +691,14 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
+@click.option(
+    "--max-wait",
+    "max_wait",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Headless: seconds to wait for a provider (offline, or every provider down) before giving up with exit "
+    "code 75; 0 waits for ever. Default: reliability.max_wait from the config, else 300",
+)
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
 @click.option(
@@ -647,6 +714,7 @@ def main(
     json_output: bool,
     session: str,
     resume: bool,
+    max_wait: float | None,
     config_dir: Path | None,
     repl: bool,
     stdio_flag: bool,
@@ -715,6 +783,7 @@ def main(
                 session=session,
                 resume=resume,
                 project_dir=project_dir,
+                max_wait=max_wait,
             )
         )
         if json_output and result:
@@ -724,7 +793,9 @@ def main(
                 sys.stdout.write("\n")  # the streamed answer: end it so the shell prompt starts on its own line
             if "error" in result:
                 click.echo(f"k3code: error: {result.get('message') or result['error']}", err=True)
-        sys.exit(0 if result and "error" not in result else 1)
+        if result and "error" not in result:
+            sys.exit(0)
+        sys.exit(75 if result and result.get("error") == "gave_up" else 1)  # EX_TEMPFAIL: a scheduler tries again
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config, project_dir=project_dir))
@@ -754,16 +825,23 @@ def _offer_project_trust(project_dir: Path) -> None:
     trust.record(project_dir, trusted=answer)
 
 
-def _run_gateway() -> None:
-    """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
-    import asyncio
-
+def _configure_service_logging() -> None:
+    """The gateway and the daemon log at INFO on stderr. httpx logs one INFO line per request, and an idle daemon
+    makes one per probe (#109): its logger stays at WARNING, as ``k3code doctor`` keeps it."""
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,  # the import-time basicConfig above already installed a handler
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _run_gateway() -> None:
+    """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
+    import asyncio
+
+    _configure_service_logging()
     from k3code.gateway.server import GatewayServer
 
     async def _serve() -> None:
@@ -909,6 +987,14 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
+@click.option(
+    "--max-wait",
+    "max_wait",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Headless: seconds to wait for a provider (offline, or every provider down) before giving up with exit "
+    "code 75; 0 waits for ever. Default: reliability.max_wait from the config, else 300",
+)
 def cli(
     ctx: click.Context,
     prompt: str | None,
@@ -919,6 +1005,7 @@ def cli(
     resume: bool,
     config_dir: Path | None,
     repl: bool,
+    max_wait: float | None,
 ) -> None:
     """k3code — terminal coding agent."""
     if ctx.invoked_subcommand is None:
@@ -939,6 +1026,7 @@ def cli(
             json_output=json_output,
             session=session,
             resume=resume,
+            max_wait=max_wait,
             config_dir=config_dir,
             repl=repl,
             stdio_flag=False,
@@ -1053,12 +1141,7 @@ def daemon_cmd() -> None:
 
     from k3code.daemon import DaemonAlreadyRunning, run_daemon
 
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        force=True,  # the import-time basicConfig above already installed a handler
-    )
+    _configure_service_logging()
     try:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(run_daemon())

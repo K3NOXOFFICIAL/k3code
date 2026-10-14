@@ -329,7 +329,10 @@ class PersistentRetry:
             self._raise_if_cancelled()
             now = self._monotonic()
             if deadline is not None and now >= deadline:
-                raise _MaxWaitExceeded(f"max_wait of {self.config.max_wait:.0f}s exceeded while waiting")
+                waited = float(self.config.max_wait or 0)
+                detail = f"gave up after {waited:.0f}s waiting for a provider"
+                self.events.emit(ev.GAVE_UP, detail=detail, waited=waited)
+                raise _MaxWaitExceeded(f"max_wait of {waited:.0f}s exceeded while waiting")
             if (
                 ready()
                 or (until_ts is not None and now >= until_ts)
