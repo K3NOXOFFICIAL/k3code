@@ -405,7 +405,13 @@ class SubagentManager:
 
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
-        perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
+        perms = PermissionState(
+            mode=PermissionMode(parent.perms.mode),
+            cwd=cwd,
+            add_dirs=list(parent.perms.add_dirs),
+            # a worktree child's cwd is a fresh path under the project: its config rules are the parent project's
+            project_dir=parent.perms.project_dir or parent.perms.cwd,
+        )
         base = build_system_prompt(
             parent.system_prompt,
             cwd=cwd,
