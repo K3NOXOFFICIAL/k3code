@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 from k3code import doctor
 from k3code.permissions import PermissionMode, rules
-from k3code.permissions.state import PermissionState, load_permissions_config, permissions_from_text
+from k3code.permissions.state import UNREADABLE, PermissionState, load_permissions_config, permissions_from_text
 
 #: YAML spellings of an action that is not exactly allow|ask|deny (``no`` is a bool, an empty value is null).
 BAD_ACTIONS = ["Deny", '"deny "', "block", "no", "", "[deny]", "{a: deny}", "1"]
@@ -83,7 +84,34 @@ def test_a_permissions_file_that_cannot_be_read_denies_what_no_rule_allows(tmp_p
     assert _bash(st, "ls") == "allow"  # the builtin read-only allowlist still applies
 
 
-def test_an_unreadable_accepted_recipe_rules_file_fails_closed(tmp_path):
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod 000 file, so it cannot be made unreadable")
+def test_a_permissions_file_the_os_refuses_to_read_denies_what_no_rule_allows(tmp_path):
+    path = _config(tmp_path, 'permissions:\n  bash:\n    "git push *": deny\n')
+    path.chmod(0o000)
+    try:
+        assert path.is_file()
+        parsed, _ = load_permissions_config(path)
+        assert parsed == list(UNREADABLE)
+        st = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path, user_config=path)
+        st.reload()
+        assert _bash(st, "git push origin main") == "deny"
+        assert _bash(st, "ls") == "allow"  # the builtin read-only allowlist still applies
+    finally:
+        path.chmod(0o600)
+
+
+def test_a_permissions_file_that_is_not_utf8_denies_what_no_rule_allows(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b'permissions:\n  bash:\n    "git push *": deny\n# \xff\xfe\n')
+    parsed, _ = load_permissions_config(path)
+    assert parsed == list(UNREADABLE)
+    st = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path, user_config=path)
+    st.reload()
+    assert _bash(st, "git push origin main") == "deny"
+    assert _bash(st, "ls") == "allow"
+
+
+def test_an_accepted_recipe_rules_file_with_an_invalid_action_fails_closed(tmp_path):
     from k3code.learning.projectstate import rules_path
 
     path = rules_path(tmp_path)
