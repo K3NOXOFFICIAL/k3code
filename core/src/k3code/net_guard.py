@@ -9,12 +9,16 @@ or encode, and a name that does not resolve, are refused. ``check_url`` is block
 
 DNS rebinding: ``WebFetcher`` connects through ``GuardedTransport``, whose network backend resolves the name once at
 connect time, vets every answer and connects to a vetted address (TLS SNI and the Host header keep the name), so the
-address that was checked is the address that is reached. Not pinned, stated plainly:
+address that was checked is the address that is reached. For the same reason it never uses a proxy: a proxy would
+look the name up again itself. ``HTTP_PROXY``, ``HTTPS_PROXY`` and ``ALL_PROXY`` are ignored (httpx reads them only for
+a client without a transport of its own), so on a host that reaches the web only through a proxy ``web_fetch`` cannot
+connect. ``web_search`` reaches SearXNG or DuckDuckGo through a plain httpx client, which does use the proxy.
+Not pinned, stated plainly:
 * the browser: Chromium resolves names itself. ``BrowserManager`` vets every request, popup and WebSocket through
   Playwright routes, but a name that answers differently to Chromium than to this process is not caught.
-* an HTTP(S) proxy from the environment: httpx sends those requests through the proxy, which does its own lookup.
-Opt out with ``web.allow_private: true``; the exact origin (scheme, host, port) of ``research.searxng_url`` always
-passes, at the connection layer as its (host, port), the only parts a TCP connect sees.
+Opt out with ``web.allow_private: true``: nothing is vetted or pinned, and ``WebFetcher`` is a plain httpx client that
+uses a proxy from the environment. The exact origin (scheme, host, port) of ``research.searxng_url`` always passes, at
+the connection layer as its (host, port), the only parts a TCP connect sees.
 """
 
 from __future__ import annotations

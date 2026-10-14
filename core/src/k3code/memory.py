@@ -384,13 +384,15 @@ def _claim_order(files: list[MemoryFile], root: Path) -> list[int]:
     return sorted(range(len(files)), key=key)
 
 
-def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> str:
+def memory_prompt(
+    cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL, *, learned: bool = True
+) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
     Each file is capped at ``limit`` characters and all of them together at ``total``. The budget goes to the user's
     memory first, then to the files nearest ``cwd`` and outward, so what runs out is the repository root's text, not
     the rules of the directory being worked in; the files that fit keep the prompt order (nearest last) and one marker
-    line says how many were left out.
+    line says how many were left out. ``learned=False`` (``learning.enabled: false``) leaves the learned notes out.
     """
     parts = []
     root = project_root(cwd)
@@ -422,8 +424,8 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
         parts.append(f"## {title} ({name})\n\n" + fenced("project instructions (from the repository):", body))
     if len(bodies) < len(files):
         parts.append(TOTAL_MARKER.format(n=len(files) - len(bodies), cap=total))
-    if learned := read_learned(cwd):
-        body = "\n".join(f"- {f}" for f in learned)[:limit]
+    if learned and (notes := read_learned(cwd)):
+        body = "\n".join(f"- {f}" for f in notes)[:limit]
         parts.append("## Learned project notes\n\n" + fenced(LEARNED_LABEL, body))
     return "\n\n".join(parts)
 
