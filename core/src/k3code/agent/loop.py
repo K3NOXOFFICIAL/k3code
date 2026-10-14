@@ -13,6 +13,7 @@ from typing import Any
 from k3code import context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
+from k3code.permissions.engine import home_read_only
 from k3code.permissions.state import PermissionState
 from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
@@ -159,6 +160,9 @@ class AgentLoop:
         #: sandbox because bwrap is unusable here; the gateway shows the session a notice
         self.on_unsandboxed: Callable[[], None] | None = None
         self._unsandboxed_told = False
+        #: called once per loop, at the start of a run, when an interactive session's cwd is $HOME
+        self.on_home_started: Callable[[], None] | None = None
+        self._home_told = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         #: called when a retry makes the streamed text so far void (the consumer clears its copy)
@@ -239,6 +243,7 @@ class AgentLoop:
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
+        self._tell_home_started()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
         self._notes = {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
@@ -528,7 +533,22 @@ class AgentLoop:
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
-        if home_rooted:
+        # A command the builtin read-only allowlist allows (never a user/project/session allow such as `python3 *`,
+        # which could read all of $HOME; never one only the mode allowed: yolo has no rule, auto's conversions are
+        # auto_allowed) and that is a plain, non-recursive ls/cat/grep in every part (home_read_only: the winning rule
+        # of `ls; python3 x` is the builtin `ls *`) runs without a prompt in a sandbox that shows $HOME read-only with
+        # the credential folders hidden and no network. It cannot write anything but /tmp.
+        readonly_home = (
+            home_rooted
+            and decision.action == "allow"
+            and not decision.auto_allowed
+            and decision.rule is not None
+            and decision.rule.action == "allow"
+            and decision.rule.layer == 0
+            and home_read_only(str(args.get("command", "")))
+            and sandbox.readonly_home_ok(self.cwd, self.permissions.add_dirs)
+        )
+        if home_rooted and not readonly_home:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
             decision = replace(
@@ -583,7 +603,12 @@ class AgentLoop:
         try:
             if tool_call.name == "bash":
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
-                argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
+                if readonly_home:
+                    argv = await asyncio.to_thread(
+                        sandbox.build_argv, self.cwd, self.permissions.add_dirs, readonly_home=True
+                    )
+                else:
+                    argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
                 result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
@@ -723,6 +748,18 @@ class AgentLoop:
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return False
         return not sandbox.usable()
+
+    def _tell_home_started(self) -> None:
+        """Once per loop, for an interactive session whose cwd is $HOME: say that a project gives full auto mode (the
+        gateway shows it once per session, see LiveSession.notify_home_started)."""
+        if self._home_told or self.on_home_started is None or self.background or self.unattended:
+            return
+        self._home_told = True
+        try:
+            if Path(self.cwd).resolve() == Path.home().resolve():
+                self.on_home_started()
+        except Exception:  # noqa: BLE001 - a notice must never break a turn
+            logger.warning("home-directory notice failed", exc_info=True)
 
     def _tell_unsandboxed(self) -> None:
         if self._unsandboxed_told or self.on_unsandboxed is None:

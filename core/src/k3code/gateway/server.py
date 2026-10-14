@@ -285,6 +285,8 @@ class LiveSession:
         self.offline_protection_error = ""
         #: the "no sandbox" notice is showing (auto/yolo bash without a usable bwrap); cleared when the mode leaves them
         self.unsandboxed_notice = False
+        #: the "started in your home directory" notice was shown (once per session in this process)
+        self.home_notice = False
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -358,6 +360,21 @@ class LiveSession:
 
     #: Notification key of the "no sandbox" warning (see notify_unsandboxed).
     UNSANDBOXED_KEY = "k3.sandbox.unusable"
+
+    #: Notification key of the "started in your home directory" notice (see notify_home_started).
+    HOME_KEY = "k3.session.home"
+    HOME_NOTICE = "k3code started in your home directory: start it inside a project for full auto mode"
+
+    def notify_home_started(self) -> None:
+        """Tell the clients, once per session, that its cwd is $HOME (bash there asks unless a rule allows it)."""
+        if self.home_notice:
+            return
+        self.home_notice = True
+        self.emit(
+            "notification.show",
+            {"text": self.HOME_NOTICE, "level": "warn", "key": self.HOME_KEY, "session_id": self.session_id},
+            importance="essential",
+        )
 
     def notify_unsandboxed(self) -> None:
         """Tell the clients that this auto/yolo session's bash runs without the sandbox (bwrap is unusable here). The
@@ -2000,6 +2017,7 @@ class GatewayServer:
             context_window=self._router_window(router, session),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
+        loop.on_home_started = session.notify_home_started
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)

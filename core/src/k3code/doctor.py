@@ -793,7 +793,10 @@ def check_permissions(home: Path, project_dir: Path) -> Check:
     if (text := trust.trusted_text(project_dir)) is not None:
         problems += [f"{trust.config_path(project_dir)}: {p}" for p in parse_permissions(text)[2]]
     if problems:
-        fix = "fix each named entry (an action is allow, ask or deny, lower case); until then it is a deny"
+        fix = (
+            "fix each named entry (an action is allow, ask or deny, lower case); until then it is a deny "
+            "(a blank hardline pattern is ignored instead)"
+        )
         return Check("permissions", WARN, "; ".join(problems), fix, {"problems": len(problems)})
     return Check("permissions", OK, "every permissions entry is valid")
 
