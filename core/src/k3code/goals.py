@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 import time
@@ -42,8 +43,10 @@ DEFAULT_GATE_MAX_RETRIES = 0
 #: once. A timeout is -1.
 GATE_COULD_NOT_RUN = -2
 #: A persistent goal waits this long (doubling, up to the maximum) before asking the judge, or running the check, again.
+#: The maximum stays under the 5-minute prompt-cache TTL: a capped retry at 300 s found the cache expired and wrote the
+#: whole prefix again (3x the cost per hour of a retry at 240 s on a 60k-token history).
 PERSIST_BACKOFF_BASE_S = 15.0
-PERSIST_BACKOFF_MAX_S = 300.0
+PERSIST_BACKOFF_MAX_S = 240.0
 #: A persistent goal judged blocked this many times in a row says so (still going on; /goal clear stops it).
 BLOCKED_NOTICE_EVERY = 5
 #: A goal longer than this is quoted in a continuation prompt by its start and a pointer to the message that holds it
@@ -60,11 +63,22 @@ def quote(goal: str, limit: int = GOAL_QUOTE_CHARS) -> str:
 
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: A persistent goal keeps going when the judge's replies cannot be read, but after this many turns in a row it waits
-#: (15 s doubling to five minutes) before each turn instead of spending at full speed with nothing able to say "done".
+#: (15 s doubling to four minutes) before each turn instead of spending at full speed with nothing able to say "done".
 PERSIST_PARSE_FAILURES_BEFORE_SLOWING = 5
 #: Turns in a row that ended without any text before a goal pauses: the judge is not asked about an empty reply, so
 #: nothing else would ever stop a model that answers with nothing (40+ full turns, no judge call, no failure counted).
 MAX_CONSECUTIVE_EMPTY = 3
+#: A persistent goal whose turns answer in prose and call no tool is not working, but the judge keeps saying "continue"
+#: (30 such turns cost 188k tokens and no wait). After this many in a row it waits (15 s doubling to four minutes)
+#: before each turn; or after SAME_REPLY turns with the same reply (case, spacing and digits aside). A turn that calls a
+#: tool starts both counts again, so a long answer after tool work is never slowed; a changed reply does not reset the
+#: first count (a model that rewords the same non-answer each time must not escape it).
+PERSIST_TOOLLESS_BEFORE_SLOWING = 5
+PERSIST_SAME_REPLY_BEFORE_SLOWING = 3
+#: Loop-guard stops of a persistent goal's turns in a row (no successful turn between) that are retried; the next one
+#: pauses the goal. Each retry re-sends the whole history to a model that repeated the same call, 5-10x the cost of a
+#: blocked goal per hour. A one-off stop is still retried.
+MAX_LOOP_RECOVERIES = 5
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
 KICK_WINDOW_S = 3600.0
@@ -172,6 +186,12 @@ def _of(n: int, limit: int) -> str:
     return f"{n}/{limit}" if limit > 0 else str(n)
 
 
+def _reply_digest(text: str) -> str:
+    """Fingerprint of a reply that ignores case, spacing and digits (a counter or a time in it is not progress)."""
+    norm = re.sub(r"\d+", "#", " ".join(text.lower().split()))
+    return hashlib.sha1(norm.encode()).hexdigest()[:12] if norm else ""
+
+
 def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -226,6 +246,10 @@ class GoalState:
     consecutive_empty_replies: int = 0
     #: Turns in a row the judge called blocked (a persistent goal goes on and says so every BLOCKED_NOTICE_EVERY).
     consecutive_blocked: int = 0
+    #: Judged turns in a row that made no tool call, and how many in a row answered the same (``last_reply_hash``).
+    consecutive_toolless: int = 0
+    same_reply_run: int = 0
+    last_reply_hash: str = ""
     #: ``--turns N`` set ``max_turns``. Without it a stored 300 is the old default, not a choice (see from_dict).
     max_turns_explicit: bool = False
     gates: list[GoalGate] = field(default_factory=list)
@@ -426,7 +450,7 @@ class GoalManager:
             return None
         s.status, s.paused_reason = "active", None
         s.consecutive_parse_failures = s.consecutive_transport_failures = s.consecutive_empty_replies = 0
-        s.consecutive_blocked = 0
+        s.consecutive_blocked = s.consecutive_toolless = s.same_reply_run = 0
         if reset_budget:
             s.turns_used = 0
         for g in s.gates:
@@ -502,9 +526,16 @@ class GoalManager:
         return Decision("cleared", False, None, verdict, why, "")
 
     async def evaluate_after_turn(
-        self, last_response: str, judge: Judge, *, cwd: str | None = None, reviewer: Reviewer | None = None
+        self,
+        last_response: str,
+        judge: Judge,
+        *,
+        cwd: str | None = None,
+        reviewer: Reviewer | None = None,
+        used_tools: bool = True,
     ) -> Decision:
-        """Judge the finished turn; both user prompts and our continuations spend the turn budget."""
+        """Judge the finished turn; both user prompts and our continuations spend the turn budget. ``used_tools``:
+        the turn called at least one tool (True when unknown: nothing is slowed on a guess)."""
         s = self.state
         if s is None or s.status != "active":
             return Decision(s.status if s else None, False, None, "inactive", "no active goal", "")
@@ -532,6 +563,13 @@ class GoalManager:
         s.consecutive_transport_failures = s.consecutive_transport_failures + 1 if transport_failed else 0
         s.consecutive_empty_replies = 0 if last_response.strip() else s.consecutive_empty_replies + 1
         s.consecutive_blocked = s.consecutive_blocked + 1 if verdict == "blocked" else 0
+        if used_tools:
+            s.consecutive_toolless, s.same_reply_run, s.last_reply_hash = 0, 0, ""
+        else:
+            digest = _reply_digest(last_response)
+            s.consecutive_toolless += 1
+            s.same_reply_run = s.same_reply_run + 1 if digest and digest == s.last_reply_hash else 1
+            s.last_reply_hash = digest
 
         if verdict == "blocked" and self.persist and not s.implicit:
             # not a stop: the judge says this way is blocked, so the agent is sent to find another one
@@ -734,6 +772,23 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the judge isn't returning the required JSON verdict ({n} turns).",
             )
+        slow = max(
+            s.consecutive_toolless - PERSIST_TOOLLESS_BEFORE_SLOWING,
+            s.same_reply_run - PERSIST_SAME_REPLY_BEFORE_SLOWING,
+        )
+        if self.persist and not s.implicit and slow >= 0 and not s.budget_spent():
+            # prose without a tool call, turn after turn, and the judge still says "continue": not stopped, but not
+            # spending at full speed on a model that is going nowhere
+            self._save(s)
+            same = s.same_reply_run >= PERSIST_SAME_REPLY_BEFORE_SLOWING
+            await self._wait(
+                s,
+                slow,
+                f"{s.consecutive_toolless} turns in a row called no tool{' and repeat themselves' if same else ''}; "
+                "the next turn starts",
+            )
+            if (gone := self._superseded(s)) is not None:
+                return gone
         if s.budget_spent():
             return self._budget_pause(s, "continue", reason)
         self._save(s)
@@ -749,7 +804,7 @@ class GoalManager:
 
     @staticmethod
     def backoff(n: int) -> float:
-        """Seconds a persistent goal waits before the ``n``-th retry (0-based): 15, 30, 60 ... up to five minutes."""
+        """Seconds a persistent goal waits before the ``n``-th retry (0-based): 15, 30, 60 ... up to four minutes."""
         return min(PERSIST_BACKOFF_MAX_S, PERSIST_BACKOFF_BASE_S * 2 ** min(n, 16))
 
     async def _wait(self, s: GoalState, n: int, what: str) -> None:

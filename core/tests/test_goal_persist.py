@@ -92,8 +92,8 @@ async def test_empty_replies_and_judge_noise_never_pause_a_persistent_goal_but_s
         assert decision.should_continue and mgr.state.status == "active"
     assert "ended without any text" in decision.message and "concrete step" in decision.prompt
     assert mgr.state.consecutive_parse_failures == 25 and mgr.state.consecutive_empty_replies == 25
-    # the first two empty turns go at full speed; then the pause before each turn doubles up to five minutes
-    assert slept[:4] == [15.0, 30.0, 60.0, 120.0] and max(slept) == 300.0 and len(slept) == 23
+    # the first two empty turns go at full speed; then the pause before each turn doubles up to four minutes
+    assert slept[:4] == [15.0, 30.0, 60.0, 120.0] and max(slept) == 240.0 and len(slept) == 23
 
 
 async def test_a_judge_that_is_not_readable_slows_the_goal_without_stopping_it():
@@ -199,9 +199,9 @@ async def test_without_persist_the_older_pausing_stays():
     assert not decision.should_continue and "judge" in mgr.state.paused_reason
 
 
-def test_backoff_doubles_up_to_five_minutes():
-    assert [GoalManager.backoff(n) for n in range(7)] == [15.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
-    assert GoalManager.backoff(10_000) == 300.0
+def test_backoff_doubles_up_to_four_minutes():
+    assert [GoalManager.backoff(n) for n in range(7)] == [15.0, 30.0, 60.0, 120.0, 240.0, 240.0, 240.0]
+    assert GoalManager.backoff(10_000) == 240.0
 
 
 # ── the gateway: a turn that failed or stopped for input is retried ─────────────────────────────────────────────

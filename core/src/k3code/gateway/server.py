@@ -107,6 +107,7 @@ from k3code.goals import (
     CONTINUATION_PROMPT_RECOVER_TEMPLATE,
     GOAL_QUOTE_CHARS,
     MAX_KICKS_PER_WINDOW,
+    MAX_LOOP_RECOVERIES,
     GoalManager,
     make_judge,
     quote,
@@ -352,6 +353,12 @@ class LiveSession:
         self.budget_stopped = False
         #: Failed or stalled goal turns in a row: the pause before the next retry grows with it (GoalManager.backoff).
         self.goal_retry_streak = 0
+        #: Loop-guard stops of a goal's turns in a row, no successful turn between (see _goal_recovery); and what the
+        #: guard stopped on in this turn (its key), "" when it did not.
+        self.goal_loop_streak = 0
+        self.loop_repeat = ""
+        #: Tool calls the last turn made (None until one ran): a goal turn that calls none is slowed (goals.py).
+        self.last_tool_calls: int | None = None
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
@@ -1924,6 +1931,8 @@ class GatewayServer:
             )
         elif kind in (rev.BUDGET_EXCEEDED, rev.LOOP_DETECTED):
             session.needs_input = True
+            if kind == rev.LOOP_DETECTED:
+                session.loop_repeat = detail  # the guard's key for what repeated: "tool:<name>:<args>" or "text:..."
             label = "Budget exceeded" if kind == rev.BUDGET_EXCEEDED else "Loop detected"
             session.emit("error", {"message": f"{label}: {detail}"}, importance=ess)
         elif kind == rev.NEEDS_INPUT:
@@ -1978,6 +1987,7 @@ class GatewayServer:
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
+        session.goal_loop_streak = 0  # the user's own prompt starts the count of repeated loops again
         hooked: userhooks.HookOutcome | None = None  # the hooks' verdict on the typed prompt, handed to its first turn
         blocked = False  # a hook refused the prompt: it ends as a blocked turn, with no model or judge call around it
         if typed and not self.halted:
@@ -2077,7 +2087,7 @@ class GatewayServer:
                     continue
                 status = "halted" if self.halted and mgr.is_active() else status
             if status == "done":
-                session.goal_retry_streak = 0
+                session.goal_retry_streak = session.goal_loop_streak = 0
             if status != "done" or not mgr.is_active():
                 self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
@@ -2092,7 +2102,11 @@ class GatewayServer:
             # no strong-tier advisor veto on an implicit goal: it would review every answered question
             reviewer = None if implicit else self._goal_reviewer(session)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer
+                final_text,
+                judge,
+                cwd=session.stored.cwd or None,
+                reviewer=reviewer,
+                used_tools=session.last_tool_calls is None or session.last_tool_calls > 0,
             )
             self.emit_goal(session)
             if decision.message:
@@ -2269,6 +2283,15 @@ class GatewayServer:
         if last.get("role") == "user" and str(last.get("content") or "").startswith(prompt):
             session.stored.messages = messages[:-1]
 
+    @staticmethod
+    def _loop_call(key: str) -> str:
+        """What the loop guard stopped on, from its key (``tool:<name>:<args json>`` or ``text:<message>``)."""
+        kind, _, rest = key.partition(":")
+        if kind != "tool":
+            return "the same message"
+        name, _, args = rest.partition(":")
+        return f"the call `{name}` ({scrub_text(args)[:80]})"
+
     def _goal_recovery(self, session: LiveSession, mgr: GoalManager, status: str) -> tuple[float, str, str] | None:
         """What a persistent goal does when its turn did not finish: ``(seconds to wait, next prompt, notice)``, or None
         to leave it to ``_block_goal_for`` (pause). Persisting covers a failed turn (no provider answered after the
@@ -2281,6 +2304,14 @@ class GatewayServer:
             why = f"it failed ({scrub_text(session.last_error or 'see the error above')[:160]})"
         elif status == "needs_input" and not session.budget_stopped:
             why = "it stopped for input (a question, an approval nobody answered, or the loop guard)"
+            if session.loop_repeat:
+                # the same call again and again: a few more tries, then the goal pauses (see _block_goal_for); a
+                # single stop is retried as before
+                session.goal_loop_streak += 1
+                if session.goal_loop_streak > MAX_LOOP_RECOVERIES:
+                    return None
+                call = self._loop_call(session.loop_repeat)
+                why = f"the loop guard stopped it for repeating {call}; do not repeat it"
         else:
             return None
         if not mgr.count_recovery_turn():
@@ -2304,7 +2335,26 @@ class GatewayServer:
             mgr.clear()  # an implicit goal ends with its turn: no pause, no "/goal resume" notice (GoalState.implicit)
             self.emit_goal(session)
             return
-        if status == "needs_input":
+        if status == "needs_input" and session.goal_loop_streak > MAX_LOOP_RECOVERIES and session.loop_repeat:
+            reason = "needs_input"
+            text = (
+                f"Goal paused: the model kept repeating {self._loop_call(session.loop_repeat)} through "
+                f"{MAX_LOOP_RECOVERIES} retries and the loop guard stopped it each time. Change the goal or the "
+                "approach, then /goal resume."
+            )
+            session.goal_loop_streak = 0  # /goal resume gets a fresh set of retries
+        elif status == "needs_input" and session.budget_stopped:
+            # a spend cap (reliability.*) or the max_turns cap stopped the turn: nobody has a question to answer
+            detail = scrub_text(session.last_error)[:160]
+            reason = "needs_input"
+            text = (
+                f"Goal paused: a spend cap stopped the turn ({detail}). Raise it (reliability.* in the config), or "
+                "/goal resume after it resets (a day cap resets at midnight)."
+                if detail
+                else "Goal paused: the max_turns cap on model calls per prompt stopped the turn. Raise max_turns "
+                "in the config, then /goal resume."
+            )
+        elif status == "needs_input":
             reason, text = "needs_input", "Goal needs your input before it can continue. Answer, then /goal resume."
         elif status == "interrupted" and self.stopping:
             reason, text = "daemon restart", "Goal stopped by the daemon restart; it resumes on the next boot."
@@ -2595,6 +2645,7 @@ class GatewayServer:
         session.budget_stopped = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
+        session.loop_repeat, session.last_tool_calls = "", None
         session.turn_gate = None
         reliability = await self._reliability_for(session)
         reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
@@ -2785,6 +2836,7 @@ class GatewayServer:
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
                 session.needs_input = False
+                session.loop_repeat = ""  # a higher tier took over: a later stop is not this loop
                 if reliability.loop_guard is not None:
                     reliability.loop_guard.reset()
                 history = [m for m in loop.turn_messages if m.role != "system"]
@@ -2874,6 +2926,7 @@ class GatewayServer:
 
         session.last_error = error or ""
         session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
+        session.last_tool_calls = sum(len(m.tool_calls) for m in loop.turn_messages if m.role == "assistant")
         # Foreground turns too: the agent view and the strip show a turn that ended in an error as failed, not idle.
         session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
         if status == "needs_input":
