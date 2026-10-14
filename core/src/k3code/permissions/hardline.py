@@ -53,6 +53,7 @@ HARDLINE_NAMES: list[str] = [
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     "scan-budget",  # a command too long to parse within the scan budget (see check)
+    "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -196,10 +197,13 @@ def check(
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
     parsed = parse(command, budget=budget)
-    hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home)
-    # past the scan budget a substitution's end is unresolved and the text after it was never read as commands:
-    # whatever runs there is unknown, so the command is denied rather than allowed unchecked (yolo too)
-    return hit or ("scan-budget" if budget[0] < 0 else None)
+    # past the scan budget a substitution's end is unresolved and the text after it was never read as commands, and
+    # past the nesting the parser follows the commands in there were never read either: whatever runs there is
+    # unknown, so the command is denied rather than allowed unchecked (yolo too). The checks below cannot lift that
+    # deny and would tokenise every nesting level of such a command, so they are skipped.
+    if budget[0] < 0 or parsed.too_deep:
+        return "scan-budget" if budget[0] < 0 else "scan-depth"
+    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home)
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
@@ -769,6 +773,8 @@ class Parsed:
     remote_heredoc: list[list[str]] = field(default_factory=list)
     open_heredoc: bool = False  # a heredoc with no line after it to start its body
     open_bracket: bool = False  # a ${, [, a=( ... still open at the end (see _scan)
+    #: nested deeper than the parser follows (_SCAN_MAX_DEPTH, parse): what runs in there was never read as commands
+    too_deep: bool = False
     children: list[Parsed] = field(default_factory=list)  # the parsed payloads
 
 
@@ -779,10 +785,14 @@ _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
 #: unterminated) instead of rescanning quadratically, and ``check`` denies the command (``scan-budget``)
 _SCAN_BUDGET = 100_000
 
-#: how deep ``_scan`` follows nested ``$(...)``/backticks before it stops and marks the command unterminated. Real
-#: commands nest a handful deep; a long run of substitutions bash never closes is what reaches this (``parse`` caps its
-#: own recursion at 6, so deeper payloads are not read as commands anyway).
+#: how deep ``_scan`` follows nested ``$(...)``/backticks before it stops and marks the command unterminated and too
+#: deep (``check`` denies it: ``scan-depth``). Real commands nest a handful deep; a long run of substitutions bash
+#: never closes is what reaches this (``parse`` stops at _PARSE_MAX_DEPTH, so deeper payloads are denied anyway).
 _SCAN_MAX_DEPTH = 24
+
+#: how many levels of nested commands ``parse`` reads (``$(...)``, ``bash -c``, ``eval``, a heredoc a shell runs ...);
+#: a command with more than that is too deep and ``check`` denies it (``scan-depth``)
+_PARSE_MAX_DEPTH = 6
 
 
 def _match_paren(text: str, open_idx: int, arith: bool | None = None, budget: list[int] | None = None) -> int:
@@ -855,9 +865,9 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
     next lines stay commands."""
     out = Parsed()
     if _depth > _SCAN_MAX_DEPTH:
-        # too deeply nested to resolve: leave it unterminated (a person confirms) rather than recurse further. The
-        # raw text still reaches the regex checks as `clean`, and open_bracket makes the enclosing substitution unsure.
-        out.unterminated = out.open_bracket = True
+        # too deeply nested to resolve: stop here rather than recurse further. What runs in there is unknown, so the
+        # command is too deep (check denies it), and open_bracket makes the enclosing substitution unsure.
+        out.unterminated = out.open_bracket = out.too_deep = True
         out.clean = text
         return out
     cur: list[str] = []
@@ -905,6 +915,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         payload = _subst_payload(text, at, end)
         cur_payloads.append(payload)
         inner = _scan(payload, budget, _depth + 1)
+        out.too_deep = out.too_deep or inner.too_deep
         # `$(cat <<EOF)`: bash reads the body from the lines after the substitution
         out.unterminated = out.unterminated or inner.open_heredoc
         if inner.open_bracket:
@@ -920,6 +931,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             end = n
         cur_payloads.append(text[at + 1 : end])
         inner_bt = _scan(text[at + 1 : end], budget, _depth + 1)
+        out.too_deep = out.too_deep or inner_bt.too_deep
         out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
         return end + 1, text[at : end + 1]
 
@@ -1195,17 +1207,22 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     if budget is None:
         budget = [_SCAN_BUDGET]  # one budget for the whole command, so nesting cannot multiply the paren scan
     parsed = _scan(command, budget)
-    if _depth >= 6:  # pathological nesting is cut off; the caller still checks the cleaned text
-        return parsed
+    if budget[0] < 0 or parsed.too_deep:
+        return parsed  # the parser gave up and check() denies the command: its nested commands are not read
     payloads = [p for ps in parsed.sub_payloads for p in ps]
     for sub in parsed.subs:
         payloads.extend(_launcher_payloads(sub))
+    if _depth >= _PARSE_MAX_DEPTH:
+        # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
+        parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc
+        return parsed
     for payload in payloads:
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
         parsed.comment_quote = parsed.comment_quote or inner.comment_quote
+        parsed.too_deep = parsed.too_deep or inner.too_deep
     # a heredoc a shell runs is its script (`bash <<'EOF'`, `cat <<EOF | sh`): checked like `bash -c "..."`, except for
     # its quotes (a stray one in a comment of a long script is not worth a prompt). The program of another
     # interpreter is not shell: such a heredoc is only kept out of the allowlist (see engine._decide_bash).
@@ -1214,6 +1231,7 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
             inner = parse(heredoc.body, _depth + 1, budget)
             parsed.children.append(inner)
             parsed.nested.extend([*inner.subs, *inner.nested])
+            parsed.too_deep = parsed.too_deep or inner.too_deep
             # `ssh host <<EOF` runs the body on host: each command is also checked as `ssh host '<command>'`, the
             # spelling the rules about remote hosts match
             remote = [*inner.subs, *inner.nested]

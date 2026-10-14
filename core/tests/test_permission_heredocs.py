@@ -8,6 +8,7 @@ quoted delimiter (``<<'EOF'``) keeps the body data.
 
 from __future__ import annotations
 
+import shlex
 import time
 from pathlib import Path
 
@@ -397,6 +398,63 @@ def test_past_the_scan_budget_the_rest_is_not_swallowed(tmp_path: Path, cmd: str
     assert check(cmd, cwd=str(tmp_path)) is not None
     for mode in ("auto", "yolo"):
         assert _bash(cmd, mode, tmp_path).action == "deny", mode
+
+
+def _substs(depth: int, inner: str) -> str:
+    return "echo " + "$(" * depth + inner + ")" * depth
+
+
+def _launched(depth: int, inner: str, launcher: str = "bash -c ") -> str:
+    for _ in range(depth):
+        inner = launcher + shlex.quote(inner)
+    return inner
+
+
+DEEP = "$(" * 25 + "x" + ")" * 25  # one level past _SCAN_MAX_DEPTH
+# past the nesting the parser follows, the commands in there were never read: 25 nested `$(` left a bracket open that
+# made the next `<<` no heredoc, so the line bash runs after the body hid in a quote; seven nested levels (the checks
+# read six) were never tokenised. Unchecked, yolo (and auto for the second) ran them, so the hardline denies them.
+TOO_DEEP = [
+    f"echo {DEEP}; cat <<y\n'\ny\n{HIDDEN}\n",
+    f"cat {DEEP} <<y\n'\ny\n{HIDDEN}\n",
+    f"cat <<y {DEEP}\n'\ny\n{HIDDEN}\n",
+    _substs(7, HIDDEN),
+    _launched(7, HIDDEN),
+    _launched(7, HIDDEN, "eval "),
+    "cat <(" * 7 + HIDDEN + ")" * 7,
+]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    TOO_DEEP,
+    ids=["subst-then-heredoc", "heredoc-after", "heredoc-before", "substs", "bash-c", "eval", "process-subst"],
+)
+def test_past_the_nesting_the_parser_follows_the_command_is_denied(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "scan-depth"
+    for mode in MODES:
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+
+
+def test_nesting_the_parser_follows_is_still_checked(tmp_path: Path) -> None:
+    for cmd in (_substs(6, HIDDEN), _launched(6, HIDDEN), _launched(6, HIDDEN, "eval ")):
+        assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home", cmd
+    for cmd in (_substs(6, "date"), _launched(6, "git status")):
+        assert check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# a command the parser gives up on (past the budget or the nesting) was still tokenised at every nesting level by the
+# per-command checks, which cannot lift the deny: `$(` x 50,000 took 49 s in decide() and nesting raised RecursionError
+GIVES_UP = ["$(" * 50_000, "<(" * 50_000, "$(((" * 30_000, "$((" * 800, "`$(" * 30_000]
+
+
+@pytest.mark.parametrize("cmd", GIVES_UP, ids=["substs", "process-substs", "arith-substs", "arith-800", "backticks"])
+def test_a_command_the_parser_gives_up_on_is_denied_quickly(tmp_path: Path, cmd: str) -> None:
+    for mode in MODES:
+        start = time.perf_counter()
+        dec = _bash(cmd, mode, tmp_path)
+        assert time.perf_counter() - start < 2.0, mode
+        assert dec.action == "deny", mode
 
 
 # a << bash may read as something else (in ${...} or a[...]) or a word bash versions read differently: no body is

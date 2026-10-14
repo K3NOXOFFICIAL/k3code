@@ -50,3 +50,23 @@ def test_repl_closes_its_providers(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
     asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
     assert _Closing.closed == 1
+
+
+def test_headless_run_passes_its_session_id_to_the_system_prompt(tmp_path, monkeypatch):
+    config = _setup(monkeypatch, tmp_path)
+    import k3code.prompting as prompting_mod
+
+    seen: list[str | None] = []
+    real = prompting_mod.build_system_prompt
+
+    def spy(*a, **kw):
+        seen.append(kw.get("session_id"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(prompting_mod, "build_system_prompt", spy)
+    asyncio.run(
+        cli_mod._run_headless(
+            "hi", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True, session="s-42"
+        )
+    )
+    assert seen == ["s-42"]

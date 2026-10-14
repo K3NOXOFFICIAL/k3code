@@ -120,6 +120,10 @@ async def test_optimizer_rollback_restores_the_live_config(tmp_path, monkeypatch
     user_config_path().parent.mkdir(parents=True, exist_ok=True)  # the k3code home the helper set up
     user_config_path().write_text("task_tiers:\n  title: fast\n")
     hub = server.learning
+    for i in range(12):  # control history for the before/after test
+        server.usage.record(
+            "call", session=f"s{i}", tokens_in=100, tokens_out=10, tier="main", task_kind="interactive_turn"
+        )
     resets = []
     monkeypatch.setattr(server, "reset_tier_routers", lambda: resets.append(1))
     msg = hub._apply_overlay({"title": "t", "patch": {"task_tiers": {"classification": "main"}}})

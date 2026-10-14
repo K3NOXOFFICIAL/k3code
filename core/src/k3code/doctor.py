@@ -782,19 +782,29 @@ def check_project(project_dir: Path) -> Check:
 
 def check_permissions(home: Path, project_dir: Path) -> Check:
     """Every ``permissions:`` entry k3code cannot read and enforces as a deny: the user config, the rules accepted from
-    this project's recipe and the project config as trusted. The session logs each one once; this lists them all."""
+    this project's recipe and the project config as trusted. The session logs each one once; this lists them all.
+    A ``permissions.hardline`` k3code cannot read fails the check: no bash command can run until it is fixed."""
     from k3code import trust
     from k3code.learning.projectstate import rules_path
-    from k3code.permissions.state import parse_permissions, read_permissions
+    from k3code.permissions.state import UNREADABLE_HARDLINE, parse_permissions, read_permissions
 
     problems: list[str] = []
+    hard: list[str] = []
     for path in (home / "config.yaml", rules_path(project_dir)):
-        problems += [f"{path}: {p}" for p in read_permissions(path)[2]]
+        _, extra, found = read_permissions(path)
+        problems += [f"{path}: {p}" for p in found]
+        hard += extra
     if (text := trust.trusted_text(project_dir)) is not None:
-        problems += [f"{trust.config_path(project_dir)}: {p}" for p in parse_permissions(text)[2]]
+        _, extra, found = parse_permissions(text)
+        problems += [f"{trust.config_path(project_dir)}: {p}" for p in found]
+        hard += extra
     if problems:
-        fix = "fix each named entry (an action is allow, ask or deny, lower case); until then it is a deny"
-        return Check("permissions", WARN, "; ".join(problems), fix, {"problems": len(problems)})
+        fix = (
+            "fix each named entry (an action is allow, ask or deny, lower case; permissions.hardline is a list of"
+            " quoted regexes); until then it is a deny"
+        )
+        status = FAIL if UNREADABLE_HARDLINE in hard else WARN
+        return Check("permissions", status, "; ".join(problems), fix, {"problems": len(problems)})
     return Check("permissions", OK, "every permissions entry is valid")
 
 
