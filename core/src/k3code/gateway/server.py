@@ -3595,12 +3595,17 @@ class GatewayServer:
     ) -> str:
         """Sub-turn: one tool-less completion; returns the text.
 
-        With a task ``kind`` (and no explicit ``model_key``) the call goes through :class:`ModelCaller`
-        (tier policy, escalation, tier/kind usage rows); otherwise through a plain chain for ``model_key``.
+        With a task ``kind`` the call goes through :class:`ModelCaller` (tier/kind usage rows, the session and day
+        budgets); an explicit ``model_key`` names the chain it is sent to (no tier policy or escalation then, but still
+        booked and charged: a configured ``goal.judge_model`` used to leave no trace). Without a ``kind``: a plain chain
+        for ``model_key``.
         """
         messages = [Message(role="system", content=system), Message(role="user", content=user)]
-        if kind is not None and model_key is None:
-            res = await self.model_caller.complete(kind, messages, session_id=session_id, max_tokens=max_tokens)
+        if kind is not None:
+            router = self._router_for(model_key) if model_key is not None else None
+            res = await self.model_caller.complete(
+                kind, messages, session_id=session_id, max_tokens=max_tokens, router=router
+            )
             return res.text
         router = self._router_for(model_key)
         # the chain already holds each provider's resolved model; an explicit model= would override it with the key

@@ -12,6 +12,7 @@ from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd, split_args
 from k3code.goals import _extract_json_object
 from k3code.reliability.sandbox import child_env
+from k3code.routing.tiers import TaskKind
 
 RUBRIC_PATH = Path(__file__).resolve().parent.parent / "prompts" / "review_rubric.md"
 MAX_INPUT_CHARS = 120_000
@@ -161,7 +162,9 @@ class ReviewCommand(CommandDef):
         live = ctx.sessions.get(session_id) if session_id else None
         model = live.stored.model if live and live.stored.model else None
         user = f"Review the following {desc}.\n\n{text}"
-        raw = await ctx.oneshot(rubric, user, model_key=model, max_tokens=4096)
+        raw = await ctx.oneshot(
+            rubric, user, model_key=model, max_tokens=4096, kind=TaskKind.REVIEW, session_id=session_id or ""
+        )
         try:
             result = parse_findings(raw)
         except ValueError as e:

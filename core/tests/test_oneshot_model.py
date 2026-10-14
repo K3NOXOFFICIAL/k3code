@@ -63,3 +63,21 @@ async def test_oneshot_sends_the_mapped_model_not_the_key(tmp_path: Path) -> Non
     assert await server.oneshot("sys", "user", model_key="cheap") == "reviewed"
     assert await server.oneshot("sys", "user", model_key="not-a-key") == "reviewed"  # unknown key -> default model
     assert provider.models == ["real-model-id", "cheap-model-id", "real-model-id"]
+
+
+async def test_a_one_shot_with_an_explicit_model_is_still_booked_and_charged(tmp_path: Path) -> None:
+    """A configured ``goal.judge_model`` (an explicit model key) and every ``/review`` bypassed ModelCaller: no usage
+    row, nothing charged to the session or day budgets, so `/stats` and the caps never saw those calls."""
+    from k3code.routing.tiers import TaskKind
+
+    provider = Recording()
+    server = _server(tmp_path, provider)
+    charged: list[str] = []
+    server.model_caller._charge = lambda sid, u: charged.append(sid)  # the budget hook
+    text = await server.oneshot(
+        "sys", "user", model_key="default", kind=TaskKind.GOAL_JUDGE, session_id="s1", max_tokens=512
+    )
+    assert text == "reviewed" and provider.models == ["real-model-id"]  # the named model's chain served it
+    rows = [r for r in server.usage.rows() if r.get("kind") == "call"]
+    assert [r.get("task_kind") for r in rows] == ["goal_judge"]
+    assert charged == ["s1"]
