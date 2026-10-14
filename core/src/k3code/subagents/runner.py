@@ -22,7 +22,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.prompting import build_system_prompt
+from k3code.prompting import build_system_prompt, subagent_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
@@ -412,6 +412,7 @@ class SubagentManager:
             config=server.config,
             session_meta=parent.stored.meta,
             mcp=server.mcp,
+            attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
         )
         note = ""
         if h.isolation == "worktree":
@@ -420,7 +421,7 @@ class SubagentManager:
                 "your changes are committed and merged back by the harness. Do not run git commands that "
                 "change branches."
             )
-        system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
+        system = subagent_system_prompt(base, name=atype.name, description=h.description, body=atype.prompt, note=note)
         router = server._ensure_router(parent.stored.model or None).get(Tier(h.tier))  # the parent's key (#130)
         loop = AgentLoop(
             router,

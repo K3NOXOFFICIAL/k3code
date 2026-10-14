@@ -79,13 +79,40 @@ def test_openai_compatible_marks_messages_only_for_claude_ids_and_never_on_opena
     off = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="off")
     assert breakpoints(off._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
     on = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="on")
-    assert breakpoints(on._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
     payload = on._payload(conversation(), TOOLS, "anthropic/claude-test", max_tokens=100, temperature=None)
     msgs = payload["messages"]
     assert msgs[0]["content"] == [{"type": "text", "text": "SYSTEM PROMPT", "cache_control": {"type": "ephemeral"}}]
     assert msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in json.dumps(payload["tools"])  # inside messages only
     assert breakpoints(payload) == 2
+
+
+def test_prompt_cache_on_marks_alias_ids_and_cache_models_opts_other_ids_in_under_auto():
+    """Issue #168/4: a gateway alias (auto/coding-manual) in front of Claude carries no 'claude' in its id."""
+
+    def marks(provider: OpenAICompatProvider, model: str) -> int:
+        return breakpoints(provider._payload(conversation(), TOOLS, model, max_tokens=100, temperature=None))
+
+    relay = "https://relay.test/v1"
+    on = OpenAICompatProvider(name="o", base_url=relay, api_key="k", prompt_cache="on")
+    assert marks(on, "auto/coding-manual") == 2 and marks(on, "gpt-4o") == 2
+    auto = OpenAICompatProvider(name="o", base_url=relay, api_key="k")
+    assert marks(auto, "auto/coding-manual") == 0  # auto keeps the Claude-id rule
+    listed = OpenAICompatProvider(name="o", base_url=relay, api_key="k", cache_models=["Auto/*", "coding-manual"])
+    assert marks(listed, "auto/coding-manual") == 2 and marks(listed, "coding-manual") == 2
+    assert marks(listed, "gpt-4o") == 0 and marks(listed, "claude-test") == 2
+    off = OpenAICompatProvider(name="o", base_url=relay, api_key="k", prompt_cache="off", cache_models=["*"])
+    assert marks(off, "auto/coding-manual") == 0
+    openai = OpenAICompatProvider(name="o", base_url="https://api.openai.com/v1", api_key="k", cache_models=["*"])
+    assert marks(openai, "gpt-4o") == 0  # OpenAI caches by itself: the guess never applies there
+
+
+def test_cache_models_is_validated_and_reaches_the_provider():
+    entry = ProviderEntry(name="o", kind="openai", base_url="https://o.test", api_key_env="E", cache_models=["auto/*"])
+    (provider,) = make_providers([entry])
+    assert provider._cache_models == ["auto/*"]
+    with pytest.raises(ValidationError):
+        ProviderEntry(name="o", kind="openai", base_url="u", api_key_env="E", cache_models="auto/*")
 
 
 def test_prompt_cache_is_validated_and_reaches_the_providers():

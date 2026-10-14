@@ -6,6 +6,7 @@ Secrets are never printed: API keys are only checked for presence.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 import shlex
@@ -17,6 +18,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from k3code import service
 from k3code.config import Settings, default_project_dir, load_config
@@ -197,6 +200,39 @@ def check_context_windows(config: Settings) -> list[Check]:
         )
         for m in unknown
     ]
+
+
+def check_prompt_cache(config: Settings) -> list[Check]:
+    """Chain models of an openai-kind relay that ``prompt_cache: auto`` leaves without cache breakpoints because the id
+    does not say Claude and no family is known (mostly a gateway alias in front of a large model)."""
+    checks: list[Check] = []
+    for p in config.providers:
+        if p.kind != "openai" or p.prompt_cache != "auto" or httpx.URL(p.base_url).host == "api.openai.com":
+            continue
+        aliases: list[str] = []
+        for spec in [*p.models.values(), *p.tiers.values()]:
+            for model_id in [spec] if isinstance(spec, str) else spec:
+                name = model_id.lower()
+                if (
+                    model_id
+                    and model_id not in aliases
+                    and "claude" not in name
+                    and family_window(model_id) is None
+                    and not any(fnmatch.fnmatchcase(name, pat.lower()) for pat in p.cache_models)
+                ):
+                    aliases.append(model_id)
+        if aliases:
+            checks.append(
+                Check(
+                    f"prompt-cache:{p.name}",
+                    WARN,
+                    f"{', '.join(aliases)}: no 'claude' in the id, so prompt_cache auto sends no cache breakpoints",
+                    "if a Claude model sits behind it, set prompt_cache: on on this provider entry, or list the id "
+                    "under cache_models: [pattern] to opt only these in",
+                    {"provider": p.name, "models": aliases},
+                )
+            )
+    return checks or [Check("prompt-cache", OK, "no relay alias ids without cache breakpoints")]
 
 
 def check_keys(config: Settings) -> Check:
@@ -820,6 +856,7 @@ async def run_checks(
     checks += await check_providers(config, probe=probe and network)
     checks.append(check_keys(config))
     checks += check_context_windows(config)
+    checks += check_prompt_cache(config)
     checks.append(await check_netwatch_async() if probe and network else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")

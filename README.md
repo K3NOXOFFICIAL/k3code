@@ -309,6 +309,7 @@ A pane running k3code reports its state (working, needs input, done) to `k3` aut
 ```sh
 k3code daemon                  # long-lived host: sessions, scheduler, automations
 k3code service install         # systemd user unit (--dry-run previews it); then: loginctl enable-linger $USER
+k3code service restart         # restart the unit; `k3code service status` shows its state
 k3code attach <session-id>     # open the TUI on a daemon session; detach any time, work continues
 k3code agents                  # open the TUI on the daemon with the agent view showing
 ```

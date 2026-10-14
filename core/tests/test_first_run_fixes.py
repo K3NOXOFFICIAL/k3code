@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from k3code.providers.base import ProviderError, request_headers
@@ -109,3 +111,82 @@ async def test_complete_slash_and_path(tmp_path) -> None:
     assert {i["display"].rstrip("/").split("/")[-1] for i in paths["items"]} == {"src", "README.md"}
     sub = await srv._complete_path(FakeServer(), {"word": "@" + str(tmp_path / "src") + "/ma"})
     assert [i["text"] for i in sub["items"]] == ["@" + str(tmp_path / "src") + "/main.py"]
+
+
+class _PathServer:
+    """The bare minimum `_complete_path` needs: a session directory."""
+
+    def __init__(self, cwd: object) -> None:
+        self._cwd = cwd
+
+    def _session_for(self, _sid: object) -> None:
+        return None
+
+
+async def test_complete_path_scans_off_the_loop_and_caps_the_scan(tmp_path, monkeypatch) -> None:
+    """A huge directory is read on a worker thread and abandoned after the scan cap, not statted whole."""
+    import os
+    import threading
+    import time
+
+    from k3code.gateway import server as srv
+
+    for i in range(srv.COMPLETE_PATH_SCAN_CAP + 500):
+        (tmp_path / f"f{i:05d}").write_text("")
+    seen = {"entries": 0, "threads": set()}
+    real_scandir = os.scandir
+
+    class CountingScandir:
+        def __init__(self, path: object) -> None:
+            self._inner = real_scandir(path)
+
+        def __enter__(self) -> CountingScandir:
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._inner.__exit__(*exc)
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry:
+            seen["threads"].add(threading.get_ident())
+            time.sleep(0.0005)  # a slow disk: would stall the loop if it ran there
+            entry = next(self._inner)
+            seen["entries"] += 1
+            return entry
+
+    monkeypatch.setattr(srv.os, "scandir", CountingScandir)
+    server = _PathServer(tmp_path)
+    monkeypatch.setattr(srv, "_session_dir", lambda *_a: tmp_path)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    got = await srv._complete_path(server, {"word": "./"})
+    task.cancel()
+
+    assert len(got["items"]) == 50
+    assert seen["entries"] == srv.COMPLETE_PATH_SCAN_CAP
+    assert threading.get_ident() not in seen["threads"]
+    assert ticks >= 10  # the loop kept turning while the directory was read
+
+
+async def test_complete_path_keeps_directories_first_and_hides_dotfiles(tmp_path, monkeypatch) -> None:
+    from k3code.gateway import server as srv
+
+    (tmp_path / "zdir").mkdir()
+    (tmp_path / "a.txt").write_text("")
+    (tmp_path / ".hidden").write_text("")
+    monkeypatch.setattr(srv, "_session_dir", lambda *_a: tmp_path)
+    got = await srv._complete_path(_PathServer(tmp_path), {"word": "./"})
+    assert [i["display"] for i in got["items"]] == ["./zdir/", "./a.txt"]
+    shown = await srv._complete_path(_PathServer(tmp_path), {"word": "./.h"})
+    assert [i["display"] for i in shown["items"]] == ["./.hidden"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import tempfile
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from k3code.tools import (
+    _atomic_write,
     build_registry,
     format_tool_result,
     tool_bash,
@@ -563,3 +565,133 @@ async def test_read_numbers_lines_like_an_editor(temp_dir):
     f.write_text("a\x0cb\nc\nd\n")  # a form feed is not a line break for editors (str.splitlines() splits on it)
     result = await tool_read({"path": str(f), "start": 2, "end": 2}, cwd=temp_dir)
     assert result["content"] == "c" and result["lines"] == "2-2 of 3"
+
+
+# ── _atomic_write falls back to an in-place write when the temp-file rename is not possible (#169) ──
+
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+
+
+def _no_temp_files(d: Path) -> bool:
+    return [p.name for p in d.iterdir() if "k3tmp" in p.name] == []
+
+
+@needs_non_root
+async def test_write_into_a_read_only_directory_rewrites_the_writable_file_in_place(temp_dir):
+    f = temp_dir / "locked_dir.py"
+    f.write_text("old\n")
+    f.chmod(0o640)
+    inode = f.stat().st_ino
+    temp_dir.chmod(0o555)
+    try:
+        assert (await tool_write({"path": str(f), "content": "new\n"}, cwd=temp_dir))["ok"] is True
+        assert f.read_text() == "new\n"
+        assert f.stat().st_ino == inode and (f.stat().st_mode & 0o777) == 0o640  # same file, same mode
+    finally:
+        temp_dir.chmod(0o755)
+    assert _no_temp_files(temp_dir)
+
+
+@needs_non_root
+async def test_edit_in_a_read_only_directory_rewrites_the_writable_file_in_place(temp_dir):
+    f = temp_dir / "locked_dir.py"
+    f.write_text("alpha beta\n")
+    temp_dir.chmod(0o555)
+    try:
+        result = await tool_edit({"path": str(f), "old_string": "beta", "new_string": "gamma"}, cwd=temp_dir)
+    finally:
+        temp_dir.chmod(0o755)
+    assert result["ok"] is True and f.read_text() == "alpha gamma\n"
+
+
+@needs_non_root
+def test_a_new_file_in_a_read_only_directory_still_fails(temp_dir):
+    temp_dir.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError):
+            _atomic_write(temp_dir / "new.txt", b"x")
+    finally:
+        temp_dir.chmod(0o755)
+
+
+@pytest.mark.parametrize("code", [errno.EXDEV, errno.EBUSY, errno.EACCES, errno.EPERM])
+def test_a_rename_that_fails_with_a_mount_or_lock_error_falls_back_to_an_in_place_write(temp_dir, monkeypatch, code):
+    f = temp_dir / "bind.txt"
+    f.write_bytes(b"old content that is longer\n")
+    f.chmod(0o640)
+    inode = f.stat().st_ino
+
+    def refuse(src, dst):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(os, "replace", refuse)
+    _atomic_write(f, b"new\n")
+    assert f.read_bytes() == b"new\n"  # shorter than before: the tail is truncated
+    assert f.stat().st_ino == inode and (f.stat().st_mode & 0o777) == 0o640
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_rename_that_fails_with_a_full_disk_does_not_touch_the_file(temp_dir, monkeypatch):
+    f = temp_dir / "full.txt"
+    f.write_bytes(b"precious\n")
+
+    def full(src, dst):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(os, "replace", full)
+    with pytest.raises(OSError) as exc:
+        _atomic_write(f, b"new\n")
+    assert exc.value.errno == errno.ENOSPC
+    assert f.read_bytes() == b"precious\n"  # never rewritten in place on ENOSPC
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_failed_in_place_write_puts_the_old_bytes_back(temp_dir, monkeypatch):
+    f = temp_dir / "restore.txt"
+    f.write_bytes(b"old bytes\n")
+    real_fsync = os.fsync
+    calls = []
+
+    def replace_refused(src, dst):
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def fsync_fails_once_in_place(fd):
+        calls.append(fd)
+        if len(calls) == 2:  # 1st: the temp file; 2nd: the in-place write
+            raise OSError(errno.EIO, "io error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", replace_refused)
+    monkeypatch.setattr(os, "fsync", fsync_fails_once_in_place)
+    with pytest.raises(OSError) as exc:
+        _atomic_write(f, b"a completely different new content\n")
+    assert exc.value.errno == errno.EIO
+    assert f.read_bytes() == b"old bytes\n"
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_root_run_write_keeps_the_original_owner(temp_dir, monkeypatch):
+    f = temp_dir / "owned.txt"
+    f.write_text("old\n")
+    st = f.stat()
+    chowned = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        os, "chown", lambda p, uid, gid: chowned.append((Path(p).name.startswith(".owned.txt.k3tmp-"), uid, gid))
+    )
+    _atomic_write(f, b"new\n")
+    assert chowned == [(True, st.st_uid, st.st_gid)]  # the temp file is handed to the original owner before the rename
+    assert f.read_text() == "new\n"
+
+
+def test_a_non_root_write_does_not_chown(temp_dir, monkeypatch):
+    f = temp_dir / "plain.txt"
+    f.write_text("old\n")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    def boom(*a):
+        raise AssertionError("chown must only run as root")
+
+    monkeypatch.setattr(os, "chown", boom)
+    _atomic_write(f, b"new\n")
+    assert f.read_text() == "new\n"
