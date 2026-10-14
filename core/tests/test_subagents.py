@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from k3code.config import ProviderEntry
 from k3code.permissions import PermissionMode
 from k3code.reliability import sandbox
 from k3code.subagents import DepthLimit
@@ -480,3 +481,25 @@ def test_child_max_turns_takes_the_smaller_positive_cap():
     assert _child_max_turns(Settings(max_turns=50)) == 50
     assert _child_max_turns(Settings(max_turns=500)) == 200
     assert _child_max_turns(Settings(subagents={"max_turns": 7})) == 7
+
+
+async def test_a_child_follows_its_parents_provider_pick(tmp_path, monkeypatch):
+    """/provider puts a block first for the session; the sub-agent's router is built from the parent's pick too, so the
+    child's first call goes to that block, not to the config's first one."""
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    server.config.providers.append(
+        ProviderEntry(name="b", kind="openai", base_url="http://b", api_key_env="NOPE", models={"default": "m-b"})
+    )
+    await start(server, tmp_path)
+    sid = server.session.session_id
+    out = await call(server, "command.dispatch", {"name": "provider", "arg": "b", "session_id": sid})
+    assert out["message"] == "Provider set to: b (from the next turn)"
+    await run_turn(server, "PARENT: delegate it")
+    assert last_tool_result(server) == "the answer is 42"
+    child = [c["model"] for p in server.providers for c in p.log if "[agent:worker]" in c["text"]]
+    assert child == ["m-b"], child

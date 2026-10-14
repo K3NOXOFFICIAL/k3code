@@ -18,7 +18,7 @@ export function openTunePopup(ctx: SlashRunCtx): void {
 function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
   return ctx.gateway.gw
     .request<SlashExecResponse>("slash.exec", {
-      command: `${name} ${arg}`,
+      command: arg ? `${name} ${arg}` : name,
       session_id: ctx.sid,
     })
     .then((r) => {
@@ -74,5 +74,12 @@ export const tuneCommands: SlashCommand[] = [
     usage: "/effort [low|medium|high|xhigh|max|default]",
     run: (arg, ctx) =>
       arg.trim() ? runOnGateway("effort", arg.trim(), ctx) : openTunePopup(ctx),
+  },
+
+  {
+    help: "list the providers, or switch this session's (--save: also the default in config.yaml)",
+    name: "provider",
+    usage: "/provider [<name> [--save]]",
+    run: (arg, ctx) => runOnGateway("provider", arg.trim(), ctx),
   },
 ];
