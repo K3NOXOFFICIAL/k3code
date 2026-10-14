@@ -489,20 +489,49 @@ def test_a_clearly_worse_overlay_is_rolled_back(tmp_path):
         assert "router" not in confio.read_yaml(cfg)
 
 
-def test_too_few_sessions_per_arm_is_no_decision_and_ends_inconclusive(tmp_path):
+def test_a_before_after_experiment_without_enough_control_history_is_refused(tmp_path):
     cfg = tmp_path / "config.yaml"
     xp = optimizer.Experiments(tmp_path, FakeClock())
     patch = {"router": {"max_inline_wait": 40}}
-    xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=5), sessions=2, config_path=cfg)
+    with pytest.raises(ValueError, match="not enough history"):
+        xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=5), sessions=2, config_path=cfg)
+    assert xp.all() == [] and not cfg.exists()  # nothing started, nothing written, nobody blocked
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=optimizer.MIN_SESSIONS_PER_ARM), config_path=cfg)
+
+
+def test_too_few_treatment_sessions_is_no_decision_and_ends_inconclusive(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1), sessions=2, config_path=cfg)
     notes: list[str] = []
-    worse = metrics_for(0.9)  # clearly worse, but the control arm has 5 sessions, under MIN_SESSIONS_PER_ARM
+    few = metrics_for(0.9, n=0)
     for _ in range(optimizer.MAX_WINDOW_FACTOR * 2 - 1):
-        assert xp.session_done(lambda since: worse, notes.append, cfg) == []
+        assert xp.session_done(lambda since: few, notes.append, cfg) == []
     assert xp.get("x1")["status"] == "active" and not notes
     assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 40
-    xp.session_done(lambda since: worse, notes.append, cfg)  # past the longest window: give up, restore
+    xp.session_done(lambda since: few, notes.append, cfg)  # past the longest window: give up, restore
     assert xp.get("x1")["status"] == "inconclusive" and "inconclusive" in notes[0] and "too few" in notes[0]
     assert "router" not in confio.read_yaml(cfg)
+
+
+def test_an_experiment_without_a_design_field_is_judged_by_the_old_baseline_rule(tmp_path):
+    import json
+
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1), sessions=1, config_path=cfg)
+    items = xp.all()
+    for x in items:
+        del x["design"]
+        del x["control"]
+    xp._save(items)
+    notes: list[str] = []
+    (done,) = xp.session_done(lambda since: metrics_for(0.9), notes.append, cfg)
+    assert done["id"] == "x1" and xp.get("x1")["status"] == "rolled_back"
+    assert "rolled back automatically" in notes[0] and "router" not in confio.read_yaml(cfg)
+    json.dumps(xp.all())  # the stored record stays serializable
 
 
 def test_an_overlay_that_cannot_be_shown_no_worse_is_inconclusive():
@@ -569,7 +598,7 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
     from test_permissions_gateway import make_server
 
     server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
-    for i in range(6):  # six sessions this week, so the optimizer runs
+    for i in range(12):  # twelve sessions this week, so the optimizer runs
         server.usage.record(
             "call",
             session=f"s{i}",
@@ -595,10 +624,10 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
 
 
 def seed_a_week_with_a_gate_passing_candidate(server):
-    """Six sessions this week, and replay records in which one large turn makes ``tool_output_chars: 6000`` pass."""
+    """Twelve sessions this week (control history), and replay records where a large turn makes a 6000-char cap pass."""
     from test_learning_replay import turn
 
-    for i in range(6):
+    for i in range(12):
         server.usage.record(
             "call",
             session=f"s{i}",
@@ -683,7 +712,7 @@ async def test_a_rolled_back_auto_candidate_is_not_applied_again_next_week(tmp_p
     from test_permissions_gateway import make_server
 
     server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
-    for i in range(6):
+    for i in range(12):
         server.usage.record(
             "call",
             session=f"s{i}",

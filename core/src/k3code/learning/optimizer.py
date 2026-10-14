@@ -506,8 +506,13 @@ class Experiments:
                 f"experiment {busy[0]} is still running; one experiment at a time (wait for its A/B window or "
                 f"/optimizer rollback {busy[0]})"
             )
-        xid = f"x{len(items) + 1}"
         per_session = baseline.get("per_session") or {}
+        if "patch" in overlay and len(per_session) < MIN_SESSIONS_PER_ARM:
+            raise ValueError(
+                f"not enough history for a before/after test: {len(per_session)} control sessions, "
+                f"{MIN_SESSIONS_PER_ARM} needed"
+            )
+        xid = f"x{len(items) + 1}"
         exp: dict[str, Any] = {
             "id": xid,
             "title": overlay.get("title", ""),
@@ -603,6 +608,10 @@ class Experiments:
         finished = []
         for x in due:
             m = current_metrics(x["started"])
+            if "design" not in x:  # started before the A/B design: judge it by the old rule
+                self._judge_legacy(x, m, notify, config_path)
+                finished.append(x)
+                continue
             per_session = m.get("per_session") or {}
             if x.get("design") == "concurrent":
                 treatment = [s for sid, s in per_session.items() if arm(x["id"], sid) == "treatment"]
@@ -635,6 +644,27 @@ class Experiments:
             if notify:
                 notify(msg)
         return finished
+
+    def _judge_legacy(
+        self, x: dict[str, Any], m: dict[str, Any], notify: Callable[[str], None] | None, config_path: Path | None
+    ) -> None:
+        """Experiments without a ``design`` field: compare the window's score to the stored baseline score."""
+        after = score(m, x.get("baseline"))
+        x["after"], x["after_score"] = {k: v for k, v in m.items() if k != "per_session"}, after
+        if after < x["baseline_score"] - ROLLBACK_MARGIN:
+            x["result"] = {"decision": "rolled_back"}
+            self._store_result(x, "rolled_back")
+            self.rollback(x["id"], config_path=config_path)
+            msg = (
+                f"Optimizer experiment {x['id']} ({x['title']}) rolled back automatically: score "
+                f"{x['baseline_score']} → {after}."
+            )
+        else:
+            x["result"] = {"decision": "kept"}
+            self._store_result(x, "kept")
+            msg = f"Optimizer experiment {x['id']} ({x['title']}) kept: score {x['baseline_score']} → {after}."
+        if notify:
+            notify(msg)
 
     def _store_result(self, exp: dict[str, Any], status: str) -> None:
         items = self.all()

@@ -129,7 +129,7 @@ async def _run_headless(
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config, session_id=session)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
