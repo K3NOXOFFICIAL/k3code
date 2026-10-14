@@ -149,6 +149,8 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 
 ### Main chat input
 
+`Alt+Enter` is the portable newline key: it works in every terminal. `Shift+Enter` and `Ctrl+J` insert a newline only where the terminal reports them (Windows Terminal, SSH sessions, Ghostty, WSL); elsewhere `Ctrl+J` submits.
+
 | Key                         | Behavior                                                                                                                                                |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Enter`                     | Submit the current draft                                                                                                                                |

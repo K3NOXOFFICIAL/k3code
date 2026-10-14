@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import type { InputEvent, Key } from "@k3code/ink";
 import * as Ink from "@k3code/ink";
 import {
@@ -282,8 +284,23 @@ export async function cutSelection(
   return ok;
 }
 
+let procVersionCache: string | undefined;
+
+function readProcVersion(): string {
+  if (procVersionCache === undefined) {
+    try {
+      procVersionCache = readFileSync("/proc/version", "utf8");
+    } catch {
+      procVersionCache = "";
+    }
+  }
+
+  return procVersionCache;
+}
+
 export function shouldPreserveCtrlJNewline(
   env: MinimalEnv = process.env,
+  procVersion: () => string = readProcVersion,
 ): boolean {
   if (env.WT_SESSION) {
     return true;
@@ -305,7 +322,12 @@ export function shouldPreserveCtrlJNewline(
     return true;
   }
 
-  return (env.WSL_DISTRO_NAME ?? "").toLowerCase().includes("microsoft");
+  // WSL_DISTRO_NAME holds the distro ("Ubuntu"), never "microsoft".
+  if (env.WSL_INTEROP) {
+    return true;
+  }
+
+  return procVersion().toLowerCase().includes("microsoft");
 }
 
 type ReturnDecisionKey = {
