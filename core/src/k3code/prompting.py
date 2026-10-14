@@ -35,6 +35,7 @@ def prompt_sections(
     skills: bool = True,
     advisor: bool = True,
     attended: bool = True,
+    session_id: str | None = None,
 ) -> list[tuple[str, str]]:
     """The prompt as ``(name, text)`` sections in the order they are sent."""
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
@@ -75,7 +76,8 @@ def prompt_sections(
     if machine := user_gotchas_prompt():  # lines learned alike in several projects; changes only when one is added
         parts.append(("machine-gotchas", machine))
 
-    if learned and (overlay := overlay_prompt()):
+    # a control-arm session of an A/B experiment goes without
+    if learned and (overlay := overlay_prompt(session_id)):
         parts.append(("overlay", overlay))
     return parts
 
@@ -90,6 +92,7 @@ def build_system_prompt(
     skills: bool = True,
     advisor: bool = True,
     attended: bool = True,
+    session_id: str | None = None,
 ) -> str:
     sections = prompt_sections(
         base,
@@ -100,6 +103,7 @@ def build_system_prompt(
         skills=skills,
         advisor=advisor,
         attended=attended,
+        session_id=session_id,
     )
     return "\n\n".join(text for _, text in sections) + "\n"
 

@@ -345,8 +345,8 @@ class LearningHub:
         if "patch" in overlay:
             self._reset_routers()
         return (
-            f"Experiment {exp['id']} started: active for {exp['target_sessions']} sessions, then compared "
-            f"(auto-rollback if worse). /optimizer status"
+            f"Experiment {exp['id']} started: active for at least {exp['target_sessions']} sessions, then compared "
+            f"(auto-rollback if worse or inconclusive). /optimizer status"
         )
 
     def _config_rolled_back(self, exp: dict[str, Any]) -> None:
@@ -543,8 +543,9 @@ class LearningHub:
         return made
 
     def _rolled_back_before(self, patch: dict[str, Any]) -> bool:
+        """Judged worse, or not shown to be no worse (inconclusive): either way not auto-applied again."""
         return any(
-            x["patch"] == patch and x["status"] == "rolled_back"
+            x["patch"] == patch and x["status"] in ("rolled_back", "inconclusive")
             for x in self.experiments.all()
             if x.get("kind") == "config"
         )
