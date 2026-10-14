@@ -400,3 +400,155 @@ async def test_a_known_secret_is_dropped_also_when_percent_encoded(tmp_path, mon
     server.emit("tool_result", {"output": f"GET https://x.example.com/a?q={quote(known, safe='')} 401"})
     files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path, probe=False))
     assert "Sec%2Cret" not in files["events.json"]
+
+
+# K3NOX-493: a token-shaped URL user name is hidden whatever follows it
+
+USER_TOKEN = "Zq81" + "xYw9Pq2L" + "mN7tK3vB"  # the user name is the credential (`https://<token>:x-oauth-basic@`)
+
+
+@pytest.mark.parametrize("password", [":*", ":?", ":****", ":*?", ":", ""])
+@pytest.mark.parametrize("scheme", ["https", "ssh", "git+https"])
+def test_a_token_shaped_url_user_name_is_hidden_whatever_follows_it(scheme, password):
+    from k3code.redact import redact_session_json, scrub_text
+    from k3code.toolerrors import failure_of
+
+    # pip prints an index URL whose user name is the token as `https://<token>:****@host`
+    text = f"pip install --index-url {scheme}://{USER_TOKEN}{password}@pkgs.example.com/simple x"
+    assert USER_TOKEN not in scrub_text(text)
+    assert USER_TOKEN not in json.dumps(redact({"cmd": text}))
+    assert USER_TOKEN not in json.dumps(redact_session_json({"messages": [{"content": text}]}))
+    failure = failure_of("bash", {"command": "pip install x"}, {"exit_code": 1, "stderr": f"ERROR: {text}"})
+    assert failure is not None and USER_TOKEN not in failure.first_line + failure.signature
+
+
+@pytest.mark.parametrize("password", [":*", ":****", ":", ""])  # a `?` starts the query: scrub_text covers `<token>:?@`
+def test_scrub_urls_hides_a_token_shaped_user_name_whatever_follows_it(password):
+    from k3code.redact import scrub_urls
+
+    out = scrub_urls(f"https://{USER_TOKEN}{password}@pkgs.example.com/simple")
+    assert USER_TOKEN not in out and out.startswith(f"https://{REDACTED}") and out.endswith("@pkgs.example.com/simple")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://alice:*@h.example.com/x",
+        "curl https://*:*@*",
+        "ssh://git@github.com/o/r.git",
+        "https://bob@h.example.com",
+    ],
+)
+def test_an_ordinary_url_user_name_and_a_glob_password_stay(url):
+    from k3code.redact import scrub_text
+
+    assert scrub_text(url) == url
+    assert redact({"permissions": {"bash": {url: "deny"}}}) == {"permissions": {"bash": {url: "deny"}}}
+
+
+# K3NOX-493: a guessed secret (an MCP value of an ordinary name) never rewrites a deny rule
+
+
+def test_a_path_with_an_ordinary_word_is_no_token_whatever_its_directories_are_called():
+    paths = ["/Users/dev/Code/MyAwesomeProject", "~/src/KubernetesDeployments", "/srv/data/Project2024Archive01"]
+    env = {f"P{i}": p for i, p in enumerate(paths)}
+    cfg = Settings(mcp={"servers": {"s": McpServerConfig(command="srv", env=env)}})
+    known = [p for p in paths if p in debugdump.secret_values(cfg)]  # a failure shows these, not the host's env
+    assert known == []
+
+
+#: MCP env values under an ordinary name that are no ordinary word, path or address: known values only by a guess.
+GUESSED_MCP_VALUES = [
+    ("ROOT", "/Users/dev/Code/MyAwesomeProject", "git", "git clean -fdx /Users/dev/Code/MyAwesomeProject/src"),
+    ("REGION", "eu-west-1", "aws", "aws s3 rm s3://b --recursive --region eu-west-1"),
+    ("DB_NAME", "my_app_db", "psql", "psql my_app_db -c 'drop table users'"),
+    ("PROJECT", "MyProject2", "gcloud", "gcloud projects delete MyProject2"),
+]
+
+
+@pytest.mark.parametrize("name, value, tool, command", GUESSED_MCP_VALUES)
+def test_a_deny_rule_and_a_hardline_regex_naming_an_mcp_value_survive_export_and_trusted_import(
+    name, value, tool, command, tmp_path
+):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+    from k3code.permissions.rules import evaluate
+    from k3code.permissions.state import permissions_from_text
+
+    hardline = f"^{tool} .*{value}"
+    server = {"command": "srv", "args": ["--root", value], "env": {name: value}}
+    perms = {"bash": {f"{tool} *": "allow", f"{tool} *{value}*": "deny"}, "hardline": [hardline]}
+    _write_user_config({"mcp": {"servers": {"fs": server}}, "permissions": perms})
+    assert evaluate("bash", command, permissions_from_text(user_config_path().read_text())[0]).action == "deny"
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    user_config_path().unlink()  # a new device: only the bundle's rules are there
+    store = SessionStore(tmp_path / "t.db")
+    bundle.apply_bundle(bundle.read_bundle(out), store=store, cwd=tmp_path, sessions=False, trust_bundle=True)
+    rules, hard = permissions_from_text(user_config_path().read_text())
+    assert evaluate("bash", command, rules).action == "deny"
+    assert hard == [hardline]
+
+
+def test_an_mcp_root_path_in_server_args_survives_export(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    root = "/Users/dev/Code/MyAwesomeProject"
+    server = {"command": "srv", "args": ["--root", root], "env": {"ROOT": root}}
+    _write_user_config({"mcp": {"servers": {"fs": server}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    assert bundle.read_bundle(out).settings["user"]["mcp"]["servers"]["fs"]["args"] == ["--root", root]
+
+
+def test_an_allow_rule_still_loses_a_guessed_value_and_every_rule_a_named_secret(tmp_path, monkeypatch):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    guessed = "Q1w2E3r4" + "T5y6U7i8"  # no shape the scrubber knows: only the known-value pass can hide it
+    named = "hunter2" + "named" + "pw"
+    monkeypatch.setenv("K3_TEST_DB_PASSWORD", named)
+    perms = {
+        "bash": {f"tool -x {guessed}": "allow", f"* {named}*": "deny", f"ask {named}": "ask"},
+        "hardline": [f"echo {named}"],
+    }
+    server = {"command": "srv", "env": {"UPSTREAM": guessed}}
+    _write_user_config({"mcp": {"servers": {"s": server}}, "permissions": perms})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert guessed not in blob and named not in blob
+
+
+def test_a_known_secret_in_a_permission_tool_key_is_hidden(tmp_path, monkeypatch):
+    # K3NOX-495: the tool key (`web.<x>`, `mcp__<x>__run`) goes through the known-value pass like every other key
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    tok = "Dpl0y" + "ToolKey" + "Zq81xW"
+    monkeypatch.setenv("K3_TEST_DEPLOY_TOKEN", tok)
+    _write_user_config({"permissions": {f"web.{tok}": "deny", f"mcp__{tok}__run": {"*": "deny"}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert tok not in blob
+
+
+@pytest.mark.parametrize("action", ["Allow", "deny ", ["deny"], None])
+def test_a_rule_whose_action_is_not_deny_or_ask_loses_a_guessed_value(action, tmp_path):
+    # only an exact `deny`/`ask` keeps a guessed value; an action no rule accepts enforces nothing (K3NOX-497)
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    guessed = "Q1w2E3r4" + "T5y6U7i8"
+    server = {"command": "srv", "env": {"UPSTREAM": guessed}}
+    _write_user_config({"mcp": {"servers": {"s": server}}, "permissions": {"bash": {f"tool -x {guessed}": action}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    with tarfile.open(out) as tar:
+        blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
+    assert guessed not in blob
