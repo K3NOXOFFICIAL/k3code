@@ -4454,8 +4454,9 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
-    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
+def _project_sessions(server: GatewayServer, cwd: str, limit: int, offset: int = 0) -> list[SessionSummary]:
+    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised),
+    after skipping the ``offset`` newest such matches."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
     for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP):
@@ -4463,22 +4464,33 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Sessi
             spelled[stored_cwd] = _norm_cwd(stored_cwd)
         if spelled[stored_cwd] == cwd:
             ids.append(sid)
-            if len(ids) >= limit:
+            if len(ids) >= offset + limit:
                 break
-    return server.store.summaries(ids)
+    return server.store.summaries(ids[offset:])
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
-    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all."""
+    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all.
+    ``offset`` skips that many rows of the same listing (the next page); ``has_more`` says whether a row follows."""
     try:
-        limit = int(params.get("limit") or 50)
+        limit = max(1, int(params.get("limit") or 50))
     except (TypeError, ValueError):
         raise _InvalidParams("limit must be a whole number") from None
+    offset = params.get("offset")
+    offset = 0 if offset is None else offset
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise _InvalidParams("offset must be a whole number, 0 or more")
     if params.get("cwd") is not None and not isinstance(params["cwd"], str):
         raise _InvalidParams("cwd must be a string")
     cwd = _norm_cwd(params.get("cwd"))
-    sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
+    # one row more than the page, to tell whether another page follows
+    if cwd:
+        sessions = _project_sessions(server, cwd, limit + 1, offset)
+    else:
+        sessions = server.store.list(limit=limit + 1, offset=offset)
+    has_more = len(sessions) > limit
+    sessions = sessions[:limit]
     rows = []
     for s in sessions:
         preview = s.preview
@@ -4496,7 +4508,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "cwd": _norm_cwd(s.cwd),
             }
         )
-    return {"sessions": rows}
+    return {"sessions": rows, "has_more": has_more}
 
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

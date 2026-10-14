@@ -257,6 +257,35 @@ async def test_session_list_without_cwd_is_unchanged(tmp_path):
     await server.close()
 
 
+@pytest.mark.parametrize("by_cwd", [False, True])
+async def test_session_list_pages_with_offset_and_has_more(tmp_path, by_cwd):
+    """The bottom of a long session list must be reachable: offset pages through it, has_more says when to stop."""
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "other").mkdir()
+    server = make_server()
+    ids = [_stored(server, str(tmp_path / "proj"), updated_at=1000 - i) for i in range(250)]  # newest first
+    if by_cwd:  # another project's sessions, interleaved and newer, stay out of every page
+        for i in range(40):
+            _stored(server, str(tmp_path / "other"), updated_at=2000 + i)
+    params = {"cwd": str(tmp_path / "proj")} if by_cwd else {}
+    pages = []
+    for offset in (0, 100, 200):
+        res = (await rpc(server, "session.list", {**params, "limit": 100, "offset": offset}))["result"]
+        pages.append(res)
+    assert [len(p["sessions"]) for p in pages] == [100, 100, 50]
+    assert [p["has_more"] for p in pages] == [True, True, False]
+    assert [r["id"] for p in pages for r in p["sessions"]] == ids  # every one, in order: no duplicate and no gap
+    await server.close()
+
+
+@pytest.mark.parametrize("offset", [-1, "3", 1.5, True, [0]])
+async def test_session_list_rejects_a_bad_offset(offset):
+    server = make_server()
+    res = await rpc(server, "session.list", {"offset": offset})
+    assert res["error"]["code"] == -32602 and "offset" in res["error"]["message"]
+    await server.close()
+
+
 async def test_resumed_session_reports_its_cwd_normalised(tmp_path, monkeypatch):
     """A session stored as ``<symlink>/`` (before normalisation existed) reports the real path once resumed, so the
     agent view's project filter matches it."""
