@@ -624,7 +624,6 @@ describe("AgentViewPane", () => {
       await waitFor(() => expect(p.last()).toContain("› ◐ alpha"));
       expect(getAgentViewDraft()).toBe("hello");
 
-      // One key per render: the view reads its selection from the last render.
       p.stdin.write("\x1b[A");
       await waitFor(() => expect(p.last()).toContain("› ◐ this one"));
       p.stdin.write("\x1b[A"); // onto + New agent
@@ -642,6 +641,55 @@ describe("AgentViewPane", () => {
       expect(lines[1]!.trim()).toBe("");
       expect(lines[3]).toBe("Working");
       expect(getAgentViewDraft()).toBe("hello");
+    } finally {
+      p.done();
+    }
+  });
+
+  const FOUR = [
+    { id: "a", status: "working", title: "alpha" },
+    { id: "b", status: "working", title: "bravo" },
+    { id: "c", status: "working", title: "charlie" },
+    { id: "d", status: "working", title: "delta" },
+  ] as const;
+
+  it("moves once per arrow when several arrive in one burst (key repeat, a pasted sequence)", async () => {
+    const p = mountPane({}, [...FOUR]);
+
+    try {
+      await waitFor(() => expect(p.output()).toContain("› ◐ alpha"));
+      // One chunk: all three ↓ reach the handler before the view renders again.
+      p.stdin.write("\x1b[B\x1b[B\x1b[B");
+      await waitFor(() => expect(p.last()).toContain("› ◐ delta"));
+      expect(p.last()).not.toMatch(/› ◐ (alpha|bravo|charlie)/);
+    } finally {
+      p.done();
+    }
+  });
+
+  it("keeps the selection and the draft apart when ↓ and typing interleave in one burst", async () => {
+    const p = mountPane({}, [...FOUR]);
+
+    try {
+      await waitFor(() => expect(p.output()).toContain("› ◐ alpha"));
+      p.stdin.write("\x1b[Bx\x1b[By");
+      await waitFor(() => expect(p.last()).toContain("› ◐ charlie"));
+      expect(getAgentViewDraft()).toBe("xy");
+      expect(p.last()).toContain("› xy");
+    } finally {
+      p.done();
+    }
+  });
+
+  it("⏎ right after ↓ in one burst attaches the row ↓ moved to", async () => {
+    const onActivate = vi.fn();
+    const p = mountPane({ onActivate }, [...FOUR]);
+
+    try {
+      await waitFor(() => expect(p.output()).toContain("› ◐ alpha"));
+      p.stdin.write("\x1b[B\r");
+      await waitFor(() => expect(onActivate).toHaveBeenCalled());
+      expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "b" });
     } finally {
       p.done();
     }

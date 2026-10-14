@@ -1,7 +1,7 @@
 import { Box, Text, useInput, useStdout } from "@k3code/ink";
 import type { SessionListResult } from "@k3code/shared/gateway-events";
 import { useStore } from "@nanostores/react";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentRoster } from "../app/agentRoster.js";
 import { $uiState } from "../app/uiStore.js";
@@ -320,6 +320,18 @@ export interface AgentViewPaneProps {
   onSteer?: (row: ViewRow, text: string) => Promise<ViewNotice>;
 }
 
+/** The view's selection state: the nav plus the key of the row it rests on (`null` until the user moves). */
+interface NavState {
+  nav: ViewNav;
+  selKey: null | string;
+}
+
+/** The nav against the current rows: the selection follows its row's key, else rests on `defaultViewKey`. */
+const resolveNav = (rows: readonly ViewRow[], s: NavState): ViewNav => ({
+  ...s.nav,
+  index: selectedIndex(rows, s.selKey ?? defaultViewKey(rows), s.nav.index),
+});
+
 const UNAVAILABLE: ViewNotice = {
   text: "not available here",
   tone: "error",
@@ -352,10 +364,18 @@ export function AgentViewPane({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   const [notice, setNotice] = useState<null | ViewNotice>(null);
-  const [navState, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
   // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it. Until the user
-  // moves, it rests on this session's row, where they came from.
-  const [selKey, setSelKey] = useState<null | string>(null);
+  // moves, it rests on this session's row, where they came from. The key handler reads and writes the ref, so keys
+  // arriving in one tick (key repeat, a pasted burst) each see the one before; the state mirrors it for rendering.
+  const navRef = useRef<NavState>({ nav: IDLE_VIEW_NAV, selKey: null });
+  // Set by the composer's submit for the ⏎ that the key handler sees next.
+  const submittedRef = useRef(false);
+  const [navState, setNavState] = useState<NavState>(navRef.current);
+  const updateNav = (next: Partial<NavState>) => {
+    navRef.current = { ...navRef.current, ...next };
+    setNavState(navRef.current);
+  };
+  const setSelKey = (selKey: null | string) => updateNav({ selKey });
   const [now, setNow] = useState(Date.now);
   // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
   const currentCwd = info?.cwd;
@@ -422,10 +442,7 @@ export function AgentViewPane({
       ),
     [currentCwd, now, past, sessions, sid, subagents],
   );
-  const nav: ViewNav = {
-    ...navState,
-    index: selectedIndex(rows, selKey ?? defaultViewKey(rows), navState.index),
-  };
+  const nav = resolveNav(rows, navState);
   const selected = rows[nav.index];
   const working = rows.some((r) => r.state === "working");
 
@@ -473,12 +490,14 @@ export function AgentViewPane({
         return setAgentViewDraft("");
       case "confirm":
         setAgentViewDraft("");
-        setSelKey(a.row.key);
 
-        return setNav({
-          confirmAction: a.action,
-          confirmKey: a.row.key,
-          index: rows.indexOf(a.row),
+        return updateNav({
+          nav: {
+            confirmAction: a.action,
+            confirmKey: a.row.key,
+            index: rows.indexOf(a.row),
+          },
+          selKey: a.row.key,
         });
       case "new":
         setAgentViewDraft("");
@@ -518,25 +537,37 @@ export function AgentViewPane({
   const submit = (value: string) => {
     const text = value.trim();
 
+    submittedRef.current = true;
+    // From the ref: a ↓ earlier in the same burst has not rendered yet.
+    const row = rows[resolveNav(rows, navRef.current).index];
+
     if (!text) {
-      return activate(selected);
+      return activate(row);
     }
 
-    if (selected) {
-      run(routeViewInput(text, selected));
+    if (row) {
+      run(routeViewInput(text, row));
     }
   };
 
   // The composer's TextInput subscribed first (child effects run first), so it has already applied this key and
   // flushed its value to the draft atom when a non-text key arrives; read the atom, not the render's `draft`.
   useInput((ch, key) => {
+    // This ⏎ was the composer's submit, which ran just before this handler: it must not also confirm the y/n it armed
+    // (`/delete`), now that the handler sees the nav that submit wrote.
+    if (key.return && submittedRef.current) {
+      submittedRef.current = false;
+
+      return;
+    }
+
     if (!key.return) {
       // Enter's notice comes from the composer's submit, which ran just before this handler.
       setNotice(null);
     }
 
     const r = reduceViewKey(
-      nav,
+      resolveNav(rows, navRef.current),
       rows,
       {
         ch,
@@ -561,8 +592,7 @@ export function AgentViewPane({
       return;
     }
 
-    setNav(r.nav);
-    setSelKey(rows[r.nav.index]?.key ?? null);
+    updateNav({ nav: r.nav, selKey: rows[r.nav.index]?.key ?? null });
 
     // Side effects run here, never inside a state updater, so a stop cannot fire twice.
     switch (r.effect?.type) {

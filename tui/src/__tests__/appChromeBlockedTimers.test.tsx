@@ -35,6 +35,7 @@ import { DOUBLE_ESC_MS } from "../config/timing.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
 import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
+import { getAgentViewDraft, setAgentViewDraft } from "../k3/agentViewStore.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { SubagentProgress } from "../types.js";
 import { waitFor } from "./waitFor.js";
@@ -270,6 +271,8 @@ let nowSpy: ReturnType<typeof vi.spyOn<typeof Date, "now">>;
 beforeEach(() => {
   resetOverlayState();
   resetUiState();
+  // The view's composer draft is a module atom: text left in it turns the next test's empty-draft ⏎ into a send.
+  setAgentViewDraft("");
   nowSpy = vi.spyOn(Date, "now").mockReturnValue(T0);
   intervalSpy = vi.spyOn(globalThis, "setInterval");
 });
@@ -573,11 +576,11 @@ describe("AppLayout agent view: leaving the startup session", () => {
 
   // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
   it.each([
-    ["n", "newLiveSession", ["s1"]],
-    ["\r", "activateLiveSession", ["s2", "s1"]],
+    ["Ctrl+N", "\x0e", "newLiveSession", ["s1"]],
+    ["⏎", "\r", "activateLiveSession", ["s2", "s1"]],
   ] as const)(
-    "%j closes the empty session forged after the view opened",
-    async (key, method, args) => {
+    "%s closes the empty session forged after the view opened",
+    async (_label, key, method, args) => {
       const spy = vi.fn();
       const layout = mountLayout(
         { agentView: true },
@@ -607,6 +610,8 @@ describe("AppLayout agent view: leaving the startup session", () => {
         await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
       }
 
+      // An empty composer: Ctrl+N starts a foreground session (not a background agent), ⏎ attaches the row.
+      expect(getAgentViewDraft()).toBe("");
       layout.press(key);
 
       await waitFor(() => expect(spy).toHaveBeenCalled());
@@ -717,13 +722,13 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
   const closeCalls = (request: ReturnType<typeof vi.fn>) =>
     request.mock.calls.filter(([method]) => method === "session.close");
 
-  it("n with no strip rows closes the origin session once the new one is attached", async () => {
+  it("Ctrl+N with no strip rows closes the origin session once the new one is attached", async () => {
     const { layout, request } = mountWithLifecycle("s1");
 
-    await waitFor(() =>
-      expect(layout.output()).toContain("No sessions yet - press n"),
-    );
-    layout.press("n");
+    // No live rows: the selection rests on "+ New agent".
+    await waitFor(() => expect(layout.output()).toContain("› + New agent"));
+    expect(getAgentViewDraft()).toBe("");
+    layout.press("\x0e"); // Ctrl+N with an empty composer
 
     await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
     expect(getUiState().sid).toBe("s-new");
@@ -736,6 +741,8 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     const { layout, request } = mountWithLifecycle("s1");
 
     await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+    // ⏎ with an empty composer attaches the row; with text it would send it there.
+    expect(getAgentViewDraft()).toBe("");
     layout.press("\r");
 
     await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
@@ -757,9 +764,14 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       },
     ]);
 
+    // An earlier session is never the default selection (it rests on "+ New agent"), so ↓ selects it.
+    await waitFor(() => expect(layout.output()).toContain("· older work"));
+    await flush();
+    layout.press("\x1b[B");
     await waitFor(() => expect(layout.output()).toContain("› · older work"));
     // The row is painted before the pane's input handler is re-armed with it (see "⏎ routes by row kind").
     await flush();
+    expect(getAgentViewDraft()).toBe("");
     layout.press("\r");
 
     await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
@@ -774,10 +786,10 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
   it("closes nothing when there was no origin session", async () => {
     const { layout, request, rpc } = mountWithLifecycle(null);
 
-    await waitFor(() =>
-      expect(layout.output()).toContain("No sessions yet - press n"),
-    );
-    layout.press("n");
+    // No live rows: the selection rests on "+ New agent".
+    await waitFor(() => expect(layout.output()).toContain("› + New agent"));
+    expect(getAgentViewDraft()).toBe("");
+    layout.press("\x0e"); // Ctrl+N with an empty composer
 
     // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
     await waitFor(() => expect(getUiState().sid).toBe("s-new"));
@@ -1699,10 +1711,16 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
       { gateway: pastGateway },
     );
 
+    // An earlier session is never the default selection (it rests on "+ New agent"), so ↓ selects it.
+    await waitFor(() => expect(layout.output()).toContain("· older work"));
+    await flush();
+    layout.press("\x1b[B");
     await waitFor(() => expect(layout.output()).toContain("› · older work"));
     // The row is painted before the pane's input handler is re-armed with it; a ⏎ in that gap is dropped, and
     // nothing observable marks the end of the gap.
     await flush();
+    // An empty composer: ⏎ resumes the row instead of sending text to it.
+    expect(getAgentViewDraft()).toBe("");
     layout.press("\r");
 
     await waitFor(() => expect(resumeById).toHaveBeenCalled());
