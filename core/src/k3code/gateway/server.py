@@ -1993,6 +1993,7 @@ class GatewayServer:
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
                 attended=not (session.background or session.goal_continuation),
+                session_id=session.session_id,
             ),
             max_turns=self.config.max_turns,
             headless=False,
@@ -2232,7 +2233,10 @@ class GatewayServer:
             elif extra := hooked.context_text():
                 prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
-                fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
+                # M4b: parallel worktree children, within autonomy.fanout's agent/token budget (issue #136)
+                fan = await self.fanout.run(
+                    session, text, gate.plan, subtasks, budget=self.fanout.budget(len(subtasks))
+                )
                 if fan is not None and fan.ok:
                     gate.proceed, gate.message = False, fan.summary()
                     session.stored.messages = [
@@ -2549,6 +2553,7 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                session_id=session.session_id,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]

@@ -182,6 +182,31 @@ def _isolated_k3code_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _close_sqlite_connections(monkeypatch):
+    """Close every SQLite connection a test left open (K3NOX-563).
+
+    The gateway tests build a ``GatewayServer`` and never close it, so each one kept the sessions, blockers, usage,
+    artifacts and decisions databases open: about 17 descriptors per test (a database, its ``-wal`` and ``-shm``).
+    Over a full run that pushes later tests' descriptors past 1023, where ``select()`` cannot poll them.
+    """
+    import sqlite3
+
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    def connect(*args, **kwargs):
+        db = real_connect(*args, **kwargs)
+        opened.append(db)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    yield
+    for db in opened:
+        with contextlib.suppress(sqlite3.Error):
+            db.close()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_dns(monkeypatch):
     """The SSRF guard resolves hostnames: tests never touch DNS. Names resolve to a public address; IP literals
     (decimal, octal and hex forms included) still go through the real, offline parser."""

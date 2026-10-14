@@ -405,7 +405,15 @@ class SubagentManager:
 
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
-        perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
+        perms = PermissionState(
+            mode=PermissionMode(parent.perms.mode),
+            cwd=cwd,
+            add_dirs=list(parent.perms.add_dirs),
+            # a worktree child's cwd is a fresh path under the project: its config rules are the parent project's
+            project_dir=parent.perms.project_dir or parent.perms.cwd,
+            # the parent's session denies outrank a config allow there: the child may not run what the parent refuses
+            session_rules=[r for r in parent.perms.session_rules if r.action == "deny"],
+        )
         base = build_system_prompt(
             parent.system_prompt,
             cwd=cwd,
@@ -413,6 +421,7 @@ class SubagentManager:
             session_meta=parent.stored.meta,
             mcp=server.mcp,
             attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
+            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
         )
         note = ""
         if h.isolation == "worktree":

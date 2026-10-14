@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import subprocess
 import sys
 from pathlib import Path
@@ -114,6 +115,45 @@ def test_an_idle_open_pipe_does_not_hang_the_run(monkeypatch, capsys):
     finally:
         os.close(stdin.writer)
         stdin.reader.close()
+    assert "no input arrived on stdin" in capsys.readouterr().err
+
+
+def test_stdin_redirected_from_a_file_is_read(monkeypatch, tmp_path):
+    # epoll refuses a regular file; it never blocks, so it counts as ready
+    f = tmp_path / "in.txt"
+    f.write_text("from a file\n")
+    with f.open(encoding="utf-8") as fh:
+        monkeypatch.setattr(sys, "stdin", fh)
+        assert cli._headless_prompt("summarize") == "summarize\n\nfrom a file"
+
+
+def test_stdin_without_a_descriptor_is_read(monkeypatch):
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("in memory\n"))
+    assert cli._headless_prompt("summarize") == "summarize\n\nin memory"
+
+
+def test_an_idle_open_pipe_above_fd_1023_does_not_hang_the_run(monkeypatch, capsys):
+    # select() cannot poll a descriptor >= FD_SETSIZE; a long test run (or a daemon with many files open) gets there
+    monkeypatch.setattr(cli, "_STDIN_WAIT_SECONDS", 0.1)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    high = 1100
+    if hard != resource.RLIM_INFINITY and hard <= high:
+        pytest.skip("descriptor limit too low to open fd 1100")
+    if soft != resource.RLIM_INFINITY and soft <= high:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (high + 16, hard))
+    r, w = os.pipe()
+    os.dup2(r, high)
+    os.close(r)
+    reader = os.fdopen(high, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", reader)
+    try:
+        assert reader.fileno() > 1023
+        assert cli._headless_prompt("fix it") == "fix it"
+    finally:
+        os.close(w)
+        reader.close()
     assert "no input arrived on stdin" in capsys.readouterr().err
 
 

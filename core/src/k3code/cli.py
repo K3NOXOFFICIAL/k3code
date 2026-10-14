@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import os
-import select
+import selectors
 import shlex
 import subprocess
 import sys
@@ -125,6 +125,7 @@ async def _run_headless(
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
+    from k3code.permissions.state import PermissionState
     from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -134,7 +135,7 @@ async def _run_headless(
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config, session_id=session)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -150,7 +151,8 @@ async def _run_headless(
         router,
         system_prompt=system_prompt,
         max_turns=config.max_turns,
-        permission_mode=permission_mode.value,
+        # the config of the project the run applies (--config-dir) is the one its rules come from
+        permissions=PermissionState(mode=permission_mode, cwd=Path.cwd(), project_dir=project_dir),
         headless=True,
         on_event=_print_event,
         cwd=Path.cwd(),
@@ -273,8 +275,13 @@ def _read_stdin(wait: float | None) -> str:
         return ""
     if wait is not None:
         try:
-            ready = bool(select.select([stream], [], [], wait)[0])
-        except (OSError, ValueError, TypeError):  # an in-memory stream has no descriptor to poll, and cannot block
+            # epoll where there is one: select() fails on a descriptor >= FD_SETSIZE (1024), which must not turn into a
+            # blocking read of an idle pipe
+            with selectors.DefaultSelector() as sel:
+                sel.register(stream, selectors.EVENT_READ)
+                ready = bool(sel.select(wait))
+        except (AttributeError, OSError, ValueError, TypeError):
+            # no descriptor to poll (an in-memory stream) or one epoll refuses (a regular file): neither can block
             ready = True
         if not ready:
             click.echo(
@@ -443,6 +450,7 @@ async def _run_repl(
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
+    from k3code.permissions.state import PermissionState
     from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -477,7 +485,8 @@ async def _run_repl(
         router,
         system_prompt=system_prompt,
         max_turns=config.max_turns,
-        permission_mode=permission_mode.value,
+        # the config of the project the run applies (--config-dir) is the one its rules come from
+        permissions=PermissionState(mode=permission_mode, cwd=Path.cwd(), project_dir=project_dir),
         headless=False,
         on_event=_print_event,
         cwd=Path.cwd(),

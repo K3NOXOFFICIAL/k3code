@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,9 +27,20 @@ def _home() -> Path:
 
 
 #: What a config whose ``permissions:`` cannot be read at all contributes: a deny for every call that no more specific
-#: rule decides (the builtin read-only allowlist still applies). Contributing nothing let auto allow what it denied.
+#: rule decides, with :data:`UNREADABLE_HARDLINE` for bash. Contributing nothing let auto allow what it denied.
 UNREADABLE: tuple[Rule, ...] = (Rule(tool="*", pattern="*", action="deny"),)
+#: What a ``permissions.hardline`` that is not a list of regexes, or that sits in a config whose ``permissions:``
+#: cannot be read at all, contributes in their place: one that matches every command (a regex comment matches the
+#: empty string), so every bash command is hardline-denied in every mode. A deny rule would not do: yolo skips the
+#: rules for bash, so the user's own hardline lapsed. The builtin hardline list still runs first.
+UNREADABLE_HARDLINE = "(?#permissions.hardline cannot be read: every bash command is denied)"
 _warned: set[tuple[str, str]] = set()
+
+
+def _unreadable(why: str) -> tuple[list[Rule], list[str], list[str]]:
+    """What a config whose ``permissions:`` cannot be read at all gives: its rules and its hardline both fail closed."""
+    problem = f"{why}; every bash command is hardline-denied, every other call no rule allows is denied"
+    return list(UNREADABLE), [UNREADABLE_HARDLINE], [problem]
 
 
 def load_permissions_config(path: Path) -> tuple[list[Rule], list[str]]:
@@ -52,36 +64,64 @@ def read_permissions(path: Path) -> tuple[list[Rule], list[str], list[str]]:
     except FileNotFoundError:
         text = None
     except (OSError, UnicodeDecodeError):
-        return list(UNREADABLE), [], ["cannot read the file; every call no rule allows is denied"]
+        return _unreadable("cannot read the file")
     return parse_permissions(text)
 
 
 def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str]]:
     """(rules, extra hardline regexes, problems) of config text.
 
-    Fails closed and says so in ``problems``: an invalid entry is a deny (``from_config``), and text whose
-    ``permissions:`` cannot be read at all gives :data:`UNREADABLE`. No text, or no ``permissions:``, has no rules.
+    Fails closed and says so in ``problems``: an invalid entry is a deny (``from_config``), an invalid
+    ``permissions.hardline`` gives :data:`UNREADABLE_HARDLINE`, and text whose ``permissions:`` cannot be read at all
+    gives :data:`UNREADABLE` and :data:`UNREADABLE_HARDLINE`. No text, or no ``permissions:``, has no rules. Never
+    raises: the gateway re-reads the config before every turn, and doctor reads it to say what is wrong.
     """
     try:
         data = yaml.safe_load(text) if text is not None else None
-    except yaml.YAMLError:
-        return list(UNREADABLE), [], ["not valid YAML; every call no rule allows is denied"]
+    # safe_load raises ValueError for a date or an !!int it cannot build and RecursionError for deep nesting
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return _unreadable("not valid YAML")
     if data is not None and not isinstance(data, dict):
-        return list(UNREADABLE), [], ["the file is not a mapping; every call no rule allows is denied"]
+        return _unreadable("the file is not a mapping")
     section = (data or {}).get("permissions")
     if section is None:
         return [], [], []
     if not isinstance(section, dict):
-        return list(UNREADABLE), [], ["permissions: is not a mapping; every call no rule allows is denied"]
+        return _unreadable("permissions: is not a mapping")
     section = dict(section)
     problems: list[str] = []
-    hard: list[str] = []
-    for i, h in enumerate(section.pop("hardline", None) or []):
-        if str(h).strip():
-            hard.append(str(h))
-        else:  # '' matches every command: one stray empty entry denied all bash
-            problems.append(f"permissions.hardline[{i}] is blank: ignored (it would match every command)")
+    hard = _hardline(section.pop("hardline", None), problems)
     return from_config(section, problems), hard, problems
+
+
+def _hardline(value: object, problems: list[str]) -> list[str]:
+    """The extra regexes of ``permissions.hardline``, or :data:`UNREADABLE_HARDLINE` in place of all of them when any
+    part is not a regex; each problem names the entry, never its text (a pattern may hold a secret). A blank entry is
+    left out and reported, not failed closed."""
+    if value is None:
+        return []
+    consequence = "every bash command is hardline-denied"
+    if not isinstance(value, list):  # a string was split into one regex per character
+        problems.append(f"permissions.hardline: must be a list of regexes; {consequence}")
+        return [UNREADABLE_HARDLINE]
+    hard: list[str] = []
+    failed = False
+    for n, rx in enumerate(value, 1):
+        if not isinstance(rx, str):  # 5 became the regex "5", null the regex "None"
+            problems.append(f"permissions.hardline entry {n}: not text (quote it); {consequence}")
+            failed = True
+            continue
+        if not rx.strip():  # '' matches every command: one stray empty entry denied all bash
+            problems.append(f"permissions.hardline[{n - 1}] is blank: ignored (it would match every command)")
+            continue
+        try:
+            re.compile(rx)
+        except (re.error, OverflowError, RecursionError):  # raised again on every bash call
+            problems.append(f"permissions.hardline entry {n}: not a valid regex; {consequence}")
+            failed = True
+            continue
+        hard.append(rx)
+    return [UNREADABLE_HARDLINE] if failed else hard
 
 
 def _warn_once(source: str, problems: list[str]) -> None:
@@ -134,6 +174,12 @@ class PermissionState:
     user_rules: list[Rule] = field(default_factory=list)
     project_rules: list[Rule] = field(default_factory=list)
     hardline_extra: list[str] = field(default_factory=list)
+    #: The project whose config and accepted rules apply (None = cwd): the CLI's --config-dir, a worktree child's
+    #: parent project (its cwd is a fresh path under the one the user trusted).
+    project_dir: Path | None = None
+    #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
+    #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
+    loaded: bool = field(default=False, init=False, repr=False)
 
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""
@@ -142,17 +188,21 @@ class PermissionState:
         # they rank as the user's own (k3code.learning.projectstate.rules_path).
         from k3code.learning.projectstate import rules_path
 
-        accepted, _ = load_permissions_config(rules_path(self.cwd))
+        project_dir = self.project_dir or self.cwd
+        accepted, accepted_hard = load_permissions_config(rules_path(project_dir))
         user = [*user, *accepted]
         # A project config the user has not trusted contributes no rules and no hardline patterns.
-        text = trust.trusted_text(self.cwd)
+        text = trust.trusted_text(project_dir)
         project, project_hard = (
-            permissions_from_text(text, str(project_config_path(self.cwd))) if text is not None else ([], [])
+            permissions_from_text(text, str(project_config_path(project_dir))) if text is not None else ([], [])
         )
         self.user_rules, self.project_rules = user, project
-        self.hardline_extra = [*user_hard, *project_hard]
+        self.hardline_extra = [*user_hard, *accepted_hard, *project_hard]
+        self.loaded = True
 
     def decide(self, tool: str, args: dict[str, object], *, headless: bool = False) -> Decision:
+        if not self.loaded:
+            self.reload()
         return decide(
             mode=self.mode,
             tool=tool,
