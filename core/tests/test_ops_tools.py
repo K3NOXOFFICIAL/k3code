@@ -374,6 +374,62 @@ async def test_auto_mode_unsandboxed_bash_runs_once_approved_and_rules_still_all
     assert asked == ["git push origin main"] and ran[-1] == ("make test", None)
 
 
+async def test_auto_mode_hook_approve_cannot_run_a_sandbox_only_runner_on_the_host(tmp_path, monkeypatch):
+    """A builtin test runner is allowed only inside the sandbox. With bwrap unusable the host-run fallback is a human
+    decision (as for any auto-allowed command, issue #135): a PreToolUse hook's approve must not answer it."""
+    from k3code.providers.types import ToolCall
+    from k3code.userhooks import HookOutcome
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "auto")
+    dec = loop.permissions.decide("bash", {"command": "make test"})
+    assert dec.action == "allow" and dec.sandbox_only and not dec.auto_allowed  # the premise: a runner, sandbox only
+
+    async def approving_hook(event, tool, payload):
+        return HookOutcome(approved=True)
+
+    monkeypatch.setattr(loop, "_run_hooks", approving_hook)
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "make test"}))
+    assert "User denied" in result.get("error", "") and ran == []
+    assert len(asked) == 1 and asked[0].needs_human and "bubblewrap" in (asked[0].message or "")
+
+    # a person who approves it still runs it on the host
+    async def approve(name, args, decision):
+        return _Answer(True)
+
+    loop.approval_callback = approve
+    await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": "make test"}))
+    assert ran == [("make test", None)]
+
+
+async def test_accept_edits_hook_approve_still_answers_the_sandbox_only_runner_ask(tmp_path, monkeypatch):
+    """accept-edits does not sandbox bash and its ordinary asks are hook-approvable: no stricter for the runner."""
+    from k3code.providers.types import ToolCall
+    from k3code.userhooks import HookOutcome
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "accept-edits")
+
+    async def approving_hook(event, tool, payload):
+        return HookOutcome(approved=True)
+
+    monkeypatch.setattr(loop, "_run_hooks", approving_hook)
+
+    async def must_not_ask(name, args, decision):
+        raise AssertionError("the hook approved it")
+
+    loop.approval_callback = must_not_ask
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "make test"}))
+    assert ran == [("make test", None)]
+
+
 async def test_auto_mode_with_a_usable_sandbox_still_runs_without_asking(tmp_path, monkeypatch):
     from k3code.providers.types import ToolCall
 

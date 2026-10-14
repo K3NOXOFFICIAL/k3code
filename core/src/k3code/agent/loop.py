@@ -564,7 +564,8 @@ class AgentLoop:
                 )
             else:
                 why = "no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host"
-            decision = replace(decision, action="ask", sandbox_only=False, message=why)
+            # no_bwrap (auto/yolo, bwrap unusable): running on the host is a human-only call, as for auto_allowed below
+            decision = replace(decision, action="ask", sandbox_only=False, needs_human=no_bwrap, message=why)
         if home_rooted and not readonly_home:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
