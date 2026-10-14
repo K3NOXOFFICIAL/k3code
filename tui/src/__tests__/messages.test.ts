@@ -7,7 +7,10 @@ import { describe, expect, it } from "vitest";
 
 import { fmtMsgTimestamp, MessageLine } from "../components/messageLine.js";
 import { MAX_HISTORY } from "../config/limits.js";
-import { toTranscriptMessages } from "../domain/messages.js";
+import {
+  fmtDurationMinutes,
+  toTranscriptMessages,
+} from "../domain/messages.js";
 import {
   appendTranscriptMessage,
   capTranscriptHistory,
@@ -388,5 +391,16 @@ describe("display.timestamps (#41531)", () => {
       text: "then",
     });
     expect(kept?.createdAt).toBe(123);
+  });
+});
+
+describe("fmtDurationMinutes", () => {
+  it("shows whole minutes, never seconds", () => {
+    expect(fmtDurationMinutes(-5_000)).toBe("<1m");
+    expect(fmtDurationMinutes(59_999)).toBe("<1m");
+    expect(fmtDurationMinutes(60_000)).toBe("1m");
+    expect(fmtDurationMinutes(59 * 60_000 + 59_000)).toBe("59m");
+    expect(fmtDurationMinutes(3_600_000)).toBe("1h 0m");
+    expect(fmtDurationMinutes(99 * 3_600_000 + 59 * 60_000)).toBe("99h 59m");
   });
 });

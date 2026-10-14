@@ -44,6 +44,8 @@ type IntervalSpy = ReturnType<
   typeof vi.spyOn<typeof globalThis, "setInterval">
 >;
 
+type TimeoutSpy = ReturnType<typeof vi.spyOn<typeof globalThis, "setTimeout">>;
+
 // Fixed wall clock so the rendered elapsed read-outs are exact strings rather
 // than whatever the machine's clock happens to produce mid-test.
 const T0 = 1_800_000_000_000;
@@ -148,10 +150,21 @@ const armedDelays = (spy: IntervalSpy) => spy.mock.calls.map((call) => call[1]);
 const oneSecondTimers = (spy: IntervalSpy) =>
   armedDelays(spy).filter((delay) => delay === 1000).length;
 
-/** The handlers of every 1s clock armed so far — `() => setNow(Date.now())`. */
-const oneSecondTicks = (spy: IntervalSpy) =>
+// The idle SessionDuration + IdleSince read-outs are minute-granular: each arms
+// one setTimeout for the next minute boundary of its start time (<= 60 s away),
+// not a 1 s interval.  Everything else the tree arms with setTimeout is far
+// shorter, so the 30–60 s window isolates the clocks.
+const isClockDelay = (delay: unknown) =>
+  typeof delay === "number" && delay >= 30_000 && delay <= 60_000;
+
+/** Number of idle-clock timeouts armed so far. */
+const clockTimers = (spy: TimeoutSpy) =>
+  spy.mock.calls.filter((call) => isClockDelay(call[1])).length;
+
+/** The handlers of every idle-clock timeout armed so far. */
+const clockTicks = (spy: TimeoutSpy) =>
   spy.mock.calls
-    .filter((call) => call[1] === 1000)
+    .filter((call) => isClockDelay(call[1]))
     .map((call) => call[0] as () => void);
 
 // ── AppLayout harness ────────────────────────────────────────────────
@@ -265,6 +278,7 @@ const mountLayout = (
 const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
 
 let intervalSpy: IntervalSpy;
+let timeoutSpy: TimeoutSpy;
 let nowSpy: ReturnType<typeof vi.spyOn<typeof Date, "now">>;
 
 beforeEach(() => {
@@ -272,6 +286,7 @@ beforeEach(() => {
   resetUiState();
   nowSpy = vi.spyOn(Date, "now").mockReturnValue(T0);
   intervalSpy = vi.spyOn(globalThis, "setInterval");
+  timeoutSpy = vi.spyOn(globalThis, "setTimeout");
 });
 
 afterEach(() => {
@@ -280,16 +295,17 @@ afterEach(() => {
   }
 
   intervalSpy.mockRestore();
+  timeoutSpy.mockRestore();
   nowSpy.mockRestore();
   resetOverlayState();
   resetUiState();
 });
 
 describe("status-chrome timers under an occluding overlay", () => {
-  it("arms the one-second SessionDuration + IdleSince clocks when nothing covers the rule", () => {
+  it("arms the minute-granular SessionDuration + IdleSince clocks when nothing covers the rule", () => {
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("arms no timer at all when an occluding overlay is already open", () => {
@@ -297,7 +313,7 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 
   it("arms the FaceTicker glyph/verb/clock trio mid-turn when nothing covers the rule", () => {
@@ -348,7 +364,7 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("re-syncs the elapsed read-outs from the wall clock on reveal instead of resuming stale", async () => {
@@ -359,8 +375,8 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     const rule = mount(idleProps);
 
-    expect(rule.output()).toContain("1m 0s");
-    expect(rule.output()).toContain("✓ 5s");
+    expect(rule.output()).toContain("│ 1m │");
+    expect(rule.output()).toContain("✓ <1m");
 
     // Five minutes of wall clock elapse while the overlay covers the rule.
     nowSpy.mockReturnValue(T0 + 300_000);
@@ -368,7 +384,7 @@ describe("status-chrome timers under an occluding overlay", () => {
     resetOverlayState();
     // Poll for the reveal frame instead of a fixed tick: under CI load the
     // store-driven re-render can land well after one 20ms scheduler turn.
-    await waitFor(() => expect(rule.output()).toContain("6m 0s"), {
+    await waitFor(() => expect(rule.output()).toContain("│ 6m │"), {
       interval: 10,
       timeout: 5_000,
     });
@@ -376,25 +392,25 @@ describe("status-chrome timers under an occluding overlay", () => {
     const resumed = rule.output();
 
     // Caught up to real elapsed time, not stuck on the pre-overlay values.
-    expect(resumed).toContain("6m 0s");
-    expect(resumed).toContain("✓ 5m 5s");
-    expect(resumed).not.toContain("1m 0s");
+    expect(resumed).toContain("│ 6m │");
+    expect(resumed).toContain("✓ 5m");
+    expect(resumed).not.toContain("│ 1m │");
 
     // …and the clocks are running again.
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("tears the clocks down when an overlay opens over an already-running status rule", async () => {
     mount(idleProps);
 
-    // Handles of the two live 1-second clocks (SessionDuration + IdleSince).
-    const clocks = intervalSpy.mock.results
-      .filter((_result, i) => intervalSpy.mock.calls[i]?.[1] === 1000)
-      .map((result) => result.value as ReturnType<typeof setInterval>);
+    // Handles of the two live minute clocks (SessionDuration + IdleSince).
+    const clocks = timeoutSpy.mock.results
+      .filter((_result, i) => isClockDelay(timeoutSpy.mock.calls[i]?.[1]))
+      .map((result) => result.value as ReturnType<typeof setTimeout>);
 
     expect(clocks).toHaveLength(2);
 
-    const clearSpy = vi.spyOn(globalThis, "clearInterval");
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
 
     patchOverlayState({ sessions: true });
     await flush();
@@ -405,9 +421,35 @@ describe("status-chrome timers under an occluding overlay", () => {
     }
 
     // … and the occluded re-run arms no replacement (still just the original two).
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
 
     clearSpy.mockRestore();
+  });
+});
+
+describe("idle status rule repaints (#170)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("writes no frame for 30 s while idle, then one minute-granular repaint at the next minute", async () => {
+    nowSpy.mockRestore();
+    vi.useFakeTimers({ now: T0 });
+
+    // Session started 60 s ago, last turn ended 5 s ago: the next minute
+    // boundary is 55 s away, so nothing may be written before then.
+    const rule = mount(idleProps);
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(rule.output()).toContain("1m");
+    rule.clear();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rule.output()).toBe("");
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rule.output()).toContain("2m");
+    expect(rule.output()).toContain("✓ 1m");
   });
 });
 
@@ -475,7 +517,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
       mount(idleProps);
 
-      expect(oneSecondTimers(intervalSpy)).toBe(0);
+      expect(clockTimers(timeoutSpy)).toBe(0);
     },
   );
 
@@ -486,7 +528,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
       mount(idleProps);
 
-      expect(oneSecondTimers(intervalSpy)).toBe(2);
+      expect(clockTimers(timeoutSpy)).toBe(2);
     },
   );
 
@@ -497,7 +539,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 });
 
@@ -519,20 +561,20 @@ describe("AppLayout status-rule visibility", () => {
     // The rule is genuinely rendered — the approval prompt pushed it, it did
     // not cover it — so freezing its clock would freeze something visible.
     expect(layout.output()).toContain("~/repo");
-    expect(layout.output()).toContain("1m 0s");
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(layout.output()).toContain("1m");
+    expect(clockTimers(timeoutSpy)).toBe(2);
 
-    // …and it really advances: drive the armed 1s handlers forward.
-    nowSpy.mockReturnValue(T0 + 30_000);
+    // …and it really advances: drive the armed minute handlers forward.
+    nowSpy.mockReturnValue(T0 + 120_000);
 
-    for (const tick of oneSecondTicks(intervalSpy)) {
+    for (const tick of clockTicks(timeoutSpy)) {
       tick();
     }
 
     await flush();
     await flush();
 
-    expect(layout.output()).toContain("1m 30s");
+    expect(layout.output()).toContain("3m");
   });
 
   it("arms no clock under a floating model picker while the rule is at the top", async () => {
@@ -540,7 +582,7 @@ describe("AppLayout status-rule visibility", () => {
 
     await flush();
 
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 
   it("keeps the clocks armed under a floating model picker while the rule is at the bottom", async () => {
@@ -548,7 +590,7 @@ describe("AppLayout status-rule visibility", () => {
 
     await flush();
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("swaps the transcript and composer for the full-screen agent view", async () => {
@@ -559,7 +601,7 @@ describe("AppLayout status-rule visibility", () => {
     expect(layout.output()).toContain(AGENT_VIEW_HINT);
     // the composer (and the status rule inside it) unmounts with the view up
     expect(layout.output()).not.toContain("~/repo");
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 });
 
