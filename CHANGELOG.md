@@ -6,6 +6,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Changed
 
+- **`/settings` shows the saved theme.** The Theme row read the gateway skin name, so after choosing `light` and relaunching it showed `default`. It now reads the `display.tui_theme` pin that `/theme` writes, and cycles `auto`, `light`, `dark` (`default` was never a value `/theme` accepts).
 - **TUI README hotkeys.** `Ctrl+L` is documented as a full repaint (same as `/redraw`), not a new session, and `PgUp`/`PgDn`/`Shift+Up`/`Shift+Down` as transcript scrolling; `Home`/`End` are said not to scroll it. A test pins the three rows.
 - **System prompt no longer overpromises.** It said `read`, `grep` and `glob` never need permission and that a file you read is unchanged unless you edited it. Reads outside the project ask first and credential paths are refused, and a file can change under a `bash` formatter, `git checkout` or generator, so the prompt now says to re-read after such a command or a failed `edit` match, and to take the reversible option when nobody can answer.
 - **`learning` output style in unattended runs.** The `learning` style told the model to leave a `TODO(human)` for the user to implement; in a background or `/goal` turn and in every sub-agent nobody could fill it in. Those prompts now keep the teaching part and tell the model to implement all of it. Interactive sessions and custom style files are unchanged. (#166)
