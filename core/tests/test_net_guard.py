@@ -383,3 +383,119 @@ async def test_the_guarded_transport_keeps_the_name_for_the_host_header():
         server.shutdown()
         server.server_close()
     assert (r.status_code, r.text, asked, hosts) == (200, "ok", [PUBLIC], ["public.test"])
+
+
+# ── a proxy from the environment: the guarded fetcher connects directly (a proxy would resolve the name itself) ──
+
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+@pytest.fixture
+def env_proxy(monkeypatch):
+    """A local stand-in for an HTTP proxy that records every request it gets (absolute-form GET or CONNECT) and
+    answers ``via-proxy``. Yields (set, hits): ``set(var)`` points that environment variable at it."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    hits: list[str] = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def _answer(self) -> None:
+            hits.append(f"{self.command} {self.path}")
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", "9")
+            self.end_headers()
+            self.wfile.write(b"via-proxy")
+
+        do_GET = do_CONNECT = _answer  # noqa: N815
+
+        def log_message(self, *_a) -> None:
+            return None
+
+    for var in PROXY_VARS + tuple(v.lower() for v in PROXY_VARS):
+        monkeypatch.delenv(var, raising=False)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    yield (lambda var: monkeypatch.setenv(var, url)), hits
+    server.shutdown()
+    server.server_close()
+
+
+def _direct_to_local(monkeypatch, asked: list[tuple[str, int]], port: int | None):
+    """Build the fetcher's guarded transport with a backend that records where it was asked to connect and then
+    connects to the local server on ``port`` (``None``: connects nowhere)."""
+    import httpcore
+
+    from k3code.research import fetch as fetch_mod
+
+    class Backend:
+        async def connect_tcp(self, host, port_, **kw):
+            asked.append((host, port_))
+            if port is None:
+                raise httpcore.ConnectError("not connecting in tests")
+            return await httpcore.AnyIOBackend().connect_tcp("127.0.0.1", port, **kw)
+
+    real = net_guard.GuardedTransport
+    monkeypatch.setattr(fetch_mod, "GuardedTransport", lambda origins=(): real(origins, inner=Backend()))
+
+
+@pytest.mark.parametrize("var", ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+async def test_the_guarded_fetcher_ignores_a_proxy_for_http(monkeypatch, env_proxy, var):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    set_proxy, hits = env_proxy
+    set_proxy(var)
+
+    class Direct(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", "6")
+            self.end_headers()
+            self.wfile.write(b"direct")
+
+        def log_message(self, *_a) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Direct)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    asked: list[tuple[str, int]] = []
+    _direct_to_local(monkeypatch, asked, server.server_address[1])
+    fetcher = WebFetcher(respect_robots=False)
+    try:
+        got = await fetcher.get("http://public.test/")
+    finally:
+        await fetcher.aclose()
+        server.shutdown()
+        server.server_close()
+    assert (got.body, asked, hits) == ("direct", [(PUBLIC, 80)], [])
+
+
+@pytest.mark.parametrize("var", ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])
+async def test_the_guarded_fetcher_ignores_a_proxy_for_https(monkeypatch, env_proxy, var):
+    set_proxy, hits = env_proxy
+    set_proxy(var)
+    asked: list[tuple[str, int]] = []
+    _direct_to_local(monkeypatch, asked, None)
+    fetcher = WebFetcher(respect_robots=False)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await fetcher.get("https://public.test/")
+    finally:
+        await fetcher.aclose()
+    assert (asked, hits) == ([(PUBLIC, 443)], [])  # no CONNECT reached the proxy: the vetted address was dialled
+
+
+async def test_with_allow_private_the_fetcher_uses_the_environment_proxy(env_proxy):
+    """The guard is off, so nothing is pinned and httpx's default applies: HTTP(S)_PROXY / ALL_PROXY are used."""
+    set_proxy, hits = env_proxy
+    set_proxy("HTTP_PROXY")
+    fetcher = WebFetcher(respect_robots=False, allow_private=True)
+    try:
+        got = await fetcher.get("http://public.test/")
+    finally:
+        await fetcher.aclose()
+    assert (got.body, hits) == ("via-proxy", ["GET http://public.test/"])

@@ -177,6 +177,8 @@ class Settings(BaseModel):
 
     providers: list[ProviderEntry] = Field(default_factory=list)
     default_model: str = "default"  # key into provider.models
+    #: provider block a session's turns try first (/provider <name> --save); "" or an unknown name = the first block
+    default_provider: str = ""
     max_turns: int = 0  # model calls per prompt; 0 = no cap (a reached cap stops the turn as needs_input)
     max_tokens: int = 8192
     temperature: float | None = None
@@ -216,7 +218,8 @@ class Settings(BaseModel):
         default_factory=lambda: {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
     )
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
-    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
+    # the exact origin of research.searxng_url is always allowed. While the guard is on, web_fetch connects directly
+    # and ignores HTTP(S)_PROXY/ALL_PROXY (a proxy would resolve names again). See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
     # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",

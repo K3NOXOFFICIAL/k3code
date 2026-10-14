@@ -60,7 +60,12 @@ def prompt_sections(
 
     if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
         parts.append(("facts", facts))
-    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS))):
+    from k3code.learning import learning_cfg
+
+    # learning.enabled: false keeps what learning wrote on its own (learned notes, optimizer overlays) out of the
+    # prompt too, not only stops new learning; lines a person accepted (gotcha cards, USER.md) stay
+    learned = bool(learning_cfg(config)["enabled"])
+    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS)), learned=learned):
         parts.append(("memory", mem))
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt
@@ -70,7 +75,7 @@ def prompt_sections(
     if machine := user_gotchas_prompt():  # lines learned alike in several projects; changes only when one is added
         parts.append(("machine-gotchas", machine))
 
-    if overlay := overlay_prompt():
+    if learned and (overlay := overlay_prompt()):
         parts.append(("overlay", overlay))
     return parts
 

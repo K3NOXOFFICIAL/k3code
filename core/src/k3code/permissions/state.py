@@ -165,6 +165,12 @@ class PermissionState:
     user_rules: list[Rule] = field(default_factory=list)
     project_rules: list[Rule] = field(default_factory=list)
     hardline_extra: list[str] = field(default_factory=list)
+    #: The project whose config and accepted rules apply (None = cwd): the CLI's --config-dir, a worktree child's
+    #: parent project (its cwd is a fresh path under the one the user trusted).
+    project_dir: Path | None = None
+    #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
+    #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
+    loaded: bool = field(default=False, init=False, repr=False)
 
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""
@@ -173,17 +179,21 @@ class PermissionState:
         # they rank as the user's own (k3code.learning.projectstate.rules_path).
         from k3code.learning.projectstate import rules_path
 
-        accepted, accepted_hard = load_permissions_config(rules_path(self.cwd))
+        project_dir = self.project_dir or self.cwd
+        accepted, accepted_hard = load_permissions_config(rules_path(project_dir))
         user = [*user, *accepted]
         # A project config the user has not trusted contributes no rules and no hardline patterns.
-        text = trust.trusted_text(self.cwd)
+        text = trust.trusted_text(project_dir)
         project, project_hard = (
-            permissions_from_text(text, str(project_config_path(self.cwd))) if text is not None else ([], [])
+            permissions_from_text(text, str(project_config_path(project_dir))) if text is not None else ([], [])
         )
         self.user_rules, self.project_rules = user, project
         self.hardline_extra = [*user_hard, *accepted_hard, *project_hard]
+        self.loaded = True
 
     def decide(self, tool: str, args: dict[str, object], *, headless: bool = False) -> Decision:
+        if not self.loaded:
+            self.reload()
         return decide(
             mode=self.mode,
             tool=tool,

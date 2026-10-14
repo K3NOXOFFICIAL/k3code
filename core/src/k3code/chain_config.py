@@ -132,15 +132,25 @@ def set_default_model(key: str, home: Path | None = None) -> tuple[bool, str]:
     touched then), ``backup`` is '' when there was no file to back up. The caller has checked that ``key`` is a known
     model key. (YAML comments are not preserved by the rewrite; the backup keeps them.)
     """
+    return _set_top_level("default_model", key, home)
+
+
+def set_default_provider(name: str, home: Path | None = None) -> tuple[bool, str]:
+    """Make ``name`` the ``default_provider`` of the user config (``/provider <name> --save``), the same way
+    :func:`set_default_model` saves the default model. The caller has checked that ``name`` is a provider block."""
+    return _set_top_level("default_provider", name, home)
+
+
+def _set_top_level(field: str, value: str, home: Path | None) -> tuple[bool, str]:
     path = config_path(home)
     with confio.locked(path):
         try:
             data = confio.read_yaml(path)
         except (confio.ConfigError, yaml.YAMLError, OSError) as e:
             raise ChainEditError(f"cannot read {path}: {e}") from e
-        if data.get("default_model") == key:
+        if data.get(field) == value:
             return False, ""
-        data["default_model"] = key
+        data[field] = value
         try:
             confio.validate(data)
             backup = confio.write_yaml(path, data)
