@@ -10,6 +10,7 @@ kept in memory by the server; this store only persists what resume needs.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -128,6 +129,8 @@ class SessionStore:
         self.path = Path(path)
         self._executor: ThreadPoolExecutor | None = None
         self._writer: SessionStore | None = None
+        #: the writes submitted to the writer thread that have not run yet (see writes_queued)
+        self._queued: set[concurrent.futures.Future[None]] = set()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
@@ -384,7 +387,19 @@ class SessionStore:
     async def _on_writer(self, name: str, *args: Any) -> None:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k3code-session-writer")
-        await asyncio.get_running_loop().run_in_executor(self._executor, self._call_writer, name, *args)
+        job = self._executor.submit(self._call_writer, name, *args)
+        self._queued.add(job)  # until it has run, even when its caller stops waiting (a cancelled turn)
+        job.add_done_callback(self._queued.discard)
+        await asyncio.wrap_future(job)
+
+    def writes_queued(self) -> bool:
+        """A write is queued on (or running in) the writer thread: a save made now on this thread may be undone."""
+        return bool(self._queued)
+
+    async def writes_landed(self) -> None:
+        """Wait until every write queued on the writer thread so far has run."""
+        if pending := list(self._queued):
+            await asyncio.wait([asyncio.wrap_future(job) for job in pending])
 
     def _call_writer(self, name: str, *args: Any) -> None:
         if self._writer is None:  # a sqlite connection may only be used by the thread that made it

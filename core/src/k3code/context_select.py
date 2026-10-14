@@ -90,9 +90,12 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _task(messages: Sequence[Message]) -> str:
-    """The latest user message: the prompt of this turn (a reused loop's history holds older ones first)."""
+    """The latest user message: the prompt of this turn (a reused loop's history holds older ones first); a `!cmd`
+    record is context the user added, not the task."""
+    from k3code.session_ai import is_shell_record
+
     for m in reversed(messages):
-        if m.role == "user" and m.content:
+        if m.role == "user" and m.content and not is_shell_record(m):
             return m.content
     return ""
 

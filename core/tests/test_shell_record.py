@@ -288,3 +288,143 @@ def test_anthropic_sends_both_user_messages_in_order_after_the_assistant():
 def test_claude_cli_renders_both_in_order():
     _system, prompt = render_prompt(_two_users(), [])
     assert prompt.index("[user]\n<bash-input>ls") < prompt.index("[user]\nq2")
+
+
+# ── readers of "the request": a record is never the task ──
+
+
+def test_context_select_takes_the_prompt_not_a_record_after_it():
+    from k3code.context_select import _task
+
+    assert _task([Message(role="user", content="fix the build"), Message(role="user", content=rec()["content"])]) == (
+        "fix the build"
+    )
+
+
+def test_the_planner_history_drops_older_records_and_never_merges_one_into_a_prompt():
+    from k3code.autonomy.plan_first import planner_history
+
+    older = [
+        Message(role="user", content="first ask"),
+        Message(role="assistant", content="first answer"),
+        Message(role="user", content=rec("cat log", "z" * 5000)["content"]),
+        Message(role="user", content="second ask"),
+        Message(role="assistant", content="second answer"),
+    ]
+    tail = [Message(role="user", content="third ask"), Message(role="assistant", content="third answer")]
+    out = planner_history([*older, *tail], keep=2)
+    assert [m.content for m in out] == [
+        "first ask",
+        "first answer",
+        "second ask",
+        "second answer",
+        *[m.content for m in tail],
+    ]
+
+
+def test_a_goal_continuation_after_a_record_still_finds_the_goal_message():
+    from types import SimpleNamespace
+
+    from k3code.gateway.server import GatewayServer
+    from k3code.goals import quote
+
+    goal = ("Rebuild the billing module. " + "requirement " * 120).strip()
+    prompt = f"[Continuing toward your standing goal]\nGoal: {quote(goal)}\n\nNext step."
+    mgr = SimpleNamespace(state=SimpleNamespace(goal=goal))
+    held = {"role": "user", "content": f"[Standing goal]\nGoal: {goal}"}
+    session = SimpleNamespace(stored=SimpleNamespace(messages=[held, {"role": "assistant", "content": "a"}, rec()]))
+    assert GatewayServer._with_long_goal(session, mgr, prompt) == prompt  # the record displaced nothing
+    # only a record holds the goal (the user printed it): no goal message is above, the prompt carries it whole
+    session.stored.messages = [rec("cat goal.txt", goal)]
+    restored = GatewayServer._with_long_goal(session, mgr, prompt)
+    assert goal in restored and quote(goal) not in restored
+
+
+async def test_a_compaction_over_records_keeps_the_real_task_and_a_bounded_command():
+    from k3code.session_ai import COMPACT_TOOL_CHARS, SUMMARY_PREFIX, compact_messages
+
+    seen: list[str] = []
+
+    class Caller:
+        async def complete(self, kind, messages, **kw):
+            seen.append(messages[-1].content)
+            return type("R", (), {"text": "summary body"})()
+
+    huge = rec("make check", "".join(f"out {i}\n" for i in range(20_000)))
+    messages = [rec("git status", "clean\n"), {"role": "user", "content": "the real task"}]
+    for i in range(6):
+        messages += [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": f"c{i}", "name": "read", "arguments": {}}]},
+            {"role": "tool", "tool_call_id": f"c{i}", "name": "read", "content": "x" * 50},
+            {"role": "assistant", "content": f"step {i}"},
+            huge if i == 3 else {"role": "user", "content": f"go on {i}"},
+        ]
+    out, folded = await compact_messages(Caller(), messages, keep=4)
+    assert folded and out[0]["content"] == "the real task" and out[1]["content"].startswith(SUMMARY_PREFIX)
+    assert "make check" in seen[0] and "git status" in seen[0]
+    assert seen[0].count("out ") < COMPACT_TOOL_CHARS // 4  # the record's output is cut as a tool result is
+    calls = {c["id"] for m in out for c in m.get("tool_calls") or []}
+    assert calls == {m["tool_call_id"] for m in out if m.get("role") == "tool"}  # the cut broke no pair
+    wire = messages_to_openai(
+        [
+            Message(role=m["role"], content=m.get("content"))
+            for m in out
+            if not m.get("tool_calls") and m["role"] != "tool"
+        ]
+    )
+    roles = [m["role"] for m in wire]
+    assert all(a != b for a, b in zip(roles, roles[1:], strict=False))  # consecutive user messages are one turn
+
+
+async def test_a_record_flushed_while_a_cancelled_turns_snapshot_is_still_writing_survives_it(tmp_path, monkeypatch):
+    """/stop twice: the second cancel leaves the turn's shielded snapshot (made without the record) on the writer
+    thread while the turn's done-callback saves the record. The snapshot must not be the last word."""
+    import contextlib
+    import threading
+
+    from k3code.gateway.sessions import SessionStore
+
+    server = await _server(tmp_path, monkeypatch, SLOW)
+    entered, release = threading.Event(), threading.Event()
+    save = SessionStore.save
+
+    def gated(self, sess):
+        if threading.current_thread().name.startswith("k3code-session-writer") and not entered.is_set():
+            entered.set()
+            release.wait(5)
+        save(self, sess)
+
+    monkeypatch.setattr(SessionStore, "save", gated)
+    await call(server, "prompt.submit", {"text": "first task"})
+    task = server.session.turn_task
+    await asyncio.sleep(0.3)
+    assert (await call(server, "shell.exec", {"command": "echo during", "record": True}))["recorded"] == "after_turn"
+    assert await server.interrupt_turn()
+    for _ in range(300):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set()  # the turn's snapshot is on the writer thread now
+    task.cancel()  # the second /stop
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert any(is_shell_record(m) for m in server.session.messages)  # the done-callback put it in
+    release.set()
+    await server.store.writes_landed()
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if not server._side_tasks:
+            break
+    assert any(is_shell_record(m) for m in server.store.get(server.session.session_id).messages)
+
+
+async def test_undo_after_a_record_removes_the_last_prompt_not_the_record(tmp_path, monkeypatch):
+    server = await _server(tmp_path, monkeypatch)
+    await call(server, "shell.exec", {"command": "echo before", "record": True})
+    await run_turn(server, "explain")
+    await call(server, "shell.exec", {"command": "echo after", "record": True})
+    res = await call(server, "session.undo", {"session_id": server.session.session_id})
+    assert res["removed"] == 3  # the prompt, its answer and the record made after it
+    kept = [m for m in server.session.messages if m.get("role") != "system"]
+    assert len(kept) == 1 and "before" in kept[0]["content"]

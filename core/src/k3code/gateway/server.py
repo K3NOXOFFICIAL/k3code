@@ -2143,7 +2143,20 @@ class GatewayServer:
         records, session.shell_records = session.shell_records, []
         session.stored.messages = [*session.stored.messages, *records]
         self.store.save(session.stored)
+        if self.store.writes_queued():
+            # a write queued before this save (a cancelled turn's shielded snapshot, a checkpoint) holds the transcript
+            # without the records and would land after it: save again once it has
+            task = asyncio.ensure_future(self._save_after_queued_writes(session))
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
         return True
+
+    async def _save_after_queued_writes(self, session: LiveSession) -> None:
+        await self.store.writes_landed()
+        try:
+            self.store.save(session.stored)  # the live transcript: never older than what was queued
+        except Exception:  # noqa: BLE001 - may run after the store closed (shutdown)
+            logger.warning("could not save session %s after its queued writes", session.session_id, exc_info=True)
 
     async def _fold_after_overflow(
         self, session: LiveSession, failed_attempt: list[dict[str, Any]], n_before: int, pin: dict[str, Any] | None
@@ -2179,7 +2192,8 @@ class GatewayServer:
         state = mgr.state
         if state is None or len(state.goal) <= GOAL_QUOTE_CHARS or quote(state.goal) not in prompt:
             return prompt
-        if any(state.goal in str(m.get("content") or "") for m in session.stored.messages):
+        # a `!cmd` record that printed the goal is no goal message: the pointer says "the goal message above"
+        if any(state.goal in str(m.get("content") or "") for m in session.stored.messages if not is_shell_record(m)):
             return prompt
         return prompt.replace(quote(state.goal), state.goal)
 

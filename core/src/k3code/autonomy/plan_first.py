@@ -22,7 +22,7 @@ from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind, Tier
-from k3code.session_ai import split_for_compaction
+from k3code.session_ai import is_shell_record, split_for_compaction
 from k3code.tools import jobs
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,8 @@ def planner_history(history: list[Message], keep: int) -> list[Message]:
     cut = split_for_compaction([{"role": m.role} for m in history], keep)
     older: list[Message] = []
     for m in history[:cut]:
+        if is_shell_record(m):  # a `!cmd` and its output, context like a tool result: the planner can run it again
+            continue
         if m.role == "user" and older and older[-1].role == "user":
             # the assistant's tool turn between two prompts is gone: one user turn, not two in a row
             older[-1] = Message(role="user", content=f"{older[-1].content or ''}\n\n{m.content or ''}")
