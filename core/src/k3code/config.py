@@ -232,6 +232,19 @@ class Settings(BaseModel):
     # see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("providers")
+    @classmethod
+    def _unique_provider_names(cls, v: list[ProviderEntry]) -> list[ProviderEntry]:
+        """The name is how /model, doctor, NetWatch and the cooldown store find an entry: two blocks sharing one would
+        be edited, cleared and parked together. A second account of a provider gets its own name."""
+        seen: set[str] = set()
+        for p in v:
+            name = p.name.strip().lower()
+            if name in seen:
+                raise ValueError(f"duplicate provider name {p.name.strip()!r}: give each provider block its own name")
+            seen.add(name)
+        return v
+
     @model_validator(mode="before")
     @classmethod
     def _lift_legacy_searxng(cls, data: Any) -> Any:

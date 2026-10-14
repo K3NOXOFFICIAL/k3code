@@ -83,8 +83,8 @@ class ChainEntry:
         return not getattr(self.provider, "api_key", "")
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower())
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower(), self.key_fingerprint)
 
 
 def build_chain(providers: Sequence[Provider], models: Sequence[str | Sequence[str]]) -> list[ChainEntry]:
@@ -253,6 +253,7 @@ class Router:
                     provider=entry.provider_name,
                     model=target_model,
                     base_url=entry.base_url,
+                    account=entry.key_fingerprint,
                     fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
@@ -272,7 +273,10 @@ class Router:
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
                             self.cooldowns.record_success(
-                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                                provider=entry.provider_name,
+                                model=target_model,
+                                base_url=entry.base_url,
+                                account=entry.key_fingerprint,
                             )
                         yield event
                     # The provider yields its "done" event then closes normally.
@@ -394,16 +398,28 @@ class Router:
             target = model if index == 0 and model else entry.model
             fp = entry.key_fingerprint
             if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             ):
                 if index in auth_failed:
                     continue
                 return None
             left = self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             cooled = self.cooldowns.reason_of(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
@@ -421,10 +437,18 @@ class Router:
             return None
         fp = entry.key_fingerprint
         if self.cooldowns.in_cooldown(
-            provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+            provider=entry.provider_name,
+            model=model,
+            base_url=entry.base_url,
+            account=fp,
+            fingerprint=fp,
         ):
             return self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=model,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
         return None
 
@@ -446,6 +470,7 @@ class Router:
             provider=entry.provider_name,
             model=target_model,
             base_url=entry.base_url,
+            account=entry.key_fingerprint,
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
