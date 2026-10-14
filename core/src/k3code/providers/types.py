@@ -176,6 +176,23 @@ def _reminder_text(content: str) -> str:
     return f"<system-reminder>\n{content}\n</system-reminder>"
 
 
+def _append_openai(out: list[dict[str, Any]], entry: dict[str, Any]) -> None:
+    """Add ``entry`` to the wire; a plain user message right after another is joined to it: the chat templates of
+    Mistral-instruct and Gemma-2 refuse two user turns in a row ('Conversation roles must alternate'), and compaction
+    leaves the kept history, the summary and the pinned notes as separate user messages."""
+    prev = out[-1] if out else None
+    if (
+        entry["role"] == "user"
+        and prev is not None
+        and prev["role"] == "user"
+        and isinstance(prev["content"], str)
+        and isinstance(entry["content"], str)
+    ):
+        prev["content"] = "\n\n".join(p for p in (prev["content"], entry["content"]) if p)
+        return
+    out.append(entry)
+
+
 def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
     """Serialize messages for chat-completions-compatible providers.
 
@@ -201,6 +218,8 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
         if m.role == "system" and out:  # a second leading system message joins the first
             out[-1]["content"] = f"{out[-1]['content']}\n\n{m.content or ''}".rstrip()
             continue
+        if m.role == "assistant" and not m.tool_calls and not (m.content or "").strip():
+            continue  # said nothing (an empty reply kept in the history): an empty assistant turn is refused by relays
         entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
         if m.role == "assistant" and m.tool_calls:
             entry["tool_calls"] = [
@@ -221,11 +240,11 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
             if m.role == "user":
                 entry["content"] = "\n\n".join([*notes, *([m.content] if m.content else [])])
             else:
-                out.append({"role": "user", "content": "\n\n".join(notes)})
+                _append_openai(out, {"role": "user", "content": "\n\n".join(notes)})
             notes = []
-        out.append(entry)
+        _append_openai(out, entry)
     if notes:  # notes after the last message
-        out.append({"role": "user", "content": "\n\n".join(notes)})
+        _append_openai(out, {"role": "user", "content": "\n\n".join(notes)})
     return out
 
 

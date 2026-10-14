@@ -64,7 +64,8 @@ def test_chat_completions_providers_get_one_system_message():
     later = [*msgs("a", "b"), Message(role="system", content="a note later in the conversation")]
     wire = messages_to_openai(later)
     # only the leading run merges; a note later in the conversation is a user reminder, not a second system message
-    assert [m["role"] for m in wire] == ["system", "user", "user"]
+    # and it joins the user message before it (two user turns in a row are one: chat templates want alternation)
+    assert [m["role"] for m in wire] == ["system", "user"]
     assert "a note later in the conversation" in wire[-1]["content"]
 
 

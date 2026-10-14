@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -11,7 +12,7 @@ from typing import Any
 import httpx
 
 from k3code.providers.base import Provider, ProviderError, error_from_http, request_headers, to_provider_error
-from k3code.providers.effort import openai_effort, takes_effort
+from k3code.providers.effort import openai_effort, takes_effort, usable_temperature
 from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     Message,
@@ -92,7 +93,7 @@ class OpenAICompatProvider(Provider):
         # OpenAI's reasoning models (o-series, gpt-5) reject ``max_tokens`` ("use max_completion_tokens instead"), and
         # the limit there also covers the hidden reasoning; every other model id keeps the key all servers understand
         payload["max_completion_tokens" if takes_effort(model, "openai") else "max_tokens"] = max_tokens
-        if temperature is not None:
+        if (temperature := _usable_temperature(model, temperature)) is not None:
             payload["temperature"] = temperature
         if effort := openai_effort(model):
             payload["reasoning_effort"] = effort
@@ -190,22 +191,27 @@ class OpenAICompatProvider(Provider):
                         complete = True
                         finish_reason = choices[0]["finish_reason"]
                     delta = choices[0].get("delta") or {}
-                    if text := delta.get("content"):
-                        content_parts.append(text)
-                        yield StreamEvent(type="text_delta", text=text)
+                    for field in ("content", "refusal"):  # a refusal is the model's answer: shown, and kept in history
+                        if text := _delta_text(delta.get(field)):
+                            content_parts.append(text)
+                            yield StreamEvent(type="text_delta", text=text)
                     for tc in delta.get("tool_calls") or []:
                         wire = tc.get("index", 0)
                         tc_id = tc.get("id")
                         key = current.get(wire)
+                        fn = tc.get("function") or {}
                         # a different id on the same index is another call: some servers number every parallel call 0
-                        if key is None or (tc_id and tool_calls[key]["id"] and tc_id != tool_calls[key]["id"]):
+                        if (
+                            key is None
+                            or (tc_id and tool_calls[key]["id"] and tc_id != tool_calls[key]["id"])
+                            or _next_call_starts(tool_calls[key], fn)
+                        ):
                             key = max(tool_calls, default=-1) + 1
                             current[wire] = key
                             tool_calls[key] = {"id": "", "name": "", "args": []}
                         slot = tool_calls[key]
                         if tc_id:
                             slot["id"] = tc_id
-                        fn = tc.get("function") or {}
                         if fn_name := fn.get("name"):
                             # the name arrives whole, in pieces, or repeated whole in every delta ("readread")
                             if not slot["name"] or fn_name.startswith(slot["name"]):
@@ -213,7 +219,7 @@ class OpenAICompatProvider(Provider):
                             elif fn_name != slot["name"]:
                                 slot["name"] += fn_name
                         if args := fn.get("arguments"):
-                            slot["args"].append(args)
+                            slot["args"].append(_delta_arguments(args))
                 if chunk_usage := chunk.get("usage"):
                     usage = _parse_usage(
                         chunk_usage, reports_cost="openrouter" in self.base_url.lower(), write_multiple=write_multiple
@@ -252,6 +258,77 @@ class OpenAICompatProvider(Provider):
             raise to_provider_error(exc, kind="openai") from exc
         finally:
             await response.aclose()
+
+
+def _unreadable(what: str, value: Any) -> ProviderError:
+    # status 400: the router fails over without retrying; the same reply would come again, and every retry is billed
+    return ProviderError(
+        message=f"the endpoint's stream is not chat-completions shaped: {what} is {type(value).__name__}",
+        status_code=400,
+        headers={},
+        body={},
+    )
+
+
+def _delta_text(value: Any) -> str:
+    """The text of a delta's ``content`` or ``refusal``: a string, or (some servers) a list of parts, of which the
+    ``text`` ones count and ``thinking`` and the like are left out."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            p if isinstance(p, str) else str(p.get("text") or "")
+            for p in value
+            if isinstance(p, str) or (isinstance(p, dict) and p.get("type") in (None, "text", "output_text"))
+        )
+    raise _unreadable("delta.content", value)
+
+
+def _delta_arguments(value: Any) -> str:
+    """A tool call's ``arguments`` piece: a string, or an already parsed object (some servers send the whole call)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    raise _unreadable("function.arguments", value)
+
+
+def _next_call_starts(slot: dict[str, Any], fn: dict[str, Any]) -> bool:
+    """Whether a delta on the index of ``slot`` starts another call. Some servers (Gemini's compatibility layer) number
+    every parallel call 0 and send no id, or an empty one: a delta that names a call when the one before it is whole
+    (its arguments are a complete JSON object) and brings arguments or another name is a new call. A server that
+    repeats the name in every delta of ONE call is not split: its arguments are not whole yet."""
+    name = fn.get("name")
+    if not name or not slot["name"] or not slot["args"]:
+        return False
+    if not fn.get("arguments") and name == slot["name"]:
+        return False
+    raw = "".join(slot["args"]).rstrip()
+    if not raw.endswith("}"):
+        return False
+    try:
+        return isinstance(json.loads(raw, strict=False), dict)
+    except json.JSONDecodeError:
+        return False
+
+
+# o1/o3/o4 and gpt-5 accept only the default temperature (HTTP 400 otherwise); gpt-5-chat is not a reasoning model.
+_FIXED_TEMPERATURE = re.compile(r"(?:^|/)(?:o[134](?:-|$)|gpt-5(?!-chat))")
+_WARNED_TEMPERATURE: set[str] = set()
+
+
+def _usable_temperature(model: str, temperature: float | None) -> float | None:
+    """``temperature``, or None for a model that refuses it (a warning, once per model and process): Claude ids by the
+    rule of the Anthropic wire, OpenAI's reasoning models here."""
+    temperature = usable_temperature(model, temperature)
+    if temperature is not None and _FIXED_TEMPERATURE.search(model.lower()):
+        if model not in _WARNED_TEMPERATURE:
+            _WARNED_TEMPERATURE.add(model)
+            logger.warning("%s does not take a temperature: sending the request without it", model)
+        return None
+    return temperature
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
