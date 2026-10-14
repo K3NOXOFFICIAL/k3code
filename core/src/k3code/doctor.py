@@ -527,10 +527,32 @@ def check_home(home: Path) -> Check:
     return Check("k3code-home", OK, f"{home} writable")
 
 
+#: ``check_journal`` parses whole journals, so it reads only the newest files and stops once the budget is spent
+#: (#82: 61 journals of 7 MB took the doctor 7.4 s).
+JOURNAL_MAX_FILES = 20
+JOURNAL_BUDGET_S = 2.0
+
+
+def _newest_journals(jdir: Path) -> list[Path]:
+    stamped: list[tuple[float, Path]] = []
+    for path in jdir.glob("*.jsonl") if jdir.is_dir() else []:
+        try:
+            stamped.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    return [p for _, p in sorted(stamped, key=lambda t: (-t[0], t[1].name))]
+
+
 def check_journal(home: Path) -> Check:
     jdir = home / "journal"
     open_sessions: dict[str, int] = {}
-    for path in sorted(jdir.glob("*.jsonl")) if jdir.is_dir() else []:
+    paths = _newest_journals(jdir)
+    deadline = time.monotonic() + JOURNAL_BUDGET_S
+    checked = 0
+    for path in paths[:JOURNAL_MAX_FILES]:
+        if time.monotonic() > deadline:
+            break
+        checked += 1
         try:
             j = ToolJournal(home, path.stem)
             try:
@@ -542,16 +564,18 @@ def check_journal(home: Path) -> Check:
             continue
         if pending:
             open_sessions[path.stem] = len(pending)
+    unchecked = len(paths) - checked
+    note = f" ({unchecked} older journal(s) not checked)" if unchecked else ""
     if open_sessions:
         names = ", ".join(f"{k} ({v if v >= 0 else 'unreadable'})" for k, v in open_sessions.items())
         return Check(
             "journal",
             WARN,
-            f"unresolved tool intents in: {names}",
+            f"unresolved tool intents in: {names}{note}",
             "k3code --resume --session <id> completes them (side-effect tools are never re-run)",
-            {"sessions": open_sessions},
+            {"sessions": open_sessions, "unchecked": unchecked},
         )
-    return Check("journal", OK, "no unresolved intents")
+    return Check("journal", OK, f"no unresolved intents{note}", data={"unchecked": unchecked})
 
 
 def check_vendor() -> Check:

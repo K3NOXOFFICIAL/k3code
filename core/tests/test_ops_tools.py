@@ -102,6 +102,37 @@ def test_doctor_journal_unresolved_intent(tmp_path):
     assert doctor.check_journal(tmp_path / "empty").status == "ok"
 
 
+def _old_pending_journal_and_two_new(tmp_path):
+    import os
+
+    from k3code.reliability.journal import ToolJournal
+
+    j = ToolJournal(tmp_path, "old")
+    j.record_intent("c1", "bash", {"command": "echo"}, side_effect=True)
+    j.close()
+    os.utime(tmp_path / "journal" / "old.jsonl", (1_000_000, 1_000_000))
+    for name in ("new1", "new2"):
+        (tmp_path / "journal" / f"{name}.jsonl").write_text("")
+
+
+def test_doctor_journal_reads_only_newest_files(tmp_path, monkeypatch):
+    # #82: the check parses whole journals, so it stops at the newest JOURNAL_MAX_FILES and says what it skipped.
+    _old_pending_journal_and_two_new(tmp_path)
+    monkeypatch.setattr(doctor, "JOURNAL_MAX_FILES", 2, raising=False)
+    c = doctor.check_journal(tmp_path)
+    assert c.status == "ok" and "1 older journal(s) not checked" in c.detail
+    assert c.data["unchecked"] == 1
+    monkeypatch.setattr(doctor, "JOURNAL_MAX_FILES", 3, raising=False)
+    assert doctor.check_journal(tmp_path).status == "warn"
+
+
+def test_doctor_journal_stops_when_budget_spent(tmp_path, monkeypatch):
+    _old_pending_journal_and_two_new(tmp_path)
+    monkeypatch.setattr(doctor, "JOURNAL_BUDGET_S", -1.0, raising=False)
+    c = doctor.check_journal(tmp_path)
+    assert c.status == "ok" and c.data["unchecked"] == 3
+
+
 def test_doctor_isolation_flags_hermes_env(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
     assert doctor.check_isolation().status == "ok"
