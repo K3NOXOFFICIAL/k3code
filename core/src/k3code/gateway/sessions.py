@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from k3code import sqlstore
+from k3code import recall, sqlstore
 from k3code.gateway.protocol import scrub_surrogates
 
 logger = logging.getLogger(__name__)
@@ -151,6 +151,8 @@ class SessionStore:
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
         )
         self._db.commit()
+        #: the recall archive's tables (DDL only: this runs per writer thread and in CLI paths too)
+        self.fts = recall.ensure_schema(self._db)
 
     def create(self, *, title: str = "", model: str = "", provider: str = "", cwd: str = "") -> StoredSession:
         now = time.time()
@@ -212,6 +214,35 @@ class SessionStore:
                 preview,
             ),
         )
+        self._index(sess.session_id, sess.cwd, sess.messages, sess.updated_at)
+
+    def _index(self, session_id: str, cwd: str, messages: list[dict[str, Any]], at: float) -> None:
+        """Feed the recall archive inside the caller's open transaction. Indexing must never fail a save: an error
+        rolls back only the index writes (savepoint) and is logged."""
+        try:
+            self._db.execute("SAVEPOINT recall_index")
+        except sqlite3.Error:
+            logger.warning("recall index: session %s not indexed", session_id, exc_info=True)
+            return
+        try:
+            recall.ingest(self._db, session_id, cwd, messages, at)
+        except sqlite3.Error:
+            logger.warning("recall index: session %s not indexed", session_id, exc_info=True)
+            with contextlib.suppress(sqlite3.Error):
+                self._db.execute("ROLLBACK TO recall_index")
+        with contextlib.suppress(sqlite3.Error):
+            self._db.execute("RELEASE recall_index")
+
+    def archive(self, session_id: str, messages: list[dict[str, Any]], cwd: str = "") -> None:
+        """Archive ``messages`` now, before a rewrite (compaction, /clear) drops them from the stored transcript,
+        whether or not the backfill has reached this session yet."""
+        with self._db:
+            self._index(session_id, cwd, messages, time.time())
+
+    def backfill_archive_batch(self, max_sessions: int = 8, max_bytes: int = 4 << 20) -> int:
+        """One batch of the recall backfill (see :func:`recall.backfill_batch`); run it on the writer thread
+        (``await store._on_writer("backfill_archive_batch")``). Returns the sessions processed, 0 when done."""
+        return recall.backfill_batch(self._db, max_sessions, max_bytes)
 
     @staticmethod
     def new_id() -> str:
@@ -341,6 +372,7 @@ class SessionStore:
                 ),
             )
             if cur.rowcount:
+                self._index(sess.session_id, sess.cwd, sess.messages, sess.updated_at)
                 return
             gone = self._db.execute("DELETE FROM swept_sessions WHERE session_id = ?", (sess.session_id,))
             if not gone.rowcount:
@@ -377,20 +409,24 @@ class SessionStore:
         title or meta it was snapshotted with over a newer value saved in between. A missing row stays missing."""
         count, preview = summarize_messages(messages)
         payload = dump_messages(messages)
+        now = time.time()
         with self._db:
-            self._db.execute(
+            cur = self._db.execute(
                 "UPDATE sessions SET messages=?, model=CASE WHEN model='' THEN ? ELSE model END, updated_at=?,"
                 " message_count=?, preview=? WHERE session_id=?",
-                (payload, scrub_surrogates(model), time.time(), count, preview, session_id),
+                (payload, scrub_surrogates(model), now, count, preview, session_id),
             )
+            if cur.rowcount:
+                row = self._db.execute("SELECT cwd FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                self._index(session_id, row[0] if row else "", messages, now)
 
-    async def _on_writer(self, name: str, *args: Any) -> None:
+    async def _on_writer(self, name: str, *args: Any) -> Any:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k3code-session-writer")
         job = self._executor.submit(self._call_writer, name, *args)
         self._queued.add(job)  # until it has run, even when its caller stops waiting (a cancelled turn)
         job.add_done_callback(self._queued.discard)
-        await asyncio.wrap_future(job)
+        return await asyncio.wrap_future(job)
 
     def writes_queued(self) -> bool:
         """A write is queued on (or running in) the writer thread: a save made now on this thread may be undone."""
@@ -401,10 +437,10 @@ class SessionStore:
         if pending := list(self._queued):
             await asyncio.wait([asyncio.wrap_future(job) for job in pending])
 
-    def _call_writer(self, name: str, *args: Any) -> None:
+    def _call_writer(self, name: str, *args: Any) -> Any:
         if self._writer is None:  # a sqlite connection may only be used by the thread that made it
             self._writer = SessionStore(self.path)
-        getattr(self._writer, name)(*args)
+        return getattr(self._writer, name)(*args)
 
     async def save_async(self, sess: StoredSession) -> None:
         """:meth:`save` on a worker thread with its own connection, so a large transcript does not stall the event
@@ -421,10 +457,12 @@ class SessionStore:
             self._writer = None
 
     def delete(self, session_id: str) -> bool:
-        """Delete the row and any sweep tombstone for it, so no later save brings the session back."""
+        """Delete the row and any sweep tombstone for it, so no later save brings the session back, and its recall
+        archive (deleting a session forgets it)."""
         with self._db:
             cur = self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             self._db.execute("DELETE FROM swept_sessions WHERE session_id = ?", (session_id,))
+            recall.delete_session(self._db, session_id)
         return cur.rowcount > 0
 
     def sweep_empty(

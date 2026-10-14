@@ -881,6 +881,7 @@ class GatewayServer:
         #: work that belongs to a turn but outlives its start (MCP early start, plan critique); close() cancels it
         self._bg_tasks: set[asyncio.Future[Any]] = set()
         self._idle_sweeper: asyncio.Task[None] | None = None
+        self._archive_backfill: asyncio.Task[None] | None = None
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
         self.last_attempt: tuple[str, str] = ("", "")
         self.model_caller = ModelCaller(
@@ -1115,6 +1116,9 @@ class GatewayServer:
         if not stdio:
             self.clients.remove(self._stdio_client)
         self._idle_sweeper = asyncio.get_running_loop().create_task(self._idle_sweep_loop(), name="k3-idle-sweeper")
+        self._archive_backfill = asyncio.get_running_loop().create_task(
+            self._archive_backfill_loop(), name="k3-archive-backfill"
+        )
         try:
             if socket_path is not None:
                 await self.start_socket(socket_path)
@@ -1128,6 +1132,9 @@ class GatewayServer:
             self.shutdown()
         finally:
             self._idle_sweeper.cancel()
+            self._archive_backfill.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._archive_backfill
 
     async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1476,6 +1483,29 @@ class GatewayServer:
                 await self.sweep_idle_reliability()
             except Exception:
                 logger.exception("idle reliability sweep failed")
+
+    ARCHIVE_BACKFILL_PAUSE_S = 0.25
+    ARCHIVE_BACKFILL_RETRY_S = 5.0
+
+    async def _archive_backfill_loop(self) -> None:
+        """Index the sessions saved before the recall archive existed, a small batch at a time on the store's writer
+        thread (its own connection, in line with the saves), until a batch finds nothing left. A failing batch (a
+        locked database) is retried a few times, then left to the next start."""
+        failures = 0
+        while True:
+            try:
+                done = await self.store._on_writer("backfill_archive_batch")
+            except Exception:
+                failures += 1
+                logger.warning("recall index backfill: batch failed (%d)", failures, exc_info=True)
+                if failures >= 3:
+                    return
+                await asyncio.sleep(self.ARCHIVE_BACKFILL_RETRY_S)
+                continue
+            failures = 0
+            if not done:
+                return
+            await asyncio.sleep(self.ARCHIVE_BACKFILL_PAUSE_S)
 
     async def sweep_idle_reliability(self, now: float | None = None) -> int:
         """Stop the NetWatch of sessions that have been idle for IDLE_RELIABILITY_S; returns how many were stopped.
@@ -3191,6 +3221,9 @@ class GatewayServer:
         current = session.stored.messages
         if current[: len(snapshot)] != snapshot:  # /clear or another rewrite ran during the summary call: it wins
             return 0
+        # the folded part leaves the stored transcript now: archive it first (an old session the backfill has not
+        # reached yet, or messages never saved, would otherwise be lost to recall)
+        self.store.archive(session.session_id, snapshot[:folded], session.stored.cwd)
         new = self._with_todos(session, snapshot[:folded], new)
         session.stored.messages = [*new, *current[len(snapshot) :]]  # what was appended meanwhile stays
         if isinstance(session.stored.meta.get("goal_started"), dict):

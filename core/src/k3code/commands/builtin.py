@@ -144,6 +144,13 @@ class _ClearCommand(CommandDef):
             return {"type": "message", "message": "No active session to clear."}
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
+        from k3code.gateway.sessions import StoredSession
+
+        stored: StoredSession | None = ctx.store.get(session_id or "")
+        # what is cleared stays recallable: the saved transcript and the live one (it may hold an unsaved tail)
+        for messages in (stored.messages if stored is not None else [], list(live.messages)):
+            if messages:
+                ctx.store.archive(session_id or "", messages, live.stored.cwd)
         live.messages = []
         live.shell_records.clear()  # `!cmd` records waiting for a turn to end belong to the old conversation
         live.refresh_prompt_inputs()  # a new conversation: show what was learned since this prompt was built
@@ -153,9 +160,6 @@ class _ClearCommand(CommandDef):
         live.pinned_reads.clear()
         live.elided.clear()
         live.elide_notes.clear()
-        from k3code.gateway.sessions import StoredSession
-
-        stored: StoredSession | None = ctx.store.get(session_id or "")
         if stored is not None:
             stored.messages = []
             stored.meta.pop("file_stamps", None)
