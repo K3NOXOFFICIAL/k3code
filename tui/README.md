@@ -194,7 +194,8 @@ Notes:
 | Context                     | Keys                | Behavior                                          |
 | --------------------------- | ------------------- | ------------------------------------------------- |
 | approval prompt             | `Up/Down`, `Enter`  | Move and confirm the selected approval choice     |
-| approval prompt             | `o`, `s`, `a`, `d`  | Quick-pick `once`, `session`, `always`, `deny`    |
+| approval prompt             | `1`-`4`             | Quick-pick the matching numbered choice           |
+| approval prompt             | other typed text    | Ignored; only deny works until `Up/Down`          |
 | approval prompt             | `Esc`, `Ctrl+C`     | Deny                                              |
 | clarify prompt with choices | `Up/Down`, `Enter`  | Move and confirm the selected choice              |
 | clarify prompt with choices | single-digit number | Quick-pick the matching numbered choice           |
