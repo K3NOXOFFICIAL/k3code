@@ -14,6 +14,7 @@ from k3code.autonomy.advisor import summary_system, transcript_text
 from k3code.context_budget import POINTER_CALL_RE, text_tokens
 from k3code.errors import ContextOverflow
 from k3code.providers.types import Message
+from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,7 @@ def work_ledger(folded: list[dict[str, Any]]) -> str:
                 add("read", path)
             elif name == "bash" and isinstance(args.get("command"), str) and args["command"].strip():
                 first, *rest = args["command"].strip().splitlines()
+                first = scrub_text(first)  # before the cut: a secret cut in two no longer has its shape
                 add("ran", first[:100] + ("…" if rest or len(first) > 100 else ""))
     for path in kinds["changed"]:
         kinds["read"].pop(path, None)  # a file that was changed is listed once

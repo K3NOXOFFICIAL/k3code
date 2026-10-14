@@ -144,12 +144,15 @@ class UsageDB:
             cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         return cur.rowcount
 
-    def rows(self, since: float = 0.0) -> list[dict[str, Any]]:
-        """Raw events with ``ts >= since`` as dicts (for the self-optimizer)."""
+    def rows(self, since: float = 0.0, session: str | None = None) -> list[dict[str, Any]]:
+        """Raw events with ``ts >= since`` as dicts (for the self-optimizer); only ``session``'s when given."""
+        where, params = "ts >= ?", [since]
+        if session is not None:
+            where, params = where + " AND session = ?", [*params, session]
         cur = self._db.execute(
             "SELECT ts, session, kind, provider, model, detail, tier, task_kind, turn, tokens_in, tokens_out,"
-            " cost_usd FROM events WHERE ts >= ? ORDER BY ts",
-            (since,),
+            f" cost_usd FROM events WHERE {where} ORDER BY ts",
+            params,
         )
         names = [c[0] for c in cur.description]
         return [dict(zip(names, r, strict=True)) for r in cur]

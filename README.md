@@ -159,7 +159,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/maxagents` (how many sub-agents, how many at once, dynamic sizing) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
 | **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
-| **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
+| **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/handoff` (continue this session in another harness or on another device) · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
 

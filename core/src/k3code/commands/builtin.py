@@ -298,6 +298,7 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.export import ExportCommand
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
+    from k3code.commands.handoff import HandoffCommand
     from k3code.commands.import_ import ImportCommand
     from k3code.commands.learning_cmd import (
         LearnCommand,
@@ -321,6 +322,7 @@ def build_registry() -> CommandRegistry:
     reg = CommandRegistry()
     for extra in (
         ExportCommand(),
+        HandoffCommand(),
         ImportCommand(),
         ForkCommand(),
         BranchCommand(),

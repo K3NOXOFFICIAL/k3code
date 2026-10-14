@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import tarfile
 import time
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import yaml
 
@@ -25,6 +26,10 @@ BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
 _SETTINGS_FILES = {"settings/user.config.yaml": "user", "settings/project.config.yaml": "project"}
 _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
+#: A session id an import accepts: the rule of the member name above (a newline in one reached the handoff text).
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+#: A line break or control character: never in an imported provider or model name (one-line fields).
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
 _MEMORY_FILE = "memory.json"
 MEMORY_VERSION = 1
 #: entries a memory.json list keeps (on export and on read), and the longest single entry read from one
@@ -59,6 +64,19 @@ def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[
     return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
+def _map_strings(obj: Any, f: Callable[[str], str], *, keys: bool = True) -> Any:
+    """``obj`` with ``f`` applied to every string in it, dict keys included unless ``keys`` is False (a rewrite that
+    can make two keys one). On the objects, not on their JSON text: there a newline before a path is the two
+    characters ``\\n``, and a pattern anchored on a path's start misses it."""
+    if isinstance(obj, str):
+        return f(obj)
+    if isinstance(obj, dict):
+        return {f(k) if keys and isinstance(k, str) else k: _map_strings(v, f, keys=keys) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_map_strings(x, f, keys=keys) for x in obj]
+    return obj
+
+
 def _known_secrets(config: Any, cwd: Path) -> list[str]:
     """Every secret value this process knows (configured provider keys, secret-named env vars), longest first."""
     from k3code.debugdump import secret_values
@@ -74,7 +92,7 @@ def _known_secrets(config: Any, cwd: Path) -> list[str]:
 
 
 def write_bundle(
-    path: Path,
+    path: Path | BinaryIO,
     *,
     store: SessionStore,
     cwd: Path,
@@ -82,9 +100,14 @@ def write_bundle(
     settings: bool = True,
     config: Any = None,
     memory: bool = False,
+    redact_text: Callable[[str], str] | None = None,
+    drop_meta: Collection[str] = (),
 ) -> dict[str, Any]:
-    """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``).
-    ``memory``: add memory.json (see :func:`collect_memory`), redacted the same way."""
+    """Write the bundle to ``path``, or into an open binary file (the caller's, left open: a handoff writes through
+    the file it created, never reopening its name); returns the manifest. ``config`` names the keys to drop (default:
+    loaded for ``cwd``). ``memory``: add memory.json (see :func:`collect_memory`), redacted the same way.
+    ``redact_text``: applied to every string value (never a dict key) of each session and of memory.json, never to the
+    settings (a handoff shows the home as ``~``). ``drop_meta``: session meta keys left out."""
     secrets = _known_secrets(config, cwd)
     files: dict[str, bytes] = {}
     if settings:
@@ -99,9 +122,15 @@ def write_bundle(
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
         session = session_to_dict(stored, secrets)
+        if drop_meta and isinstance(session.get("meta"), dict):
+            session["meta"] = {k: v for k, v in session["meta"].items() if k not in drop_meta}
+        if redact_text is not None:
+            session = _map_strings(session, redact_text, keys=False)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     mem = collect_memory(cwd, secrets) if memory else {}
+    if redact_text is not None:
+        mem = _map_strings(mem, redact_text, keys=False)
     present = _memory_keys(mem)
     if present:
         files[_MEMORY_FILE] = json.dumps(mem, ensure_ascii=False, indent=1).encode()
@@ -117,14 +146,23 @@ def write_bundle(
         },
         "memory_counts": _memory_counts(mem),
     }
+    if not isinstance(path, (str, os.PathLike)):
+        os.fchmod(path.fileno(), 0o600)
+        with tarfile.open(fileobj=path, mode="w:gz") as tar:  # closing the tar leaves the caller's file open
+            _write_members(tar, manifest, files)
+        return manifest
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(path, "w:gz") as tar:
-        _add(tar, "manifest.json", json.dumps(manifest, indent=1).encode())
-        for name, data in files.items():
-            _add(tar, name, data)
+        _write_members(tar, manifest, files)
     path.chmod(0o600)
     return manifest
+
+
+def _write_members(tar: tarfile.TarFile, manifest: dict[str, Any], files: dict[str, bytes]) -> None:
+    _add(tar, "manifest.json", json.dumps(manifest, indent=1).encode())
+    for name, data in files.items():
+        _add(tar, name, data)
 
 
 def _instruction_files(cwd: Path) -> list[dict[str, Any]]:
@@ -634,9 +672,15 @@ def _stored_from(obj: dict[str, Any]) -> tuple[StoredSession | None, str]:
     """The session a bundle record describes, or ``(None, why)`` when it cannot be one. Text fields must be text and
     ``messages`` a list of well-formed message objects (rejected otherwise); ``usage``, ``meta`` and the timestamps of
     the wrong type are dropped (an empty value is used)."""
+    sid = obj.get("session_id")
+    if not isinstance(sid, str) or not _SESSION_ID_RE.fullmatch(sid):
+        return None, "session_id is not 1 to 64 letters, digits, '_' or '-'"
     for key in ("title", "model", "provider", "cwd"):
         if key in obj and not isinstance(obj[key], str):
             return None, f"{key} is not text"
+    for key in ("model", "provider"):
+        if _CONTROL_RE.search(obj.get(key, "")):
+            return None, f"{key} holds a line break or a control character"
     messages = obj.get("messages", [])
     if not isinstance(messages, list):
         return None, "messages is not a list"

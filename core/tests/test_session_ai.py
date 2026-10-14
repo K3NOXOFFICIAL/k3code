@@ -151,3 +151,15 @@ def test_every_context_key_the_code_reads_is_quiet_in_a_config(tmp_path, monkeyp
     with caplog.at_level(logging.WARNING, logger="k3code.config"):
         load_config(project_dir=tmp_path)
     assert "is not used" not in caplog.text, caplog.text
+
+
+def test_the_work_ledger_scrubs_a_command_before_it_cuts_it():
+    from k3code.session_ai import work_ledger
+
+    token = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0" * 2
+    for start in (85, 90, 94):  # it spans the cut at 100
+        cmd = "echo " + "-" * (start - 6) + " " + token + " done"
+        call = {"id": "1", "name": "bash", "arguments": {"command": cmd}}
+        ledger = work_ledger([{"role": "assistant", "content": "", "tool_calls": [call]}])
+        assert "ran: echo" in ledger
+        assert not [token[i : i + 6] for i in range(len(token) - 5) if token[i : i + 6] in ledger], start

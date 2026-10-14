@@ -262,6 +262,7 @@ async def test_all_m1_commands_registered_with_help(tmp_path, monkeypatch):
     reg = build_registry()
     for name in (
         "export",
+        "handoff",
         "import",
         "fork",
         "branch",

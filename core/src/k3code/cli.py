@@ -1209,6 +1209,40 @@ def export_cmd(
     click.echo(export_summary(out, manifest))
 
 
+@cli.command("handoff")
+@click.option("--session", "session_id", help="The session to hand off (default: the most recent one)")
+@click.option(
+    "--out", "out_dir", type=click.Path(path_type=Path), help="Where to write the files (default: ~/.k3code/handoffs)"
+)
+@click.option("--embed", is_flag=True, help="Embed the .k3bundle in the text, base64-encoded (when it is small enough)")
+@click.option(
+    "--tail", type=click.IntRange(min=0), default=12, show_default=True, help="Recent messages quoted verbatim"
+)
+def handoff_cmd(session_id: str | None, out_dir: Path | None, embed: bool, tail: int) -> None:
+    """Print a text that continues a session in another harness or on another device (`k3code handoff | pbcopy`).
+
+    Only the text goes to stdout; the paths of the written text and .k3bundle go to stderr."""
+    from k3code.bundle import BundleError
+    from k3code.gateway.sessions import SessionStore
+    from k3code.handoff import HandoffError, build, notice
+    from k3code.paths import home
+
+    store = SessionStore(home() / "sessions.db")
+    try:
+        if not session_id:
+            recent = store.most_recent()
+            if recent is None:
+                raise click.ClickException("no session to hand off")
+            session_id = recent.session_id
+        built = build(store, session_id, cwd=Path.cwd(), out_dir=out_dir, embed=embed, tail=tail)
+    except (HandoffError, BundleError, OSError) as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        store.close()
+    click.echo(built.text, nl=False)
+    click.echo(notice(built), err=True)
+
+
 @cli.command("import")
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (headless)")

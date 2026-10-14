@@ -154,3 +154,20 @@ def test_a_model_that_only_had_a_dead_attempt_is_not_listed_with_zero_calls(tmp_
     (g,) = db.aggregate("session")
     assert [name for name, _ in g["by_model"]] == ["remote/haiku"] if isinstance(g["by_model"], list) else True
     assert "qwen" not in str(g["by_model"]) and "haiku" in str(g["by_model"])
+
+
+def test_rows_of_one_session_are_filtered_in_sql(tmp_path):
+    import time
+
+    from k3code.usage import UsageDB
+
+    db = UsageDB(tmp_path / "u.db")
+    for sess in ("s1", "s2", "s1"):
+        db.record("call", session=sess, provider="p", model="m")
+    try:
+        assert [r["session"] for r in db.rows(session="s1")] == ["s1", "s1"]
+        assert db.rows(session="nope") == []
+        assert sorted(r["session"] for r in db.rows()) == ["s1", "s1", "s2"]  # unchanged without the filter
+        assert db.rows(since=time.time() + 60, session="s1") == []
+    finally:
+        db.close()
