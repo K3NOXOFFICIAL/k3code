@@ -28,7 +28,7 @@ License bookkeeping is checked with `python3 scripts/vendor_check.py`.
 
 ## Local CI
 
-There are no GitHub Actions. The checks run on your machine with `scripts/ci/check.sh`, which runs every area CI used to run: `core` (`uv run ruff check . ../scripts`, `uv run ruff format --check . ../scripts`, `uv run pytest -q` in `core/`, so `core/scripts` and the top-level `scripts/` are linted too), `tui`, `panes`, `vendor`, `secrets` (gitleaks) and `shell` (shellcheck). It prints a summary table and keeps the logs in `.k3dev/ci/`.
+There are no GitHub Actions. The checks run on your machine with `scripts/ci/check.sh`, which runs every area CI used to run: `core` (`uv run ruff check . ../scripts`, `uv run ruff format --check . ../scripts`, `uv run pytest -q` in `core/`, run in parallel with pytest-xdist plus a serial lane for tests marked `serial`, so `core/scripts` and the top-level `scripts/` are linted too), `tui`, `panes`, `vendor`, `secrets` (gitleaks) and `shell` (shellcheck). It prints a summary table and keeps the logs in `.k3dev/ci/`.
 
 ```sh
 scripts/ci/check.sh              # the full check: run it before you push to Main or open a PR for review
