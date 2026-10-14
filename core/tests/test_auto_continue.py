@@ -240,3 +240,24 @@ async def test_a_continuation_run_through_the_turn_loop_gets_the_long_goal_back_
     await server._run_turn_locked(live, f"[Continuing toward your standing goal]\nGoal: {quote(goal)}\n\nNext step.")
     assert sent and goal in sent[0] and quote(goal) not in sent[0]
     await server.close()
+
+
+async def test_the_learning_review_is_told_which_turns_the_goal_drove(tmp_path, monkeypatch):
+    """A continuation is not a prompt the user typed: the session review (a model call over the transcript) must not
+    count it as one. The flag is cleared before the spawned task runs, so the caller passes it when it spawns."""
+    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "step 2", "all built"])
+    server.goal_judge = scripted_judge(["continue", "continue", "done"])
+    seen: list[bool | None] = []
+    real = server.learning.turn_finished
+
+    async def spy(session, status, *, unattended=None):
+        seen.append(unattended)
+        await real(session, status, unattended=unattended)
+
+    server.learning.turn_finished = spy  # type: ignore[method-assign]
+    assert server.learning.enabled  # on by default
+    status, _ = await server._run_turn(live, "build the parser")
+    assert status == "done"
+    await server.learning.drain()
+    assert seen == [False, True, True]  # the typed prompt's turn, then the two the goal drove
+    await server.close()

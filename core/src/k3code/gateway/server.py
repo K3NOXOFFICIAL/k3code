@@ -2860,7 +2860,9 @@ class GatewayServer:
             if not prompt_blocked:  # a prompt a hook refused is not a task: nothing to log or learn from
                 self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled and not prompt_blocked:
-                self.learning.spawn(self.learning.turn_finished(session, status))
+                self.learning.spawn(
+                    self.learning.turn_finished(session, status, unattended=session.goal_continuation)
+                )  # read now: the flag is cleared before the spawned task runs
             if cancelled:
                 # /stop and Esc cancel the turn task, so the message.complete below never runs; the TUI holds its input
                 # on "interrupting…" until it hears one (a queued message waited for a second Esc)

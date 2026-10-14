@@ -116,3 +116,19 @@ def test_the_session_total_follows_the_list_not_the_calls():
     tail = messages[-6:]  # compaction left 3 of the 10 user messages
     assert review.session_turns(meta, tail) == 10
     assert review.session_turns(meta, tail + exchange(10)) == 11
+
+
+async def test_goal_continuations_are_not_reviewed_as_user_sessions(tmp_path, monkeypatch):
+    """The review read a /goal's continuation prompts ("[Continuing toward your standing goal] …") as the user's own
+    turns and fired every few of them: ~3.5k cheap-tier tokens per review, and proposals mined from boilerplate."""
+    caller = FakeCaller(REPLY)
+    server, live = await session(tmp_path, monkeypatch, caller)
+    for i in range(30):
+        live.stored.messages.extend(exchange(i))
+        await server.learning.turn_finished(live, "done", unattended=True)
+    assert caller.calls == [] and not live.stored.meta.get("reviewed_turns")
+    for i in range(30, 60):  # the same session, typed by the user: reviewed as before
+        live.stored.messages.extend(exchange(i))
+        await server.learning.turn_finished(live, "done")
+    assert len(caller.calls) > 0
+    await server.close()

@@ -545,7 +545,9 @@ class LearningHub:
         except Exception:  # noqa: BLE001 - recording must never break a turn
             logger.warning("replay record failed", exc_info=True)
 
-    async def turn_finished(self, session: Any, status: str) -> None:
+    async def turn_finished(self, session: Any, status: str, *, unattended: bool | None = None) -> None:
+        """``unattended``: the turn was driven by the harness (a goal continuation), not typed. The caller says so when
+        it spawns this, because the goal flag is cleared by the time the task runs."""
         if not self.enabled:
             return
         await self.mine_if_changed(session)
@@ -556,7 +558,9 @@ class LearningHub:
         if reviewed > turns:  # a mark from before the total was kept: it counted the compacted list, which is shorter
             reviewed = 0
         minimum = int(self.cfg["review_min_turns"])
-        unattended = bool(getattr(session, "background", False))  # loop ticks, cron, automations: synthetic prompts
+        # loop ticks, cron, automations and goal continuations: synthetic prompts. A review of them read the
+        # standing-goal boilerplate ("[Continuing toward your standing goal] …") as a user-driven session
+        unattended = bool(getattr(session, "background", False)) or bool(unattended)
         if status == "done" and not unattended and turns > minimum and turns > reviewed + minimum - 1:
             meta["reviewed_turns"] = turns
             r = await review.review_session(
