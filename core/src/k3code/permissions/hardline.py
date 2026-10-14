@@ -28,7 +28,13 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     ("ssh-key-cat", r"(?i)\bcat\b[^\n;|&]*\.ssh/"),  # cat ~/.ssh/...
     # cat .env / *.env, but not the committed templates (.env.example ...)
     ("dotenv-cat", r"(?i)\bcat\b[^\n;|&]*\.env\b(?!\.(?:example|sample|template|dist)\b)"),
-    ("git-push-force-main", r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)(?=[^\n;|&]*\b(?:main|master)\b)"),
+    # main/master as a whole ref (an operand, the end of a refspec, refs/heads/...), not inside a branch name such as
+    # fix/main or main-docs
+    (
+        "git-push-force-main",
+        r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)"
+        r"(?=[^\n;|&]*(?:[\s:+]|refs/heads/)(?:main|master)(?![^\s;|&]))",
+    ),
 ]
 
 #: Remote hosts whose services must never be restarted from here. ``ssh <host> "<remote command>"`` can carry

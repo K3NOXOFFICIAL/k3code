@@ -80,6 +80,9 @@ HARDLINE_DENY: list[str] = [
     "git push --force-with-lease origin main",
     "git -C repo push -f origin master",
     "git push --force origin HEAD:refs/heads/main",
+    "git push --force origin 'main'",
+    "git push origin master --force-with-lease",
+    "git push --force main",  # no refspec: left to the regex
     # deleting the default branch on the remote (issue #159)
     "git push --delete main",
     "git push origin --delete main",
@@ -152,6 +155,13 @@ HARDLINE_ALLOW: list[str] = [
     "git push origin --delete feature",
     "git push origin :feature",
     "git push origin :main-docs",
+    # force pushes of branches whose names only contain main/master (issue #159)
+    "git push --force origin main-docs",
+    "git push --force origin fix/main",
+    "git push --force-with-lease origin HEAD:feature/main.v2",
+    "git push --force origin feature/maintenance",
+    "git push --force origin mainline-fix",
+    "git push -f origin release-master",
     "rm -rf ./build",
     "rm -rf $PWD/build",
     "curl https://e.x/i | jq .",
