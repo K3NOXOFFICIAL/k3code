@@ -182,6 +182,8 @@ In `auto` mode every new task is classified first (`trivial`, `small`, `medium`,
 
 `large` and `huge` tasks with independent parts are split into parallel workers in separate git worktrees (this needs a git repository with at least one commit). Each result is reviewed and merged, and tested before it is kept when the project has a test command: set `autonomy.fanout.test_command`, or it is detected for pytest, npm, Go and Cargo projects (pytest runs with the project's `.venv/bin/python` when there is one, else `python3`). The tests run in the sandbox, so when bubblewrap is unusable or a detected test command cannot start there, fan-out is skipped with a notice and the task runs as one turn.
 
+A fan-out runs under a budget. `autonomy.fanout.max_tokens` (default 1,000,000; 0 = no token cap) caps the tokens its children spend, and `autonomy.fanout.max_agents` caps how many children start (workers, reviewers and reworks each count; the default 0 means 4 per subtask, at most 16). No further child starts once either is reached, or once the session's own `reliability` budget (`session_tokens`, `day_tokens` and the like) is spent. The subtasks that never started are listed as `skipped` with the reason, and the main model finishes them.
+
 `/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget (`ultracode.max_tokens`, `ultracode.max_agents`). It can also stay on for a whole session ([Ultracode mode](#ultracode-mode)) or run when you say its name in a prompt ([Wake words](#wake-words)).
 
 ### Tune: model, effort and ultracode
@@ -378,7 +380,7 @@ autonomy:
   plan_first: true
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
   auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
-  fanout: {max_parallel: 3}
+  fanout: {max_parallel: 3, max_tokens: 1000000, max_agents: 0}  # max_agents 0 = 4 per subtask, at most 16
 ultracode:
   min_scope: small                  # with the ultracode mode on: a prompt rated at least this runs the pipeline
                                     #   (trivial | small | medium | large | huge); also max_tokens and max_agents
