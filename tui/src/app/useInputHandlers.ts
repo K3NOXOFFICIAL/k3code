@@ -140,11 +140,8 @@ const CTRL_C_ORDER = [
   "modelPicker",
   "tunePicker",
   "settingsPanel",
-  "skillsHub",
-  "pluginsHub",
   "sessions",
   "agents",
-  "journey",
   "widget",
 ] as const satisfies readonly (keyof OverlayState)[];
 
@@ -336,16 +333,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return patchOverlayState({ settingsPanel: false });
       case "tunePicker":
         return patchOverlayState({ tunePicker: false });
-      case "skillsHub":
-        return patchOverlayState({ skillsHub: false });
-      case "pluginsHub":
-        return patchOverlayState({ pluginsHub: false });
       case "sessions":
         return patchOverlayState({ sessions: false });
       case "agents":
         return patchOverlayState({ agents: false });
-      case "journey":
-        return patchOverlayState({ journey: false });
       case "widget":
         return closeWidget();
     }

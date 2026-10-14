@@ -24,12 +24,15 @@ import copy
 import dataclasses
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -86,7 +89,7 @@ from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
-from k3code.prompting import build_system_prompt
+from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
@@ -138,7 +141,6 @@ OPEN_METHODS = frozenset(
         "system.battery",
         "commands.catalog",
         "complete.slash",
-        "input.detect_drop",
         "model.options",
         "tune.get",
         "settings.get",
@@ -172,15 +174,8 @@ _DEFAULT_SKIN = {
     "tool_prefix": "k3",
 }
 
-_SYSTEM_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system.md"
 #: How long an approval, plan or clarify request may wait for an answer before it is denied and the goal pauses.
 APPROVAL_TIMEOUT_S = 1800.0
-
-
-def _load_system_prompt() -> str:
-    if _SYSTEM_PROMPT_PATH.is_file():
-        return _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    return "You are a helpful coding assistant."
 
 
 def _turn_status(result: Any) -> str | None:
@@ -225,7 +220,7 @@ class LiveSession:
         self.session_id = session_id
         self.stored = stored
         self.server = server
-        self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
+        self.system_prompt = base_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self._tools_cache: dict[str, list[str]] | None = None  # banner info, see live_info
@@ -1965,6 +1960,7 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                attended=not (session.background or session.goal_continuation),
             ),
             max_turns=self.config.max_turns,
             headless=False,
@@ -3723,8 +3719,8 @@ async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    # M1: no clipboard integration; the TUI pastes text inline instead.
-    return {"text": "", "images": [], "files": []}
+    # M1: no clipboard integration and no image input (text-only providers); `message` is what /paste shows.
+    return {"attached": False, "message": "Image paste is not supported yet (text-only providers)"}
 
 
 async def _process_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3770,9 +3766,49 @@ async def _image_detach(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {"detached": 0, "count": 0}
 
 
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".heic"})
+#: Longest text ``input.detect_drop`` looks at; every submitted prompt passes through it, a dropped path is short.
+MAX_DROP_CHARS = 4096
+
+
+def _dropped_file(server: GatewayServer, params: dict[str, Any]) -> Path | None:
+    """The one existing file ``params["text"]`` names (quoted, backslash-escaped, ``~``, ``file://`` or relative to the
+    session directory), else None: a prompt that merely mentions a path is not a drop."""
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_DROP_CHARS or "\n" in text.strip():
+        return None
+    try:
+        words = shlex.split(text.strip())
+    except ValueError:  # an unbalanced quote: ordinary prose
+        return None
+    if len(words) != 1:
+        return None
+    word = words[0]
+    if word.startswith("file://"):
+        word = urllib.parse.unquote(urllib.parse.urlparse(word).path)
+    try:
+        path = Path(word).expanduser()
+        if not path.is_absolute():
+            path = _session_dir(server, params) / path
+        return path if path.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 async def _input_detect_drop(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    paths = params.get("paths") or []
-    return {"images": [], "files": [str(p) for p in paths if p]}
+    """The TUI's drop check (every submit, and a pasted path): ``{matched, text}`` where ``text`` is ``@path`` for a
+    dropped file (``@"path"`` if the path has whitespace). Images are not attached (no image input yet), so an image
+    drop is just a reference the model can open with its tools."""
+    path = _dropped_file(server, params)
+    if path is None:
+        return {"matched": False}
+    shown = f'"{path}"' if any(c.isspace() for c in str(path)) else str(path)
+    return {
+        "matched": True,
+        "text": f"@{shown}",
+        "name": path.name,
+        "is_image": path.suffix.lower() in IMAGE_SUFFIXES,
+    }
 
 
 async def _command_dispatch(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -4038,6 +4074,33 @@ async def _complete_slash(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"items": items[:50], "replace_from": 1}
 
 
+#: directory entries `complete.path` looks at before it stops reading; the rest of a huge directory is not offered
+COMPLETE_PATH_SCAN_CAP = 2000
+
+
+def _scan_path_matches(directory: Path, stem: str) -> list[tuple[str, bool]]:
+    """``(name, is_dir)`` of the entries in ``directory`` that complete ``stem``: at most 50, directories first.
+
+    Blocking; the caller runs it on a worker thread. Reads at most ``COMPLETE_PATH_SCAN_CAP`` entries and sorts
+    only the matches."""
+    low = stem.lower()
+    matches: list[tuple[str, bool]] = []
+    with os.scandir(directory) as it:
+        for entry in itertools.islice(it, COMPLETE_PATH_SCAN_CAP):
+            name = entry.name
+            if name.startswith(".") and not stem.startswith("."):
+                continue
+            if not name.lower().startswith(low):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            matches.append((name, is_dir))
+    matches.sort(key=lambda m: (not m[1], m[0].lower()))
+    return matches[:50]
+
+
 async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """Path completion for ``@file`` / ``./x`` words, relative to the session's directory."""
     word = str(params.get("word", ""))
@@ -4049,24 +4112,19 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     stem = "" if raw.endswith("/") else expanded.name
     items: list[dict[str, str]] = []
     try:
-        for entry in sorted(directory.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if entry.name.startswith(".") and not stem.startswith("."):
-                continue
-            if not entry.name.lower().startswith(stem.lower()):
-                continue
-            shown = raw[: len(raw) - len(stem)] + entry.name + ("/" if entry.is_dir() else "")
-            items.append(
-                {
-                    "text": ("@" if word.startswith("@") else "") + shown,
-                    "display": shown,
-                    "meta": "dir" if entry.is_dir() else "file",
-                    "kind": "path",
-                }
-            )
-            if len(items) >= 50:
-                break
+        matches = await asyncio.to_thread(_scan_path_matches, directory, stem)
     except OSError:
-        pass
+        matches = []
+    for name, is_dir in matches:
+        shown = raw[: len(raw) - len(stem)] + name + ("/" if is_dir else "")
+        items.append(
+            {
+                "text": ("@" if word.startswith("@") else "") + shown,
+                "display": shown,
+                "meta": "dir" if is_dir else "file",
+                "kind": "path",
+            }
+        )
     return {"items": items}
 
 

@@ -109,6 +109,9 @@ _SLUG_WORD = re.compile(r"[a-z]+[0-9]{0,4}|[0-9]{1,8}")
 #: A value made only of glob characters is a permission pattern (`* --pat *`, `curl *?sig=*`), not a credential:
 #: hiding it turns an exported deny rule into one that never matches.
 _GLOB = re.compile(r"[*?]+")
+#: The user name of a URL can be the credential (`https://<token>@host`; pip prints `https://<token>:****@host`): it is
+#: hidden when token-shaped whatever follows it, also a glob-only password that keeps `https://*:*@*` a pattern.
+_URL_USER = re.compile(r"(?<=://)[^/\s:@]+(?=(?::[^/\s@]*)?@)")
 
 
 def _hide(value: str) -> str:
@@ -118,7 +121,8 @@ def _hide(value: str) -> str:
 def scrub_text(text: str, *, opaque: bool = False) -> str:
     """Free text (session messages, URLs, command lines): mask credential shapes.
 
-    Well-known prefixed tokens, private key blocks, ``NAME_PASSWORD=value`` style assignments, ``Authorization`` /
+    Well-known prefixed tokens, private key blocks, URL user info (a password, a token-shaped user name),
+    ``NAME_PASSWORD=value`` style assignments, ``Authorization`` /
     ``Cookie`` header values, URL query secrets (``?api_key=...``), ``--password value`` style flags and a credential
     named in a sentence (``the DB password is hunter2hunter2``).
 
@@ -128,6 +132,7 @@ def scrub_text(text: str, *, opaque: bool = False) -> str:
     """
     text = _PEM.sub(REDACTED, text)
     text = _PREFIXED.sub(REDACTED, text)
+    text = _URL_USER.sub(lambda m: REDACTED if _token_shaped(m.group(0), 20) else m.group(0), text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_hide(m.group(4))}{m.group(3)}", text)
     text = _PROSE.sub(_prose_secret, text)
@@ -165,8 +170,8 @@ def _scrub_url(url: str) -> str:
     user, at, host = authority.rpartition("@")
     if at:
         name, colon, pw = user.partition(":")
-        user = f"{name}:{_hide(pw)}" if colon else (REDACTED if _token_shaped(user, 20) else user)
-        authority = f"{user}@{host}"
+        name = REDACTED if _token_shaped(name, 20) else name  # whatever follows it (`<token>:****`)
+        authority = f"{name}:{_hide(pw)}@{host}" if colon else f"{name}@{host}"
     path = "/".join(REDACTED if _token_shaped(seg, 20) else seg for seg in path.split("/"))
     if query:
         pairs = []

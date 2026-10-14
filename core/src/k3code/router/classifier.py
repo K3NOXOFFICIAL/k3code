@@ -460,7 +460,28 @@ _MESSAGE_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
     (_CONNECTION_MESSAGE_PATTERNS, _R.network),
 )
 
+# A 5xx body is matched against server-specific overflow wording only. The broad list ("input token", "token limit",
+# "too many tokens", "exceeds the limit", ...) also appears in ordinary server errors, and a false overflow stops the
+# fallback walk and forces compaction instead of failing over.
+_5XX_OVERFLOW_PATTERNS = (
+    # llama.cpp
+    "exceeds the available context size",
+    "slot context",
+    "n_ctx_slot",
+    "truncating input",
+    # vLLM
+    "max_model_len",
+    "maximum model length",
+    "prompt is too long",
+)
+
 _5XX_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
+    (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _R.server),
+    (_5XX_OVERFLOW_PATTERNS, _R.context_overflow),
+)
+
+# 413/422 are payload rejections, where the broad overflow phrases are the right reading.
+_PAYLOAD_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
     (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _R.server),
     (_CONTEXT_OVERFLOW_PATTERNS, _R.context_overflow),
 )
@@ -475,6 +496,7 @@ _ERROR_CODE_REASONS: dict[str, FailoverReason] = {
     **dict.fromkeys(_QUOTA_ERROR_CODES, _R.quota),
     **dict.fromkeys(_MODEL_NOT_FOUND_ERROR_CODES, _R.bad_request),
     **dict.fromkeys(_CONTEXT_OVERFLOW_ERROR_CODES, _R.context_overflow),
+    **dict.fromkeys(("invalid_api_key", "incorrect_api_key", "authentication_error", "permission_error"), _R.auth),
     "server_error": _R.server,
     "api_error": _R.server,
     "rate_limit_error": _R.rate_limit,
@@ -534,7 +556,7 @@ def _by_status(c: _Ctx) -> FailoverReason | None:
     if status == 408:
         return _R.timeout
     if status in (413, 422):
-        return _first_match(c.msg, _5XX_RULES) or (_R.context_overflow if status == 413 else _R.bad_request)
+        return _first_match(c.msg, _PAYLOAD_RULES) or (_R.context_overflow if status == 413 else _R.bad_request)
     if status == 429:
         return _status_429(c)
     if status in (500, 502):

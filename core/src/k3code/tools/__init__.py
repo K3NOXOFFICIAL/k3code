@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import json
 import os
 import shutil
@@ -79,18 +80,37 @@ def _split_lines(text: str) -> list[str]:
     return lines
 
 
+#: Errors of the temp-file path that say "this directory or mount cannot do a rename here", not "the disk is broken":
+#: a read-only directory (EACCES/EPERM), a file held open by another OS (WSL on /mnt/c) or bind-mounted (EBUSY), a
+#: rename across mounts (EXDEV). ENOSPC, EIO and EROFS are not in it: rewriting in place would not help.
+_IN_PLACE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY, errno.EXDEV})
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` atomically (temp file in the same directory + rename), keeping its mode.
 
     A plain write_text() truncates first: a kill -9 or a full disk in the middle left a half-written source file.
     Symlinks are written through (the link itself is not replaced). A new file gets 0666 minus the umask, like any
-    other program's (mkstemp made every new file 0600).
+    other program's (mkstemp made every new file 0600). Run as root, the new file keeps the old file's owner.
+
+    When the temp-file path is refused (see ``_IN_PLACE_ERRNOS``) and the file exists, it is rewritten in place
+    instead: not crash-safe, but the only way into a writable file in a read-only directory or on a bind mount.
     """
+    target = path.resolve() if path.is_symlink() else path
+    old = target.stat() if target.exists() else None
+    try:
+        _write_via_temp(target, data, old)
+    except OSError as exc:
+        if old is None or exc.errno not in _IN_PLACE_ERRNOS:
+            raise
+        _write_in_place(target, data, exc)
+
+
+def _write_via_temp(target: Path, data: bytes, old: os.stat_result | None) -> None:
     import secrets
     import stat
 
-    target = path.resolve() if path.is_symlink() else path
-    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    mode = stat.S_IMODE(old.st_mode) if old is not None else None
     for _ in range(100):
         tmp = str(target.parent / f".{target.name}.k3tmp-{secrets.token_hex(4)}")
         try:  # O_EXCL never follows or reuses an existing name; the kernel applies the umask to the new-file 0o666
@@ -107,13 +127,38 @@ def _atomic_write(path: Path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        if mode is not None:
+        if old is not None:
             os.chmod(tmp, mode)
+            if getattr(os, "geteuid", lambda: -1)() == 0:
+                with contextlib.suppress(OSError):
+                    os.chown(tmp, old.st_uid, old.st_gid)
         os.replace(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _write_in_place(target: Path, data: bytes, refused: OSError) -> None:
+    """Truncate-and-write ``target`` itself. The old bytes are kept in memory and put back if the write fails."""
+    try:
+        before = target.read_bytes()
+    except OSError:
+        raise refused from None  # the original error is the useful one
+    try:
+        _overwrite(target, data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _overwrite(target, before)
+        raise
+
+
+def _overwrite(target: Path, data: bytes) -> None:
+    with open(target, "r+b") as f:
+        f.write(data)
+        f.truncate()
+        f.flush()
+        os.fsync(f.fileno())
 
 
 #: The tools FileStamps guards: they change a file, so the model must have seen what is in it now.
@@ -155,6 +200,18 @@ class FileStamps:
 
 #: Files larger than this are only read as an explicit line range (streamed, never loaded whole).
 MAX_READ_BYTES = 10 * 1024 * 1024
+
+
+def _file_size_note(size: int) -> str:
+    return f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB)"
+
+
+def _too_big_to_read(path: Path) -> dict[str, Any] | None:
+    """edit loads the whole file and matches it in memory, so it takes no more than read would load whole."""
+    size = path.stat().st_size
+    if size <= MAX_READ_BYTES:
+        return None
+    return {"error": f"{_file_size_note(size)}: edit cannot load it; change it with bash (sed, python) instead"}
 
 
 def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
@@ -220,7 +277,12 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
     ``start``/``end`` (an inclusive line range) still work. The result carries the raw lines (``content``) and where
     they are (``first``, ``last``, ``total``); format_tool_result numbers them for the model and says how to go on.
+    Runs on a worker thread: the gateway serves every session from one event loop (see tool_edit).
     """
+    return await asyncio.to_thread(_read_sync, arguments, cwd)
+
+
+def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
@@ -231,7 +293,7 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
         if not explicit:
             return {
-                "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                "error": f"{_file_size_note(size)}: "
                 "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
             }
         return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
@@ -261,6 +323,10 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
 async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Write a file, creating parent directories (atomically; an existing file keeps its mode)."""
+    return await asyncio.to_thread(_write_sync, arguments, cwd)
+
+
+def _write_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     content = arguments["content"]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +357,8 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
     old_string = arguments["old_string"]
     new_string = arguments["new_string"]
     replace_all = arguments.get("replace_all", False)
+    if (too_big := _too_big_to_read(path)) is not None:
+        return too_big
     raw = path.read_bytes()
     try:
         content = raw.decode("utf-8")  # strict: errors="replace" wrote U+FFFD over latin-1/binary bytes for good
@@ -321,7 +389,15 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
 
 
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included).
+
+    The body runs on a worker thread: the gateway serves every session from one event loop, and a failed edit on a
+    big file tries every match strategy and then a similarity search over each line.
+    """
+    return await asyncio.to_thread(_edit_sync, arguments, cwd)
+
+
+def _edit_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     plan = plan_edit(arguments, cwd=cwd)
     if isinstance(plan, dict):
         return plan
