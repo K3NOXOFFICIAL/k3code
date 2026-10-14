@@ -160,7 +160,7 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 | `Ctrl+C`                    | Interrupt active run, or clear the current draft, or exit if nothing is pending                                                                         |
 | `Ctrl+D`                    | Exit                                                                                                                                                    |
 | `Cmd/Ctrl+G` / `Alt+G`      | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
-| `Ctrl+L`                    | New session (same as `/clear`)                                                                                                                          |
+| `Ctrl+L`                    | Force a full repaint (same as `/redraw`)                                                                                                                |
 | `Ctrl+O`                    | Open the Tune popup (same as `/tune`): model, reasoning effort and ultracode in one place                                                               |
 | `Ctrl+V` / `Alt+V`          | Paste text first, then fall back to image/path attachment when applicable                                                                               |
 | `Tab`                       | Apply the active completion                                                                                                                             |
@@ -184,7 +184,7 @@ Notes:
 
 - `Tab` only applies completions when completions are present and you are not in multiline mode.
 - Queue/history navigation only applies when you are not in multiline mode.
-- `PgUp` / `PgDn` are left to the terminal emulator; the TUI does not handle them.
+- `PgUp` / `PgDn` scroll the transcript by half a viewport; `Shift+Up` / `Shift+Down` scroll it one row. `Home` / `End` edit the input line and do not scroll the transcript (there is no jump-to-bottom key).
 - A wake word (`ultracode`, `ultraplan`, ...) is painted in the accent colour when the gateway would act on it: the
   composer judges every line of a multi-line draft as one prompt, skips text inside a paste, and never paints a mode
   that `wake_words` in `config.yaml` switched off.
