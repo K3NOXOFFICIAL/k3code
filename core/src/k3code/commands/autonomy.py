@@ -11,6 +11,7 @@ from k3code.autonomy.proposals import LEARNED_KINDS, format_proposals
 from k3code.autonomy.scope import SCOPES
 from k3code.commands import CommandDef
 from k3code.errors import ChainExhausted
+from k3code.learning import curator
 
 
 def _msg(text: str, **extra: Any) -> dict[str, Any]:
@@ -47,11 +48,22 @@ class ScopeCommand(CommandDef):
 
 class ProposalsCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="proposals", help="List proposals: /proposals [all|accept <id>|dismiss <id>]")
+        super().__init__(name="proposals", help="List proposals: /proposals [all|show <id>|accept <id>|dismiss <id>]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         store = ctx.autonomy.proposals
         parts = arg.split()
+        if parts[:1] == ["show"]:
+            if len(parts) < 2:
+                return _msg("Usage: /proposals show <id>")
+            p = store.get(parts[1])
+            if p is None:
+                return _msg(f"No such proposal: {parts[1]}")
+            lines = [f"{p.id} [{p.kind}] ({p.status})", p.text, f"Accepting: {p.action}"]
+            if p.kind == "skill" and p.payload.get("op") == "save":
+                body = curator.draft_text(p.payload) or p.payload.get("body") or "(the draft is gone)"
+                lines += ["", "SKILL.md that accepting saves:", str(body).rstrip()]
+            return _msg("\n".join(lines))
         if parts[:1] in (["accept"], ["dismiss"]):
             if len(parts) < 2:
                 return _msg(f"Usage: /proposals {parts[0]} <id>")
@@ -62,14 +74,17 @@ class ProposalsCommand(CommandDef):
             live = _live(ctx, session_id)
             if parts[0] == "dismiss":
                 store.set_status(p.id, "dismissed")
+                curator.discard_draft(p.payload)  # a skill card's draft has no use once its card is answered
                 if hub is not None:
                     hub.decide(p, "dismiss", live)
                 return _msg(f"Dismissed {p.id}; it will not come back.")
+            handled = hub is not None and p.kind in LEARNED_KINDS and p.payload.get("op") != "send"
+            applied = await hub.apply(p, live) if handled else ""  # raises: the card stays pending, to retry
             store.set_status(p.id, "accepted")
             if hub is not None:
                 hub.decide(p, "accept", live)
-                if p.kind in LEARNED_KINDS and p.payload.get("op") != "send":
-                    return _msg(f"Accepted {p.id}: {await hub.apply(p, live)}")
+            if handled:
+                return _msg(f"Accepted {p.id}: {applied}")
             return {"type": "send", "message": p.action, "text": p.action, "notice": f"Accepted {p.id}: {p.text}"}
         items = store.all()
         if parts[:1] != ["all"]:

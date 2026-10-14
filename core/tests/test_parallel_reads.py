@@ -128,3 +128,18 @@ async def test_unchanged_read_pointer_names_the_step_of_the_original_read(tmp_pa
     results = {m.tool_call_id: m.content for m in await run(loop)}
     assert results["a2"].startswith("[unchanged since the read at step 1 (call a)")
     assert results["b2"].startswith("[unchanged since the read at step 2 (call b)")
+
+
+@pytest.mark.asyncio
+async def test_transcript_is_saved_once_per_tool_batch_not_per_result(tmp_path):
+    log: list[str] = []
+    loop = make_loop(tmp_path, [calls_for("a", "b", "c")])
+    for n in ("a", "b", "c"):
+        register(loop, n, log, side_effect=False)
+    saves: list[int] = []
+    real = loop.reliability.save_transcript
+    loop.reliability.save_transcript = lambda msgs: (saves.append(len(msgs)), real(msgs))[1]
+    await run(loop)
+    # system + user + assistant = 3 messages before the batch; the 3 results land together in ONE save (6),
+    # never as the intermediate 4 and 5 that one-save-per-result produced
+    assert 6 in saves and 4 not in saves and 5 not in saves, saves

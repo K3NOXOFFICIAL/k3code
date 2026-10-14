@@ -13,7 +13,7 @@ import pytest
 
 from k3code.bundle import write_bundle
 from k3code.gateway import auth as gw_auth
-from k3code.gateway.protocol import TOO_MANY_REQUESTS, UNAUTHORIZED
+from k3code.gateway.protocol import METHOD_NOT_FOUND, TOO_MANY_REQUESTS, UNAUTHORIZED
 from k3code.permissions import PermissionMode
 from m1cmd_helpers import make_server, new_session, rpc
 from test_gateway_socket import Peer
@@ -68,6 +68,51 @@ async def test_privileged_methods_need_the_daemon_token(gw, tmp_path):
     assert shell["result"]["code"] == 0 and marker.exists()
     mode = await _call(owner, "session.mode.set", {"mode": "yolo", "session_id": sid})
     assert mode["result"]["mode"] == "yolo" and server.live[sid].perms.mode == PermissionMode.YOLO
+
+
+async def test_an_unauthenticated_peer_cannot_drive_a_turn(gw, tmp_path):
+    """Only a deny-list of methods needed the token: a peer without it could attach to a session and run a turn
+    (prompt.submit), whose tools run with that session's permissions."""
+    server, sock = gw
+    sid = await new_session(server, tmp_path)
+    before = len(server.live[sid].stored.messages)
+    stranger = await Peer.connect(sock, auth=False)
+    for method, params in (
+        ("session.activate", {"session_id": sid}),
+        ("session.resume", {"session_id": sid}),
+        ("session.create", {"cwd": str(tmp_path)}),
+        ("prompt.submit", {"text": "run the tests", "session_id": sid}),
+        ("prompt.background", {"text": "run the tests", "session_id": sid}),
+        ("session.steer", {"text": "and push", "session_id": sid}),
+        ("session.undo", {"session_id": sid}),
+    ):
+        reply = await _call(stranger, method, params)
+        assert reply.get("error", {}).get("code") == UNAUTHORIZED, (method, reply)
+    await asyncio.sleep(0.2)  # a turn would have started by now
+    live = server.live[sid]
+    assert len(live.stored.messages) == before and live.turn_task is None
+    assert len(server.store.list()) == 1  # no session was created either
+
+
+async def test_every_method_but_the_open_reads_needs_the_daemon_token(gw, tmp_path):
+    """Fail closed: a method added to the gateway needs the token until it is listed as an open read."""
+    from k3code.gateway import server as gateway_server
+
+    server, sock = gw
+    sid = await new_session(server, tmp_path)
+    stranger = await Peer.connect(sock, auth=False)
+    open_methods = gateway_server.OPEN_METHODS
+    assert open_methods <= set(gateway_server._HANDLERS)  # no stale names
+    for method in sorted(set(gateway_server._HANDLERS) - {"browser.manage"}):  # decided by its action, below
+        reply = await _call(stranger, method, {"session_id": sid})
+        refused = reply.get("error", {}).get("code") == UNAUTHORIZED
+        assert refused == (method not in open_methods), (method, reply)
+    assert "setup.status" in open_methods and "session.list" in open_methods  # k3code doctor, scripts/e2e_tui_file.py
+    for action, refused in (("status", False), ("connect", True), ("disconnect", True), (" Status ", False)):
+        reply = await _call(stranger, "browser.manage", {"action": action})
+        assert (reply.get("error", {}).get("code") == UNAUTHORIZED) == refused, (action, reply)
+    unknown = await _call(stranger, "no.such.method", {})
+    assert unknown["error"]["code"] == METHOD_NOT_FOUND  # unchanged: an unknown method is not an auth question
 
 
 async def test_an_unauthenticated_peer_cannot_answer_a_pending_request(gw, tmp_path):

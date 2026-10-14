@@ -331,7 +331,56 @@ async def test_timeout_kills_the_process(shim: Path, monkeypatch: pytest.MonkeyP
     p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim), timeout=0.5)
     with pytest.raises(ProviderError) as ei:
         await _collect(p, [Message(role="user", content="x")])
-    assert ei.value.status_code == 504
+    assert ei.value.status_code == 408
+    await p.aclose()
+
+
+def test_timeout_seconds_reaches_the_provider() -> None:
+    """The 300 s per-step limit was hard-coded: a provider block could not change it (issue #167)."""
+    assert ProviderEntry(name="cc", kind="claude-cli").timeout_seconds == 300.0
+    (default,) = make_providers([ProviderEntry(name="cc", kind="claude-cli")])
+    (custom,) = make_providers([ProviderEntry(name="cc", kind="claude-cli", timeout_seconds=1800)])
+    assert isinstance(default, ClaudeCliProvider) and default.timeout == 300.0
+    assert isinstance(custom, ClaudeCliProvider) and custom.timeout == 1800.0
+    for bad in (0, -5):
+        with pytest.raises(ValidationError):
+            ProviderEntry(name="cc", kind="claude-cli", timeout_seconds=bad)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_the_deadline_kill_is_a_timeout_that_is_not_retried_on_the_same_entry(
+    shim: Path, monkeypatch: pytest.MonkeyPatch, persistent: bool
+) -> None:
+    """A step that used its whole deadline was classified as a 5xx and retried max_retries times on the same entry."""
+    from k3code.providers.fake import FakeProvider
+    from k3code.router import Router, build_chain
+    from k3code.router.classifier import FailoverReason, classify_api_error
+
+    monkeypatch.setenv("SHIM_MODE", "sleep")
+    p = ClaudeCliProvider(name="cc", persistent=persistent, command=str(shim), timeout=0.5)
+    with pytest.raises(ProviderError) as ei:
+        await _collect(p, [Message(role="user", content="x")])
+    assert classify_api_error(ei.value).reason is FailoverReason.timeout
+
+    spawns = 0
+    real_stream = p.stream
+
+    async def counting(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal spawns
+        spawns += 1
+        async for event in real_stream(*args, **kwargs):
+            yield event
+
+    monkeypatch.setattr(p, "stream", counting)
+    good = FakeProvider(name="good", steps=[{"type": "text", "text": "ok"}])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    router = Router(build_chain([p, good], [["m"], ["m"]]), max_retries=2, sleep=no_sleep)
+    result = await router.complete([Message(role="user", content="x")], [])
+    assert result.content == "ok"
+    assert spawns == 1  # failed over at once; the old path tried the same entry three times
     await p.aclose()
 
 
@@ -780,7 +829,7 @@ async def test_a_failed_step_kills_the_process_and_the_retry_starts_fresh(
     _ctl(tmp_path, mode=mode)
     with pytest.raises(ProviderError) as ei:
         await _collect(p, msgs)
-    assert ei.value.status_code == {"error": 503, "crash": 502, "sleep": 504}[mode]
+    assert ei.value.status_code == {"error": 503, "crash": 502, "sleep": 408}[mode]
     assert not _alive(first) and not p._pool
     await _step(p, msgs, tmp_path, "done")
     spawns = _lines(tmp_path, ".spawns")
@@ -942,3 +991,57 @@ async def test_a_rewritten_history_keeps_one_idle_process_per_conversation(pshim
         assert len([s for s in p._pool if not s.busy]) <= 1
     assert len(_lines(tmp_path, ".spawns")) >= 2  # the elisions did force full renders
     await _close_and_check(p, tmp_path)
+
+
+def test_sweep_removes_workdirs_of_dead_runs_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scratch dirs left by a killed run go; a live run's dir, an unrelated dir and a fresh untagged dir stay."""
+    import time
+
+    from k3code.providers import claude_cli
+
+    monkeypatch.setattr(claude_cli.tempfile, "tempdir", str(tmp_path))
+    dead = tmp_path / "k3code-claude-cli.99999999.abc"
+    live = tmp_path / f"k3code-claude-cli.{os.getpid()}.abc"
+    old_untagged = tmp_path / "k3code-claude-cli.oldone"
+    fresh_untagged = tmp_path / "k3code-claude-cli.fresh"
+    other = tmp_path / "something-else"
+    for d in (dead, live, old_untagged, fresh_untagged, other):
+        d.mkdir()
+    long_ago = time.time() - 3 * 86400
+    os.utime(old_untagged, (long_ago, long_ago))
+    assert claude_cli._sweep_workdirs() == 2
+    assert not dead.exists() and not old_untagged.exists()
+    assert live.exists() and fresh_untagged.exists() and other.exists()
+
+
+def test_workdir_is_tagged_with_the_pid_and_removed_at_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.providers import claude_cli
+
+    monkeypatch.setattr(claude_cli.tempfile, "tempdir", str(tmp_path))
+    prov = claude_cli.ClaudeCliProvider(name="c")
+    cwd = Path(prov._cwd())
+    assert cwd.name.startswith(f"k3code-claude-cli.{os.getpid()}.")
+    asyncio.run(prov.aclose())
+    assert not cwd.exists()
+
+
+def test_login_status_reads_claude_auth_status(fake_claude) -> None:
+    """`claude` on PATH says nothing about a login: `claude auth status` does (issue #146)."""
+    from k3code.providers.claude_cli import login_status
+
+    for state, expected in (("in", True), ("out", False), ("old", None), ("garbage", None)):
+        fake_claude(state)
+        assert login_status() is expected, state  # None = cannot tell (an old Claude Code, odd output)
+
+
+def test_login_status_cannot_tell_without_the_command_or_when_it_hangs(fake_claude, monkeypatch) -> None:
+    import time
+
+    from k3code.providers.claude_cli import login_status
+
+    fake_claude("hang")
+    start = time.monotonic()
+    assert login_status(timeout=0.5) is None
+    assert time.monotonic() - start < 10
+    monkeypatch.setenv("PATH", "")
+    assert login_status() is None

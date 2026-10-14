@@ -16,6 +16,12 @@ export const LIVE_RENDER_MAX_LINES = 240;
 export const VERBOSE_TRAIL_MAX_CHARS = 800;
 export const VERBOSE_TRAIL_MAX_LINES = 12;
 
+// Rows the live area paints for one tool trail. The live area re-renders on
+// every gateway event, so a burst of N tool calls costs N renders of every
+// row so far: CPU grew with N squared and RSS peaked near 250 MB at N=160
+// (#164). Settled transcript messages are painted once and stay uncapped.
+export const LIVE_TOOL_ROWS_MAX = 24;
+
 export const LONG_MSG = 300;
 export const MAX_HISTORY = 800;
 export const THINKING_COT_MAX = 160;

@@ -50,6 +50,34 @@ describe("shouldEmitClipboardSequence", () => {
     ).toBe(false);
   });
 
+  it("honors the K3CODE_TUI_* OSC 52 knobs, which win over the HERMES_ ones", () => {
+    expect(
+      shouldEmitClipboardSequence({
+        K3CODE_TUI_FORCE_OSC52: "1",
+        TMUX: "/tmp/t,1,0",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(
+      shouldEmitClipboardSequence({
+        K3CODE_TUI_CLIPBOARD_OSC52: "1",
+        TMUX: "/tmp/t,1,0",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(
+      shouldEmitClipboardSequence({
+        K3CODE_TUI_COPY_OSC52: "0",
+        TERM: "xterm-256color",
+      } as NodeJS.ProcessEnv),
+    ).toBe(false);
+    expect(
+      shouldEmitClipboardSequence({
+        HERMES_TUI_FORCE_OSC52: "1",
+        K3CODE_TUI_FORCE_OSC52: "0",
+        SSH_CONNECTION: "1",
+      } as NodeJS.ProcessEnv),
+    ).toBe(false);
+  });
+
   it("HERMES_TUI_FORCE_OSC52 takes precedence over TMUX suppression", () => {
     // Without the override, local-in-tmux suppresses the OSC 52 sequence
     // so the terminal multiplexer path wins. FORCE_OSC52=1 flips that

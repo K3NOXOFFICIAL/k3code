@@ -4,6 +4,7 @@ import {
   buildSettingsItems,
   initSettingsState,
   settingsKey,
+  settingsSnapshot,
   type SettingsSnapshot,
   visibleItems,
 } from "../domain/settings.js";
@@ -25,7 +26,7 @@ const snap: SettingsSnapshot = {
   showReasoning: false,
   statusBar: "top",
   statusLines: ["x", "y"],
-  theme: "default",
+  theme: "auto",
 };
 
 describe("settings panel state", () => {
@@ -69,5 +70,82 @@ describe("settings panel state", () => {
     expect(settingsKey(s, "", { escape: true }).action.type).toBe("close");
     expect(settingsKey(s, "", { tab: true }).state.tab).toBe("status");
     expect(settingsKey(s, "q", {}, { locked: true }).action.type).toBe("none");
+  });
+
+  // Ink sets key.meta on every Esc (a bare ESC byte parses as meta+escape), so
+  // the "ignore Alt-chords" guard used to swallow the key the footer advertises.
+  it("Esc closes although Ink flags it as meta", () => {
+    const s = initSettingsState(snap);
+
+    expect(settingsKey(s, "", { escape: true, meta: true }).action.type).toBe(
+      "close",
+    );
+  });
+
+  it("Esc with meta clears the search before it closes", () => {
+    let s = initSettingsState(snap);
+
+    for (const ch of ["/", "m", "o"]) {
+      s = settingsKey(s, ch, {}).state;
+    }
+
+    s = settingsKey(s, "", { escape: true, meta: true }).state;
+    expect(s.searching).toBe(false);
+    expect(s.query).toBe("");
+    expect(settingsKey(s, "", { escape: true, meta: true }).action.type).toBe(
+      "close",
+    );
+  });
+
+  it("an open approval still blocks Esc, and Alt-chords stay ignored", () => {
+    const s = initSettingsState(snap);
+
+    expect(
+      settingsKey(s, "", { escape: true, meta: true }, { locked: true }).action
+        .type,
+    ).toBe("none");
+    expect(settingsKey(s, "q", { meta: true }).action.type).toBe("none");
+    expect(settingsKey(s, "", { ctrl: true, escape: true }).action.type).toBe(
+      "none",
+    );
+  });
+});
+
+describe("settings panel theme row", () => {
+  const local = {
+    busy: "queue",
+    compact: false,
+    details: "expanded",
+    indicator: "kaomoji",
+    indicators: ["kaomoji"],
+    mouse: true,
+    showReasoning: false,
+    statusBar: "top",
+  };
+
+  it("shows the saved display.tui_theme pin, not the gateway skin name", () => {
+    const raw = { settings: { theme: "default" } };
+
+    expect(settingsSnapshot(raw, { ...local, theme: "light" }).theme).toBe(
+      "light",
+    );
+    expect(settingsSnapshot(raw, { ...local, theme: "dark" }).theme).toBe(
+      "dark",
+    );
+  });
+
+  it("falls back to auto when no pin is saved", () => {
+    const raw = { settings: { theme: "default" } };
+
+    expect(settingsSnapshot(raw, local).theme).toBe("auto");
+    expect(settingsSnapshot(raw, { ...local, theme: "" }).theme).toBe("auto");
+  });
+
+  it("cycles only values /theme accepts", () => {
+    const theme = buildSettingsItems({ ...snap, theme: "auto" }).find(
+      (i) => i.id === "theme",
+    );
+
+    expect(theme?.options).toEqual(["auto", "light", "dark"]);
   });
 });

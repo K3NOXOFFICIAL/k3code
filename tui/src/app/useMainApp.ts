@@ -56,6 +56,7 @@ import {
   appendTranscriptMessage,
   capTranscriptHistory,
 } from "../lib/messages.js";
+import { onOpenFailure } from "../lib/openExternalUrl.js";
 import { isMac } from "../lib/platform.js";
 import { createResizeCoalescer } from "../lib/resizeCoalescer.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
@@ -619,6 +620,10 @@ export function useMainApp(gw: GatewayClient) {
     [sys],
   );
 
+  // A link click that no opener could handle (e.g. WSL without wslview) says
+  // so in the transcript instead of doing nothing.
+  useEffect(() => onOpenFailure(sys), [sys]);
+
   const page = useCallback(
     (text: string, title?: string) =>
       patchOverlayState({
@@ -1110,6 +1115,7 @@ export function useMainApp(gw: GatewayClient) {
     composerRefs,
     composerState,
     gw,
+    scrollRef,
     setLastUserMsg,
     slashRef,
     submitRef,

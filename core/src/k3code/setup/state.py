@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,14 +21,31 @@ def env_file_path() -> Path:
     return Path(base) / "k3code" / "env"
 
 
-def load_state() -> dict[str, Any]:
+def load_state(say: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """The saved progress, or a fresh state. A file that is not usable state (cut off, not an object, wrong-typed
+    ``completed``/``data``) is moved aside to ``setup_state.json.bad`` and reported through ``say``."""
+    path = state_path()
     try:
-        data = json.loads(state_path().read_text())
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"completed": [], "data": {}}
     except (OSError, ValueError):
-        data = {}
-    data.setdefault("completed", [])
-    data.setdefault("data", {})
-    return data
+        data = None
+    if isinstance(data, dict):
+        data.setdefault("completed", [])
+        data.setdefault("data", {})
+        if (
+            isinstance(data["completed"], list)
+            and all(isinstance(n, str) for n in data["completed"])
+            and isinstance(data["data"], dict)
+        ):
+            return data
+    backup = path.with_name(path.name + ".bad")
+    with contextlib.suppress(OSError):
+        os.replace(path, backup)  # a rename keeps the file's 0600 mode
+    if say:
+        say(f"Setup: saved progress was unreadable, starting over (the old file is kept at {backup}).")
+    return {"completed": [], "data": {}}
 
 
 def save_state(state: dict[str, Any]) -> None:

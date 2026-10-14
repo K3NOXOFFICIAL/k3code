@@ -20,6 +20,9 @@ _PATH = re.compile(r"(?:[A-Za-z0-9_.~\-]*/)+[A-Za-z0-9_.\-]*")
 _HEX = re.compile(r"\b(?:0x)?(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}\b")
 _NUMBER = re.compile(r"(?<![A-Za-z_<])\d+(?:\.\d+)?")
 _EXCEPTION = re.compile(r"^Tool execution failed: ([A-Za-z_][\w.]*):")
+#: how a refusal by policy starts (lower case): the permission engine's hardline, auto-mode root and plan-mode
+#: messages and the agent loop's PreToolUse hook block. They say nothing about the project, so they are "denied".
+_POLICY_DENIALS = ("hardline deny", "auto mode writes only", "plan mode is read-only", "blocked by a pretooluse hook")
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ def _error_class(text: str) -> str:
         return m.group(1)
     if "timed out" in low:
         return "timeout"
-    if "denied" in low or low.startswith("permission"):
+    if "denied" in low or low.startswith(("permission", *_POLICY_DENIALS)):
         return "denied"
     head = text.split(":", 1)[0].strip()
     return head[:40] if head and len(head) <= 40 else "error"
@@ -71,7 +74,7 @@ def failure_of(tool: str, args: dict[str, Any] | None, result: dict[str, Any]) -
     and the exit code, then the first line of stderr).
     """
     if "error" in result and "content" not in result:
-        line = first_line(result["error"])
+        line = scrub_text(first_line(result["error"]))  # first: the class is a piece of this line and is stored as is
         cls = _error_class(line)
         if tool == "bash" and cls == "timeout":
             line = f"{_program(str((args or {}).get('command', '')))}: {line}"

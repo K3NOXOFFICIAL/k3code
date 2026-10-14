@@ -315,6 +315,51 @@ def test_a_genuine_context_overflow_is_still_context_overflow():
     assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 529])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "upstream error: failed to count input token usage",
+        "internal error: token limit bookkeeping failed",
+        "backend crashed: too many tokens in flight, exceeds the limit of workers",
+        "upstream error: could not read prompt length from cache, context size unknown",
+    ],
+)
+def test_server_error_with_generic_token_wording_is_server_not_context_overflow(status, message):
+    """A 5xx body that merely mentions tokens used to be context_overflow, which stops the fallback walk and
+    forces compaction instead of failing over to the next entry."""
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError(message, status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.server
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 529])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "the request exceeds the available context size, try increasing it",
+        "slot context shift failed: n_ctx_slot = 4096",
+        "truncating input prompt: limit exceeded",
+        "This model's max_model_len is 8192; the prompt exceeds the max_model_len",
+        "prompt is too long for the maximum model length",
+    ],
+)
+def test_llamacpp_and_vllm_overflow_wording_on_5xx_is_still_context_overflow(status, message):
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError(message, status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
+
+
+@pytest.mark.parametrize("status", [413, 422])
+def test_payload_too_large_wording_on_413_422_keeps_the_broad_overflow_phrases(status):
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError("request failed: too many tokens, token limit exceeded", status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
+
+
 # ── TLS certificate failures: permanent, hinted, never parked ─────────
 
 CERT_ERROR = (

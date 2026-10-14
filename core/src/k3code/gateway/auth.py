@@ -1,10 +1,19 @@
 """Who may drive the daemon: a per-daemon token in the private run directory.
 
-The socket is 0600, but every unsandboxed child of the daemon (an MCP stdio server, an approved bash command) runs as
-the same user and could connect to it. Privileged methods (``shell.exec``, ``config.set``, mode switches, slash
-commands, ...) therefore need a connection that first sent ``gateway.auth`` with the token the daemon wrote at start.
-The TUI's attach bridge and the CLI clients read it from ``<run dir>/gateway.token``; children never get the socket's
-location through their environment (:data:`k3code.paths.GATEWAY_ENV_VARS`).
+Every method except a few reads of k3code's own state (``gateway.server.OPEN_METHODS``) needs a connection that first
+sent ``gateway.auth`` with the token the daemon wrote at start: a turn, a steer, an undo, a shell command, a mode or
+config change, ... The TUI's attach bridge and the CLI clients read it from ``<run dir>/gateway.token``; children never
+get the socket's location through their environment (:data:`k3code.paths.GATEWAY_ENV_VARS`).
+
+What the token guards against: a peer that can connect to the socket but cannot read the run directory, such as a
+process under a sandbox or confinement that passes the socket through but not the directory. The bwrap sandbox shows
+neither: it hides ``$HOME`` and never binds the k3code home (:mod:`k3code.reliability.sandbox`).
+
+What it does not guard against: a process that runs unsandboxed as the same user. The socket and the token are both
+0600 files of that user, so an MCP stdio server (unsandboxed by design, see ``mcpclient.stdio_env``), a bash command
+that runs outside the sandbox or any other program of the user can read the token and authenticate. Such a process
+already has the user's rights (it could as well edit the config); keeping it away from the daemon takes a sandbox,
+not a token.
 """
 
 from __future__ import annotations

@@ -99,7 +99,10 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     for cmd in (
         "(cd core && uv run ruff check . ../scripts)",
         "(cd core && uv run ruff format --check . ../scripts)",
-        "(cd core && timeout --kill-after=30 2700 uv run pytest -q)",  # a stalled run fails (issue #42)
+        # a stalled run fails (issue #42); the suite runs in parallel, the `serial` tests alone after it
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -n ",
+        " -m not serial --basetemp ",
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -m serial --basetemp ",
         "(cd tui && npm run build:ink)",
         "(cd tui && npm run typecheck)",
         "(cd tui && npm run lint)",
@@ -115,6 +118,16 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     ):
         assert cmd in out, cmd
     assert "go test ./..." not in out  # panes' upstream remote-sync tests recurse without bound
+
+
+def test_pytest_basetemp_stays_short_whatever_tmpdir_is(tmp_path: Path) -> None:
+    """A Unix socket path caps at 108 bytes and an xdist worker adds popen-gwN/: a long TMPDIR (the Multica runtime's
+    /tmp/multica-task-<id>) must not lengthen the --basetemp of the pytest lanes."""
+    long_tmp = tmp_path / ("t" * 60)
+    long_tmp.mkdir()
+    out = _run(["bash", str(CHECK), "--plan", "--only", "core"], REPO, _env(tmp_path, TMPDIR=str(long_tmp))).stdout
+    bases = [w for line in out.splitlines() for w in line.split() if w.startswith("/") and "/k3ci-" in w]
+    assert len(bases) == 2 and all(b.startswith("/tmp/k3ci-") and len(b) < 30 for b in bases), bases
 
 
 def test_quick_plan_has_no_builds_or_test_suites(tmp_path: Path) -> None:
@@ -440,6 +453,56 @@ def test_release_ships_what_release_yml_shipped() -> None:
         assert needle in text
 
 
+def _release_changelog_setup(tmp: Path, changelog: str) -> tuple[Path, dict[str, str]]:
+    """A copy of release.sh in a repository on Main with a bare origin, VERSION 1.2.3 and the given CHANGELOG.md. The
+    check it would run next fails, so a run that gets past the preconditions stops there and builds nothing."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": ".k3dev/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": changelog,
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 1\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    env["PATH"] = f"{_stub_bin(tmp)}:{env['PATH']}"
+    return repo, env
+
+
+_FOLDED = "# Changelog\n\n## Unreleased\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+_UNFOLDED = "# Changelog\n\n## Unreleased\n\n### Fixed\n\n- not in the notes\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+
+
+@pytest.mark.parametrize("dry", [False, True])
+def test_release_refuses_while_changelog_unreleased_has_content(tmp_path: Path, dry: bool) -> None:
+    """The notes are the '## [X.Y.Z]' section only, so whatever '## Unreleased' holds would be left out of them."""
+    repo, env = _release_changelog_setup(tmp_path, _UNFOLDED)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    verb = "a real release would refuse" if dry else "refused"
+    assert f"{verb}: CHANGELOG.md '## Unreleased' still holds 1 line" in r.stderr, r.stderr
+    assert "## [1.2.3] - <date>" in r.stderr  # it says what to do
+    if not dry:
+        assert r.returncode == 2 and "1 precondition(s) failed; nothing was built or published" in r.stderr
+        assert "the full check failed" not in r.stderr  # it stopped before the check
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize(
+    "text", [_FOLDED, _FOLDED.replace("## Unreleased\n", "## [Unreleased]\n\n### Added\n\n### Fixed\n")]
+)
+def test_release_accepts_an_empty_changelog_unreleased(tmp_path: Path, dry: bool, text: str) -> None:
+    """Folded: '## Unreleased' is empty (blank lines and '###' subheadings only), so the preconditions pass."""
+    repo, env = _release_changelog_setup(tmp_path, text)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    assert "Unreleased" not in r.stderr and "precondition" not in r.stderr, r.stderr
+    assert "the full check failed" in r.stderr  # past the preconditions, stopped at the stubbed check
+
+
 @pytest.mark.parametrize(("plat", "machine", "arch"), [("linux", "x86_64", "amd64"), ("darwin", "arm64", "arm64")])
 def test_update_installs_the_assets_release_sh_publishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plat: str, machine: str, arch: str
@@ -483,3 +546,144 @@ def test_update_rejects_an_asset_that_does_not_match_sha256sums(
     rel = upd.Release(tag="v1.2.3", version="1.2.3", body="", prerelease=False, assets={n: n for n in names})
     with pytest.raises(ValueError, match="k3-linux-amd64"):
         upd.install_release(rel, None, uv="uv")
+
+
+# --- release.sh: a failed publish leaves no tag behind -------------------------------------------------------------
+
+_RELEASE_TOOLS = {
+    "uv": """#!/bin/sh
+case "$1" in
+  build) while [ $# -gt 0 ]; do [ "$1" = --out-dir ] && out=$2; shift; done
+         mkdir -p "$out" && echo wheel > "$out/k3code-1.2.3-py3-none-any.whl" ;;
+  export) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo requirements > "$out" ;;
+esac
+""",
+    "npm": "#!/bin/sh\nmkdir -p dist\n",
+    "go": '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo k3 > "$out"\n',
+    # The part of GitHub release.sh depends on: a draft release has no tag, publishing it creates the tag in the origin
+    # at the draft's target. State: $FAKE_GH_DIR/draft-<tag> (the target, then one asset name per line).
+    # `release list` prints what the script's --jq leaves of the list: the tags of the drafts. `release view` leaves
+    # out the asset named by FAKE_GH_HIDE (an upload that did not arrive).
+    "gh": """#!/bin/sh
+d=$FAKE_GH_DIR
+printf '%s\\n' "$*" >> "$d/gh.log"
+tag=$3
+publish() {
+  git --git-dir "$FAKE_GH_ORIGIN" rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
+    git --git-dir "$FAKE_GH_ORIGIN" tag "$tag" "$(head -n 1 "$d/draft-$tag")"
+  rm "$d/draft-$tag"
+}
+case "$1 $2" in
+  "release list") for f in "$d"/draft-*; do [ -f "$f" ] && basename "$f" | sed 's/^draft-//'; done; exit 0 ;;
+  "release view") tail -n +2 "$d/draft-$tag" | grep -v -x -e "${FAKE_GH_HIDE:-}" || exit 1 ;;
+  "release delete") rm "$d/draft-$tag" || exit 1 ;;
+  "release edit") [ "$FAKE_GH_FAIL" = edit ] && exit 1; publish ;;
+  "release create")
+    [ -f "$d/draft-$tag" ] && { echo "release $tag already exists" >&2; exit 1; }
+    shift 3; draft=0; : > "$d/new"; : > "$d/target"
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --target) echo "$2" > "$d/target"; shift ;;
+        --title | --notes-file) shift ;;
+        --draft) draft=1 ;;
+        -*) ;;
+        *) [ -f "$1" ] && basename "$1" >> "$d/new" ;;
+      esac
+      shift
+    done
+    { cat "$d/target"; cat "$d/new"; } > "$d/draft-$tag"; rm "$d/new" "$d/target"
+    [ "$FAKE_GH_FAIL" = create ] && exit 1  # an upload that fails leaves the draft behind
+    [ "$draft" = 1 ] || publish ;;
+esac
+exit 0
+""",
+}
+
+
+def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
+    """A copy of the release scripts in a repository on Main with a bare origin, and stand-ins for uv, npm, go, gh."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": "node_modules/\n.k3dev/\ntui/dist/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": "# Changelog\n\n## [1.2.3] - 2026-01-01\n\n- a change\n",
+        "core/k": "",
+        "tui/k": "",
+        "panes/k": "",
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 0\n",
+        "scripts/release/build_release.sh": "#!/bin/sh\nexit 0\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    bindir = _stub_bin(tmp)
+    for tool, text in _RELEASE_TOOLS.items():
+        (bindir / tool).write_text(text)
+        (bindir / tool).chmod(0o755)
+    (tmp / "gh-state").mkdir()
+    env.update(PATH=f"{bindir}:{env['PATH']}", FAKE_GH_DIR=str(tmp / "gh-state"), FAKE_GH_ORIGIN=str(origin))
+    return repo, env, origin
+
+
+def _release_calls(env: dict[str, str]) -> list[str]:
+    log = Path(env["FAKE_GH_DIR"]) / "gh.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _remote_tags(env: dict[str, str], origin: Path) -> list[str]:
+    return _git(origin, env, "tag", "--list").split()
+
+
+def test_release_creates_the_tag_only_by_publishing_a_complete_draft(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sha = _git(repo, env, "rev-parse", "HEAD")
+    calls = [c for c in _release_calls(env) if c.startswith("release")]
+    assert [c.split()[1] for c in calls] == ["list", "create", "view", "edit"]
+    create = calls[1].split()
+    assert "--draft" in create and create[create.index("--target") + 1] == sha  # the tag will name the checked commit
+    assert "--verify-tag" not in create  # there is no tag yet to verify
+    assert calls[3] == "release edit v1.2.3 --draft=false"
+    assert _remote_tags(env, origin) == ["v1.2.3"]  # created by publishing...
+    assert _git(origin, env, "rev-parse", "v1.2.3") == sha
+    assert _git(repo, env, "tag", "--list") == ""  # ...not pushed by the script
+
+
+@pytest.mark.parametrize("failing_step", ["create", "edit"])
+def test_release_failing_before_the_publish_leaves_no_tag_and_can_be_rerun(tmp_path: Path, failing_step: str) -> None:
+    """A tag that exists blocks a rerun (release.sh refuses an existing tag) and is what install.sh takes as the
+    newest version. A gh failure must leave neither."""
+    repo, env, origin = _release_setup(tmp_path)
+    script = str(repo / "scripts/release/release.sh")
+    r = _run(["bash", script, "1.2.3"], repo, {**env, "FAKE_GH_FAIL": failing_step})
+    assert r.returncode != 0
+    assert _remote_tags(env, origin) == [] and _git(repo, env, "tag", "--list") == ""
+    assert _git(repo, env, "ls-remote", "--tags", "origin") == ""
+    assert (Path(env["FAKE_GH_DIR"]) / "draft-v1.2.3").is_file()  # the half-made release is still a draft
+    r = _run(["bash", script, "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "replacing the draft release v1.2.3" in r.stderr
+    assert "release delete v1.2.3 --yes" in _release_calls(env)  # the draft only: never --cleanup-tag
+    assert _remote_tags(env, origin) == ["v1.2.3"]
+
+
+def test_release_refuses_a_draft_that_lacks_an_asset(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, {**env, "FAKE_GH_HIDE": "SHA256SUMS"})
+    assert r.returncode == 2 and "stays a draft" in r.stderr
+    assert not any(c.startswith("release edit") for c in _release_calls(env))
+    assert _remote_tags(env, origin) == []
+
+
+def test_release_dry_run_describes_the_draft_flow_and_contacts_no_release(tmp_path: Path) -> None:
+    repo, env, _ = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "--dry-run", "--no-check", "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--draft --target" in r.stdout and "release edit v1.2.3 --draft=false" in r.stdout
+    assert "git push" not in r.stdout and "git tag" not in r.stdout
+    assert [c for c in _release_calls(env) if c.startswith("release")] == []

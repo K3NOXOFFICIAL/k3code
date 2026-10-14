@@ -23,6 +23,14 @@ PRESETS: dict[str, str] = {
     ),
 }
 
+#: What a preset says when nobody is there to fill in what it asks for (an unattended session, a sub-agent).
+UNATTENDED_PRESETS: dict[str, str] = {
+    "learning": (
+        "Output style: learning. Teach while you work: explain key decisions. Nobody is available to finish "
+        "part of the task for you, so implement all of it yourself and leave nothing marked for the user to do."
+    ),
+}
+
 
 def _dirs(cwd: str | Path) -> list[Path]:
     """The user's styles, then the project's (only once the project is trusted, see k3code.trust)."""
@@ -46,11 +54,14 @@ def available(cwd: str | Path) -> list[str]:
     return [*PRESETS, *sorted(n for n in custom_styles(cwd) if n not in PRESETS)]
 
 
-def style_text(name: str, cwd: str | Path) -> str | None:
-    """Style text for ``name`` ('' for default); None if unknown. Custom files may override presets."""
+def style_text(name: str, cwd: str | Path, *, attended: bool = True) -> str | None:
+    """Style text for ``name`` ('' for default); None if unknown. Custom files may override presets.
+
+    ``attended=False``: no human reads the run as it goes, so a preset that hands work to the user says otherwise.
+    """
     custom = custom_styles(cwd)
     if name in custom:
         return custom[name].read_text(encoding="utf-8").strip()
     if name in PRESETS:
-        return PRESETS[name]
+        return PRESETS[name] if attended else UNATTENDED_PRESETS.get(name, PRESETS[name])
     return None

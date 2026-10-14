@@ -28,7 +28,7 @@ This fetches the upstream repositories into temporary bare clones (nothing in th
 
 1. Run the dry run; for `panes/` it should list fewer than 10 conflicting files.
 2. Fetch upstream into a scratch directory, merge the changed files into `panes/`, and re-apply the two hooks listed in `panes/K3_CHANGES.md` if they conflict.
-3. Run only the packages we depend on: `(cd panes && go build ./cmd/k3 && go test ./internal/k3keys/... ./internal/harness/... ./internal/input/ ./internal/app/)`. Do not run the whole upstream test tree: its remote-sync tests recurse without bound.
+3. Run only the packages we depend on: `(cd panes && go build ./cmd/k3 && go test ./internal/k3keys/... ./internal/harness/... ./internal/input/ ./internal/app/ ./cmd/k3/)`. Do not run the whole upstream test tree: its remote-sync tests recurse without bound.
 4. Update the base commit in `panes/UPSTREAM.toml` and `VENDOR.toml`.
 
 ## Rules that always apply

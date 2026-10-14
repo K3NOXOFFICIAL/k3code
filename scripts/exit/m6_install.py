@@ -29,13 +29,23 @@ mkdir -p /tmp/k3code && cd /src && tar --exclude=.git --exclude=node_modules --e
 cd /tmp/k3code
 export HOME=/root PATH=/root/.local/bin:$PATH
 T0=$(date +%s)
-sh install/install.sh --from-source --yes --no-setup; rc=$?
+# the container runs as root; --allow-root is the installer's own switch for a deliberate root install
+sh install/install.sh --from-source --yes --no-setup --allow-root; rc=$?
 T1=$(date +%s); echo "INSTALL_RC=$rc INSTALL_SECS=$((T1-T0))"
 [ $rc = 0 ] || exit 91
 k3code setup --non-interactive --answers install/answers.sample.yaml --no-probe; rc=$?
 T2=$(date +%s); echo "SETUP_RC=$rc SETUP_SECS=$((T2-T1)) TOTAL_SECS=$((T2-T0))"
 k3code doctor; echo "DOCTOR_RC=$?"
 """
+
+
+def default_exit_rows() -> None:
+    """A standalone run keeps its rows in rows/m6_rows.jsonl; run_all.sh sets EXIT_ROWS itself and wins."""
+    if os.environ.get("EXIT_ROWS"):
+        return
+    rows = LOGS.parent / "m6_rows.jsonl"
+    rows.write_text("")
+    os.environ["EXIT_ROWS"] = str(rows)
 
 
 def kenv(home: Path, **extra: str) -> dict[str, str]:
@@ -51,7 +61,7 @@ def k3(home: Path, *args: str, **kw: object) -> tuple[int, str]:
 def fresh_install() -> None:
     how = (
         f"podman run {IMAGE}: dnf basics, cp /src to /tmp/k3code, install.sh --from-source --yes "
-        f"--no-setup, k3code setup --non-interactive --no-probe, k3code doctor"
+        f"--no-setup --allow-root, k3code setup --non-interactive --no-probe, k3code doctor"
     )
     if not shutil.which("podman"):
         return emit(
@@ -392,6 +402,7 @@ def upstream_sync() -> None:
 
 
 if __name__ == "__main__":
+    default_exit_rows()
     only = sys.argv[1:] or ["sync", "bundle", "resume", "update", "fresh"]
     for name, fn in (
         ("sync", upstream_sync),

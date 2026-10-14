@@ -17,6 +17,7 @@ import yaml
 from k3code import confio
 from k3code.config import ProviderEntry, Settings
 from k3code.daemon import k3_home
+from k3code.router.cooldown import key_fingerprint
 
 
 class ChainEditError(Exception):
@@ -99,26 +100,27 @@ def apply_edit(providers: list[dict[str, Any]], op: str, args: list[str]) -> lis
 def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
     """Validate, back up, then write; returns the backup path ('' when there was no file)."""
     path = config_path(home)
-    data: dict[str, Any] = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
-    providers = data.get("providers")
-    if not providers:
-        raise ChainEditError(f"no providers in {path}; the chain is defined elsewhere (project config?)")
-    new = apply_edit(providers, op, args)
-    if not new:
-        raise ChainEditError("that would leave the chain empty")
-    # 1. validate (raises pydantic ValidationError → shown as the failure)
-    try:
-        Settings(providers=[ProviderEntry(**{**p, "api_key": ""}) for p in new])
-    except Exception as e:  # noqa: BLE001
-        raise ChainEditError(f"invalid chain: {e}") from e
-    # 2. backup  3. write
-    backup = ""
-    if path.is_file():
-        backup = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
-        shutil.copy2(path, backup)
-    data["providers"] = new
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    with confio.locked(path):  # read-modify-write: a second edit waits for the first, then reads its result
+        data: dict[str, Any] = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
+        providers = data.get("providers")
+        if not providers:
+            raise ChainEditError(f"no providers in {path}; the chain is defined elsewhere (project config?)")
+        new = apply_edit(providers, op, args)
+        if not new:
+            raise ChainEditError("that would leave the chain empty")
+        # 1. validate (raises pydantic ValidationError → shown as the failure)
+        try:
+            Settings(providers=[ProviderEntry(**{**p, "api_key": ""}) for p in new])
+        except Exception as e:  # noqa: BLE001
+            raise ChainEditError(f"invalid chain: {e}") from e
+        # 2. backup  3. write (atomic: a crash mid-write keeps the old file)
+        backup = ""
+        if path.is_file():
+            backup = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(path, backup)
+        data["providers"] = new
+        path.parent.mkdir(parents=True, exist_ok=True)
+        confio.atomic_write_text(path, yaml.safe_dump(data, sort_keys=False))
     return backup
 
 
@@ -130,22 +132,33 @@ def set_default_model(key: str, home: Path | None = None) -> tuple[bool, str]:
     touched then), ``backup`` is '' when there was no file to back up. The caller has checked that ``key`` is a known
     model key. (YAML comments are not preserved by the rewrite; the backup keeps them.)
     """
+    return _set_top_level("default_model", key, home)
+
+
+def set_default_provider(name: str, home: Path | None = None) -> tuple[bool, str]:
+    """Make ``name`` the ``default_provider`` of the user config (``/provider <name> --save``), the same way
+    :func:`set_default_model` saves the default model. The caller has checked that ``name`` is a provider block."""
+    return _set_top_level("default_provider", name, home)
+
+
+def _set_top_level(field: str, value: str, home: Path | None) -> tuple[bool, str]:
     path = config_path(home)
-    try:
-        data = confio.read_yaml(path)
-    except (confio.ConfigError, yaml.YAMLError, OSError) as e:
-        raise ChainEditError(f"cannot read {path}: {e}") from e
-    if data.get("default_model") == key:
-        return False, ""
-    data["default_model"] = key
-    try:
-        confio.validate(data)
-        backup = confio.write_yaml(path, data)
-    except confio.ConfigError as e:
-        raise ChainEditError(f"{path} would be invalid: {e}") from e
-    except OSError as e:
-        raise ChainEditError(f"cannot write {path}: {e}") from e
-    return True, str(backup or "")
+    with confio.locked(path):
+        try:
+            data = confio.read_yaml(path)
+        except (confio.ConfigError, yaml.YAMLError, OSError) as e:
+            raise ChainEditError(f"cannot read {path}: {e}") from e
+        if data.get(field) == value:
+            return False, ""
+        data[field] = value
+        try:
+            confio.validate(data)
+            backup = confio.write_yaml(path, data)
+        except confio.ConfigError as e:
+            raise ChainEditError(f"{path} would be invalid: {e}") from e
+        except OSError as e:
+            raise ChainEditError(f"cannot write {path}: {e}") from e
+        return True, str(backup or "")
 
 
 def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:
@@ -161,7 +174,9 @@ def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:
         for model in [spec] if isinstance(spec, str) else list(spec):
             remaining = 0.0
             if cooldowns is not None:
-                remaining = cooldowns.remaining_seconds(provider=p.name, model=model, base_url=p.base_url)
+                remaining = cooldowns.remaining_seconds(
+                    provider=p.name, model=model, base_url=p.base_url, account=key_fingerprint(p.api_key)
+                )
             state = netwatch.provider_state(p.name) if netwatch is not None else None
             # A connectivity verdict (provider_down / offline / captive) says *why* the entry is cooling down.
             if state is not None and state.value in ("provider_down", "offline", "captive"):

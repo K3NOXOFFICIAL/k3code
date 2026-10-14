@@ -36,8 +36,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.providers.base import Provider
+from k3code.providers.base import Provider, ProviderDeadline
 from k3code.providers.retry_utils import jittered_backoff
+from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
     FailoverReason,
@@ -47,6 +48,9 @@ from k3code.router.classifier import (
 from k3code.router.cooldown import CooldownStore, key_fingerprint
 
 logger = logging.getLogger(__name__)
+
+#: retries of the same entry after a stream stalled (see providers/stall.py)
+STALL_RETRIES = 1
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -79,8 +83,8 @@ class ChainEntry:
         return not getattr(self.provider, "api_key", "")
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower())
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower(), self.key_fingerprint)
 
 
 def build_chain(providers: Sequence[Provider], models: Sequence[str | Sequence[str]]) -> list[ChainEntry]:
@@ -249,6 +253,7 @@ class Router:
                     provider=entry.provider_name,
                     model=target_model,
                     base_url=entry.base_url,
+                    account=entry.key_fingerprint,
                     fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
@@ -268,7 +273,10 @@ class Router:
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
                             self.cooldowns.record_success(
-                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                                provider=entry.provider_name,
+                                model=target_model,
+                                base_url=entry.base_url,
+                                account=entry.key_fingerprint,
                             )
                         yield event
                     # The provider yields its "done" event then closes normally.
@@ -301,8 +309,15 @@ class Router:
                             retry_after=cooldown,
                         )
                         break
-                    # retryable: same entry with backoff, max_retries times, then fail over
-                    if attempt >= self.max_retries:
+                    # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
+                    # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
+                    if isinstance(exc, ProviderDeadline):
+                        retries = 0
+                    elif is_stall(exc):
+                        retries = min(self.max_retries, STALL_RETRIES)
+                    else:
+                        retries = self.max_retries
+                    if attempt >= retries:
                         self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
                         break
                     attempt += 1
@@ -383,16 +398,28 @@ class Router:
             target = model if index == 0 and model else entry.model
             fp = entry.key_fingerprint
             if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             ):
                 if index in auth_failed:
                     continue
                 return None
             left = self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             cooled = self.cooldowns.reason_of(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
@@ -410,10 +437,18 @@ class Router:
             return None
         fp = entry.key_fingerprint
         if self.cooldowns.in_cooldown(
-            provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+            provider=entry.provider_name,
+            model=model,
+            base_url=entry.base_url,
+            account=fp,
+            fingerprint=fp,
         ):
             return self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=model,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
         return None
 
@@ -435,6 +470,7 @@ class Router:
             provider=entry.provider_name,
             model=target_model,
             base_url=entry.base_url,
+            account=entry.key_fingerprint,
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
