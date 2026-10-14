@@ -59,15 +59,21 @@ def _configs(config: Any, cwd: Path) -> list[Any]:
             config = load_config(project_dir=cwd)
         except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
+    # a file that exists but does not parse names no secrets: refuse rather than export its copies in clear
+    # (the error text is left out: a YAML error quotes the line, which may hold the secret)
     try:
         user = confio.read_yaml(user_config_path())
-    except (OSError, ValueError, yaml.YAMLError):  # it does not parse: exporting it fails on its own
-        user = None
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        raise BundleError(_unparsed(user_config_path())) from e
     try:
         project = yaml.safe_load(trust.trusted_text(cwd) or "")
-    except yaml.YAMLError:
-        project = None
+    except yaml.YAMLError as e:
+        raise BundleError(_unparsed(project_config_path(cwd))) from e
     return [config, user, project]
+
+
+def _unparsed(path: Path) -> str:
+    return f"{path} does not parse: fix it first, or the export cannot tell which of its values to hide"
 
 
 def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:

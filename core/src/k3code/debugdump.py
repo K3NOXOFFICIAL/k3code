@@ -69,6 +69,11 @@ def _env_refs(obj: Any) -> set[str]:
     return set()
 
 
+def _scalar(value: Any) -> Any:
+    """An unquoted YAML number or bool as the text it was written as: `SERVICE_TOKEN: 8274619305` is a secret too."""
+    return str(value) if isinstance(value, (int, float, bool)) else value
+
+
 def secret_values(config: Any = None, *, guesses: bool = True) -> list[str]:
     """Every secret value this process knows, longest first: env vars that look secret, provider keys, the variables
     ``*_env`` settings name (``bearer_env``), and MCP env/header values that are secret by name or by shape. Each also
@@ -88,7 +93,7 @@ def secret_values(config: Any = None, *, guesses: bool = True) -> list[str]:
     if isinstance(config, dict):
         dump = config
         providers = dump.get("providers") if isinstance(dump.get("providers"), list) else []
-        keys = [p.get("api_key") for p in providers if isinstance(p, dict)]
+        keys = [_scalar(p.get("api_key")) for p in providers if isinstance(p, dict)]
     else:
         dump = config.model_dump(mode="json") if hasattr(config, "model_dump") else {}
         keys = [getattr(p, "api_key", "") for p in getattr(config, "providers", None) or []]
@@ -101,6 +106,7 @@ def secret_values(config: Any = None, *, guesses: bool = True) -> list[str]:
     for cfg in servers.values() if isinstance(servers, dict) else []:
         parts = [cfg.get("env"), cfg.get("headers")] if isinstance(cfg, dict) else []
         for name, value in [item for part in parts if isinstance(part, dict) for item in part.items()]:
+            value = _scalar(value)
             if not isinstance(value, str):
                 continue
             name = str(name)
