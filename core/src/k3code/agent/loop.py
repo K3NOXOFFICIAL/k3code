@@ -559,7 +559,9 @@ class AgentLoop:
         )
         if decision.sandbox_only and decision.action == "allow" and not contained and not home_rooted:
             if await asyncio.to_thread(sandbox.usable):  # bwrap works; it is the root (e.g. $HOME) it refuses
-                why = "no sandbox here: approve to run it on the host, or start k3code in a project to run this sandboxed"
+                why = (
+                    "no sandbox here: approve to run it on the host, or start k3code in a project to run this sandboxed"
+                )
             else:
                 why = "no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host"
             decision = replace(decision, action="ask", sandbox_only=False, message=why)
