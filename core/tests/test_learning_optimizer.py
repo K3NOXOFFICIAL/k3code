@@ -1,3 +1,5 @@
+import itertools
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -76,8 +78,55 @@ def test_suggest_from_metrics(tmp_path):
     assert optimizer.propose(m, Settings(), store) == []
 
 
-def metrics_for(esc_rate):
-    return optimizer.collect(rows(0, 10, int(10 * esc_rate)), SimpleNamespace(query=lambda *a, **k: []), [], since=0)
+NO_LOG = SimpleNamespace(query=lambda *a, **k: [])
+_sids = itertools.count()
+
+
+def metrics_for(esc_rate, n=12):
+    """``n`` fresh sessions (the A/B samples), each with 10 calls of which ``esc_rate`` escalated."""
+    out = []
+    for _ in range(n):
+        out += rows(0, 10, int(10 * esc_rate), session=f"w{next(_sids)}")
+    return optimizer.collect(out, NO_LOG, [], since=0)
+
+
+def ab_window(xid, treatment_esc, control_esc, per_arm=12):
+    """Sessions of one period split by ``optimizer.arm``: each arm gets ``per_arm`` sessions at its escalation rate."""
+    out, counts = [], {"treatment": 0, "control": 0}
+    while min(counts.values()) < per_arm:
+        sid = f"w{next(_sids)}"
+        side = optimizer.arm(xid, sid)
+        if counts[side] >= per_arm:
+            continue
+        counts[side] += 1
+        out += rows(0, 10, int(10 * (treatment_esc if side == "treatment" else control_esc)), session=sid)
+    return optimizer.collect(out, NO_LOG, [], since=0)
+
+
+def synthetic_session(rng, sid, esc_p=0.2):
+    """One noisy session: 3-15 calls of 500-3000 tokens (two calls a turn), escalations, a loop guard, approvals."""
+    calls = rng.randint(3, 15)
+    out = [
+        {**ev(i, "call", sid, "cheap", "classification"), "tokens_in": rng.randint(500, 3000), "tokens_out": 0}
+        | {"turn": f"{sid}-{i // 2}"}
+        for i in range(calls)
+    ]
+    out += [
+        ev(50 + i, "escalated", sid, "main", "classification", "cheap->main: x")
+        for i in range(calls)
+        if rng.random() < esc_p
+    ]
+    if rng.random() < 0.1:
+        out.append(ev(70, "loop_guard", sid))
+    out += [ev(80 + i, "approval", sid) for i in range(rng.randint(0, 3))]
+    return out
+
+
+def synthetic_window(rng, n=20, esc_p=0.2):
+    out = []
+    for _ in range(n):
+        out += synthetic_session(rng, f"w{next(_sids)}", esc_p)
+    return optimizer.collect(out, NO_LOG, [], since=0)
 
 
 def test_ab_worse_metrics_rolls_back_automatically(tmp_path):
@@ -132,7 +181,12 @@ def test_prompt_overlay_ab_and_rollback(tmp_path, monkeypatch):
     from k3code.prompting import build_system_prompt
 
     assert "Do not repeat failing calls." in build_system_prompt("base", cwd=tmp_path, config=Settings())
-    xp.session_done(lambda since: metrics_for(0.7))
+    # a concurrent A/B: sessions in the control arm are built without the overlay
+    treated = next(f"s{i}" for i in range(100) if optimizer.arm("x1", f"s{i}") == "treatment")
+    held_back = next(f"s{i}" for i in range(100) if optimizer.arm("x1", f"s{i}") == "control")
+    assert "Do not repeat" in build_system_prompt("base", cwd=tmp_path, config=Settings(), session_id=treated)
+    assert "Do not repeat" not in build_system_prompt("base", cwd=tmp_path, config=Settings(), session_id=held_back)
+    xp.session_done(lambda since: ab_window("x1", treatment_esc=0.7, control_esc=0.1))
     assert xp.get("x1")["status"] == "rolled_back" and optimizer.overlay_prompt() == ""
 
 
@@ -204,7 +258,7 @@ def test_scope_accuracy_is_scored_from_the_verifier_outcome(tmp_path):
         scope.append({"ts": 1, "type": "verdict", "hash": h, "verdict": {"scope": verdict_scope}})
         scope.append({"ts": 2, "type": "outcome", "hash": h, "outcome": outcome})
     m = optimizer.collect([], DecisionLog(tmp_path), scope, since=0)
-    assert m["scope_judged"] == 2 and m["scope_accuracy"] == 0.5 and m["verifier_pass_rate"] == 0.5
+    assert m["scope_judged"] == 2 and m["scope_accuracy"] == 0.5 and m["turn_completion_rate"] == 0.5
 
 
 def test_rollback_restores_the_live_settings_not_only_the_yaml(tmp_path):
@@ -239,22 +293,21 @@ def test_rollback_of_a_key_that_was_absent_resets_the_live_value_to_its_default(
     assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
 
 
-def test_a_patch_on_a_key_an_active_experiment_changed_is_refused(tmp_path):
-    from k3code.learning.updateconfig import PatchRejected
-
+def test_a_second_experiment_is_refused_while_one_is_active(tmp_path):
+    """Experiments share one score, so a second one (on any key, or a prompt) waits until the first is judged."""
     cfg = tmp_path / "config.yaml"
     cfg.write_text("router:\n  max_inline_wait: 20\n")
     xp = optimizer.Experiments(tmp_path, FakeClock())
     xp.start({"title": "x1", "patch": {"router": {"max_inline_wait": 40}}}, metrics_for(0.1), config_path=cfg)
-    # suggest() doubles the live value, so the next run proposes 40 -> 80 while x1 is still being judged
-    with pytest.raises(PatchRejected, match=r"router\.max_inline_wait.*x1"):
-        xp.start({"title": "x2", "patch": {"router": {"max_inline_wait": 80}}}, metrics_for(0.1), config_path=cfg)
-    assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 40
-    assert [x["id"] for x in xp.all()] == ["x1"]
-    # other keys, and sibling keys under one table, stay free
-    xp.start({"title": "x2", "patch": {"task_tiers": {"title": "main"}}}, metrics_for(0.1), config_path=cfg)
-    xp.start({"title": "x3", "patch": {"task_tiers": {"classification": "main"}}}, metrics_for(0.1), config_path=cfg)
-    assert [x["id"] for x in xp.active()] == ["x1", "x2", "x3"]
+    for overlay in (
+        {"title": "x2", "patch": {"router": {"max_inline_wait": 80}}},
+        {"title": "x2", "patch": {"task_tiers": {"title": "main"}}},
+        {"title": "x2", "name": "brief", "prompt": "Be brief."},
+    ):
+        with pytest.raises(optimizer.ExperimentBusy, match="x1"):
+            xp.start(overlay, metrics_for(0.1), config_path=cfg)
+    assert confio.read_yaml(cfg) == {"router": {"max_inline_wait": 40}}
+    assert [x["id"] for x in xp.all()] == ["x1"] and not (tmp_path / "overlays").exists()
 
 
 def test_a_key_is_free_again_once_its_experiment_is_judged(tmp_path):
@@ -375,25 +428,117 @@ def test_gate_widening_is_accepted_only_when_the_planning_cost_is_small(tmp_path
     assert not any("Plan more often" in c["title"] for c in optimizer.suggest(dear, Settings()))
 
 
+def token_window(escalations, tokens_per_call, n=12):
+    """``n`` fresh sessions of 100 calls (one turn each), ``escalations`` of them escalated, at the given tokens."""
+    out = []
+    for _ in range(n):
+        sid = f"w{next(_sids)}"
+        for r in rows(0, 100, escalations, session=sid):
+            if r["kind"] == "call":
+                r = {**r, "tokens_in": tokens_per_call, "tokens_out": 0, "turn": f"{sid}-{r['ts']}"}
+            out.append(r)
+    return optimizer.collect(out, NO_LOG, [], since=0)
+
+
 def test_ab_judgement_scores_tokens_as_well_as_quality(tmp_path):
     cfg = tmp_path / "config.yaml"
     xp = optimizer.Experiments(tmp_path, FakeClock())
-    xp.start(
-        {"title": "a", "patch": {"router": {"max_inline_wait": 40}}},
-        base_metrics(0.2, 1000),
-        sessions=1,
-        config_path=cfg,
-    )
-    xp.session_done(lambda since: base_metrics(0.19, 1300), lambda text: None, cfg)  # +1 point, +30% tokens
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "a", "patch": patch}, token_window(20, 1000), sessions=1, config_path=cfg)
+    xp.session_done(lambda since: token_window(19, 1300), lambda text: None, cfg)  # +1 point, +30% tokens
     assert xp.get("x1")["status"] == "rolled_back"
-    xp.start(
-        {"title": "b", "patch": {"router": {"max_inline_wait": 40}}},
-        base_metrics(0.2, 1000),
-        sessions=1,
-        config_path=cfg,
-    )
-    xp.session_done(lambda since: base_metrics(0.10, 1050), lambda text: None, cfg)  # +10 points, +5% tokens
+    xp.start({"title": "b", "patch": patch}, token_window(20, 1000), sessions=1, config_path=cfg)
+    xp.session_done(lambda since: token_window(10, 1050), lambda text: None, cfg)  # +10 points, +5% tokens
     assert xp.get("x2")["status"] == "kept"
+    # symmetric: the same quality for 30% fewer tokens is a gain (it was scored as no change)
+    patch = {"router": {"max_inline_wait": 60}}
+    xp.start({"title": "c", "patch": patch}, token_window(20, 1000), sessions=1, config_path=cfg)
+    xp.session_done(lambda since: token_window(20, 700), lambda text: None, cfg)
+    assert xp.get("x3")["status"] == "kept" and xp.get("x3")["result"]["diff"] == 0.15
+
+
+def test_same_distribution_arms_are_rarely_rolled_back(tmp_path):
+    """No real effect: the old before/after comparison of two aggregate scores rolled back about half of these."""
+    cfg = tmp_path / "config.yaml"
+    rolled_back = 0
+    for seed in range(200):
+        xp = optimizer.Experiments(tmp_path / str(seed), FakeClock())  # a fresh store: 200 records would slow it down
+        rng = random.Random(seed)
+        baseline, after = synthetic_window(rng), synthetic_window(rng)
+        overlay = {"title": f"t{seed}", "patch": {"router": {"max_inline_wait": 40 + seed}}}
+        x = xp.start(overlay, baseline, sessions=1, config_path=cfg)
+        xp.session_done(lambda since, after=after: after, config_path=cfg)
+        status = xp.get(x["id"])["status"]
+        assert status != "active"
+        rolled_back += status == "rolled_back"
+    assert rolled_back < 20  # under 10% (about 2.5% expected: the interval's upper tail)
+
+
+def test_a_clearly_worse_overlay_is_rolled_back(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    for seed in range(5):
+        rng = random.Random(seed)
+        baseline, worse = synthetic_window(rng, esc_p=0.2), synthetic_window(rng, esc_p=0.6)
+        patch = {"router": {"max_inline_wait": 40}}
+        x = xp.start({"title": "t", "patch": patch}, baseline, sessions=1, config_path=cfg)
+        notes: list[str] = []
+        (done,) = xp.session_done(lambda since, worse=worse: worse, notes.append, cfg)
+        assert done["id"] == x["id"] and xp.get(x["id"])["status"] == "rolled_back"
+        assert done["result"]["ci"][1] < 0 and "rolled back automatically" in notes[0]
+        assert "router" not in confio.read_yaml(cfg)
+
+
+def test_a_before_after_experiment_without_enough_control_history_is_refused(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    with pytest.raises(ValueError, match="not enough history"):
+        xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=5), sessions=2, config_path=cfg)
+    assert xp.all() == [] and not cfg.exists()  # nothing started, nothing written, nobody blocked
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=optimizer.MIN_SESSIONS_PER_ARM), config_path=cfg)
+
+
+def test_too_few_treatment_sessions_is_no_decision_and_ends_inconclusive(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1), sessions=2, config_path=cfg)
+    notes: list[str] = []
+    few = metrics_for(0.9, n=0)
+    for _ in range(optimizer.MAX_WINDOW_FACTOR * 2 - 1):
+        assert xp.session_done(lambda since: few, notes.append, cfg) == []
+    assert xp.get("x1")["status"] == "active" and not notes
+    assert confio.read_yaml(cfg)["router"]["max_inline_wait"] == 40
+    xp.session_done(lambda since: few, notes.append, cfg)  # past the longest window: give up, restore
+    assert xp.get("x1")["status"] == "inconclusive" and "inconclusive" in notes[0] and "too few" in notes[0]
+    assert "router" not in confio.read_yaml(cfg)
+
+
+def test_an_experiment_without_a_design_field_is_judged_by_the_old_baseline_rule(tmp_path):
+    import json
+
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"router": {"max_inline_wait": 40}}
+    xp.start({"title": "t", "patch": patch}, metrics_for(0.1), sessions=1, config_path=cfg)
+    items = xp.all()
+    for x in items:
+        del x["design"]
+        del x["control"]
+    xp._save(items)
+    notes: list[str] = []
+    (done,) = xp.session_done(lambda since: metrics_for(0.9), notes.append, cfg)
+    assert done["id"] == "x1" and xp.get("x1")["status"] == "rolled_back"
+    assert "rolled back automatically" in notes[0] and "router" not in confio.read_yaml(cfg)
+    json.dumps(xp.all())  # the stored record stays serializable
+
+
+def test_an_overlay_that_cannot_be_shown_no_worse_is_inconclusive():
+    noisy = [0.3, -0.3] * 6  # the same mean in both arms, but far too noisy to rule out a loss beyond the margin
+    r = optimizer.decide(noisy, noisy, seed=1)
+    assert r["decision"] == "inconclusive" and r["ci"][0] < -optimizer.ROLLBACK_MARGIN and r["ci"][1] >= 0
+    assert optimizer.decide([0.5] * 9, [0.5] * 20, seed=1)["decision"] is None
 
 
 def test_the_optimizer_allowlist_rejects_permissions_sandbox_caps_halt_channels_and_its_own_gates():
@@ -453,7 +598,7 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
     from test_permissions_gateway import make_server
 
     server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
-    for i in range(6):  # six sessions this week, so the optimizer runs
+    for i in range(12):  # twelve sessions this week, so the optimizer runs
         server.usage.record(
             "call",
             session=f"s{i}",
@@ -479,10 +624,10 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
 
 
 def seed_a_week_with_a_gate_passing_candidate(server):
-    """Six sessions this week, and replay records in which one large turn makes ``tool_output_chars: 6000`` pass."""
+    """Twelve sessions this week (control history), and replay records where a large turn makes a 6000-char cap pass."""
     from test_learning_replay import turn
 
-    for i in range(6):
+    for i in range(12):
         server.usage.record(
             "call",
             session=f"s{i}",
@@ -567,7 +712,7 @@ async def test_a_rolled_back_auto_candidate_is_not_applied_again_next_week(tmp_p
     from test_permissions_gateway import make_server
 
     server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
-    for i in range(6):
+    for i in range(12):
         server.usage.record(
             "call",
             session=f"s{i}",

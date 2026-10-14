@@ -247,6 +247,7 @@ class PlanFirst:
             session_meta=session.stored.meta,
             skills=False,
             advisor=False,
+            session_id=session.session_id,
         )
         loop = AgentLoop(
             router,

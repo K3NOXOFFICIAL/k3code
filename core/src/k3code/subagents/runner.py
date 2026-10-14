@@ -421,6 +421,7 @@ class SubagentManager:
             session_meta=parent.stored.meta,
             mcp=server.mcp,
             attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
+            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
         )
         note = ""
         if h.isolation == "worktree":
