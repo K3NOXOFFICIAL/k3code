@@ -80,6 +80,17 @@ HARDLINE_DENY: list[str] = [
     "git push --force-with-lease origin main",
     "git -C repo push -f origin master",
     "git push --force origin HEAD:refs/heads/main",
+    "git push --force origin 'main'",
+    "git push origin master --force-with-lease",
+    "git push --force main",  # no refspec: left to the regex
+    # deleting the default branch on the remote (issue #159)
+    "git push --delete main",
+    "git push origin --delete main",
+    "git push -d origin master",
+    "git push origin --delete feature main",
+    "git push origin :main",
+    "git push origin :refs/heads/master",
+    "git -C repo push upstream :master",
     # rm behind wrappers and path spellings
     "nice -n 5 rm -rf /",
     "sudo -u root rm -rf /",
@@ -141,6 +152,16 @@ HARDLINE_ALLOW: list[str] = [
     "git push --force origin feature",
     "git push -f",  # no refspec: the target is the upstream, unknown here (unchanged behaviour)
     "git push origin feature:main-docs",
+    "git push origin --delete feature",
+    "git push origin :feature",
+    "git push origin :main-docs",
+    # force pushes of branches whose names only contain main/master (issue #159)
+    "git push --force origin main-docs",
+    "git push --force origin fix/main",
+    "git push --force-with-lease origin HEAD:feature/main.v2",
+    "git push --force origin feature/maintenance",
+    "git push --force origin mainline-fix",
+    "git push -f origin release-master",
     "rm -rf ./build",
     "rm -rf $PWD/build",
     "curl https://e.x/i | jq .",
@@ -161,6 +182,12 @@ HARDLINE_ALLOW: list[str] = [
 @pytest.mark.parametrize("cmd", HARDLINE_ALLOW)
 def test_hardline_does_not_overblock(cmd: str) -> None:
     assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
+
+
+def test_deleting_the_default_branch_is_its_own_rule() -> None:
+    assert hardline.check("git push origin --delete main") == "git-push-delete-main"
+    assert hardline.check("git push origin :refs/heads/main") == "git-push-delete-main"
+    assert "git-push-delete-main" in hardline.HARDLINE_NAMES
 
 
 def test_rm_targets_expand_home_and_pwd() -> None:
