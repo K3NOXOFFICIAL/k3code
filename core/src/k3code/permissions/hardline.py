@@ -1089,14 +1089,17 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             out.unterminated = True
             end = n
         payload = _unescape_backticks(text[at + 1 : end], dquoted)
-        # the text up to the next backtick, escaped or not, is read too, as before the unescaping;
-        # it holds no backtick, so it adds one flat scan per backtick and no nesting
-        upto_next = text[at + 1 : n if (nxt := text.find("`", at + 1)) < 0 else nxt]
+        # the text up to the next backtick, escaped or not, is read too, as before the unescaping, and the scan goes on
+        # from there (an earlier or equal point than ``end``): it holds no backtick, so it adds one flat scan per
+        # backtick and no nesting, and the text after it is still read as commands
+        first = text.find("`", at + 1)
+        upto_next = text[at + 1 : n if first < 0 else first]
         for p in dict.fromkeys([payload, upto_next]):
             cur_payloads.append(p)
             inner_bt = _scan(p, budget, _depth + 1)
             out.too_deep = out.too_deep or inner_bt.too_deep
             out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        end = n if first < 0 else min(end, first)
         return end + 1, text[at : end + 1]
 
     while i < n:

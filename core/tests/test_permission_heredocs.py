@@ -538,9 +538,10 @@ def test_an_escaped_backtick_in_backticks_stays_text(tmp_path: Path, cmd: str) -
 
 
 def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
-    # next to the unescaped payload comes the text up to the next backtick, escaped or not, as Main read it
-    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\"", "a \\"]]
-    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"', "a \\"]]
+    # next to the unescaped payload come the readings of Main: the text up to the next backtick, escaped or not, and
+    # (the scan goes on from there) what the backtick that closes the command then opens
+    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\"", "a \\", ""]]
+    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"', "a \\", '"']]
     # in a heredoc body bash keeps the backslash of `\"`, dash drops it: both are checked and no rule vouches for it
     body = parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF")
     # and the raw text of the payload, as Main read it
@@ -829,6 +830,8 @@ STILL_DENIED = [
     'echo "$(cat <<EOF\n$(rm -rf ~)\nEOF\n)"',
     *SHELL_SCRIPTS,
     "cat <<EOF\n`\\\nrm -rf ~`\nEOF",
+    "`\\``rm -rf ~",  # Main ends the first payload at the escaped backtick and reads on from there
+    "echo `\\``rm -rf ~",
 ]
 
 
