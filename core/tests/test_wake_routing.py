@@ -948,7 +948,7 @@ async def test_a_blocked_typed_prompt_does_not_reach_the_goal_judge(tmp_path, mo
 
 
 async def test_a_context_overflow_retry_runs_its_own_hooks(tmp_path, monkeypatch):
-    provider = Recording(overflow_over=6000)  # the first call overflows; the retry after compaction fits
+    provider = Recording(overflow_over=10000)  # the first call overflows; the retry after compaction fits
     big = {"compact_at_tokens": 10_000_000, "keep_messages": 6}  # proactive compaction off: only the retry fires
     server, live = await seed(tmp_path, monkeypatch, provider, context=big)
     count = tmp_path / "hook-count.txt"
