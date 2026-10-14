@@ -61,6 +61,7 @@ def calls_for(*names: str) -> list[ToolCall]:
     return [ToolCall(id=f"c{i}", name=n, arguments={}) for i, n in enumerate(names)]
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 @pytest.mark.asyncio
 async def test_independent_reads_run_concurrently_and_report_in_call_order(tmp_path):
     log: list[str] = []
