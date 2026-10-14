@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
@@ -362,11 +363,18 @@ def _simple_check(sub: str) -> str | None:
     return None
 
 
-def _tokens(sub: str) -> list[str]:
+@lru_cache(maxsize=64)
+def _split_words(sub: str) -> tuple[str, ...]:
     try:
-        return shlex.split(sub, posix=True)
+        return tuple(shlex.split(sub, posix=True))
     except ValueError:
-        return sub.split()
+        return tuple(sub.split())
+
+
+def _tokens(sub: str) -> list[str]:
+    """shlex words of ``sub``. shlex is slow and the same text is split again for each reading of a nested command, so
+    the result is cached (a copy is returned: callers edit it)."""
+    return list(_split_words(sub))
 
 
 def _unit_end(text: str, i: int) -> int:
@@ -1096,6 +1104,11 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         upto_next = text[at + 1 : n if first < 0 else first]
         for p in dict.fromkeys([payload, upto_next]):
             cur_payloads.append(p)
+            # the scan goes on inside and after the backtick, so a payload is read twice (and again at every level
+            # of nesting): its characters are charged to the budget, and past it the command is denied (check)
+            budget[0] -= len(p) or 1
+            if budget[0] < 0:
+                break
             inner_bt = _scan(p, budget, _depth + 1)
             out.too_deep = out.too_deep or inner_bt.too_deep
             out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
@@ -1361,7 +1374,15 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
         parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc
         return parsed
-    for payload in payloads:
+    # a unit is read in more than one way (see _scan, _body_payloads, _launcher_payloads), and each reading is a subtree
+    # of its own, so the work would multiply with every level of nesting. An identical reading is parsed once, and the
+    # characters of every reading but the first are charged to the shared budget: past it the command is denied
+    # (``scan-budget``) instead of read twice over
+    for n, payload in enumerate(dict.fromkeys(payloads)):
+        if n:
+            budget[0] -= len(payload) or 1
+        if budget[0] < 0:
+            return parsed
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])

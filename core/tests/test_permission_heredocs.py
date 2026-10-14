@@ -840,3 +840,58 @@ def test_what_main_denied_is_still_denied(tmp_path: Path, cmd: str) -> None:
     assert check(cmd) is not None, cmd
     for mode in ("auto", "yolo"):
         assert _bash(cmd, mode, tmp_path).action == "deny", (mode, cmd)
+
+
+# ── a unit read in more than one way is not read twice over at every level of nesting ──
+
+
+def _escape_backticks(text: str) -> str:
+    return re.sub(r"([\\`$])", r"\\\1", text)
+
+
+def _nested_bodies(depth: int, filler: str) -> str:
+    """Each level: a heredoc-body backtick holding `\\"` (bash and dash read it differently) and `\\\\` (the raw text
+    differs), so every level has three readings that all differ."""
+    cmd = "echo " + filler
+    for _ in range(depth):
+        cmd = "cat <<X\n`" + _escape_backticks(cmd) + ' \\" \\\\`\nX'
+    return cmd
+
+
+def _nested_backticks(depth: int, filler: str) -> str:
+    cmd = "echo " + filler
+    for _ in range(depth):
+        cmd = "echo `" + _escape_backticks(cmd) + "`"
+    return cmd
+
+
+#: (builder, filler size, hard limit in seconds). Measured on kokadock: 0.02 to 0.3 s; Main took 0.00 s and 3.1 s. The
+#: readings multiplied before the budget was charged: 3.9 s at 5.4 KB and 210 s at 100 KB.
+NESTED_READINGS = [
+    (_nested_bodies, 5_000, 1.0),
+    (_nested_bodies, 100_000, 3.0),
+    (_nested_backticks, 5_000, 1.0),
+    (_nested_backticks, 100_000, 3.0),
+]
+
+
+@pytest.mark.parametrize(
+    ("build", "size", "limit"), NESTED_READINGS, ids=["bodies-5k", "bodies-100k", "backticks-5k", "backticks-100k"]
+)
+def test_nested_readings_of_a_unit_are_decided_in_bounded_time(tmp_path: Path, build, size: int, limit: float) -> None:
+    cmd = build(6, "a" * size)
+    for mode in ("auto", "yolo"):
+        start = time.perf_counter()
+        dec = _bash(cmd, mode, tmp_path)
+        assert time.perf_counter() - start < limit, (build.__name__, size, mode)
+        assert dec.action != "allow", (build.__name__, size, mode)
+
+
+def test_a_command_too_expensive_to_read_twice_is_denied_not_allowed(tmp_path: Path) -> None:
+    cmd = _nested_bodies(6, "a" * 20_000)
+    assert check(cmd, cwd=str(tmp_path)) == "scan-budget"
+    for mode in MODES:
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+    # the same shape with little text is still read, and its hidden command found
+    assert check(_nested_bodies(3, f"x; {HIDDEN}"), cwd=str(tmp_path)) == "rm-rf-home"
+    assert check(_nested_bodies(3, "date"), cwd=str(tmp_path)) is None
