@@ -52,6 +52,7 @@ HARDLINE_NAMES: list[str] = [
     "sensitive-path",
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
+    "scan-budget",  # a command too long to parse within the scan budget (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -193,8 +194,12 @@ def check(
     ``home`` expand ``$PWD``, ``~`` and ``$HOME`` in rm targets (home defaults to the real one).
     """
     home = home if home is not None else os.path.expanduser("~")
-    parsed = parse(command)
-    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home)
+    budget = [_SCAN_BUDGET]
+    parsed = parse(command, budget=budget)
+    hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home)
+    # past the scan budget a substitution's end is unresolved and the text after it was never read as commands:
+    # whatever runs there is unknown, so the command is denied rather than allowed unchecked (yolo too)
+    return hit or ("scan-budget" if budget[0] < 0 else None)
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
@@ -771,7 +776,7 @@ _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
 
 #: a cap on the total characters ``_match_paren`` scans in one top-level ``parse`` (shared by every nested scan, so
 #: substitutions, quotes and arithmetic cannot multiply it); past it an open ``(`` is left unresolved (the command is
-#: unterminated, a person confirms) instead of rescanning quadratically
+#: unterminated) instead of rescanning quadratically, and ``check`` denies the command (``scan-budget``)
 _SCAN_BUDGET = 100_000
 
 #: how deep ``_scan`` follows nested ``$(...)``/backticks before it stops and marks the command unterminated. Real

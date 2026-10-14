@@ -381,6 +381,24 @@ def test_the_paren_scan_cannot_be_multiplied_by_substitutions(cmd: str) -> None:
     assert parsed.unterminated
 
 
+# past the scan budget every later `$(` is unresolved, and an unresolved substitution ran to the end of the text: the
+# commands after it were one open payload nobody checked, so yolo ran them. Where the text after it stands (in the
+# substitution, in a quote, on the command line) is unknown there, so the hardline denies the command.
+PAST_BUDGET = [
+    'echo "$(printf %s ' + "x" * 100_050 + f')"; {HIDDEN}',
+    "(( " + "x" * 100_050 + " ))" + "echo $(true)\n" * 8 + HIDDEN,
+    "(( " + "x" * 100_050 + " ))\n" + "echo $(true)\n" * 8 + HIDDEN,
+    'echo "$(printf %s ' + "x" * 100_050 + f'; {HIDDEN})"',
+]
+
+
+@pytest.mark.parametrize("cmd", PAST_BUDGET, ids=["after-quoted-subst", "arith-subst", "arith-nl-subst", "in-subst"])
+def test_past_the_scan_budget_the_rest_is_not_swallowed(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) is not None
+    for mode in ("auto", "yolo"):
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+
+
 # a << bash may read as something else (in ${...} or a[...]) or a word bash versions read differently: no body is
 # skipped and no rule vouches for the command
 UNSURE = [
