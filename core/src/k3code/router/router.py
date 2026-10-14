@@ -541,17 +541,19 @@ class Router:
     ) -> None:
         if self.on_event is None:
             return
-        self.on_event(
-            RouterEvent(
-                kind=kind,
-                provider=entry.provider_name if entry else "",
-                model=(entry.model if entry else "") or (extra or {}).get("model", ""),
-                attempt=attempt,
-                reason=reason,
-                detail=detail,
-                extra={**(extra or {}), "tier": self.tier},
-            )
+        event = RouterEvent(
+            kind=kind,
+            provider=entry.provider_name if entry else "",
+            model=(entry.model if entry else "") or (extra or {}).get("model", ""),
+            attempt=attempt,
+            reason=reason,
+            detail=detail,
+            extra={**(extra or {}), "tier": self.tier},
         )
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001 - a sink that fails (a client gone mid-turn) must not abort the walk (#148)
+            logger.warning("router event sink failed on %s", kind, exc_info=True)
 
 
 class ProviderStreamError(Exception):
