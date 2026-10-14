@@ -91,6 +91,8 @@ _HOME_READERS = frozenset({"ls", "cat", "grep"})
 _HOME_PLAIN = re.compile(r"[A-Za-z0-9._/@+=,: |;&-]+")
 #: Long options (GNU getopt takes any unambiguous prefix) that make ``ls``/``grep`` walk a directory tree.
 _RECURSIVE_LONG = ("recursive", "dereference-recursive", "directories")
+#: A path component that starts with a dot (``.config``, ``..x``), not the ``.`` and ``..`` steps.
+_DOT_SEGMENT = re.compile(r"(?:^|/)\.(?!\.?(?:/|$))")
 
 
 def home_read_only(command: str) -> bool:
@@ -98,7 +100,9 @@ def home_read_only(command: str) -> bool:
     directory: every part is a plain, non-recursive ``ls``, ``cat`` or ``grep``. Dotenv files lie anywhere below
     ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``) or
     expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by :func:`decide` first.
-    Over-matching only costs a prompt."""
+    Credential stores sit in dot folders no list names in full (``~/.config/git/credentials``,
+    ``~/.cache/huggingface/token``), so no argument may have a dot-segment, nor an option a dot at all
+    (``--file=.x``, ``-f.x``). Over-matching only costs a prompt."""
     if not _HOME_PLAIN.fullmatch(command):
         return False
     parsed = hardline.parse(command)
@@ -109,6 +113,8 @@ def home_read_only(command: str) -> bool:
         if not words or words[0] not in _HOME_READERS:
             return False
         for word in words[1:]:
+            if ("." in word) if word.startswith("-") else bool(_DOT_SEGMENT.search(word)):
+                return False
             if word.startswith("--"):
                 name = word[2:].split("=", 1)[0]
                 if any(full.startswith(name) for full in _RECURSIVE_LONG):
@@ -422,6 +428,37 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     if arg.startswith("$"):
         return True  # a variable: an unknown path
     return not _inside(_abs(arg, cwd), roots)
+
+
+def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
+    """``sub`` names a path below a dot folder of ``$HOME`` (``~/.config/git/credentials``,
+    ``~/.cache/huggingface/token``) that a root at or above ``$HOME`` covers, i.e. not one inside a project root below
+    it (``.gitignore`` there is ordinary). Credential stores live in such folders and no denylist names them all, so
+    the builtin read-only allowlist does not cover these reads. Checked on the path as written and on its realpath (a
+    symlink in ``$HOME`` into a dot folder); a short option with a dot (``-f.config/x``) may attach such a path."""
+    home = os.path.normpath(os.path.expanduser("~"))
+    homes = list(dict.fromkeys((home, os.path.realpath(home))))
+    if not _inside(home, roots):
+        return False  # no root covers $HOME: a path there is outside the roots, which voids a builtin allow already
+    projects = [r for r in roots if not _inside(home, [r])]
+    for t in _argv(sub)[1:]:
+        if t.startswith("-"):
+            if "=" in t:
+                t = t.split("=", 1)[1]
+            elif not t.startswith("--") and "." in t:
+                return True
+            else:
+                continue
+        if not t or t.startswith("$"):
+            continue
+        lexical = _abs(t, cwd)
+        for p in dict.fromkeys((lexical, os.path.realpath(os.path.join(cwd, os.path.expanduser(t))))):
+            if projects and _inside(p, projects):
+                continue
+            for h in homes:
+                if p.startswith(h.rstrip("/") + "/") and any(c.startswith(".") for c in p[len(h) :].split("/")):
+                    return True
+    return False
 
 
 # ── credential files named on a command line ──
@@ -824,8 +861,12 @@ def _decide_bash(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
         )
     worst: Rule | None = None
+    home_dot = False
     for k, sub in enumerate(subs):
         rule = evaluate("bash", sub, ruleset, default="ask")
+        if rule.action == "allow" and rule.layer == 0 and _home_dot_path(sub, roots, cwd):
+            home_dot = True  # a person answers it, in auto mode too (see below)
+            rule = Rule(tool="bash", pattern="*", action="ask")
         # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
         # command line does not say what runs
         if rule.action == "allow" and (
@@ -859,6 +900,14 @@ def _decide_bash(
         )
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
+        )
+    if home_dot and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Reads a dot folder of the home directory, where credentials live; confirm it yourself: "
+            f"{command[:120]}",
         )
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")

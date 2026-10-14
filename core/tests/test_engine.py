@@ -433,3 +433,68 @@ def test_home_read_only_takes_only_plain_non_recursive_readers(command, ok):
     from k3code.permissions.engine import home_read_only
 
     assert home_read_only(command) is ok
+
+
+# --- dot-paths under $HOME keep the prompt (PR 347 review: credential stores no denylist names) ----------------
+
+
+@pytest.mark.parametrize("mode", ["auto", "default", "accept-edits"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat .cache/huggingface/token",
+        "cat {home}/.config/git/credentials",
+        "cat .config/github-copilot/hosts.json",
+        "cat .local/share/opencode/auth.json",
+        "cat notes/../.config/git/credentials",
+        "grep -n token .cache/huggingface/token",
+        "grep --file=.config/git/credentials notes",
+        "cat creds",  # a symlink to ~/.config/git/credentials
+    ],
+)
+def test_builtin_reads_of_a_home_dot_path_ask_at_home(tmp_path, monkeypatch, mode, command) -> None:
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:tok@example.com\n")
+    (home / "creds").symlink_to(home / ".config" / "git" / "credentials")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    d = decide(mode=mode, tool="bash", args={"command": command.format(home=home)}, cwd=str(home))
+    assert d.action == "ask", d
+    assert d.needs_human and not d.auto_allowed
+
+
+@pytest.mark.parametrize("command", ["cat notes.txt", "ls", "ls .", "ls -la", "grep -n KEY notes.txt"])
+def test_builtin_reads_of_plain_home_paths_keep_the_fast_path(tmp_path, monkeypatch, command) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
+    assert d.action == "allow" and not d.auto_allowed and d.rule is not None and d.rule.layer == 0, d
+
+
+def test_builtin_reads_of_dot_paths_inside_a_project_under_home_stay_allowed(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    proj = home / "src" / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for command in ("cat .gitignore", "cat .github/workflows/ci.yml", "ls .github"):
+        d = decide(mode="default", tool="bash", args={"command": command}, cwd=str(proj))
+        assert d.action == "allow" and d.rule is not None and d.rule.layer == 0, (command, d)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat /home/u/.cache/huggingface/token",
+        "ls notes .local/share/opencode",
+        "grep --file=.config/git/credentials notes",
+        "grep -f.config/git/credentials notes",
+    ],
+)
+def test_home_read_only_refuses_dot_paths(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is False
