@@ -2,14 +2,16 @@ import { PassThrough } from "stream";
 
 import { renderSync } from "@k3code/ink";
 import React, { useEffect } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ComposerToken } from "../app/interfaces.js";
 import {
   appendShellOutput,
   resetShellRunsForTests,
   shellRunCount,
+  shellRunsToCancel,
 } from "../app/shellRunStore.js";
+import { turnController } from "../app/turnController.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import {
   prepareSubmission,
@@ -123,6 +125,7 @@ function mountSubmission(slash = vi.fn(() => true)) {
       } as never,
       composerRefs: {
         queueEditRef: { current: null },
+        queueRef: { current: [] },
         tokensRef: { current: [] },
       } as never,
       composerState: {
@@ -478,5 +481,62 @@ describe("{!cmd} interpolation", () => {
     expect(mounted.prompts[0]).toMatchObject({
       text: "compare Tue with up 3 days",
     });
+  });
+});
+
+describe("a double Enter with a running !cmd", () => {
+  beforeEach(() => {
+    resetUiState();
+    resetShellRunsForTests();
+    patchUiState({ sid: "sess-1" });
+  });
+
+  afterEach(() => {
+    resetShellRunsForTests();
+    vi.restoreAllMocks();
+  });
+
+  const cancelCalls = (gw: GatewayClient) =>
+    vi
+      .mocked(gw.request)
+      .mock.calls.filter(([method]) => method === "shell.cancel");
+
+  it("cancels the !cmd instead of interrupting; the next double Enter reaches the turn", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+    const interrupt = vi.spyOn(turnController, "interruptTurn");
+
+    sub.dispatchSubmission("!sleep 9");
+    expect(getUiState().busy).toBe(true);
+
+    sub.submit("");
+    sub.submit("");
+
+    expect(cancelCalls(mounted.gw)).toEqual([
+      ["shell.cancel", { session_id: "sess-1" }],
+    ]);
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(mounted.sys).toHaveBeenCalledWith(
+      "cancelling the running ! command …",
+    );
+    expect(shellRunsToCancel()).toEqual([]);
+
+    sub.submit("");
+
+    expect(cancelCalls(mounted.gw)).toHaveLength(1);
+    expect(interrupt).toHaveBeenCalledTimes(1);
+  });
+
+  it("with no !cmd running interrupts the turn as before", async () => {
+    const mounted = mountSubmission();
+    const sub = await mounted.sub();
+    const interrupt = vi.spyOn(turnController, "interruptTurn");
+
+    patchUiState({ busy: true, status: "thinking…" });
+    sub.submit("");
+    sub.submit("");
+
+    expect(cancelCalls(mounted.gw)).toEqual([]);
+    expect(interrupt).toHaveBeenCalledTimes(1);
   });
 });

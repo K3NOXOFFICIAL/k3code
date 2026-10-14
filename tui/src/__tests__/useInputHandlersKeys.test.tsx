@@ -6,6 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setInputSelection } from "../app/inputSelectionStore.js";
 import type { InputHandlerContext } from "../app/interfaces.js";
+import {
+  $shellRuns,
+  resetShellRunsForTests,
+  shellRunsToCancel,
+  startShellRun,
+} from "../app/shellRunStore.js";
+import { turnController } from "../app/turnController.js";
 import { patchUiState, resetUiState } from "../app/uiStore.js";
 import {
   resolveQueueForceSend,
@@ -51,7 +58,13 @@ class FakeTty extends EventEmitter {
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-const KEY = { ctrlK: "\x0b", down: "\x1b[B", esc: "\x1b", up: "\x1b[A" };
+const KEY = {
+  ctrlC: "\x03",
+  ctrlK: "\x0b",
+  down: "\x1b[B",
+  esc: "\x1b",
+  up: "\x1b[A",
+};
 
 const item = (text: string): QueueItem => ({ display: text, text });
 
@@ -85,11 +98,15 @@ function setup(over: Composer = {}) {
 
   const actions = {
     appendMessage: vi.fn(),
+    die: vi.fn(),
     dispatchSubmission: vi.fn(),
     sys: vi.fn(),
   };
 
-  const gw = { request: vi.fn(() => Promise.resolve({})) };
+  const gw = {
+    publishLocalEvent: vi.fn(),
+    request: vi.fn((_method: string, _params?: unknown) => Promise.resolve({})),
+  };
 
   const ctx = {
     actions,
@@ -154,6 +171,8 @@ async function press(ctx: unknown, ...keys: string[]) {
   }
 
   const instance = renderSync(React.createElement(Probe), {
+    // as the app runs: Ctrl+C reaches the handlers instead of unmounting
+    exitOnCtrlC: false,
     patchConsole: false,
     stderr: new FakeTty() as unknown as NodeJS.WriteStream,
     stdin: stdin as unknown as NodeJS.ReadStream,
@@ -381,6 +400,191 @@ describe("useInputHandlers keys", () => {
       await press(t.ctx, KEY.up);
 
       expect(t.cActions.setInput).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("a cancel press with a running !cmd", () => {
+  beforeEach(() => {
+    resetUiState();
+    resetShellRunsForTests();
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    setInputSelection(null);
+    resetShellRunsForTests();
+    vi.restoreAllMocks();
+  });
+
+  const calls = (
+    gw: { request: { mock: { calls: unknown[][] } } },
+    m: string,
+  ) => gw.request.mock.calls.filter(([method]) => method === m);
+
+  const watchInterrupt = () => vi.spyOn(turnController, "interruptTurn");
+
+  describe("Ctrl+C", () => {
+    it("mid-turn cancels the !cmd once and leaves the turn running", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toEqual([
+        ["shell.cancel", { session_id: "sess-1" }],
+      ]);
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(t.actions.sys).toHaveBeenCalledWith(
+        "cancelling the running ! command …",
+      );
+      expect(shellRunsToCancel()).toEqual([]);
+    });
+
+    it("a second press, with every run already cancelling, interrupts the turn as before", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlC, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+    });
+
+    it("with no !cmd running interrupts the turn as before", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toEqual([]);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+    });
+
+    it("idle on an empty composer cancels a !cmd that outlived its turn instead of quitting", async () => {
+      const t = setup();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(t.actions.die).not.toHaveBeenCalled();
+    });
+
+    it("idle on an empty composer with no !cmd running quits as before", async () => {
+      const t = setup();
+
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toEqual([]);
+      expect(t.actions.die).toHaveBeenCalledTimes(1);
+    });
+
+    it("over a draft still clears the draft first", async () => {
+      const t = setup({ busy: true, input: "draft" });
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(t.cActions.clearIn).toHaveBeenCalledTimes(1);
+      expect(calls(t.gw, "shell.cancel")).toEqual([]);
+    });
+
+    it("one press cancels two concurrent runs", async () => {
+      const t = setup({ busy: true });
+
+      startShellRun("x1");
+      startShellRun("x2");
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect($shellRuns.get()).toMatchObject({
+        x1: { cancelling: true },
+        x2: { cancelling: true },
+      });
+    });
+
+    it("a failed shell.cancel shows the error and unflags the runs, so a later press retries", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      t.gw.request.mockImplementation((method: string) =>
+        method === "shell.cancel"
+          ? Promise.reject(new Error("socket closed"))
+          : Promise.resolve({}),
+      );
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(t.actions.sys).toHaveBeenCalledWith(
+        expect.stringMatching(/^error: /),
+      );
+      expect(shellRunsToCancel()).toEqual(["x1"]);
+
+      await press(t.ctx, KEY.ctrlC);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(2);
+      expect(interrupt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Esc Esc", () => {
+    it("mid-turn cancels the !cmd and leaves the turn running", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.esc, KEY.esc);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(interrupt).not.toHaveBeenCalled();
+    });
+
+    it("a second pair, with the run already cancelling, interrupts the turn", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.esc, KEY.esc, KEY.esc, KEY.esc);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+    });
+
+    it("with no !cmd running interrupts the turn as before", async () => {
+      const t = setup({ busy: true });
+      const interrupt = watchInterrupt();
+
+      await press(t.ctx, KEY.esc, KEY.esc);
+
+      expect(calls(t.gw, "shell.cancel")).toEqual([]);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("Ctrl+K mid-turn in 'queue' mode", () => {
+    it("cancels the !cmd instead of stopping the turn", async () => {
+      const t = setup({ busy: true, queue: [item("first")] });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlK);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(interrupt).not.toHaveBeenCalled();
+    });
+
+    it("a second press, with the run already cancelling, stops the turn", async () => {
+      const t = setup({ busy: true, queue: [item("first")] });
+      const interrupt = watchInterrupt();
+
+      startShellRun("x1");
+      await press(t.ctx, KEY.ctrlK, KEY.ctrlK);
+
+      expect(calls(t.gw, "shell.cancel")).toHaveLength(1);
+      expect(interrupt).toHaveBeenCalledTimes(1);
     });
   });
 });

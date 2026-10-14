@@ -44,6 +44,7 @@ import {
   patchOverlayState,
 } from "./overlayStore.js";
 import { respondToServerRequest } from "./serverRequestStore.js";
+import { cancelShellRuns } from "./shellRunStore.js";
 import { turnController } from "./turnController.js";
 import { patchTurnState } from "./turnStore.js";
 import { $uiState, getUiState } from "./uiStore.js";
@@ -540,6 +541,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       } else {
         hideEscInterruptHint();
 
+        if (
+          cancelShellRuns({ gw: gateway.gw, sid: live.sid, sys: actions.sys })
+        ) {
+          return;
+        }
+
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
           gw: gateway.gw,
@@ -936,6 +943,15 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return cActions.clearIn();
       }
 
+      // A running `!cmd` is cancelled first, also from an idle empty composer (one started mid-turn can outlive the
+      // turn): there Ctrl+C would otherwise quit under it.
+      if (
+        live.sid &&
+        cancelShellRuns({ gw: gateway.gw, sid: live.sid, sys: actions.sys })
+      ) {
+        return;
+      }
+
       if (ctrlC === "interrupt" && live.sid) {
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
@@ -1028,6 +1044,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       });
 
       if (forceSend === "interrupt" && live.sid) {
+        if (
+          cancelShellRuns({ gw: gateway.gw, sid: live.sid, sys: actions.sys })
+        ) {
+          return;
+        }
+
         // like a double Enter: busy is held, so the queue drains once on the settle edge
         return turnController.interruptTurn(
           {

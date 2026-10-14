@@ -34,7 +34,11 @@ import type {
   ComposerToken,
   StateSetter,
 } from "./interfaces.js";
-import { finishShellRun, startShellRun } from "./shellRunStore.js";
+import {
+  cancelShellRuns,
+  finishShellRun,
+  startShellRun,
+} from "./shellRunStore.js";
 import { submitPrompt } from "./submissionCore.js";
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
@@ -696,6 +700,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
         lastEmptyAt.current = now;
 
         if (doubleTap && live.busy && live.sid) {
+          if (cancelShellRuns({ gw, sid: live.sid, sys })) {
+            return;
+          }
+
           // Force-send: keep busy when a message is queued so the settle edge
           // drains it once (no race). Empty queue = plain Stop → 'ready'.
           const hasQueued = composerRefs.queueRef.current.length > 0;
