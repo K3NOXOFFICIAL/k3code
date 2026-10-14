@@ -369,10 +369,49 @@ def _tokens(sub: str) -> list[str]:
         return sub.split()
 
 
+#: how deep ``_unit_end`` follows a ``${...}`` nested in a ``${...}``; deeper, the unit is unresolved
+_UNIT_MAX_DEPTH = 32
+
+
+def _unit_end(text: str, i: int, _depth: int = 0) -> int:
+    """Index of the last character of the ``$(...)``, backtick or ``${...}`` at ``i``, read as one unit as the shell
+    reads it (the quotes in it are its own); -1 when none starts there, -2 when it does not close."""
+    if text.startswith("$(", i):
+        end = _match_paren(text, i + 1)
+        return end if end >= 0 else -2
+    if text.startswith("`", i):
+        end = _backtick_end(text, i)
+        return end if end >= 0 else -2
+    if not text.startswith("${", i):
+        return -1
+    if _depth >= _UNIT_MAX_DEPTH:
+        return -2
+    j, n = i + 2, len(text)
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            j += 2
+        elif c in "'\"":
+            k = text.find(c, j + 1)
+            if k < 0:
+                return -2
+            j = k + 1
+        elif c == "}":
+            return j
+        elif (end := _unit_end(text, j, _depth + 1)) != -1:
+            if end < 0:
+                return -2
+            j = end + 1
+        else:
+            j += 1
+    return -2
+
+
 def _shell_words(sub: str) -> list[str]:
     """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
     double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
-    ``bash -c "echo \\`x\\`"`` is the line the inner shell runs. An open quote falls back to :func:`_tokens`."""
+    ``bash -c "echo \\`x\\`"`` is the line the inner shell runs, and a ``$(...)``, backtick or ``${...}`` is one unit
+    whose quotes are its own (see _unit_end). An open quote or unit falls back to :func:`_tokens`."""
     words: list[str] = []
     word: list[str] | None = None
     i, n = 0, len(sub)
@@ -388,6 +427,11 @@ def _shell_words(sub: str) -> list[str]:
         if c == "\\":
             word.append(sub[i + 1 : i + 2].replace("\n", ""))  # \<newline> joins lines
             i += 2
+        elif (end := _unit_end(sub, i)) != -1:
+            if end < 0:
+                return _tokens(sub)
+            word.append(sub[i : end + 1])  # kept as written: parse reads it
+            i = end + 1
         elif c == "'":
             j = sub.find("'", i + 1)
             if j < 0:
@@ -401,6 +445,11 @@ def _shell_words(sub: str) -> list[str]:
                     nxt = sub[j + 1]
                     word.append(nxt if nxt in '$`"\\' else "" if nxt == "\n" else sub[j : j + 2])
                     j += 2
+                elif (end := _unit_end(sub, j)) != -1:
+                    if end < 0:
+                        return _tokens(sub)
+                    word.append(sub[j : end + 1])
+                    j = end + 1
                 else:
                     word.append(sub[j])
                     j += 1

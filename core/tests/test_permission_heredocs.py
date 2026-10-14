@@ -480,6 +480,14 @@ NESTED_BACKTICKS = [
     r'bash -c "echo \"\`rm -rf ~\`\""',
     r'echo $(bash -c "echo \`rm -rf ~\`")',
     r'bash -c "echo \"\$(rm -rf ~)\""',
+    # a $(...), backtick or ${...} in the argument is one unit: its quotes do not end or start the argument's quotes
+    r'''bash -c "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''sh -c "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''eval "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''bash -c "$(: "'")\`rm -rf ~\`"''',
+    r"""bash -c $(: "'")"\`rm -rf ~\`"$(: "'")""",
+    r'''bash -c "${x:+"'"}\`rm -rf ~\`${x:+"'"}"''',
+    r'''bash -c "`: "'"`\`rm -rf ~\``: "'"`"''',
 ]
 
 
@@ -515,6 +523,15 @@ def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
     body = parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF")
     assert body.heredocs[0][0].payloads == [r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
     assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
+
+
+def test_a_launcher_argument_nested_in_brackets_is_decided_quickly(tmp_path: Path) -> None:
+    # reading a ${...} as one unit must not recurse once per level (RecursionError) or rescan the text per level
+    for cmd in ('bash -c "' + "${" * 5000 + 'x"', 'bash -c "' + "${x:+" * 5000 + "x" + "}" * 5000 + '"'):
+        start = time.perf_counter()
+        for mode in MODES:
+            _bash(cmd, mode, tmp_path)
+        assert time.perf_counter() - start < 5.0
 
 
 def test_backticks_count_as_nesting(tmp_path: Path) -> None:
