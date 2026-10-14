@@ -120,6 +120,16 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     assert "go test ./..." not in out  # panes' upstream remote-sync tests recurse without bound
 
 
+def test_pytest_basetemp_stays_short_whatever_tmpdir_is(tmp_path: Path) -> None:
+    """A Unix socket path caps at 108 bytes and an xdist worker adds popen-gwN/: a long TMPDIR (the Multica runtime's
+    /tmp/multica-task-<id>) must not lengthen the --basetemp of the pytest lanes."""
+    long_tmp = tmp_path / ("t" * 60)
+    long_tmp.mkdir()
+    out = _run(["bash", str(CHECK), "--plan", "--only", "core"], REPO, _env(tmp_path, TMPDIR=str(long_tmp))).stdout
+    bases = [w for line in out.splitlines() for w in line.split() if w.startswith("/") and "/k3ci-" in w]
+    assert len(bases) == 2 and all(b.startswith("/tmp/k3ci-") and len(b) < 30 for b in bases), bases
+
+
 def test_quick_plan_has_no_builds_or_test_suites(tmp_path: Path) -> None:
     out = _run(["bash", str(CHECK), "--plan", "--quick"], REPO, _env(tmp_path)).stdout
     assert "uv run ruff check" in out and "npx prettier --check" in out and "go vet" in out and "shell_lint" in out

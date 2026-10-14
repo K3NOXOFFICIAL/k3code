@@ -199,9 +199,10 @@ area_core() {
     need timeout
     # The bulk of the suite runs in parallel (pytest-xdist); tests marked `serial` (real systemd, a pty) run alone
     # afterwards. --basetemp keeps the temp paths short: a worker adds popen-gwN/, and a Unix socket path caps at 108
-    # bytes. K3CODE_CI_PYTEST_WORKERS=0 runs the first lane in one process.
+    # bytes, so the dir sits directly under /tmp even when TMPDIR is long (the Multica runtime sets
+    # /tmp/multica-task-<id>). K3CODE_CI_PYTEST_WORKERS=0 runs the first lane in one process.
     local workers="${K3CODE_CI_PYTEST_WORKERS:-$(n=$(nproc 2>/dev/null || echo 1); echo $((n < 8 ? n : 8)))}" base
-    base=$(mktemp -d "${TMPDIR:-/tmp}/k3ci-XXXXXX")
+    base=$(mktemp -d /tmp/k3ci-XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/k3ci-XXXXXX")
     step "pytest (parallel, $workers workers)" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" \
       uv run pytest -q -n "$workers" -m "not serial" --basetemp "$base/par"
     step "pytest (serial lane)" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" \
