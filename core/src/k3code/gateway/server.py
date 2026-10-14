@@ -4615,7 +4615,16 @@ async def _session_events_stats(server: GatewayServer, params: dict[str, Any]) -
 
 
 async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    # `session_id` stays ignored: the TUI always sends its attached sid, and honouring it would move a send made
+    # during a session switch to the session being left. The agent view names another live session explicitly.
     session = server.session
+    tgt = params.get("target_session_id")
+    if tgt is not None:
+        if not isinstance(tgt, str):
+            raise _InvalidParams("target_session_id must be a string")
+        session = server.live.get(tgt)
+        if session is None:
+            raise _InvalidParams(f"session {tgt} is not running; attach it first")
     if session is None:
         raise _InvalidParams("no active session")
     text = scrub_surrogates(str(_require(params, "text")))  # one lone surrogate failed every save of the session
