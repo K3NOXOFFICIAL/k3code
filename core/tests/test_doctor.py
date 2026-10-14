@@ -503,6 +503,33 @@ def test_doctor_names_chain_models_whose_context_window_is_a_guess():
     assert [(c.name, c.status) for c in check_context_windows(cfg)] == [("context-window", OK)]
 
 
+def test_doctor_names_alias_ids_that_prompt_cache_auto_leaves_unmarked():
+    """Issue #168/4: under prompt_cache auto a relay alias id gets no cache breakpoints; doctor says how to opt in."""
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, WARN, check_prompt_cache
+
+    def entry(**kw):
+        base = {"name": "gw", "kind": "openai", "base_url": "http://gw/v1", "api_key_env": "K"}
+        return ProviderEntry(**{**base, "models": {"default": ["auto/coding-manual", "claude-x", "gpt-4.1"]}, **kw})
+
+    checks = check_prompt_cache(Settings(providers=[entry()]))
+    assert [(c.name, c.status) for c in checks] == [("prompt-cache:gw", WARN)]
+    assert "auto/coding-manual" in checks[0].detail and "claude-x" not in checks[0].detail
+    assert "gpt-4.1" not in checks[0].detail  # a known non-Claude family is not an alias
+    assert "prompt_cache: on" in checks[0].fix and "cache_models" in checks[0].fix
+    assert checks[0].data == {"provider": "gw", "models": ["auto/coding-manual"]}
+
+    quiet = [
+        entry(prompt_cache="on"),
+        entry(prompt_cache="off"),
+        entry(cache_models=["auto/*"]),
+        entry(base_url="https://api.openai.com/v1"),
+        entry(kind="anthropic"),
+    ]
+    for e in quiet:
+        assert [c.status for c in check_prompt_cache(Settings(providers=[e]))] == [OK], e
+
+
 def test_context_window_check_says_so_when_no_chain_models_are_configured():
     from k3code.config import ProviderEntry, Settings
     from k3code.doctor import OK, check_context_windows

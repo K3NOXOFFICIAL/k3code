@@ -16,7 +16,7 @@ The client entrypoint is `src/entry.tsx`. It exits early if `stdin` is not a TTY
 python -m tui_gateway.entry
 ```
 
-Interpreter resolution uses `HERMES_PYTHON`, supplied by the CLI launcher or
+Interpreter resolution uses `K3CODE_PYTHON`, supplied by the CLI launcher or
 Nix wrapper. Direct development runs without that value use `python3` on PATH,
 or `python` on Windows. The TUI does not search `PYTHON`, `VIRTUAL_ENV`, or
 checkout venv directories for a different interpreter.
@@ -228,7 +228,7 @@ Notes:
 - Completion requests are debounced by 60 ms. Input starting with `/` uses `complete.slash`. A trailing token that starts with `./`, `../`, `~/`, `/`, or `@` uses `complete.path`.
 - Text pastes are inserted inline directly into the draft. Nothing is newline-flattened.
 - `Cmd/Ctrl+G` (or `Alt+G` in VSCode/Cursor, which intercept the primary keystroke for Find Next) writes the current draft, including any multiline buffer, to a temp file, suspends Ink, launches `$EDITOR`, then restores the TUI and submits the saved text if the editor exits cleanly.
-- Input history is stored in `~/.hermes/.hermes_history` or under `HERMES_HOME`.
+- Input history is stored per project in `~/.k3code/projects/<project>/.input_history`, or under `K3CODE_HOME`.
 
 ## Rendering
 
@@ -370,6 +370,8 @@ Current color overrides:
 
 - banner title, accent, border, body, dim
 - label, ok, error, warn
+
+`NO_COLOR` (non-empty, see no-color.org) turns off all foreground and background colour at the one place colour is applied (`colorize()` in `packages/hermes-ink/src/ink/colorize.ts`); bold, dim and inverse stay.
 
 `branding.tsx` uses those values for the logo, session panel, and update notice.
 
