@@ -159,3 +159,44 @@ async def test_a_project_below_home_searches_its_own_dot_folders(home, monkeypat
     res = await tool_grep({"pattern": "API_KEY", "include": "*"}, cwd=proj)
     assert _files(res) == {"ci.yml"}, res
     assert "warnings" not in res
+
+
+# --- a symlink in the project that leaves it (K3NOX-650) -------------------------------------------------------------
+# rg does not follow symlinks without -L; the Python walk listed a link like any file and opened it, so a link made in
+# the sandbox (`ln -s ~/.config/git/credentials notes`) returned the lines of a file outside every root.
+
+
+@pytest.fixture
+def linked(home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    proj = home / "proj"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "ok.txt").write_text("API_KEY = read_it()\n")
+    (proj / "a").symlink_to(home / ".config" / "git" / "credentials")
+    (proj / "sub" / "b.txt").symlink_to(home / "notes.txt")  # not a named credential store: only the link is wrong
+    (proj / "real").mkdir()
+    (proj / "real" / "c.txt").write_text("API_KEY in a real dir\n")
+    (proj / "dir_link").symlink_to(proj / "real")
+    return proj
+
+
+@pytest.mark.parametrize("engine", ["rg", "fallback"])
+@pytest.mark.parametrize("include", [None, "*"])
+async def test_a_search_does_not_follow_a_project_symlink_out_of_the_tree(
+    linked, home, monkeypatch, engine, include
+) -> None:
+    if engine == "rg" and not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    if engine == "fallback":
+        _no_rg(home, monkeypatch)
+    args = {"pattern": "API_KEY", **({"include": include} if include else {})}
+    res = await tool_grep(args, cwd=linked)
+    assert "not-a-real-value" not in res["matches"]
+    assert _files(res) == {"ok.txt", "c.txt"}, res
+
+
+async def test_the_fallback_searches_a_symlink_it_was_pointed_at(linked, home, monkeypatch) -> None:
+    _no_rg(home, monkeypatch)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(linked / "sub" / "b.txt")}, cwd=linked)
+    assert _files(res) == {"b.txt"}, res
+    res = await tool_grep({"pattern": "API_KEY", "path": str(linked / "dir_link")}, cwd=linked)
+    assert _files(res) == {"c.txt"}, res

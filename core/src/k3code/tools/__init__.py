@@ -1100,6 +1100,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
+        if not named and os.path.islink(fp):  # rg does not follow links in a walk: one may lead out of the roots
+            continue
         if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1
             continue
