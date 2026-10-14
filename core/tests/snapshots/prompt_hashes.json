@@ -1,34 +1,34 @@
 {
   "base": {
-    "chars": 2505,
-    "hash": "4d4ab965ff5f8576"
+    "chars": 2637,
+    "hash": "913bf91cdb0d6330"
   },
   "headless": {
-    "chars": 2505,
-    "hash": "4d4ab965ff5f8576"
+    "chars": 2637,
+    "hash": "913bf91cdb0d6330"
   },
   "interactive": {
-    "chars": 2505,
-    "hash": "4d4ab965ff5f8576"
+    "chars": 2637,
+    "hash": "913bf91cdb0d6330"
   },
   "plan": {
-    "chars": 2773,
-    "hash": "4ba59f049b9c4e40"
+    "chars": 2905,
+    "hash": "7a9eca6e069cb614"
   },
   "subagent:explorer": {
-    "chars": 2837,
-    "hash": "93b04799442f791b"
+    "chars": 2969,
+    "hash": "4c782552f194f9be"
   },
   "subagent:planner": {
-    "chars": 2847,
-    "hash": "fc2dd84462af5aba"
+    "chars": 2979,
+    "hash": "db08a0a595f71496"
   },
   "subagent:reviewer": {
-    "chars": 2947,
-    "hash": "1647c32ec956960d"
+    "chars": 3079,
+    "hash": "a105a5ae7dd54fda"
   },
   "subagent:worker": {
-    "chars": 2839,
-    "hash": "69933d00639e7017"
+    "chars": 2971,
+    "hash": "303dfd5d51c0a841"
   }
 }
