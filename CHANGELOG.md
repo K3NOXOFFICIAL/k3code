@@ -8,6 +8,11 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 - **`/learned` (issue #141).** Lists the project's gotchas, auto gotchas and learned notes plus the machine gotchas, preferences and overlays with an id each; `/learned forget <id>` removes one and `/learned purge --yes` clears auto gotchas, learned notes and overlays outside an active experiment.
 
+### TUI agents overlay
+
+- **The agent view folds its groups and starts a session from a typed prompt.** Working, Needs input and Completed each sit under a header with their count (an empty group shows `(0)` dimmed); `Enter`, `→` or `Space` on a header folds or unfolds the group, `↑`/`↓` step over a folded group's rows, and the folds are kept while the TUI runs. The header reads `Agents  2 working · 1 needs input · 7 completed`. `n` was announced in the footer but only started an empty session: it now opens an inline prompt ("first message for the new session"); `Enter` starts a session and sends the text as its first message, an empty `Enter` starts an empty session as before, `Esc` cancels.
+- **The agent view opens at once.** It showed "Loading sessions…" until `session.list` answered, and that answer took seconds on a store with large transcripts: the project filter compared the `messages` column against `'[]'`, which makes sqlite read every stored transcript off disk for each listing (the switcher, the start-up worktree reap and the agent view all go through it). The filter now reads the `message_count` column (a row from before the column existed is decided by its transcript once), and the view renders the live rows and the project's history from its last answer immediately, refreshing behind a "loading…" mark in the header.
+
 ### Fixed
 
 - **Auto mode lets bash write scratch output to `/tmp`.** `pytest > /tmp/out.txt 2>&1; tail /tmp/out.txt` was refused as "Auto mode writes only inside the project roots", although auto-mode bash runs in the sandbox, whose `/tmp` is a private tmpfs nothing on the host sees (without a usable sandbox the command still asks a person first). A redirect into `/tmp` is now auto-allowed like any other sandboxed command; one that leaves `/tmp` (`/tmp/../x`, a host symlink in `/tmp`), lands under `$HOME` or anywhere else outside the project, and every `write`/`edit` outside it, is refused as before.

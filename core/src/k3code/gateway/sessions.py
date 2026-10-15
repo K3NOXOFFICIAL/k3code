@@ -262,12 +262,15 @@ class SessionStore:
     def worked_in(self, *, limit: int) -> list[tuple[str, str]]:
         """``(session_id, cwd)`` of the newest ``limit`` sessions with at least one message and no automation origin.
 
-        Decided in SQL, so no transcript is parsed or copied into Python: every write path stores an empty
-        transcript as exactly ``'[]'``.
+        Decided in SQL from the ``message_count`` column, so no transcript is parsed, copied into Python or even
+        read from disk: comparing ``messages`` itself made sqlite load every row's transcript (a store with a few
+        large sessions took seconds per listing). Only a row from before the column existed (``-1``) is decided by
+        its transcript, once, as every write path stores an empty one as exactly ``'[]'``.
         """
         return self._db.execute(
             "SELECT session_id, cwd FROM sessions"
-            " WHERE messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+            " WHERE (message_count > 0 OR (message_count < 0 AND messages NOT IN ('', '[]')))"
+            " AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
             " ORDER BY updated_at DESC LIMIT ?",
             (max(1, limit),),
         ).fetchall()

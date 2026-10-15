@@ -1514,13 +1514,14 @@ export function useMainApp(gw: GatewayClient) {
     [session, sys],
   );
 
+  const { newLiveSession: startLiveSession } = session;
   const newPromptSession = useCallback(
-    (prompt: string, modelArg?: string) => {
+    (prompt: string, modelArg?: string, dropSid?: string) => {
       void startPromptLiveSession({
         dispatchSubmission,
         maybeWarn,
         modelArg,
-        newLiveSession: session.newLiveSession,
+        newLiveSession: (msg, title) => startLiveSession(msg, title, dropSid),
         onModelSwitched: (value) =>
           patchUiState((state) => ({
             ...state,
@@ -1533,7 +1534,7 @@ export function useMainApp(gw: GatewayClient) {
         sys,
       });
     },
-    [dispatchSubmission, maybeWarn, rpc, session.newLiveSession, sys],
+    [dispatchSubmission, maybeWarn, rpc, startLiveSession, sys],
   );
 
   const hasReasoning = useTurnSelector((state) =>

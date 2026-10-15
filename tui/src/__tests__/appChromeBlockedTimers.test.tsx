@@ -640,13 +640,24 @@ describe("AppLayout agent view: leaving the startup session", () => {
       ]);
       await waitFor(() => expect(layout.output()).toContain("busy one"));
 
-      // The view rests on this session's row (s1); s2 (working) is listed above it, so ↑ selects it for ⏎ to attach.
+      // The view rests on this session's row (s1, idle, under Completed); s2 (working) is listed above it past the
+      // Completed header, so ↑↑ selects it for ⏎ to attach.
       if (key === "\r") {
+        layout.press("\x1b[A");
+        await waitFor(() => expect(layout.output()).toContain("› ▾ Completed"));
         layout.press("\x1b[A");
         await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
       }
 
       layout.press(key);
+
+      // `n` opens the prompt for the first message; an empty ⏎ starts a plain new session.
+      if (key === "n") {
+        await waitFor(() =>
+          expect(layout.output()).toContain("first message for the new"),
+        );
+        layout.press("\r");
+      }
 
       await waitFor(() => expect(spy).toHaveBeenCalled());
       expect(spy).toHaveBeenCalledWith(...args);
@@ -763,6 +774,10 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() =>
+      expect(layout.output()).toContain("first message for the new"),
+    );
+    layout.press("\r");
 
     await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
     expect(getUiState().sid).toBe("s-new");
@@ -817,6 +832,10 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() =>
+      expect(layout.output()).toContain("first message for the new"),
+    );
+    layout.press("\r");
 
     // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
     await waitFor(() => expect(getUiState().sid).toBe("s-new"));

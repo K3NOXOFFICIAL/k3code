@@ -7,6 +7,7 @@ import { useAgentRoster } from "../app/agentRoster.js";
 import { $uiState } from "../app/uiStore.js";
 import { relativeSessionAge } from "../components/activeSessionSwitcher.js";
 import { listRowStyle } from "../components/overlayPrimitives.js";
+import { TextInput } from "../components/textInput.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { fmtDuration } from "../lib/subagentTree.js";
@@ -16,35 +17,40 @@ import type { Theme } from "../theme.js";
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
 import { $stripSessions } from "./agentStripStore.js";
 import {
+  $collapsedGroups,
+  $pastSessionsCache,
   buildViewRows,
   IDLE_VIEW_NAV,
   type PastSessionRow,
   reduceViewKey,
   selectedIndex,
+  toggleGroup,
   VIEW_GROUP_LABEL,
-  VIEW_GROUPS,
   type ViewGroup,
+  type ViewItem,
+  viewItems,
   type ViewNav,
   type ViewRow,
   visibleWindow,
 } from "./agentViewStore.js";
 
 export const AGENT_VIEW_HINT =
-  "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back";
+  "↑↓ select · →/⏎ attach · ⏎/space fold group · x stop · n new · ←/esc back";
+export const NEW_SESSION_PLACEHOLDER =
+  "first message for the new session (Enter to start, Esc to cancel)";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
-  input: "need input",
+  input: "needs input",
   working: "working",
 };
+
+/** Header summary order: what runs first, then what waits, then what is done. */
+const SUMMARY_ORDER: readonly ViewGroup[] = ["working", "input", "completed"];
 
 const CURRENT_TAG = " (this session)";
 const CONFIRM_TAG = "  stop? y/n";
 const MODEL_MAX = 24;
-
-type Line =
-  | { group: ViewGroup; type: "header" }
-  | { index: number; row: ViewRow; type: "row" };
 
 const stateText = (row: ViewRow) =>
   row.kind === "past"
@@ -53,10 +59,19 @@ const stateText = (row: ViewRow) =>
       ? LABEL[row.state]
       : `${LABEL[row.state]} ${fmtDuration(row.elapsedSeconds)}`;
 
+/** The inline prompt for a new session, shown in place of the footer hint while `n` is active. */
+export interface NewSessionDraft {
+  onChange: (value: string) => void;
+  onSubmit: (value: string) => void;
+  value: string;
+}
+
 export interface AgentViewViewProps {
+  collapsed?: ReadonlySet<ViewGroup>;
   cols: number;
   /** Short terminal: no spacer lines and no scroll indicators, so every line goes to the list. */
   compact?: boolean;
+  draft?: NewSessionDraft | null;
   error?: null | string;
   /** Lines available to the grouped list (headers, rows and scroll indicators). */
   height: number;
@@ -66,10 +81,14 @@ export interface AgentViewViewProps {
   t: Theme;
 }
 
-/** Presentation only: every session grouped by state, the selection kept in view. */
+const NO_GROUPS: ReadonlySet<ViewGroup> = new Set();
+
+/** Presentation only: every session grouped by state under a foldable header, the selection kept in view. */
 export function AgentViewView({
+  collapsed = NO_GROUPS,
   cols,
   compact = false,
+  draft = null,
   error = null,
   height,
   loading = false,
@@ -77,38 +96,22 @@ export function AgentViewView({
   rows,
   t,
 }: AgentViewViewProps) {
-  const index = Math.max(0, Math.min(nav.index, rows.length - 1));
-  const lines: Line[] = [];
-
-  for (const group of VIEW_GROUPS) {
-    const inGroup = rows.filter((r) => r.group === group);
-
-    if (inGroup.length) {
-      lines.push({ group, type: "header" });
-
-      for (const row of inGroup) {
-        lines.push({ index: rows.indexOf(row), row, type: "row" });
-      }
-    }
-  }
-
-  const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
+  const lines: ViewItem[] = viewItems(rows, collapsed);
+  const index = Math.max(0, Math.min(nav.index, lines.length - 1));
   // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
   const overflow = !compact && lines.length > height;
   const inner = overflow ? Math.max(1, height - 2) : Math.max(1, height);
   const [prevStart, setPrevStart] = useState(0);
-  const win = visibleWindow(lines.length, selLine, inner, prevStart);
+  const win = visibleWindow(lines.length, index, inner, prevStart);
 
   if (win.start !== prevStart) {
     setPrevStart(win.start);
   }
 
-  const rowsIn = (from: number, to: number) =>
-    lines.slice(from, to).filter((l) => l.type === "row").length;
-  const above = overflow ? rowsIn(0, win.start) : 0;
-  const below = overflow ? rowsIn(win.end, lines.length) : 0;
+  const above = overflow ? win.start : 0;
+  const below = overflow ? lines.length - win.end : 0;
 
-  const counts = VIEW_GROUPS.map(
+  const counts = SUMMARY_ORDER.map(
     (g) => [g, rows.filter((r) => r.group === g).length] as const,
   )
     .filter(([, n]) => n > 0)
@@ -121,8 +124,43 @@ export function AgentViewView({
     Math.max(0, ...rows.map((r) => r.model?.length ?? 0)),
   );
 
-  const renderRow = (row: ViewRow, i: number) => {
-    const selected = i === index;
+  const renderHeader = (
+    line: Extract<ViewItem, { type: "header" }>,
+    selected: boolean,
+  ) => {
+    const style = listRowStyle(t, selected);
+    const empty = line.count === 0;
+
+    return (
+      <Text
+        backgroundColor={style.backgroundColor}
+        bold={selected || !empty}
+        key={line.key}
+        wrap="truncate-end"
+      >
+        <Text color={selected ? t.color.accent : t.color.muted}>
+          {selected ? "› " : "  "}
+        </Text>
+        <Text color={selected ? t.color.accent : t.color.muted}>
+          {line.collapsed ? "▸ " : "▾ "}
+        </Text>
+        <Text
+          color={
+            selected
+              ? (style.color ?? t.color.text)
+              : empty
+                ? t.color.muted
+                : t.color.text
+          }
+          dimColor={empty && !selected}
+        >
+          {`${VIEW_GROUP_LABEL[line.group]} (${line.count})`}
+        </Text>
+      </Text>
+    );
+  };
+
+  const renderRow = (row: ViewRow, selected: boolean) => {
     const style = listRowStyle(t, selected);
     const confirm = nav.confirmKey === row.key;
     const tag = row.current ? CURRENT_TAG : "";
@@ -188,44 +226,49 @@ export function AgentViewView({
         </Text>
       ) : null}
       {compact ? null : <Text> </Text>}
-      {!rows.length ? (
+      {!rows.length && !loading ? (
         <Text color={t.color.muted} wrap="truncate-end">
-          {loading
-            ? "Loading sessions…"
-            : "No sessions yet - press n to start one"}
+          No sessions yet - press n to start one
         </Text>
-      ) : (
-        <Box flexDirection="column">
-          {above > 0 ? (
-            <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↑ ${above} more`}
-            </Text>
-          ) : null}
-          {lines.slice(win.start, win.end).map((l) =>
-            l.type === "header" ? (
-              <Text
-                bold
-                color={t.color.text}
-                key={`group:${l.group}`}
-                wrap="truncate-end"
-              >
-                {VIEW_GROUP_LABEL[l.group]}
-              </Text>
-            ) : (
-              renderRow(l.row, l.index)
-            ),
+      ) : null}
+      <Box flexDirection="column">
+        {above > 0 ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {`  ↑ ${above} more`}
+          </Text>
+        ) : null}
+        {lines
+          .slice(win.start, win.end)
+          .map((l, i) =>
+            l.type === "header"
+              ? renderHeader(l, win.start + i === index)
+              : renderRow(l.row, win.start + i === index),
           )}
-          {below > 0 ? (
-            <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↓ ${below} more`}
-            </Text>
-          ) : null}
-        </Box>
-      )}
+        {below > 0 ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {`  ↓ ${below} more`}
+          </Text>
+        ) : null}
+      </Box>
       {compact ? null : <Text> </Text>}
-      <Text color={t.color.muted} wrap="truncate-end">
-        {AGENT_VIEW_HINT}
-      </Text>
+      {draft ? (
+        <Box>
+          <Text color={t.color.accent}>new › </Text>
+          <TextInput
+            color={t.color.text}
+            columns={Math.max(10, cols - 6)}
+            onChange={draft.onChange}
+            onSubmit={draft.onSubmit}
+            placeholder={NEW_SESSION_PLACEHOLDER}
+            placeholderColor={t.color.muted}
+            value={draft.value}
+          />
+        </Box>
+      ) : (
+        <Text color={t.color.muted} wrap="truncate-end">
+          {AGENT_VIEW_HINT}
+        </Text>
+      )}
     </Box>
   );
 }
@@ -234,7 +277,10 @@ export interface AgentViewPaneProps {
   gw: GatewayClient;
   onActivate: (row: ViewRow) => void;
   onClose: () => void;
+  /** An empty draft: start an empty session, as before. */
   onNew: () => void;
+  /** A typed draft: start a session and send the text as its first prompt. */
+  onNewPrompt: (prompt: string) => void;
   onStop: (row: ViewRow) => void;
 }
 
@@ -244,22 +290,30 @@ export function AgentViewPane({
   onActivate,
   onClose,
   onNew,
+  onNewPrompt,
   onStop,
 }: AgentViewPaneProps) {
   const { stdout } = useStdout();
   const { info, sid, theme } = useStore($uiState);
   const sessions = useStore($stripSessions);
   const subagents = useAgentRoster();
-  const [past, setPast] = useState<PastSessionRow[]>([]);
+  const collapsed = useStore($collapsedGroups);
+  const cache = useStore($pastSessionsCache);
+  // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
+  const currentCwd = info?.cwd;
+  // The view opens on what the last fetch of this project brought and refreshes behind it, so the live rows and the
+  // cached history show at once instead of a "Loading…" screen while the daemon answers.
+  const cached = currentCwd && cache?.cwd === currentCwd ? cache.rows : null;
+  const [past, setPast] = useState<PastSessionRow[]>(cached ?? []);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   const [navState, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
-  // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it. Until the user
+  // The selection follows its line's key: the 1.5 s session poll can reorder or insert rows above it. Until the user
   // moves, it rests on this session's row, where they came from.
   const [selKey, setSelKey] = useState<null | string>(null);
   const [now, setNow] = useState(Date.now);
-  // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
-  const currentCwd = info?.cwd;
+  // `n`: the first message of a new session is typed here; null while no draft is open.
+  const [draft, setDraft] = useState<null | string>(null);
 
   const termRows = stdout?.rows ?? 24;
   // The real width, however narrow: a wider layout would wrap every line.
@@ -285,7 +339,12 @@ export function AgentViewPane({
         const r = asRpcResult<SessionListResult>(raw);
 
         if (r) {
-          setPast(r.sessions ?? []);
+          const rows = r.sessions ?? [];
+          setPast(rows);
+
+          if (currentCwd) {
+            $pastSessionsCache.set({ cwd: currentCwd, rows });
+          }
         } else {
           setError("invalid response: session.list");
         }
@@ -318,13 +377,17 @@ export function AgentViewPane({
       }),
     [currentCwd, now, past, sessions, sid, subagents],
   );
+  const items = useMemo(() => viewItems(rows, collapsed), [collapsed, rows]);
+  // Before the user moves: this session's row, else the first visible row (an empty leading header is no place to
+  // start); the current row is hidden when its group is folded.
+  const curKey = rows.find((r) => r.current)?.key;
+  const restKey =
+    items.find((it) => it.type === "row" && it.key === curKey)?.key ??
+    items.find((it) => it.type === "row")?.key ??
+    null;
   const nav: ViewNav = {
     ...navState,
-    index: selectedIndex(
-      rows,
-      selKey ?? rows.find((r) => r.current)?.key ?? null,
-      navState.index,
-    ),
+    index: selectedIndex(items, selKey ?? restKey, navState.index),
   };
   const working = rows.some((r) => r.state === "working");
 
@@ -338,10 +401,31 @@ export function AgentViewPane({
     return () => clearInterval(timer);
   }, [working]);
 
+  const submitDraft = (value: string) => {
+    const prompt = value.trim();
+    setDraft(null);
+
+    // An empty Enter starts an empty session, as `n` did before the draft existed.
+    if (prompt) {
+      onNewPrompt(prompt);
+    } else {
+      onNew();
+    }
+  };
+
   useInput((ch, key) => {
+    // While the draft is open the TextInput owns the keys; only Esc (which it leaves alone) cancels it here.
+    if (draft != null) {
+      if (key.escape) {
+        setDraft(null);
+      }
+
+      return;
+    }
+
     const r = reduceViewKey(
       nav,
-      rows,
+      items,
       {
         ch,
         ctrl: key.ctrl,
@@ -361,7 +445,7 @@ export function AgentViewPane({
     );
 
     setNav(r.nav);
-    setSelKey(rows[r.nav.index]?.key ?? null);
+    setSelKey(items[r.nav.index]?.key ?? null);
 
     // Side effects run here, never inside a state updater, so a stop cannot fire twice.
     switch (r.effect?.type) {
@@ -369,8 +453,10 @@ export function AgentViewPane({
         return onActivate(r.effect.row);
       case "stop":
         return onStop(r.effect.row);
+      case "toggle":
+        return toggleGroup(r.effect.group);
       case "new":
-        return onNew();
+        return setDraft("");
       case "close":
         return onClose();
     }
@@ -378,8 +464,14 @@ export function AgentViewPane({
 
   return (
     <AgentViewView
+      collapsed={collapsed}
       cols={cols}
       compact={compact}
+      draft={
+        draft == null
+          ? null
+          : { onChange: setDraft, onSubmit: submitDraft, value: draft }
+      }
       error={error}
       height={height}
       loading={loading}

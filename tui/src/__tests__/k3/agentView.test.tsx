@@ -11,11 +11,17 @@ import {
   AGENT_VIEW_HINT,
   AgentViewPane,
   AgentViewView,
+  NEW_SESSION_PLACEHOLDER,
 } from "../../k3/agentView.js";
 import { $stripSessions } from "../../k3/agentStripStore.js";
 import {
+  $collapsedGroups,
+  $pastSessionsCache,
   buildViewRows,
   IDLE_VIEW_NAV,
+  resetCollapsedGroups,
+  toggleGroup,
+  type ViewGroup,
   type ViewNav,
   type ViewRow,
 } from "../../k3/agentViewStore.js";
@@ -89,25 +95,26 @@ const mixed = (): ViewRow[] => [
 
 describe("AgentViewView", () => {
   it("groups rows under the three headers with the strip's glyphs and counts, past rows last", () => {
-    const out = dump(mixed(), {}, { confirmKey: null, index: 1 });
+    // index 3: input header, "asks a question", working header, this one
+    const out = dump(mixed(), {}, { confirmKey: null, index: 3 });
 
     console.log(`\n--- agent view dump ---\n${out}\n-----------------------`);
 
     const lines = out.split("\n");
 
     expect(lines[0]).toContain("Agents");
-    expect(lines[0]).toContain("1 need input · 2 working · 3 completed");
-    expect(lines.filter((l) => l === "Completed")).toHaveLength(1);
+    expect(lines[0]).toContain("2 working · 1 needs input · 3 completed");
+    expect(lines.filter((l) => l.includes("Completed (3)"))).toHaveLength(1);
     expect(out).not.toContain("Earlier sessions");
     expect(out).not.toContain("Idle");
 
     const order = [
-      "Needs input",
+      "▾ Needs input (1)",
       "● asks a question",
-      "Working",
+      "▾ Working (2)",
       "◐ this one (this session)",
       "◐ helper agent",
-      "Completed",
+      "▾ Completed (3)",
       "✓ shipped",
       "✗ broke",
       "· older work",
@@ -121,7 +128,7 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back",
+      "↑↓ select · →/⏎ attach · ⏎/space fold group · x stop · n new · ←/esc back",
     );
   });
 
@@ -144,9 +151,9 @@ describe("AgentViewView", () => {
     expect(out).not.toMatch(/Session \(this session\)\s+completed/);
 
     const order = [
-      "Working",
+      "Working (1)",
       "◐ busy",
-      "Completed",
+      "Completed (2)",
       "○ Session",
       "✓ shipped",
     ].map((s) => out.indexOf(s));
@@ -155,12 +162,24 @@ describe("AgentViewView", () => {
     expect(order).toEqual([...order].sort((a, b) => a - b));
   });
 
-  it("omits headers of empty groups", () => {
+  it("lists every group header, an empty one with (0)", () => {
     const out = dump([row(1)]);
 
-    expect(out).toContain("Working");
-    expect(out).not.toContain("Needs input");
-    expect(out).not.toContain("Completed");
+    expect(out).toContain("▾ Working (1)");
+    expect(out).toContain("▾ Needs input (0)");
+    expect(out).toContain("▾ Completed (0)");
+  });
+
+  it("a collapsed group shows only its header, marked ▸, and keeps its count", () => {
+    const out = dump(mixed(), {
+      collapsed: new Set<ViewGroup>(["completed"]),
+    });
+
+    expect(out).toContain("▸ Completed (3)");
+    expect(out).not.toContain("shipped");
+    expect(out).not.toContain("older work");
+    expect(out).toContain("▾ Working (2)");
+    expect(out).toContain("helper agent");
   });
 
   it("shows the stop confirmation on its row", () => {
@@ -175,11 +194,15 @@ describe("AgentViewView", () => {
     const out = dump([]);
 
     expect(out).toContain("No sessions yet - press n to start one");
+    expect(out).toContain("Working (0)");
     expect(out).toContain(AGENT_VIEW_HINT);
   });
 
   it("shows loading and errors", () => {
-    expect(dump([], { loading: true })).toContain("loading…");
+    const loading = dump([], { loading: true });
+
+    expect(loading).toContain("loading…");
+    expect(loading).not.toContain("No sessions yet");
     expect(dump([row(1)], { error: "could not load" })).toContain(
       "could not load",
     );
@@ -194,23 +217,26 @@ describe("AgentViewView", () => {
         .slice(2, -2)
         .filter((l) => l.trim());
 
+    // 33 lines: the three headers and 30 rows; the window shows 6 of them plus the two indicators.
     const top = dump(rows, { height });
 
-    expect(top).toContain("↓ 25 more");
+    expect(top).toContain("↓ 27 more");
     expect(top).not.toMatch(/↑ \d+ more/);
     expect(listLines(top).length).toBeLessThanOrEqual(height);
 
-    const mid = dump(rows, { height }, { confirmKey: null, index: 15 });
+    // item 17: input header, working header, then task 0..14 → task 15
+    const mid = dump(rows, { height }, { confirmKey: null, index: 17 });
 
     expect(mid).toMatch(/› ◐ task 15/);
     expect(mid).toMatch(/↑ \d+ more/);
     expect(mid).toMatch(/↓ \d+ more/);
     expect(listLines(mid).length).toBeLessThanOrEqual(height);
 
-    const bottom = dump(rows, { height }, { confirmKey: null, index: 29 });
+    const bottom = dump(rows, { height }, { confirmKey: null, index: 32 });
 
-    expect(bottom).toMatch(/› ◐ task 29/);
-    expect(bottom).toContain("↑ 24 more");
+    expect(bottom).toMatch(/› ▾ Completed \(0\)/);
+    expect(bottom).toMatch(/◐ task 29/);
+    expect(bottom).toContain("↑ 27 more");
     expect(bottom).not.toMatch(/↓ \d+ more/);
     expect(listLines(bottom).length).toBeLessThanOrEqual(height);
   });
@@ -282,6 +308,7 @@ describe("AgentViewPane", () => {
         onActivate={onActivate}
         onClose={onClose}
         onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -304,6 +331,8 @@ describe("AgentViewPane", () => {
       expect(onActivate).not.toHaveBeenCalled();
 
       output = "";
+      stdin.write("\x1b[A"); // ↑ onto the Working header
+      await waitFor(() => expect(output).toContain("› ▾ Working (1)"));
       stdin.write("\x1b[A"); // ↑ onto alpha
       await waitFor(() => expect(output).toContain("› ● alpha"));
       stdin.write("\x1b[C");
@@ -354,6 +383,7 @@ describe("AgentViewPane", () => {
         onActivate={onActivate}
         onClose={() => {}}
         onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -434,6 +464,7 @@ describe("AgentViewPane", () => {
         onActivate={() => {}}
         onClose={() => {}}
         onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -465,7 +496,7 @@ describe("AgentViewPane", () => {
       // header, four list lines, footer: no spacers, no ↑/↓ indicators
       expect(lines).toHaveLength(6);
       expect(lines[0]).toContain("Agents");
-      expect(lines[1]).toBe("Needs input");
+      expect(lines[1]).toBe("  ▾ Needs input (1)");
       expect(lines[2]).toContain("bravo");
       expect(out).not.toMatch(/more/);
       expect(lines.at(-1)).toContain("↑↓ select");
@@ -532,6 +563,7 @@ describe("AgentViewPane", () => {
         onActivate={() => {}}
         onClose={() => {}}
         onNew={onNew}
+        onNewPrompt={() => {}}
         onStop={onStop}
       />,
       {
@@ -569,6 +601,8 @@ describe("AgentViewPane", () => {
       expect(onStop.mock.calls[0]![0]).toMatchObject({ id: "a" });
 
       stdin.write("n");
+      await waitFor(() => expect(output).toContain(NEW_SESSION_PLACEHOLDER));
+      stdin.write("\r"); // an empty draft: a plain new session
       await waitFor(() => expect(onNew).toHaveBeenCalled());
     } finally {
       view.unmount();
@@ -598,6 +632,7 @@ describe("AgentViewPane", () => {
         onActivate={() => {}}
         onClose={() => {}}
         onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -621,6 +656,270 @@ describe("AgentViewPane", () => {
     } finally {
       view.unmount();
       view.cleanup();
+      resetUiState();
+    }
+  });
+
+  /** Mount the pane against `gw`, with a 90x30 terminal; returns the captured output and the stdin to type into. */
+  const mount = (
+    request: (method: string, params: unknown) => Promise<unknown>,
+    handlers: Partial<React.ComponentProps<typeof AgentViewPane>> = {},
+  ) => {
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+    const out = { text: "" };
+    const frames: string[] = [];
+
+    stdout.on("data", (c) => {
+      const text = stripAnsi(c.toString());
+      out.text += text;
+      frames.push(text);
+    });
+
+    const view = renderSync(
+      <AgentViewPane
+        gw={{ request } as unknown as GatewayClient}
+        onActivate={() => {}}
+        onClose={() => {}}
+        onNew={() => {}}
+        onNewPrompt={() => {}}
+        onStop={() => {}}
+        {...handlers}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    return {
+      /** The last full frame: Ink repaints the whole pane, so this is what the terminal shows. */
+      last: () => frames.filter((f) => f.trim()).at(-1) ?? "",
+      out,
+      stdin,
+      unmount: () => {
+        view.unmount();
+        view.cleanup();
+      },
+    };
+  };
+
+  it("renders the live rows and the cached history before session.list answers", async () => {
+    resetUiState();
+    patchUiState({
+      info: { cwd: "/work/proj", model: "test", skills: {}, tools: {} },
+      sid: "cur",
+    });
+    $stripSessions.set([
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+    $pastSessionsCache.set({
+      cwd: "/work/proj",
+      rows: [
+        {
+          cwd: "/work/proj",
+          id: "old1",
+          message_count: 3,
+          started_at: 1,
+          title: "cached earlier work",
+        },
+      ],
+    });
+
+    // The gateway never answers: everything shown comes from what the TUI already knew.
+    const pane = mount(() => new Promise(() => {}));
+
+    try {
+      await waitFor(() => {
+        expect(pane.out.text).toContain("› ◐ this one (this session)");
+        expect(pane.out.text).toContain("cached earlier work");
+      });
+      expect(pane.out.text).toContain("loading…");
+      expect(pane.out.text).not.toContain("Loading sessions");
+    } finally {
+      pane.unmount();
+      $stripSessions.set([]);
+      $pastSessionsCache.set(null);
+      resetUiState();
+    }
+  });
+
+  it("replaces the cached history with the fetched one and keeps it for the next open", async () => {
+    resetUiState();
+    patchUiState({
+      info: { cwd: "/work/proj", model: "test", skills: {}, tools: {} },
+      sid: "cur",
+    });
+    $pastSessionsCache.set({
+      cwd: "/other/proj",
+      rows: [
+        { cwd: "/other/proj", id: "x", message_count: 1, title: "elsewhere" },
+      ],
+    });
+    const fetched = {
+      sessions: [
+        {
+          cwd: "/work/proj",
+          id: "f1",
+          message_count: 2,
+          started_at: 5,
+          title: "fetched",
+        },
+      ],
+    };
+    const pane = mount(() => Promise.resolve(fetched));
+
+    try {
+      await waitFor(() => expect(pane.out.text).toContain("fetched"));
+      // Another project's cache is not shown here.
+      expect(pane.out.text).not.toContain("elsewhere");
+      expect($pastSessionsCache.get()).toEqual({
+        cwd: "/work/proj",
+        rows: fetched.sessions,
+      });
+    } finally {
+      pane.unmount();
+      $pastSessionsCache.set(null);
+      resetUiState();
+    }
+  });
+
+  it("n opens the prompt; Enter starts a session with the text, Esc cancels", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+    const onNew = vi.fn();
+    const onNewPrompt = vi.fn();
+    const onClose = vi.fn();
+    const pane = mount(() => Promise.resolve({ sessions: [] }), {
+      onClose,
+      onNew,
+      onNewPrompt,
+    });
+
+    try {
+      await waitFor(() => expect(pane.out.text).toContain("› ◐ this one"));
+
+      pane.stdin.write("n");
+      await waitFor(() =>
+        expect(pane.out.text).toContain(NEW_SESSION_PLACEHOLDER),
+      );
+      pane.stdin.write("fix the build");
+      await waitFor(() =>
+        expect(pane.out.text).toContain("new › fix the build"),
+      );
+      // While typing, the letters are text, not view commands: no stop prompt, no close.
+      expect(pane.out.text).not.toContain("stop? y/n");
+      expect(onClose).not.toHaveBeenCalled();
+
+      pane.stdin.write("\r");
+      await waitFor(() =>
+        expect(onNewPrompt).toHaveBeenCalledWith("fix the build"),
+      );
+      expect(onNew).not.toHaveBeenCalled();
+
+      // The draft closes with Enter; a second n opens a fresh one and Esc only cancels it.
+      pane.out.text = "";
+      pane.stdin.write("n");
+      await waitFor(() =>
+        expect(pane.out.text).toContain(NEW_SESSION_PLACEHOLDER),
+      );
+      pane.stdin.write("abc");
+      await waitFor(() => expect(pane.out.text).toContain("new › abc"));
+      pane.out.text = "";
+      pane.stdin.write("\x1b");
+      await waitFor(() => expect(pane.out.text).toContain(AGENT_VIEW_HINT));
+      expect(onClose).not.toHaveBeenCalled();
+      expect(onNewPrompt).toHaveBeenCalledTimes(1);
+
+      // Esc on the list, with no draft, closes the view.
+      pane.stdin.write("\x1b");
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+    } finally {
+      pane.unmount();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
+  const foldFixture = () => {
+    resetCollapsedGroups();
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { current: true, id: "cur", status: "working", title: "this one" },
+      { id: "a", status: "working", title: "alpha" },
+      { id: "d", status: "failed", title: "delta" },
+    ]);
+  };
+
+  it("space on a header folds the group and ↑↓ skip its rows", async () => {
+    foldFixture();
+    const onActivate = vi.fn();
+    const pane = mount(() => Promise.resolve({ sessions: [] }), {
+      onActivate,
+    });
+
+    try {
+      await waitFor(() => expect(pane.last()).toContain("› ◐ this one"));
+      pane.stdin.write("\x1b[A"); // ↑ onto the Working header
+      await waitFor(() => expect(pane.last()).toContain("› ▾ Working (2)"));
+      pane.stdin.write(" ");
+      await waitFor(() => expect(pane.last()).toContain("› ▸ Working (2)"));
+      expect(pane.last()).not.toContain("alpha");
+      expect(pane.last()).toContain("▾ Needs input (0)");
+
+      // ↓ from the folded header lands on the Completed header, not on a hidden row.
+      pane.stdin.write("\x1b[B");
+      await waitFor(() => expect(pane.last()).toContain("› ▾ Completed (1)"));
+      pane.stdin.write("\x1b[B");
+      await waitFor(() => expect(pane.last()).toContain("› ✗ delta"));
+      pane.stdin.write("\r");
+      await waitFor(() => expect(onActivate).toHaveBeenCalled());
+      expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "d" });
+    } finally {
+      pane.unmount();
+      $stripSessions.set([]);
+      resetCollapsedGroups();
+      resetUiState();
+    }
+  });
+
+  it("keeps a fold across opens; Enter on the header unfolds it", async () => {
+    foldFixture();
+    toggleGroup("working");
+    const pane = mount(() => Promise.resolve({ sessions: [] }));
+
+    try {
+      // The current row is hidden, so the cursor rests on the first visible row.
+      await waitFor(() => expect(pane.last()).toContain("› ✗ delta"));
+      expect(pane.last()).toContain("▸ Working (2)");
+      expect(pane.last()).not.toContain("alpha");
+      pane.stdin.write("\x1b[A");
+      await waitFor(() => expect(pane.last()).toContain("› ▾ Completed (1)"));
+      pane.stdin.write("\x1b[A");
+      await waitFor(() => expect(pane.last()).toContain("› ▸ Working (2)"));
+      pane.stdin.write("\r");
+      await waitFor(() => expect(pane.last()).toContain("› ▾ Working (2)"));
+      expect(pane.last()).toContain("alpha");
+      expect($collapsedGroups.get().size).toBe(0);
+    } finally {
+      pane.unmount();
+      $stripSessions.set([]);
+      resetCollapsedGroups();
       resetUiState();
     }
   });

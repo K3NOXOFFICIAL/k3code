@@ -655,6 +655,10 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
         actions.newLiveSession(dropSid());
         close();
       }}
+      onNewPrompt={(prompt) => {
+        actions.newPromptSession(prompt, undefined, dropSid());
+        close();
+      }}
       onStop={({ kind, ...row }) => {
         if (kind !== "past") {
           getStripHandlers()?.stop({ ...row, kind });

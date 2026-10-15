@@ -111,3 +111,46 @@ def test_an_old_database_gains_the_columns(tmp_path):
     db.close()
     [row] = SessionStore(path).list()
     assert (row.message_count, row.preview) == (1, "carried over")
+
+
+def test_worked_in_decides_by_the_count_column_and_falls_back_to_the_transcript_only_for_old_rows(tmp_path):
+    """The agent view's `session.list {cwd}` scans the newest 2000 rows through `worked_in`; the row filter must not
+    touch the transcript column, or sqlite reads every stored transcript off disk for each listing."""
+    store = SessionStore(tmp_path / "s.db")
+    used = _session(store, [{"role": "user", "content": "hello"}])
+    empty = _session(store, [])
+    db = store._db
+    # Written before the column existed: only this row may be decided by its transcript.
+    db.execute(
+        "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count) VALUES ('old','/p',?,5,-1)",
+        (json.dumps([{"role": "user", "content": "carried over"}]),),
+    )
+    row = "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count) VALUES (?,?,?,?,?)"
+    db.execute(row, ("old-empty", "/p", "[]", 6, -1))
+    # The count column is the source of truth: these transcripts are never looked at.
+    db.execute(row, ("counted", "/p", "[]", 7, 3))
+    db.execute(
+        "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count) VALUES ('zero','/p',?,8,0)",
+        (json.dumps([{"role": "user", "content": "stale body"}]),),
+    )
+    db.commit()
+    ids = {sid for sid, _ in store.worked_in(limit=50)}
+    assert ids == {"counted", "old", used}
+    assert empty not in ids
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+def test_worked_in_does_not_read_the_transcripts(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    big = json.dumps([{"role": "user", "content": "x" * 2_000_000}])
+    store._db.executemany(
+        "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count, preview)"
+        " VALUES (?,'/p',?,?,1,'x')",
+        [(f"s{i:03d}", big, float(i)) for i in range(60)],
+    )
+    store._db.commit()
+    # A fresh connection: the page cache of the writing connection would hide a full read.
+    store = SessionStore(tmp_path / "s.db")
+    began = time.perf_counter()
+    assert len(store.worked_in(limit=2000)) == 60
+    assert time.perf_counter() - began < 0.1  # 120 MB of transcripts take far longer to read

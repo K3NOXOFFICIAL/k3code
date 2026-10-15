@@ -437,7 +437,12 @@ export interface AppLayoutActions {
   activateLiveSession: (id: string, dropSid?: string) => void;
   closeLiveSession: (id: string) => Promise<null | SessionCloseResponse>;
   newLiveSession: (dropSid?: string) => void;
-  newPromptSession: (prompt: string, modelArg?: string) => void;
+  /** `dropSid`: the session being left, closed once the new one is attached if it is disposable (agent view). */
+  newPromptSession: (
+    prompt: string,
+    modelArg?: string,
+    dropSid?: string,
+  ) => void;
   onModelSelect: (value: string) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
   onSettingsApply: (command: string) => void;

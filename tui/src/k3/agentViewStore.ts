@@ -1,4 +1,5 @@
 import type { SessionListRow } from "@k3code/shared/gateway-events";
+import { atom } from "nanostores";
 
 import { resumableHistory } from "../components/activeSessionSwitcher.js";
 import type { SessionActiveItem } from "../gatewayTypes.js";
@@ -31,6 +32,12 @@ export interface ViewRow extends Omit<StripRow, "kind"> {
 
 /** `session.list` row. The k3code gateway adds `cwd` (null when unknown); the generated Hermes contract lacks it. */
 export type PastSessionRow = SessionListRow & { cwd?: null | string };
+
+/** The last `session.list` answer per project, so the view opens with it and refreshes behind it. */
+export const $pastSessionsCache = atom<null | {
+  cwd: string;
+  rows: PastSessionRow[];
+}>(null);
 
 /** Idle, done and failed all land in Completed; each row keeps its own glyph. */
 const groupOf = (state: StripState): ViewGroup =>
@@ -114,9 +121,70 @@ export function buildViewRows({
   ];
 }
 
+/**
+ * Groups folded shut in the view. Module state, not component state: it is kept while the TUI runs, so the view
+ * reopens the way it was left.
+ */
+export const $collapsedGroups = atom<ReadonlySet<ViewGroup>>(new Set());
+
+export const toggleGroup = (group: ViewGroup) => {
+  const next = new Set($collapsedGroups.get());
+
+  if (!next.delete(group)) {
+    next.add(group);
+  }
+
+  $collapsedGroups.set(next);
+};
+
+export const resetCollapsedGroups = () => $collapsedGroups.set(new Set());
+
+export const headerKey = (group: ViewGroup) => `group:${group}`;
+
+/** One navigable line of the view: a group header (always listed, also when empty) or a row of an open group. */
+export type ViewItem =
+  | {
+      collapsed: boolean;
+      count: number;
+      group: ViewGroup;
+      key: string;
+      type: "header";
+    }
+  | { key: string; row: ViewRow; type: "row" };
+
+/** The lines the cursor walks: every header, and the rows of the groups that are not collapsed. */
+export function viewItems(
+  rows: readonly ViewRow[],
+  collapsed: ReadonlySet<ViewGroup>,
+): ViewItem[] {
+  const items: ViewItem[] = [];
+
+  for (const group of VIEW_GROUPS) {
+    const inGroup = rows.filter((r) => r.group === group);
+    const fold = collapsed.has(group);
+
+    items.push({
+      collapsed: fold,
+      count: inGroup.length,
+      group,
+      key: headerKey(group),
+      type: "header",
+    });
+
+    if (!fold) {
+      for (const row of inGroup) {
+        items.push({ key: row.key, row, type: "row" });
+      }
+    }
+  }
+
+  return items;
+}
+
 export interface ViewNav {
   /** Row key awaiting a y/n stop confirmation. */
   confirmKey: null | string;
+  /** Position in the `viewItems` list (headers included), not in the rows. */
   index: number;
 }
 
@@ -139,36 +207,40 @@ export type ViewKey = {
 };
 
 export type ViewEffect =
+  | { group: ViewGroup; type: "toggle" }
   | { row: ViewRow; type: "activate" | "stop" }
   | { type: "close" }
   | { type: "new" };
 
 /**
- * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
- * has gone does the old position (clamped) stand in.
+ * Selected item by key, so a refresh that reorders or inserts rows keeps the cursor on the same line. Only when that
+ * line has gone (or its group folded) does the old position (clamped) stand in.
  */
 export function selectedIndex(
-  rows: readonly ViewRow[],
+  items: readonly ViewItem[],
   key: null | string,
   fallback: number,
 ): number {
-  const i = key == null ? -1 : rows.findIndex((r) => r.key === key);
+  const i = key == null ? -1 : items.findIndex((it) => it.key === key);
 
-  return i >= 0 ? i : Math.max(0, Math.min(fallback, rows.length - 1));
+  return i >= 0 ? i : Math.max(0, Math.min(fallback, items.length - 1));
 }
 
 /** Live sessions other than this one and in-turn agents can be stopped; past rows and the current session cannot. */
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);
 
-/** Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. */
+/**
+ * Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. `items` is the
+ * `viewItems` list the cursor walks: rows of a collapsed group are not in it, so ↑/↓ step over them.
+ */
 export function reduceViewKey(
   nav: ViewNav,
-  rows: readonly ViewRow[],
+  items: readonly ViewItem[],
   key: ViewKey,
   pageSize: number,
 ): { consumed: true; effect: null | ViewEffect; nav: ViewNav } {
-  const last = rows.length - 1;
+  const last = items.length - 1;
   const index = Math.max(0, Math.min(nav.index, last));
   // With Ctrl/Meta held the letter is a chord (Ctrl+N, Ctrl+X), not a view command.
   const ch = key.ctrl || key.meta ? "" : (key.ch ?? "").toLowerCase();
@@ -181,7 +253,10 @@ export function reduceViewKey(
   // other key); when the row has gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to
   // whatever row moved under it.
   if (nav.confirmKey) {
-    const target = rows.find((r) => r.key === nav.confirmKey);
+    const target = items.find(
+      (it): it is ViewItem & { type: "row" } =>
+        it.type === "row" && it.key === nav.confirmKey,
+    )?.row;
 
     return done(
       target && !key.escape && !key.left && (ch === "y" || key.return)
@@ -198,7 +273,7 @@ export function reduceViewKey(
     return done({ type: "new" });
   }
 
-  if (!rows.length) {
+  if (!items.length) {
     return done(null);
   }
 
@@ -230,7 +305,18 @@ export function reduceViewKey(
     return move(index + step);
   }
 
-  const row = rows[index]!;
+  const item = items[index]!;
+
+  if (item.type === "header") {
+    // ⏎, → and space fold or unfold the group under the cursor; ← keeps closing the view, as on a row.
+    return done(
+      key.return || key.right || ch === " "
+        ? { group: item.group, type: "toggle" }
+        : null,
+    );
+  }
+
+  const { row } = item;
 
   if (key.return || key.right) {
     return done(row.current ? { type: "close" } : { row, type: "activate" });

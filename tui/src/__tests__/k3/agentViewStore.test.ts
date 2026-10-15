@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  $collapsedGroups,
   buildViewRows,
+  headerKey,
   IDLE_VIEW_NAV,
   type PastSessionRow,
   reduceViewKey,
+  resetCollapsedGroups,
   selectedIndex,
+  toggleGroup,
+  type ViewGroup,
+  type ViewItem,
+  viewItems,
   type ViewKey,
   type ViewNav,
   type ViewRow,
@@ -155,14 +162,19 @@ describe("buildViewRows", () => {
     ]);
 
     // Enter on it closes the view; x does not arm a stop on the current session.
-    const idx = rows.indexOf(cur);
+    const items = viewItems(rows, new Set());
+    const idx = items.findIndex((it) => it.key === cur.key);
 
     expect(
-      reduceViewKey({ confirmKey: null, index: idx }, rows, { return: true }, 5)
-        .effect,
+      reduceViewKey(
+        { confirmKey: null, index: idx },
+        items,
+        { return: true },
+        5,
+      ).effect,
     ).toEqual({ type: "close" });
     expect(
-      reduceViewKey({ confirmKey: null, index: idx }, rows, { ch: "x" }, 5).nav
+      reduceViewKey({ confirmKey: null, index: idx }, items, { ch: "x" }, 5).nav
         .confirmKey,
     ).toBeNull();
   });
@@ -348,57 +360,145 @@ const ROWS: ViewRow[] = [
   vrow("s2"),
 ];
 
-const press = (nav: ViewNav, key: ViewKey, rows = ROWS, page = 2) =>
-  reduceViewKey(nav, rows, key, page);
+/**
+ * The cursor list of ROWS with nothing folded:
+ * 0 Needs input (0) · 1 Working (4) · 2 cur · 3 s1 · 4 a1 · 5 s2 · 6 Completed (1) · 7 p1
+ */
+const ITEMS = viewItems(ROWS, new Set());
+const CUR = 2;
+const S1 = 3;
+const A1 = 4;
+const DONE = 6;
+const P1 = 7;
+
+const press = (nav: ViewNav, key: ViewKey, items = ITEMS, page = 2) =>
+  reduceViewKey(nav, items, key, page);
 const at = (index: number): ViewNav => ({ confirmKey: null, index });
 
+describe("viewItems", () => {
+  it("lists every group header, empty ones included, with the rows of the open groups", () => {
+    expect(
+      ITEMS.map((it) =>
+        it.type === "header"
+          ? `${it.group}(${it.count})${it.collapsed ? "-" : "+"}`
+          : it.key,
+      ),
+    ).toEqual([
+      "input(0)+",
+      "working(4)+",
+      "session:cur",
+      "session:s1",
+      "agent:a1",
+      "session:s2",
+      "completed(1)+",
+      "past:p1",
+    ]);
+  });
+
+  it("keeps the header, with its count, and drops the rows of a collapsed group", () => {
+    const folded = viewItems(ROWS, new Set<ViewGroup>(["working"]));
+
+    expect(folded.map((it) => it.key)).toEqual([
+      headerKey("input"),
+      headerKey("working"),
+      headerKey("completed"),
+      "past:p1",
+    ]);
+    expect(folded[1]).toMatchObject({ collapsed: true, count: 4 });
+  });
+
+  it("toggleGroup folds and unfolds in the shared store, which survives until reset", () => {
+    resetCollapsedGroups();
+    toggleGroup("completed");
+    expect([...$collapsedGroups.get()]).toEqual(["completed"]);
+    toggleGroup("input");
+    expect([...$collapsedGroups.get()].sort()).toEqual(["completed", "input"]);
+    toggleGroup("completed");
+    expect([...$collapsedGroups.get()]).toEqual(["input"]);
+    resetCollapsedGroups();
+    expect($collapsedGroups.get().size).toBe(0);
+  });
+});
+
 describe("reduceViewKey", () => {
-  it("moves with ↑/↓ and clamps at both ends without wrapping", () => {
+  it("moves with ↑/↓ over headers and rows alike, clamped at both ends without wrapping", () => {
     expect(press(at(0), { up: true }).nav).toEqual(at(0));
     expect(press(at(0), { down: true }).nav).toEqual(at(1));
-    expect(press(at(4), { down: true }).nav).toEqual(at(4));
-    expect(press(at(3), { up: true }).nav).toEqual(at(2));
+    expect(press(at(1), { down: true }).nav).toEqual(at(CUR));
+    expect(press(at(P1), { down: true }).nav).toEqual(at(P1));
+    expect(press(at(S1), { up: true }).nav).toEqual(at(CUR));
+    expect(press(at(P1), { up: true }).nav).toEqual(at(DONE));
+  });
+
+  it("skips the rows of a collapsed group: ↓ from its header lands on the next header", () => {
+    const folded = viewItems(ROWS, new Set<ViewGroup>(["working"]));
+
+    // 0 input · 1 working (folded) · 2 completed · 3 p1
+    expect(press(at(1), { down: true }, folded).nav).toEqual(at(2));
+    expect(press(at(2), { up: true }, folded).nav).toEqual(at(1));
+    expect(press(at(3), { up: true }, folded).nav).toEqual(at(2));
+    expect(press(at(0), { end: true }, folded).nav.index).toBe(3);
+  });
+
+  it("⏎, → and space on a header toggle its group; ← there still closes the view", () => {
+    for (const key of [{ return: true }, { right: true }, { ch: " " }]) {
+      expect(press(at(1), key).effect).toEqual({
+        group: "working",
+        type: "toggle",
+      });
+      expect(press(at(0), key).effect).toEqual({
+        group: "input",
+        type: "toggle",
+      });
+    }
+
+    expect(press(at(1), { left: true }).effect).toEqual({ type: "close" });
+    expect(press(at(1), { ch: "x" })).toEqual({
+      consumed: true,
+      effect: null,
+      nav: at(1),
+    });
   });
 
   it("jumps with home/end and pages by pageSize, clamped", () => {
-    expect(press(at(3), { home: true }).nav.index).toBe(0);
-    expect(press(at(1), { end: true }).nav.index).toBe(4);
+    expect(press(at(S1), { home: true }).nav.index).toBe(0);
+    expect(press(at(1), { end: true }).nav.index).toBe(P1);
     expect(press(at(0), { pageDown: true }).nav.index).toBe(2);
-    expect(press(at(3), { pageDown: true }).nav.index).toBe(4);
-    expect(press(at(3), { pageUp: true }).nav.index).toBe(1);
+    expect(press(at(DONE), { pageDown: true }).nav.index).toBe(P1);
+    expect(press(at(S1), { pageUp: true }).nav.index).toBe(1);
     expect(press(at(1), { pageUp: true }).nav.index).toBe(0);
-    expect(press(at(0), { pageDown: true }, ROWS, 0).nav.index).toBe(1);
+    expect(press(at(0), { pageDown: true }, ITEMS, 0).nav.index).toBe(1);
   });
 
   it("⏎ attaches to the selected row, and closes on the current one", () => {
-    expect(press(at(1), { return: true }).effect).toEqual({
+    expect(press(at(S1), { return: true }).effect).toEqual({
       row: ROWS[1],
       type: "activate",
     });
-    expect(press(at(3), { return: true }).effect).toEqual({
+    expect(press(at(P1), { return: true }).effect).toEqual({
       row: ROWS[3],
       type: "activate",
     });
-    expect(press(at(0), { return: true }).effect).toEqual({ type: "close" });
+    expect(press(at(CUR), { return: true }).effect).toEqual({ type: "close" });
   });
 
   it("→ attaches to the selected row like ⏎, and closes on the current one", () => {
-    expect(press(at(1), { right: true }).effect).toEqual({
+    expect(press(at(S1), { right: true }).effect).toEqual({
       row: ROWS[1],
       type: "activate",
     });
-    expect(press(at(2), { right: true }).effect).toEqual({
+    expect(press(at(A1), { right: true }).effect).toEqual({
       row: ROWS[2],
       type: "activate",
     });
-    expect(press(at(3), { right: true }).effect).toEqual({
+    expect(press(at(P1), { right: true }).effect).toEqual({
       row: ROWS[3],
       type: "activate",
     });
-    expect(press(at(0), { right: true })).toEqual({
+    expect(press(at(CUR), { right: true })).toEqual({
       consumed: true,
       effect: { type: "close" },
-      nav: at(0),
+      nav: at(CUR),
     });
     expect(press(at(1), { right: true }, [])).toEqual({
       consumed: true,
@@ -408,11 +508,11 @@ describe("reduceViewKey", () => {
   });
 
   it("→ cancels a pending stop confirmation instead of stopping or attaching", () => {
-    const ask = press(at(1), { ch: "x" }).nav;
+    const ask = press(at(S1), { ch: "x" }).nav;
     const r = press(ask, { right: true });
 
     expect(r.effect).toBeNull();
-    expect(r.nav).toEqual(at(1));
+    expect(r.nav).toEqual(at(S1));
     // the next → attaches as usual
     expect(press(r.nav, { right: true }).effect).toEqual({
       row: ROWS[1],
@@ -421,10 +521,10 @@ describe("reduceViewKey", () => {
   });
 
   it("x asks first; y or ⏎ stops", () => {
-    const ask = press(at(1), { ch: "x" });
+    const ask = press(at(S1), { ch: "x" });
 
     expect(ask.effect).toBeNull();
-    expect(ask.nav).toEqual({ confirmKey: "session:s1", index: 1 });
+    expect(ask.nav).toEqual({ confirmKey: "session:s1", index: S1 });
 
     for (const key of [{ ch: "y" }, { ch: "Y" }, { return: true }]) {
       const r = press(ask.nav, key);
@@ -433,11 +533,11 @@ describe("reduceViewKey", () => {
       expect(r.nav.confirmKey).toBeNull();
     }
 
-    expect(press(at(2), { ch: "x" }).nav.confirmKey).toBe("agent:a1");
+    expect(press(at(A1), { ch: "x" }).nav.confirmKey).toBe("agent:a1");
   });
 
   it("any other key cancels the confirmation and does nothing else", () => {
-    const ask = press(at(1), { ch: "x" }).nav;
+    const ask = press(at(S1), { ch: "x" }).nav;
 
     for (const key of [
       { ch: "n" },
@@ -449,12 +549,12 @@ describe("reduceViewKey", () => {
       const r = press(ask, key);
 
       expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(at(1));
+      expect(r.nav).toEqual(at(S1));
     }
   });
 
   it("ignores x on past rows and on the current session", () => {
-    for (const i of [0, 3]) {
+    for (const i of [CUR, P1]) {
       const r = press(at(i), { ch: "x" });
 
       expect(r.effect).toBeNull();
@@ -463,29 +563,30 @@ describe("reduceViewKey", () => {
   });
 
   it("n starts a new session; esc and ← close", () => {
-    expect(press(at(2), { ch: "n" }).effect).toEqual({ type: "new" });
-    expect(press(at(2), { escape: true }).effect).toEqual({ type: "close" });
-    expect(press(at(2), { left: true }).effect).toEqual({ type: "close" });
+    expect(press(at(A1), { ch: "n" }).effect).toEqual({ type: "new" });
+    expect(press(at(1), { ch: "n" }).effect).toEqual({ type: "new" });
+    expect(press(at(A1), { escape: true }).effect).toEqual({ type: "close" });
+    expect(press(at(A1), { left: true }).effect).toEqual({ type: "close" });
   });
 
   it("ignores n, x and y chords with Ctrl or Meta; arrows, ⏎ and esc still work", () => {
     for (const mod of [{ ctrl: true }, { meta: true }]) {
       for (const ch of ["n", "x", "y", "N"]) {
-        const r = press(at(1), { ch, ...mod });
+        const r = press(at(S1), { ch, ...mod });
 
         expect(r.effect).toBeNull();
-        expect(r.nav).toEqual(at(1));
+        expect(r.nav).toEqual(at(S1));
       }
 
-      const ask = press(at(1), { ch: "x" }).nav;
+      const ask = press(at(S1), { ch: "x" }).nav;
 
       expect(press(ask, { ch: "y", ...mod }).effect).toBeNull();
-      expect(press(at(1), { down: true, ...mod }).nav).toEqual(at(2));
-      expect(press(at(1), { return: true, ...mod }).effect).toEqual({
+      expect(press(at(S1), { down: true, ...mod }).nav).toEqual(at(A1));
+      expect(press(at(S1), { return: true, ...mod }).effect).toEqual({
         row: ROWS[1],
         type: "activate",
       });
-      expect(press(at(1), { escape: true, ...mod }).effect).toEqual({
+      expect(press(at(S1), { escape: true, ...mod }).effect).toEqual({
         type: "close",
       });
     }
@@ -493,16 +594,16 @@ describe("reduceViewKey", () => {
 
   it("swallows every other key without an effect", () => {
     for (const key of [{ ch: "q" }, { ch: "y" }, {}]) {
-      const r = press(at(2), key);
+      const r = press(at(A1), key);
 
       expect(r.consumed).toBe(true);
       expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(at(2));
+      expect(r.nav).toEqual(at(A1));
     }
   });
 
-  it("with no rows only n, esc and ← do anything", () => {
-    const none: ViewRow[] = [];
+  it("with no items only n, esc and ← do anything", () => {
+    const none: ViewItem[] = [];
 
     for (const key of [
       { down: true },
@@ -530,19 +631,19 @@ describe("reduceViewKey", () => {
     });
   });
 
-  it("clamps the index when the rows shrink under it", () => {
-    const short = ROWS.slice(0, 2);
+  it("clamps the index when the items shrink under it", () => {
+    const short = ITEMS.slice(0, S1 + 1);
 
-    expect(press(at(4), { ch: "q" }, short).nav.index).toBe(1);
-    expect(press(at(4), { up: true }, short).nav.index).toBe(0);
-    expect(press(at(4), { return: true }, short).effect).toEqual({
-      row: short[1],
+    expect(press(at(P1), { ch: "q" }, short).nav.index).toBe(S1);
+    expect(press(at(P1), { up: true }, short).nav.index).toBe(CUR);
+    expect(press(at(P1), { return: true }, short).effect).toEqual({
+      row: ROWS[1],
       type: "activate",
     });
   });
 
   it("drops a confirmation whose row has gone", () => {
-    const stale: ViewNav = { confirmKey: "session:gone", index: 1 };
+    const stale: ViewNav = { confirmKey: "session:gone", index: S1 };
 
     const y = press(stale, { ch: "y" });
 
@@ -560,7 +661,7 @@ describe("reduceViewKey", () => {
   });
 
   it("a stale confirmation eats ⏎ instead of attaching to the row under the cursor", () => {
-    const r = press({ confirmKey: "agent:gone", index: 1 }, { return: true });
+    const r = press({ confirmKey: "agent:gone", index: S1 }, { return: true });
 
     expect(r.effect).toBeNull();
     expect(r.nav.confirmKey).toBeNull();
@@ -569,20 +670,38 @@ describe("reduceViewKey", () => {
       type: "activate",
     });
   });
+
+  it("a confirmation does not fire on a row hidden by folding its group", () => {
+    const ask = press(at(S1), { ch: "x" }).nav;
+    const folded = viewItems(ROWS, new Set<ViewGroup>(["working"]));
+
+    expect(press(ask, { ch: "y" }, folded).effect).toBeNull();
+  });
 });
 
 describe("selectedIndex", () => {
   it("follows the selected key when rows are inserted above it or reordered", () => {
-    const moved = [vrow("new"), ROWS[2]!, ROWS[0]!, ROWS[1]!];
+    const moved = viewItems(
+      [vrow("new"), ROWS[2]!, ROWS[0]!, ROWS[1]!],
+      new Set(),
+    );
 
-    expect(selectedIndex(moved, "session:s1", 1)).toBe(3);
-    expect(selectedIndex(moved, "agent:a1", 2)).toBe(1);
+    // 0 input · 1 working · 2 new · 3 a1 · 4 cur · 5 s1 · 6 completed
+    expect(selectedIndex(moved, "session:s1", 1)).toBe(5);
+    expect(selectedIndex(moved, "agent:a1", 2)).toBe(3);
+    expect(selectedIndex(moved, headerKey("completed"), 0)).toBe(6);
   });
 
   it("falls back to the old position, clamped, when the key is gone or unset", () => {
-    expect(selectedIndex(ROWS, "session:gone", 2)).toBe(2);
-    expect(selectedIndex(ROWS, null, 9)).toBe(4);
+    expect(selectedIndex(ITEMS, "session:gone", 2)).toBe(2);
+    expect(selectedIndex(ITEMS, null, 9)).toBe(P1);
     expect(selectedIndex([], "session:s1", 3)).toBe(0);
+  });
+
+  it("falls back to the position when the selected row's group is folded", () => {
+    const folded = viewItems(ROWS, new Set<ViewGroup>(["working"]));
+
+    expect(selectedIndex(folded, "session:s1", S1)).toBe(3);
   });
 });
 
