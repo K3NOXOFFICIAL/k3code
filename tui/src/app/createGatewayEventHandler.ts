@@ -1434,9 +1434,14 @@ export function createGatewayEventHandler(
       case "fanout.progress":
         if (
           ev.payload &&
-          ["merged", "retrying", "escalated", "failed", "skipped"].includes(
-            ev.payload.state,
-          )
+          [
+            "merged",
+            "retrying",
+            "escalated",
+            "failed",
+            "skipped",
+            "stopped",
+          ].includes(ev.payload.state)
         ) {
           const d = ev.payload.detail
             ? ` — ${ev.payload.detail.split("\n")[0]}`

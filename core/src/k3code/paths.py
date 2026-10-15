@@ -36,6 +36,34 @@ def ensure_private_dir(path: Path) -> Path:
     return path
 
 
+def ensure_state_dir(path: Path) -> Path:
+    """Create ``path`` for a file k3code writes where it may be its own state or a project's file (a config file):
+    private (:func:`ensure_private_dir`) when it is ``$K3CODE_HOME`` or inside it, otherwise a plain ``mkdir`` with
+    the umask's mode (a project's ``.k3code/`` is part of the repository and is left as the user's umask makes it)."""
+    target, own = Path(path).expanduser().resolve(), home().resolve()
+    if target == own or target.is_relative_to(own):
+        return ensure_private_dir(Path(path))
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return Path(path)
+
+
+def tighten_home() -> bool:
+    """Make an existing ``$K3CODE_HOME`` that the group or others can read 0700; True when it changed it.
+
+    Older versions created it with ``mkdir(parents=True)``, so under the usual umask (0022) it is 0755 and every
+    user on the machine can list it and read whatever file in it is not 0600 itself. Called once at startup. A
+    directory another user owns is left as it is (``doctor`` reports it), and a missing one is not created here."""
+    path = home()
+    try:
+        st = path.stat()
+        if not path.is_dir() or st.st_uid != os.getuid() or not st.st_mode & 0o077:
+            return False
+        path.chmod(0o700)
+    except OSError:
+        return False
+    return True
+
+
 def private_file(path: Path) -> Path:
     """Create ``path`` empty when it is missing and make it 0600 whatever the umask (an existing file we own is
     tightened). A missing parent is created 0700. sqlite gives a database's -journal/-wal/-shm files its mode, so

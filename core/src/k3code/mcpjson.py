@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 
 from k3code.config import McpServerConfig
-from k3code.paths import project_state_dir
+from k3code.paths import ensure_private_dir, project_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def set_enabled(project_dir: str | Path, name: str, cfg: McpServerConfig | None)
     else:
         state[name] = digest(cfg)
     path = _state_path(project_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME/projects/<key>: 0700 whatever the umask (issue #163)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"enabled": state}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)

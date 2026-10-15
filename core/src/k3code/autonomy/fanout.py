@@ -47,6 +47,10 @@ class ReviewUnavailable(Exception):
     """No reviewer returned a verdict: the gate stays shut and the subtask goes to the parent."""
 
 
+class StoppedByBudget(BudgetStop):
+    """A child was interrupted while it ran because the fan-out's token cap was crossed (its subtask: ``stopped``)."""
+
+
 # ── helpers ──
 
 
@@ -193,7 +197,7 @@ class FanoutResult:
         return "\n".join(lines)
 
     def escalation_prompt(self, task: str) -> str:
-        bad = self.by_state("escalated", "failed", "skipped")
+        bad = self.by_state("escalated", "failed", "skipped", "stopped")
         parts = [f"The task was split into parallel subtasks. {self.summary()}", ""]
         for s in bad:
             parts.append(f"Subtask '{s.title}' needs you ({s.state}): {s.detail}")
@@ -328,7 +332,7 @@ class FanoutExecutor:
                 "fanout_id": fid,
                 "ok": result.ok,
                 "merged": len(result.by_state("merged")),
-                "escalated": len(result.by_state("escalated", "failed", "skipped")),
+                "escalated": len(result.by_state("escalated", "failed", "skipped", "stopped")),
                 "total": len(result.subtasks),
                 "tests": result.tests,
                 "summary": result.summary(),
@@ -339,7 +343,7 @@ class FanoutExecutor:
 
     def progress(self, ctx: _Ctx, st: Subtask, state: str, detail: str = "") -> None:
         st.state, st.detail = state, detail or st.detail
-        done = len(ctx.result.by_state("merged", "escalated", "failed", "skipped"))
+        done = len(ctx.result.by_state("merged", "escalated", "failed", "skipped", "stopped"))
         ctx.session.emit(
             "fanout.progress",
             {
@@ -392,10 +396,43 @@ class FanoutExecutor:
         st.handles.append(h)
         if self.cfg.get("panes"):  # k3 panes: one read-only pane per child (the pane's process opens it)
             ctx.session.emit("pane.open", {"subagent_id": h.id, "name": f"fan {st.id} {st.title}"[:40]})
-        await mgr.wait(h)
         if ctx.budget is not None:
-            ctx.budget.charge(h)
+            # the cap was checked only before a child started and charged only after it ended, so up to
+            # max_parallel running children overshot it by a whole run each. Its tokens now count while it runs, and
+            # after every model call of any child the running ones are stopped once the cap is crossed.
+            ctx.budget.track(h)
+            h.on_usage = lambda child, final: self._stop_over_budget(ctx, child if final else None)
+        try:
+            await mgr.wait(h)
+        finally:
+            if ctx.budget is not None:
+                ctx.budget.charge(h)
+        if (why := ctx.stopped.get(h.id)) is not None:
+            if st.worktree is None and h.worktree is not None and h.merge == "pending":
+                st.worktree = h.worktree  # its partial work is on its branch: the parent is told where
+            raise StoppedByBudget(why)
         return h
+
+    def _stop_over_budget(self, ctx: _Ctx, finishing: Handle | None = None) -> None:
+        """Called after every model call of a running child: once the token cap is crossed (the finished children
+        plus what the running ones used so far), interrupt every running child and note why, so its subtask ends as
+        ``stopped`` by the budget (not as a failed child) and the summary says so.
+
+        ``finishing`` is the child whose call this was when that call was its final answer: it makes no further
+        call, so stopping it would save nothing and only throw away a finished result (a reviewer's verdict)."""
+        budget = ctx.budget
+        if budget is None or not (why := budget.over()):
+            return
+        for h in list(budget.running.values()):
+            # once only: a second cancel would cut the child's own cleanup short (committing its partial work). A
+            # child with no loop yet is still setting up (its worktree): cancelling a `git worktree add` midway could
+            # leave a broken checkout, so it is stopped after its own first call instead.
+            if h is finishing or h.id in ctx.stopped or h.loop is None:
+                continue
+            if not self.server.subagents.interrupt(h.id):
+                continue
+            ctx.stopped[h.id] = f"{why}; stopped while running"
+            logger.info("fan-out %s: %s; stopped sub-agent %s", ctx.result.fanout_id, why, h.id)
 
     @staticmethod
     def _release(ctx: _Ctx, st: Subtask) -> None:
@@ -450,9 +487,9 @@ class FanoutExecutor:
                         self.progress(ctx, st, "escalated", f"review failed after a retry: {err}")
                         return
             await self._merge(ctx, st)
-        except BudgetStop as e:
+        except BudgetStop as e:  # a child the budget stopped while it ran, or a child it never let start
             ctx.result.stopped = ctx.result.stopped or str(e)
-            self.progress(ctx, st, "skipped", str(e))
+            self.progress(ctx, st, "stopped" if isinstance(e, StoppedByBudget) else "skipped", str(e))
         except ReviewUnavailable as e:  # reworking would not help: the work was never judged
             self.progress(ctx, st, "escalated", f"no review verdict: {e}")
         except Exception as e:  # noqa: BLE001 - one subtask must not take the others down
@@ -623,3 +660,5 @@ class _Ctx:
     merge_lock: asyncio.Lock
     executor: FanoutExecutor
     reserved: int = 0  # reviewer slots kept for the workers that started and have not been reviewed yet
+    #: why each child the token cap stopped while it ran was stopped, by handle id (see _stop_over_budget)
+    stopped: dict[str, str] = field(default_factory=dict)

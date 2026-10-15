@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import home, user_config_path
+from k3code.paths import ensure_private_dir, home, user_config_path
 from k3code.redact import scrub_text
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
@@ -50,7 +50,7 @@ def question_answered() -> bool:
 
 def record_answer(answer: str) -> None:
     path = marker_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     path.write_text(json.dumps({"answer": answer}) + "\n", encoding="utf-8")
 
 

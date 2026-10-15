@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.paths import ensure_private_dir, ensure_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class Artifact:
 class ArtifactStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         self._db = sqlstore.connect(self.path, check_same_thread=False)
         self._db.executescript(_SCHEMA)
         self._db.commit()
@@ -113,7 +114,7 @@ def publish_file(src: Path, dest_dir: Path, *, force: bool = False) -> Path:
     dest = dest_dir / src.name
     if dest.exists() and not force:
         raise AlreadyPublished(dest)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(dest_dir)  # the default is $K3CODE_HOME/published (0700); a chosen publish_dir keeps the umask
     shutil.copy2(src, dest)
     return dest
 
@@ -127,7 +128,7 @@ def slugify(text: str, limit: int = 40) -> str:
 
 def write_artifact_file(ctx: Any, kind: str, directory: Path, title: str, body: str, *, session: str = "") -> Path:
     """``<directory>/<ts>-<slug>.md`` plus a registry row."""
-    directory.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(directory)  # 0700 under $K3CODE_HOME, the umask's mode in a project (issue #163)
     path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{slugify(title)}.md"
     n = 1
     while path.exists():

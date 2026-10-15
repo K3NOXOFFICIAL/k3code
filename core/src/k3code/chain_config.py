@@ -17,6 +17,7 @@ import yaml
 from k3code import confio
 from k3code.config import ProviderEntry, Settings
 from k3code.daemon import k3_home
+from k3code.paths import ensure_private_dir
 from k3code.router.cooldown import key_fingerprint
 
 
@@ -119,7 +120,7 @@ def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
             backup = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
             shutil.copy2(path, backup)
         data["providers"] = new
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         confio.atomic_write_text(path, yaml.safe_dump(data, sort_keys=False))
     return backup
 

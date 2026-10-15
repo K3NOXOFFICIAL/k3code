@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from k3code.paths import home, main_checkout
+from k3code.paths import ensure_private_dir, home, main_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +154,7 @@ def _store() -> dict[str, Any]:
 
 def _save(projects: dict[str, Any]) -> None:
     path = home() / STORE_NAME
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"version": 1, "projects": projects}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)

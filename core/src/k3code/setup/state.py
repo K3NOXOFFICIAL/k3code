@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import home, private_file
+from k3code.paths import ensure_private_dir, home, private_file
 
 
 def state_path() -> Path:
@@ -50,7 +50,7 @@ def load_state(say: Callable[[str], None] | None = None) -> dict[str, Any]:
 
 def save_state(state: dict[str, Any]) -> None:
     p = state_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(p.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     tmp = p.with_suffix(".tmp")
     private_file(tmp).write_text(json.dumps(state, indent=2, sort_keys=True))  # setup answers: 0600
     os.replace(tmp, p)
@@ -83,7 +83,7 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
 def set_env_var(name: str, value: str, path: Path | None = None) -> Path:
     """Add/replace ``name=value`` in the env file, keeping other lines; file is always mode 0600."""
     path = path or env_file_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # ~/.config/k3code holds provider keys: 0700 whatever the umask (issue #163)
     lines = path.read_text().splitlines() if path.is_file() else []
     new = [ln for ln in lines if _env_key(ln) != name]
     new.append(f"{name}={value}")

@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import quote
 
 from k3code.daemon import k3_home
+from k3code.paths import ensure_private_dir
 from k3code.redact import (
     REDACTED,
     _token_shaped,
@@ -183,7 +184,7 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
         "prompt.json": json.dumps(prompt_fingerprints(server.config, default_project_dir()), indent=2),
     }
     out_dir = home / "debug"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(out_dir)  # the bundle holds events and config: 0700 whatever the umask (issue #163)
     path = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
     with tarfile.open(path, "w:gz") as tar:
         for name, body in parts.items():
