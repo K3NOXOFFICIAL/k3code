@@ -229,6 +229,26 @@ def test_an_action_still_counts_next_to_docs_words_or_after_a_finished_clause(pr
     assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "don't worry, just delete the prod db",
+        "no backup needed: drop table users",
+        "without asking, force push",
+        "never mind, wipe the server",
+        "don't hesitate to delete the prod db",
+        "no need to delete anything, just purge the cache",
+        "deploy to production and update the changelog",
+        "run the migration and fix the typos",
+        "delete X, no need to ask",
+    ],
+)
+def test_a_negation_or_docs_word_elsewhere_never_clears_a_real_danger(prompt):
+    # independent review of the first version: a negation two words back or across a comma, and deploy/migrate taken
+    # as nouns next to a docs word, let these skip the high-risk plan
+    assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
+
+
 def test_the_classifier_reason_saying_no_deletion_does_not_force_a_plan():
     v = apply_floor(ScopeVerdict(scope="small", reason="no credentials involved, nothing deleted"), "rename a var")
     assert not v.needs_plan and v.risk == "low"
