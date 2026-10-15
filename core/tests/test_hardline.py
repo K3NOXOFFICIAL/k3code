@@ -60,6 +60,67 @@ def test_hardline_allowed(command: str) -> None:
     assert hardline.check(command) is None, command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # bare dumps and the wrapper spellings that still print the environment
+        "env",
+        "sudo env",
+        "FOO=1 env",
+        "/usr/bin/env",
+        "env -i",
+        "env -u PATH",
+        "env -i -u X",
+        "env -S printenv",  # -S splits the string: the command is `printenv`
+        "printenv",
+        "printenv SECRET",
+        "export -p",
+        "set",
+        # a redirect or a pipe is not a wrapped command: still a dump
+        "env > file",
+        "env 2>/dev/null",
+        "env | grep SECRET",
+        "$(env)",
+    ],
+)
+def test_env_dump_is_still_denied(command: str) -> None:
+    assert hardline.check(command) == "env-dump", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # env VAR=x cmd / -u / -i / -C only set up cmd's environment: cmd goes through the normal checks, not env-dump
+        "env FOO=1 make test",
+        "env -u X ls",
+        "env -i cmd",
+        "env FOO=1 ls -la",
+        "env -C /proj make",
+        "sudo env PATH=x make",
+        "env VAR=1 git status",
+    ],
+)
+def test_env_wrapping_a_command_is_not_an_env_dump(command: str) -> None:
+    assert hardline.check(command) is None, command
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        ("env X=1 rm -rf /", "rm-rf-root"),
+        ("env -i rm -rf ~", "rm-rf-home"),
+        ("env FOO=1 git push --force origin main", "git-push-force-main"),
+    ],
+)
+def test_env_wrapping_a_dangerous_command_keeps_that_rule(command: str, rule: str) -> None:
+    # the wrapped command's own hardline rule must still fire through the env wrapper
+    assert hardline.check(command) == rule, command
+
+
+def test_env_dump_is_a_named_hardline_rule() -> None:
+    assert "env-dump" in hardline.HARDLINE_NAMES
+
+
 def test_config_extension() -> None:
     assert hardline.check("echo hi", ["^echo"]) == "config-hardline-0"
     assert hardline.check("echo hi") is None

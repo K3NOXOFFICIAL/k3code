@@ -19,11 +19,12 @@ from dataclasses import dataclass, field
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # rm -rf / and ~ are caught by _rm_check (token based: any flag spelling, quotes, sudo/env wrappers)
+    # env / printenv dumping the environment are caught by _env_dump_check (token based: it lets `env VAR=x cmd`,
+    # `env -u X cmd` and `env -i cmd` fall through to the real command's checks, which a raw regex could not)
     ("mkfs", r"\bmkfs(?:\.\w+)?\b"),  # mkfs / mkfs.ext4 ...
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
     ("wget-pipe-to-shell", r"\bwget\b[^|]*-O\s*-\s*[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),
-    ("env-dump", r"^\s*(?:sudo\s+)?(?:env|printenv)\b"),  # env / printenv
     # (?i): drvfs (/mnt/c) and macOS open ~/.ssh for ~/.SSH and .env for .ENV
     ("ssh-key-cat", r"(?i)\bcat\b[^\n;|&]*\.ssh/"),  # cat ~/.ssh/...
     # cat .env / *.env, but not the committed templates (.env.example ...)
@@ -59,6 +60,7 @@ HARDLINE_NAMES: list[str] = [
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
+    "env-dump",  # env / printenv / export -p / set printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -222,7 +224,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
             or _simple_check(sub)
             or _rm_check(argv, cwd, home)
             or _git_push_check(argv)
-            or _env_dump_check(argv)
+            or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
@@ -692,11 +694,21 @@ def _git_push_check(argv: list[str]) -> str | None:
     return None
 
 
-def _env_dump_check(argv: list[str]) -> str | None:
-    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript."""
+def _env_dump_check(sub: str) -> str | None:
+    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript.
+
+    Decided on the *normalised* argv of the simple command ``sub`` (see :func:`normalize_argv`), so that a wrapped run —
+    ``env FOO=1 make test``, ``env -u X cmd``, ``env -i cmd``, ``env -C dir cmd`` — is *not* an environment dump: there
+    ``env`` only sets up the environment of ``cmd`` and reduces to ``cmd``, whose own checks still apply (``env X=1 rm
+    -rf /`` is refused as the rm rule). Only a bare ``env`` / ``printenv`` with no command to run prints the
+    environment: it reduces to ``env`` / ``printenv`` itself (``env``, ``env -i``, ``env -u X``, ``sudo env``,
+    ``FOO=1 env``, ``env -S printenv``). A redirection (``env > file``, ``env 2>/dev/null``) is not a wrapped command:
+    the redirect words are dropped first, so those stay refused (a pipe such as ``env | grep`` is already its own
+    simple command ``env``)."""
+    argv = normalize_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
-    name, args = argv[0], argv[1:]
+    name, args = os.path.basename(argv[0]), argv[1:]
     if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
         return "env-dump"
     return None
