@@ -1638,9 +1638,15 @@ def _home_stores() -> list[str]:
     return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
 
 
+def _flat(path: str) -> str:
+    """``path`` (absolute) normalised, with a leading ``//`` made ``/``: normpath keeps two slashes (POSIX leaves them
+    implementation-defined) and the kernel does not: ``//home/u/.npmrc`` is ``/home/u/.npmrc`` and must compare so."""
+    return "/" + os.path.normpath(path).lstrip("/")
+
+
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((os.path.normpath(path), os.path.realpath(path))))
+    return list(dict.fromkeys((_flat(path), os.path.realpath(path))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -1698,7 +1704,7 @@ def _link_hops(path: str) -> list[str]:
     cur = path
     try:
         for _ in range(_MAX_LINK_HOPS):
-            hops.append(os.path.normpath(cur))
+            hops.append(_flat(cur))
             done: list[str] = []
             rest = cur.split("/")
             for i, comp in enumerate(rest):
@@ -1710,7 +1716,7 @@ def _link_hops(path: str) -> list[str]:
                     continue
                 probe = "/" + "/".join([*done, comp])
                 if os.path.islink(probe):
-                    cur = "/".join([os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :]])
+                    cur = os.path.join(os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :])
                     break
                 done.append(comp)
             else:
@@ -1723,10 +1729,33 @@ def _link_hops(path: str) -> list[str]:
 _MAX_LINK_HOPS = 40  # as the kernel's symlink limit
 
 
-def _under(path: str, base: str) -> bool:
-    """``path`` is ``base`` or lies below it, by name (not resolved again), compared case-insensitively."""
-    low, root = path.casefold(), base.casefold().rstrip("/")
+def _under(path: str, base: str, fold: bool = False) -> bool:
+    """``path`` is ``base`` or lies below it, by name (not resolved again). ``fold`` compares case-insensitively, as
+    secret_store does: only the test that a path lies in a credential store wants that (on drvfs and macOS
+    ``~/.NPMRC`` is ``~/.npmrc``). A root that covers a path, or lies in a store, does so by its exact spelling."""
+    low, root = (path.casefold(), base.casefold().rstrip("/")) if fold else (path, base.rstrip("/"))
     return low == root or low.startswith(root + "/")
+
+
+def _mirrored(path: str, homes: list[str], projects: list[str]) -> bool:
+    """``path`` lies in a copy of a project root that keeps the root's place below ``$HOME``, in a folder of its own
+    without a dot: a GNU stow package (``~/dotfiles/k3code/.k3code/memory/USER.md`` for the root ``~/.k3code/memory``).
+    Only a root whose own place has a dot component needs this: the copy is the same files, so its dot folders are as
+    ordinary as the root's; any other dot folder of the package (``.config/gh``) is not."""
+    for home in homes:
+        if not path.startswith(home):
+            continue
+        parts = path[len(home) :].split("/")
+        for root in projects:
+            rel = next((root[len(h) :].split("/") for h in homes if root.startswith(h)), [])
+            if not any(c.startswith(".") for c in rel):
+                continue
+            for i in range(1, len(parts) - len(rel) + 1):
+                if any(c.startswith(".") for c in parts[:i]):
+                    break
+                if parts[i : i + len(rel)] == rel:
+                    return True
+    return False
 
 
 def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
@@ -1752,7 +1781,7 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
         return all(any(_under(p, f) for f in forms[root]) for p in paths)
 
     for store in [*_home_stores(), *extra_stores]:
-        held = [p for p in spellings if _under(p, store)]
+        held = [p for p in spellings if _under(p, store, fold=True)]
         if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
             return True
     home = os.path.normpath(os.path.expanduser("~"))
@@ -1760,7 +1789,10 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
         return False
     projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not any(_under(p, f) for f in projects) for p in spellings)
+    return any(
+        _below_home_dot(p, homes) and not (any(_under(p, f) for f in projects) or _mirrored(p, homes, projects))
+        for p in spellings
+    )
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:

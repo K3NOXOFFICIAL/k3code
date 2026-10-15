@@ -295,3 +295,120 @@ def test_a_link_from_the_memory_folder_to_a_credential_file_is_still_refused(mon
     (k3 / "memory" / "ghdir").symlink_to(home / ".config" / "gh")
     _w(k3 / "memory" / "USER.md", "@a.md\n@b.md\n@ghdir/hosts.yml")
     assert TOKEN not in _text(home / "nowhere")
+
+
+# K3NOX-751: POSIX keeps a leading ``//`` through normpath, so ``//home/u/...`` matched no ``$HOME/...`` prefix and its
+# realpath (a store file linked out of the store) is outside every store. Each spelling must lose the extra slash.
+
+
+def _linked_out(home: Path, rel: str, text: str) -> None:
+    """``~/<rel>`` as a link to a file in a dotfiles folder, the way a dotfiles manager leaves a store file."""
+    real = _w(home / "dotfiles" / Path(rel).parent.name / Path(rel).name.lstrip("."), text)  # no dot component
+    (home / rel).parent.mkdir(parents=True, exist_ok=True)
+    (home / rel).symlink_to(real)
+
+
+def test_a_double_slash_spelling_of_a_linked_out_store_file_is_refused_from_a_home_rooted_project(monkeypatch) -> None:
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out(home, ".config/gh/hosts.yml", "oauth_token: " + TOKEN)
+    _w(home / "AGENTS.md", f"@/{home}/.config/gh/hosts.yml")  # ``@//home/u/...``
+    assert TOKEN not in _text(home)
+
+
+def test_a_double_slash_spelling_is_refused_from_user_memory(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _linked_out(home, ".config/gh/hosts.yml", "oauth_token: " + TOKEN)
+    _w(k3 / "memory" / "USER.md", f"@/{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home / "nowhere")
+
+
+def test_a_double_slash_spelling_of_a_linked_out_dot_folder_file_is_refused(monkeypatch) -> None:
+    """``~/.config/git/credentials`` is no listed store: only the dot-folder rule guards it."""
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out(home, ".config/git/credentials", "https://u:" + TOKEN + "@h")
+    _w(home / "AGENTS.md", f"@/{home}/.config/git/credentials")
+    assert TOKEN not in _text(home)
+
+
+def test_a_proc_root_spelling_of_a_linked_out_store_file_is_refused(monkeypatch) -> None:
+    """``/proc/self/root`` links to ``/``: joining ``/`` with the rest must not start with ``//``."""
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out(home, ".config/gh/hosts.yml", "oauth_token: " + TOKEN)
+    _w(home / "AGENTS.md", f"@/proc/self/root{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home)
+
+
+def test_no_spelling_of_a_path_through_a_link_to_the_root_starts_with_two_slashes(monkeypatch) -> None:
+    """``~/r -> /`` (and ``/proc/<pid>/root``) leaves the rest of the path to be joined onto ``/``."""
+    from k3code.permissions.engine import _link_hops, _spellings
+
+    home = Path.home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "r").symlink_to("/")
+    path = f"{home}/r{home}/.config/gh/hosts.yml"
+    for spelling in (*_link_hops(path), *_spellings("/" + path), *_link_hops(f"/proc/self/root{home}/x")):
+        assert not spelling.startswith("//"), spelling
+    assert f"{home}/.config/gh/hosts.yml" in _link_hops(path)
+
+
+def test_a_double_slash_spelling_of_an_ordinary_file_still_reads(monkeypatch) -> None:
+    home = Path.home()
+    _k3home(monkeypatch)
+    _w(home / "notes.md", "ORDINARY")
+    _w(home / "AGENTS.md", f"@/{home}/notes.md")
+    assert "ORDINARY" in _text(home)
+
+
+# K3NOX-773: a stow package keeps the file below a dot folder of its own (``~/dotfiles/k3code/.k3code/memory/USER.md``);
+# ``k3code setup`` has already made ``~/.k3code/memory``, so stow links the file, not the folder.
+
+
+def test_user_memory_file_linked_into_a_stow_package_below_a_dot_folder_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "USER.md", "MY-PREFS")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "USER.md").symlink_to(real)
+    assert "MY-PREFS" in _text(home / "elsewhere")
+    assert next(s for s in scan_memory(home / "elsewhere") if s.scope == "user").status == "read"
+
+
+def test_user_memory_import_linked_into_a_stow_package_below_a_dot_folder_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "style.md", "MY-STYLE")
+    _w(k3 / "memory" / "USER.md", "@style.md")
+    (k3 / "memory" / "style.md").symlink_to(real)
+    assert "MY-STYLE" in _text(home / "elsewhere")
+
+
+def test_a_memory_folder_link_into_a_stow_package_cannot_reach_a_credential_file(monkeypatch) -> None:
+    """The stow exemption is for the memory file's own place, not for the folder it sits in: a credential file in the
+    package's other folders, or reached through ``..``, stays refused."""
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(home / "dotfiles" / "k3code" / ".config" / "gh" / "hosts.yml", "oauth_token: " + TOKEN)
+    _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "ok.md", "FINE")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "ok.md").symlink_to(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "ok.md")
+    (k3 / "memory" / "bad.md").symlink_to(home / "dotfiles" / "k3code" / ".config" / "gh" / "hosts.yml")
+    _w(k3 / "memory" / "USER.md", "@ok.md\n@bad.md")
+    text = _text(home / "elsewhere")
+    assert "FINE" in text
+    assert TOKEN not in text
+
+
+def test_a_folder_that_differs_from_the_memory_folder_only_in_case_is_not_the_memory_folder(monkeypatch) -> None:
+    """Case is folded to see that a path lies in a store, not to see that a root covers it: ``../MEMORY/x`` from
+    ``USER.md`` is a folder of the state, which is not importable (K3NOX-773)."""
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(k3 / "memory" / "USER.md", "@../MEMORY/x.md")
+    _w(k3 / "MEMORY" / "x.md", "STATE-FOLDER")
+    if (k3 / "memory" / "x.md").exists() or (k3 / "Memory").exists():
+        pytest.skip("case-insensitive file system")
+    assert "STATE-FOLDER" not in _text(home / "elsewhere")
