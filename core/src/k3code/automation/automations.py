@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import secrets
 import shlex
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from k3code.automation.clock import Clock
@@ -21,7 +22,7 @@ from k3code.automation.triggers import (
     IdleTrigger,
     Trigger,
 )
-from k3code.automation.webhook import WebhookServer
+from k3code.automation.webhook import Rejected, WebhookServer
 
 logger = logging.getLogger("k3code.automation.automations")
 
@@ -170,7 +171,7 @@ class AutomationManager:
             if self.webhook is None:
                 logger.warning("automation %s uses a webhook trigger but webhooks are disabled", aid)
             else:
-                self.webhook.register(aid, str(trig.get("token") or ""), fire)
+                self.webhook.register(aid, str(trig.get("token") or ""), lambda info: self._webhook_fire(aid, info))
         if t is not None:
             self._triggers[aid] = t
             t.start()
@@ -279,28 +280,63 @@ class AutomationManager:
 
     # ── firing ───────────────────────────────────────────────────────
 
-    async def fire(self, aid: str, info: dict[str, Any], *, force: bool = False) -> RunResult | None:
+    def _policy_refusal(self, row: dict[str, Any], now: float) -> Rejected | None:
+        """Why the policy (cooldown, ``max_per_hour``) does not let ``row`` fire at ``now``; ``None`` when it may.
+
+        The rate limit counts the runs that started in the last hour, so ``retry_after`` is when enough of them have
+        aged out of it."""
+        policy = row["policy"] or {}
+        cd = float(policy.get("cooldown_s") or 0)
+        if cd and row["last_fired_at"] and now - row["last_fired_at"] < cd:
+            wait = max(1, math.ceil(cd - (now - row["last_fired_at"])))
+            return Rejected(429, "cooldown", f"cooldown: the next run is allowed in {wait}s", retry_after=wait)
+        limit = policy.get("max_per_hour")
+        per_hour = int(_default_max_per_hour(row) if limit is None else limit or 0)
+        if per_hour:
+            recent = self.db.rows("job_runs", "owner=? AND started_at>?", (row["id"], now - 3600))
+            if len(recent) >= per_hour:
+                starts = sorted(float(r["started_at"]) for r in recent)
+                wait = max(1, math.ceil(starts[len(recent) - per_hour] + 3600 - now))
+                return Rejected(429, "rate_limited", f"rate limit: at most {per_hour} runs per hour", retry_after=wait)
+        return None
+
+    def _claim(self, aid: str, *, force: bool = False) -> dict[str, Any] | Rejected:
+        """Check state and policy and, when the automation may run now, mark it busy. Returns its row, or why not.
+
+        Synchronous on purpose: the webhook listener calls it before it answers, so the sender learns whether its
+        event started a run (and a second request right behind the first already sees the claim)."""
         row = self.db.get("automations", aid)
         if row is None or (row["state"] != "active" and not force):
-            return None
-        now = self.clock.now()
-        policy = row["policy"] or {}
+            return Rejected(404, "not_active", "no such active automation")
         if not force:
-            cd = float(policy.get("cooldown_s") or 0)
-            if cd and row["last_fired_at"] and now - row["last_fired_at"] < cd:
-                logger.info("automation %s: skipped (cooldown)", aid)
-                return None
-            limit = policy.get("max_per_hour")
-            per_hour = int(_default_max_per_hour(row) if limit is None else limit or 0)
-            if per_hour:
-                recent = self.db.rows("job_runs", "owner=? AND started_at>?", (aid, now - 3600))
-                if len(recent) >= per_hour:
-                    logger.info("automation %s: skipped (rate limit)", aid)
-                    return None
+            refusal = self._policy_refusal(row, self.clock.now())
+            if refusal is not None:
+                logger.info("automation %s: skipped (%s)", aid, refusal.reason)
+                return refusal
         if aid in self._busy:
             logger.info("automation %s: skipped (previous run still going)", aid)
-            return None
+            return Rejected(409, "busy", "the previous run is still going")
         self._busy.add(aid)
+        return row
+
+    def _webhook_fire(self, aid: str, info: dict[str, Any]) -> Awaitable[RunResult] | Rejected:
+        """Webhook handler: decide now (busy, cooldown, rate limit) and hand back the run for the listener to start."""
+        claim = self._claim(aid)
+        if isinstance(claim, Rejected):
+            return claim
+        return self._run_claimed(claim, info)
+
+    async def fire(self, aid: str, info: dict[str, Any], *, force: bool = False) -> RunResult | None:
+        """Run the automation for ``info`` unless its state or policy refuses (``None`` then)."""
+        claim = self._claim(aid, force=force)
+        if isinstance(claim, Rejected):
+            return None
+        return await self._run_claimed(claim, info)
+
+    async def _run_claimed(self, row: dict[str, Any], info: dict[str, Any]) -> RunResult:
+        """Run an automation :meth:`_claim` marked busy, record the run and release the claim."""
+        aid = row["id"]
+        now = self.clock.now()
         try:  # everything after the claim sits in the try: an exception in the inserts leaked `_busy` for good
             run_id = self.db.insert(
                 "job_runs",

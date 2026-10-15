@@ -2,6 +2,11 @@
 
 Binds ``127.0.0.1`` only, and only when ``automation.webhook_port`` is configured. The token is accepted as
 ``Authorization: Bearer <token>`` or ``X-K3-Token``. Wrong or missing token → 401, unknown automation → 404.
+
+The answer says whether the run really started: ``202 {"ok": true}`` only when it did; a cooldown or rate limit →
+``429`` with ``Retry-After`` (seconds), a previous run still going → ``409``, both with a JSON ``error`` and ``reason``.
+The handler decides before the answer is written: it returns the run (an awaitable, started in the background) or a
+:class:`Rejected`.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import hmac
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("k3code.automation.webhook")
@@ -19,7 +25,22 @@ logger = logging.getLogger("k3code.automation.webhook")
 MAX_HEADER_BYTES = 16 * 1024
 READ_TIMEOUT_S = 10.0  # reading + authenticating the request; the action itself is not bound by it
 MAX_BODY_BYTES = 1024 * 1024
-Handler = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class Rejected:
+    """A handler's answer when the run does not start: the HTTP ``status``, a short ``error`` code, a human ``reason``
+    and, for 429, ``retry_after`` (whole seconds, sent as ``Retry-After``)."""
+
+    status: int
+    error: str
+    reason: str
+    retry_after: int | None = None
+
+
+#: Called with the event while the request is still open; returns the run to start in the background, or a
+#: :class:`Rejected` (an ``async def`` handler always accepts: calling it only creates the coroutine).
+Handler = Callable[[dict[str, Any]], "Awaitable[Any] | Rejected"]
 
 _REASONS = {
     200: "OK",
@@ -28,7 +49,9 @@ _REASONS = {
     401: "Unauthorized",
     404: "Not Found",
     405: "Method Not Allowed",
+    409: "Conflict",
     413: "Payload Too Large",
+    429: "Too Many Requests",
 }
 
 
@@ -62,13 +85,13 @@ class WebhookServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _spawn(self, handler: Handler, event: dict[str, Any]) -> None:
-        """Run the action in the background and answer 202 now: a prompt/goal/shell action takes far longer than
-        the request timeout (it used to be cancelled 10 s in and the sender saw 400, then retried)."""
+    def _spawn(self, action: Awaitable[Any]) -> None:
+        """Run the accepted action in the background and answer 202 now: a prompt/goal/shell action takes far longer
+        than the request timeout (it used to be cancelled 10 s in and the sender saw 400, then retried)."""
 
         async def run() -> None:
             try:
-                await handler(event)
+                await action
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -84,8 +107,9 @@ class WebhookServer:
         except Exception:  # noqa: BLE001
             status, body = 400, {"error": "bad request"}
         payload = json.dumps(body).encode()
+        retry = f"Retry-After: {body['retry_after']}\r\n" if body.get("retry_after") is not None else ""
         writer.write(
-            f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}\r\nContent-Type: application/json\r\n"
+            f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}\r\nContent-Type: application/json\r\n{retry}"
             f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
             + payload
         )
@@ -117,5 +141,13 @@ class WebhookServer:
         if length > MAX_BODY_BYTES:
             return 413, {"error": "body too large"}
         raw = await reader.readexactly(length) if length else b""
-        self._spawn(handler, {"event": "webhook", "body": raw.decode("utf-8", "replace")[:2000]})
+        # Decide before answering: a 202 used to go out for every authenticated request while the run was dropped
+        # afterwards (cooldown, rate limit, previous run still going) with only an INFO log, so the sender never knew.
+        outcome = handler({"event": "webhook", "body": raw.decode("utf-8", "replace")[:2000]})
+        if isinstance(outcome, Rejected):
+            out: dict[str, Any] = {"ok": False, "error": outcome.error, "reason": outcome.reason}
+            if outcome.retry_after is not None:
+                out["retry_after"] = outcome.retry_after
+            return outcome.status, out
+        self._spawn(outcome)
         return 202, {"ok": True}
