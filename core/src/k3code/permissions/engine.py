@@ -1400,8 +1400,10 @@ def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool 
     tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
     expanded, globs are matched."""
     worst: str | None = None
+    # once per line, not per sub: a line of thousands of simple commands made this subs x pipelines (K3NOX-691)
+    in_pipes = {sub for p in parsed.pipelines if len(p) > 1 for sub in p}
     for sub in parsed.subs:
-        piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
+        piped = consumed or sub in in_pipes
         worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
@@ -1430,10 +1432,9 @@ def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
-    hit = hardline.check(command, extra, cwd=cwd, home=home)
+    hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    parsed = hardline.parse(command)
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote

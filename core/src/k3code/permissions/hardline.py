@@ -397,6 +397,14 @@ def check(
     push, environment dumps, downloads fed to a shell) run on the normalised argv and the pipelines. ``cwd`` and
     ``home`` expand ``$PWD``, ``~`` and ``$HOME`` in rm targets (home defaults to the real one).
     """
+    return check_parse(command, extra_patterns, cwd=cwd, home=home)[0]
+
+
+def check_parse(
+    command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
+) -> tuple[str | None, Parsed]:
+    """:func:`check` and the parse it read (``parse(command)``): the engine decides on that parse instead of parsing a
+    long command line a second time."""
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
     parsed = parse(command, budget=budget)
@@ -405,8 +413,8 @@ def check(
     # unknown, so the command is denied rather than allowed unchecked (yolo too). The checks below cannot lift that
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
-        return "scan-budget" if budget[0] < 0 else "scan-depth"
-    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home)
+        return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home), parsed
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
@@ -1672,7 +1680,10 @@ def _launcher_payloads(sub: str) -> list[str]:
     the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the two, and
     shlex's reading is checked as well. Identical readings are one reading."""
     out: list[str] = []
-    readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
+    # the readings differ only in a ${...} unit: without one they are all the first, read once (a line of thousands of
+    # simple commands is read once per command, see engine._secret_access)
+    flags = [(u, e) for u in (False, True) for e in (True, False)] if "${" in sub else [(False, True)]
+    readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote, unescape in flags]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
         pre = _strip_wrappers(list(toks))
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
