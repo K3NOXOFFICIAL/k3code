@@ -331,6 +331,100 @@ def test_windows_rules_do_not_overblock(command: str) -> None:
     assert hardline.check(command, cwd="/work/proj", home="/home/user") is None, command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # -e / --exec / -- end wsl.exe's options; what follows is the command line it runs
+        "wsl.exe -e rm -rf /",
+        "wsl -e rm -rf ~",
+        "wsl.exe --exec rm -rf /",
+        "wsl ~ -e rm -rf /",
+        "wsl.exe -d Ubuntu -u root --exec rm -rf /",
+        "wsl.exe -- rm -rf /",
+        "wsl.exe -e rm -rf $HOME",
+        "wsl.exe -e rm -rf /mnt/c",
+        "wsl.exe -e sh -c 'rm -rf /'",
+        "wsl.exe -e sudo rm --recursive --force /",
+        "wsl.exe -e find / -delete",
+        "cmd.exe /c wsl.exe -e rm -rf /",
+        "/mnt/c/Windows/System32/wsl.exe -e rm -rf /",
+        "WSL.EXE -e rm -rf /",
+    ],
+)
+def test_wsl_exec_runs_the_hardline_on_its_command_line(command: str) -> None:
+    assert hardline.check(command, cwd="/home/user/proj", home="/home/user") is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "wsl.exe -e ls",
+        "wsl -e ls -la",
+        "wsl.exe --exec git status",
+        "wsl.exe -d Ubuntu -e cat README.md",
+        "wsl.exe -e rm -rf ./build",
+        "wsl ~ -e rm -rf proj/build",
+    ],
+)
+def test_wsl_exec_of_an_ordinary_command_is_not_denied(command: str) -> None:
+    assert hardline.check(command, cwd="/home/user/proj", home="/home/user") is None, command
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        # find -delete / -exec rm over a root that rm -rf of it is refused for
+        ("find /mnt/c -delete", "find-delete-root"),
+        ("find / -delete", "find-delete-root"),
+        ("find / -name '*.tmp' -delete", "find-delete-root"),
+        ("find -L / -type f -delete", "find-delete-root"),
+        ("find /usr -execdir rm {} +", "find-delete-root"),
+        ("find /mnt/c/Users/nils -delete", "find-delete-root"),
+        ("find ~ -exec rm -rf {} +", "find-delete-home"),
+        ("find $HOME -type f -exec rm {} \\;", "find-delete-home"),
+        ("find /home/user -name '*.pyc' -delete", "find-delete-home"),
+        ("find /home/user/proj/.. -delete", "find-delete-home"),
+        ("find /home -ok rm {} \\;", "find-delete-home"),
+        # a parent of the project: the project sits in it
+        ("find .. -name '*.log' -delete", "find-delete-root"),
+        ("find /home/user/proj/../.. -delete", "find-delete-home"),
+        # wrappers, launchers and a nested command do not hide it
+        ("sudo find / -delete", "find-delete-root"),
+        ("bash -c 'find / -delete'", "find-delete-root"),
+        ("ls; find ~ -delete", "find-delete-home"),
+        ("wsl.exe -e find / -delete", "find-delete-root"),
+    ],
+)
+def test_find_delete_over_a_whole_tree_is_denied(command: str, rule: str) -> None:
+    assert hardline.check(command, cwd="/home/user/proj", home="/home/user") == rule, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . -name '*.pyc' -delete",
+        "find . -delete",
+        "find -delete",
+        "find ./build -delete",
+        "find /home/user/proj -name '*.orig' -delete",
+        "find /home/user/proj/build -exec rm {} +",
+        "find build -type f -exec rm -f {} \\;",
+        "find /mnt/c/Users/nils/project -delete",
+        "find / -name foo",
+        "find ~ -name '*.txt' -print",
+        "find / -exec ls {} +",
+        "find ~ -exec grep -l x {} +",
+    ],
+)
+def test_find_rules_do_not_overblock(command: str) -> None:
+    assert hardline.check(command, cwd="/home/user/proj", home="/home/user") is None, command
+
+
+def test_find_delete_rules_are_named_hardline_rules() -> None:
+    assert "find-delete-root" in hardline.HARDLINE_NAMES
+    assert "find-delete-home" in hardline.HARDLINE_NAMES
+
+
 def test_windows_rules_are_named_hardline_rules() -> None:
     for name in (
         "win-cmd-recursive-delete",

@@ -83,3 +83,18 @@ def test_config_servers_win_a_name_clash(tmp_path: Path) -> None:
     mine = McpServerConfig(command="from-config")
     assert mcpjson.merged({"same": mine}, tmp_path)["same"].command == "from-config"
     assert mcpjson.merged({}, tmp_path)["same"].command == "from-mcp-json"
+
+
+def test_as_config_reads_a_normal_file_and_refuses_one_over_the_cap(tmp_path: Path) -> None:
+    _write_mcp_json(tmp_path, {"srv": {"command": "x", "env": {"TOKEN": "s3cret", "nested": {"a": 1}}}})
+    assert mcpjson.as_config(tmp_path) == {"mcp": {"servers": {"srv": {"env": {"TOKEN": "s3cret"}, "headers": {}}}}}
+    assert mcpjson.as_config(tmp_path / "nowhere") == {}
+
+    # a repository you clone chooses the file: one over the project-config bound is not loaded (not even parsed), and
+    # None tells the caller its values are unknown rather than empty
+    big = {"mcpServers": {"srv": {"command": "x", "env": {"TOKEN": "s3cret", "pad": "x" * trust.MAX_CONFIG_BYTES}}}}
+    (tmp_path / mcpjson.FILE).write_text(json.dumps(big), encoding="utf-8")
+    assert (tmp_path / mcpjson.FILE).stat().st_size > trust.MAX_CONFIG_BYTES
+    assert mcpjson.as_config(tmp_path) is None
+    trust.record(tmp_path, trusted=True)
+    assert mcpjson.declared(tmp_path) == {}  # the trusted loader applies the same bound

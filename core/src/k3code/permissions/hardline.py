@@ -117,6 +117,9 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [*_SSH_RESTART_PATTERNS, *_WIN
 HARDLINE_NAMES: list[str] = [
     "rm-rf-root",
     "rm-rf-home",
+    # find -delete / -exec rm over /, ~, a system dir, a Windows drive or a parent of the project (see _find_check)
+    "find-delete-root",
+    "find-delete-home",
     # read/grep/glob, or a bash argument, < source or glob that reads or sends keys, ~/.config/k3code,
     # /proc/*/environ, .env (engine.py: printing, testing, chmod, ssh -i and a copy destination are not reads;
     # rm, source, git add and --env-file ask a person)
@@ -417,6 +420,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
             or _match(" ".join(argv), extra)
             or _simple_check(sub)
             or _rm_check(argv, cwd, home)
+            or _find_check(argv, cwd, home)
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
@@ -1204,17 +1208,67 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
     if not recursive:
         return None
-    dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
+    for t in targets:
+        kind = _wipe_target(t, cwd, home)
+        if kind:
+            return f"rm-rf-{kind}"
+    return None
+
+
+def _wipe_target(t: str, cwd: str | None, home: str, project: bool = False) -> str | None:
+    """What a recursive delete of ``t`` wipes: ``"home"`` for ~, $HOME or /home, ``"root"`` for /, a top-level
+    system directory or a Windows drive, system folder or profile reached through WSL (issue #169); with ``project``
+    also for a parent of ``cwd`` (the project sits in it). None for anything else (a project folder, ``./build``)."""
+    if not t:
+        return None
+    target = _expand_target(t, cwd, home)
+    if target in _DANGEROUS_RM_TARGETS or target in (home, home + "/*"):
+        homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
+        return "home" if homeish else "root"
     from .engine import windows_drives  # engine imports this module
 
-    drives = windows_drives()
-    for t in targets:
-        target = _expand_target(t, cwd, home) if t else t
-        if target in dangerous:
-            homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
-            return "rm-rf-home" if homeish else "rm-rf-root"
-        if target and windows_rm_target(target.lower(), drives):
-            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
+    if windows_rm_target(target.lower(), windows_drives()):
+        return "root"
+    if project and cwd:
+        base = target[:-2] if target.endswith("/*") else target
+        base = os.path.normpath(os.path.join(cwd, base))  # `..` is read from the project directory
+        if base != cwd and cwd.startswith(base.rstrip("/") + "/"):
+            return "root"
+    return None
+
+
+#: ``find`` primaries that run a program on what it found; the program is the next word, its arguments run to ``;``
+#: or ``+``.
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_check(argv: list[str], cwd: str | None, home: str) -> str | None:
+    """``find`` deleting below a whole-tree root: ``-delete`` or ``-exec rm ...`` (``-execdir``, ``-ok``, ``-okdir``)
+    with a starting point that ``rm -rf`` of it would be refused for (/, ~, $HOME, a system directory, a Windows drive
+    or its system folders) or a parent of the project (``find .. -delete``). With no starting point find walks the
+    current directory. A filter (``-name '*.pyc'``) does not lift it: the walk still covers the whole tree, and a
+    deletion under such a root is not a project cleanup. ``find ./build -delete`` is left to the ordinary rules."""
+    if not argv or argv[0] != "find":
+        return None
+    args = argv[1:]
+    i = 0
+    while i < len(args) and args[i].startswith("-") and (args[i] in ("-H", "-L", "-P", "-D") or args[i][:2] == "-O"):
+        i += 2 if args[i] == "-D" else 1  # -D takes the debug options as the next word
+    starts: list[str] = []
+    while i < len(args) and not args[i].startswith(("-", "(", "!", ",")):
+        starts.append(args[i])
+        i += 1
+    expr = args[i:]
+    deletes = "-delete" in expr
+    for k, a in enumerate(expr):
+        if a in _FIND_EXEC and k + 1 < len(expr) and os.path.basename(expr[k + 1]) == "rm":
+            deletes = True
+    if not deletes:
+        return None
+    for s in starts or ["."]:
+        kind = _wipe_target(s, cwd, home, project=True)
+        if kind:
+            return f"find-delete-{kind}"
     return None
 
 

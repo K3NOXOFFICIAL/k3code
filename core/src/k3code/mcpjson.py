@@ -19,6 +19,7 @@ from typing import Any
 
 from k3code.config import McpServerConfig
 from k3code.paths import ensure_private_dir, project_state_dir
+from k3code.trust import read_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +57,13 @@ def as_config(project_dir: str | Path) -> dict[str, Any] | None:
     """The file as written, trusted or not, as a config's ``mcp`` section with each server's ``env`` and ``headers``
     only (their text, number and bool values), whatever its type: the values a session may quote, for
     ``debugdump.secret_values`` (k3code.bundle). ``{}`` without a file; None when it exists but cannot be read or
-    parsed (a caller must not guess its values)."""
+    parsed (a caller must not guess its values), which includes a file over ``trust.MAX_CONFIG_BYTES``: a repository
+    you clone chooses the file, and it is read with the same bound as the project config (trust.read_bounded)."""
     path = Path(project_dir) / FILE
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_bounded(path).decode("utf-8"))
     except (OSError, ValueError, RecursionError):
         return None
     servers = data.get("mcpServers") if isinstance(data, dict) else None
@@ -89,8 +91,8 @@ def declared(project_dir: str | Path) -> dict[str, McpServerConfig]:
     if not path.is_file() or trust.decision(project_dir) != trust.TRUSTED:
         return {}
     try:
-        return parse(path.read_text(encoding="utf-8"))
-    except OSError:
+        return parse(read_bounded(path).decode("utf-8"))  # bounded: see as_config
+    except (OSError, UnicodeDecodeError):
         return {}
 
 
