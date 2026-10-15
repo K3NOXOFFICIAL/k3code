@@ -89,11 +89,16 @@ async def test_what_the_session_wrote_edited_or_read_again_it_may_change(tmp_pat
         ToolCall(id="w4", name="write", arguments={"path": str(f), "content": "v = 2\n"}),  # ... then it may
     ]
     results = await run_script(tmp_path, script, {4: lambda: f.write_text("v = 1  # theirs\n")})
-    assert [results[k] for k in ("w1", "e1", "w2")] == [f"Wrote {new}", "Edited: 1 replacement", f"Wrote {new}"]
+    ok = "\nsyntax: ok"  # a .py file: the syntax check's line follows (test_editcheck)
+    assert [results[k] for k in ("w1", "e1", "w2")] == [
+        f"Wrote {new}{ok}",
+        f"Edited: 1 replacement{ok}",
+        f"Wrote {new}{ok}",
+    ]
     assert new.read_text() == "n = 3\n"
     assert "changed since you read it" in results["w3"]
     assert "theirs" in results["r2"]
-    assert results["w4"] == f"Wrote {f}"
+    assert results["w4"] == f"Wrote {f}{ok}"
     assert f.read_text() == "v = 2\n"
 
 
@@ -145,7 +150,8 @@ async def test_a_read_in_one_turn_lets_the_next_turn_write_the_unchanged_file(tm
         return next(m.content for m in loop.turn_messages if m.role == "tool")
 
     await turn(ToolCall(id="r", name="read", arguments={"path": str(f)}))
-    assert await turn(ToolCall(id="w", name="write", arguments={"path": str(f), "content": "x = 2\n"})) == f"Wrote {f}"
+    written = await turn(ToolCall(id="w", name="write", arguments={"path": str(f), "content": "x = 2\n"}))
+    assert written == f"Wrote {f}\nsyntax: ok"
     f.write_text("x = 2\ny = 'mine'\n")  # between turns the user saves the file
     result = await turn(ToolCall(id="w2", name="write", arguments={"path": str(f), "content": "x = 3\n"}))
     assert "changed since you read it" in result

@@ -120,7 +120,7 @@ from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
-from k3code.tools import FileStamps, clip_for_model, register_todo
+from k3code.tools import FileStamps, clip_for_model, editcheck, register_todo
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
@@ -2098,6 +2098,7 @@ class GatewayServer:
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
+        loop.syntax_checks = editcheck.enabled(self.config)
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply

@@ -238,6 +238,8 @@ class Settings(BaseModel):
     # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
     # see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
+    # File tools: {syntax_check: true}: edit and write end with a syntax check of the file (k3code.tools.editcheck)
+    tools: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("providers")
     @classmethod

@@ -190,6 +190,7 @@ async def _run_headless(
     from k3code.reliability.persistent_retry import TurnCancelled
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
+    from k3code.tools import editcheck
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
@@ -225,6 +226,7 @@ async def _run_headless(
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     loop.on_home_started = _warn_home_started
+    loop.syntax_checks = editcheck.enabled(config)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
@@ -525,6 +527,7 @@ async def _run_repl(
     from k3code.reliability.persistent_retry import TurnCancelled
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
+    from k3code.tools import editcheck
 
     if model and (err := _use_model_key(config, model)):
         print(f"[Error] {err}; using {config.default_model}")
@@ -562,6 +565,7 @@ async def _run_repl(
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     loop.on_home_started = _warn_home_started
+    loop.syntax_checks = editcheck.enabled(config)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False

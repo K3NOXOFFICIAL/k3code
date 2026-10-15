@@ -27,6 +27,7 @@ from k3code.tools import (
     FileStamps,
     build_registry,
     clip_tool_results,
+    editcheck,
     format_tool_result,
 )
 from k3code.tools.validate import invalid_arguments
@@ -127,6 +128,8 @@ class AgentLoop:
         self.task_kind = task_kind
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
         self.max_tool_errors = max_tool_errors
+        #: edit and write results end with a syntax check of the file (k3code.tools.editcheck); off: never
+        self.syntax_checks = True
         self._tool_errors = 0
         self._truncated: set[str] = set()  # ids of tool calls cut off by the output limit: never executed
         self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
@@ -678,6 +681,11 @@ class AgentLoop:
         seen = (tool_call.name == "read" and "first" in result) or (tool_call.name in FILE_TOOLS and result.get("ok"))
         if seen and (path := self._tool_path(args)) is not None:
             self.file_stamps.record(path)
+            # the model sees a syntax error now, in the result of the call that caused it, instead of when it runs
+            # the tests (or never); a check that cannot run adds nothing
+            note = editcheck.render(await editcheck.syntax_check(path)) if self._checks(tool_call.name) else ""
+            if note:
+                result = {**result, "content": f"{format_tool_result(result)}\n{note}"}
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
@@ -690,6 +698,9 @@ class AgentLoop:
         if not self.hooks:
             return HookOutcome()
         return await self.hooks.run(event, {"tool_name": tool, **payload}, tool_name=tool)
+
+    def _checks(self, tool: str) -> bool:
+        return tool in FILE_TOOLS and self.syntax_checks
 
     def _tool_path(self, args: dict[str, Any]) -> Path | None:
         """The file a read, write or edit call names, resolved as the tool resolves it; None if it cannot be."""
