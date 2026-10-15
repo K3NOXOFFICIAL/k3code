@@ -8,8 +8,11 @@ pick what it runs (hooks, config, ``info/``: see :data:`GIT_CODE_ENTRIES`). The 
 lock files, so a command there can still plant a ``commondir`` (or a new ``worktrees/<x>`` admin dir, or a code key in
 ``config.worktree``) that the next git run would follow; the loop undoes exactly that after each ``git_writable`` bash
 call (:func:`snapshot_git_writable` / :func:`scrub_git_writable_changes`), and harness git runs with hooks and
-fsmonitor off regardless (see :func:`harness_git_argv`), so it is still off by default. The network stays on for
-interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
+fsmonitor off regardless (see :func:`harness_git_argv`), so it is still off by default. The setting applies to
+foreground bash calls only: a ``background: true`` job (the call returns when it starts, before the scrub could see
+what it writes) and the harness's own unattended commands (goal checks, fan-out and ultra test runs, automation shell
+actions: :func:`unattended_prefix`, which nothing scrubs after) always get the git metadata read-only. The network
+stays on for interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
 Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
 before each command only the sandbox made safe, yolo runs it, the session shows a warning and ``/doctor`` reports it
@@ -216,13 +219,19 @@ def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, n
     Unattended work (goal gates, fan-out tests, ultra, automation shells, sub-agents) has no human to see a warning,
     so there is no unsandboxed fallback for it. The network is off unless the caller allows it. Callers run this in
     a thread: :func:`usable` may spawn bwrap (up to 10 s).
+
+    The git metadata is always read-only here, whatever ``sandbox.git_writable`` says: these commands (a test run, a
+    check, an automation's shell action) run code the model wrote with nobody watching, and their callers never take
+    the snapshot/scrub the agent loop takes around a ``git_writable`` bash call, so a ``.git/commondir`` (or a
+    ``worktrees/<x>`` admin dir) one of them planted would stay for the next harness git. None of them needs to write
+    git metadata.
     """
     if not usable():
         raise SandboxUnavailable(
             "bubblewrap is unusable here (user namespaces blocked?): unattended commands are refused, "
             "not run unsandboxed; see /doctor"
         )
-    return build_argv(cwd, add_dirs, network=network)
+    return build_argv(cwd, add_dirs, network=network, git_writable=False)
 
 
 async def spawn_unattended_shell(
@@ -753,7 +762,8 @@ def build_argv(
 
     ``git_writable`` (default: ``sandbox.git_writable`` of the user's config, false) lets ``git add``/``commit``/
     ``branch`` write the git metadata; its hooks, config and ``info/`` stay read-only (see :func:`_git_metadata_argv`).
-    False binds all of it read-only.
+    False binds all of it read-only. A caller that does not snapshot and scrub the git dirs around the command
+    (:func:`snapshot_git_writable`) passes False: a background job and :func:`unattended_prefix` do.
 
     A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
     command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case.

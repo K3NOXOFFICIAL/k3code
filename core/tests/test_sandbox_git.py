@@ -4,6 +4,7 @@ config, ``info/``) stay read-only, and so do stand-ins for the ones that were mi
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -335,3 +336,74 @@ async def test_the_agent_loop_scrubs_a_planted_commondir_around_a_git_writable_b
     result = next(m.content for m in loop.turn_messages if m.role == "tool")
     assert "planted" in result  # the command ran (the .git root is writable)
     assert not (repo / ".git" / "commondir").exists()  # but the loop removed what it planted
+
+
+# ── git_writable applies to foreground bash only: what runs after the scrub, or never gets one, sees .git read-only ──
+
+
+def _git_writable_on(tmp_path: Path, monkeypatch) -> None:
+    k3home = tmp_path / "k3home"
+    k3home.mkdir()
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    (k3home / "config.yaml").write_text(yaml.safe_dump({"sandbox": {"git_writable": True}}))
+    assert sandbox.configured_git_writable() is True
+
+
+def test_unattended_commands_get_read_only_git_metadata_whatever_the_setting(tmp_path, monkeypatch):
+    """Goal checks, fan-out/ultra test runs and automation shell actions go through ``unattended_prefix``; nothing
+    snapshots or scrubs the git dirs around them, so their sandbox binds the whole ``.git`` read-only even with
+    ``sandbox.git_writable`` on (a foreground bash call keeps the setting)."""
+    _git_writable_on(tmp_path, monkeypatch)
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    repo = _repo(tmp_path / "repo")
+    assert str(repo / ".git") not in _ro_binds(sandbox.build_argv(repo, home=tmp_path / "home", bwrap=BWRAP))
+    assert str(repo / ".git") in _ro_binds(sandbox.unattended_prefix(repo))
+
+
+@needs_bwrap
+async def test_goal_checks_fanout_tests_and_automation_shells_cannot_plant_a_commondir(tmp_path, monkeypatch):
+    """End to end through each harness caller of ``unattended_prefix``, with ``sandbox.git_writable`` on: the write
+    to ``.git`` fails inside the sandbox, so there is nothing for a later harness git to follow."""
+    from k3code.automation.server_runner import ServerRunner
+    from k3code.autonomy.fanout import run_tests
+    from k3code.goals import GoalGate, run_gate
+
+    _git_writable_on(tmp_path, monkeypatch)
+    repo = _repo(tmp_path / "repo")
+    plant = "echo /tmp/evil > .git/commondir"
+    passed, _code, gate_out = await run_gate(GoalGate(command=plant), cwd=str(repo))
+    ok, tests_out = await run_tests(plant, repo, 60)
+    rc, shell_out = await ServerRunner(None).run_shell(plant, str(repo))  # type: ignore[arg-type]
+    for out in (gate_out, tests_out, shell_out):
+        assert "Read-only file system" in out, out
+    assert not passed and not ok and rc != 0
+    assert not (repo / ".git" / "commondir").exists()
+
+
+@needs_bwrap
+async def test_a_background_job_cannot_plant_a_commondir_after_its_call_returned(tmp_path, monkeypatch):
+    """``background: true`` returns as soon as the job starts, so the loop's scrub runs before the job has written
+    anything. The job waits for that (the test creates ``go`` once the turn is over) and then tries to plant a
+    ``.git/commondir``: its sandbox has the git metadata read-only, so the write fails and nothing is left behind."""
+    from k3code.providers.types import ToolCall
+    from k3code.tools import jobs
+    from test_token_context_budget import make_loop
+    from test_wire_clip import Recorder, text_reply, tool_reply
+
+    _git_writable_on(tmp_path, monkeypatch)
+    repo = _repo(tmp_path / "repo")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    command = "while [ ! -e go ]; do sleep 0.05; done; echo /tmp/evil > .git/commondir; echo exit=$?"
+    call = ToolCall(id="b", name="bash", arguments={"command": command, "background": True})
+    loop = make_loop(repo, Recorder([tool_reply(call), text_reply("done")]), window=None)
+    try:
+        async for _ in loop.run("start it"):
+            pass
+        (job,) = [j for j in jobs.REGISTRY._jobs.values() if j.session_id == loop.session_id]
+        (repo / "go").touch()  # the call has returned and the loop's scrub (if any) has run
+        await asyncio.wait_for(job.reader, timeout=30)
+        out = bytes(job.tail).decode()
+        assert "Read-only file system" in out and "exit=0" not in out, out
+        assert not (repo / ".git" / "commondir").exists()
+    finally:
+        await jobs.REGISTRY.reap(loop.session_id)
