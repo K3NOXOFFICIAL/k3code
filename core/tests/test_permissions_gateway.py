@@ -154,9 +154,11 @@ def listed(rules: list[Rule], scope: str) -> list[str]:
         (lambda d: bash(f"touch {d}/pa1.txt"), ["allow bash touch *"]),
         (lambda d: bash("mkdir -p sub && touch sub/x.txt"), ["allow bash mkdir *", "allow bash touch *"]),
         (lambda d: bash("make -n nothing"), ["allow bash make -n nothing"]),  # wildcard-unsafe: the exact command
+        # the arity prefix `git status` is not how the command starts: the exact command is stored (#170), and shown
+        (lambda d: bash("git -C sub status"), ["allow bash git -C sub status"]),
         (lambda d: ToolCall(id="c1", name="write", arguments={"path": "w.txt", "content": "x"}), None),
     ],
-    ids=["touch", "compound", "wildcard-unsafe", "write"],
+    ids=["touch", "compound", "wildcard-unsafe", "narrowed", "write"],
 )
 async def test_always_prompt_shows_the_rule_it_stores(tmp_path, monkeypatch, call_, expected):
     server, _ = make_server(tmp_path, [call_(tmp_path), "ok"], monkeypatch)
