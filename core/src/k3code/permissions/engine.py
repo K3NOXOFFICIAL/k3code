@@ -3,7 +3,8 @@
 Modes: ``default`` (ask edits + non-allowlisted bash), ``accept-edits``
 (edits allowed, bash asks), ``plan`` (read-only + ``exit_plan``), ``auto``
 (everything not denied allowed, side effects logged), ``yolo`` (everything
-except hardline and the edits of protected files, see :func:`protected_path`, which always ask).
+except hardline and the edits of protected files, see :func:`protected_path`, which always ask, as do the reads of the
+credential stores and dot folders of ``$HOME`` that a root covers, see :func:`_decide_path`).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import functools
 import glob
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -461,7 +463,7 @@ def protected_path(path: str) -> bool:
 
 
 def _stricter(a: Decision, b: Decision) -> Decision:
-    return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human))
+    return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human, d.always_ask))
 
 
 def decide(
@@ -1314,6 +1316,18 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
+    if not is_edit and rule.layer == 0 and dec.action != "deny":
+        # a root that covers a credential store of $HOME, or $HOME itself, makes these in-roots reads: they run in the
+        # daemon, where the sandbox that hides them from bash does not apply. A person answers, in every mode (yolo
+        # and auto included); a user/project/session rule still decides.
+        why = None
+        if _home_store_read(path, roots):
+            why = "Reads a credential store of the home directory"
+        elif _home_dot_read(path, roots) and not _toolchain_read(path):
+            why = "Reads a dot folder of the home directory, where credentials live"
+        if why:
+            dec.action, dec.needs_human, dec.always_ask = "ask", True, True
+            dec.message = f"{why}; confirm it yourself: {path}"
     if is_edit and dec.action != "deny" and secret_store(path):
         # write/edit run in the daemon, outside the sandbox: ~/.ssh/authorized_keys or a file in a Windows profile's
         # AppData (its Startup folder) is changed only when a person says so; yolo still allows it (issue #134)
@@ -1325,7 +1339,8 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
 #: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person:
 #: ``/usr`` and ``/etc`` (the sandbox shows bash those anyway), the system package trees ``/opt`` and ``/nix/store``
 #: (the sandbox does not bind them: only these in-process reads see them), and the language package caches under
-#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path).
+#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path). uv counts only with its
+#: interpreters and tools: ``~/.local/share/uv/credentials`` (``uv auth dir``) holds index tokens.
 _TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
 _TOOLCHAIN_HOME = (
     ".cargo/registry",
@@ -1351,6 +1366,97 @@ def _toolchain_read(path: str) -> bool:
     if _inside(path, [*_TOOLCHAIN_SYSTEM, *(os.path.join(home, rel) for rel in _TOOLCHAIN_HOME)]):
         return True
     return any(seg in _TOOLCHAIN_SEGMENTS for seg in os.path.realpath(path).split(os.sep))
+
+
+def _home_stores() -> list[str]:
+    """The credential stores of ``$HOME`` that the read-only home sandbox hides from bash (sandbox.HOME_RO_HIDDEN:
+    ``~/.netrc``, ``~/.npmrc``, ``~/.config/gh``, ``~/.docker`` ...) plus uv's (_UV_CREDENTIALS): each below ``$HOME``
+    as written and below its realpath, and each one's own realpath (a dotfile manager's symlink)."""
+    from k3code.reliability.sandbox import HOME_RO_HIDDEN  # that module imports this one
+
+    home = os.path.expanduser("~")
+    stores = [
+        os.path.join(h, rel)
+        for h in dict.fromkeys((os.path.normpath(home), os.path.realpath(home)))
+        for rel in (*HOME_RO_HIDDEN, _UV_CREDENTIALS)
+    ]
+    return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
+
+
+def _spellings(path: str) -> list[str]:
+    """``path`` (absolute) as written, normalised, and its realpath."""
+    return list(dict.fromkeys((os.path.normpath(path), os.path.realpath(path))))
+
+
+def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
+    """The entries of ``stores`` that a path lies in, by any of its ``spellings``. Compared case-insensitively, as
+    secret_store does: on drvfs and macOS ``~/.NPMRC`` is ``~/.npmrc``."""
+    folded = [p.casefold() for p in spellings]
+    out: list[str] = []
+    for store in stores:
+        low = store.casefold().rstrip("/")
+        if any(p == low or p.startswith(low + "/") for p in folded):
+            out.append(store)
+    return out
+
+
+def _home_store_read(path: str, roots: list[str]) -> bool:
+    """``path`` lies in a credential store of ``$HOME`` (see _home_stores) that a root covers whole: a root at
+    ``$HOME`` or above it, or one such as ``~/.config`` or ``~/.local``. A root inside the store makes its own files
+    ordinary (a session started in ``~/.claude/skills/x`` reads that skill)."""
+    for store in _stores_holding(_spellings(path), _home_stores()):
+        if _inside(store, roots) and not any(_inside(path, [r]) and _inside(r, [store]) for r in roots):
+            return True
+    return False
+
+
+def _home_prefixes() -> list[str]:
+    """``$HOME/`` as written and by its realpath."""
+    home = os.path.normpath(os.path.expanduser("~"))
+    return [h.rstrip("/") + "/" for h in dict.fromkeys((home, os.path.realpath(home)))]
+
+
+def _below_home_dot(path: str, homes: list[str]) -> bool:
+    """``path`` (absolute, normalised) has a component below one of ``homes`` (see _home_prefixes) that starts with a
+    dot: ``~/.netrc``, ``~/.config/gh/hosts.yml``, ``~/src/x/.github/ci.yml``."""
+    return any(path.startswith(h) and any(c.startswith(".") for c in path[len(h) :].split("/")) for h in homes)
+
+
+def _home_dot_read(path: str, roots: list[str]) -> bool:
+    """What _home_dot_path finds on a bash command line, for the in-process readers: ``path`` lies below a dot folder
+    of ``$HOME`` (or is a dotfile there), a root at or above ``$HOME`` covers it and no project root below ``$HOME``
+    does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
+    (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
+    home = os.path.normpath(os.path.expanduser("~"))
+    if not _inside(home, roots):
+        return False
+    projects = [r for r in roots if not _inside(home, [r])]
+    homes = _home_prefixes()
+    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+
+
+def search_withheld(searched: str) -> Callable[[str], bool]:
+    """Which files a search below ``searched`` (grep over a directory) returns no lines of: a credential file
+    (sensitive_path); a file in a credential store of ``$HOME`` (see _home_stores) that ``searched`` is not itself
+    inside (a search of the store was decided on that path); and, in a search of ``$HOME`` or a directory above it,
+    every file below a dot folder of ``$HOME``, whose read asks a person there (see _decide_path). A walk of ``$HOME``
+    thus leaves a project's ``.github`` out too: search the project."""
+    inside = _spellings(searched)
+    # _stores_holding per file, precomputed: a walk of $HOME checks every file it finds
+    stores = [s.casefold().rstrip("/") for s in _home_stores() if not _stores_holding(inside, [s])]
+    exact, below = frozenset(stores), tuple(s + "/" for s in stores)
+    homes = _home_prefixes() if _inside(os.path.expanduser("~"), [searched]) else []
+
+    def withheld(path: str) -> bool:
+        if sensitive_path(path):
+            return True
+        for p in _spellings(path):
+            low = p.casefold()
+            if low in exact or low.startswith(below) or _below_home_dot(p, homes):
+                return True
+        return False
+
+    return withheld
 
 
 #: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).

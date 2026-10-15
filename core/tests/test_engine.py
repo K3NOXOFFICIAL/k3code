@@ -356,6 +356,26 @@ def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
     assert d.action == "ask" and d.needs_human
 
 
+def test_uv_credentials_are_never_auto_allowed(tmp_path, monkeypatch) -> None:
+    # `uv auth dir` is ~/.local/share/uv/credentials: only uv's interpreters and tools count as a toolchain read
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    proj = str(tmp_path / "proj")
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+        ("read", "~/.local/share/uv/python/../credentials/credentials.toml"),
+    ):
+        # auto mode refuses it like any read outside the roots (never auto-allowed, never resolved without a person)
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert (d.action == "deny" or d.needs_human) and not d.auto_allowed, (tool, path, d)
+        d = decide(mode="default", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+    for rel in ("python/cpython-3.12-linux/lib/python3.12/os.py", "tools/ruff/bin/ruff"):
+        d = decide(mode="auto", tool="read", args={"path": f"~/.local/share/uv/{rel}"}, cwd=proj)
+        assert d.action == "allow" and d.auto_allowed, (rel, d)
+
+
 def test_auto_mode_reads_of_the_uv_credentials_store_ask_a_person(tmp_path, monkeypatch) -> None:
     # PR 347 review: `uv auth dir` is ~/.local/share/uv/credentials; the uv toolchain allow must not cover it
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -581,3 +601,145 @@ def test_home_fast_path_credential_paths_still_ask_at_home(tmp_path, monkeypatch
     for command in ("cat .config/git/credentials", "grep -n tok .config/git/credentials"):
         d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
         assert d.action == "ask" and d.needs_human and not d.auto_allowed, (command, d)
+
+
+# --- in-process reads where a root covers a home credential store (K3NOX-640) ------------------------------------
+# read/grep/glob run in the daemon, outside the sandbox: a root at $HOME (or ~/.config) put ~/.npmrc, ~/.config/gh and
+# uv's credentials inside the roots, where every read was allowed without a person, yolo and auto included.
+
+_HOME_FILES = (
+    ".local/share/uv/credentials/credentials.toml",
+    ".config/gh/hosts.yml",
+    ".config/git/credentials",
+    ".cache/huggingface/token",
+    ".docker/config.json",
+    ".npmrc",
+    ".bashrc",
+    ".cargo/registry/src/x/lib.rs",
+    ".local/share/uv/python/cpython-3.12/lib/os.py",
+    ".local/lib/python3.12/site-packages/pkg/a.py",
+    ".claude/skills/mine/SKILL.md",
+    "notes.txt",
+    "src/proj/.github/workflows/ci.yml",
+)
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    for rel in _HOME_FILES:
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("x\n")
+    (home / "creds").symlink_to(home / ".config" / "gh" / "hosts.yml")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return home
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize(
+    "tool, path",
+    [
+        ("read", ".local/share/uv/credentials/credentials.toml"),
+        ("grep", ".local/share/uv"),
+        ("grep", ".local/share/uv/credentials"),
+        ("read", "~/.config/gh/hosts.yml"),
+        ("read", "{home}/.docker/config.json"),
+        ("read", ".npmrc"),
+        ("read", ".cache/huggingface/token"),
+        ("read", ".config/git/credentials"),
+        ("read", ".bashrc"),
+        ("read", "notes/../.npmrc"),
+        ("read", "creds"),  # a symlink in $HOME to ~/.config/gh/hosts.yml
+        ("grep", ".config"),
+        ("glob", ".config/gh"),
+        ("read", ".claude/skills/mine/SKILL.md"),
+    ],
+)
+def test_in_process_reads_of_home_dot_paths_ask_a_person_at_home(fake_home, mode, tool, path) -> None:
+    path = path.format(home=fake_home)
+    # a session started in $HOME, one started above it, a project with $HOME added
+    for cwd, add_dirs in ((str(fake_home), []), ("/", []), ("/proj", [str(fake_home)])):
+        p = path if cwd == str(fake_home) or path[0] in "~/" else f"{fake_home}/{path}"
+        d = decide(mode=mode, tool=tool, args={"path": p, "pattern": "."}, cwd=cwd, add_dirs=add_dirs)
+        assert d.action == "ask", (cwd, d)
+        assert d.needs_human and d.always_ask and not d.auto_allowed, (cwd, d)
+        d = decide(mode=mode, tool=tool, args={"path": p, "pattern": "."}, cwd=cwd, add_dirs=add_dirs, headless=True)
+        assert d.action == "deny", (cwd, d)
+
+
+def test_a_glob_pattern_into_a_home_dot_folder_asks_at_home(fake_home) -> None:
+    for pattern in (".config/gh/*", ".local/share/uv/credentials/*", ".docker/*", ".cache/*/token"):
+        d = decide(mode="auto", tool="glob", args={"path": ".", "pattern": pattern}, cwd=str(fake_home))
+        assert d.action == "ask" and d.needs_human and d.always_ask, (pattern, d)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_root_that_covers_a_home_credential_store_asks_for_it(fake_home, mode) -> None:
+    # a dotfiles checkout at ~/.config, a session started in ~/.local: the store is inside the roots
+    for cwd, path in (
+        (fake_home / ".config", "gh/hosts.yml"),
+        (fake_home / ".local", "share/uv/credentials/credentials.toml"),
+        (fake_home / ".local/share/uv", "credentials"),
+    ):
+        tool = "grep" if path == "credentials" else "read"
+        d = decide(mode=mode, tool=tool, args={"path": path, "pattern": "."}, cwd=str(cwd))
+        assert d.action == "ask" and d.needs_human and d.always_ask, (cwd, path, d)
+    # the rest of such a root stays an ordinary read
+    d = decide(mode=mode, tool="read", args={"path": "nvim/init.lua"}, cwd=str(fake_home / ".config"))
+    assert d.action == "allow", d
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+def test_ordinary_reads_at_home_keep_working(fake_home, mode) -> None:
+    home = str(fake_home)
+    allowed = [
+        ("read", "notes.txt", home, []),
+        ("grep", ".", home, []),  # the walk itself withholds the dot folders, see test_grep_secrets
+        ("glob", ".", home, []),
+        # toolchain dirs under $HOME are read without a person, as outside the roots
+        ("read", ".cargo/registry/src/x/lib.rs", home, []),
+        ("read", ".local/share/uv/python/cpython-3.12/lib/os.py", home, []),
+        ("read", ".local/lib/python3.12/site-packages/pkg/a.py", home, []),
+        # a project below $HOME: its own dot folders are ordinary, as for bash
+        ("read", ".github/workflows/ci.yml", f"{home}/src/proj", []),
+        ("read", "src/proj/.github/workflows/ci.yml", home, [f"{home}/src/proj"]),
+        # a session started inside a store's folder (developing a skill in ~/.claude/skills) reads its own files
+        ("read", "SKILL.md", f"{home}/.claude/skills/mine", []),
+    ]
+    for tool, path, cwd, add_dirs in allowed:
+        d = decide(mode=mode, tool=tool, args={"path": path, "pattern": "*"}, cwd=cwd, add_dirs=add_dirs)
+        assert d.action == "allow" and not d.always_ask, (tool, path, cwd, d)
+
+
+def test_a_user_rule_still_decides_a_home_dot_read(fake_home) -> None:
+    allow = [_r("read", f"{fake_home}/.config/gh/*", "allow")]
+    d = decide(mode="default", tool="read", args={"path": ".config/gh/hosts.yml"}, cwd=str(fake_home), user_rules=allow)
+    assert d.action == "allow", d
+    deny = [_r("read", f"{fake_home}/.npmrc", "deny")]
+    assert (
+        decide(mode="yolo", tool="read", args={"path": ".npmrc"}, cwd=str(fake_home), user_rules=deny).action == "deny"
+    )
+    # a person's "session" answer is a session rule: the same read is not asked twice
+    session = [_r("read", f"{fake_home}/.npmrc", "allow")]
+    d = decide(mode="auto", tool="read", args={"path": ".npmrc"}, cwd=str(fake_home), session_rules=session)
+    assert d.action == "allow", d
+
+
+def test_reads_of_home_stores_outside_the_roots_are_unchanged(fake_home) -> None:
+    # outside the roots a person (or auto's refusal) already stands
+    store = "~/.config/gh/hosts.yml"
+    assert decide(mode="default", tool="read", args={"path": store}, cwd=CWD).needs_human
+    assert decide(mode="auto", tool="read", args={"path": store}, cwd=CWD).action == "deny"
+    d = decide(mode="auto", tool="read", args={"path": "~/.local/share/uv/credentials/x.toml"}, cwd=CWD)
+    assert d.action == "ask" and d.needs_human
+
+
+def test_the_stricter_of_the_written_and_the_reached_path_keeps_always_ask(fake_home, tmp_path) -> None:
+    # `link/../hosts.yml`: the tools follow link first, so ~/.config/gh/hosts.yml is read, not <cwd>/hosts.yml
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "link").symlink_to(fake_home / ".config" / "gh" / "sub", target_is_directory=True)
+    (fake_home / ".config" / "gh" / "sub").mkdir()
+    d = decide(mode="yolo", tool="read", args={"path": f"{outside}/link/../hosts.yml"}, cwd=str(fake_home))
+    assert d.action == "ask" and d.always_ask, d

@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
@@ -350,12 +351,29 @@ def _subst_payload(text: str, at: int, end: int) -> str:
     return text[at + 1 : end + 1] if text.startswith("$((", at) else text[at + 2 : end]
 
 
+def _backtick_end(text: str, at: int) -> int:
+    """Index of the backtick that closes the one at ``at``: the first one no backslash escapes; -1 when none does."""
+    j, n = at + 1, len(text)
+    while j < n and text[j] != "`":
+        j += 2 if text[j] == "\\" else 1
+    return j if j < n else -1
+
+
+def _unescape_backticks(payload: str, dquoted: bool = False) -> str:
+    """The command bash runs for a backtick ``payload``: a backslash before `` ` ``, ``\\`` or ``$`` (in double quotes
+    also before ``"``) is dropped, any other stays (``\\x`` is ``\\x``)."""
+    escaped = '\\`$"' if dquoted else "\\`$"
+    return re.sub(r"\\([\s\S])", lambda m: m.group(1) if m.group(1) in escaped else m.group(0), payload)
+
+
 def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str], bool]:
     """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
-    unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
-    ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)`` runs)."""
+    unterminated or read differently by bash and dash. Quotes mean nothing in a body, a backslash escapes the next
+    character (``\\$(x)`` is text) and ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)``
+    runs)."""
     body = re.sub(r"\\([\s\S])", lambda m: "" if m.group(1) == "\n" else m.group(0), body)
     out: list[str] = []
+    unsure = False
     i, n = 0, len(body)
     while i < n:
         c = body[i]
@@ -368,16 +386,19 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
             out.append(_subst_payload(body, i, end))
             i = end + 1
         elif c == "`":
-            j = i + 1
-            while j < n and body[j] != "`":
-                j += 2 if body[j] == "\\" else 1
-            if j >= n:
-                return [*out, body[i + 1 :]], True
-            out.append(body[i + 1 : j])
+            j = _backtick_end(body, i)
+            # bash keeps the backslash of `\"` in the backticks of a body, dash drops it: both readings are checked,
+            # and a payload the two read differently is unsure
+            raw = body[i + 1 :] if j < 0 else body[i + 1 : j]
+            readings = list(dict.fromkeys([_unescape_backticks(raw), _unescape_backticks(raw, dquoted=True)]))
+            out += dict.fromkeys([raw, *readings])  # the raw text too, as before the unescaping
+            if j < 0:
+                return out, True
+            unsure = unsure or len(readings) > 1
             i = j + 1
         else:
             i += 1
-    return out, False
+    return out, unsure
 
 
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
@@ -399,11 +420,181 @@ def _simple_check(sub: str) -> str | None:
     return None
 
 
-def _tokens(sub: str) -> list[str]:
+@lru_cache(maxsize=64)
+def _split_words(sub: str) -> tuple[str, ...]:
     try:
-        return shlex.split(sub, posix=True)
+        return tuple(shlex.split(sub, posix=True))
     except ValueError:
-        return sub.split()
+        return tuple(sub.split())
+
+
+def _tokens(sub: str) -> list[str]:
+    """shlex words of ``sub``. shlex is slow and the same text is split again for each reading of a nested command, so
+    the result is cached (a copy is returned: callers edit it)."""
+    return list(_split_words(sub))
+
+
+def _unit_end(text: str, i: int) -> int:
+    """Index of the last character of the ``$(...)``, backtick or ``${...}`` at ``i``, read as one unit as the shell
+    reads it (the quotes in it are its own); -1 when none starts there, -2 when it does not close. Nested ``${`` are
+    counted, not recursed into, so no depth of them is left unread."""
+    if text.startswith("$(", i):
+        end = _match_paren(text, i + 1)
+        return end if end >= 0 else -2
+    if text.startswith("`", i):
+        end = _backtick_end(text, i)
+        return end if end >= 0 else -2
+    if not text.startswith("${", i):
+        return -1
+    depth, j, n = 1, i + 2, len(text)
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            j += 2
+        elif c in "'\"":
+            k = text.find(c, j + 1)
+            if k < 0:
+                return -2
+            j = k + 1
+        elif text.startswith("${", j):
+            depth += 1
+            j += 2
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+            j += 1
+        elif text.startswith("$(", j) or c == "`":
+            end = _unit_end(text, j)  # _match_paren or _backtick_end: no recursion
+            if end < 0:
+                return -2
+            j = end + 1
+        else:
+            j += 1
+    return -2
+
+
+def _unquoted_brace(unit: str) -> str:
+    """The text an unquoted ``${...}`` gives the command it is an argument of when its word is used: the shell removes
+    the quotes and backslashes of the word (``${x:+'`a`'}`` hands on `` `a` ``); ``$(...)`` and backticks stay as
+    written, and ``"..."`` drops only the backslashes it drops on the command line."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\":
+            out.append(unit[i + 1 : i + 2])
+            i += 2
+        elif c == "'":
+            j = unit.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(unit[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and unit[j] != '"':
+                if unit[j] == "\\" and j + 1 < n:
+                    nxt = unit[j + 1]
+                    out.append(nxt if nxt in '$`"\\' else unit[j : j + 2])
+                    j += 2
+                elif not unit.startswith("${", j) and (end := _unit_end(unit, j)) >= 0:
+                    out.append(unit[j : end + 1])
+                    j = end + 1
+                else:
+                    out.append(unit[j])
+                    j += 1
+            i = j + 1
+        elif not unit.startswith("${", i) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _dquoted_brace(unit: str) -> str:
+    """The ``${...}`` ``unit`` of a double-quoted word as the shell passes it on: bash and dash drop the backslash of
+    `` \\` ``, ``\\$``, ``\\"``, ``\\\\`` and ``\\}`` in it and remove ``\\<newline>`` (any other ``\\x`` stays), so the
+    inner shell of ``bash -c "${x:+\\`y\\`}"`` runs ``y``. The ``$(...)`` and backtick units in it are kept as written:
+    the outer shell runs them and parse reads them."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\" and i + 1 < n:
+            nxt = unit[i + 1]
+            out.append(nxt if nxt in '$`"\\}' else "" if nxt == "\n" else unit[i : i + 2])
+            i += 2
+        elif (c == "`" or unit.startswith("$(", i)) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _shell_words(sub: str, unquote_braces: bool = False, dquoted_braces: bool = True) -> list[str]:
+    """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
+    double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
+    ``bash -c "echo \\`x\\`"`` is the line the inner shell runs, and a ``$(...)``, backtick or ``${...}`` is one unit
+    whose quotes are its own (see _unit_end). With ``unquote_braces`` an unquoted ``${...}`` is read as the text its
+    word gives instead (see _unquoted_brace); with ``dquoted_braces`` a ``${...}`` in double quotes loses the
+    backslashes the shell drops there (see _dquoted_brace), without it it is kept as written. An open quote or unit
+    falls back to :func:`_tokens`."""
+    words: list[str] = []
+    word: list[str] | None = None
+    i, n = 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c in " \t\n":
+            if word is not None:
+                words.append("".join(word))
+                word = None
+            i += 1
+            continue
+        word = [] if word is None else word
+        if c == "\\":
+            word.append(sub[i + 1 : i + 2].replace("\n", ""))  # \<newline> joins lines
+            i += 2
+        elif (end := _unit_end(sub, i)) != -1:
+            if end < 0:
+                return _tokens(sub)
+            unit = sub[i : end + 1]
+            word.append(_unquoted_brace(unit) if unquote_braces and unit.startswith("${") else unit)
+            i = end + 1
+        elif c == "'":
+            j = sub.find("'", i + 1)
+            if j < 0:
+                return _tokens(sub)
+            word.append(sub[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and sub[j] != '"':
+                if sub[j] == "\\" and j + 1 < n:
+                    nxt = sub[j + 1]
+                    word.append(nxt if nxt in '$`"\\' else "" if nxt == "\n" else sub[j : j + 2])
+                    j += 2
+                elif (end := _unit_end(sub, j)) != -1:
+                    if end < 0:
+                        return _tokens(sub)
+                    unit = sub[j : end + 1]
+                    word.append(_dquoted_brace(unit) if dquoted_braces and unit.startswith("${") else unit)
+                    j = end + 1
+                else:
+                    word.append(sub[j])
+                    j += 1
+            if j >= n:
+                return _tokens(sub)
+            i = j + 1
+        else:
+            word.append(c)
+            i += 1
+    if word is not None:
+        words.append("".join(word))
+    return words
 
 
 def _strip_wrappers(tokens: list[str]) -> list[str]:
@@ -1005,15 +1196,29 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             ctx.append(("$(", -1))
         return end + 1, text[at : at + open_len] + inner.clean.strip() + ")"
 
-    def backtick(at: int) -> tuple[int, str]:
-        end = text.find("`", at + 1)
+    def backtick(at: int, dquoted: bool = False) -> tuple[int, str]:
+        """`` ` `` at ``at``: (index after the closing backtick, cleaned text). bash runs the payload unescaped."""
+        end = _backtick_end(text, at)
         if end < 0:
             out.unterminated = True
             end = n
-        cur_payloads.append(text[at + 1 : end])
-        inner_bt = _scan(text[at + 1 : end], budget, _depth + 1)
-        out.too_deep = out.too_deep or inner_bt.too_deep
-        out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        payload = _unescape_backticks(text[at + 1 : end], dquoted)
+        # the text up to the next backtick, escaped or not, is read too, as before the unescaping, and the scan goes on
+        # from there (an earlier or equal point than ``end``): it holds no backtick, so it adds one flat scan per
+        # backtick and no nesting, and the text after it is still read as commands
+        first = text.find("`", at + 1)
+        upto_next = text[at + 1 : n if first < 0 else first]
+        for p in dict.fromkeys([payload, upto_next]):
+            cur_payloads.append(p)
+            # the scan goes on inside and after the backtick, so a payload is read twice (and again at every level
+            # of nesting): its characters are charged to the budget, and past it the command is denied (check)
+            budget[0] -= len(p) or 1
+            if budget[0] < 0:
+                break
+            inner_bt = _scan(p, budget, _depth + 1)
+            out.too_deep = out.too_deep or inner_bt.too_deep
+            out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        end = n if first < 0 else min(end, first)
         return end + 1, text[at : end + 1]
 
     while i < n:
@@ -1048,7 +1253,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                     j, s = subst(j, 2)
                     piece.append(s)
                 elif d == "`":
-                    j, s = backtick(j)
+                    j, s = backtick(j, dquoted=True)
                     piece.append(s)
                 else:
                     piece.append(d)
@@ -1244,18 +1449,23 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
-    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands."""
-    toks = _tokens(sub)
+    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
+    shell unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word
+    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the
+    backslashes the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the
+    two, and shlex's reading is checked as well. Identical readings are one reading."""
     out: list[str] = []
-    pre = _strip_wrappers(toks)
-    if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
-        out.append(" ".join(pre[1:]))
-    real = normalize_argv(toks)
-    if real and real[0] in LAUNCHERS:
-        out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
-    if real:
-        out += ssh_option_commands(real[0], real[1:])
-    return out
+    readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
+    for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
+        pre = _strip_wrappers(list(toks))
+        if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
+            out.append(" ".join(pre[1:]))
+        real = normalize_argv(list(toks))
+        if real and real[0] in LAUNCHERS:
+            out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real:
+            out += ssh_option_commands(real[0], real[1:])
+    return list(dict.fromkeys(out))
 
 
 def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Parsed:
@@ -1272,7 +1482,15 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
         parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc
         return parsed
-    for payload in payloads:
+    # a unit is read in more than one way (see _scan, _body_payloads, _launcher_payloads), and each reading is a subtree
+    # of its own, so the work would multiply with every level of nesting. An identical reading is parsed once, and the
+    # characters of every reading but the first are charged to the shared budget: past it the command is denied
+    # (``scan-budget``) instead of read twice over
+    for n, payload in enumerate(dict.fromkeys(payloads)):
+        if n:
+            budget[0] -= len(payload) or 1
+        if budget[0] < 0:
+            return parsed
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])
