@@ -9,6 +9,7 @@ long opaque tokens).
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import unquote
 
@@ -20,17 +21,16 @@ _KEY_RE = re.compile(r"token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-
 _KEY_WORD_RE = re.compile(r"(?:key|Key)s?(?![a-z])|KEYS?(?![A-Z])")
 #: Config sections whose every value is a secret by default (MCP server environments and request headers).
 _SECRET_SECTIONS = frozenset({"env", "environment", "headers"})
-#: A JWT that stands free is matched from its start. One glued to a word (`x<jwt>`) is matched from the last `eyJ` of
-#: the run with 8 or more characters after it: trying every `eyJ` of a long run to its end was quadratic (K3NOX-356).
+#: Known token prefixes, bearer headers and URL user info. JWTs are found by _jwts: as one more alternative here, a
+#: JWT was tried again at every `eyJ` of a long run and scanned to the end of the run each time (quadratic, K3NOX-356).
 _PREFIXED = re.compile(
     r"(?:sk-[A-Za-z0-9_\-]{12,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|glpat-[A-Za-z0-9_\-]{16,}"
-    r"|(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"
-    r"|eyJ(?=[A-Za-z0-9_\-]{8})(?:(?!eyJ[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-])*+\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"
     r"|Bearer\s+[A-Za-z0-9._\-~+/]{16,}"
     r"|Bearer\s+(?=[A-Za-z0-9._\-~+/]*[0-9._\-~+/])[A-Za-z0-9._\-~+/]{6,}"
     r"|://[^/\s:@]+:(?![*?]+@)[^/\s@]+@)"
 )
+_TOKEN_RUN = re.compile(r"[A-Za-z0-9_\-]+")
 _OPAQUE = re.compile(r"[A-Za-z0-9_\-]{32,}")
 
 
@@ -41,10 +41,60 @@ def is_secret_key(key: str) -> bool:
     return bool(_KEY_RE.search(k) or _KEY_WORD_RE.search(k))
 
 
+def _jwts(text: str) -> Iterator[tuple[int, int]]:
+    """Each place, in order, where ``eyJ<t>{8,}\\.<t>{8,}\\.<t>{4,}`` (``<t>`` a token character) matches, with the end
+    of that match: three runs of token characters joined by single dots, the first with an ``eyJ`` 8 or more characters
+    before its end. Each run is looked at once."""
+    first = second = None
+    for third in _TOKEN_RUN.finditer(text):
+        if (
+            first is not None
+            and second is not None
+            and first.end() + 1 == second.start()
+            and second.end() + 1 == third.start()
+            and text[first.end()] == text[second.end()] == "."
+            and second.end() - second.start() >= 8
+            and third.end() - third.start() >= 4
+            and first.end() - first.start() >= 11
+        ):
+            i = text.find("eyJ", first.start(), first.end() - 8)
+            while i != -1:
+                yield i, third.end()
+                i = text.find("eyJ", i + 3, first.end() - 8)
+        first, second = second, third
+
+
+def _prefixed_spans(text: str) -> list[tuple[int, int]]:
+    """Where _PREFIXED and _jwts match, left to right and without overlap, as one regex of both did: the match that
+    starts first wins (no prefixed rule starts with ``eyJ``, so two never start at the same place)."""
+    spans: list[tuple[int, int]] = []
+    jwts = _jwts(text) if "eyJ" in text else iter(())
+    jwt, m = next(jwts, None), _PREFIXED.search(text)
+    while jwt is not None or m is not None:
+        if m is None or (jwt is not None and jwt[0] < m.start()):
+            span = jwt
+        else:
+            span = m.span()
+        spans.append(span)
+        while jwt is not None and jwt[0] < span[1]:
+            jwt = next(jwts, None)
+        if m is not None and m.start() < span[1]:
+            m = _PREFIXED.search(text, span[1])
+    return spans
+
+
+def _hide_prefixed(text: str) -> str:
+    out, last = [], 0
+    for start, end in _prefixed_spans(text):
+        out += (text[last:start], REDACTED)
+        last = end
+    return "".join(out) + text[last:]
+
+
 def looks_like_secret(value: str) -> bool:
     if value == REDACTED:
         return False
-    if _PREFIXED.search(value):
+    if _PREFIXED.search(value) or ("eyJ" in value and next(_jwts(value), None)):
         return True
     v = value.strip()
     return bool(_OPAQUE.fullmatch(v)) and any(c.isdigit() for c in v) and any(c.isalpha() for c in v)
@@ -52,11 +102,12 @@ def looks_like_secret(value: str) -> bool:
 
 _PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
 #: `DB_PASSWORD=hunter2`, `export API_KEY: "abc123"`, `client_secret = xyz` (the value stays hidden, the name stays).
-#: The name is the whole run of name characters, tried once from its start (atomic): starting again at every word
-#: start inside a long run (`a-a-a-...`) or at every keyword in it (`tokentoken...`) was quadratic (K3NOX-356).
+#: Tried once per run of name characters, from its first word start (`\b`, as before), with an atomic name: starting
+#: again at every word start inside a long run (`a-a-a-...`) or at every keyword in it (`tokentoken...`) was quadratic
+#: (K3NOX-356).
 _ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Z0-9_.\-])((?>[A-Z0-9_.\-]*?(?:password|passwd|secret|token|api[_-]?key|apikey|private[_-]?key|"
-    r"credential|access[_-]?key|auth)[A-Z0-9_.\-]*))(\s*[=:]\s*)(['\"]?)([^\s'\"<>,;]{6,})\3"
+    r"(?i)(?<![A-Z0-9_.\-])((?>[A-Z0-9_.\-]*?\b)(?>[A-Z0-9_.\-]*?(?:password|passwd|secret|token|api[_-]?key|apikey|"
+    r"private[_-]?key|credential|access[_-]?key|auth)[A-Z0-9_.\-]*))(\s*[=:]\s*)(['\"]?)([^\s'\"<>,;]{6,})\3"
 )
 _AUTH_HEADER = re.compile(
     r"(?i)\b((?:proxy-)?authorization|set-cookie|cookie|x-api-key|x-auth-token)(\s*[:=]\s*)"
@@ -139,7 +190,7 @@ def scrub_text(text: str, *, opaque: bool = False) -> str:
     exports that should keep SHAs do not.
     """
     text = _PEM.sub(REDACTED, text)
-    text = _PREFIXED.sub(REDACTED, text)
+    text = _hide_prefixed(text)
     text = _URL_USER.sub(lambda m: REDACTED if _token_shaped(m.group(0), 20) else m.group(0), text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_hide(m.group(4))}{m.group(3)}", text)
