@@ -476,6 +476,7 @@ def decide(
     session_rules: list[Rule] | None = None,
     hardline_extra: list[str] | None = None,
     headless: bool = False,
+    plan_for: PermissionMode | str | None = None,
 ) -> Decision:
     """Decide allow/ask/deny for one tool call.
 
@@ -483,8 +484,19 @@ def decide(
     ``add_dirs`` extend the readable/writable roots. Order: hardline deny,
     then mode (plan/yolo), then rules (builtin < user < project < session),
     then auto-mode conversion of ask, then headless conversion of ask.
+
+    ``plan_for``: in plan mode, the mode of the session the plan is made for (the plan-first planning turn). For an
+    auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
     mode = PermissionMode(mode)
+    # The planning turn of an auto session reads outside the roots what the session's own turns read there: toolchain
+    # and system dirs without a prompt, anything else refused with a hint. Plan mode asked a person for both, in a
+    # session whose user chose not to be asked (and the turn after the plan refuses the second kind anyway).
+    outside_reads = (
+        PermissionMode.AUTO
+        if mode == PermissionMode.PLAN and plan_for is not None and PermissionMode(plan_for) == PermissionMode.AUTO
+        else mode
+    )
     args = args or {}
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
@@ -499,12 +511,12 @@ def decide(
         path = _abs(raw, cwd_s)
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
-        dec = _decide_path(mode, tool, path, roots, ruleset)
+        dec = _decide_path(mode, tool, path, roots, ruleset, outside_reads)
         # The tools and the kernel follow a symlink before they apply a `..` (`link/../x` is `<target of link>/../x`),
         # `_abs` applied it first: decide the file that is really reached as well, and take the stricter answer.
         reached = os.path.realpath(os.path.join(cwd_s, raw))
         if tool != "glob" and reached != os.path.realpath(path):
-            dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset))
+            dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset, outside_reads))
         if tool in EDIT_TOOLS and dec.action != "deny" and (protected_path(path) or protected_path(reached)):
             # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
@@ -1290,8 +1302,18 @@ def _decide_bash(
     )
 
 
-def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], ruleset: list[Rule]) -> Decision:
+def _decide_path(
+    mode: PermissionMode,
+    tool: str,
+    path: str,
+    roots: list[str],
+    ruleset: list[Rule],
+    outside_reads: PermissionMode | None = None,
+) -> Decision:
+    """``outside_reads``: the mode whose policy decides a read outside the roots that no user/project/session rule
+    decides (default ``mode``; auto for the planning turn of an auto session, see decide)."""
     is_edit = tool in EDIT_TOOLS
+    outside_reads = outside_reads or mode
     if is_edit and mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=[path], message=PLAN_MSG)
     if not is_edit and sensitive_path(path):
@@ -1322,11 +1344,13 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
             # a read of the toolchain dirs (/usr, site-packages, node_modules ...) is never worth a prompt: every
             # mode allows it (auto logs it as an auto allow, see _finish, and alone takes /etc too). A
             # user/project/session rule still wins; credential paths were refused above.
-            if mode != PermissionMode.AUTO and not _inside(path, ["/etc"]):
+            if outside_reads != PermissionMode.AUTO and not _inside(path, ["/etc"]):
                 dec.action = "allow"
-            elif mode != PermissionMode.AUTO:
+            elif outside_reads != PermissionMode.AUTO:
                 dec.needs_human = True  # /etc outside auto: a person approves it, as before
-        elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
+            elif mode != PermissionMode.AUTO:
+                dec.action, dec.auto_allowed = "allow", True  # what _finish does for auto itself
+        elif not is_edit and rule.action == "ask" and outside_reads == PermissionMode.AUTO and rule.layer == 0:
             # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
             dec.action = "deny"
             dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
