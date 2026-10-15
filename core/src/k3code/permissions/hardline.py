@@ -811,6 +811,12 @@ _ENV_LONG_OPTS = (
 )
 #: Wrapper options whose value names a file the wrapper reads and hands on as text: ``xargs -a FILE echo`` prints FILE.
 _WRAPPER_READ_OPTS: dict[str, tuple[str, frozenset[str]]] = {"xargs": ("a", frozenset({"--arg-file"}))}
+#: Wrapper options whose value is the directory the wrapped command runs in: ``env -C DIR`` / ``--chdir``,
+#: ``sudo -D DIR`` / ``--chdir`` (git's ``-C DIR`` is handled in :func:`normalize_argv`).
+_WRAPPER_CHDIR_OPTS: dict[str, tuple[str, frozenset[str]]] = {
+    "env": ("C", frozenset({"--chdir"})),
+    "sudo": ("D", frozenset({"--chdir"})),
+}
 #: git options before the subcommand that take a value (``git -C dir push`` is ``git push``).
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"})
 #: ssh client short options taking a value.
@@ -894,7 +900,11 @@ def _env_long_option(key: str) -> str:
 
 
 def _skip_wrapper_options(
-    name: str, args: list[str], spec: tuple[str, frozenset[str], int], reads: list[str] | None = None
+    name: str,
+    args: list[str],
+    spec: tuple[str, frozenset[str], int],
+    reads: list[str] | None = None,
+    chdirs: list[str] | None = None,
 ) -> list[str]:
     """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
     none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
@@ -902,6 +912,7 @@ def _skip_wrapper_options(
     ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make' test`` runs ``make test``."""
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
+    chdir_short, chdir_long = _WRAPPER_CHDIR_OPTS.get(name, ("", frozenset()))
     args = list(args)
     i = 0
     while i < len(args):
@@ -924,6 +935,8 @@ def _skip_wrapper_options(
                 split = _tokens(value)
             if key in read_long and value and reads is not None:
                 reads.append(value)
+            if key in chdir_long and value and chdirs is not None:
+                chdirs.append(value)
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
                 if ch in short_val:
@@ -935,6 +948,8 @@ def _skip_wrapper_options(
                         split = _tokens(value)
                     if ch in read_short and value and reads is not None:
                         reads.append(value)
+                    if ch in chdir_short and value and chdirs is not None:
+                        chdirs.append(value)
                     break
         else:
             break
@@ -943,11 +958,13 @@ def _skip_wrapper_options(
     return args[i + positionals :]
 
 
-def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[str]:
+def normalize_argv(tokens: list[str], reads: list[str] | None = None, chdirs: list[str] | None = None) -> list[str]:
     """The command that really runs: leading ``VAR=x`` assignments and wrappers (sudo, env, nice, timeout, xargs,
     ...) with their options dropped, ``eval`` arguments re-split, git's global options (``-C dir``, ``-c k=v``, ...)
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
-    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS)."""
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS);
+    ``chdirs`` the directories a dropped option runs the command in (``env -C DIR``, ``sudo -D DIR``, ``git -C DIR``).
+    """
     argv = list(tokens)
     # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
     for _ in range(sum(len(t) + 1 for t in tokens) + 1):
@@ -963,12 +980,14 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[st
         if name == "git":
             i = 1
             while i < len(argv) and argv[i].startswith("-"):
+                if argv[i] == "-C" and chdirs is not None and i + 1 < len(argv):
+                    chdirs.append(argv[i + 1])
                 i += 2 if argv[i] in _GIT_VALUE_OPTS else 1
             return [name, *argv[i:]]
         spec = _WRAPPER_SPECS.get(name)
         if spec is None:
             return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec, reads)
+        rest = _skip_wrapper_options(name, argv[1:], spec, reads, chdirs)
         if not rest:
             return argv
         argv = rest

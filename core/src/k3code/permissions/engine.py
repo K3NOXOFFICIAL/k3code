@@ -985,11 +985,12 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
     return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
-def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
+def _argv(sub: str, reads: list[str] | None = None, chdirs: list[str] | None = None) -> list[str]:
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
-    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``)."""
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
+    runs the command in (``env -C DIR``, ``git -C DIR``)."""
     words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words), reads)
+    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -1430,35 +1431,65 @@ def _loops(parsed: hardline.Parsed) -> bool:
     return bool(_LOOP.search(parsed.clean)) or any(_loops(child) for child in parsed.children)
 
 
-def _cd_commands(parsed: hardline.Parsed) -> tuple[list[tuple[str, list[str]]], bool]:
-    """Every ``cd``/``pushd`` on the line, nested commands (``bash -c``, ``$(...)``, a subshell) included, as (name,
-    arguments), and whether the line sets ``CDPATH``."""
-    found: list[tuple[str, list[str]]] = []
-    cdpath = False
+#: Words that open a compound command in front of the command it runs: ``if cd ~; then ...``, ``{ cd ~; }``,
+#: ``! cd ~``, ``do cd ~``.
+_SHELL_KEYWORDS = frozenset({"!", "{", "(", "if", "then", "elif", "else", "do", "while", "until"})
+#: Commands that run text this check never reads: a sourced file, an alias, a trap.
+_RUNS_UNREAD_TEXT = frozenset({"source", ".", "alias", "trap"})
+#: Shell settings that move the directory in ways the check does not follow: a rewritten ``DIRSTACK`` that ``popd``
+#: returns to, ``cdable_vars`` (``cd x`` goes to the directory ``$x`` names).
+_CD_SETTINGS = ("DIRSTACK", "cdable_vars")
+_HOME_ASSIGNMENT = re.compile(r"^HOME\+?=")
+
+
+@dataclass
+class _CdScan:
+    """The directory changes on a command line: each ``cd``/``pushd`` as (name, arguments), and what makes the
+    directories reachable unclear: ``CDPATH`` set (a relative ``cd`` may go elsewhere), or ``unknown`` (a command the
+    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS)."""
+
+    found: list[tuple[str, list[str]]] = field(default_factory=list)
+    cdpath: bool = False
+    unknown: bool = False
+
+
+def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
+    """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
+    included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
+    ``sudo -D`` or ``git -C`` runs its command in."""
+    scan = scan or _CdScan()
     for sub in parsed.subs:
-        cdpath = cdpath or "CDPATH" in sub
-        argv = _argv(sub)
-        while len(argv) > 1 and argv[0] in ("builtin", "command"):
-            argv = argv[1:]
-        if argv and argv[0] in _CD_BUILTINS:
-            found.append((argv[0], argv[1:]))
+        scan.cdpath = scan.cdpath or "CDPATH" in sub
+        scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
+        raw = hardline.tokens(sub)
+        scan.unknown = scan.unknown or any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        chdirs: list[str] = []
+        argv = _argv(sub, None, chdirs)
+        scan.found += [("cd", [d]) for d in chdirs]
+        while argv and (argv[0] in _SHELL_KEYWORDS or argv[0] == "function" or argv[0] in ("builtin", "command")):
+            argv = argv[2:] if argv[0] == "function" else argv[1:]  # ``function NAME {``: the name is no command
+        if not argv:
+            continue
+        if "$" in argv[0] or "`" in argv[0] or argv[0] in _RUNS_UNREAD_TEXT:
+            scan.unknown = True  # ``$c ~``, ``$(echo cd) ~``, ``. ./x.sh``, ``alias c='cd ~'``
+        if argv[0] in _CD_BUILTINS:
+            scan.found.append((argv[0], argv[1:]))
     for child in parsed.children:
-        inner, inner_cdpath = _cd_commands(child)
-        found += inner
-        cdpath = cdpath or inner_cdpath
-    return found, cdpath
+        _cd_commands(child, scan)
+    return scan
 
 
 def _cd_operand(name: str, args: list[str]) -> str | None:
     """The directory ``cd``/``pushd`` is given: ``~`` for a bare ``cd``; None when the command stays in the
-    directories it has (``pushd`` alone swaps, ``pushd +1`` rotates, ``pushd -n DIR`` only records DIR)."""
+    directories it has (``pushd`` alone swaps, ``pushd +1`` rotates). ``pushd -n DIR`` does not change directory
+    itself, but ``popd`` or a bare ``pushd`` comes back to DIR, so it counts as reached."""
     operands: list[str] = []
     options_over = False
     for a in args:
         if not options_over and a == "--":
             options_over = True
         elif not options_over and a.startswith(("-", "+")) and a != "-":
-            if name == "pushd" and (a == "-n" or a[1:].isdigit()):
+            if name == "pushd" and a[1:].isdigit():
                 return None
         else:
             operands.append(a)
@@ -1502,9 +1533,10 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
     reach, each ``cd`` applied to every directory found before it (``cd ~ && cd .ssh``). One that cannot be resolved
     makes the directory unknown (``unknown``), which the credential check treats like an unknown variable."""
     start = base if isinstance(base, _Where) else _Where((base,))
-    cds, cdpath = _cd_commands(parsed)
+    scan = _cd_commands(parsed)
+    cds, cdpath = scan.found, scan.cdpath
     dirs = list(start.dirs)
-    unknown = start.unknown
+    unknown = start.unknown or scan.unknown
     passes_allowed = _CD_PASSES if _loops(parsed) else 1
     for passes in range(passes_allowed):
         grew = False

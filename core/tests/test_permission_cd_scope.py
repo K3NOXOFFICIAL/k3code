@@ -75,6 +75,26 @@ DENIED = [
     "for i in 1 2; do head .ssh/id_rsa; cd ~; done",
     # a symlink in the directory cd went to
     "cd sub && head link.txt",
+    # a keyword or a function in front of the cd
+    "if cd ~; then head .ssh/id_rsa; fi",
+    "{ cd ~; }; head .ssh/id_rsa",
+    "! cd ~; head .ssh/id_rsa",
+    "for i in 1; do cd ~; done; head .ssh/id_rsa",
+    "while cd ~; do break; done; head .ssh/id_rsa",
+    "until ! cd ~; do break; done; head .ssh/id_rsa",
+    "f(){ cd ~; }; f; head .ssh/id_rsa",
+    "function f { cd ~; }; f; head .ssh/id_rsa",
+    # a directory the stack remembers
+    "pushd -n ~; popd; head .ssh/id_rsa",
+    "pushd -n ~; pushd; head .ssh/id_rsa",
+    # the directory a wrapper runs the command in
+    "env -C ~/.ssh head id_rsa",
+    "env --chdir=~/.ssh head id_rsa",
+    "env -C ~ head .ssh/id_rsa",
+    "sudo -D ~/.ssh head id_rsa",
+    "sudo --chdir ~/.aws head credentials",
+    "git -C ~/.aws diff --no-index credentials /dev/null",
+    "git -C ~ show HEAD:.ssh/id_rsa",
     # the builtin spelled through a wrapper
     "builtin cd ~ && head .ssh/id_rsa",
     "command cd ~ && head .ssh/id_rsa",
@@ -98,6 +118,22 @@ UNKNOWN_DIR = [
     "cd $DIR && head k3code/env",
     "cd $DIR && head environ",
     "CDPATH=~ cd .ssh && head id_rsa",
+    # HOME rewritten on the line: ``~``, ``$HOME`` and a bare cd no longer mean the home directory
+    "HOME=$HOME/.ssh cd && head id_rsa",
+    "HOME=~/.ssh; cd; head id_rsa",
+    "export HOME=~/.aws; cd; head credentials",
+    # a cd that is not a literal command word, or text this check does not read
+    "c=cd; $c ~ && head .ssh/id_rsa",
+    "$(echo cd) ~; head .ssh/id_rsa",
+    "`echo cd` ~; head .ssh/id_rsa",
+    "eval \"$(printf 'cd ~')\"; head .ssh/id_rsa",
+    ". ./x.sh; head .ssh/id_rsa",
+    "source ./x.sh; head id_rsa",
+    "alias c='cd ~'\nc\nhead .ssh/id_rsa",
+    "trap 'cd ~' USR1; head .ssh/id_rsa",
+    # directory-stack and variable tricks
+    "DIRSTACK[1]=~/.ssh; popd; head id_rsa",
+    "shopt -s cdable_vars; x=~/.ssh; cd x; head id_rsa",
 ]
 
 
@@ -124,6 +160,10 @@ KEPT = [
     "cd $DIR && cat README.md",  # an unknown directory asks only for a name that could be a credential
     "cd sub && popd && cat README.md",
     "cd sub && ls -la",
+    "git -C sub status",
+    "env -C sub ls",
+    "if cd sub; then cat file.txt; fi",
+    "f(){ cd sub; }; f; cat file.txt",
 ]
 
 
