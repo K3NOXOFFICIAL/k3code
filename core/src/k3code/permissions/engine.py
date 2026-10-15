@@ -15,11 +15,14 @@ import glob
 import os
 import re
 import shlex
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+from k3code import paths
 
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
@@ -447,6 +450,43 @@ _HOME_PROTECTED = (
 )
 
 
+def _install_roots() -> list[str]:
+    """What the next start of k3code runs, as paths: the install root (``K3CODE_DATA``, and the one the running
+    process's own virtualenv sits in: ``<data>/current/venv`` or ``<data>/versions/<ver>/venv``, so a process that
+    lacks the setting the install was made with still finds it), the ``k3code`` and ``k3`` links in ``<prefix>/bin``
+    (``<data>`` is ``<prefix>/share/k3code``; also ``~/.local/bin`` and ``K3_BIN_DIR``) and the systemd user unit
+    directory with k3code's service, its recovery unit and their drop-ins."""
+    from k3code import service  # lazy: service imports the daemon, which imports this module
+
+    datas = [paths.data_dir()]
+    for venv in dict.fromkeys((Path(sys.prefix), Path(os.path.realpath(sys.prefix)))):
+        if venv.name != "venv":
+            continue  # a dev checkout's own environment is a project file, not an install
+        if venv.parent.name == "current":
+            datas.append(venv.parent.parent)
+        elif venv.parent.parent.name == "versions":
+            datas.append(venv.parent.parent.parent)
+    bins = [Path.home() / ".local" / "bin"]
+    bins += [d.parent.parent / "bin" for d in datas if d.parent.name == "share"]
+    if explicit := os.environ.get("K3_BIN_DIR"):
+        bins.append(Path(explicit).expanduser())
+    return [str(x) for x in (*datas, *(b / n for b in bins for n in ("k3code", "k3")), service.unit_dir())]
+
+
+def k3code_install(path: str) -> bool:
+    """``path`` (absolute) is k3code's own installed code, one of its launcher links or the systemd user unit
+    directory (see :func:`_install_roots`): what the next start runs, with no sandbox and no permission engine. Other
+    files in ``~/.local/bin`` are not covered. Compared like :func:`k3code_state`: as written and resolved, against
+    the locations as set and as resolved, case-insensitively."""
+    guarded = [g for root in _install_roots() for g in (os.path.normpath(root), os.path.realpath(root))]
+    guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
+
+
 def protected_path(path: str) -> bool:
     """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
     file or git config in the home directory, or under a credential directory (``~/.ssh``, ``~/.config/k3code``).
@@ -463,7 +503,7 @@ def protected_path(path: str) -> bool:
         low = p.casefold()
         if any(low == g or low.startswith(g + os.sep) for g in guarded):
             return True
-    return False
+    return k3code_install(path)
 
 
 def _stricter(a: Decision, b: Decision) -> Decision:
@@ -528,6 +568,8 @@ def decide(
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
             dec.action, dec.needs_human, dec.always_ask = "ask", True, True
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
+            if k3code_install(path) or k3code_install(reached):
+                dec.message = f"Edits k3code's own install (code, launcher, service unit); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
