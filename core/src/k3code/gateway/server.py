@@ -82,6 +82,7 @@ from k3code.gateway.protocol import (
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
+from k3code.learning import optimizer
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.memory import fenced
@@ -2060,7 +2061,13 @@ class GatewayServer:
             unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
-            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            # the session's own settings: a concurrent config experiment's treatment arm gets its clip (issue #140)
+            tool_output_chars=int(
+                (getattr(optimizer.session_settings(self.config, session.session_id), "context", None) or {}).get(
+                    "tool_output_chars", 0
+                )
+            )
+            or None,
             context_window=self._router_window(router, session),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
@@ -2590,7 +2597,8 @@ class GatewayServer:
         """
         if self.halted:  # the compaction call is a model call too
             return 0
-        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
+        own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
+        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
         messages = session.stored.messages
         if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0

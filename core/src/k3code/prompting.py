@@ -37,7 +37,13 @@ def prompt_sections(
     attended: bool = True,
     session_id: str | None = None,
 ) -> list[tuple[str, str]]:
-    """The prompt as ``(name, text)`` sections in the order they are sent."""
+    """The prompt as ``(name, text)`` sections in the order they are sent.
+
+    With ``session_id``, the settings are the session's own (``optimizer.session_settings``): a session in the
+    treatment arm of a concurrent config experiment gets its memory and skills limits."""
+    from k3code.learning.optimizer import session_settings
+
+    config = session_settings(config, session_id)
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
     # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.

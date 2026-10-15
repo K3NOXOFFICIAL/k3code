@@ -13,12 +13,17 @@ success (``turn_completion_rate``, kept as a secondary metric only). The rest of
 guards, approval prompts, and tokens per turn against the control arm's tokens per turn, rewarded as well as
 penalised. The two arms are:
 
-- ``concurrent`` (prompt overlays): each session is assigned to ``treatment`` or ``control`` by a hash of the
-  experiment id and the session id (:func:`arm`, 50/50), and control sessions are built without the overlay
-  (:func:`overlay_prompt`). Both arms see the same period.
-- ``before_after`` (config overlays): a config overlay rewrites the one shared config and the live settings every
-  session, router and process reads, so it cannot be held back from some sessions. Control is the sessions of the
-  week before the start, treatment the sessions since; a session seen in both is left out of the treatment.
+- ``concurrent`` (prompt overlays, and config overlays whose every key is in ``PER_SESSION_PATHS``): each session is
+  assigned to ``treatment`` or ``control`` by a hash of the experiment id and the session id (:func:`arm`, 50/50).
+  Control sessions are built without the overlay: a prompt overlay is left out of their system prompt
+  (:func:`overlay_prompt`), and a config overlay is not written to the shared config at all; a treatment session's
+  build reads its settings through :func:`session_settings`, which adds the patch. Both arms see the same period. A
+  config overlay that is kept is then written to the config for every session.
+- ``before_after`` (config overlays with a key outside ``PER_SESSION_PATHS``): such a key is read by something every
+  session shares (the tier routers, side calls outside any session, the per-project ranker), so it cannot be held
+  back from some sessions. The overlay rewrites the shared config and the live settings; control is the sessions of
+  the week before the start, treatment the sessions since; a session seen in both is left out of the treatment. The
+  experiment records why (``design_note``).
 
 After ``target_sessions`` counted sessions the difference ``mean(treatment) - mean(control)`` gets a 95% percentile
 bootstrap interval (:func:`bootstrap_ci`, ``BOOTSTRAP_RESAMPLES`` resamples, seeded from the experiment id, so the
@@ -33,6 +38,7 @@ judgement is reproducible). The rule (:func:`decide`), in this order:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import random
@@ -83,6 +89,17 @@ TUNABLE_PATHS = (
     "context.memory_chars",
     "context.skill_prompt_limit",
     "context.compact_input_chars",
+)
+#: Tunable settings a session's own build reads (its agent loop, system prompt, compaction and scope gate), so a config
+#: overlay on them alone can be given to the treatment arm only (:func:`session_settings`). The other tunables are read
+#: by what every session shares: ``task_tiers`` by the tier routers and by side calls made outside any session,
+#: ``router.*`` by routers built once for all sessions, ``learning.rank_threshold`` by the per-project ranker.
+PER_SESSION_PATHS = (
+    "context.tool_output_chars",
+    "context.memory_chars",
+    "context.skill_prompt_limit",
+    "context.compact_input_chars",
+    "autonomy.gate_modes",
 )
 #: Hard exclusions, checked first and never overridden: permissions, the sandbox, halt, spend and turn caps and
 #: deadlines, notification channels, and the optimizer's own gates (learning.optimizer.*, learning.enabled).
@@ -550,6 +567,25 @@ def _describe(result: dict[str, Any]) -> str:
     return f"score {result['diff']:+.3f} vs control ({CONFIDENCE:.0%} interval {lo:+.3f} to {hi:+.3f}; {arms})"
 
 
+#: How each design is named where an experiment is shown.
+DESIGN_LABELS = {"concurrent": "concurrent A/B", "before_after": "before/after", "": "baseline score (legacy)"}
+
+
+def config_design(patch: dict[str, Any]) -> tuple[str, str]:
+    """The A/B design a config overlay gets, and a note on why: ``concurrent`` when every key it patches is in
+    ``PER_SESSION_PATHS``, otherwise ``before_after`` (the note names the keys that cannot be applied per session)."""
+    shared = [p for p in _leaf_paths(patch) if not any(p == t or p.startswith(t + ".") for t in PER_SESSION_PATHS)]
+    if not shared:
+        return "concurrent", "applied per session: the treatment arm's sessions get it, the control arm's do not"
+    return "before_after", f"{', '.join(shared)} cannot be applied per session: compared with the week before"
+
+
+def describe_design(x: dict[str, Any]) -> str:
+    """The experiment's design for display, with its note when it has one."""
+    label = DESIGN_LABELS.get(str(x.get("design") or ""), str(x.get("design")))
+    return f"{label}: {x['design_note']}" if x.get("design_note") else label
+
+
 def describe_success(m: dict[str, Any]) -> str:
     """The headline metrics in one line: turn success (scored turns, pending ones, why the others failed) and, as a
     secondary number, the share of tasks that merely finished."""
@@ -613,7 +649,8 @@ class Experiments:
                 f"/optimizer rollback {busy[0]})"
             )
         per_session = baseline.get("per_session") or {}
-        if "patch" in overlay and len(per_session) < MIN_SESSIONS_PER_ARM:
+        design, note = config_design(overlay["patch"]) if "patch" in overlay else ("concurrent", "")
+        if design == "before_after" and len(per_session) < MIN_SESSIONS_PER_ARM:
             raise ValueError(
                 f"not enough history for a before/after test: {len(per_session)} control sessions, "
                 f"{MIN_SESSIONS_PER_ARM} needed"
@@ -630,9 +667,11 @@ class Experiments:
             "baseline_score": score(baseline),
             "evidence": overlay.get("evidence", {}),
             "auto": bool(overlay.get("auto")),
-            "design": "before_after" if "patch" in overlay else "concurrent",
+            "design": design,
         }
-        if "patch" in overlay:  # the week before is the control arm
+        if note:
+            exp["design_note"] = note
+        if design == "before_after":  # the week before is the control arm
             exp["control"] = per_session
         if "patch" in overlay:
             path = config_path or user_config_path()
@@ -640,11 +679,13 @@ class Experiments:
             check_patch(overlay["patch"], cur)
             check_optimizer_patch(overlay["patch"])
             _check_no_overlap(overlay["patch"], items)
-            exp.update(kind="config", patch=overlay["patch"], prev=_prev_values(cur, overlay["patch"]))
             merged = merge_patch(cur, overlay["patch"])
-            confio.validate(merged)
-            confio.write_yaml(path, merged)
-            self._sync_live(merged, overlay["patch"])
+            confio.validate(merged)  # a treatment session must be able to run with it, whichever design
+            exp.update(kind="config", patch=overlay["patch"])
+            if design == "before_after":  # the shared config changes now; a concurrent one only when kept
+                exp["prev"] = _prev_values(cur, overlay["patch"])
+                confio.write_yaml(path, merged)
+                self._sync_live(merged, overlay["patch"])
         else:
             exp.update(kind="prompt", name=overlay["name"])
             ensure_private_dir(self.overlays)
@@ -660,7 +701,7 @@ class Experiments:
         exp = next((x for x in items if x["id"] == xid), None)
         if exp is None or exp["status"] not in ("active", "kept"):
             return False
-        if exp["kind"] == "config":
+        if exp["kind"] == "config" and "prev" in exp:  # written to the config (before/after, or a kept concurrent one)
             path = config_path or user_config_path()
             cur = confio.read_yaml(path)
             _hand_over(items, exp, cur)
@@ -669,7 +710,7 @@ class Experiments:
             self._sync_live(restored, exp["patch"])
             if self.on_config_rollback is not None:
                 self.on_config_rollback(exp)
-        else:
+        elif exp["kind"] != "config":  # a prompt overlay (a concurrent config overlay not yet kept wrote nothing)
             f = self.overlays / f"{xid}-{exp['name']}.md"
             if f.is_file():
                 f.unlink()
@@ -737,8 +778,17 @@ class Experiments:
             x["after_score"], x["result"] = score(m, x.get("baseline")), result
             status = result["decision"]
             self._store_result(x, status)
-            if status == "kept":
-                msg = f"Optimizer experiment {x['id']} ({x['title']}) kept: {_describe(result)}."
+            adopt_error = ""
+            if status == "kept" and x.get("kind") == "config" and x.get("design") == "concurrent":
+                adopt_error = self._adopt(x["id"], config_path)
+            if adopt_error:
+                msg = (
+                    f"Optimizer experiment {x['id']} ({x['title']}) won its A/B but could not be written to the "
+                    f"config ({adopt_error}); nothing changed: {_describe(result)}."
+                )
+            elif status == "kept":
+                everyone = " and applied to every session" if x.get("kind") == "config" else ""
+                msg = f"Optimizer experiment {x['id']} ({x['title']}) kept{everyone}: {_describe(result)}."
             else:
                 self.rollback(x["id"], status=status, config_path=config_path)
                 msg = (
@@ -751,6 +801,30 @@ class Experiments:
             if notify:
                 notify(msg)
         return finished
+
+    def _adopt(self, xid: str, config_path: Path | None) -> str:
+        """A concurrent config overlay won its A/B: write it to the shared config and the live settings, keeping the
+        old values for a later rollback, like a before/after one at its start. Returns "" or why it could not be
+        written (the status is then ``not_applied`` and nothing changed)."""
+        items = self.all()
+        exp = next(x for x in items if x["id"] == xid)
+        path = config_path or user_config_path()
+        try:
+            cur = confio.read_yaml(path)
+            check_patch(exp["patch"], cur)
+            check_optimizer_patch(exp["patch"])
+            merged = merge_patch(cur, exp["patch"])
+            confio.validate(merged)
+            prev = _prev_values(cur, exp["patch"])
+            confio.write_yaml(path, merged)
+        except Exception as e:  # noqa: BLE001 - the config is left as it was
+            exp["status"], exp["adopt_error"] = "not_applied", str(e)[:200]
+            self._save(items)
+            return exp["adopt_error"]
+        exp["prev"], exp["adopted"] = prev, self.clock()
+        self._save(items)
+        self._sync_live(merged, exp["patch"])
+        return ""
 
     def _judge_legacy(
         self, x: dict[str, Any], m: dict[str, Any], notify: Callable[[str], None] | None, config_path: Path | None
@@ -796,7 +870,8 @@ class Experiments:
             else:  # judged before the per-session A/B
                 extra = f"  score {x['baseline_score']} → {x.get('after_score', '?')}"
             lines.append(
-                f"{x['id']} [{x['status']}] {x['title']}  ({x['sessions_done']}/{x['target_sessions']} sessions){extra}"
+                f"{x['id']} [{x['status']}] {x['title']}  ({x['sessions_done']}/{x['target_sessions']} sessions; "
+                f"{describe_design(x)}){extra}"
             )
         return "\n".join(lines)
 
@@ -867,7 +942,9 @@ def _hand_over(items: list[dict[str, Any]], exp: dict[str, Any], cur: dict[str, 
     held before ``exp``, not the value ``exp`` set.
     """
     later = [
-        x for x in items[items.index(exp) + 1 :] if x.get("kind") == "config" and x["status"] in ("active", "kept")
+        x
+        for x in items[items.index(exp) + 1 :]
+        if x.get("kind") == "config" and x["status"] in ("active", "kept") and "prev" in x
     ]
     for path in _leaf_paths(exp["patch"]):
         if _leaf_value(cur, path) == _leaf_value(exp["patch"], path):
@@ -944,6 +1021,51 @@ def propose_replayed(candidates: list[dict[str, Any]], store: ProposalStore) -> 
         )
         if p:
             out.append(p)
+    return out
+
+
+def _per_session_only(patch: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """The part of ``patch`` inside ``PER_SESSION_PATHS``; everything else is dropped."""
+    out: dict[str, Any] = {}
+    for key, value in patch.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if any(path == t or path.startswith(t + ".") for t in PER_SESSION_PATHS):
+            out[key] = value
+        elif (
+            isinstance(value, dict)
+            and any(t.startswith(path + ".") for t in PER_SESSION_PATHS)
+            and (sub := _per_session_only(value, path))
+        ):
+            out[key] = sub
+    return out
+
+
+def treatment_patch(session_id: str) -> dict[str, Any]:
+    """The config patch ``session_id`` runs with: the patches of the active concurrent config experiments whose
+    treatment arm it is in (by the same hash as the prompt overlays, :func:`arm`), merged; {} for every other
+    session. Read from ``experiments.json`` on every session build, so it is cut to ``PER_SESSION_PATHS`` here too:
+    a record edited by hand (or by a future version) never puts another setting into a session."""
+    patch: dict[str, Any] = {}
+    for x in Experiments(home()).active():
+        if x.get("kind") == "config" and x.get("design") == "concurrent" and arm(x["id"], session_id) == "treatment":
+            patch = merge_patch(patch, _per_session_only(x.get("patch") or {}))
+    return patch
+
+
+def session_settings(config: Any, session_id: str | None) -> Any:
+    """The settings one session's build reads: ``config`` with :func:`treatment_patch` merged on top, as a shallow
+    copy (``config`` itself, which every session shares, is never changed). ``config`` as it is without a session,
+    for a session in no treatment arm, and while learning is off (an experiment is not judged then, so no session
+    runs a change nobody will judge). Only keys in ``PER_SESSION_PATHS`` ever reach a concurrent experiment."""
+    if not session_id or not learning_cfg(config)["enabled"]:
+        return config
+    patch = treatment_patch(session_id)
+    if not patch:
+        return config
+    out = copy.copy(config)
+    for key, value in patch.items():
+        cur = getattr(config, key, None)
+        setattr(out, key, merge_patch(cur, value) if isinstance(cur, dict) and isinstance(value, dict) else value)
     return out
 
 

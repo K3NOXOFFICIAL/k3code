@@ -343,11 +343,12 @@ class LearningHub:
             exp = self.experiments.start(overlay, baseline, sessions=int(self.cfg["optimizer"]["ab_sessions"]))
         except Exception as e:  # noqa: BLE001
             return f"overlay not applied: {e}"
-        if "patch" in overlay:
+        if "prev" in exp:  # the shared config changed (before/after): routers built from it are stale
             self._reset_routers()
         return (
-            f"Experiment {exp['id']} started: active for at least {exp['target_sessions']} sessions, then compared "
-            f"(auto-rollback if worse or inconclusive). /optimizer status"
+            f"Experiment {exp['id']} started ({optimizer.describe_design(exp)}): active for at least "
+            f"{exp['target_sessions']} sessions, then compared (auto-rollback if worse or inconclusive). "
+            "/optimizer status"
         )
 
     def _config_rolled_back(self, exp: dict[str, Any]) -> None:
@@ -426,7 +427,8 @@ class LearningHub:
             from k3code.skills import PROMPT_LIMIT, skills_prompt
 
             cwd = session.perms.cwd
-            ctx = self.server.config.context or {}
+            # the sizes the session's prompt had: its own settings (a treatment arm's limits), not the shared ones
+            ctx = optimizer.session_settings(self.server.config, session.session_id).context or {}
             tok_in, tok_out = self.server.usage.turn_tokens(turn_id) if turn_id else (0, 0)
             skill_text = skills_prompt(
                 cwd, list(self.server.config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))
@@ -655,7 +657,8 @@ class LearningHub:
             detail={"experiment": exp["id"], "evidence": cand["evidence"]},
         )
         self._notify(
-            f"Optimizer applied automatically (experiment {exp['id']}): {cand['title']}. Replay: tokens "
+            f"Optimizer applied automatically (experiment {exp['id']}, {optimizer.describe_design(exp)}): "
+            f"{cand['title']}. Replay: tokens "
             f"-{cand['evidence']['token_reduction_pct']}%, pass drop at most "
             f"{cand['evidence']['pass_drop_points']} points. Rolled back automatically if worse."
         )
