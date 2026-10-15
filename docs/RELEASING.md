@@ -34,9 +34,9 @@ scripts/ci/check.sh --post       # full run, then set local-ci on HEAD (clean tr
 
 Areas: `core` (ruff check, ruff format --check, pytest; needs uv and bubblewrap), `tui` (npm ci, build, typecheck,
 eslint, prettier, vitest minus `tui/.ci-test-excludes`; needs Node 22+), `panes` (go build, go vet and go test on the
-packages k3 uses, never `go test ./...`; needs Go and a C compiler for `-race`), `vendor` (`scripts/vendor_check.py`),
-`secrets` (gitleaks on the commits over `origin/Main` and on uncommitted changes), `shell` (shellcheck, `sh -n` /
-`bash -n`). A missing tool fails its area with an install hint. The run is niced (`nice -n 10`); logs and a summary
+packages k3 uses, never `go test ./...`; needs Go and a C compiler for `-race`), `vendor` (`scripts/vendor_check.py`;
+the full check also builds the wheel and checks that it ships `LICENSE`, `NOTICE` and `LICENSES/`), `secrets`
+(gitleaks on the commits over `origin/Main` and on uncommitted changes), `shell` (shellcheck, `sh -n` / `bash -n`). A missing tool fails its area with an install hint. The run is niced (`nice -n 10`); logs and a summary
 table go to `.k3dev/ci/<time>/`.
 
 `npm ci` runs only when `tui/package-lock.json` changed since the last install (a hash in
@@ -125,10 +125,11 @@ already exists". Check `gh release view vX.Y.Z`; if it shows the release publish
 
 | Asset | Built with | Used by the updater |
 | --- | --- | --- |
-| `k3code-<pep440>-py3-none-any.whl` | `uv build --wheel` in `core/` | the one `*.whl`, installed into a fresh venv |
+| `k3code-<pep440>-py3-none-any.whl` | `uv build --wheel` in `core/`; `core/hatch_build.py` adds `LICENSE`, `NOTICE` and `LICENSES/` under `k3code/`, and the release stops if they are missing | the one `*.whl`, installed into a fresh venv |
 | `k3code-X.Y.Z-requirements.txt` | `uv export --locked --no-dev --no-emit-project` (hashed) | `*-requirements.txt`: the locked dependencies, for an updater that installs with `--require-hashes` (an older one downloads and ignores it) |
-| `k3code-tui-X.Y.Z.tar.gz` | `npm ci`, `build:ink`, `build`, `tar` of `tui/dist` | `k3code-tui-*.tar.gz`, unpacked into the version's `tui/` |
+| `k3code-tui-X.Y.Z.tar.gz` | `npm ci`, `build:ink`, `build`, `tar` of `tui/dist` with `LICENSE`, `NOTICE`, `LICENSES/` and `THIRD_PARTY_NOTICES.txt` (the production packages of `tui/package-lock.json`: name, version, license and license file) | `k3code-tui-*.tar.gz`, unpacked into the version's `tui/` |
 | `k3-linux-amd64`, `k3-linux-arm64`, `k3-darwin-amd64`, `k3-darwin-arm64` | `CGO_ENABLED=0 GOOS=… GOARCH=… go build -trimpath -ldflags "-s -w" ./cmd/k3` | `k3-<platform>-<arch>`, copied to the version's `bin/k3` |
+| `THIRD_PARTY_NOTICES.txt` | `scripts/release/third_party_notices.py`: `NOTICE` and `LICENSES/`, the TUI's npm packages, and the Go modules (`go list -deps -json=Module ./cmd/k3` for each platform) and Go runtime linked into the `k3` binaries, each with its license text | verified and downloaded, not installed: it is the notice for the binaries |
 | `SHA256SUMS` | `sha256sum` of every other asset | each asset it lists is verified before anything is installed |
 
 `k3code update` (`core/src/k3code/update.py`) downloads every asset of the newest release on its channel, verifies

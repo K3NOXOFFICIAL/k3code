@@ -47,7 +47,7 @@ from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
-from k3code.autonomy import advisor, auto_continue_on, autonomy_cfg, is_plain_question
+from k3code.autonomy import advisor, auto_continue_on, auto_continue_turns, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -80,21 +80,22 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, TurnEvidence, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
+from k3code.learning import optimizer
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
-from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
+from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, Rule, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
-from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
+from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, shared_netwatch
 from k3code.reliability import events as rev
 from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
@@ -115,7 +116,7 @@ from k3code.routing.tiers import (
     tier_for,
     tier_model_specs,
 )
-from k3code.session_ai import compact_messages, make_title
+from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
@@ -283,6 +284,9 @@ class LiveSession:
         #: what the scope gate made of the latest prompt (None: no gate ran), so an implicit goal whose prompt it rates
         #: trivial, or whose plan was refused or fanned out, ends after its first turn, unjudged (see _run_turn_locked)
         self.turn_gate: GateResult | None = None
+        #: what this turn's fan-out did (its workers' tests and edits, the merges and the merge tests), for the goal
+        #: judge: the turn's stored messages hold only the task and the fan-out's summary (see _run_one_turn)
+        self.fanout_evidence: TurnEvidence | None = None
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
@@ -303,6 +307,11 @@ class LiveSession:
         self.current_kind = "interactive_turn"
         #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
         self.turn_id = ""
+        #: The user stopped the turn in flight (/stop, Esc: ``interrupt_turn``); reset when the next turn starts. A
+        #: cancellation without it (daemon stop, deleted session) is not the user's verdict on the work (issue #140).
+        self.user_stopped = False
+        #: Approval prompts of the turn in flight the user answered "deny".
+        self.turn_denials = 0
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
@@ -424,6 +433,8 @@ class LiveSession:
                         )
                         for tc in (m.get("tool_calls") or [])
                     ],
+                    # kept for the next turn's persist (the history is re-stored from these): never sent to a provider
+                    meta=m.get("meta") if isinstance(m.get("meta"), dict) else None,
                 )
             )
         return out
@@ -618,6 +629,11 @@ class GatewayServer:
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
+        #: One NetWatch for the whole daemon (#109): every session's reliability bundle shares it, so there is a single
+        #: monitor loop and a single nmcli poll instead of a pair per session. None when netwatch is off in the config.
+        #: Built on first use (``_shared_netwatch``); the bundles refcount it, so it polls only while a session is live.
+        self._netwatch: Any = None
+        self._netwatch_built = False
         self.mcp = McpManager(mcpjson.merged(self.config.mcp.servers, default_project_dir()))
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
@@ -732,6 +748,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        self.learning.settle_turns(sid)  # the session ended: its last turn can no longer be undone
         await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
@@ -1618,10 +1635,22 @@ class GatewayServer:
         assert self._tiers is not None
         return self._tiers
 
+    def _shared_netwatch(self) -> Any:
+        """The daemon's single NetWatch (#109), built once from the config. None when netwatch is off. Sessions'
+        bundles share it; it is refcounted, so its monitor and nmcli poll run only while a session holds it started."""
+        if not self._netwatch_built:
+            self._netwatch = shared_netwatch(self.config)
+            self._netwatch_built = True
+        return self._netwatch
+
     async def _reliability_for(self, session: LiveSession) -> Reliability:
-        """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
+        """One Reliability bundle per session, all sharing the daemon's single NetWatch (#109): one monitor loop and
+        one nmcli poll for the whole process; each session's bundle subscribes its own forwarder so events still reach
+        that session's clients, and the idle sweeper releases a session's reference."""
         if session.reliability is None:
-            rel = build_reliability(self.config, session=session.session_id, home=self._home())
+            rel = build_reliability(
+                self.config, session=session.session_id, home=self._home(), netwatch=self._shared_netwatch()
+            )
             rel.events.add(lambda e: self._on_reliability_event(session, e), key="gateway")
             session.reliability = rel
         assert self.router is not None
@@ -1770,6 +1799,10 @@ class GatewayServer:
         pasted = text.paste_spans if isinstance(text, TypedPrompt) else ()
         prompt = text = str(text)  # the marker only says who wrote it (and which parts were pasted)
         mgr = self.goal_manager(session)
+        # a new prompt moves the session on: an /undo now removes its turn, never an earlier one, so the earlier turns'
+        # outcomes stop waiting for one (issue #140). A goal's continuations are not new prompts: /undo can still
+        # step back through them one by one.
+        self.learning.settle_turns(session.session_id)
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
@@ -1802,6 +1835,7 @@ class GatewayServer:
                     # The provider says the conversation does not fit: drop this attempt's messages, fold the older
                     # history into a summary, and run the prompt once more.
                     session.stored.messages = session.stored.messages[:n_before]
+                    self.learning.discard_turn(session.turn_id)  # this attempt is thrown away; the rerun is the turn
                     if await self._maybe_compact(session, force=True):
                         n_before = len(session.stored.messages)  # the summary replaced the history
                         status, final_text = await self._run_one_turn(session, prompt)
@@ -1833,13 +1867,13 @@ class GatewayServer:
             judge = self.goal_judge or make_judge(self._goal_completer(session))
             # no strong-tier advisor veto on an implicit goal: it would review every answered question
             reviewer = None if implicit else self._goal_reviewer(session)
+            evidence = turn_evidence(session.stored.messages[n_before:])
+            if session.fanout_evidence is not None:  # the children's work comes first, the parent's (if any) after
+                evidence = session.fanout_evidence.followed_by(evidence)
             decision = await mgr.evaluate_after_turn(
-                final_text,
-                judge,
-                cwd=session.stored.cwd or None,
-                reviewer=reviewer,
-                evidence=turn_evidence(session.stored.messages[n_before:]),
+                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer, evidence=evidence
             )
+            self.learning.turn_judged(session.turn_id, decision.verdict, decision.gate)
             self.emit_goal(session)
             if decision.message:
                 session.emit(
@@ -1871,7 +1905,8 @@ class GatewayServer:
             return
         acfg = autonomy_cfg(self.config)
         if auto_continue_on(acfg, session.perms.mode) and not is_plain_question(text):
-            mgr.set(text, implicit=True, max_turns=max(0, int(acfg["auto_continue_max_turns"])))
+            # read defensively: a value set at runtime never went through the config-load check
+            mgr.set(text, implicit=True, max_turns=auto_continue_turns(acfg))
         elif state is not None and state.implicit:
             mgr.clear()
         else:
@@ -2048,7 +2083,13 @@ class GatewayServer:
             unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
-            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            # the session's own settings: a concurrent config experiment's treatment arm gets its clip (issue #140)
+            tool_output_chars=int(
+                (getattr(optimizer.session_settings(self.config, session.session_id), "context", None) or {}).get(
+                    "tool_output_chars", 0
+                )
+            )
+            or None,
             context_window=self._router_window(router, session),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
@@ -2076,6 +2117,9 @@ class GatewayServer:
             session, call, result, failure, **kw
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
+        # MCP tools mcp_tool_search activated stay advertised in every later loop of the session (each turn, each
+        # tier), at the end of the tools array in activation order: the provider's cached prefix survives (#168)
+        loop.tools.keep_activated_in(session.stored.meta)
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
             install(loop.tools)
@@ -2159,11 +2203,15 @@ class GatewayServer:
         tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
+        session.user_stopped, session.turn_denials = False, 0
+        # where this turn's messages start in the stored conversation: an /undo that cuts there removes this turn
+        msg_start = len(session.stored.messages)
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
+        session.fanout_evidence = None  # set below when this turn fans out
         reliability = await self._reliability_for(session)
         reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
         await self.mcp.ensure_started()
@@ -2274,6 +2322,8 @@ class GatewayServer:
                 fan = await self.fanout.run(
                     session, text, gate.plan, subtasks, budget=self.fanout.budget(len(subtasks))
                 )
+                if fan is not None:  # what the children did, for the goal judge (the summary shows no tool call)
+                    session.fanout_evidence = fan.evidence
                 if fan is not None and fan.ok:
                     gate.proceed, gate.message = False, fan.summary()
                     session.stored.messages = [
@@ -2287,12 +2337,16 @@ class GatewayServer:
             if not gate.proceed:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})
+            # a goal's continuation prompt is the harness's, not the user's: marked, so /undo goes back past it to the
+            # prompt the user sent (see _session_undo); a stall prompt inside a continuation turn is part of it too
+            prompt_meta = dict(CONTINUATION_META) if session.goal_continuation else None
             while gate.proceed:
                 async for event in loop.run(
                     prompt,
                     max_tokens=config.max_tokens,
                     temperature=config.temperature,
                     history=history,
+                    prompt_meta=prompt_meta,
                 ):
                     self._on_stream_event(session, event)
                 attempt_reason = loop.escalation_reason or ""
@@ -2396,6 +2450,7 @@ class GatewayServer:
             )
             if not prompt_blocked:  # a prompt a hook refused is not a task: nothing to log or learn from
                 self.autonomy.finish(session, gate, scope_outcome, final_text, text)
+                self._record_turn_outcome(session, scope_outcome, tier.value, kind.value, msg_start)
             if self.learning.enabled and not prompt_blocked:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
@@ -2432,6 +2487,30 @@ class GatewayServer:
             self._side_tasks.add(task)
             task.add_done_callback(self._side_tasks.discard)
         return status, final_text
+
+    def _record_turn_outcome(self, session: LiveSession, status: str, tier: str, kind: str, msg_start: int) -> None:
+        """The turn's outcome signals for the improvement engine (issue #140): how it ended (``outage`` kept apart
+        from ``error``), whether the user stopped it, its last test/check (``goals.turn_evidence``), the approvals
+        denied, and its slice of the stored conversation (what an /undo of it removes). The goal judge's verdict and
+        an /undo are added later; until then the outcome is pending. Never raises: it runs in ``finally``."""
+        try:
+            messages = session.stored.messages
+            test = turn_evidence(messages[msg_start:]).last_status() if len(messages) > msg_start else None
+        except Exception:  # noqa: BLE001 - the evidence is best effort; the outcome is still recorded
+            logger.warning("turn evidence for the outcome failed", exc_info=True)
+            messages, test = session.stored.messages, None
+        self.learning.record_turn_outcome(
+            session,
+            session.turn_id,
+            status=status,
+            tier=tier,
+            kind=kind,
+            interrupted=session.user_stopped,
+            test=test,
+            denials=session.turn_denials,
+            msg_start=msg_start,
+            msg_end=len(messages),
+        )
 
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
@@ -2550,7 +2629,8 @@ class GatewayServer:
         """
         if self.halted:  # the compaction call is a model call too
             return 0
-        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
+        own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
+        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
         messages = session.stored.messages
         if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0
@@ -2567,6 +2647,9 @@ class GatewayServer:
             return 0
         if folded:
             session.stored.messages = new
+            # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
+            # be matched to its turn, so their outcomes stop waiting for one
+            self.learning.settle_turns(session.session_id)
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
             session.emit(
@@ -2688,6 +2771,12 @@ class GatewayServer:
                         "allow_session": True,
                         "tool_name": tool_name,
                         "pattern": pattern,
+                        # the rules each choice adds, as /permissions lists them: "always" on `touch a.txt` stores
+                        # `allow bash touch * [project]`, and the prompt must say so before it is stored
+                        "rules": {
+                            "session": _listed_rules(rules, "session"),
+                            "always": _listed_rules(rules, "project"),
+                        },
                     },
                     session.session_id,
                 )
@@ -2696,6 +2785,8 @@ class GatewayServer:
             choice = str(result.get("choice", "deny")).lower()
             if choice not in ("once", "session", "always"):
                 choice = "deny"
+            if choice == "deny":
+                session.turn_denials += 1
             reason = str(result.get("reason") or result.get("text") or "").strip()
             if choice in ("session", "always"):
                 session.perms.session_rules.extend(rules)
@@ -3284,6 +3375,7 @@ class GatewayServer:
             return False
         session.pending_prompts.clear()  # /stop means stop: what was queued behind the turn does not run either
         session.steer_queue.clear()
+        session.user_stopped = True  # the turn's outcome: stopped by the user (issue #140)
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
         self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
@@ -3347,6 +3439,11 @@ def _resolve_model_specs(config: Any, key: str) -> list[str | list[str]]:
     return resolved
 
 
+#: ``Message.meta`` of a user message the harness wrote to continue a goal (implicit or /goal): stored with it as
+#: ``"meta"``, never sent to a provider. /undo skips these to reach the prompt the user sent.
+CONTINUATION_META: dict[str, Any] = {"continuation": True}
+
+
 def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
@@ -3357,6 +3454,8 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
             entry["name"] = m.name
         if m.tool_calls:
             entry["tool_calls"] = [_stored_tool_call(tc) for tc in m.tool_calls]
+        if m.meta:
+            entry["meta"] = dict(m.meta)
         out.append(entry)
     return out
 
@@ -3368,6 +3467,11 @@ def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     if tc.raw_arguments is not None:
         stored["raw_arguments"] = tc.raw_arguments
     return stored
+
+
+def _listed_rules(rules: list[Rule], scope: str) -> list[str]:
+    """``allow bash touch * [project]``: rules as /permissions lists them, for the approval prompt."""
+    return [f"{r.action} {r.tool} {r.pattern} [{scope}]" for r in rules]
 
 
 async def _change_preview(tool_name: str, arguments: dict[str, Any], cwd: Path) -> str | None:
@@ -3617,6 +3721,7 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
     sid = _require(params, "session_id")
     deleted = server.store.delete(str(sid))
     live = server.live.pop(str(sid), None)
+    server.learning.settle_turns(str(sid))
     await tool_jobs.reap(str(sid))  # background bash jobs end with their session
     if live is not None:
         if live.turn_task is not None and not live.turn_task.done():
@@ -3764,6 +3869,9 @@ async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[
             "goal": h.description,
             "model": h.model or h.tier,
             "started_at": h.started_wall,
+            # how long a finished child ran (None while it runs): the TUI's strip drops a finished child a minute
+            # after its end, and without this one known only from this list never left it and kept repainting
+            "duration_seconds": h.finished_at - h.started_at if h.done and h.finished_at else None,
             "status": h.status,
             "tool_count": h.tool_count,
             "last_tool": h.last_tool,
@@ -3906,22 +4014,50 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
         _ctx_cwd.reset(token)
 
 
+def _model_capabilities(entry: Any) -> dict[str, dict[str, bool]]:
+    """``{key: {reasoning, fast}}`` for the model keys of ``entry`` whose effort support is known.
+
+    ``reasoning`` is :func:`effort.takes_effort` on the key's first model id, the test the provider applies when it
+    builds a request. A claude-cli entry passes ``--effort`` to the CLI for any model, so its keys are True there. A key
+    whose answer is unknown (no model id, a provider kind effort.py does not know) is left out: the picker then keeps
+    offering the effort step for it rather than hiding a control that may work. ``fast`` is not known per model here
+    and is always False (the field is required by the contract)."""
+    out: dict[str, dict[str, bool]] = {}
+    for key, spec in entry.models.items():
+        model = _first_model_id(spec)
+        takes = (True if model else None) if entry.kind == "claude-cli" else effort_mod.takes_effort(model, entry.kind)
+        if takes is not None:
+            out[key] = {"reasoning": takes, "fast": False}
+    return out
+
+
+def _provider_option(entry: Any, active: str) -> dict[str, Any]:
+    """One ``model.options`` provider row (the ``ModelOptionProvider`` shape the TUI picker reads)."""
+    keyed = entry.kind != "claude-cli" and bool(entry.api_key_env)  # claude-cli and keyless endpoints take no key
+    row: dict[str, Any] = {
+        "slug": entry.name,
+        "name": entry.name,
+        "models": sorted(entry.models.keys()),  # the keys /model and --provider take
+        "model_ids": {k: _first_model_id(spec) for k, spec in entry.models.items()},  # key -> the model id it sends
+        "descriptions": {k: v for k, v in entry.descriptions.items() if v},  # key -> config `descriptions` text
+        "capabilities": _model_capabilities(entry),
+        "api_url": entry.base_url,
+        "is_current": entry.name == active,
+        "auth_type": "api_key" if keyed else "none",
+        "authenticated": bool(entry.api_key) if keyed else True,
+    }
+    if keyed:
+        row["key_env"] = entry.api_key_env  # the variable's name only, never its value
+        if not entry.api_key:
+            row["warning"] = f"paste {entry.api_key_env} to activate"
+    return row
+
+
 async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     # the session asked about (else the current one): its model key and its /provider pick, not only the defaults
     session = server._session_for(params.get("session_id"))
     active = active_provider(server.config, session.stored.provider if session is not None else "")
-    providers = []
-    for p in server.config.providers:
-        providers.append(
-            {
-                "slug": p.name,
-                "name": p.name,
-                "models": sorted(p.models.keys()),  # the keys /model and --provider take
-                "model_ids": {k: _first_model_id(spec) for k, spec in p.models.items()},  # key -> the model id it sends
-                "api_url": p.base_url,
-                "is_current": p.name == active,
-            }
-        )
+    providers = [_provider_option(p, active) for p in server.config.providers]
     return {"providers": providers, "model": tune_cmd.current_model(server.config, session), "provider": active}
 
 
@@ -3940,15 +4076,115 @@ async def _tune_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, 
     return {**tune_cmd.snapshot(server, session), "ok": True, "changed": outcome.changed}
 
 
+def _keyed_provider(server: GatewayServer, params: dict[str, Any]) -> Any:
+    """The provider block ``params['slug']`` names, which must take an API key from an environment variable."""
+    slug = str(_require(params, "slug"))
+    entry = next((p for p in server.config.providers if p.name == slug), None)
+    if entry is None:
+        valid = ", ".join(p.name for p in server.config.providers) or "none configured"
+        raise _InvalidParams(f"Unknown provider: {slug} (valid: {valid})")
+    if entry.kind == "claude-cli" or not entry.api_key_env:
+        how = "it uses the Claude Code login" if entry.kind == "claude-cli" else "its endpoint takes none"
+        raise _InvalidParams(f"{slug} takes no API key ({how})")
+    # load_config: the process environment wins over the env file. Under systemd the unit loads that file
+    # (EnvironmentFile=), so a saved key is in the environment too, with the same value: that one is ours to change.
+    # A different value was exported some other way, and a key saved or removed here would be ignored.
+    from k3code.setup.state import read_env_file
+
+    exported = os.environ.get(entry.api_key_env)
+    if exported and exported != read_env_file().get(entry.api_key_env):
+        raise _InvalidParams(
+            f"{entry.api_key_env} is set in the daemon's environment, which wins over the saved keys: change or unset "
+            "it there and restart the daemon"
+        )
+    return entry
+
+
+#: What a pasted key may not contain: whitespace and control characters (a line break would add a line of its own to
+#: the env file, which systemd loads into the daemon's environment), quotes and backslashes (they change how systemd's
+#: EnvironmentFile= and read_env_file read the line; a trailing backslash joins the next line).
+_BAD_KEY_CHARS = frozenset("'\"`\\")
+
+
+def _use_saved_key(server: GatewayServer, name: str, value: str) -> None:
+    """Give every provider block whose key variable is ``name`` the key ``value`` (what load_config would read now).
+
+    The blocks are replaced, not edited, in a new list: the routers are rebuilt from it on the next turn and only the
+    changed providers are swapped (``_swap_providers``), as after a config reload; a turn in flight keeps its own. The
+    daemon's environment follows when the variable came from the env file (_keyed_provider allowed only that), as the
+    setup wizard does: a later config reload then reads the same key. Child processes never see it (child_env)."""
+    if name in os.environ:
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+    server.config.providers = [
+        p.model_copy(update={"api_key": value}) if p.api_key_env == name else p for p in server.config.providers
+    ]
+    server.router = None
+    server._tiers = None
+
+
+def _option_for(server: GatewayServer, params: dict[str, Any], slug: str) -> dict[str, Any] | None:
+    session = server._session_for(params.get("session_id"))
+    active = active_provider(server.config, session.stored.provider if session is not None else "")
+    entry = next((p for p in server.config.providers if p.name == slug), None)
+    return _provider_option(entry, active) if entry is not None else None
+
+
 async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    _require(params, "provider")
-    _require(params, "key")
-    # M1: keys come from config env vars; persisting new keys is a later milestone.
-    return {"provider": params.get("provider")}
+    """``model.save_key {slug, api_key}``: store the key of provider ``slug`` and use it from the next turn.
+
+    The key goes where the setup wizard puts it (``set_env_var``): the 0600 env file ``~/.config/k3code/env`` under the
+    variable the user's provider block names (``api_key_env``), never into config.yaml; the client cannot pick another
+    variable. The daemon reads that file at start (systemd ``EnvironmentFile=``, load_config), and the running gateway
+    uses the key from the next turn. Refused: a variable the daemon's environment sets (it would win over the saved
+    key), and one another endpoint also uses (its requests would carry this key, issues #114 and #120). Nothing
+    echoes the key: not the reply, not an error, not the log."""
+    from k3code.setup.state import set_env_var
+
+    entry = _keyed_provider(server, params)
+    key = params.get("api_key")
+    if not isinstance(key, str) or not key.strip():
+        raise _InvalidParams("missing required param: api_key")
+    key = key.strip()
+    if any(c.isspace() or not c.isprintable() or c in _BAD_KEY_CHARS for c in key):
+        raise _InvalidParams("that does not look like an API key (spaces, quotes or control characters): paste the key")
+    name = entry.api_key_env
+    url = entry.base_url.rstrip("/")
+    others = sorted(
+        {p.name for p in server.config.providers if p.api_key_env == name and p.base_url.rstrip("/") != url}
+    )
+    if others:
+        raise _InvalidParams(
+            f"{name} is also the key variable of {', '.join(others)} (another endpoint), which would then send this "
+            f"key there too: give {entry.name} a variable of its own (k3code setup --step providers) first"
+        )
+    set_env_var(name, key)
+    _use_saved_key(server, name, key)
+    logger.info("model.save_key: stored %s for provider %s", name, entry.name)
+    return {"provider": _option_for(server, params, entry.name)}
 
 
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    return {"disconnected": False}
+    """``model.disconnect {slug}``: remove the saved key of provider ``slug`` and stop using it from the next turn.
+
+    Only the line the picker or the setup wizard wrote (``api_key_env`` in ``~/.config/k3code/env``) is removed
+    (``unset_env_var``); the provider block stays in config.yaml, so pasting a key brings it back. A key in the daemon's
+    own environment is refused (_keyed_provider): the picker never says "disconnected" while that key is still used."""
+    from k3code.setup.state import unset_env_var
+
+    entry = _keyed_provider(server, params)
+    name = entry.api_key_env
+    if unset_env_var(name):
+        logger.info("model.disconnect: removed %s (provider %s) from the saved keys", name, entry.name)
+    _use_saved_key(server, name, "")
+    return {
+        "slug": entry.name,
+        "name": entry.name,
+        "disconnected": True,
+        "provider": _option_for(server, params, entry.name),
+    }
 
 
 async def _mode_session(server: GatewayServer, params: dict[str, Any]) -> LiveSession:
@@ -4248,17 +4484,37 @@ async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
     }
 
 
+def _is_continuation(message: dict[str, Any]) -> bool:
+    """A user message the harness wrote to continue a goal (``CONTINUATION_META``), not one the user sent."""
+    meta = message.get("meta")
+    return isinstance(meta, dict) and bool(meta.get("continuation"))
+
+
 async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """/undo and /retry: drop the last user message and everything after it."""
+    """/undo and /retry: drop the last user message and everything after it.
+
+    The goal's continuation prompts are no user messages here: after an auto-continued (or /goal) run, /undo drops
+    the whole run back to the prompt the user sent, as the TUI's transcript does (it never showed the continuations).
+    It used to drop only the last continuation turn, so the run's earlier turns stayed in the conversation the next
+    prompt (and /retry) went on from. ``removed``: the number of messages dropped."""
     session = server._session_for(params.get("session_id"))
     if session is None:
         raise _InvalidParams("no active session")
     if session.turn_in_flight:
         raise _InvalidParams("a turn is running in this session; /undo when it ends")
     messages = list(session.messages)
-    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    last_user = users[-1] if users else None
+    for i in reversed(users):
+        if str(messages[i].get("content") or "").startswith(SUMMARY_PREFIX):
+            break  # the run's own prompt was compacted into this summary: drop only the last turn, as before
+        if not _is_continuation(messages[i]):
+            last_user = i
+            break
     if last_user is None:
         return {"removed": 0}
+    # the turn these messages came from was rejected: its outcome is a failure, not "finished" (issue #140)
+    server.learning.turn_undone(session, last_user)
     session.messages = messages[:last_user]
     server.store.save(session.stored)
     return {"removed": len(messages) - last_user}

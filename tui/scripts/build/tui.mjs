@@ -57,7 +57,13 @@ export async function buildTui(options) {
       platform: "node",
       format: "esm",
       target: "node20",
-      outfile: out,
+      // Code that only a dynamic import() reaches goes into its own file under dist/chunks/ and is read only
+      // when that import runs. Bundled into entry.js it was parsed on every start: undici (the WebSocket for
+      // Node 20, ~30% of the bundle, never loaded on Node 22+) raised the startup peak by about 9 MB (#164).
+      outdir: join(product, "dist"),
+      entryNames: "[name]",
+      chunkNames: "chunks/[name]-[hash]",
+      splitting: true,
       jsx: "automatic",
       jsxImportSource: "react",
       // Skip the prebuilt @hermes/ink bundle and inline the source instead:
@@ -100,6 +106,13 @@ export async function buildTui(options) {
     }
     writeFileSync(
       join(product, "package.json"),
+      JSON.stringify({ type: "module" }) + "\n",
+    );
+    // The same marker inside dist/, which is all the installer copies and the release tarball ships: without
+    // one above it Node took the ESM bundle for CommonJS and parsed it twice (start-up peak ~100 MB instead of
+    // ~88 MB), and a Node without module-syntax detection could not start it (#164).
+    writeFileSync(
+      join(product, "dist", "package.json"),
       JSON.stringify({ type: "module" }) + "\n",
     );
     recordProduct({

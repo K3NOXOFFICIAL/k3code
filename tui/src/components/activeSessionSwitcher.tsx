@@ -432,7 +432,10 @@ export function ActiveSessionSwitcher({
           return [];
         }
 
-        const next = r.sessions ?? [];
+        // The daemon's running sub-agents share this list with the agent strip, but they are not sessions:
+        // picking one sent session.activate with a sub-agent id ("unknown session"). The strip and the agent
+        // view leave them out too (#170).
+        const next = (r.sessions ?? []).filter((s) => s.origin !== "subagent");
 
         // Surface a garbled/failed session.list rather than silently blanking
         // the resumable section; keep the last good raw history so a transient

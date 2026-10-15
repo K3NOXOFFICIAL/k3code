@@ -182,6 +182,14 @@ class _EffortCommand(CommandDef):
         return {"type": "message", "message": "\n".join(outcome.lines)}
 
 
+def _settle_turns(ctx: Any, live: Any) -> None:
+    """The stored conversation was rewritten: the pending turns' message ranges no longer point at their messages, so
+    an /undo could not be matched to its turn. Their outcomes stop waiting for one (issue #140)."""
+    hub = getattr(ctx, "learning", None)
+    if hub is not None:
+        hub.settle_turns(live.session_id)
+
+
 class _ClearCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="clear", help="Clear the current session transcript", aliases=["c"])
@@ -193,6 +201,7 @@ class _ClearCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
+        _settle_turns(ctx, live)
         from k3code.gateway.sessions import StoredSession
 
         stored: StoredSession | None = ctx.store.get(session_id or "")
@@ -220,6 +229,7 @@ class _CompactCommand(CommandDef):
         if not folded:
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
         live.messages = messages
+        _settle_turns(ctx, live)
         ctx.store.save(live.stored)
         note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
         return {"type": "message", "message": note}

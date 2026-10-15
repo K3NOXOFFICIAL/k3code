@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import private_file
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -152,7 +152,7 @@ class ProposalStore:
 
     def _rewrite(self, proposals: list[Proposal]) -> None:
         """Replace the file by one line per proposal, so status changes do not pile up superseded snapshots."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text("".join(json.dumps(q.as_dict(), ensure_ascii=False) + "\n" for q in proposals), encoding="utf-8")
         tmp.replace(self.path)

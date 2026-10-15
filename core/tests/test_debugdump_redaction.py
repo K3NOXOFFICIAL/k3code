@@ -891,3 +891,366 @@ def test_a_config_that_does_not_parse_refuses_the_export_without_its_parser_text
     assert refused.value.__cause__ is None and refused.value.__context__ is None
     shown = tok in "".join(traceback.format_exception(refused.value))
     assert not shown
+
+
+# K3NOX-581: a project's .mcp.json, trusted or not, names the secrets the sessions and the debug dump must not carry
+
+MCP_TOK = "Svc" + "AccessTok" + "Qz81xW4p"
+MCP_HDR = "Hdr" + "Va1ue" + "Mn27vB5qLp"
+MCP_AUTH = "Au7h" + "Sch3me" + "Vq5Lw8"
+MCP_GUESS = "orders" + "_prod_" + "eu7"  # secret by neither name nor shape: an untrusted file must not hide it
+MCP_SERVERS = {
+    "s": {"command": "srv", "env": {"API_TOKEN": MCP_TOK, "DB_NAME": MCP_GUESS}},
+    "r": {"type": "http", "url": "https://mcp.example.com/mcp", "headers": {"X-Api-Key": MCP_HDR}},
+    # a type k3code does not run is still a file a session can quote
+    "o": {"type": "sse", "url": "https://old.example.com/sse", "headers": {"Authorization": f"Token {MCP_AUTH}"}},
+}
+MCP_STATES = ["trusted", "edited after trust", "never trusted"]
+
+
+def _project_with_mcp_json(tmp_path, data, state: str = "never trusted"):
+    from k3code import trust
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = project / ".mcp.json"
+    path.write_bytes(data if isinstance(data, bytes) else json.dumps(data).encode())
+    if state != "never trusted":
+        assert trust.record(project, trusted=True)
+    if state == "edited after trust":
+        path.write_bytes(path.read_bytes() + b"\n")
+    assert (trust.decision(project) == trust.TRUSTED) is (state == "trusted")
+    return project
+
+
+@pytest.mark.parametrize("settings", [False, True], ids=["session-only", "with-settings"])
+@pytest.mark.parametrize("state", MCP_STATES)
+def test_a_project_mcp_json_hides_its_certain_values_in_the_exported_sessions(state, settings, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    project = _project_with_mcp_json(tmp_path, {"mcpServers": MCP_SERVERS}, state)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"values: {MCP_TOK} {MCP_HDR} {MCP_AUTH} and the db {MCP_GUESS}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=settings)
+    blob = _export_blob(out)
+    leaked = [v for v in (MCP_TOK, MCP_HDR, MCP_AUTH) if v in blob]
+    assert leaked == []
+    assert MCP_GUESS in blob  # certain values only: a name or shape says it is a secret
+
+
+def test_a_session_from_another_project_hides_that_projects_mcp_json_values(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    project = _project_with_mcp_json(tmp_path, {"mcpServers": MCP_SERVERS})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    store = SessionStore(tmp_path / "s.db")
+    sess = store.create(title="t", cwd=str(project))
+    sess.messages = [{"role": "tool", "content": f"the value is {MCP_TOK}"}]
+    store.save(sess)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=elsewhere, session_ids=[sess.session_id], settings=False)
+    assert MCP_TOK not in _export_blob(out)
+
+
+#: A .mcp.json that exists but names no values the export can read.
+MCP_UNREADABLE = {
+    "truncated": json.dumps({"mcpServers": {"s": {"env": {"API_TOKEN": MCP_TOK}}}})[:-2].encode(),
+    "not utf-8": b'{"mcpServers": {"s": {"env": {"API_TOKEN": "' + MCP_TOK.encode() + b'\xff"}}}}',
+    "nested too deep": b"[" * 100_000 + MCP_TOK.encode(),
+}
+
+
+@pytest.mark.parametrize("settings", [False, True], ids=["session-only", "with-settings"])
+@pytest.mark.parametrize("state", ["trusted", "never trusted"])
+@pytest.mark.parametrize("broken", list(MCP_UNREADABLE))
+def test_a_project_mcp_json_that_does_not_parse_refuses_the_export(broken, state, settings, tmp_path):
+    import traceback
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    project = _project_with_mcp_json(tmp_path, MCP_UNREADABLE[broken], state)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {MCP_TOK}")
+    out = tmp_path / "x.k3bundle"
+    with pytest.raises(bundle.BundleError, match="does not parse") as refused:
+        bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=settings)
+    assert not out.exists()
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
+    shown = MCP_TOK in "".join(traceback.format_exception(refused.value))
+    assert not shown
+
+
+def test_a_settings_only_export_does_not_read_the_project_mcp_json(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    project = _project_with_mcp_json(tmp_path, MCP_UNREADABLE["truncated"])
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=project, session_ids=[])
+    assert out.exists()
+
+
+def test_a_project_without_mcp_json_exports_as_before(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    project = tmp_path / "proj"
+    (project / ".mcp.json").mkdir(parents=True)  # not a file: nothing k3code or a session could have read
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the db is {MCP_GUESS}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert MCP_GUESS in _export_blob(out)
+
+
+@pytest.mark.parametrize("state", MCP_STATES)
+async def test_the_debug_dump_hides_the_project_mcp_json_values(state, tmp_path, monkeypatch):
+    project = _project_with_mcp_json(tmp_path, {"mcpServers": MCP_SERVERS}, state)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": f"values: {MCP_TOK} {MCP_HDR} {MCP_AUTH} and the db {MCP_GUESS}"})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    blob = "\n".join(files.values())
+    leaked = [v for v in (MCP_TOK, MCP_HDR, MCP_AUTH) if v in blob]
+    assert leaked == []
+    assert MCP_GUESS in files["events.json"]
+
+
+async def test_the_debug_dump_hides_the_mcp_json_values_of_each_dumped_sessions_project(tmp_path, monkeypatch):
+    project = _project_with_mcp_json(tmp_path, {"mcpServers": MCP_SERVERS})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(elsewhere))
+    server = make_server(config=Settings())
+    sess = server.store.create(title="t", cwd=str(project))
+    record = {"ts": 0.0, "type": "tool_result", "session": sess.session_id, "importance": None}
+    server.event_log.append({**record, "payload": {"output": f"the value is {MCP_TOK}"}})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert MCP_TOK not in files["events.json"]
+
+
+async def test_the_debug_dump_refuses_a_project_mcp_json_that_does_not_parse(tmp_path, monkeypatch):
+    project = _project_with_mcp_json(tmp_path, MCP_UNREADABLE["truncated"])
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": f"the value is {MCP_TOK}"})
+    with pytest.raises(ValueError, match="does not parse") as refused:
+        await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False)
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
+    assert not (tmp_path / "home" / "debug").exists() or not list((tmp_path / "home" / "debug").iterdir())
+
+
+# A value only an untrusted file names must not blank the word a shape needs and so keep the credential after it
+
+SHAPE_TOK = "Zq81" + "xYw9Pq2L" + "mN7tK3vB" + "Lw5"
+#: (the word a file names as a secret, a line whose credential only the shape pass hides)
+ANCHORS = [
+    ("Bearer", f'curl -H "Authorization: Bearer {SHAPE_TOK}" https://api.example.com/v1/x'),
+    ("token=", f"GET https://api.example.com/x?token={SHAPE_TOK} 401"),
+    ("password", f'password: "{SHAPE_TOK}"'),
+]
+
+
+def _poisoned_project(tmp_path, source: str, word: str):
+    import yaml
+
+    project = tmp_path / "proj"
+    if source == ".mcp.json":
+        return _project_with_mcp_json(tmp_path, {"mcpServers": {"x": {"command": "y", "env": {"API_KEY": word}}}})
+    (project / ".k3code").mkdir(parents=True)
+    servers = {"x": {"command": "y", "env": {"API_KEY": word}}}
+    (project / ".k3code" / "config.yaml").write_text(yaml.safe_dump({"mcp": {"servers": servers}}))
+    return project
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+@pytest.mark.parametrize(("word", "line"), ANCHORS, ids=[a[0] for a in ANCHORS])
+def test_an_untrusted_value_cannot_blank_the_word_a_shape_needs_in_the_export(source, word, line, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, line)
+    clean = tmp_path / "clean.k3bundle"
+    bundle.write_bundle(clean, store=store, cwd=tmp_path, session_ids=[sid], settings=False)
+    assert SHAPE_TOK not in _export_blob(clean)  # the shape pass alone hides it
+    project = _poisoned_project(tmp_path, source, word)
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    blob = _export_blob(out)
+    assert SHAPE_TOK not in blob
+    assert word not in blob  # still hidden: only later
+
+
+@pytest.mark.parametrize(("word", "line"), ANCHORS, ids=[a[0] for a in ANCHORS])
+async def test_an_untrusted_mcp_json_value_cannot_blank_the_word_a_shape_needs_in_the_debug_dump(
+    word, line, tmp_path, monkeypatch
+):
+    project = _poisoned_project(tmp_path, ".mcp.json", word)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": line})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert SHAPE_TOK not in files["events.json"]
+
+
+#: An untrusted value with a character a shape stops at, each in a line where that shape hides part of it.
+CUT_HEAD, CUT_TAIL = "Hq7" + "Lm2Xw9", "Tz4" + "Pk8Rv1"
+CUT_LINES = [
+    "API_TOKEN={v}",
+    "export API_TOKEN='{v}'",
+    'API_TOKEN="{v}"',
+    "--token {v}",
+    "?token={v}&x=1",
+    "Authorization: Bearer {v}",
+    "the password is {v}",
+    '{{"api_token": "{v}"}}',
+]
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+@pytest.mark.parametrize("sep", [",", " ", '"', "'", ";", "<"])
+def test_an_untrusted_value_a_shape_cuts_is_still_hidden_whole_in_the_export(source, sep, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    value = CUT_HEAD + sep + CUT_TAIL
+    project = _poisoned_project(tmp_path, source, value)
+    store = SessionStore(tmp_path / "s.db")
+    sids = [_session_with(store, line.format(v=value)) for line in CUT_LINES]
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=sids, settings=False)
+    blob = _export_blob(out)
+    assert CUT_HEAD not in blob and CUT_TAIL not in blob
+
+
+@pytest.mark.parametrize("sep", [",", " ", '"', "'", ";"])
+async def test_an_untrusted_mcp_json_value_a_shape_cuts_is_still_hidden_whole_in_the_debug_dump(
+    sep, tmp_path, monkeypatch
+):
+    value = CUT_HEAD + sep + CUT_TAIL
+    project = _poisoned_project(tmp_path, ".mcp.json", value)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    for line in CUT_LINES:
+        server.emit("tool_result", {"output": line.format(v=value)})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert CUT_HEAD not in files["events.json"] and CUT_TAIL not in files["events.json"]
+
+
+def test_drop_after_shapes_hides_what_a_shape_left_of_a_value_on_either_side_or_between_two():
+    from k3code.redact import drop_after_shapes
+
+    value = "ab12 cd34;ef56,gh78"
+    original = f"x={value} | {value} | {value} | s xs"
+    shaped = f"x={REDACTED} cd34;ef56,gh78 | ab12 {REDACTED} | ab12 cd34;{REDACTED};ef56{REDACTED},gh78 | s {REDACTED}s"
+    out = drop_after_shapes(shaped, original, [value])
+    assert not any(p in out for p in ("ab12", "cd34", "ef56", "gh78"))
+    assert out.endswith(f"| s {REDACTED}s")  # beside a marker but no part of the value: kept
+
+
+@pytest.mark.parametrize("source", [".mcp.json", "config.yaml"])
+def test_an_untrusted_value_that_holds_a_trusted_one_is_hidden_whole(source, tmp_path, monkeypatch):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    trusted = "AKIA" + "FAKEFAKE" + "12345678"  # in this process's environment
+    other = "wJal" + "rFAKEsecret" + "/K7MDENG+bPxRfiCY"  # only in the file
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", trusted)
+    project = _poisoned_project(tmp_path, source, f"{trusted}:{other}")
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"creds {trusted}:{other}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    blob = _export_blob(out)
+    assert trusted not in blob and other not in blob
+
+
+def test_a_long_untrusted_value_a_shape_cuts_is_still_hidden_whole(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    session = "user_session=" + "Ck81" + "xYw9Pq2LmN7tK3vB" * 3
+    cookie = "; ".join([f"pref{i}=v{i}x{i}" for i in range(60)] + [session])
+    assert len(cookie) > 800
+    project = _poisoned_project(tmp_path, "config.yaml", cookie)
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"curl -H 'Cookie: {cookie}' https://app.example.com/")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert session.split("=")[1] not in _export_blob(out)
+
+
+def test_many_long_untrusted_values_a_shape_cuts_do_not_stall_the_export(tmp_path):
+    import time
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    # each value a suffix of one run a shape hides, beside many markers: finding what is left of each is quadratic
+    values = {f"API_KEY_{k}": "a" * k + "b" for k in range(511, 311, -1)}
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": {"x": {"command": "y", "env": values}}}))
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, "token=" + "a" * 511 + "b " + ("a" * 40 + "c" + REDACTED) * 2000)
+    out = tmp_path / "x.k3bundle"
+    start = time.monotonic()
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert time.monotonic() - start < 5
+    blob = _export_blob(out)
+    assert not any(v in blob for v in values.values())
+
+
+def test_a_mcp_json_nested_deep_in_an_env_value_exports_without_a_recursion_error(tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    deep = "[" * 900 + "]" * 900
+    text = '{"mcpServers": {"s": {"env": {"API_TOKEN": "' + MCP_TOK + '", "X": ' + deep + "}}}}"
+    project = _project_with_mcp_json(tmp_path, text.encode())
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, f"the value is {MCP_TOK}")
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert MCP_TOK not in _export_blob(out)
+
+
+async def test_the_debug_dump_hides_an_untrusted_value_quoted_in_json_inside_an_event(tmp_path, monkeypatch):
+    value = 'Svc"' + "Fake" + "Qz81xW4pLm"  # a quote: JSON in an event string escapes it twice in events.json
+    data = {"mcpServers": {"x": {"command": "y", "env": {"API_TOKEN": value}}}}
+    project = _project_with_mcp_json(tmp_path, data)
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    server = make_server(config=Settings())
+    server.emit("tool_result", {"output": "$ cat .mcp.json\n" + json.dumps(data)})
+    files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path / "home", probe=False))
+    assert "Qz81xW4pLm" not in files["events.json"]
+
+
+def test_many_untrusted_values_a_shape_hides_beside_each_other_do_not_stall_the_export(tmp_path):
+    import random
+    import time
+
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+
+    rnd = random.Random(581)
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    values = {f"API_KEY_{i}": "sk-" + "".join(rnd.choice(alphabet) for _ in range(57)) for i in range(4000)}
+    data = {"mcpServers": {"x": {"command": "y", "env": values}}}
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(json.dumps(data))
+    store = SessionStore(tmp_path / "s.db")
+    sid = _session_with(store, "$ cat .mcp.json\n" + json.dumps(data, indent=1))
+    out = tmp_path / "x.k3bundle"
+    start = time.monotonic()
+    bundle.write_bundle(out, store=store, cwd=project, session_ids=[sid], settings=False)
+    assert time.monotonic() - start < 5
+    blob = _export_blob(out)
+    assert not any(v[3:] in blob for v in values.values())

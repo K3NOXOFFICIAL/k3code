@@ -194,3 +194,38 @@ def test_duplicate_provider_names_are_rejected():
     with pytest.raises(ValidationError, match="duplicate provider name 'Relay'"):
         Settings(providers=[block("relay"), block("Relay ")])
     assert len(Settings(providers=[block("relay"), block("relay-backup")]).providers) == 2
+
+
+@pytest.mark.parametrize(
+    ("text", "auto_continue", "max_turns", "warned"),
+    [
+        ("auto_continue: auto\n  auto_continue_max_turns: 3", "auto", 3, ""),
+        ("auto_continue: true\n  auto_continue_max_turns: '12'", True, 12, ""),
+        ("auto_continue: 'off'\n  auto_continue_max_turns: 0", False, 0, ""),
+        ("auto_continue_max_turns: eight", None, None, "autonomy.auto_continue_max_turns='eight' is not valid"),
+        ("auto_continue_max_turns: -1", None, None, "autonomy.auto_continue_max_turns=-1 is not valid"),
+        ("auto_continue_max_turns: 2.5", None, None, "autonomy.auto_continue_max_turns=2.5 is not valid"),
+        ("auto_continue: sometimes", None, None, "autonomy.auto_continue='sometimes' is not valid"),
+        ("auto_continue: 3", None, None, "autonomy.auto_continue=3 is not valid"),
+    ],
+)
+def test_auto_continue_settings_are_checked_at_load(tmp_path, caplog, text, auto_continue, max_turns, warned):
+    """``auto_continue_max_turns: eight`` passed the load and raised (int("eight")) at the first auto-continued prompt;
+    ``-1`` silently meant no cap. A bad value is now warned about at load and the default applies."""
+    import logging
+
+    from k3code.autonomy import auto_continue_on, autonomy_cfg
+
+    cfg_dir = Path(os.environ["K3CODE_HOME"])
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.yaml").write_text(f"autonomy:\n  {text}\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="k3code.config"):
+        config = load_config(project_dir=tmp_path)
+    acfg = autonomy_cfg(config)
+    if warned:
+        assert warned in caplog.text and "using the default" in caplog.text
+    else:
+        assert "is not valid" not in caplog.text
+    assert acfg["auto_continue"] == (auto_continue if auto_continue is not None else "auto")
+    assert acfg["auto_continue_max_turns"] == (max_turns if max_turns is not None else 8)
+    assert auto_continue_on(acfg, "auto") == (auto_continue is not False)

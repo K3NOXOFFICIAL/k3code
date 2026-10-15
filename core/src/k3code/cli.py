@@ -8,12 +8,11 @@ import logging
 import os
 import selectors
 import shlex
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
@@ -875,19 +874,45 @@ _TERMINAL_RESET = (
 )
 
 
-def _restore_terminal() -> None:
-    """Put the terminal back after a TUI that exited abnormally (OOM kill, crash): the shell would otherwise stay in
-    the alternate screen with mouse tracking and bracketed paste on and the cursor hidden. Harmless after a TUI that
-    did reset. Nothing is written when stdout is not a terminal."""
-    with contextlib.suppress(OSError, ValueError):
-        if sys.stdout.isatty():
-            sys.stdout.write(_TERMINAL_RESET)
-            sys.stdout.flush()
+#: The process the launcher becomes once the TUI is found (#164). The launcher has imported most of the gateway by
+#: then, and waiting for the TUI kept that Python process resident (about 47 MB) for the whole session. This ``sh``
+#: waiter runs the TUI (``"$@"``), puts the terminal back when the TUI did not exit cleanly (an OOM kill, a crash: the
+#: shell would otherwise stay in the alternate screen with mouse tracking and bracketed paste on and the cursor hidden,
+#: #153) when stdout is a terminal, and exits with the TUI's status (a signal death as 128 + signo, as a shell reports
+#: it). ``$1`` is the reset. The no-op INT/QUIT trap keeps the waiter alive through a Ctrl+C that reaches the whole
+#: process group before the TUI has its terminal in raw mode; the TUI itself gets those signals as usual.
+_TUI_WAITER = (
+    'trap : INT QUIT; reset=$1; shift; "$@"; rc=$?; '
+    'if [ "$rc" -ne 0 ] && [ -t 1 ]; then printf "%s" "$reset" 2>/dev/null; fi; exit "$rc"'
+)
 
 
-def _exit_status(returncode: int) -> int:
-    """A child killed by signal N has returncode -N (``sys.exit(-9)`` gives 247): report 128 + N, as a shell does."""
-    return 128 - returncode if returncode < 0 else returncode
+#: The shell the waiter runs in, by absolute path (see :func:`_waiter_shell`).
+_WAITER_SH = "/bin/sh"
+
+
+def _waiter_shell(path: str | None) -> str:
+    """The ``sh`` for the TUI's waiter: :data:`_WAITER_SH`, or where it does not exist the first ``sh`` in an absolute
+    entry of ``path`` (the PATH). Never one found through a relative entry: an empty entry or ``.`` in PATH is the
+    current directory, the project, whose ``./sh`` would then run with the TUI's environment and as its parent."""
+    if os.path.isfile(_WAITER_SH) and os.access(_WAITER_SH, os.X_OK):
+        return _WAITER_SH
+    import shutil
+
+    for entry in (path if path is not None else os.defpath).split(os.pathsep):
+        if os.path.isabs(entry) and (found := shutil.which("sh", path=entry)):
+            return found
+    return _WAITER_SH  # nothing better: execve then fails as it would have
+
+
+def _exec_tui(argv: list[str], env: dict[str, str]) -> NoReturn:
+    """Replace this process with the TUI's waiter (:data:`_TUI_WAITER`) running ``argv``."""
+    sh = _waiter_shell(env.get("PATH"))
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(OSError, ValueError):
+            stream.flush()
+    logging.shutdown()  # exec runs no atexit handlers: flush the log file now
+    os.execve(sh, [sh, "-c", _TUI_WAITER, "k3code", _TERMINAL_RESET, *argv], env)
 
 
 def _launch_tui(
@@ -944,10 +969,7 @@ def _launch_tui(
     if project_dir is not None:
         env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
-    result = subprocess.run([node, str(entry)], env=env, check=False)
-    if result.returncode != 0:
-        _restore_terminal()  # a TUI that died on a signal never ran its own exit reset
-    sys.exit(_exit_status(result.returncode))
+    _exec_tui([node, str(entry)], env)
 
 
 def _find_repo_root() -> Path | None:
@@ -1018,6 +1040,12 @@ def cli(
     max_wait: float | None,
 ) -> None:
     """k3code — terminal coding agent."""
+    from k3code.paths import tighten_home
+
+    # Every entry point passes here (the systemd unit runs `k3code daemon`): a $K3CODE_HOME that an older version made
+    # 0755 under the usual umask is made 0700 once, before anything reads or writes in it (issue #163).
+    if tighten_home():
+        logger.info("made %s owner-only (0700)", os.environ.get("K3CODE_HOME") or "~/.k3code")
     if ctx.invoked_subcommand is None:
         if prompt is None and _is_interactive():
             from k3code.setup.onboard import first_run
@@ -1590,15 +1618,16 @@ def config_edit_cmd(project: bool) -> None:
 @click.argument("action", type=click.Choice(["edit", "list"]), default="list")
 @click.option("--user", is_flag=True, help="User memory instead of project memory")
 def memory_cmd(action: str, user: bool) -> None:
-    """List memory files, or open one in $EDITOR."""
+    """List the memory files the prompt reads here (the same listing as /memory), or open one in $EDITOR."""
     from k3code.commands.config_cmd import open_editor
+    from k3code.commands.memory_cmd import memory_listing
+    from k3code.config import load_config
     from k3code.memory import project_memory_path, user_memory_path
 
     target = user_memory_path() if user else project_memory_path(Path.cwd())
     if action == "edit":
         raise SystemExit(open_editor(target))
-    for scope, p in (("user", user_memory_path()), ("project", project_memory_path(Path.cwd()))):
-        click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
+    click.echo(memory_listing(Path.cwd(), load_config(project_dir=Path.cwd()))[0])
 
 
 # ── schedule (cron jobs) ──────────────────────────────────────────────

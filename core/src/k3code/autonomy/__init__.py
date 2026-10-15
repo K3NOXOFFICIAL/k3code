@@ -86,12 +86,51 @@ DEFAULT_MIN_SCOPE = "small"
 AUTO_CONTINUE_MODES = frozenset({"auto", "yolo"})
 
 
+def auto_continue_setting(value: Any) -> bool | str | None:
+    """A valid ``autonomy.auto_continue``: True, False or "auto"; None for anything else. YAML gives the booleans;
+    the strings ``true``/``false``/``on``/``off``/``yes``/``no`` (a value set from an environment or a CLI) count as
+    them, in any case."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word == "auto":
+            return "auto"
+        if word in ("true", "on", "yes", "1"):
+            return True
+        if word in ("false", "off", "no", "0"):
+            return False
+    return None
+
+
+def auto_continue_max_turns(value: Any) -> int | None:
+    """A valid ``autonomy.auto_continue_max_turns``: a non-negative whole number (``8``, ``"8"``, ``8.0``); None for
+    anything else (``"eight"``, ``-1``, ``2.5``, ``true``, ``null``)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    return value if isinstance(value, int) and value >= 0 else None
+
+
 def auto_continue_on(cfg: dict[str, Any], mode: str) -> bool:
-    """``autonomy.auto_continue`` for a session in permission ``mode``: true/false force it, "auto" follows the mode."""
-    value = cfg.get("auto_continue")
-    if isinstance(value, str) and value.strip().lower() == "auto":
+    """``autonomy.auto_continue`` for a session in permission ``mode``: true/false force it, "auto" follows the mode.
+    An invalid value (config load warned about it) counts as the default, "auto"."""
+    value = auto_continue_setting(cfg.get("auto_continue"))
+    if value is None:
+        value = DEFAULTS["auto_continue"]
+    if value == "auto":
         return str(mode) in AUTO_CONTINUE_MODES
     return bool(value)
+
+
+def auto_continue_turns(cfg: dict[str, Any]) -> int:
+    """``autonomy.auto_continue_max_turns`` (0 = no cap); an invalid value (config load warned about it) counts as the
+    default, so a typo never removes the cap."""
+    value = auto_continue_max_turns(cfg.get("auto_continue_max_turns"))
+    return DEFAULTS["auto_continue_max_turns"] if value is None else value
 
 
 _REQUEST_OPENER = re.compile(

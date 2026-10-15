@@ -216,6 +216,54 @@ async def test_medium_risk_in_auto_is_approved_without_asking(tmp_path, monkeypa
     assert server.session.stored.messages[-1]["content"] == "implemented"
 
 
+async def test_planner_of_an_auto_session_reads_outside_the_project_as_auto_mode_does(tmp_path, monkeypatch):
+    """The planning turn ran in plan mode, which asks a person for every read outside the project: an auto session got
+    an approval prompt for a planner read that its own turns refuse without asking. The planner now decides such reads
+    as the session does: refused with the /add-dir hint (credential paths stay hard-denied, see test_engine)."""
+    proj = sub(tmp_path, "proj")
+    (sub(tmp_path, "other") / "notes.md").write_text("elsewhere\n")
+    planner_call = {"type": "tool_call", "model": "m-strong", "match": "PLANNING mode"}
+    steps = [
+        verdict("medium"),
+        {**planner_call, "when": "first", "name": "read", "arguments": {"path": "../other/notes.md"}},
+        {**planner_call, "when": "after_tool", "name": "exit_plan", "arguments": {"plan": PLAN}},
+        *EXECUTOR,
+    ]
+    server = make(proj, monkeypatch, steps, autonomy={"proposals": False})
+    await start(server, proj)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []  # no approval prompt in auto mode
+    planner_texts = [c["text"] for p in server.providers for c in p.log if "PLANNING mode" in c["text"]]
+    assert any("outside the project" in t and "/add-dir" in t for t in planner_texts)
+    assert not any("elsewhere" in t for t in planner_texts)  # the file was not read
+    assert server.session.stored.messages[-1]["content"] == "implemented"
+
+
+def test_planner_permissions_follow_the_session(tmp_path):
+    from k3code.autonomy.plan_first import planner_permissions
+    from k3code.permissions import PermissionMode, Rule
+    from k3code.permissions.state import PermissionState
+
+    session = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path / "proj", add_dirs=[str(tmp_path / "lib")])
+    perms = planner_permissions(session)
+    assert perms.mode is PermissionMode.PLAN and perms.plan_for is PermissionMode.AUTO
+    assert perms.add_dirs == session.add_dirs and perms.add_dirs is not session.add_dirs
+    session.session_rules.append(Rule(tool="read", pattern="/srv/data/*", action="allow"))
+    assert perms.decide("read", {"path": "/srv/data/a.csv"}).action == "allow"  # the session's approval holds
+    assert perms.decide("read", {"path": "/srv/other/a.csv"}).action == "deny"
+    assert perms.decide("read", {"path": "/etc/k3code-test.conf"}).action == "allow"  # as auto mode reads it
+    # still read-only whatever a rule says, and credentials stay refused
+    session.session_rules.append(Rule(tool="bash", pattern="*", action="allow"))
+    assert perms.decide("bash", {"command": "ls"}).action == "deny"
+    assert perms.decide("write", {"path": "a.py", "content": "x"}).action == "deny"
+    assert perms.decide("read", {"path": "~/.ssh/id_rsa"}).hardline == "sensitive-path"
+    # a default-mode session's planner asks a person for both, as before
+    plain = planner_permissions(PermissionState(mode=PermissionMode.DEFAULT, cwd=tmp_path / "proj"))
+    for path in ("/srv/other/a.csv", "/etc/k3code-test.conf"):
+        d = plain.decide("read", {"path": path})
+        assert d.action == "ask" and d.needs_human, (path, d)
+
+
 async def test_planner_gets_the_conversation_condensed_not_as_history(tmp_path, monkeypatch):
     """The planning turn carried the whole message history (every tool result in full) into the strong-tier call.
     It now gets the condensed transcript the advisor gets: clipped messages, the old part summarized on the cheap

@@ -100,7 +100,7 @@ def maybe_auto_clear(server: Any, home: Path | None = None, now: float | None = 
         )
         return False
     clears.append(now)
-    clears_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(clears_path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     clears_path.write_text(json.dumps(clears))
     server.background_paused = False
     server.safe_mode_notice = ""

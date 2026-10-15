@@ -134,3 +134,14 @@ def test_without_rule_files_only_the_generic_checks_run_and_it_says_so(tmp_path:
     (tree / "a.txt").write_text(f"{HOST} only\n", encoding="utf-8")
     result = _scan(tree, empty)
     assert result.returncode == 0 and "no name rules" in result.stderr
+
+
+def test_public_release_checklist_no_longer_says_the_repository_is_private() -> None:
+    """The repository is public (issue #165). docs/PUBLIC-RELEASE.md said "The repository is private" and put the
+    switch in the future; it now says it is public and keeps what only the owner can still do as open items."""
+    doc = (REPO / "docs" / "PUBLIC-RELEASE.md").read_text(encoding="utf-8")
+    assert "The repository is private" not in doc
+    assert "The repository is public" in doc
+    open_items = doc.split("## Still open", 1)[1].split("\n## ", 1)[0]
+    for owner_task in ("Dependabot", "secret", "branch protection", "first release"):
+        assert owner_task in open_items, owner_task

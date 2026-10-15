@@ -15,9 +15,10 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from k3code.config import McpServerConfig
-from k3code.paths import project_state_dir
+from k3code.paths import ensure_private_dir, project_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,35 @@ def parse(text: str) -> dict[str, McpServerConfig]:
         else:
             logger.info("%s: server %s (type %s) is not supported, skipped", FILE, name, kind)
     return out
+
+
+def as_config(project_dir: str | Path) -> dict[str, Any] | None:
+    """The file as written, trusted or not, as a config's ``mcp`` section with each server's ``env`` and ``headers``
+    only (their text, number and bool values), whatever its type: the values a session may quote, for
+    ``debugdump.secret_values`` (k3code.bundle). ``{}`` without a file; None when it exists but cannot be read or
+    parsed (a caller must not guess its values)."""
+    path = Path(project_dir) / FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    items = servers.items() if isinstance(servers, dict) else []
+    kept = {
+        str(name): {k: _scalars(spec.get(k)) for k in ("env", "headers")}
+        for name, spec in items
+        if isinstance(spec, dict)
+    }
+    return {"mcp": {"servers": kept}}
+
+
+def _scalars(section: object) -> dict[str, object]:
+    """``section``'s text, number and bool values (a nested one is no value a server gets, and walking it can recurse
+    past Python's limit)."""
+    items = section.items() if isinstance(section, dict) else []
+    return {str(k): v for k, v in items if isinstance(v, str | int | float | bool)}
 
 
 def declared(project_dir: str | Path) -> dict[str, McpServerConfig]:
@@ -88,7 +118,7 @@ def set_enabled(project_dir: str | Path, name: str, cfg: McpServerConfig | None)
     else:
         state[name] = digest(cfg)
     path = _state_path(project_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME/projects/<key>: 0700 whatever the umask (issue #163)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"enabled": state}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)

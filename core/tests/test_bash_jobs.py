@@ -147,7 +147,7 @@ async def test_background_bash_goes_through_the_bash_permission_decision(tmp_pat
         assert decide(mode="default", tool=tool, args={"job_id": "job1"}, cwd=tmp_path).action == "allow"
     # the loop files a started job under its own session
     loop.permission_mode = "yolo"
-    loop._sandbox_argv = lambda: None  # this test is about the session, not bwrap
+    loop._sandbox_argv = lambda **_: None  # this test is about the session, not bwrap
     started = await loop._execute_tool(
         ToolCall(id="c", name="bash", arguments={"command": "sleep 30", "background": True})
     )
@@ -179,7 +179,7 @@ async def test_a_finished_sub_agent_reaps_its_background_jobs(tmp_path, monkeypa
 
     def unsandboxed(self, *args, **kwargs):  # this test is about the job's owner, not bwrap
         loop = real_build(self, *args, **kwargs)
-        loop._sandbox_argv = lambda: None
+        loop._sandbox_argv = lambda **_: None
         return loop
 
     monkeypatch.setattr(runner.SubagentManager, "build_loop", unsandboxed)
@@ -227,7 +227,7 @@ def test_a_cli_run_reaps_its_background_jobs_at_exit(tmp_path, monkeypatch, mode
 
     bg = ToolCall(id="c1", name="bash", arguments={"command": "sleep 30", "background": True})
     monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [ScriptedProvider([bg, "started it"])])
-    monkeypatch.setattr(AgentLoop, "_sandbox_argv", lambda self: None)  # about the run's exit, not bwrap
+    monkeypatch.setattr(AgentLoop, "_sandbox_argv", lambda self, **_: None)  # about the run's exit, not bwrap
     started = _record_jobs(monkeypatch)
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
     config = Settings(providers=[prov], default_model="default")

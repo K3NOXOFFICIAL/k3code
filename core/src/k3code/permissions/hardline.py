@@ -15,15 +15,17 @@ import os
 import re
 import shlex
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # rm -rf / and ~ are caught by _rm_check (token based: any flag spelling, quotes, sudo/env wrappers)
+    # env / printenv dumping the environment are caught by _env_dump_check (token based: it lets `env VAR=x cmd`,
+    # `env -u X cmd` and `env -i cmd` fall through to the real command's checks, which a raw regex could not)
     ("mkfs", r"\bmkfs(?:\.\w+)?\b"),  # mkfs / mkfs.ext4 ...
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
     ("wget-pipe-to-shell", r"\bwget\b[^|]*-O\s*-\s*[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),
-    ("env-dump", r"^\s*(?:sudo\s+)?(?:env|printenv)\b"),  # env / printenv
     # (?i): drvfs (/mnt/c) and macOS open ~/.ssh for ~/.SSH and .env for .ENV
     ("ssh-key-cat", r"(?i)\bcat\b[^\n;|&]*\.ssh/"),  # cat ~/.ssh/...
     # cat .env / *.env, but not the committed templates (.env.example ...)
@@ -41,11 +43,74 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
 #: ``&&``/``;`` inside the quotes, so these run on each *simple* command (quotes kept together), never on the raw
 #: multi-command line, where ``.*`` would mix unrelated commands.
 _REMOTE_HOSTS = ("protected-host-a", "protected-host-b")
-HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
+_SSH_RESTART_PATTERNS = [
     (f"{host}-{what}-restart", rf"\bssh\b.*\b{host}\b.*\b{tool}\b.*\b(?:restart|stop|kill|down|rm)\b")
     for host in _REMOTE_HOSTS
     for what, tool in (("service", "systemctl"), ("docker", "docker"), ("compose", "docker-compose"))
 ]
+
+#: A Windows drive target whose recursive deletion wipes the host (issue #169): a drive root (``C:``, ``C:\``, ``C:/``),
+#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``), the Windows directory (``C:\Windows``) or the installed
+#: programs (``C:\Program Files``, ``C:\Program Files (x86)``, ``C:\ProgramData``), with ``/`` or ``\`` separators. A
+#: string fragment (no flags), used inside the case-insensitive launcher patterns below; backslashes survive here
+#: because these run on the raw simple command, before the posix tokenizer (which would eat them) ever sees it.
+#: ``Program Files`` has a space in it, so it counts only where the quoted word (or the command) ends after it:
+#: ``"C:\Program Files Custom"`` is another folder.
+_WIN_DRIVE_DIR = (
+    r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows|programdata"
+    r"|program files(?: \(x86\))?(?=[\\/]?(?:\*(?:\.\*)?)?(?:[\"']|$))))?"
+)
+#: The user's profile (or the system drive or Windows directory) named through a variable: cmd's ``%USERPROFILE%``
+#: (``%HOMEDRIVE%%HOMEPATH%``, ``%SystemDrive%``, ``%SystemRoot%``, ``%windir%``), PowerShell's ``$env:USERPROFILE``
+#: (``${env:...}``) and ``$HOME``, and ``~``. It must start a word, so ``backup~`` is a file name, not the profile.
+_WIN_VARS = r"(?:userprofile|homedrive|homepath|systemdrive|systemroot|windir)"
+_WIN_PROFILE_VAR = (
+    r"(?:(?<=[\s\"'=(,:])|^)"
+    r"(?:(?:%" + _WIN_VARS + r"%)+|(?:\$\{?env:" + _WIN_VARS + r"\}?)+|\$\{?home\}?|~)"
+)
+#: A whole-tree target: one of the two above, then an optional separator and the ``*`` / ``*.*`` wildcard of everything
+#: in it (``C:\*``, ``C:\*.*``, ``%USERPROFILE%\*``), then the end of the word (``(?=[\s"']|$)``). That end stops it at
+#: the word's end, so a *deeper* path such as ``C:\Users\<name>\project`` or ``$env:USERPROFILE\proj\build`` -- an
+#: ordinary project folder -- is NOT one of these.
+_WIN_DRIVE = r"(?:" + _WIN_DRIVE_DIR + "|" + _WIN_PROFILE_VAR + r")[\\/]?(?:\*(?:\.\*)?)?(?=[\s\"']|$)"
+#: PowerShell's ``-Recurse``: any unambiguous prefix of it (``-r``, ``-rec``, ``-Recurse``; Remove-Item has no other
+#: parameter starting with r), starting a word, after a hyphen or the en/em dash PowerShell also accepts.
+_PS_RECURSE = r"(?<![\w-])[-\u2013\u2014]r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b"
+#: Remove-Item and the PowerShell aliases for it.
+_PS_REMOVE = r"\b(?:remove-item|rm|ri|del|erase|rd|rmdir)\b"
+
+#: A verb that is the command being run: at the start of the simple command, right after a launcher token
+#: (``powershell Format-Volume``), or after a launcher's opening quote (``cmd /c "diskpart"``). Keeps the format/
+#: diskpart rules below off prose and filenames. A string fragment used inside those case-insensitive patterns.
+_WIN_CMD_POS = r"(?:^\s*|\b(?:cmd(?:\.exe)?|powershell|pwsh(?:\.exe)?)\b[^\"'\n]*[\s\"'])"
+
+#: Windows / WSL destroyers, matched on each simple command (``cmd /c "..."`` and ``powershell -Command "..."`` keep
+#: their quoted script in the sub, so the verb and target are visible). The recursive-delete rules fire only with a
+#: launcher (or the verb starting the command) AND a recursive flag AND a whole-tree target from :data:`_WIN_DRIVE`,
+#: in any order; ``rmdir /s /q build`` or ``Remove-Item -Recurse .\build`` has no such target, so a project subfolder
+#: delete is never caught.
+_WINDOWS_PATTERNS: list[tuple[str, str]] = [
+    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows / the programs
+    (
+        "win-cmd-recursive-delete",
+        r"(?i)(?:\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)|^\s*(?:del|erase|rd|rmdir)\b)"
+        r"(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
+    ),
+    # powershell|pwsh (with -Command/-c or bare)  Remove-Item or an alias of it ... -Recurse  on those targets
+    (
+        "win-powershell-recursive-delete",
+        r"(?i)(?:\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*" + _PS_REMOVE + r")|^\s*remove-item\b)"
+        r"(?=.*" + _PS_RECURSE + r")(?=.*" + _WIN_DRIVE + ")",
+    ),
+    # Format-Volume (PowerShell cmdlet), diskpart (partition tool) and the legacy `format X:` command only count as the
+    # command being run, not as a word in prose or a filename (`cat notes-about-diskpart.md`, `echo "run diskpart"`):
+    # _WIN_CMD_POS requires the verb to start the simple command, follow a launcher's quote (`cmd /c "diskpart ..."`),
+    # or directly follow a launcher token (`powershell Format-Volume ...`).
+    ("win-format-volume", r"(?i)" + _WIN_CMD_POS + r"format-volume\b"),
+    ("win-format-drive", r"(?i)" + _WIN_CMD_POS + r"format\s+[A-Za-z]:[\\/]?(?=[\s\"']|$)"),
+    ("win-diskpart", r"(?i)" + _WIN_CMD_POS + r"diskpart(?:\.exe)?\b"),
+]
+HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [*_SSH_RESTART_PATTERNS, *_WINDOWS_PATTERNS]
 
 #: Every hardline rule by name, for display (/permissions, the setup wizard): the regex ones, the token-based rm check
 #: (see _rm_check) and the per-command ssh checks.
@@ -59,6 +124,7 @@ HARDLINE_NAMES: list[str] = [
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
+    "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -87,6 +153,92 @@ _WRAPPERS = frozenset(
         "chrt",
     }
 )
+#: Windows interpreters reached from a WSL install through interop: ``powershell.exe``, ``cmd.exe``, ``pwsh``,
+#: ``wsl.exe`` and the classic script hosts all run arbitrary code from their arguments, so they count as launchers
+#: (never an ``always allow <prefix>`` rule) and the hardline looks inside what they are told to run. Matched after
+#: lower-casing and dropping a Windows executable suffix, because drvfs (``/mnt/c``) is case-insensitive and interop
+#: invokes ``foo.exe``: ``PowerShell.exe`` and ``/mnt/c/.../powershell.exe`` are the same program (issue #169).
+WINDOWS_LAUNCHERS = frozenset(
+    {
+        "powershell",
+        "pwsh",
+        "cmd",
+        "wsl",
+        "wslg",
+        "cscript",
+        "wscript",
+        "mshta",
+        "rundll32",
+        "regsvr32",
+    }
+)
+#: How interop spells a Windows interpreter binary (``powershell.exe``); not script/data suffixes like ``.ps1``.
+_WINDOWS_EXEC_SUFFIX = re.compile(r"\.(?:exe|com|bat)$")
+
+
+def _windows_program(name: str) -> str:
+    """``name`` (an argv0 basename) lower-cased and without a Windows executable suffix: ``PowerShell.EXE`` ->
+    ``powershell``."""
+    return _WINDOWS_EXEC_SUFFIX.sub("", name.lower())
+
+
+def _windows_launcher(name: str) -> bool:
+    """``name`` (an argv0 basename) is a Windows interpreter reached through WSL interop (see WINDOWS_LAUNCHERS)."""
+    return _windows_program(name) in WINDOWS_LAUNCHERS
+
+
+#: wsl.exe options that take a value; ``-e``/``--exec``/``--`` end its options.
+_WSL_VALUE_OPTS = frozenset({"-d", "--distribution", "--distribution-id", "-u", "--user", "--cd", "--shell-type"})
+#: PowerShell parameters that take a value (lower case, no leading ``-``): any prefix of one is the parameter, as
+#: PowerShell accepts abbreviations (``-ExecutionPol``). Aliases that are no prefix are listed apart.
+_PS_VALUE_PARAMS = (
+    *("executionpolicy", "windowstyle", "version", "psconsolefile", "inputformat", "outputformat"),
+    *("configurationname", "configurationfile", "settingsfile", "workingdirectory", "custompipename"),
+)
+_PS_VALUE_ALIASES = frozenset({"ep", "if", "of", "wd"})
+
+
+def _windows_command_line(name: str, args: list[str]) -> list[str]:
+    """The command line a Windows launcher runs from its arguments, joined as it joins them: ``wsl.exe [options]
+    <command ...>`` (also after ``-e``/``--exec``/``--``), ``cmd.exe ... /c <command ...>`` (``/k``, ``/r``) and
+    ``powershell.exe ... -Command <command ...>`` (any prefix of ``-Command``, or the first positional argument, which
+    Windows PowerShell runs as the command). Read like the script of ``bash -c``, so the hardline sees an unquoted
+    ``wsl.exe rm -rf ~`` or ``cmd.exe /c wsl rm -rf ~`` (issue #169). ``-File`` and ``-EncodedCommand`` give none."""
+    prog = _windows_program(name)
+    rest: list[str] = []
+    if prog == "wsl":
+        i = 1 if args[:1] == ["~"] else 0  # `wsl ~ ...` starts in the home directory
+        while i < len(args) and args[i].startswith("-"):
+            i += 1
+            if args[i - 1] in ("-e", "--exec", "--"):
+                break
+            if args[i - 1] in _WSL_VALUE_OPTS:
+                i += 1
+        rest = args[i:]
+    elif prog == "cmd":
+        for i, a in enumerate(args):
+            if a[:2].lower() in ("/c", "/k", "/r"):
+                rest = [a[2:], *args[i + 1 :]] if a[2:] else args[i + 1 :]
+                break
+    elif prog in ("powershell", "pwsh"):
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a[:1] not in ("-", "/"):
+                rest = args[i:]
+                break
+            word, colon, _ = a.lstrip("-/").lower().partition(":")
+            if word and "command".startswith(word):
+                rest = args[i + 1 :]
+                break
+            encoded = word in ("e", "ec") or (len(word) > 1 and "encodedcommand".startswith(word))
+            if word and ("file".startswith(word) or encoded):
+                break
+            value = word in _PS_VALUE_ALIASES or any(p.startswith(word) for p in _PS_VALUE_PARAMS)
+            i += 2 if word and value and not colon else 1
+    return [" ".join(rest)] if rest else []
+
+
 #: Commands that run arbitrary code from their arguments: an "always allow <prefix>" rule must never be offered for
 #: them (one click on `python3 *` or `ssh *` would otherwise allow everything).
 LAUNCHERS = frozenset(
@@ -141,16 +293,23 @@ _WILDCARD_UNSAFE_PAIRS = frozenset(
 )
 
 
+def _is_launcher_name(name: str) -> bool:
+    """``name`` (an argv0 basename) runs code from its arguments: a POSIX launcher (LAUNCHERS) or a Windows
+    interpreter reached through WSL interop (WINDOWS_LAUNCHERS)."""
+    return name in LAUNCHERS or _windows_launcher(name)
+
+
 def wildcard_unsafe(command: str) -> bool:
     """``command`` (or a rule pattern) starts with a command that must never get a ``<prefix> *`` rule (see
-    WILDCARD_UNSAFE), including ``git -c key=value ...`` (a config value can name a program to run)."""
+    WILDCARD_UNSAFE and WINDOWS_LAUNCHERS), including ``git -c key=value ...`` (a config value can name a program to
+    run)."""
     toks = _tokens(command)
     while toks and _is_assignment(toks[0]):
         toks = toks[1:]
     if not toks:
         return False
     root = os.path.basename(toks[0])
-    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES):
+    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES) or _windows_launcher(root):
         return True
     if root == "git":
         i = 1
@@ -188,6 +347,43 @@ _DANGEROUS_RM_TARGETS = frozenset(
     }
 )
 
+#: Top-level folders of a Windows drive whose recursive delete wipes the host side (lower case, as drvfs folds case):
+#: ``rm -rf`` of the drive, one of these or a profile below ``Users`` wipes the Windows host from inside WSL (issue
+#: #169). A deeper path such as ``/mnt/c/Users/nils/project`` is a project folder and is left alone (see
+#: windows_rm_target).
+_WINDOWS_DRIVE_SUBDIRS = frozenset({"users", "windows", "program files", "program files (x86)", "programdata"})
+#: The default WSL automount: a Windows drive is mounted at ``/mnt/<letter>``. A custom ``automount.root`` is read
+#: from /proc/mounts instead (see :func:`k3code.permissions.engine.windows_drives`).
+_DEFAULT_MNT_DRIVE = re.compile(r"^(/mnt/[a-z])(?:/|$)")
+
+
+def _windows_drive_of(base: str, drives: list[str]) -> str | None:
+    """The Windows drive root ``base`` (lower case) sits on or is: a drvfs mount from ``drives``, or the default
+    ``/mnt/<letter>`` automount."""
+    for d in drives:
+        d = d.rstrip("/")
+        if base == d or base.startswith(d + "/"):
+            return d
+    m = _DEFAULT_MNT_DRIVE.match(base)
+    return m.group(1) if m else None
+
+
+def windows_rm_target(base: str, drives: list[str]) -> bool:
+    """``base`` (an expanded rm target, lower case, a trailing ``/*`` glob allowed) is a Windows drive root, a drive
+    glob, one of its system folders (Users, Windows, ...) or a profile root ``<drive>/Users/<name>`` under one of the
+    WSL ``drives`` or the default ``/mnt/<letter>``. Deleting any of these wipes the host side of a WSL install."""
+    if base.endswith("/*"):
+        base = base[:-2]
+    drive = _windows_drive_of(base, drives)
+    if drive is None:
+        return False
+    if base == drive:
+        return True
+    rest = base[len(drive) + 1 :].split("/")
+    if len(rest) == 1 and rest[0] in _WINDOWS_DRIVE_SUBDIRS:
+        return True
+    return len(rest) == 2 and rest[0] == "users"  # a per-user profile root (its name is not known in advance)
+
 
 def check(
     command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
@@ -222,7 +418,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
             or _simple_check(sub)
             or _rm_check(argv, cwd, home)
             or _git_push_check(argv)
-            or _env_dump_check(argv)
+            or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
@@ -302,12 +498,29 @@ def _subst_payload(text: str, at: int, end: int) -> str:
     return text[at + 1 : end + 1] if text.startswith("$((", at) else text[at + 2 : end]
 
 
+def _backtick_end(text: str, at: int) -> int:
+    """Index of the backtick that closes the one at ``at``: the first one no backslash escapes; -1 when none does."""
+    j, n = at + 1, len(text)
+    while j < n and text[j] != "`":
+        j += 2 if text[j] == "\\" else 1
+    return j if j < n else -1
+
+
+def _unescape_backticks(payload: str, dquoted: bool = False) -> str:
+    """The command bash runs for a backtick ``payload``: a backslash before `` ` ``, ``\\`` or ``$`` (in double quotes
+    also before ``"``) is dropped, any other stays (``\\x`` is ``\\x``)."""
+    escaped = '\\`$"' if dquoted else "\\`$"
+    return re.sub(r"\\([\s\S])", lambda m: m.group(1) if m.group(1) in escaped else m.group(0), payload)
+
+
 def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str], bool]:
     """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
-    unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
-    ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)`` runs)."""
+    unterminated or read differently by bash and dash. Quotes mean nothing in a body, a backslash escapes the next
+    character (``\\$(x)`` is text) and ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)``
+    runs)."""
     body = re.sub(r"\\([\s\S])", lambda m: "" if m.group(1) == "\n" else m.group(0), body)
     out: list[str] = []
+    unsure = False
     i, n = 0, len(body)
     while i < n:
         c = body[i]
@@ -320,16 +533,19 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
             out.append(_subst_payload(body, i, end))
             i = end + 1
         elif c == "`":
-            j = i + 1
-            while j < n and body[j] != "`":
-                j += 2 if body[j] == "\\" else 1
-            if j >= n:
-                return [*out, body[i + 1 :]], True
-            out.append(body[i + 1 : j])
+            j = _backtick_end(body, i)
+            # bash keeps the backslash of `\"` in the backticks of a body, dash drops it: both readings are checked,
+            # and a payload the two read differently is unsure
+            raw = body[i + 1 :] if j < 0 else body[i + 1 : j]
+            readings = list(dict.fromkeys([_unescape_backticks(raw), _unescape_backticks(raw, dquoted=True)]))
+            out += dict.fromkeys([raw, *readings])  # the raw text too, as before the unescaping
+            if j < 0:
+                return out, True
+            unsure = unsure or len(readings) > 1
             i = j + 1
         else:
             i += 1
-    return out, False
+    return out, unsure
 
 
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
@@ -351,11 +567,181 @@ def _simple_check(sub: str) -> str | None:
     return None
 
 
-def _tokens(sub: str) -> list[str]:
+@lru_cache(maxsize=64)
+def _split_words(sub: str) -> tuple[str, ...]:
     try:
-        return shlex.split(sub, posix=True)
+        return tuple(shlex.split(sub, posix=True))
     except ValueError:
-        return sub.split()
+        return tuple(sub.split())
+
+
+def _tokens(sub: str) -> list[str]:
+    """shlex words of ``sub``. shlex is slow and the same text is split again for each reading of a nested command, so
+    the result is cached (a copy is returned: callers edit it)."""
+    return list(_split_words(sub))
+
+
+def _unit_end(text: str, i: int) -> int:
+    """Index of the last character of the ``$(...)``, backtick or ``${...}`` at ``i``, read as one unit as the shell
+    reads it (the quotes in it are its own); -1 when none starts there, -2 when it does not close. Nested ``${`` are
+    counted, not recursed into, so no depth of them is left unread."""
+    if text.startswith("$(", i):
+        end = _match_paren(text, i + 1)
+        return end if end >= 0 else -2
+    if text.startswith("`", i):
+        end = _backtick_end(text, i)
+        return end if end >= 0 else -2
+    if not text.startswith("${", i):
+        return -1
+    depth, j, n = 1, i + 2, len(text)
+    while j < n:
+        c = text[j]
+        if c == "\\":
+            j += 2
+        elif c in "'\"":
+            k = text.find(c, j + 1)
+            if k < 0:
+                return -2
+            j = k + 1
+        elif text.startswith("${", j):
+            depth += 1
+            j += 2
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+            j += 1
+        elif text.startswith("$(", j) or c == "`":
+            end = _unit_end(text, j)  # _match_paren or _backtick_end: no recursion
+            if end < 0:
+                return -2
+            j = end + 1
+        else:
+            j += 1
+    return -2
+
+
+def _unquoted_brace(unit: str) -> str:
+    """The text an unquoted ``${...}`` gives the command it is an argument of when its word is used: the shell removes
+    the quotes and backslashes of the word (``${x:+'`a`'}`` hands on `` `a` ``); ``$(...)`` and backticks stay as
+    written, and ``"..."`` drops only the backslashes it drops on the command line."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\":
+            out.append(unit[i + 1 : i + 2])
+            i += 2
+        elif c == "'":
+            j = unit.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(unit[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and unit[j] != '"':
+                if unit[j] == "\\" and j + 1 < n:
+                    nxt = unit[j + 1]
+                    out.append(nxt if nxt in '$`"\\' else unit[j : j + 2])
+                    j += 2
+                elif not unit.startswith("${", j) and (end := _unit_end(unit, j)) >= 0:
+                    out.append(unit[j : end + 1])
+                    j = end + 1
+                else:
+                    out.append(unit[j])
+                    j += 1
+            i = j + 1
+        elif not unit.startswith("${", i) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _dquoted_brace(unit: str) -> str:
+    """The ``${...}`` ``unit`` of a double-quoted word as the shell passes it on: bash and dash drop the backslash of
+    `` \\` ``, ``\\$``, ``\\"``, ``\\\\`` and ``\\}`` in it and remove ``\\<newline>`` (any other ``\\x`` stays), so the
+    inner shell of ``bash -c "${x:+\\`y\\`}"`` runs ``y``. The ``$(...)`` and backtick units in it are kept as written:
+    the outer shell runs them and parse reads them."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\" and i + 1 < n:
+            nxt = unit[i + 1]
+            out.append(nxt if nxt in '$`"\\}' else "" if nxt == "\n" else unit[i : i + 2])
+            i += 2
+        elif (c == "`" or unit.startswith("$(", i)) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _shell_words(sub: str, unquote_braces: bool = False, dquoted_braces: bool = True) -> list[str]:
+    """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
+    double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
+    ``bash -c "echo \\`x\\`"`` is the line the inner shell runs, and a ``$(...)``, backtick or ``${...}`` is one unit
+    whose quotes are its own (see _unit_end). With ``unquote_braces`` an unquoted ``${...}`` is read as the text its
+    word gives instead (see _unquoted_brace); with ``dquoted_braces`` a ``${...}`` in double quotes loses the
+    backslashes the shell drops there (see _dquoted_brace), without it it is kept as written. An open quote or unit
+    falls back to :func:`_tokens`."""
+    words: list[str] = []
+    word: list[str] | None = None
+    i, n = 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c in " \t\n":
+            if word is not None:
+                words.append("".join(word))
+                word = None
+            i += 1
+            continue
+        word = [] if word is None else word
+        if c == "\\":
+            word.append(sub[i + 1 : i + 2].replace("\n", ""))  # \<newline> joins lines
+            i += 2
+        elif (end := _unit_end(sub, i)) != -1:
+            if end < 0:
+                return _tokens(sub)
+            unit = sub[i : end + 1]
+            word.append(_unquoted_brace(unit) if unquote_braces and unit.startswith("${") else unit)
+            i = end + 1
+        elif c == "'":
+            j = sub.find("'", i + 1)
+            if j < 0:
+                return _tokens(sub)
+            word.append(sub[i + 1 : j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and sub[j] != '"':
+                if sub[j] == "\\" and j + 1 < n:
+                    nxt = sub[j + 1]
+                    word.append(nxt if nxt in '$`"\\' else "" if nxt == "\n" else sub[j : j + 2])
+                    j += 2
+                elif (end := _unit_end(sub, j)) != -1:
+                    if end < 0:
+                        return _tokens(sub)
+                    unit = sub[j : end + 1]
+                    word.append(_dquoted_brace(unit) if dquoted_braces and unit.startswith("${") else unit)
+                    j = end + 1
+                else:
+                    word.append(sub[j])
+                    j += 1
+            if j >= n:
+                return _tokens(sub)
+            i = j + 1
+        else:
+            word.append(c)
+            i += 1
+    if word is not None:
+        words.append("".join(word))
+    return words
 
 
 def _strip_wrappers(tokens: list[str]) -> list[str]:
@@ -387,7 +773,7 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
         0,
     ),
     "doas": ("uC", frozenset(), 0),
-    "env": ("uSC", frozenset({"--unset", "--split-string", "--chdir"}), 0),
+    "env": ("uSCa", frozenset({"--unset", "--split-string", "--chdir", "--argv0", "--env0-from"}), 0),
     "xargs": (
         "nIPdLaEs",
         frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file", "--eof", "--max-chars"}),
@@ -404,6 +790,25 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
     "taskset": ("", frozenset(), 1),
     "setsid": ("", frozenset(), 0),
 }
+#: Every long option of GNU env (``--argv0``/``-a`` and ``--env0-from`` are newer than coreutils 9.4). getopt_long
+#: takes any unambiguous prefix of one (``env --u PATH`` is ``env --unset PATH``), so :func:`_env_long_option`
+#: resolves a prefix against the whole list, not only the ones taking a value.
+_ENV_LONG_OPTS = (
+    "--ignore-environment",
+    "--null",
+    "--unset",
+    "--chdir",
+    "--split-string",
+    "--argv0",
+    "--env0-from",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+    "--list-signal-handling",
+    "--debug",
+    "--help",
+    "--version",
+)
 #: Wrapper options whose value names a file the wrapper reads and hands on as text: ``xargs -a FILE echo`` prints FILE.
 _WRAPPER_READ_OPTS: dict[str, tuple[str, frozenset[str]]] = {"xargs": ("a", frozenset({"--arg-file"}))}
 #: git options before the subcommand that take a value (``git -C dir push`` is ``git push``).
@@ -480,12 +885,24 @@ def ssh_option_commands(name: str, args: list[str]) -> list[str]:
     return out
 
 
+def _env_long_option(key: str) -> str:
+    """The env long option ``key`` names: itself, or the one option it is an unambiguous prefix of."""
+    if key in _ENV_LONG_OPTS:
+        return key
+    hits = [opt for opt in _ENV_LONG_OPTS if opt.startswith(key)]
+    return hits[0] if len(hits) == 1 else key
+
+
 def _skip_wrapper_options(
     name: str, args: list[str], spec: tuple[str, frozenset[str], int], reads: list[str] | None = None
 ) -> list[str]:
+    """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
+    none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
+    option's place and are parsed in turn as env's own options, assignments and command, so ``env -S '-u PATH'`` is
+    ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make' test`` runs ``make test``."""
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
-    prefix: list[str] = []  # env -S "cmd args" splits its value into the command
+    args = list(args)
     i = 0
     while i < len(args):
         a = args[i]
@@ -495,18 +912,19 @@ def _skip_wrapper_options(
         if name == "env" and (a == "-" or _is_assignment(a)):
             i += 1
             continue
+        split: list[str] = []  # env -S: the words that take the option's place
         if a.startswith("--"):
             key, eq, value = a.partition("=")
+            if name == "env":
+                key = _env_long_option(key)
             if key in long_val and not eq:
                 i += 1
                 value = args[i] if i < len(args) else ""
             if name == "env" and key == "--split-string":
-                prefix += _tokens(value)
+                split = _tokens(value)
             if key in read_long and value and reads is not None:
                 reads.append(value)
-            i += 1
-            continue
-        if a.startswith("-") and len(a) > 1:
+        elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
                 if ch in short_val:
                     value = a[k + 1 :]
@@ -514,14 +932,15 @@ def _skip_wrapper_options(
                         i += 1
                         value = args[i] if i < len(args) else ""
                     if name == "env" and ch == "S":
-                        prefix += _tokens(value)
+                        split = _tokens(value)
                     if ch in read_short and value and reads is not None:
                         reads.append(value)
                     break
-            i += 1
-            continue
-        break
-    return prefix + args[i + positionals :]
+        else:
+            break
+        i += 1
+        args[i:i] = split  # STRING's words are never longer than STRING, so this ends
+    return args[i + positionals :]
 
 
 def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[str]:
@@ -530,7 +949,8 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[st
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS)."""
     argv = list(tokens)
-    for _ in range(len(tokens) + 1):  # every round drops at least one token
+    # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
+    for _ in range(sum(len(t) + 1 for t in tokens) + 1):
         while argv and _is_assignment(argv[0]):
             argv = argv[1:]
         if not argv:
@@ -692,14 +1112,47 @@ def _git_push_check(argv: list[str]) -> str | None:
     return None
 
 
-def _env_dump_check(argv: list[str]) -> str | None:
-    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript."""
+def _env_dump_check(sub: str) -> str | None:
+    """``env`` / ``printenv`` / ``export -p`` / ``set`` / ``declare -x`` printing the environment (secrets) to the
+    transcript.
+
+    Decided on the *normalised* argv of the simple command ``sub`` (see :func:`normalize_argv`), so that a wrapped run —
+    ``env FOO=1 make test``, ``env -u X cmd``, ``env -i cmd``, ``env -C dir cmd`` — is *not* an environment dump: there
+    ``env`` only sets up the environment of ``cmd`` and reduces to ``cmd``, whose own checks still apply (``env X=1 rm
+    -rf /`` is refused as the rm rule). Only a bare ``env`` / ``printenv`` with no command to run prints the
+    environment: it reduces to ``env`` / ``printenv`` itself (``env``, ``env -i``, ``env -u X``, ``env X=1``, ``sudo
+    env``, ``FOO=1 env``, ``env -S printenv``, and ``env -S 'X=1'`` / ``env -S -0`` / ``nice env -S X=1``, whose -S
+    words are env's own options and assignments). A redirection (``env > file``, ``env 2>/dev/null``) is not a wrapped
+    command: the redirect words are dropped first, so those stay refused (a pipe such as ``env | grep`` is already its
+    own simple command ``env``).
+
+    The shell builtins that list variables with their values when given no name: ``set``, ``export`` (``-p``, ``-n``,
+    ``--``) and ``declare`` / ``typeset`` (``-x``, ``-p``, ``-g``, none, ...); ``export -f`` and ``declare -f``/``-F``
+    list functions instead. ``compgen -e`` / ``-v`` print variable names only, never a value, and are left alone."""
+    argv = normalize_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
-    name, args = argv[0], argv[1:]
-    if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
+    name, args = os.path.basename(argv[0]), argv[1:]
+    if name in ("env", "printenv") or (name == "set" and not args):
         return "env-dump"
+    if name in ("export", "declare", "typeset"):
+        options, names = _builtin_options(args)
+        if not names and not (set(options) & set("fF")):
+            return "env-dump"
     return None
+
+
+def _builtin_options(args: list[str]) -> tuple[str, list[str]]:
+    """The option letters (``-x``/``+x`` alike) of a bash builtin's ``args`` and its operands, which start at the first
+    word that is not an option or right after ``--``."""
+    letters = ""
+    for i, a in enumerate(args):
+        if a == "--":
+            return letters, args[i + 1 :]
+        if len(a) < 2 or a[0] not in "-+":
+            return letters, args[i:]
+        letters += a[1:]
+    return letters, []
 
 
 _HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
@@ -752,11 +1205,16 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     if not recursive:
         return None
     dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
+    from .engine import windows_drives  # engine imports this module
+
+    drives = windows_drives()
     for t in targets:
         target = _expand_target(t, cwd, home) if t else t
         if target in dangerous:
             homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
             return "rm-rf-home" if homeish else "rm-rf-root"
+        if target and windows_rm_target(target.lower(), drives):
+            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
     return None
 
 
@@ -780,6 +1238,9 @@ class Parsed:
     unterminated: bool = False
     #: a comment that contains a quote character (an old trick to hide the next line inside a "quote")
     comment_quote: bool = False
+    #: a comment with a quote character that ends the text (``npm test  # don't watch``): nothing follows it to hide,
+    #: so it does not count as comment_quote at the top level (see _scan; a nested payload's still counts, see parse)
+    tail_comment_quote: bool = False
     pipelines: list[list[str]] = field(default_factory=list)  # the subs grouped by | and |&
     clean: str = ""  # the line without comments, line continuations and heredoc bodies (what the regexes see)
     #: $(...)/`...`/<(...) payloads per sub, those of its unquoted heredoc bodies included
@@ -943,15 +1404,29 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             ctx.append(("$(", -1))
         return end + 1, text[at : at + open_len] + inner.clean.strip() + ")"
 
-    def backtick(at: int) -> tuple[int, str]:
-        end = text.find("`", at + 1)
+    def backtick(at: int, dquoted: bool = False) -> tuple[int, str]:
+        """`` ` `` at ``at``: (index after the closing backtick, cleaned text). bash runs the payload unescaped."""
+        end = _backtick_end(text, at)
         if end < 0:
             out.unterminated = True
             end = n
-        cur_payloads.append(text[at + 1 : end])
-        inner_bt = _scan(text[at + 1 : end], budget, _depth + 1)
-        out.too_deep = out.too_deep or inner_bt.too_deep
-        out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        payload = _unescape_backticks(text[at + 1 : end], dquoted)
+        # the text up to the next backtick, escaped or not, is read too, as before the unescaping, and the scan goes on
+        # from there (an earlier or equal point than ``end``): it holds no backtick, so it adds one flat scan per
+        # backtick and no nesting, and the text after it is still read as commands
+        first = text.find("`", at + 1)
+        upto_next = text[at + 1 : n if first < 0 else first]
+        for p in dict.fromkeys([payload, upto_next]):
+            cur_payloads.append(p)
+            # the scan goes on inside and after the backtick, so a payload is read twice (and again at every level
+            # of nesting): its characters are charged to the budget, and past it the command is denied (check)
+            budget[0] -= len(p) or 1
+            if budget[0] < 0:
+                break
+            inner_bt = _scan(p, budget, _depth + 1)
+            out.too_deep = out.too_deep or inner_bt.too_deep
+            out.unterminated = out.unterminated or inner_bt.open_heredoc or inner_bt.open_bracket
+        end = n if first < 0 else min(end, first)
         return end + 1, text[at : end + 1]
 
     while i < n:
@@ -986,7 +1461,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
                     j, s = subst(j, 2)
                     piece.append(s)
                 elif d == "`":
-                    j, s = backtick(j)
+                    j, s = backtick(j, dquoted=True)
                     piece.append(s)
                 else:
                     piece.append(d)
@@ -1001,7 +1476,15 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             eol = text.find("\n", i)
             eol = n if eol < 0 else eol
             if any(q in text[i:eol] for q in "'\"`"):
-                out.comment_quote = True
+                # A quote only hides something when text follows the comment: a shell that did not take the `#` as
+                # a comment would read the quote as opening a string that swallows the next lines. In a comment that
+                # ends the text (no open bracket either) it would only open a string that never closes: a syntax
+                # error, and the shell runs nothing of that line. Such a comment is recorded apart, and parse()
+                # counts it only where the text goes on after it (a $(...) payload, a `bash -c` string).
+                if text[eol:].strip() or ctx:
+                    out.comment_quote = True
+                else:
+                    out.tail_comment_quote = True
             i = eol
         elif text.startswith(("$(", "<(", ">("), i):
             i, s = subst(i, 2)
@@ -1181,19 +1664,26 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 
 
 def _launcher_payloads(sub: str) -> list[str]:
-    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
-    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands."""
-    toks = _tokens(sub)
+    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
+    values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and the command line of ``wsl.exe``, ``cmd.exe /c``
+    and ``powershell.exe -Command`` (see _windows_command_line): strings run as commands, unquoted as the shell
+    unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word gives
+    (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the backslashes
+    the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the two, and
+    shlex's reading is checked as well. Identical readings are one reading."""
     out: list[str] = []
-    pre = _strip_wrappers(toks)
-    if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
-        out.append(" ".join(pre[1:]))
-    real = normalize_argv(toks)
-    if real and real[0] in LAUNCHERS:
-        out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
-    if real:
-        out += ssh_option_commands(real[0], real[1:])
-    return out
+    readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
+    for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
+        pre = _strip_wrappers(list(toks))
+        if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
+            out.append(" ".join(pre[1:]))
+        real = normalize_argv(list(toks))
+        if real and _is_launcher_name(real[0]):
+            out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real:
+            out += ssh_option_commands(real[0], real[1:])
+            out += _windows_command_line(real[0], real[1:])
+    return list(dict.fromkeys(out))
 
 
 def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Parsed:
@@ -1210,12 +1700,21 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
         parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc
         return parsed
-    for payload in payloads:
+    # a unit is read in more than one way (see _scan, _body_payloads, _launcher_payloads), and each reading is a subtree
+    # of its own, so the work would multiply with every level of nesting. An identical reading is parsed once, and the
+    # characters of every reading but the first are charged to the shared budget: past it the command is denied
+    # (``scan-budget``) instead of read twice over
+    for n, payload in enumerate(dict.fromkeys(payloads)):
+        if n:
+            budget[0] -= len(payload) or 1
+        if budget[0] < 0:
+            return parsed
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
-        parsed.comment_quote = parsed.comment_quote or inner.comment_quote
+        # the outer text goes on after a payload ($(...), `bash -c '...'`): a quote in its last comment still counts
+        parsed.comment_quote = parsed.comment_quote or inner.comment_quote or inner.tail_comment_quote
         parsed.too_deep = parsed.too_deep or inner.too_deep
     # a heredoc a shell runs is its script (`bash <<'EOF'`, `cat <<EOF | sh`): checked like `bash -c "..."`, except for
     # its quotes (a stray one in a comment of a long script is not worth a prompt). The program of another
@@ -1266,10 +1765,10 @@ def command_prefix(sub_command: str) -> str:
 def is_launcher(sub_command: str) -> bool:
     """True when the command runs code given in its arguments (shells, ssh, interpreters, xargs, find, sudo ...)."""
     tokens = _tokens(sub_command)
-    if tokens and os.path.basename(tokens[0]) in LAUNCHERS:
+    if tokens and _is_launcher_name(os.path.basename(tokens[0])):
         return True
     real = _strip_wrappers(tokens)
-    return bool(real) and os.path.basename(real[0]) in LAUNCHERS
+    return bool(real) and _is_launcher_name(os.path.basename(real[0]))
 
 
 #: Shell tokenising for the engine's argument checks (quote-aware, wrappers such as sudo/env stripped).

@@ -28,8 +28,8 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { beforeAll, describe, expect, it } from "vitest";
@@ -73,7 +73,19 @@ beforeAll(() => {
     );
   }
 
-  bundleSrc = readFileSync(bundlePath, "utf8");
+  // entry.js and the chunks under dist/chunks/ that its import()s load (the build splits them out, #164)
+  const files = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory()
+        ? files(join(dir, e.name))
+        : e.name.endsWith(".js")
+          ? [join(dir, e.name)]
+          : [],
+    );
+
+  bundleSrc = files(dirname(bundlePath))
+    .map((f) => readFileSync(f, "utf8"))
+    .join("\n");
 }, 180_000);
 
 describe("TUI bundle (issue #31227)", () => {

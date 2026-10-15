@@ -479,7 +479,8 @@ async def test_auto_fanout_keeps_a_reviewer_slot_for_every_parallel_worker(tmp_p
 
 async def test_auto_fanout_token_cap_stops_it(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
-    # t1's worker spends 2 calls x 350 tokens; with a 300-token cap its reviewer and every later child is refused
+    # t1's worker would spend 2 calls x 350 tokens; with a 300-token cap it is stopped after its first call (it used
+    # to run to the end, 700 tokens), and its reviewer and every later child is refused
     usage = {"type": "usage", "match": "YOUR subtask (t1)", "prompt_tokens": 200, "completion_tokens": 150}
     steps = steps_for(SUBS, extra=[usage, PARENT_TAKES_OVER], sleep=0)
     server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=1, max_tokens=300, test_command="true")
@@ -488,7 +489,8 @@ async def test_auto_fanout_token_cap_stops_it(tmp_path, monkeypatch):
     assert starts(server) == 1 and starts(server, "reviewer") == 0
     done = events(server, "fanout.done")[0]
     assert not done["ok"] and done["merged"] == 0
-    assert "Stopped early: token budget exhausted (700/300 tokens)" in done["summary"]
+    assert "Stopped early: token budget exhausted (350/300 tokens); stopped while running" in done["summary"]
+    assert f"- [stopped] {SUBS[0]} — token budget exhausted (350/300 tokens)" in done["summary"]
     assert not (repo / "f1.txt").exists()  # the unreviewed work was not merged
     assert server.session.stored.messages[-1]["content"] == "parent handled it"
 
@@ -675,3 +677,87 @@ def test_active_rows_include_running_children():
     fake = SimpleNamespace(live={}, subagents=SimpleNamespace(handles={"sa-1": h}))
     rows = GatewayServer._active_rows(fake, None)
     assert rows[0]["id"] == "sa-1" and rows[0]["origin"] == "subagent" and rows[0]["background"]
+
+
+# ── the token cap holds for children that are already running (follow-up to #136) ──
+
+
+@pytest.mark.serial  # two children's calls have to interleave
+async def test_token_cap_stops_children_that_are_already_running(tmp_path, monkeypatch):
+    """The cap was checked only before a child started and charged only after it ended, so running children were
+    never stopped: up to max_parallel of them overshot it by a whole run each. Two parallel workers that would each
+    make 20 calls of 400 tokens are now stopped once the cap is crossed, and their subtasks say why."""
+    import asyncio
+    import re
+
+    from k3code.providers.fake import FakeProvider
+    from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)  # nothing here runs in it: no bash, nothing is merged
+    real_stream = FakeProvider.stream
+    calls: dict[str, int] = {}
+
+    async def busy_workers(self, messages, tools, model, **kw):
+        found = re.search(r"YOUR subtask \((t\d)\)", "\n".join(str(m.content or "") for m in messages))
+        if found is None:  # the classifier, the planner and the parent: the script answers them
+            async for ev in real_stream(self, messages, tools, model, **kw):
+                yield ev
+            return
+        key = found.group(1)
+        n = calls[key] = calls.get(key, 0) + 1
+        await asyncio.sleep(0.02)  # the model "thinks": the two workers' calls interleave
+        # a new file every call (no repetition for the loop guard to stop), done after the 20th
+        todo = [ToolCall(id=f"w{n}", name="write", arguments={"path": f"{key}-{n}.txt", "content": "x\n"})]
+        msg = Message(
+            role="assistant",
+            content=None if n < 20 else "done",
+            tool_calls=todo if n < 20 else [],
+            usage=Usage(prompt_tokens=300, completion_tokens=100),
+        )
+        yield StreamEvent(type="done", message=msg, usage=msg.usage)
+
+    monkeypatch.setattr(FakeProvider, "stream", busy_workers)
+    repo = git_repo(tmp_path / "repo")
+    subs = SUBS[:2]
+    steps = [classify(subs), *PLANNER, {"type": "text", "match": "needs you (stopped)", "text": "parent handled it"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, max_parallel=2, max_tokens=1000, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "build the whole feature")
+
+    workers = [h for h in server.subagents.handles.values() if h.agent_type == "worker"]
+    assert len(workers) == 2 and all(h.status == "interrupted" for h in workers)
+    spent = sum(h.tokens_in + h.tokens_out for h in workers)
+    assert 1000 <= spent <= 1000 + 2 * 400  # at most the call in flight of each running child; it used to be 16000
+    assert max(calls.values()) < 20
+    assert starts(server, "reviewer") == 0
+    for t in ("t1", "t2"):
+        last = [p for p in events(server, "fanout.progress") if p["subtask_id"] == t][-1]
+        assert last["state"] == "stopped", last
+        assert "token budget exhausted" in last["detail"] and "stopped while running" in last["detail"]
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 0 and done["escalated"] == 2
+    assert "Stopped early: token budget exhausted (" in done["summary"]
+    assert f"- [stopped] {subs[0]} — token budget exhausted" in done["summary"]
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"  # the parent was told and took over
+    assert git(repo, "status", "--porcelain").strip() == ""  # nothing was merged
+
+
+def test_agent_budget_counts_running_children():
+    from types import SimpleNamespace
+
+    from k3code.subagents.budget import AgentBudget, BudgetStop
+
+    b = AgentBudget(max_tokens=1000)
+    done = SimpleNamespace(id="a", tokens_in=300, tokens_out=100)
+    running = SimpleNamespace(id="b", tokens_in=0, tokens_out=0)
+    b.track(done)
+    b.track(running)
+    b.charge(done)
+    assert (b.tokens, b.used, b.over()) == (400, 400, "")
+    running.tokens_in, running.tokens_out = 500, 150  # its calls so far, before it ends
+    assert b.used == 1050 and b.over() == "token budget exhausted (1050/1000 tokens)"
+    with pytest.raises(BudgetStop):
+        b.check()  # no further child starts while running ones have spent the cap
+    b.charge(running)
+    assert (b.tokens, b.running) == (1050, {})

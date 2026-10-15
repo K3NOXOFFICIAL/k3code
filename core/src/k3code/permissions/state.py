@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from k3code import trust
+from k3code.paths import ensure_private_dir, ensure_state_dir
 
 from .engine import Decision, PermissionMode, decide
 from .rules import Rule, from_config
@@ -138,7 +139,7 @@ def project_config_path(cwd: str | Path) -> Path:
 
 def persist_rules(path: Path, rules: list[Rule]) -> None:
     """Merge ``allow`` rules into ``permissions:`` of a config.yaml (created if missing)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(path.parent)  # 0700 for the user config's $K3CODE_HOME, the umask's mode in a project
     data: dict[str, Any] = {}
     if path.is_file():
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -156,7 +157,7 @@ def persist_rules(path: Path, rules: list[Rule]) -> None:
 def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None) -> None:
     """Append one approval decision to ``$K3CODE_HOME/decisions.jsonl`` (learning hook for M5)."""
     path = (home or _home()) / "decisions.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     row = {"session": session, "tool": tool, "pattern": pattern, "choice": choice, "cwd": cwd, "ts": time.time()}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -177,6 +178,8 @@ class PermissionState:
     #: The project whose config and accepted rules apply (None = cwd): the CLI's --config-dir, a worktree child's
     #: parent project (its cwd is a fresh path under the one the user trusted).
     project_dir: Path | None = None
+    #: In plan mode: the mode of the session the plan is made for (the plan-first planning turn, see engine.decide).
+    plan_for: PermissionMode | None = None
     #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
     #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
     loaded: bool = field(default=False, init=False, repr=False)
@@ -214,6 +217,7 @@ class PermissionState:
             session_rules=self.session_rules,
             hardline_extra=self.hardline_extra,
             headless=headless,
+            plan_for=self.plan_for,
         )
 
     def cycle_mode(self) -> PermissionMode:

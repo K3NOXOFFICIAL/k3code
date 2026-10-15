@@ -387,7 +387,9 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
       <ArtLines lines={heroLines} />
       <Text />
 
-      <Text color={t.color.accent}>
+      {/* Cut at the end like the narrow layout: the default wrap broke a long
+          model name mid-word onto a second line (#170). */}
+      <Text color={t.color.accent} wrap="truncate-end">
         {(info.model ?? "").split("/").pop()}
         <Text color={t.color.muted}> · k3code</Text>
       </Text>

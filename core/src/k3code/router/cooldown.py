@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import ensure_private_dir
 from k3code.router.classifier import FailoverReason
 
 logger = logging.getLogger(__name__)
@@ -172,11 +173,11 @@ class CooldownStore:
             and e.until_wall > now_wall
         ]
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps({"entries": rows}))
             tmp.replace(self.path)
-        except OSError as e:
+        except (OSError, RuntimeError) as e:  # RuntimeError: another user's directory
             logger.warning("could not persist cooldowns to %s: %s", self.path, e)
 
     def arm(

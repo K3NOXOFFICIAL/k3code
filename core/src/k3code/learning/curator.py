@@ -15,7 +15,7 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning.ranking import jaccard, tokens
-from k3code.paths import home, private_file
+from k3code.paths import ensure_private_dir, home, private_file
 from k3code.skills import parse_frontmatter
 
 DUP_THRESHOLD = 0.7
@@ -221,7 +221,7 @@ def apply(payload: dict[str, Any], root: Path | None = None) -> str:
         if src is None:
             return f"skill {payload['drop']} not found"
         dest = root / "_archive" / name
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(dest.parent)  # the skills directory is private state (issue #163)
         shutil.move(str(src), str(dest))
         return f"archived {payload['drop']} → {dest}"
     return "noted"

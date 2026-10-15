@@ -204,6 +204,56 @@ def test_danger_classes_force_plan_and_high_risk(prompt):
     assert v.needs_plan and v.risk == "high" and v.wants_plan
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "don't delete anything, just list the stale files",
+        "do not touch production, only fix the failing test",
+        "refactor the loader without deleting the old API",
+        "fix the typo in the deployment docs",
+        "update the README section on secrets",
+        "add a comment explaining the password check",
+    ],
+)
+def test_a_negated_or_documentation_only_danger_word_does_not_force_a_plan(prompt):
+    # these forced a high-risk plan (a strong-tier planner call before any work) on harmless tasks
+    v = apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt)
+    assert not v.needs_plan and v.risk == "low" and "danger" not in v.reason
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["delete the docs folder", "fix the tests. then deploy to staging", "not only delete the cache but rebuild it"],
+)
+def test_an_action_still_counts_next_to_docs_words_or_after_a_finished_clause(prompt):
+    assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "don't worry, just delete the prod db",
+        "no backup needed: drop table users",
+        "without asking, force push",
+        "never mind, wipe the server",
+        "don't hesitate to delete the prod db",
+        "no need to delete anything, just purge the cache",
+        "deploy to production and update the changelog",
+        "run the migration and fix the typos",
+        "delete X, no need to ask",
+    ],
+)
+def test_a_negation_or_docs_word_elsewhere_never_clears_a_real_danger(prompt):
+    # independent review of the first version: a negation two words back or across a comma, and deploy/migrate taken
+    # as nouns next to a docs word, let these skip the high-risk plan
+    assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
+
+
+def test_the_classifier_reason_saying_no_deletion_does_not_force_a_plan():
+    v = apply_floor(ScopeVerdict(scope="small", reason="no credentials involved, nothing deleted"), "rename a var")
+    assert not v.needs_plan and v.risk == "low"
+
+
 def test_danger_in_predicted_actions_counts():
     v = apply_floor(ScopeVerdict(scope="small", suggested_subtasks=["then drop table users"]), "tidy the schema")
     assert v.needs_plan and v.risk == "high"
@@ -370,6 +420,29 @@ def test_recent_context_is_fenced_and_cannot_close_its_own_fence():
     body = classifier_messages("go on", "3 files", hostile)[1].content
     assert body.count("</recent_context>") == 1 and body.rstrip().endswith("</recent_context>")
     assert "<recent_context>" not in classifier_messages("fix a typo", "3 files", "")[1].content
+
+
+def test_the_classifier_is_told_to_size_the_task_not_do_it():
+    # On the claude-cli provider (every call framed as "the assistant's next turn") the cheap model started about one
+    # task in twelve ("let me look at server.py…", no JSON), and the gate fell back to `small`. The user message leads
+    # with the reminder, before the task, and the system prompt says the same.
+    head = classifier_messages("Explain what main() in server.py does", "3 files", "")[1].content.split("Task:")[0]
+    assert "do not do it" in head.lower() and "json" in head.lower()
+    low = CLASSIFIER_SYSTEM.lower()
+    assert "never do the task" in low and "without tools or code" in low
+
+
+def test_the_classifier_prompt_sizes_by_file_count_and_not_by_the_repo():
+    # Misses of the live eval (scope_scores.jsonl, 2026-10-15): "about 15 files" and "the other 14 route files" came
+    # back medium (a "package" wins over the count), one-line bug fixes and a new flag came back trivial (under-planned
+    # onto the cheap tier), and reasons cited the repo's 4000 files to pick huge for one subsystem.
+    low = " ".join(CLASSIFIER_SYSTEM.lower().split())
+    assert "file count beats every other cue, also for one repeated mechanical change" in low and "9-60 large" in low
+    assert "trivial: no new or changed logic" in low and "a bug fix (even of one line)" in low
+    assert "a big repository never raises a level" in low
+    assert "one feature or subsystem is large" in low
+    # output stays short: the gate runs before every task
+    assert "reason under 15 words" in low
 
 
 def test_behaviour_is_what_the_gate_does_with_a_verdict():

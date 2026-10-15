@@ -425,3 +425,39 @@ async def test_certificate_failure_fails_the_turn_instead_of_parking(provider_fa
     assert client.send.await_count == 1
     assert slept == []
     assert not [e for e in seen if e.kind == PARKED]
+
+
+# ── summarize: long enough to keep the provider's explanation, never a credential (issue #163) ──
+
+
+@pytest.mark.parametrize(
+    "secret, message",
+    [
+        ("sk-proj-Ab3dEf6hIj9kLm2nOp5qRs8t", "Incorrect API key provided: {s}. You can find your key at platform"),
+        ("Zq7Vb2Xn9Lm4Kp8Rt3Wy6Hs1Df5Gj0Ac", "upstream rejected key {s} for this model"),
+        ("hunter2hunter2", "proxy said: Authorization: Bearer {s} is not valid"),
+        ("Q9w8E7r6T5y4U3i2O1p0", "GET https://api.example.com/v1/models?key={s} returned 403"),
+    ],
+)
+def test_summary_never_carries_a_key_like_token(secret, message):
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import summarize
+
+    summary = summarize(ProviderError(message.format(s=secret), status_code=401))
+    assert secret not in summary
+    assert secret[:12] not in summary  # not even the start of it
+    assert "<redacted>" in summary
+
+
+def test_summary_keeps_a_400_character_provider_error_whole():
+    """160 characters cut a provider's explanation off after the preamble; a 400-character error is now kept."""
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import summarize
+
+    message = "400 Bad Request from https://api.example.com/v1/chat/completions (request id req_0f1e): " + (
+        "the tool schema for 'search' is invalid because property 'query' has no type; " * 5
+    )
+    message = message[:400]
+    summary = summarize(ProviderError(message, status_code=400))
+    assert summary == f"ProviderError: {message.strip()}"
+    assert len(summarize(ProviderError("x" * 2000))) == 500  # the default still caps a runaway body

@@ -33,7 +33,13 @@ from k3code.reliability.governor import (
     parse_pressure,
     read_psi,
 )
-from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings, build_reliability
+from k3code.reliability.hooks import (
+    Reliability,
+    ReliabilityFlags,
+    ReliabilitySettings,
+    build_reliability,
+    shared_netwatch,
+)
 from k3code.reliability.journal import (
     INTERRUPTED_TEMPLATE,
     PendingIntent,
@@ -89,6 +95,7 @@ __all__ = [
     "Verdict",
     "args_digest",
     "build_reliability",
+    "shared_netwatch",
     "interrupted_result",
     "normalize_args",
     "parse_pressure",

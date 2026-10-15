@@ -82,13 +82,21 @@ class Reliability:
         max_wait: float | None = None,
         max_park_seconds: float | None = None,
         netwatch_config: dict[str, Any] | None = None,
+        netwatch: NetWatch | None = None,
     ) -> None:
         self.flags = flags or ReliabilityFlags()
         self.session = session
         self.home = home
         self.events = EventEmitter()
         self.cancel_token = cancel_token or CancelToken()
-        self.netwatch = NetWatch(NetWatchConfig(**(netwatch_config or {}))) if self.flags.netwatch else None
+        # #109: one NetWatch per gateway process, shared by every session's bundle (passed in as ``netwatch``), so
+        # there is one monitor loop and one nmcli poll for the whole daemon instead of a pair per session. Without a
+        # shared one (headless, tests, an automation bundle) the bundle owns its own; either way it is refcounted
+        # (acquire/release) so the loops run only while at least one bundle has it started.
+        if not self.flags.netwatch:
+            self.netwatch = None
+        else:
+            self.netwatch = netwatch if netwatch is not None else NetWatch(NetWatchConfig(**(netwatch_config or {})))
         self.retry_config = RetryConfig(max_wait=max_wait)
         if max_park_seconds is not None:  # reliability.max_park_seconds used to be read and then dropped
             self.retry_config.park_max = float(max_park_seconds)
@@ -100,7 +108,6 @@ class Reliability:
         self.retry: PersistentRetry | None = None  # built in attach_router
         self.unattended = False  # see set_unattended
         self._started = False
-        self._net_forwarded = False
         # what the transcript file holds: these messages (by identity, in order) in this many bytes; see save_transcript
         self._saved: list[Message] = []
         self._saved_bytes = -1
@@ -119,8 +126,10 @@ class Reliability:
         *,
         session: str = "default",
         home: Path | None = None,
+        netwatch: NetWatch | None = None,
     ) -> Reliability:
-        """Build from config; settings=None means "reliability on, all defaults"."""
+        """Build from config; settings=None means "reliability on, all defaults". ``netwatch`` shares one instance
+        across the process (the gateway passes its own; headless/tests/automation leave it None and own one)."""
         if settings is not None and not settings.enabled:
             return cls.disabled()
         r = cls(
@@ -130,6 +139,7 @@ class Reliability:
             max_wait=settings.max_wait if settings else None,
             max_park_seconds=settings.max_park_seconds if settings else None,
             netwatch_config=settings.netwatch if settings else None,
+            netwatch=netwatch,
         )
         if settings and r.governor is not None:
             if settings.session_tokens is not None or settings.session_usd is not None:
@@ -162,15 +172,18 @@ class Reliability:
             self.retry.unattended = self.unattended
 
     async def start(self) -> None:
-        """Begin NetWatch polling (providers should already be registered)."""
+        """Begin NetWatch polling (providers should already be registered). With a shared NetWatch this adds a
+        reference (the first one starts the loops) and subscribes this bundle's forwarder; later bundles reuse the
+        running loops."""
         if self.netwatch is not None and not self._started:
             self._forward_net_states()
-            await self.netwatch.start()
+            await self.netwatch.acquire()
             self._started = True
 
     async def stop(self) -> None:
         if self.netwatch is not None and self._started:
-            await self.netwatch.stop()
+            self.netwatch.unsubscribe(self._on_net_change)  # leave the shared instance; another bundle may hold it
+            await self.netwatch.release()
             self._started = False
         if self.journal is not None:
             self.journal.close()
@@ -425,15 +438,15 @@ class Reliability:
     # ── internals ──
 
     def _forward_net_states(self) -> None:
+        """Subscribe this bundle's forwarder to the (shared) NetWatch, exactly once per started interval. stop()
+        unsubscribes it again, so an idle-sweep re-arm re-subscribes and a connectivity change still reaches this
+        session's clients once, never N times (the subscriber used to stack on every re-arm)."""
         assert self.netwatch is not None
-        if self._net_forwarded:  # start() runs again after every idle stop(): subscribe once, not once per re-arm
-            return
-        self._net_forwarded = True
+        self.netwatch.unsubscribe(self._on_net_change)  # drop a stale copy before re-adding: deliver once, not twice
+        self.netwatch.subscribe(self._on_net_change)
 
-        def on_change(old: NetState, new: NetState) -> None:
-            self.events.emit(ev.NET_STATE, detail=f"{old.value} -> {new.value}", old=old.value, new=new.value)
-
-        self.netwatch.subscribe(on_change)
+    def _on_net_change(self, old: NetState, new: NetState) -> None:
+        self.events.emit(ev.NET_STATE, detail=f"{old.value} -> {new.value}", old=old.value, new=new.value)
 
     def cancel(self) -> None:
         """Abort any paused/parked wait (wired to /stop)."""
@@ -445,8 +458,8 @@ class Reliability:
         return self.loop_guard is not None and self.loop_guard.needs_input
 
 
-def build_reliability(config: Any, session: str, home: Path | None = None) -> Reliability:
-    """Build the reliability bundle from ``config.reliability`` (a dict shaped like ReliabilitySettings)."""
+def reliability_settings(config: Any) -> ReliabilitySettings:
+    """Parse ``config.reliability`` (a dict shaped like ReliabilitySettings) into a settings object."""
     raw = dict(getattr(config, "reliability", None) or {})
     flags_raw = raw.pop("flags", None)
     flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
@@ -463,7 +476,24 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
     settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
     for key in known & set(raw):
         setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=session, home=home)
+    return settings
+
+
+def build_reliability(
+    config: Any, session: str, home: Path | None = None, *, netwatch: NetWatch | None = None
+) -> Reliability:
+    """Build the reliability bundle from ``config.reliability``; ``netwatch`` shares one instance across the process
+    (see :meth:`Reliability.from_settings`)."""
+    return Reliability.from_settings(reliability_settings(config), session=session, home=home, netwatch=netwatch)
+
+
+def shared_netwatch(config: Any) -> NetWatch | None:
+    """A NetWatch built from ``config.reliability`` for the whole process to share, or None when netwatch is off. Its
+    probe knobs come from ``reliability.netwatch``; sessions subscribe/unsubscribe and it is refcounted."""
+    settings = reliability_settings(config)
+    if not settings.enabled or not settings.flags.netwatch:
+        return None
+    return NetWatch(NetWatchConfig(**(settings.netwatch or {})))
 
 
 def _transcript_lines(messages: list[Message]) -> bytes:

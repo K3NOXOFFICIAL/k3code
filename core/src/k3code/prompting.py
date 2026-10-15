@@ -9,7 +9,7 @@ from typing import Any
 
 from k3code import outputstyle
 from k3code.extratools import mcp_prompt
-from k3code.memory import MAX_MEMORY_CHARS, memory_prompt
+from k3code.memory import memory_limit, memory_prompt
 from k3code.skills import PROMPT_LIMIT, skills_prompt
 
 _BASE_PATH = Path(__file__).parent / "prompts" / "system.md"
@@ -25,6 +25,71 @@ def effective_style(config: Any, session_meta: dict[str, Any] | None) -> str:
     return str((session_meta or {}).get("output_style") or getattr(config, "output_style", "") or "default")
 
 
+def _shown(path: Path) -> str:
+    """``path`` as the prompt shows it, quoted: ``~/…`` under the home directory (shorter, and what a person reads),
+    else absolute; the file tools expand ``~``, so the model can pass either form back.
+
+    A directory name is not trusted text (an unpacked archive or a cloned repo chooses it) and the system prompt
+    outranks tool output, so a name that could end the quote or start a line of its own (a backtick, a newline or
+    another control character) is shown JSON-escaped in double quotes instead of between backticks."""
+    home = Path.home().resolve()
+    if path == home:
+        text = "~"
+    elif path.is_relative_to(home):
+        text = f"~/{path.relative_to(home).as_posix()}"
+    else:
+        text = path.as_posix()
+    if "`" in text or any(ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or c in "\u2028\u2029" for c in text):
+        return json.dumps(text)
+    return f"`{text}`"
+
+
+def scope_prompt(cwd: str | Path, add_dirs: list[str] | None = None) -> str:
+    """The "Session scope" section: which directory this session works in and what else it may touch.
+
+    Without it the model is never told where it is: it learns its working directory only from tool output, searches
+    ``~`` or ``/`` to orient itself and reads unrelated files outside the project, each of which asks (or is refused in
+    auto mode). Built only from the cwd, the session's /add-dir directories and the location of ``.git``, so it stays
+    the same for the whole session and costs the prompt cache nothing; it never reads a project file."""
+    from k3code.memory import project_root
+
+    where = Path(cwd).resolve()
+    home = Path.home().resolve()
+    extra = [_shown(Path(d).expanduser().resolve()) for d in add_dirs or [] if str(d).strip()]
+    head = ["## Session scope", ""]
+    if home.is_relative_to(where):  # $HOME itself, or / or /home above it
+        kind = "your home directory" if where == home else "a directory that contains your home directory"
+        lines = [*head, f"- Working directory: {_shown(where)}: {kind}, not a project."]
+        if extra:
+            lines.append("- Added with /add-dir: " + ", ".join(extra))
+        lines += [
+            "",
+            "This session did not start inside a project. Work only on the paths the task names; never search, list "
+            "or read the home directory recursively to find context. If the task is about a project it does not "
+            "locate, ask which one (the user can start k3code inside it, or /add-dir it).",
+        ]
+        return "\n".join(lines)
+    root = project_root(where)
+    shown = _shown(where)
+    lines = [*head, f"- Working directory: {shown}: this session's project; relative paths and commands start here."]
+    if not (root / ".git").exists():
+        lines.append("- Not inside a git repository.")
+    elif root != where:
+        lines.append(
+            f"- Git repository root: {_shown(root)} (above the working directory: files outside the working "
+            "directory are outside this session's scope)."
+        )
+    if extra:
+        lines.append("- Also in scope (added with /add-dir): " + ", ".join(extra))
+    lines += [
+        "",
+        "Search and read inside these directories only. Start from what the task names (a file, symbol or error text) "
+        "and search from the working directory, never from `~` or `/`. If the task needs something outside them, say "
+        "what and where instead of looking around for it: the user can /add-dir it.",
+    ]
+    return "\n".join(lines)
+
+
 def prompt_sections(
     base: str,
     *,
@@ -37,7 +102,13 @@ def prompt_sections(
     attended: bool = True,
     session_id: str | None = None,
 ) -> list[tuple[str, str]]:
-    """The prompt as ``(name, text)`` sections in the order they are sent."""
+    """The prompt as ``(name, text)`` sections in the order they are sent.
+
+    With ``session_id``, the settings are the session's own (``optimizer.session_settings``): a session in the
+    treatment arm of a concurrent config experiment gets its memory and skills limits."""
+    from k3code.learning.optimizer import session_settings
+
+    config = session_settings(config, session_id)
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
     # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
@@ -57,6 +128,9 @@ def prompt_sections(
         parts.append(("skills", index))
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(("mcp", m))
+    # where the session works: project-specific like everything after it, and fixed for the session (an /add-dir
+    # changes it, rarely), so it sits ahead of the facts and learned sections
+    parts.append(("scope", scope_prompt(cwd, (session_meta or {}).get("add_dirs"))))
     from k3code.learning.projectprep import facts_prompt
 
     if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
@@ -66,7 +140,7 @@ def prompt_sections(
     # learning.enabled: false keeps what learning wrote on its own (learned notes, optimizer overlays) out of the
     # prompt too, not only stops new learning; lines a person accepted (gotcha cards, USER.md) stay
     learned = bool(learning_cfg(config)["enabled"])
-    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS)), learned=learned):
+    if mem := memory_prompt(cwd, limit=memory_limit(config), learned=learned):  # /memory reports the same cap
         parts.append(("memory", mem))
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt

@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from k3code.net_guard import BlockedURL, acheck_url, origin_of, web_settings
+from k3code.paths import ensure_private_dir
 from k3code.paths import home as k3code_home
 from k3code.router.classifier import UPSTREAM_BLOCKED_PATTERNS
 
@@ -287,10 +288,11 @@ class BrowserManager:
     async def _launch_playwright(self, site: str) -> Any:
         pw = await self._driver()
         profile = profile_dir(site, self.home)
-        profile.mkdir(parents=True, exist_ok=True)
-        downloads_dir(self.home).mkdir(parents=True, exist_ok=True)
+        # cookies, logins and downloads under $K3CODE_HOME/browser: 0700 whatever the umask (issue #163)
+        ensure_private_dir(profile)
+        ensure_private_dir(downloads_dir(self.home))
         env = scrubbed_env(self.home)
-        Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(Path(env["HOME"]))
         # service workers would fetch outside the context's routes (net_guard): blocked
         opts: dict[str, Any] = {
             "headless": self.headless,
@@ -472,7 +474,7 @@ class BrowserManager:
     async def _save_download(self, download: Any, saved: list[str]) -> None:
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(download.suggested_filename or "download"))[:120] or "download"
         dest = downloads_dir(self.home) / f"{secrets.token_hex(4)}-{name}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(dest.parent)
         await download.save_as(str(dest))
         saved.append(str(dest))
 

@@ -29,6 +29,10 @@ To stay in a mode, press the mode's letter again — the hint strip shows
 `[locked]`. Resize mode is **locked by default**. Press `esc` to leave a
 locked mode.
 
+An overlay a mode opens (the help from `ctrl+g ?`, a rename, the Inbox) gets
+every key while it is up, and the keymap is back to typing: `esc` closes the
+overlay, and its own keys (`/` to search the help) work.
+
 ## PANES (from Chooser: `p`)
 
 | Key | Action |

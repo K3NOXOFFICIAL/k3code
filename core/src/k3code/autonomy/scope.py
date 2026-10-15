@@ -30,33 +30,93 @@ DANGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATION = (
+    r"(?:don'?t|do\s+not|does\s+not|doesn'?t|never|not(?!\s+only)|no|without|avoid(?:ing)?|must\s*n[o']t"
+    r"|shouldn'?t|won'?t|cannot|can'?t)"
+)
+#: A negation that governs an action word directly: "don't delete", "never force-push", "without deleting", "no
+#: migrations". Nothing may stand between them: "don't hesitate to delete", "don't just delete" and "no need to
+#: delete" keep the plan.
+_NEG_ACTION_RE = re.compile(rf"\b{_NEGATION}\s+$", re.IGNORECASE)
+#: A negation that governs a noun-like danger word, directly or through one verb and a determiner: "no credentials
+#: involved", "do not touch production", "don't commit any secrets".
+_NEG_NOUN_RE = re.compile(
+    rf"\b{_NEGATION}\s+(?:(?:touch|chang|modif|edit|us|commit|includ|expos|log|print|stor|leak|hardcod|need|requir"
+    r"|involv|read|show)\w*\s+)?(?:(?:the|any|a|an|real|our|your|its|their)\s+)?$",
+    re.IGNORECASE,
+)
+#: Danger words that name a thing, not an action. Only these can be skipped in a clause about documentation ("fix the
+#: typo in the deployment docs", "README section on secrets"), where they describe text. Verbs (deploy, migrate,
+#: delete, force push, …) keep forcing a plan whatever else the clause mentions.
+_DANGER_NOUN_RE = re.compile(
+    r"^(?:credentials?|secrets?|passwords?|api[ _-]?keys?|production|deployments?)$", re.IGNORECASE
+)
+_DOCS_CLAUSE_RE = re.compile(
+    r"\b(docs?|documentation|readme|guide|changelog|comments?|docstrings?|typos?|wording|spelling)\b", re.IGNORECASE
+)
+#: Where a negation's or a docs mention's reach ends: punctuation, a dash, or a word that starts another action.
+#: "don't worry, just delete the prod db" and "deploy to production and update the changelog" keep their danger.
+_CLAUSE_END_RE = re.compile(r"[.;!?\n,:]|\s[-—–]\s|[—–]|\b(?:and|then|but|after\s+that)\b", re.IGNORECASE)
+
+
+def danger_hit(text: str) -> str:
+    """The first danger word in ``text`` the task really implies (lowercased), or "" when there is none.
+
+    :data:`DANGER_RE` alone fired on "don't delete anything", "update the deployment docs" or "label the password
+    field", forcing a high-risk plan (a strong-tier planner call and a slower start) on harmless tasks. A match is
+    skipped only when a negation governs it directly (see :data:`_NEG_ACTION_RE`, :data:`_NEG_NOUN_RE`), or when it is a
+    noun-like danger word in a clause about documentation; a negation or a docs word never reaches past a comma, a
+    colon or an "and". Everything else still counts, so "don't worry, just delete the prod db" or "no backup needed:
+    drop table users" keep their plan."""
+    for m in DANGER_RE.finditer(text):
+        starts = [c.end() for c in _CLAUSE_END_RE.finditer(text, 0, m.start())]
+        start = starts[-1] if starts else 0
+        nxt = _CLAUSE_END_RE.search(text, m.end())
+        before = text[start : m.start()]
+        clause = text[start : nxt.start() if nxt else len(text)]
+        noun = bool(_DANGER_NOUN_RE.match(m.group(0)))
+        if (_NEG_NOUN_RE if noun else _NEG_ACTION_RE).search(before):
+            continue
+        if noun and _DOCS_CLAUSE_RE.search(clause):
+            continue
+        return m.group(0).lower()
+    return ""
+
+
 CLASSIFIER_SYSTEM = """\
-You classify a coding task by the amount of work it needs, before any work starts.
+You classify a coding task by the amount of work it needs, before any work starts. Never do the task, answer it or
+ask for files: size it from its words, without tools or code.
 Reply with ONE JSON object and nothing else (no prose, no code fence):
 {"scope": "trivial|small|medium|large|huge", "needs_plan": bool, "risk": "low|med|high",
  "parallelizable": bool, "suggested_subtasks": [str], "reason": str}
+Keep the reason under 15 words; list at most 5 short subtasks, none for trivial or small.
 
-Levels. Judge by the work the request literally implies, not by how important it sounds:
-- trivial: no design decisions. An answer-only question or explanation, or ONE located edit (a typo, a literal
-  value, a version/year/default, a rename on a named line). Under ~5 minutes, nothing to test.
-- small: ONE file or function. New or changed logic, a flag, a bug fix, a single unit test, a script. Tests for that
-  one change are included. Needs a little reading but no plan.
+Levels. Judge by the work the request literally implies, not by how important it sounds or how big the repo is:
+- trivial: no new or changed logic. An answer-only question or explanation, or ONE located edit of text or a literal
+  (a typo, a value such as a timeout or default, a version/year, a rename on a named line). Nothing to test.
+- small: ONE file or function with new or changed logic: a bug fix (even of one line), a new flag or option, a single
+  unit test, a script. Tests for that one change are included. Needs a little reading but no plan.
 - medium: a feature slice across roughly 2-8 files: e.g. handler + router + tests + docs, a shared module extracted
-  from a few callers, one package-wide mechanical change, UI component + styles + persistence.
+  from a few callers, a mechanical change across one package with no stated count, UI component + styles + storage.
 - large: a whole feature or one subsystem, roughly 9-60 files or several layers (DB schema, backend, UI, tests): new
-  auth/sync/plugin/i18n machinery, a mechanical change across a whole layer or a stated count of 10+ files, a
+  auth/sync/plugin/i18n machinery, a mechanical change across a whole layer or a stated count of 9+ files, a
   complete test suite for one subsystem.
 - huge: the entire repo or a whole product: build an application from scratch, change the language or framework of
   the whole codebase, rewrite into a different architecture, split into several deployables, a new engine.
 
 Rules:
-- Count scope words: "everywhere", "all", "every", "whole", "throughout" and stated file counts set the level by
-  the number of files they imply. A named single file, line or function keeps it at trivial/small.
+- A stated or implied file count beats every other cue, also for one repeated mechanical change: 1 file small, 2-8
+  medium, 9-60 large. Each named part (handler, router, docs, UI, config) is a file; N modules with their tests are 2N
+  files, but one file with its own tests stays small; "everywhere", "all", "every", "whole", "throughout" cover every
+  file of what they name. A named single file, line or function keeps it at trivial/small.
+- The Repo line describes the repository, not the task: a big repository never raises a level.
 - Tie-break between neighbours: choose the lower level if the request names one place and no extra wiring; choose the
   higher level if it also needs tests, docs, a migration, UI or several layers. Do not add a level out of caution.
-- Never pick huge for one subsystem, and never pick small for work that spans several packages.
-- If the likely actions delete data, migrate, deploy, touch credentials or force-push, set needs_plan=true and
-  risk=high. Set parallelizable=true only when the work splits into independent parts (usually large/huge).
+- huge needs the whole codebase or a whole new product: one feature or subsystem is large, however many parts it
+  lists. Never pick small for work that spans several packages.
+- Below medium, needs_plan=true only when the likely actions delete data, migrate, deploy, touch credentials or
+  force-push; at any level those set risk=high. Set parallelizable=true only when the work splits into independent
+  parts (usually large/huge).
 
 Recent context. The user message may end with a <recent_context> block: the last messages of the conversation, oldest
 first, tool output included, each cut short.
@@ -212,13 +272,14 @@ def fallback_verdict(why: str) -> ScopeVerdict:
 
 def apply_floor(verdict: ScopeVerdict, prompt: str) -> ScopeVerdict:
     """Safety floor: danger classes in the prompt or the predicted actions force a high-risk plan."""
-    haystack = " ".join([prompt, verdict.reason, *verdict.suggested_subtasks])
-    hit = DANGER_RE.search(haystack)
+    haystack = [prompt, verdict.reason, *verdict.suggested_subtasks]
+    # each part on its own: a clause never runs from the prompt into the classifier's reason
+    hit = next((h for part in haystack if (h := danger_hit(part))), "")
     if hit:
         verdict.needs_plan = True
         verdict.risk = "high"
-        if f"danger: {hit.group(0).lower()}" not in verdict.reason:
-            verdict.reason = (verdict.reason + f" [danger: {hit.group(0).lower()}]").strip()
+        if f"danger: {hit}" not in verdict.reason:
+            verdict.reason = (verdict.reason + f" [danger: {hit}]").strip()
     if verdict.scope in ("large", "huge"):
         verdict.fanout_candidate = True
     return verdict
@@ -274,8 +335,14 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
 _RECENT_TAG_RE = re.compile(r"</?recent_context\s*>", re.IGNORECASE)
 
 
+#: Heads the user message. A provider that frames every call as an agent turn (claude-cli: "write the assistant's next
+#: turn") made the cheap model start the task instead ("let me look at server.py…", no JSON: the ``small`` fallback) on
+#: about one task in twelve, mostly questions and named-file fixes; the reminder sits next to the task it is about.
+CLASSIFY_LEAD = "Classify this task; do not do it or answer it. Reply with the JSON object only."
+
+
 def classifier_messages(prompt: str, summary: str, recent: str) -> list[Message]:
-    body = f"Task:\n{prompt}\n\nRepo: {summary}\n"
+    body = f"{CLASSIFY_LEAD}\n\nTask:\n{prompt}\n\nRepo: {summary}\n"
     if recent:
         # fenced, and the fence cannot be closed from inside: the block carries tool output the model did not write
         body += f"\n<recent_context>\n{_RECENT_TAG_RE.sub('', recent)}\n</recent_context>\n"

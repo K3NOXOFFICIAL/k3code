@@ -10,11 +10,11 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from k3code.permissions.engine import sensitive_path
+from k3code.permissions.engine import search_withheld, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
@@ -29,12 +29,26 @@ from k3code.tools.jobs import MAX_UNREAD_BYTES
 
 
 class ToolRegistry:
-    """Registry of available tools with JSON-schema specs."""
+    """Registry of available tools with JSON-schema specs.
+
+    :meth:`specs` is the tools array of every model request, and providers cache the request from its first byte (the
+    system prompt, then the tools array): it must only ever grow at its end. So the always-advertised tools come first,
+    in registration order, and deferred tools (MCP) that ``mcp_tool_search`` activated follow, in activation order. An
+    activated tool listed at its registration position landed mid-array (after ``skill``, before ``mcp_tool_search``
+    and the task and web tools) and invalidated the cached prefix of every later request (#168).
+
+    The activation order lives in ``state`` (see :meth:`keep_activated_in`): the session's persisted meta in the
+    gateway, so the next turn's loop, or a higher tier's after an escalation, starts with the same tools in the same
+    order instead of losing them (and the cache) and searching again.
+    """
+
+    #: The key of ``state`` that holds the activated deferred tools' names, in activation order.
+    ACTIVATED_KEY = "mcp_activated"
 
     def __init__(self) -> None:
         self._tools: dict[str, tuple[ToolSpec, callable]] = {}
         self._deferred: set[str] = set()  # registered + callable, but schema hidden until activated
-        self._active: set[str] = set()
+        self._state: dict[str, Any] = {}  # where the activation order lives (see keep_activated_in)
 
     def register(self, spec: ToolSpec, handler: callable, *, deferred: bool = False) -> None:
         self._tools[spec.name] = (spec, handler)
@@ -43,15 +57,34 @@ class ToolRegistry:
         else:
             self._deferred.discard(spec.name)
 
+    def keep_activated_in(self, state: dict[str, Any]) -> None:
+        """Keep the activation order in ``state`` (the session's meta), from now on and including what was activated
+        here before: every registry built on the same ``state`` advertises the same activated tools, in one order."""
+        earlier = self.activated()
+        self._state = state
+        self.activate(earlier)
+
+    def activated(self) -> list[str]:
+        """Names activated so far, in activation order (a malformed stored value counts as none)."""
+        raw = self._state.get(self.ACTIVATED_KEY)
+        return [n for n in raw if isinstance(n, str)] if isinstance(raw, list) else []
+
     def activate(self, names: list[str]) -> None:
-        """Start advertising the schemas of deferred tools (``mcp_tool_search``)."""
-        self._active.update(n for n in names if n in self._deferred)
+        """Start advertising the schemas of deferred tools (``mcp_tool_search``): appended after every tool already
+        advertised, so the tools array of the requests before stays its prefix."""
+        order = self.activated()
+        new = [n for n in dict.fromkeys(names) if n in self._deferred and n not in order]
+        if new:
+            self._state[self.ACTIVATED_KEY] = [*order, *new]
 
     def get(self, name: str) -> tuple[ToolSpec, callable] | None:
         return self._tools.get(name)
 
     def specs(self) -> list[ToolSpec]:
-        return [spec for n, (spec, _) in self._tools.items() if n not in self._deferred or n in self._active]
+        """Always-advertised tools in registration order, then the activated deferred ones in activation order (a
+        name activated in an earlier loop whose MCP server has gone since is skipped)."""
+        plain = [spec for n, (spec, _) in self._tools.items() if n not in self._deferred]
+        return plain + [self._tools[n][0] for n in self.activated() if n in self._deferred and n in self._tools]
 
     def names(self) -> list[str]:
         return list(self._tools.keys())
@@ -723,10 +756,11 @@ _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/workt
 _RG_MAX_COLUMNS = 400
 
 
-def _grep_line(raw: bytes, verdicts: dict[bytes, bool]) -> tuple[str, bool]:
-    """An ``rg --null`` output line as ``path:line:text``, and whether it comes from a credential file
-    (``sensitive_path``: dotenv files, ``~/.ssh`` ...). An include glob such as ``*`` or ``.env*`` turns rg's
-    hidden-file filter off, so this is what keeps ``.env`` out of a search.
+def _grep_line(raw: bytes, verdicts: dict[bytes, bool], withheld: Callable[[str], bool]) -> tuple[str, bool]:
+    """An ``rg --null`` output line as ``path:line:text``, and whether it comes from a credential file (``withheld``,
+    see ``search_withheld``: dotenv files, ``~/.ssh``, the credential stores and, searching ``$HOME``, the dot folders
+    there). An include glob such as ``*`` or ``.env*`` turns rg's hidden-file filter off, so this is what keeps
+    ``.env`` out of a search.
 
     The file name stays bytes until the check: decoded with replacement characters first, a path with bytes that
     are not UTF-8 (a home directory named so) would no longer match ``~/.ssh`` and the like. ``verdicts`` caches
@@ -735,7 +769,7 @@ def _grep_line(raw: bytes, verdicts: dict[bytes, bool]) -> tuple[str, bool]:
     if not sep:  # one file searched: rg prints no name, and tool_grep has decided on that path already
         return raw.decode("utf-8", errors="replace"), False
     if (hide := verdicts.get(name)) is None:
-        hide = verdicts[name] = sensitive_path(os.path.abspath(os.fsdecode(name)))
+        hide = verdicts[name] = withheld(os.path.abspath(os.fsdecode(name)))
     return f"{name.decode('utf-8', errors='replace')}:{rest.decode('utf-8', errors='replace')}", hide
 
 
@@ -752,10 +786,10 @@ def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
 
-    Lines from credential files (``sensitive_path``: dotenv files, key directories, the daemon's env file) are
-    never returned (see _grep_line), and a sensitive ``path`` is refused here: the permission engine only sees
-    ``path``, while an include glob or a repository's own ``.ignore`` (``!.env``) reopens hidden files to rg,
-    and the fallback walks them anyway."""
+    Lines from credential files (``search_withheld``: dotenv files, key directories, the daemon's env file, the
+    credential stores of ``$HOME`` and, searching ``$HOME``, its dot folders) are never returned (see _grep_line), and
+    a sensitive ``path`` is refused here: the permission engine only sees ``path``, while an include glob or a
+    repository's own ``.ignore`` (``!.env``) reopens hidden files to rg, and the fallback walks them anyway."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
@@ -792,6 +826,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         withheld = 0
         cut = ""
         verdicts: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
+        secret_file = search_withheld(str(path))
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
             try:
@@ -801,7 +836,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 break
             if not raw:
                 break
-            line, secret = _grep_line(raw.rstrip(b"\n"), verdicts)
+            line, secret = _grep_line(raw.rstrip(b"\n"), verdicts, secret_file)
             if secret:
                 withheld += 1
                 continue
@@ -828,7 +863,9 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             else:
                 result = {"matches": matches}
         if withheld:
-            _note_withheld(result, f"{withheld} matching line(s) in credential files (.env, keys) not shown")
+            _note_withheld(
+                result, f"{withheld} matching line(s) in credential files (.env, keys, home dot folders) not shown"
+            )
         return result
     except (FileNotFoundError, RuntimeError) as rg_failure:
         # Python fallback (no rg, or a pattern rg refuses such as look-around): off the event loop, same tree rules as
@@ -1081,9 +1118,11 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         base, candidates = path.parent, iter([(path.name, False)])
     else:
         base, candidates = path, _iter_tree(path, deadline)
+    real_base = os.path.realpath(base)  # base itself may be a link the engine decided on
     matches: list[str] = []
     skipped = 0
     timed_out = False
+    secret_file = sensitive_path if named else search_withheld(str(path))  # a named file: tool_grep decided on it
     for rel, is_dir in candidates:
         if rel is None or time.monotonic() > deadline:
             timed_out = True
@@ -1095,7 +1134,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
-        if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
+        if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
+            continue  # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots
+        if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1
             continue
         try:
@@ -1115,7 +1156,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
     result = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
     if skipped:
-        _note_withheld(result, f"{skipped} credential file(s) (.env, keys) not searched")
+        _note_withheld(result, f"{skipped} credential file(s) (.env, keys, home dot folders) not searched")
     return result
 
 

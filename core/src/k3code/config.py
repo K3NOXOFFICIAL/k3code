@@ -409,6 +409,7 @@ def load_config(
 
     _warn_unknown_escalate_keys(merged)
     _warn_unknown_mode_keys(merged)
+    merged["autonomy"] = _checked_auto_continue(merged.get("autonomy"))
 
     # Validate first, then expand api_key_env -> api_key on the validated entries. A validation error echoes its input
     # (pydantic's input_value=<the provider block>), so a key in that block would show up in the error text (its tail
@@ -453,6 +454,30 @@ def _warn_unknown_mode_keys(merged: dict[str, Any]) -> None:
         section = merged.get(name)
         for key in sorted(set(section) - known if isinstance(section, dict) else (), key=str):
             logger.warning("%s.%s is not used and is ignored (known keys: %s)", name, key, ", ".join(sorted(known)))
+
+
+def _checked_auto_continue(section: Any) -> Any:
+    """``autonomy.auto_continue`` (true, false or "auto") and ``auto_continue_max_turns`` (a non-negative whole
+    number; ``"8"`` reads as 8) checked at load: a bad value is warned about and dropped, so the default applies
+    ("auto", 8). Before, ``auto_continue_max_turns: eight`` passed the load and raised at the first auto-continued
+    prompt, and ``-1`` silently meant no cap."""
+    from k3code.autonomy import DEFAULTS, auto_continue_max_turns, auto_continue_setting
+
+    if not isinstance(section, dict):
+        return section  # not a mapping: pydantic reports it
+    out = dict(section)
+    for key, coerce in (("auto_continue", auto_continue_setting), ("auto_continue_max_turns", auto_continue_max_turns)):
+        if key not in out:
+            continue
+        value = coerce(out[key])
+        if value is None:
+            want = 'true, false or "auto"' if key == "auto_continue" else "a whole number, 0 or more (0 = no cap)"
+            logger.warning(
+                "autonomy.%s=%r is not valid (%s); using the default %r", key, out.pop(key), want, DEFAULTS[key]
+            )
+        else:
+            out[key] = value
+    return out
 
 
 def _is_scalar(default: Any) -> bool:
