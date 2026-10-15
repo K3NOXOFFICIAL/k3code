@@ -129,6 +129,9 @@ NEEDS_HUMAN: list[str] = [
     "cat README.md #'\nsh ./evil.sh",
     "ls #'\nrm -rf ./src",
     'ls # "\ntouch x',
+    # a quote in the last comment of a payload: the outer text goes on after it
+    "echo $(ls # it's\n) '; rm -rf ./src; '",
+    'bash -c "ls # it\'s"',
     # an unterminated quote
     "cat README.md 'unterminated",
     # a builtin allow must not cover a command spanning several lines
@@ -144,6 +147,26 @@ def test_unparseable_commands_need_a_human(tmp_path: Path, cmd: str) -> None:
     d = _decide(cmd, "auto", tmp_path, headless=True)
     assert d.action == "deny", cmd
     assert "could not be parsed safely" in (d.message or ""), cmd
+
+
+#: A quote in a comment that ends the command hides nothing: no line follows it that a quote could swallow.
+TRAILING_COMMENT_QUOTE: list[tuple[str, str]] = [
+    # (command, decision in default mode); auto mode allows every one of them without asking
+    ("grep -rn 'TODO' src  # it's a note", "allow"),
+    ('git log --oneline -5  # the last "five"', "allow"),
+    ("npm test  # don't watch", "ask"),
+    ("pytest -x  # stop at the first failure, it's flaky\n", "ask"),
+    ("cargo test # run `cargo test` again later", "ask"),
+]
+
+
+@pytest.mark.parametrize(("cmd", "default"), TRAILING_COMMENT_QUOTE)
+def test_a_quote_in_a_trailing_comment_needs_no_human(tmp_path: Path, cmd: str, default: str) -> None:
+    assert parse(cmd).comment_quote is False, cmd
+    d = _decide(cmd, "default", tmp_path)
+    assert (d.action, d.needs_human) == (default, False), (cmd, d)
+    d = _decide(cmd, "auto", tmp_path)
+    assert d.action == "allow" and not d.needs_human, (cmd, d)
 
 
 # ── hardline.check without the engine: no over-blocking ──
