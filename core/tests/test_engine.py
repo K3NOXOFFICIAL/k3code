@@ -437,10 +437,24 @@ def test_an_always_rule_never_carries_an_inline_environment_value() -> None:
         ("git diff --no-index a b", False),
         ("cat */notes", False),
         ("cat .e{n,}v", False),
-        ("cat 'notes'", False),
+        # quoted literal arguments are now allowed: the quotes make the word reach the program unchanged
+        ("cat 'notes'", True),
+        ('cat "notes"', True),
+        ("grep -n 'foo bar' notes", True),
+        ('grep -n "foo bar" notes', True),
+        ("grep -n 'a|b' notes", True),  # the pipe is inside quotes: literal, not a separator
+        # find on its own is a reader now (lists names); its risky primaries still refuse it
+        ("find . -name '*.py'", True),
+        ("find . -type f", True),
+        ("find . -name '*.py' -delete", False),
+        ("find . -exec rm {} ;", False),
+        ("find ~ -name x", False),  # unquoted ~ expands: still refused
+        ("cat *.py", False),  # an unquoted glob still asks
+        ('cat "$F"', False),  # a variable inside double quotes still expands
         ("cat ~/notes", False),
         ("cat $F", False),
         ("cat notes > out", False),
+        ("cat 'notes' > out", False),  # a redirect still asks even with a quoted argument
         ("ls; python3 x", False),
         ("FOO=1 cat notes", False),
         ("", False),
@@ -515,3 +529,55 @@ def test_home_read_only_refuses_dot_paths(command):
     from k3code.permissions.engine import home_read_only
 
     assert home_read_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -rn 'foo bar' notes",  # grep -r is a tree walker whatever the quotes
+        "grep -nR 'x' .",
+        'grep -n "a$b" notes',  # $ inside double quotes expands: not what is written
+        "cat `cat f`",  # a substitution
+        "cat '.env'",  # a quoted credential-shaped dot path
+        "find . -name '*.py' -exec rm {} ;",
+        "find . -name x -delete",
+        "find . -okdir sh -c id ;",
+        "cat 'notes' > out",  # a redirect, even with a quoted argument
+        r"cat 'a'\''b'",  # a quote-splice that reassembles across words
+    ],
+)
+def test_home_read_only_still_refuses_tree_walkers_and_expansions(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -n 'foo bar' notes",  # a single-quoted literal with a space
+        'grep -n "foo bar" notes',  # a double-quoted literal with no $/backtick/backslash
+        "grep -n 'a|b' notes",  # the pipe is inside quotes: a literal, not a separator
+        "find . -name '*.py'",  # the quoted glob is passed to find, not expanded by the shell
+        "find . -name '*.py' -type f",
+        "find . -type d",
+        "cat 'notes'",
+    ],
+)
+def test_home_read_only_allows_quoted_literals_and_find(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is True
+
+
+def test_home_fast_path_credential_paths_still_ask_at_home(tmp_path, monkeypatch) -> None:
+    """The quoted-literal/find relaxation must not touch credential-path handling: a named credential file under a
+    $HOME dot folder still asks (never auto-allows), as before."""
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:tok@example.com\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for command in ("cat .config/git/credentials", "grep -n tok .config/git/credentials"):
+        d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
+        assert d.action == "ask" and d.needs_human and not d.auto_allowed, (command, d)

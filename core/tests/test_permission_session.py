@@ -157,7 +157,10 @@ def test_toolchain_reads_never_prompt_in_any_mode(mode: PermissionMode, tmp_path
         ("diff --recursive a b", False),
         ("git diff --no-index a b", False),
         ("rg KEY", False),
-        ("find . -name x", False),
+        ("find . -name x", True),  # find lists names; the sandbox masks the credential dirs
+        ("find . -name '*.py' -type f", True),
+        ("find . -delete", False),  # a write/exec primary still refuses it
+        ("find . -exec cat {} ;", False),
         ("tree -L 2", False),
         ("du -sh .", False),
         ("jq .a x.json", False),
@@ -210,7 +213,19 @@ def _home_loop(home, monkeypatch, mode: str):
     return loop, built, asked
 
 
-@pytest.mark.parametrize("command", ["git status", "head -n 20 src/a.py", "git log --oneline | head -5", "pwd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "head -n 20 src/a.py",
+        "git log --oneline | head -5",
+        "pwd",
+        "grep -n 'foo bar' notes",  # a quoted literal with a space: no prompt now
+        'grep -n "foo bar" notes',
+        "find . -name '*.py'",  # find listing names, with a quoted glob
+        "find . -type f",
+    ],
+)
 async def test_auto_mode_at_home_runs_plain_readers_in_the_read_only_home_sandbox(
     command: str, tmp_path, monkeypatch
 ) -> None:
@@ -219,6 +234,18 @@ async def test_auto_mode_at_home_runs_plain_readers_in_the_read_only_home_sandbo
     loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
     out = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": command}))
     assert asked == [] and built == ["ro-home"], (command, out)
+
+
+@pytest.mark.parametrize("command", ["cat *.py", 'cat "$SECRET"', "find . -delete", "grep -rn KEY ."])
+async def test_auto_mode_at_home_still_asks_for_globs_variables_and_risky_find(
+    command: str, tmp_path, monkeypatch
+) -> None:
+    # an unquoted glob/variable, a tree walker or a find that writes/execs is not run in the read-only home sandbox
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": command}))
+    assert built != ["ro-home"], (command, built)
 
 
 async def test_auto_mode_at_home_still_asks_for_a_tree_walker(tmp_path, monkeypatch) -> None:
