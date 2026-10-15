@@ -44,9 +44,10 @@ from k3code.permissions.engine import sensitive_path, windows_drives
 
 logger = logging.getLogger(__name__)
 
-#: ``$HOME`` entries that stay visible inside the sandbox (rw cache, ro uv-managed pythons).
+#: ``$HOME`` entries that stay visible inside the sandbox (rw cache, ro uv-managed pythons and tools). uv counts only
+#: with its interpreters and tools: ``~/.local/share/uv/credentials`` (``uv auth dir``) holds index tokens.
 HOME_CACHE = ".cache"
-HOME_UV = ".local/share/uv"
+HOME_UV = (".local/share/uv/python", ".local/share/uv/tools")
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
@@ -807,9 +808,10 @@ def build_argv(
     cache = home / HOME_CACHE
     if cache.is_dir():
         argv += ["--bind", str(cache), str(cache)]
-    uv = home / HOME_UV
-    if uv.is_dir():
-        argv += ["--ro-bind", str(uv), str(uv)]
+    for entry in HOME_UV:
+        uv = home / entry
+        if uv.is_dir():
+            argv += ["--ro-bind", str(uv), str(uv)]
     if git_writable is None:
         git_writable = configured_git_writable()
     seen: set[str] = set()

@@ -72,7 +72,7 @@ Add `--json` output.
 - `reliability/sandbox.py` builds a bubblewrap (`bwrap`) argv:
   - read-only `/usr`, `/etc`, `/lib*`;
   - the project dir and add-dirs read-write;
-  - `$HOME` hidden except `~/.cache` and `~/.local/share/uv`;
+  - `$HOME` hidden except `~/.cache` and `~/.local/share/uv/python` and `~/.local/share/uv/tools`;
   - network kept, because providers and tools need it;
   - `--die-with-parent`.
 - When a session is in `auto` or `yolo` mode, or is a background, cron or loop session, bash tool calls run inside bwrap. If bwrap is missing, `/doctor` reports `warn` and the session falls back to running without the sandbox.
