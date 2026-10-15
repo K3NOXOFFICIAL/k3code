@@ -1069,8 +1069,9 @@ def _open_regular(fp: Path, expect: str | None) -> Any:
     entry must have), is not that file. The decision is made on the open descriptor: a check by name followed by an
     open by name loses to a process that swaps a directory for a link in between. ``O_NOFOLLOW`` refuses a link as the
     last component and ``/proc/self/fd`` names the file actually opened, whatever a directory above it became;
-    ``O_NONBLOCK`` keeps the open of a FIFO without a writer from blocking."""
-    flags = os.O_RDONLY | os.O_NONBLOCK | (os.O_NOFOLLOW if expect is not None else 0)
+    ``O_NONBLOCK`` keeps the open of a FIFO without a writer from blocking and ``O_NOCTTY`` keeps a terminal device
+    from becoming the daemon's controlling terminal."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | (os.O_NOFOLLOW if expect is not None else 0)
     fd = os.open(fp, flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -1157,6 +1158,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
+        if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
+            continue  # a link met before the open is never opened; the fd check in _open_regular catches a later swap
         if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
             skipped += 1
             continue
