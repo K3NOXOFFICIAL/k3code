@@ -1325,7 +1325,8 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
 #: Read-only system and toolchain locations an auto-mode read outside the roots may look at without a person:
 #: ``/usr`` and ``/etc`` (the sandbox shows bash those anyway), the system package trees ``/opt`` and ``/nix/store``
 #: (the sandbox does not bind them: only these in-process reads see them), and the language package caches under
-#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path).
+#: ``$HOME``. Credential paths are refused before this is consulted (sensitive_path). uv counts only with its
+#: interpreters and tools: ``~/.local/share/uv/credentials`` (``uv auth dir``) holds index tokens.
 _TOOLCHAIN_SYSTEM = ("/usr", "/opt", "/etc", "/nix/store")
 _TOOLCHAIN_HOME = (
     ".cargo/registry",
