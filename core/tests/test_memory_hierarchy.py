@@ -418,3 +418,13 @@ async def test_projectprep_does_not_propose_k3code_md_over_claude_md(tmp_path: P
     _write(root / "Makefile", "test:\n\ttrue\n")
     props = await projectprep.prepare(root, store=ProposalStore(tmp_path / "store"))
     assert not [p for p in props if p.payload.get("op") == "draft_memory"]
+
+
+def test_an_import_line_with_a_nul_byte_stays_as_written(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "alice"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "alice" / ".k3code"))
+    root = _repo(tmp_path)
+    _write(root / "AGENTS.md", "before\n@a\x00b\nafter\n")
+    loaded = load_memory(root)
+    assert [m.text for m in loaded] == ["before\n@a\x00b\nafter"]
+    assert "@a\x00b" in memory_prompt(root)
