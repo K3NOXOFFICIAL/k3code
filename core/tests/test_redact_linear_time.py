@@ -33,6 +33,8 @@ LONG_LINES = {
     "scheme run": "sk-" * 21846,  # scrub_urls: a scheme start at every `s`
     "no slash": "a" * 65536,  # toolerrors._PATH: a path start at every character
     "tilde run": "a~" * 32768,
+    "glued jwt starts": "xeyJ" * 16384,
+    "jwt with a long head": "x" + "eyJ" * 21845 + ".abcdefgh.abcd",
 }
 
 
@@ -73,20 +75,43 @@ def test_a_name_glued_to_a_long_run_still_hides_its_value():
     assert scrub_text("." * 30000 + f"api_key: '{PASSWORD}'").endswith(f"api_key: '{REDACTED}'")
 
 
-def test_a_name_glued_to_a_non_ascii_letter_hides_its_value():
-    # the name used to start at a word boundary, and there is none between `é` and `D`: the value was kept
-    assert scrub_text(f"éDB_PASSWORD={PASSWORD}") == f"éDB_PASSWORD={REDACTED}"
+def test_a_name_after_a_non_ascii_letter_is_read_as_before():
+    # a name starts at a word boundary, as before: there is none between `é` and the letter after it, so the assignment
+    # is the one after `=` (matching from `é` hid the next name and left the value in clear, K3NOX-685)
+    assert scrub_text(f"éfoo_token=DB_PASSWORD = {PASSWORD}") == f"éfoo_token=DB_PASSWORD = {REDACTED}"
 
 
-def test_a_jwt_glued_to_a_word_is_hidden():
+def test_a_jwt_glued_to_a_word_is_hidden_from_its_first_eyj():
     assert scrub_text(f"x{JWT} rest") == f"x{REDACTED} rest"
     assert scrub_text(f"AKIA{'ABCDEFGHIJKLMNOP'}{JWT}") == REDACTED * 2
-    # a header that holds another `eyJ` (a nested object): a free-standing token is hidden whole as before, a glued
-    # one from that inner `eyJ` on, its payload and signature always
+    # a header that holds another `eyJ` (a nested object) is hidden whole, glued or not
     nested = "eyJ" + "hbGciOiJIUzI1NiJ9" + "eyJ" + "raWQiOiIxIn0" + JWT[JWT.index(".") :]
     assert scrub_text(f"jwt: {nested}") == f"jwt: {REDACTED}"
-    out = scrub_text(f"x{nested}")
-    assert out.endswith(REDACTED) and JWT[JWT.index(".") :] not in out
+    assert scrub_text(f"x{nested}") == f"x{REDACTED}"
+    # a first part too short for `eyJ` and 8 more is no JWT, whatever follows (an `eyJ` in the third part is not one)
+    assert redact._prefixed_spans("ab." + "x" * 10 + ".eyJ" + "y" * 9) == []
+
+
+#: Prefixed tokens a JWT's first part can hold (each long enough for its own rule), built at run time.
+_INNER_TOKENS = {
+    "sk": "sk-" + "a1" * 16,
+    "glpat": "glpat-" + "b2" * 10,
+    "aiza": "AIza" + "c3" * 18,
+    "ghp": "ghp_" + "d4" * 12,
+    "xox": "xoxb-" + "e5" * 8,
+    "akia": "AKIA" + "F6" * 8,
+}
+
+
+@pytest.mark.parametrize("glue", ["x", "a_", "id-", "9", "é", ""])
+@pytest.mark.parametrize("inner", _INNER_TOKENS)
+def test_a_glued_jwt_with_a_token_inside_is_hidden_from_its_first_eyj(glue, inner):
+    # `<glue>eyJ<8><token>eyJ<8>.<payload>.<sig>`: starting at the last `eyJ` let the token's rule swallow it and left
+    # the payload and the signature in clear (K3NOX-685); the JWT starts at its first `eyJ`, as it did before
+    tail = JWT[JWT.index(".") :]
+    text = f"{glue}eyJ{'hbGciOiJ'}{_INNER_TOKENS[inner]}eyJ{'raWQiOiI'}{tail}"
+    assert scrub_text(text) == f"{glue}{REDACTED}"
+    assert redact._prefixed_spans(text) == [m.span() for m in _OLD_PREFIXED.finditer(text)]
 
 
 # The patterns as they were before K3NOX-356: on short text, where the old cost does not matter, the new ones must
@@ -121,22 +146,21 @@ def _same_with(monkeypatch, module, name: str, old: re.Pattern[str], fn, pieces:
 
 
 def test_assignments_are_hidden_as_before(monkeypatch):
-    # ASCII only: before a non-ASCII letter the old pattern found no word start and kept the value (see above)
     pieces = ["token", "DB_", "PASSWORD", "auth", "api-key", "a", "1", "_", "-", ".", "=", ":", " ", "'", '"', ",", "x"]
-    pieces += ["abcdef", "s3cr3t-v4lue", "<", "\t"]
+    pieces += ["abcdef", "s3cr3t-v4lue", "<", "\t", "é", "ä", "²", "/"]
     _same_with(monkeypatch, redact, "_ASSIGNMENT", _OLD_ASSIGNMENT, scrub_text, pieces)
 
 
-def test_prefixed_tokens_are_hidden_as_before(monkeypatch):
-    # every `eyJ` follows a separator here: a JWT glued to a word starts at its last valid `eyJ` now (see above)
-    pieces = [" eyJ", ".eyJ", "abcdefgh", "abcd", ".", " ", "-", "_", "sk-", "AKIA", "ABCDEFGHIJKLMNOP", "ghp_"]
-    pieces += ["Bearer ", "://u", ":pw@", "x1"]
-    _same_with(monkeypatch, redact, "_PREFIXED", _OLD_PREFIXED, scrub_text, pieces)
-    for text in _samples(pieces + ["eyJ", "eyJabcdefgh"]):
-        with monkeypatch.context() as m:
+def test_prefixed_tokens_and_jwts_are_found_as_before(monkeypatch):
+    pieces = ["eyJ", "eyJabcdefgh", " eyJ", ".eyJ", "abcdefgh", "abcd", ".", " ", "-", "_", "x", "é", "Bearer "]
+    pieces += ["://u", ":pw@", "x1", *_INNER_TOKENS.values(), "sk-", "AKIA", "ABCDEFGHIJKLMNOP", "ghp_", "glpat-"]
+    for text in _samples(pieces, n=6000):
+        assert redact._prefixed_spans(text) == [m.span() for m in _OLD_PREFIXED.finditer(text)], text
+        new_secret, new_out = looks_like_secret(text), scrub_text(text)
+        with monkeypatch.context() as m:  # the old regex, JWT rule included, and no separate JWT scan
             m.setattr(redact, "_PREFIXED", _OLD_PREFIXED)
-            old = looks_like_secret(text)
-        assert looks_like_secret(text) == old, text
+            m.setattr(redact, "_jwts", lambda _text: iter(()))
+            assert (new_secret, new_out) == (looks_like_secret(text), scrub_text(text)), text
 
 
 def test_urls_are_scrubbed_as_before(monkeypatch):
