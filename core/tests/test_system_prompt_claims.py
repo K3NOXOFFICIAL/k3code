@@ -63,4 +63,25 @@ def test_tips_never_follow_the_reviewer_verdict_line():
 def test_the_base_prompt_stays_small():
     from k3code.prompting import tokens_of
 
-    assert tokens_of(base_prompt()) <= 1100  # re-sent on every request: grow it only for a rule that earns its tokens
+    # re-sent on every request: grow it only for a rule that earns its tokens (1.0k before the coding rules)
+    assert tokens_of(base_prompt()) <= 1150
+
+
+def test_the_prompt_carries_the_coding_rules():
+    text = base_prompt()
+    # read before edit, edit over write, no guessed paths, minimal changes
+    line = _line_with(text, "Prefer reading over guessing")
+    assert "`read` a file before you edit it" in line and "never guess a path" in line
+    line = _line_with(text, "Make minimal, focused changes")
+    assert "`edit`" in line and "`write` only for new files" in line and "line-number prefix" in line
+    # verification loop: run the project's tests/linter for the touched area before finishing
+    line = _line_with(text, "Verify, then claim")
+    assert "run the project's tests or linter" in line and "Project facts" in line  # the facts section's name
+    assert "say what you did not verify" in line
+    # bash: one command per call, with a timeout; the tool's feedback lines are acted on, not repeated
+    line = _line_with(text, "one command per call")
+    assert "`timeout`" in line and "background: true" in line
+    assert "`syntax:`" in _line_with(text, "closest-match hint")
+    # task end: what changed and what was run
+    line = _line_with(text, "Report briefly")
+    assert "what changed (files)" in line and "what you ran to verify it" in line
