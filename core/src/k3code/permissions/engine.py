@@ -1682,24 +1682,74 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     of ``$HOME`` (or is a dotfile there), a root at or above ``$HOME`` covers it and no project root below ``$HOME``
     does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
     (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
+    return _home_dot_spelled(_spellings(path), roots)
+
+
+def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
+    """_home_dot_read for a path given as its spellings."""
     home = os.path.normpath(os.path.expanduser("~"))
     if not _inside(home, roots):
         return False
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in spellings)
 
 
-def home_store_path(path: str) -> bool:
-    """``path`` (absolute) lies in a credential store of ``$HOME`` (see _home_stores), whatever the roots: the check
-    for a reader that has no ``decide()`` of its own (the memory loader's @imports)."""
-    return bool(_stores_holding(_spellings(path), _home_stores()))
+def _link_hops(path: str) -> list[str]:
+    """``path`` (absolute) as written and, for each symlink met on the way to its realpath, what the path becomes
+    after following it: ``~/.config/gh/hosts.yml -> ~/dotfiles/gh/hosts.yml`` is both. A reader that opens the final
+    target would otherwise never see that the path it was given names a credential store."""
+    hops: list[str] = []
+    cur = path
+    try:
+        for _ in range(_MAX_LINK_HOPS):
+            hops.append(os.path.normpath(cur))
+            done: list[str] = []
+            rest = cur.split("/")
+            for i, comp in enumerate(rest):
+                if comp in ("", "."):
+                    continue
+                if comp == "..":
+                    if done:
+                        done.pop()
+                    continue
+                probe = "/" + "/".join([*done, comp])
+                if os.path.islink(probe):
+                    cur = "/".join([os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :]])
+                    break
+                done.append(comp)
+            else:
+                break
+    except (OSError, ValueError):
+        pass
+    return list(dict.fromkeys([*hops, os.path.realpath(path)]))
 
 
-def home_dot_path(path: str, roots: Sequence[str]) -> bool:
-    """``path`` (absolute) lies below a dot folder of ``$HOME`` that ``roots`` cover only because a root is at or
-    above ``$HOME`` (see _home_dot_read): a project root below ``$HOME`` makes its own ``.github`` ordinary."""
-    return _home_dot_read(path, list(roots))
+_MAX_LINK_HOPS = 40  # as the kernel's symlink limit
+
+
+def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
+    """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
+    has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
+    (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
+    folder of ``$HOME``. Every spelling is checked: the path as written, each hop of a symlink chain and the realpath
+    (see _link_hops), so a store file that links out and a plain file that links in are both caught.
+
+    The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
+    a store, with the whole path inside that root, makes its own files ordinary (a session started in
+    ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
+    makes its dot folders ordinary (``.github`` of a repository). Callers have already checked the target lies in the
+    roots, so a store outside every root needs no test here."""
+    spellings = _link_hops(path)
+    if any(sensitive_path(p) for p in spellings):
+        return True
+    home_roots = [str(r) for r in roots]
+    for store in [*_home_stores(), *extra_stores]:
+        low = store.casefold().rstrip("/")
+        held = [p for p in spellings if p.casefold() == low or p.casefold().startswith(low + "/")]
+        if held and not any(_inside(r, [store]) and all(_inside(p, [r]) for p in held) for r in home_roots):
+            return True
+    return _home_dot_spelled(spellings, home_roots)
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:

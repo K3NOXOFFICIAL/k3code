@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -161,26 +162,38 @@ def _within(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(path == r or r in path.parents for r in roots)
 
 
-def _withheld(target: Path, roots: tuple[Path, ...]) -> bool:
-    """``target`` (resolved) is a credential location a memory file must not pull into the prompt: a key or dotenv
-    file (sensitive_path), a credential store of ``$HOME`` (the ones the read-only home sandbox hides) and, for a
-    project whose root is ``$HOME`` or above it, anything below a home dot folder. Memory files are model-writable
-    (``~/AGENTS.md`` is an in-roots edit) and the import path has no ``decide()``. The user's memory keeps its
-    ordinary home files and everything in ``$K3CODE_HOME`` (its own state, wherever that sits)."""
-    from k3code.permissions.engine import home_dot_path, home_store_path, sensitive_path
+def _user_roots() -> tuple[Path, ...]:
+    """Where the user's memory (``USER.md``) may import from: the home directory and ``$K3CODE_HOME``."""
+    return (Path.home().resolve(), home().resolve())
 
-    path = str(target)
-    if sensitive_path(path):
-        return True
-    user = home().resolve() in roots
-    if user and _within(target, (home().resolve(),)):
-        return False
-    return home_store_path(path) or (not user and home_dot_path(path, [str(r) for r in roots]))
+
+def _withheld(written: Path, roots: tuple[Path, ...]) -> bool:
+    """``written`` (absolute, symlinks not followed) is a credential location a memory file must not pull into the
+    prompt: a key or dotenv file (sensitive_path), a credential store of ``$HOME`` (the ones the read-only home
+    sandbox hides), ``$K3CODE_HOME`` (sessions, journals, config: the sandbox hides it wherever it is) and, for a
+    project whose root is ``$HOME`` or above it, anything below a home dot folder. Memory files are model-writable
+    (``~/AGENTS.md`` is an in-roots edit, so is any home file ``USER.md`` imports, and ``USER.md`` itself) and the
+    import path has no ``decide()``. The user's memory gets the dot-folder rule too, and keeps its ordinary home
+    files and ``$K3CODE_HOME/memory``. What a link on the way points to counts as well as where it ends (see
+    engine.memory_import_withheld); a root inside a store makes its own files ordinary."""
+    from k3code.permissions.engine import memory_import_withheld
+
+    check = [*roots]
+    state = home().resolve()
+    user_home = Path.home().resolve()
+    stores = [] if state in (user_home, *user_home.parents) else [str(state)]  # $HOME or above it is no store
+    if roots == _user_roots():
+        check = [roots[0], state / "memory"]  # all of $HOME and the memory folder; the rest of the state is not theirs
+    return memory_import_withheld(str(written), [str(r) for r in check], stores)
 
 
 def _import_target(spec: str, base: Path) -> Path:
-    p = Path(spec).expanduser() if spec.startswith("~/") else base / spec
-    return p.resolve()
+    return _import_spelling(spec, base).resolve()
+
+
+def _import_spelling(spec: str, base: Path) -> Path:
+    """The path an ``@import`` names, absolute, with neither its symlinks nor its ``..`` resolved."""
+    return Path(spec).expanduser() if spec.startswith("~/") else base / spec
 
 
 def _read_head(path: Path, chars: int, lead: bool) -> tuple[str, int, bool]:
@@ -303,12 +316,13 @@ def _expand_once(
         if m is None:
             add(line)
             continue
-        target = _import_target(m.group(1), resolved.parent)
+        written = _import_spelling(m.group(1), resolved.parent)
+        target = written.resolve()
         if not target.is_file():
             add(line)
         elif target in stack:
             add(f"({line.strip()} not imported: it imports itself)")
-        elif not _within(target, roots) or _withheld(target, roots):
+        elif not _within(target, roots) or _withheld(written, roots):
             add(f"({line.strip()} not imported: outside the allowed directories)")
         elif len(stack) > MAX_IMPORT_DEPTH:
             add(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
@@ -355,7 +369,7 @@ def _readable(path: Path, roots: tuple[Path, ...]) -> bool:
         target = path.resolve()
     except OSError:
         return False
-    return _within(target, roots) and not _withheld(target, roots)
+    return _within(target, roots) and not _withheld(Path(os.path.abspath(path)), roots)
 
 
 def _chain(root: Path, cwd: Path) -> list[Path]:
@@ -421,7 +435,7 @@ def scan_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[Memo
     """
     root = project_root(cwd)
     seen: dict[str, Path] = {}
-    out = [_source("user", user_memory_path(), (Path.home().resolve(), home().resolve()), seen, max_chars)]
+    out = [_source("user", user_memory_path(), _user_roots(), seen, max_chars)]
     rules = root.joinpath(*RULES_DIR)
     if rules.is_dir() and not _readable(rules, (root,)):
         out.append(MemorySource("rules", rules, REFUSED))  # a symlinked rules directory leading out: not read
