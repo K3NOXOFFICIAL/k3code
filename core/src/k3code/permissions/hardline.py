@@ -153,6 +153,92 @@ _WRAPPERS = frozenset(
         "chrt",
     }
 )
+#: Windows interpreters reached from a WSL install through interop: ``powershell.exe``, ``cmd.exe``, ``pwsh``,
+#: ``wsl.exe`` and the classic script hosts all run arbitrary code from their arguments, so they count as launchers
+#: (never an ``always allow <prefix>`` rule) and the hardline looks inside what they are told to run. Matched after
+#: lower-casing and dropping a Windows executable suffix, because drvfs (``/mnt/c``) is case-insensitive and interop
+#: invokes ``foo.exe``: ``PowerShell.exe`` and ``/mnt/c/.../powershell.exe`` are the same program (issue #169).
+WINDOWS_LAUNCHERS = frozenset(
+    {
+        "powershell",
+        "pwsh",
+        "cmd",
+        "wsl",
+        "wslg",
+        "cscript",
+        "wscript",
+        "mshta",
+        "rundll32",
+        "regsvr32",
+    }
+)
+#: How interop spells a Windows interpreter binary (``powershell.exe``); not script/data suffixes like ``.ps1``.
+_WINDOWS_EXEC_SUFFIX = re.compile(r"\.(?:exe|com|bat)$")
+
+
+def _windows_program(name: str) -> str:
+    """``name`` (an argv0 basename) lower-cased and without a Windows executable suffix: ``PowerShell.EXE`` ->
+    ``powershell``."""
+    return _WINDOWS_EXEC_SUFFIX.sub("", name.lower())
+
+
+def _windows_launcher(name: str) -> bool:
+    """``name`` (an argv0 basename) is a Windows interpreter reached through WSL interop (see WINDOWS_LAUNCHERS)."""
+    return _windows_program(name) in WINDOWS_LAUNCHERS
+
+
+#: wsl.exe options that take a value; ``-e``/``--exec``/``--`` end its options.
+_WSL_VALUE_OPTS = frozenset({"-d", "--distribution", "--distribution-id", "-u", "--user", "--cd", "--shell-type"})
+#: PowerShell parameters that take a value (lower case, no leading ``-``): any prefix of one is the parameter, as
+#: PowerShell accepts abbreviations (``-ExecutionPol``). Aliases that are no prefix are listed apart.
+_PS_VALUE_PARAMS = (
+    *("executionpolicy", "windowstyle", "version", "psconsolefile", "inputformat", "outputformat"),
+    *("configurationname", "configurationfile", "settingsfile", "workingdirectory", "custompipename"),
+)
+_PS_VALUE_ALIASES = frozenset({"ep", "if", "of", "wd"})
+
+
+def _windows_command_line(name: str, args: list[str]) -> list[str]:
+    """The command line a Windows launcher runs from its arguments, joined as it joins them: ``wsl.exe [options]
+    <command ...>`` (also after ``-e``/``--exec``/``--``), ``cmd.exe ... /c <command ...>`` (``/k``, ``/r``) and
+    ``powershell.exe ... -Command <command ...>`` (any prefix of ``-Command``, or the first positional argument, which
+    Windows PowerShell runs as the command). Read like the script of ``bash -c``, so the hardline sees an unquoted
+    ``wsl.exe rm -rf ~`` or ``cmd.exe /c wsl rm -rf ~`` (issue #169). ``-File`` and ``-EncodedCommand`` give none."""
+    prog = _windows_program(name)
+    rest: list[str] = []
+    if prog == "wsl":
+        i = 1 if args[:1] == ["~"] else 0  # `wsl ~ ...` starts in the home directory
+        while i < len(args) and args[i].startswith("-"):
+            i += 1
+            if args[i - 1] in ("-e", "--exec", "--"):
+                break
+            if args[i - 1] in _WSL_VALUE_OPTS:
+                i += 1
+        rest = args[i:]
+    elif prog == "cmd":
+        for i, a in enumerate(args):
+            if a[:2].lower() in ("/c", "/k", "/r"):
+                rest = [a[2:], *args[i + 1 :]] if a[2:] else args[i + 1 :]
+                break
+    elif prog in ("powershell", "pwsh"):
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a[:1] not in ("-", "/"):
+                rest = args[i:]
+                break
+            word, colon, _ = a.lstrip("-/").lower().partition(":")
+            if word and "command".startswith(word):
+                rest = args[i + 1 :]
+                break
+            encoded = word in ("e", "ec") or (len(word) > 1 and "encodedcommand".startswith(word))
+            if word and ("file".startswith(word) or encoded):
+                break
+            value = word in _PS_VALUE_ALIASES or any(p.startswith(word) for p in _PS_VALUE_PARAMS)
+            i += 2 if word and value and not colon else 1
+    return [" ".join(rest)] if rest else []
+
+
 #: Commands that run arbitrary code from their arguments: an "always allow <prefix>" rule must never be offered for
 #: them (one click on `python3 *` or `ssh *` would otherwise allow everything).
 LAUNCHERS = frozenset(
@@ -207,16 +293,23 @@ _WILDCARD_UNSAFE_PAIRS = frozenset(
 )
 
 
+def _is_launcher_name(name: str) -> bool:
+    """``name`` (an argv0 basename) runs code from its arguments: a POSIX launcher (LAUNCHERS) or a Windows
+    interpreter reached through WSL interop (WINDOWS_LAUNCHERS)."""
+    return name in LAUNCHERS or _windows_launcher(name)
+
+
 def wildcard_unsafe(command: str) -> bool:
     """``command`` (or a rule pattern) starts with a command that must never get a ``<prefix> *`` rule (see
-    WILDCARD_UNSAFE), including ``git -c key=value ...`` (a config value can name a program to run)."""
+    WILDCARD_UNSAFE and WINDOWS_LAUNCHERS), including ``git -c key=value ...`` (a config value can name a program to
+    run)."""
     toks = _tokens(command)
     while toks and _is_assignment(toks[0]):
         toks = toks[1:]
     if not toks:
         return False
     root = os.path.basename(toks[0])
-    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES):
+    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES) or _windows_launcher(root):
         return True
     if root == "git":
         i = 1
@@ -254,14 +347,42 @@ _DANGEROUS_RM_TARGETS = frozenset(
     }
 )
 
-#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, the Windows
-#: directory or the installed programs (``Program Files``, ``Program Files (x86)``, ``ProgramData``): ``rm -rf`` on any
-#: of these wipes the Windows host from inside WSL (issue #169). Matched against the expanded rm target (optionally a
-#: trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such as ``/mnt/c/Users/nils/project``
-#: is a project folder, not one of these, and is not matched.
-_MNT_DRIVE_RM = re.compile(
-    r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows|program files(?: \(x86\))?|programdata))?(?:/\*)?", re.IGNORECASE
-)
+#: Top-level folders of a Windows drive whose recursive delete wipes the host side (lower case, as drvfs folds case):
+#: ``rm -rf`` of the drive, one of these or a profile below ``Users`` wipes the Windows host from inside WSL (issue
+#: #169). A deeper path such as ``/mnt/c/Users/nils/project`` is a project folder and is left alone (see
+#: windows_rm_target).
+_WINDOWS_DRIVE_SUBDIRS = frozenset({"users", "windows", "program files", "program files (x86)", "programdata"})
+#: The default WSL automount: a Windows drive is mounted at ``/mnt/<letter>``. A custom ``automount.root`` is read
+#: from /proc/mounts instead (see :func:`k3code.permissions.engine.windows_drives`).
+_DEFAULT_MNT_DRIVE = re.compile(r"^(/mnt/[a-z])(?:/|$)")
+
+
+def _windows_drive_of(base: str, drives: list[str]) -> str | None:
+    """The Windows drive root ``base`` (lower case) sits on or is: a drvfs mount from ``drives``, or the default
+    ``/mnt/<letter>`` automount."""
+    for d in drives:
+        d = d.rstrip("/")
+        if base == d or base.startswith(d + "/"):
+            return d
+    m = _DEFAULT_MNT_DRIVE.match(base)
+    return m.group(1) if m else None
+
+
+def windows_rm_target(base: str, drives: list[str]) -> bool:
+    """``base`` (an expanded rm target, lower case, a trailing ``/*`` glob allowed) is a Windows drive root, a drive
+    glob, one of its system folders (Users, Windows, ...) or a profile root ``<drive>/Users/<name>`` under one of the
+    WSL ``drives`` or the default ``/mnt/<letter>``. Deleting any of these wipes the host side of a WSL install."""
+    if base.endswith("/*"):
+        base = base[:-2]
+    drive = _windows_drive_of(base, drives)
+    if drive is None:
+        return False
+    if base == drive:
+        return True
+    rest = base[len(drive) + 1 :].split("/")
+    if len(rest) == 1 and rest[0] in _WINDOWS_DRIVE_SUBDIRS:
+        return True
+    return len(rest) == 2 and rest[0] == "users"  # a per-user profile root (its name is not known in advance)
 
 
 def check(
@@ -1084,15 +1205,16 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     if not recursive:
         return None
     dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
+    from .engine import windows_drives  # engine imports this module
+
+    drives = windows_drives()
     for t in targets:
         target = _expand_target(t, cwd, home) if t else t
         if target in dangerous:
             homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
             return "rm-rf-home" if homeish else "rm-rf-root"
-        # a WSL mount of a Windows drive (`/mnt/c`, `/mnt/c/Users`, `/mnt/c/Users/<name>`, `/mnt/c/Windows`): wiping it
-        # destroys the Windows host from inside WSL. A deeper path is a project folder and is left alone.
-        if target and _MNT_DRIVE_RM.fullmatch(target):
-            return "rm-rf-root"
+        if target and windows_rm_target(target.lower(), drives):
+            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
     return None
 
 
@@ -1542,12 +1664,13 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 
 
 def _launcher_payloads(sub: str) -> list[str]:
-    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
-    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
-    shell unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word
-    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the
-    backslashes the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the
-    two, and shlex's reading is checked as well. Identical readings are one reading."""
+    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
+    values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and the command line of ``wsl.exe``, ``cmd.exe /c``
+    and ``powershell.exe -Command`` (see _windows_command_line): strings run as commands, unquoted as the shell
+    unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word gives
+    (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the backslashes
+    the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the two, and
+    shlex's reading is checked as well. Identical readings are one reading."""
     out: list[str] = []
     readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
@@ -1555,10 +1678,11 @@ def _launcher_payloads(sub: str) -> list[str]:
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
             out.append(" ".join(pre[1:]))
         real = normalize_argv(list(toks))
-        if real and real[0] in LAUNCHERS:
+        if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
         if real:
             out += ssh_option_commands(real[0], real[1:])
+            out += _windows_command_line(real[0], real[1:])
     return list(dict.fromkeys(out))
 
 
@@ -1641,10 +1765,10 @@ def command_prefix(sub_command: str) -> str:
 def is_launcher(sub_command: str) -> bool:
     """True when the command runs code given in its arguments (shells, ssh, interpreters, xargs, find, sudo ...)."""
     tokens = _tokens(sub_command)
-    if tokens and os.path.basename(tokens[0]) in LAUNCHERS:
+    if tokens and _is_launcher_name(os.path.basename(tokens[0])):
         return True
     real = _strip_wrappers(tokens)
-    return bool(real) and os.path.basename(real[0]) in LAUNCHERS
+    return bool(real) and _is_launcher_name(os.path.basename(real[0]))
 
 
 #: Shell tokenising for the engine's argument checks (quote-aware, wrappers such as sudo/env stripped).

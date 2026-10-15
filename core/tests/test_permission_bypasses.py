@@ -743,6 +743,161 @@ def test_project_setup_proposes_exact_commands_for_wildcard_unsafe_ones(cmd: str
     assert safe_commands({"test": cmd}) == [expected]
 
 
+# ── WSL: the Windows side is reached through interop (issue #169) ──
+
+#: Windows programs that run code given in their arguments, in the spellings WSL accepts (drvfs is case-insensitive).
+WINDOWS_LAUNCHERS: list[str] = [
+    "powershell.exe -NoProfile -Command Get-Date",
+    "PowerShell.exe -c 1",
+    "pwsh -c 1",
+    "pwsh.exe -c 1",
+    "cmd.exe /c dir",
+    "CMD.EXE /c dir",
+    "wsl.exe -e ls",
+    "cscript.exe x.vbs",
+    "wscript.exe x.vbs",
+    "mshta.exe x.hta",
+    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -c 1",
+]
+
+
+@pytest.mark.parametrize("cmd", WINDOWS_LAUNCHERS)
+def test_windows_launchers_are_launchers(tmp_path: Path, cmd: str) -> None:
+    from k3code.permissions.engine import suggest_rules
+
+    assert hardline.is_launcher(cmd), cmd
+    assert hardline.wildcard_unsafe(cmd), cmd
+    assert suggest_rules("bash", _decide(cmd, "default", tmp_path)) == [], cmd
+
+
+@pytest.mark.parametrize("cmd", ["sudo cmd.exe /c dir", "env X=1 powershell.exe -c 1"])
+def test_wrapped_windows_launchers_get_no_always_rule(tmp_path: Path, cmd: str) -> None:
+    from k3code.permissions.engine import suggest_rules
+
+    assert hardline.is_launcher(cmd), cmd
+    assert suggest_rules("bash", _decide(cmd, "default", tmp_path)) == [], cmd
+
+
+@pytest.mark.parametrize(
+    "pattern", ["powershell.exe *", "PowerShell.exe *", "pwsh *", "cmd.exe *", "wsl.exe *", "cscript.exe *", "mshta *"]
+)
+def test_learned_wildcards_on_windows_launchers_are_rejected(pattern: str) -> None:
+    from k3code.learning.permrules import unsafe_pattern
+
+    assert unsafe_pattern(pattern), pattern
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cmd.exe /c 'cat .env'",
+        'powershell.exe -Command "rm -rf ~"',
+        "wsl.exe -e sh -c 'rm -rf /'",
+        # wsl.exe, cmd.exe /c and powershell -Command run their remaining arguments, joined, as one command line
+        "wsl.exe rm -rf ~",
+        "wsl -e rm -rf ~",
+        "wsl.exe --exec rm -rf /",
+        "wsl -u root -- rm -rf /",
+        "WSL.EXE -d Ubuntu --cd /tmp rm -rf /mnt/c/Users/me",
+        "wsl.exe --user=root rm -rf /",
+        "wsl.exe ~ rm -rf /mnt/c",
+        "wsl ~ -u root -e rm -rf /",
+        "cmd.exe /c wsl rm -rf ~",
+        "CMD.EXE /S /C wsl.exe -e rm -rf /",
+        "cmd.exe /k wsl rm -rf ~",
+        'cmd.exe /d /c"wsl rm -rf ~"',
+        "powershell.exe -NoProfile -Command wsl rm -rf ~",
+        "powershell.exe wsl rm -rf ~",  # Windows PowerShell runs its first positional argument as -Command
+        "powershell.exe -ExecutionPolicy:Bypass -WindowStyle Hidden wsl rm -rf ~",
+        "powershell.exe -conf X -ExecutionPol Bypass -NoP wsl -e rm -rf ~",
+        'powershell.exe -c "wsl rm -rf ~"',
+        "PowerShell.exe -ExecutionPolicy Bypass -Comm wsl rm -rf ~",
+        "pwsh -c wsl -e rm -rf /",
+        "pwsh.exe --command wsl rm -rf ~",
+        "sudo wsl.exe rm -rf ~",
+    ],
+)
+def test_hardline_sees_into_windows_launcher_arguments(tmp_path: Path, cmd: str) -> None:
+    for mode in ("default", "auto", "yolo"):
+        d = _decide(cmd, mode, tmp_path)
+        assert (d.action, bool(d.hardline)) == ("deny", True), (cmd, mode)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "wsl.exe -e ls",
+        "wsl.exe --cd ~ ls -la",
+        "wsl -d Ubuntu -u root -- apt list --installed",
+        "wsl.exe --list --verbose",
+        "cmd.exe /c dir",
+        "cmd.exe /c echo rm -rf",
+        "powershell.exe -NoProfile -Command Get-Date",
+        "pwsh -File build.ps1 -Target rm",
+        "powershell.exe -EncodedCommand ZQBjAGgAbwA=",
+        "wsl.exe ~",
+    ],
+)
+def test_harmless_windows_launcher_commands_are_not_hardline(cmd: str) -> None:
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
+
+
+#: A Windows drive, its system folders and a profile root under the WSL mount (any case: drvfs folds it).
+WINDOWS_RM_DENY: list[str] = [
+    "rm -rf /mnt/c",
+    "rm -rf /mnt/c/",
+    "rm -rf /mnt/c/*",
+    "rm -rf /mnt/d",
+    "rm -rf /mnt/c/Users",
+    "rm -rf /mnt/c/users/",
+    "rm -rf /mnt/c/Windows",
+    "rm -rf /mnt/c/WINDOWS/*",
+    "rm -rf /mnt/c/Users/me",
+    "rm -rf /mnt/c/Users/me/",
+    "rm -rf /mnt/c/Users/me/*",
+    "rm -rf /mnt/c/Users/me/../me",
+    "sudo rm -r /mnt/c/Users/Public",
+]
+
+
+@pytest.mark.parametrize("cmd", WINDOWS_RM_DENY)
+def test_rm_of_a_windows_drive_or_profile_is_hardline(tmp_path: Path, cmd: str) -> None:
+    for mode in ("default", "auto", "yolo"):
+        d = _decide(cmd, mode, tmp_path)
+        assert (d.action, bool(d.hardline)) == ("deny", True), (cmd, mode)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "rm -rf /mnt/c/Users/me/project/build",
+        "rm -rf /mnt/c/Users/me/Downloads/old",
+        "rm -rf /mnt/data/cache",
+        "rm -rf /mnt/backup",
+        "rm /mnt/c/Users/me/notes.txt",
+    ],
+)
+def test_rm_inside_a_windows_profile_is_not_hardline(cmd: str) -> None:
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
+
+
+def test_rm_reads_the_drives_wsl_mounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.permissions import engine
+
+    monkeypatch.setattr(engine, "_mounted_windows_drives", lambda: ("/win/c",))  # automount.root = /win/
+    for cmd in ("rm -rf /win/c", "rm -rf /win/C/Users/me", "rm -rf /win/c/Windows"):
+        assert hardline.check(cmd, cwd="/work/proj", home="/home/user") == "rm-rf-root", cmd
+    assert hardline.check("rm -rf /win/c/Users/me/build", cwd="/work/proj", home="/home/user") is None
+
+
+def test_rm_of_a_drive_at_a_custom_automount_root_is_recognised() -> None:
+    drives = ["/win/c", "/win/data drive"]
+    for base in ("/win/c", "/win/c/*", "/win/c/users", "/win/c/windows", "/win/c/users/me", "/win/data drive"):
+        assert hardline.windows_rm_target(base, drives), base
+    for base in ("/win/c/users/me/project", "/win/other", "/mnt/wsl"):
+        assert not hardline.windows_rm_target(base, drives), base
+
+
 def test_command_prefix_keeps_python_module() -> None:
     assert hardline.command_prefix("python -m pytest -q") == "python -m pytest"
     assert hardline.command_prefix("python3 -u -m http.server 8000") == "python3 -m http.server"
