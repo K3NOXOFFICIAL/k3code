@@ -134,6 +134,7 @@ class PersistentRetry:
         cancel_token: CancelToken | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         self.router = router
         self.netwatch = netwatch
@@ -145,6 +146,8 @@ class PersistentRetry:
         self.cancel_token = cancel_token or CancelToken()
         self._sleep = sleep or asyncio.sleep
         self._monotonic = monotonic
+        #: A park also ends at its wall-clock time: the monotonic clock stops while the host sleeps.
+        self._wall = wall
         self._park_step = 0
         # Retry-After window seen on the most recent rate-limit/quota retry
         # (tracked from router.retry events; see _watch_router_events).
@@ -286,6 +289,7 @@ class PersistentRetry:
             delay = max(0.0, float(delay))
             self._park_step = 0
         next_retry_at = self._monotonic() + delay
+        retry_at_wall = self._wall() + delay
         extra = {} if until is None else {"until": until}
         self.events.emit(ev.PARKED, detail=detail, next_retry_at=next_retry_at, delay=delay, **extra)
         recoveries_at_park = getattr(self.netwatch, "recoveries", 0) if self.netwatch is not None else 0
@@ -298,7 +302,7 @@ class PersistentRetry:
             )
 
         try:
-            await self._wait_until(recovered, deadline, until_ts=next_retry_at)
+            await self._wait_until(recovered, deadline, until_ts=next_retry_at, until_wall=retry_at_wall)
         finally:
             self._raise_if_cancelled()
         woke = recovered()
@@ -312,8 +316,11 @@ class PersistentRetry:
         deadline: float | None,
         *,
         until_ts: float | None = None,
+        until_wall: float | None = None,
     ) -> None:
-        """Sleep in poll-sized chunks until ``ready()``, ``until_ts`` or ``deadline``.
+        """Sleep in poll-sized chunks until ``ready()``, ``until_ts`` (monotonic), ``until_wall`` (wall clock) or
+        ``deadline``. The wall-clock time ends the wait too: after a host suspend the monotonic clock has not
+        counted the sleep, so ``until_ts`` alone would outlive the provider's reset by the time asleep.
 
         Cancel-aware throughout: a cancelled token raises :class:`TurnCancelled`.
         """
@@ -322,8 +329,15 @@ class PersistentRetry:
             self._raise_if_cancelled()
             now = self._monotonic()
             if deadline is not None and now >= deadline:
-                raise _MaxWaitExceeded(f"max_wait of {self.config.max_wait:.0f}s exceeded while waiting")
-            if ready() or (until_ts is not None and now >= until_ts):
+                waited = float(self.config.max_wait or 0)
+                detail = f"gave up after {waited:.0f}s waiting for a provider"
+                self.events.emit(ev.GAVE_UP, detail=detail, waited=waited)
+                raise _MaxWaitExceeded(f"max_wait of {waited:.0f}s exceeded while waiting")
+            if (
+                ready()
+                or (until_ts is not None and now >= until_ts)
+                or (until_wall is not None and self._wall() >= until_wall)
+            ):
                 return
             chunk = min(step, until_ts - now) if until_ts is not None else step
             if deadline is not None:

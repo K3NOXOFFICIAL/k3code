@@ -117,7 +117,7 @@ export function buildSettingsItems(s: SettingsSnapshot): SettingItem[] {
       "theme",
       "Theme",
       s.theme,
-      ["default", "light", "dark"],
+      ["auto", "light", "dark"],
       (v) => `/theme ${v}`,
       "Colour theme",
     ),
@@ -306,7 +306,8 @@ export function settingsKey(
     state: { ...state, ...patch },
   });
 
-  if (opts.locked || key.ctrl || key.meta) {
+  // Ink flags every Esc as meta (a bare ESC byte parses as meta+escape): let it through, or the panel cannot be closed.
+  if (opts.locked || key.ctrl || (key.meta && !key.escape)) {
     return same;
   }
 
@@ -432,7 +433,11 @@ export function settingsSnapshot(
     | "mouse"
     | "showReasoning"
     | "statusBar"
-  > & { effort?: string },
+  > & {
+    effort?: string;
+    /** The saved `display.tui_theme` pin (config.get "theme"); empty = auto. */
+    theme?: string;
+  },
 ): SettingsSnapshot {
   const r = (raw ?? {}) as Record<string, unknown>;
   const v = (r.settings ?? {}) as Record<string, unknown>;
@@ -450,6 +455,9 @@ export function settingsSnapshot(
     permissionMode: str(v.permission_mode, "default"),
     permissionModes: strs(v.permission_modes),
     statusLines: str(r.output).split("\n"),
-    theme: str(v.theme, "default"),
+    // settings.get's `theme` is the gateway skin name; the row edits the
+    // `display.tui_theme` mode pin that /theme writes, so read that instead.
+    theme:
+      local.theme === "light" || local.theme === "dark" ? local.theme : "auto",
   };
 }

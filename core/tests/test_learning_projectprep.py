@@ -101,3 +101,11 @@ async def test_no_makefile_write_into_the_repo_and_scratch_dirs_are_skipped(tmp_
     empty.mkdir()
     assert await projectprep.prepare(empty, store=store) == []
     assert not (empty / ".k3code").exists() and not projectstate.state_path(empty).exists()
+
+
+async def test_a_bare_git_init_directory_is_scratch_too(tmp_path):
+    bare = tmp_path / "bare"
+    (bare / ".git").mkdir(parents=True)
+    store = ProposalStore(tmp_path / "home")
+    assert await projectprep.prepare(bare, store=store) == []
+    assert not projectstate.state_path(bare).exists() and store.all() == []

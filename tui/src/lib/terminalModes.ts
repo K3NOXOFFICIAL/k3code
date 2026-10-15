@@ -42,6 +42,16 @@ export function clearNativeTuiFrame(
   }
 }
 
+/**
+ * Blank the visible screen before the first frame. Never ESC[3J: terminals honor it against the primary buffer, so
+ * every launch erased the user's whole scrollback (build logs, earlier commands). The alt screen needs no clearing.
+ */
+export function clearStartupScreen(
+  stream: Pick<NodeJS.WriteStream, "write"> = process.stdout,
+): void {
+  stream.write("\x1b[2J\x1b[H");
+}
+
 // OSC 10/11 set the terminal's DEFAULT foreground/background — so every cell,
 // including text rendered with no explicit color (markdown body, borders,
 // third-party output), takes the skin instead of the host profile's defaults.

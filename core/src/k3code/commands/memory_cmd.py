@@ -15,9 +15,7 @@ from k3code.memory import append_memory, project_memory_path, user_memory_path
 async def mem0_search(cfg: Any, query: str, *, client: httpx.AsyncClient | None = None) -> list[str]:
     key = os.environ.get(cfg.mem0.api_key_env, "") if cfg.mem0.api_key_env else ""
     headers = {"Authorization": f"Token {key}", "X-API-Key": key} if key else {}
-    body: dict[str, Any] = {"query": query, "limit": 8}
-    if cfg.mem0.user_id:
-        body["user_id"] = cfg.mem0.user_id
+    body: dict[str, Any] = {"query": query, "limit": 8, **cfg.mem0.identifiers()}
     own = client is None
     client = client or httpx.AsyncClient(timeout=15)
     try:

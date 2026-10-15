@@ -1,7 +1,7 @@
 # Vendored from hermes-agent@4127d78da84b1eee105f298979cc57cc7457f98d:agent/fallback_cooldown.py (MIT)
 # Copyright (c) 2025 Nous Research
 # Adapted for k3code: Hermes arms cooldowns on the agent object; k3code keeps a
-# standalone CooldownStore keyed by (provider, model, base_url), so the router can
+# standalone CooldownStore keyed by (provider, model, base_url, account), so the router can
 # consult it without an agent. Retry-After / provider reset windows are honored
 # through the vendored retry_utils parsers. k3code addition: network failures also
 # cool down (the provider is down for everyone), with a flat configurable window
@@ -35,9 +35,19 @@ logger = logging.getLogger(__name__)
 # rate_limit/quota use the exponential reset ladder below; network uses a flat
 # window (same provider being unreachable is chain-wide news) — still configurable;
 # auth has its own short ladder (a revoked key is otherwise posted to on every step).
-_COOLDOWN_REASONS = frozenset(
-    {FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network, FailoverReason.auth}
+#: The entry's circuit breaker (issue #125): one failed call (its in-walk retries included) opens the entry for a
+#: short window so the next calls go straight to the backup instead of paying 3 requests and ~7 s of backoff each;
+#: a window that ends with another failure doubles the next one. Never persisted: a restart is a reset.
+BREAKER_REASONS = frozenset({FailoverReason.server, FailoverReason.timeout, FailoverReason.unknown})
+_COOLDOWN_REASONS = (
+    frozenset({FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network, FailoverReason.auth})
+    | BREAKER_REASONS
 )
+
+# Breaker ladder: 15 s → 30 s → 60 s → 2 min. The cap bounds how long a one-entry chain (the common single-gateway
+# config) parks an interactive turn between half-open probes; a declared Retry-After (503/529) seeds the window.
+_BREAKER_BASE_COOLDOWN_SECONDS = 15.0
+_BREAKER_MAX_COOLDOWN_SECONDS = 120.0
 
 # Auth ladder: 5 min → 10 min … capped at 1 h. A replaced key skips it (the credential fingerprint changes).
 _AUTH_BASE_COOLDOWN_SECONDS = 300.0
@@ -70,41 +80,56 @@ def key_fingerprint(api_key: str | None) -> str:
     return hashlib.sha256((api_key or "").encode()).hexdigest()[:12]
 
 
-def _identity(provider: str, model: str, base_url: str) -> tuple[str, str, str]:
-    return (provider.strip().lower(), model.strip().lower(), (base_url or "").strip().lower())
+_Key = tuple[str, str, str, str]
+
+
+def _identity(provider: str, model: str, base_url: str, account: str = "") -> _Key:
+    """Cooldown identity. ``account`` (the router passes :func:`key_fingerprint`) keeps two accounts of one provider
+    (same name, model and base_url, different keys) from sharing a window or a strike count."""
+    return (provider.strip().lower(), model.strip().lower(), (base_url or "").strip().lower(), account.strip().lower())
 
 
 @dataclass
 class EntryCooldown:
-    """One entry's cooldown window on the monotonic clock."""
+    """One entry's cooldown window: a monotonic deadline and, next to it, the wall-clock reset."""
 
     until: float
     seconds: float
     reason: FailoverReason
-    #: wall-clock epoch of the reset (what survives a restart in ``cooldowns.json``)
+    #: wall-clock epoch of the reset (what survives a restart in ``cooldowns.json``); 0 = unknown, ignored
     until_wall: float = 0.0
     #: fingerprint of the credential an auth cooldown was armed for (empty for other reasons)
     fingerprint: str = ""
 
+    def remaining_at(self, monotonic: float, wall: float) -> float:
+        """Seconds left, from whichever clock says the window ends first. The monotonic clock stops while the host
+        sleeps (laptop lid, WSL2 host sleep) and the wall clock does not, so a window that reset meanwhile is over."""
+        left = self.until - monotonic
+        if self.until_wall > 0:
+            left = min(left, self.until_wall - wall)
+        return max(0.0, left)
+
     @property
     def remaining(self) -> float:
-        return max(0.0, self.until - time.monotonic())
+        return self.remaining_at(time.monotonic(), time.time())
 
 
 @dataclass
 class CooldownStore:
-    """Cooldowns keyed by (provider, model, base_url); a probe-safe stand-in for
+    """Cooldowns keyed by (provider, model, base_url, account); a probe-safe stand-in for
     Hermes' agent-object fields."""
 
-    entries: dict[tuple[str, str, str], EntryCooldown] = field(default_factory=dict)
+    entries: dict[_Key, EntryCooldown] = field(default_factory=dict)
     #: when set, rate-limit/quota cooldowns are persisted here so a restart does not hammer the provider
     path: Path | None = None
     #: wall-clock source (injectable for tests)
     wall: Callable[[], float] = time.time
     #: consecutive rate-limit/quota arms per entry (the exponential ladder's step), reset by ``record_success``
-    strikes: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    strikes: dict[_Key, int] = field(default_factory=dict)
     #: consecutive auth arms per entry (the auth ladder's step), reset by ``record_success``
-    auth_strikes: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    auth_strikes: dict[_Key, int] = field(default_factory=dict)
+    #: consecutive breaker arms per entry (the breaker ladder's step), reset by ``record_success``
+    breaker_strikes: dict[_Key, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.path is not None:
@@ -122,7 +147,7 @@ class CooldownStore:
         now_wall, now_mono = self.wall(), time.monotonic()
         for row in raw.get("entries", []) if isinstance(raw, dict) else []:
             try:
-                key = _identity(row["provider"], row["model"], row.get("base_url", ""))
+                key = _identity(row["provider"], row["model"], row.get("base_url", ""), str(row.get("account", "")))
                 until_wall = float(row["until"])
                 reason = FailoverReason(row["reason"])
                 fingerprint = str(row.get("fingerprint", ""))
@@ -138,9 +163,13 @@ class CooldownStore:
         now_wall, now_mono = self.wall(), time.monotonic()
         rows = [
             {"provider": k[0], "model": k[1], "base_url": k[2], "reason": e.reason.value, "until": e.until_wall}
+            | ({"account": k[3]} if k[3] else {})
             | ({"fingerprint": e.fingerprint} if e.fingerprint else {})
             for k, e in self.entries.items()
-            if e.reason is not FailoverReason.network and e.until > now_mono and e.until_wall > now_wall
+            if e.reason is not FailoverReason.network
+            and e.reason not in BREAKER_REASONS
+            and e.until > now_mono
+            and e.until_wall > now_wall
         ]
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +186,7 @@ class CooldownStore:
         provider: str,
         model: str,
         base_url: str = "",
+        account: str = "",
         retry_after: float | None = None,
         backoff_count: int | None = None,
         network_cooldown: float | None = None,
@@ -177,8 +207,8 @@ class CooldownStore:
         """
         if reason not in _COOLDOWN_REASONS:
             return None
-        key = _identity(provider, model, base_url)
-        auth_step = 0
+        key = _identity(provider, model, base_url, account)
+        auth_step = breaker_step = 0
         if reason is FailoverReason.auth:
             if keyless:
                 return None
@@ -187,6 +217,9 @@ class CooldownStore:
             if strikes < _AUTH_STRIKES_TO_ARM:
                 return None
             auth_step = strikes - _AUTH_STRIKES_TO_ARM
+        elif reason in BREAKER_REASONS:
+            breaker_step = self.breaker_strikes.get(key, 0)
+            self.breaker_strikes[key] = breaker_step + 1
         elif reason is not FailoverReason.network:
             if backoff_count is None:
                 backoff_count = self.strikes.get(key, 0)
@@ -198,6 +231,8 @@ class CooldownStore:
             seconds = math.ceil(window)
         elif reason is FailoverReason.auth:
             seconds = min(_AUTH_BASE_COOLDOWN_SECONDS * (2 ** min(auth_step, 16)), _AUTH_MAX_COOLDOWN_SECONDS)
+        elif reason in BREAKER_REASONS and not _provider_reset_delay(retry_after):
+            seconds = min(_BREAKER_BASE_COOLDOWN_SECONDS * (2 ** min(breaker_step, 16)), _BREAKER_MAX_COOLDOWN_SECONDS)
         elif provider_delta := _provider_reset_delay(retry_after):
             seconds = math.ceil(provider_delta)
         else:
@@ -213,9 +248,11 @@ class CooldownStore:
         self._save()
         return seconds
 
-    def _live_entry(self, provider: str, model: str, base_url: str, fingerprint: str | None) -> EntryCooldown | None:
+    def _live_entry(
+        self, provider: str, model: str, base_url: str, fingerprint: str | None, account: str = ""
+    ) -> EntryCooldown | None:
         """The entry's cooldown, or None; an auth cooldown armed for another credential no longer applies."""
-        key = _identity(provider, model, base_url)
+        key = _identity(provider, model, base_url, account)
         entry = self.entries.get(key)
         if entry is None:
             return None
@@ -227,24 +264,28 @@ class CooldownStore:
             return None
         return entry
 
+    def _left(self, entry: EntryCooldown, now: float | None) -> float:
+        """Seconds left on ``entry``; ``now`` overrides the monotonic clock (tests), ``wall`` is the wall clock."""
+        return entry.remaining_at(time.monotonic() if now is None else now, self.wall())
+
     def in_cooldown(
         self,
         *,
         provider: str,
         model: str,
         base_url: str = "",
+        account: str = "",
         now: float | None = None,
         fingerprint: str | None = None,
     ) -> bool:
         """Whether this entry is still cooling down. ``fingerprint`` is the entry's current credential (see
         :func:`key_fingerprint`); omit it to skip the credential check."""
-        entry = self._live_entry(provider, model, base_url, fingerprint)
+        entry = self._live_entry(provider, model, base_url, fingerprint, account)
         if entry is None:
             return False
-        monotonic_now = time.monotonic() if now is None else now
-        if entry.until <= monotonic_now:
+        if self._left(entry, now) <= 0:
             # Expired windows are dropped so a long-lived store never grows unbounded.
-            self.entries.pop(_identity(provider, model, base_url), None)
+            self.entries.pop(_identity(provider, model, base_url, account), None)
             return False
         return True
 
@@ -254,28 +295,34 @@ class CooldownStore:
         provider: str,
         model: str,
         base_url: str = "",
+        account: str = "",
         now: float | None = None,
         fingerprint: str | None = None,
     ) -> float:
-        entry = self._live_entry(provider, model, base_url, fingerprint)
+        entry = self._live_entry(provider, model, base_url, fingerprint, account)
         if entry is None:
             return 0.0
-        monotonic_now = time.monotonic() if now is None else now
-        return max(0.0, entry.until - monotonic_now)
+        return self._left(entry, now)
 
     def reason_of(
-        self, *, provider: str, model: str, base_url: str = "", fingerprint: str | None = None
+        self, *, provider: str, model: str, base_url: str = "", account: str = "", fingerprint: str | None = None
     ) -> FailoverReason | None:
-        entry = self._live_entry(provider, model, base_url, fingerprint)
+        entry = self._live_entry(provider, model, base_url, fingerprint, account)
         return entry.reason if entry is not None else None
 
-    def record_success(self, *, provider: str, model: str, base_url: str = "") -> None:
+    def record_success(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> None:
         """The entry answered: its next rate limit starts the ladder from the bottom again."""
-        self.strikes.pop(_identity(provider, model, base_url), None)
-        self.auth_strikes.pop(_identity(provider, model, base_url), None)
+        self.strikes.pop(_identity(provider, model, base_url, account), None)
+        self.auth_strikes.pop(_identity(provider, model, base_url, account), None)
+        self.breaker_strikes.pop(_identity(provider, model, base_url, account), None)
 
-    def clear(self, *, provider: str, model: str, base_url: str = "") -> None:
-        self.entries.pop(_identity(provider, model, base_url), None)
+    def tripped(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> bool:
+        """Whether the entry's breaker opened before and the entry has not answered since: the call after a window
+        ends is the half-open probe, and its failure reopens the breaker at once instead of retrying inline."""
+        return self.breaker_strikes.get(_identity(provider, model, base_url, account), 0) > 0
+
+    def clear(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> None:
+        self.entries.pop(_identity(provider, model, base_url, account), None)
         self._save()
 
     def clear_reason(self, reason: FailoverReason, *, provider: str | None = None) -> int:
@@ -294,7 +341,8 @@ class CooldownStore:
     def only_network_cooling(self) -> bool:
         """True when at least one entry is cooling and every active cooldown is a network one."""
         now = time.monotonic()
-        active = [e for e in self.entries.values() if e.until > now]
+        wall = self.wall()
+        active = [e for e in self.entries.values() if e.remaining_at(now, wall) > 0]
         return bool(active) and all(e.reason is FailoverReason.network for e in active)
 
 

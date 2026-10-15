@@ -3,7 +3,8 @@
 A repo you clone can ship a config that starts MCP servers (commands) or adds permission rules that approve tool
 calls without asking, and agent, skill and output-style files whose text reaches the model's prompt. None of it is
 applied until you agree to these exact files. The answer is stored in ``$K3CODE_HOME/trusted_projects.json`` per
-absolute project path, with a SHA-256 over the files, so a changed or added file asks again. (With no agent, skill
+absolute project path (a linked git worktree, such as a fan-out child's, counts as its main checkout), with a
+SHA-256 over the files, so a changed or added file asks again. (With no agent, skill
 or style files the digest is the config file's own SHA-256, so answers recorded before they were covered still hold.)
 
 Interactive opens (the TUI and the REPL) ask once, in the parent process, before anything is loaded. Headless and
@@ -24,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from k3code.paths import home
+from k3code.paths import home, main_checkout
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,11 @@ def project_dir_of(path: str | Path) -> Path | None:
 
 
 def _key(project_dir: str | Path) -> str:
-    return str(Path(project_dir).expanduser().resolve())
+    """The store key: the project's absolute path; a linked git worktree (a fan-out child's) shares its main
+    checkout's answer. The answer still holds only for the exact files (``_state``), so a worktree whose files
+    differ asks again."""
+    path = Path(project_dir).expanduser().resolve()
+    return str(main_checkout(path) or path)
 
 
 def _read(project_dir: str | Path) -> bytes | None:

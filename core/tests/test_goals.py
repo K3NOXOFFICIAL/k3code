@@ -19,7 +19,7 @@ NO_ADVISOR = {"advisor_on_goal": False}
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
@@ -223,3 +223,30 @@ async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_l
     await capped.evaluate_after_turn("done!", judge)
     paused = await capped.evaluate_after_turn("done!", judge)
     assert not paused.should_continue and capped.state.paused_reason == "check exhausted 2 retries: $ exit 1"
+
+
+async def test_the_judge_receives_the_turns_evidence_digest(tmp_path, monkeypatch):
+    """Roadmap #172 §2: the judge sees what the turn's tools did, not only the agent's claim."""
+    from k3code.providers.types import ToolCall
+    from test_permissions_gateway import call, run_turn
+    from test_permissions_gateway import make_server as scripted_server
+
+    write = ToolCall(id="w1", name="write", arguments={"path": "fix.py", "content": "x = 1\n"})
+    server, _ = scripted_server(
+        tmp_path, [write, "all done, tests pass"], monkeypatch, mode="yolo", autonomy=NO_ADVISOR
+    )
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    got: list[tuple[str, str, str]] = []
+
+    async def judge(goal: str, response: str, evidence):
+        got.append((goal, response, evidence.render()))
+        return "continue", "no test ran", False, False
+
+    server.goal_judge = judge
+    server.goal_manager(server.session).set("fix the bug", max_turns=1)
+    await run_turn(server, "fix the bug", [])
+    assert len(got) == 1 and got[0][1] == "all done, tests pass"
+    evidence = got[0][2]
+    assert "No test/check command ran this turn." in evidence
+    assert "Files written/edited: 1: fix.py" in evidence
+    await server.close()

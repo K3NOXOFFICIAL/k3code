@@ -20,14 +20,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
+import dataclasses
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -39,10 +44,10 @@ from pydantic import TypeAdapter, ValidationError
 
 from k3code import confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
-from k3code._version import __version__
+from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
-from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy import advisor, auto_continue_on, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -74,8 +79,8 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -84,9 +89,9 @@ from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
-from k3code.prompting import build_system_prompt
+from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
-from k3code.providers import make_providers
+from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
@@ -104,6 +109,7 @@ from k3code.routing.tiers import (
     TaskKind,
     Tier,
     TierRouters,
+    active_provider,
     next_tier,
     router_options,
     tier_for,
@@ -111,9 +117,10 @@ from k3code.routing.tiers import (
 )
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
+from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
+from k3code.tools import FileStamps, clip_for_model, register_todo
 from k3code.tools import build_registry as build_tool_registry
-from k3code.tools import clip_for_model, register_todo
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
 
@@ -124,32 +131,42 @@ logger = logging.getLogger("k3code.gateway")
 MAX_FRAME_BYTES = 8 << 20
 #: Long-running requests (CONCURRENT_METHODS) one connection may have in flight; more are refused, not queued.
 MAX_CONCURRENT_PER_CLIENT = 8
-#: Methods only an authenticated connection (``gateway.auth``) may call: they run commands, change permissions or
-#: modes, rewrite config, restart MCP servers or move a session. The stdio client (the TUI's own child) is trusted.
-PRIVILEGED_METHODS = frozenset(
+#: Methods a socket peer may call before ``gateway.auth``: each reads k3code's own state and changes nothing (the
+#: ``k3code doctor`` probe, listings, the settings view). Every other method needs an authenticated connection: a
+#: turn (``prompt.submit``), a steer, an undo, attaching to or creating a session, a shell command, a mode or config
+#: change, an attachment, a path listing, ... A method added to ``_HANDLERS`` is privileged until it is listed here.
+#: The stdio client (the TUI's own child) is trusted.
+OPEN_METHODS = frozenset(
     {
-        "shell.exec",
-        "config.set",
-        "session.mode.set",
-        "session.mode.cycle",
-        "session.workspace.move",
-        "reload.mcp",
-        "model.save_key",
-        "model.disconnect",
-        # slash commands reach the same switches (/permissions yolo, /mcp reload, /config set ...)
-        "slash.exec",
-        "command.dispatch",
+        "setup.status",
+        "system.battery",
+        "commands.catalog",
+        "complete.slash",
+        "model.options",
+        "tune.get",
+        "settings.get",
+        "config.get",
+        "session.list",
+        "session.active_list",
+        "session.most_recent",
+        "session.status",
+        "session.usage",
+        "session.control.read",
+        "session.events.since",
+        "session.events.stats",
+        "subagent.list",
+        "subagent.tail",
+        "process.list",
+        "delegation.status",
     }
 )
 
 
 def _requires_auth(method: str, params: Any) -> bool:
-    if method in PRIVILEGED_METHODS:
-        return True
-    if method == "browser.manage":  # status/disconnect are harmless; connect attaches to a CDP endpoint
+    if method == "browser.manage":  # status is a read; connect attaches to a CDP endpoint, disconnect drops it
         action = params.get("action") if isinstance(params, dict) else None
-        return str(action or "status").strip().lower() == "connect"
-    return False
+        return str(action or "status").strip().lower() != "status"
+    return method not in OPEN_METHODS
 
 
 #: Emitted for gateway.ready; the TUI repaints its palette from this.
@@ -158,15 +175,8 @@ _DEFAULT_SKIN = {
     "tool_prefix": "k3",
 }
 
-_SYSTEM_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system.md"
 #: How long an approval, plan or clarify request may wait for an answer before it is denied and the goal pauses.
 APPROVAL_TIMEOUT_S = 1800.0
-
-
-def _load_system_prompt() -> str:
-    if _SYSTEM_PROMPT_PATH.is_file():
-        return _SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    return "You are a helpful coding assistant."
 
 
 def _turn_status(result: Any) -> str | None:
@@ -211,7 +221,7 @@ class LiveSession:
         self.session_id = session_id
         self.stored = stored
         self.server = server
-        self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
+        self.system_prompt = base_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self._tools_cache: dict[str, list[str]] | None = None  # banner info, see live_info
@@ -234,6 +244,7 @@ class LiveSession:
         self.call_started: float | None = None
         self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
+        self.checkpoint_task: asyncio.Task[None] | None = None  # the checkpoint write in flight, if any
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
@@ -244,6 +255,8 @@ class LiveSession:
         )
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
+        #: what this session's model has seen of each file: every loop of it (turns, tiers) checks write/edit against it
+        self.file_stamps = FileStamps()
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -267,9 +280,16 @@ class LiveSession:
         self.background = bool(stored.meta.get("background"))
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
+        #: what the scope gate made of the latest prompt (None: no gate ran), so an implicit goal whose prompt it rates
+        #: trivial, or whose plan was refused or fanned out, ends after its first turn, unjudged (see _run_turn_locked)
+        self.turn_gate: GateResult | None = None
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
+        #: the "no sandbox" notice is showing (auto/yolo bash without a usable bwrap); cleared when the mode leaves them
+        self.unsandboxed_notice = False
+        #: the "started in your home directory" notice was shown (once per session in this process)
+        self.home_notice = False
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -337,6 +357,47 @@ class LiveSession:
         self.stored.meta["mode"] = mode.value
         self.server.store.save(self.stored)
         self.emit("session.info", self.live_info())
+        if self.unsandboxed_notice and mode not in (PermissionMode.AUTO, PermissionMode.YOLO):
+            self.unsandboxed_notice = False
+            self.emit("notification.clear", {"key": self.UNSANDBOXED_KEY}, importance="essential")
+
+    #: Notification key of the "no sandbox" warning (see notify_unsandboxed).
+    UNSANDBOXED_KEY = "k3.sandbox.unusable"
+
+    #: Notification key of the "started in your home directory" notice (see notify_home_started).
+    HOME_KEY = "k3.session.home"
+    HOME_NOTICE = "k3code started in your home directory: start it inside a project for full auto mode"
+
+    def notify_home_started(self) -> None:
+        """Tell the clients, once per session, that its cwd is $HOME (bash there asks unless a rule allows it)."""
+        if self.home_notice:
+            return
+        self.home_notice = True
+        self.emit(
+            "notification.show",
+            {"text": self.HOME_NOTICE, "level": "warn", "key": self.HOME_KEY, "session_id": self.session_id},
+            importance="essential",
+        )
+
+    def notify_unsandboxed(self) -> None:
+        """Tell the clients that this auto/yolo session's bash runs without the sandbox (bwrap is unusable here). The
+        notice is sticky: it stays until the mode leaves auto/yolo."""
+        if self.perms.mode == PermissionMode.YOLO:
+            what = "yolo mode runs every command on this machine"
+        else:
+            what = "auto mode asks before each command it would have run in the sandbox"
+        self.unsandboxed_notice = True
+        self.emit(
+            "notification.show",
+            {
+                "text": f"⚠ No sandbox: bubblewrap is unusable here, so {what}. See /doctor.",
+                "level": "warn",
+                "kind": "sticky",
+                "key": self.UNSANDBOXED_KEY,
+                "session_id": self.session_id,
+            },
+            importance="essential",
+        )
 
     @property
     def history(self) -> list[Message]:
@@ -372,9 +433,9 @@ class LiveSession:
         config = self.server.config
         key = self.stored.model or config.default_model
         return {
-            "model": _model_label(config, key),
+            "model": _model_label(config, key, self.stored.provider),
             "model_key": key,
-            "version": __version__,
+            "version": build_version(),  # the banner: which build this daemon started as
             "tools": self._tools_info(),
             "skills": self._skills_info(),
             "provider": self.stored.provider,
@@ -463,13 +524,17 @@ _TOOL_GROUPS = {
 }
 
 
-def _model_label(config: Any, key: str) -> str:
-    """The model id the first provider uses for ``key`` (what the user recognises), else the key itself."""
+def _first_model_id(spec: str | list[str]) -> str:
+    return (spec[0] if spec else "") if isinstance(spec, list) else spec
+
+
+def _model_label(config: Any, key: str, provider: str = "") -> str:
+    """The model id the active provider block (``provider``, the session's /provider pick, else ``default_provider``,
+    else the first block) uses for ``key`` (what the user recognises), else the key itself."""
     specs = _resolve_model_specs(config, key) if config.providers else []
-    first = specs[0] if specs else ""
-    if isinstance(first, list):
-        first = first[0] if first else ""
-    return str(first or key)
+    name = active_provider(config, provider)
+    first = next((s for p, s in zip(config.providers, specs, strict=False) if p.name == name), "")
+    return str(_first_model_id(first) or key)
 
 
 #: How many recent messages stay when a session's older messages are folded into a summary. When that happens is
@@ -521,7 +586,7 @@ class Client:
         self.closed = False
         self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
         self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
-        #: May call PRIVILEGED_METHODS and answer approvals. The stdio pipe is; a socket peer after gateway.auth.
+        #: May call any method, not only OPEN_METHODS, and answer approvals: the stdio pipe, a socket peer after auth.
         self.authenticated = authenticated
         self.in_flight = 0  # running CONCURRENT_METHODS tasks of this client (capped at MAX_CONCURRENT_PER_CLIENT)
 
@@ -557,8 +622,10 @@ class GatewayServer:
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
-        self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
+        self.goal_judge: Any = None  # test hook: a goals.Judge, async (goal, last_text, TurnEvidence) -> verdict tuple
         self.providers: list[Any] = []
+        self._provider_sigs: list[dict[str, Any]] = []  # provider_signature of the entries self.providers came from
+        self._retiring: dict[int, Any] = {}  # replaced providers not closed yet (id -> provider), see _retire_providers
         self.router: Router | None = None
         self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
         self._running = False
@@ -589,7 +656,7 @@ class GatewayServer:
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
-        self._router_cache: dict[str, TierRouters] = {}  # one TierRouters per model key (see _ensure_router)
+        self._router_cache: dict[Any, TierRouters] = {}  # one TierRouters per model key [and first block]
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
         self._idle_sweeper: asyncio.Task[None] | None = None
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
@@ -824,6 +891,7 @@ class GatewayServer:
         if not stdio:
             self.clients.remove(self._stdio_client)
         self._idle_sweeper = asyncio.get_running_loop().create_task(self._idle_sweep_loop(), name="k3-idle-sweeper")
+        reaper = asyncio.get_running_loop().create_task(self._reap_at_start(), name="k3-worktree-reaper")
         try:
             if socket_path is not None:
                 await self.start_socket(socket_path)
@@ -837,6 +905,33 @@ class GatewayServer:
             self.shutdown()
         finally:
             self._idle_sweeper.cancel()
+            reaper.cancel()
+
+    #: How many of the newest sessions' working directories the start-up reap looks at.
+    REAP_SESSIONS = 200
+
+    async def _reap_at_start(self) -> None:
+        try:  # housekeeping: it must never hurt the gateway it runs in, but a failure must be visible
+            await self.reap_orphan_worktrees()
+        except Exception:
+            logger.exception("reaping orphaned worktrees failed")
+
+    async def reap_orphan_worktrees(self) -> None:
+        """Reap what fan-out and sub-agent workers left behind when their process died (``worktree.reap``), in each
+        repository these sessions worked in: nothing else removes a dead worker's checkout and branch."""
+        cwds = dict.fromkeys(cwd for _, cwd in self.store.worked_in(limit=self.REAP_SESSIONS) if cwd)
+        for cwd in cwds:
+            if not Path(cwd).is_dir():
+                continue
+            reaped = await wt_mod.reap(cwd)
+            if reaped is not None and (reaped.worktrees or reaped.merged or reaped.expired):
+                logger.info(
+                    "reaped in %s: %d orphaned worktree(s), %d merged and %d expired k3/* branch(es)",
+                    reaped.repo,
+                    len(reaped.worktrees),
+                    len(reaped.merged),
+                    len(reaped.expired),
+                )
 
     async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1234,6 +1329,7 @@ class GatewayServer:
                 except Exception:
                     logger.warning("session %s: stopping its reliability bundle failed", live.session_id, exc_info=True)
         await self.mcp.close()
+        await self._close_retired()
         for p in self.providers:
             await p.aclose()
         self.store.close()
@@ -1292,14 +1388,13 @@ class GatewayServer:
         if method == gw_auth.AUTH_METHOD:
             self._authenticate(client, req_id, params)
             return
-        if not client.authenticated and _requires_auth(method, params):
-            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
-            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
-            return
-
         handler = _HANDLERS.get(method)
         if handler is None:
             self._reply(client, encode_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}"))
+            return
+        if not client.authenticated and _requires_auth(method, params):
+            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
+            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
             return
 
         try:
@@ -1400,46 +1495,110 @@ class GatewayServer:
 
     # ── router wiring ─────────────────────────────────────────────────
 
-    def _ensure_router(self, model: str | None = None) -> None:
+    def _ensure_router(self, model: str | None = None, provider: str = "") -> TierRouters:
         """Provider chain + routers, built once per provider config and once per model key.
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
         rebuild the whole stack on every alternating turn: new httpx clients, a new cooldown store, a stray temp
-        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; the providers
-        and the cooldown store are rebuilt only when the provider config itself is replaced (/config reload).
+        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; when the provider
+        config itself is replaced (/config reload) only the blocks that changed get a new provider (see
+        ``_swap_providers``).
+
+        Returns the key's routers. ``self.router`` / ``self._tiers`` follow whichever turn called this last, so a
+        turn keeps the returned value instead of reading them again after an await (#130).
+
+        ``provider``: the session's /provider pick. That block (else ``default_provider``) goes first in the chain;
+        routers are cached per key and first block, and a first block that is the first in config order shares the
+        plain key's routers.
         """
         key = model or self.config.default_model
+        first = active_provider(self.config, provider)
+        if self.config.providers and first == self.config.providers[0].name:
+            first = ""
         # _router_cfg None: a router injected from outside (tests) is taken as is
         current = self._router_cfg is None or self._router_cfg is self.config.providers
-        if self.router is not None and self._chain_key == key and current:
-            return
+        if self.router is not None and self._chain_key == key and self._chain_provider == first and current:
+            return self.tier_routers()
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
-            self._retire_providers(self.providers)
-            self.providers = make_providers(self.config.providers)
-            self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
+            self._swap_providers()
             self._router_cache = {}
-            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains of the replaced providers
+            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains with the old model specs
             self._router_cfg = self.config.providers
-        tiers = self._router_cache.get(key)
+        cache_key = (key, first) if first else key
+        tiers = self._router_cache.get(cache_key)
         if tiers is None:
-            tiers = self._router_cache[key] = TierRouters(
-                self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
+            tiers = self._router_cache[cache_key] = TierRouters(
+                self.providers,
+                self.config,
+                cooldowns=self.cooldowns,
+                on_event=self._on_router_event,
+                main_key=key,
+                first_provider=first,
             )
         self._tiers = tiers
         self.router = tiers.get(Tier.MAIN)
-        self._chain_key = key
+        self._chain_key, self._chain_provider = key, first
+        return tiers
+
+    def _swap_providers(self) -> None:
+        """Providers for ``config.providers``: a block whose settings did not change keeps its provider.
+
+        A turn keeps the router it started with, and with it these provider objects: closing them under it made its
+        next call fail with "client has been closed", and a claude-cli provider takes its warm processes down. So
+        only a changed or removed block is rebuilt and retired. The cooldown store stays: its keys name the endpoint,
+        and an auth cooldown is tied to the key's fingerprint, so a replaced key does not inherit it.
+        """
+        entries = self.config.providers
+        sigs = [provider_signature(e) for e in entries]
+        spare = list(zip(self._provider_sigs, self.providers, strict=False))
+        fresh: list[Any] = []
+        for entry, sig in zip(entries, sigs, strict=True):
+            hit = next((i for i, (old_sig, _) in enumerate(spare) if old_sig == sig), None)
+            fresh.append(spare.pop(hit)[1] if hit is not None else make_providers([entry])[0])
+        if not fresh:  # K3CODE_FAKE_PROVIDER still gives a chain without entries one scripted provider
+            fresh = make_providers(entries)
+        kept = {id(p) for p in fresh}
+        self._retire_providers([p for p in self.providers if id(p) not in kept])
+        self.providers, self._provider_sigs = fresh, sigs
+
+    #: A replaced provider is closed once no turn is in flight (after PROVIDER_DRAIN_S at most); polled this often.
+    PROVIDER_DRAIN_S = 900.0
+    PROVIDER_DRAIN_POLL_S = 2.0
 
     def _retire_providers(self, providers: list[Any]) -> None:
-        """Close replaced providers in the background (their httpx pools / temp dirs would otherwise wait for GC)."""
-        for p in providers:
-            try:
-                task = asyncio.get_running_loop().create_task(p.aclose())
-            except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+        """Close replaced providers in the background once the turns that may hold them are done.
+
+        Their httpx pools / temp dirs would otherwise wait for GC; but a turn in flight still calls them through the
+        router it started with, so the close waits for the sessions to go quiet (``PROVIDER_DRAIN_S`` at most).
+        """
+        if not providers:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._close_when_drained(providers))
+        except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+            return
+        self._retiring.update({id(p): p for p in providers})
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    async def _close_when_drained(self, providers: list[Any]) -> None:
+        deadline = time.monotonic() + self.PROVIDER_DRAIN_S
+        while not self.stopping and time.monotonic() < deadline and any(s.turn_in_flight for s in self.live.values()):
+            await asyncio.sleep(self.PROVIDER_DRAIN_POLL_S)
+        await self._close_retired(providers)
+
+    async def _close_retired(self, providers: list[Any] | None = None) -> None:
+        """Close retired providers (all of them by default); one that is already closed is skipped."""
+        for p in list(self._retiring.values()) if providers is None else providers:
+            if self._retiring.pop(id(p), None) is None:
                 continue
-            self._side_tasks.add(task)
-            task.add_done_callback(self._side_tasks.discard)
+            try:
+                await p.aclose()
+            except Exception:  # noqa: BLE001 - one provider failing to close must not keep the others open
+                logger.warning("closing retired provider %s failed", getattr(p, "name", "?"), exc_info=True)
 
     _chain_key: str | None = None
+    _chain_provider: str = ""  # the first block of the cached chain ('' = config order); see _ensure_router
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
 
     def reset_tier_routers(self) -> None:
@@ -1626,6 +1785,7 @@ class GatewayServer:
                 routed = await self._route_typed_prompt(session, text, hooked, pasted)
                 if routed is not None:
                     return routed
+        session.turn_gate = None  # set by this prompt's scope gate, if it runs; never the previous prompt's
         if not blocked:  # a prompt a hook refused is not a task to carry on with
             self._start_implicit_goal(session, mgr, text)
         while True:
@@ -1643,6 +1803,7 @@ class GatewayServer:
                     # history into a summary, and run the prompt once more.
                     session.stored.messages = session.stored.messages[:n_before]
                     if await self._maybe_compact(session, force=True):
+                        n_before = len(session.stored.messages)  # the summary replaced the history
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
                 # /stop and Esc cancel the turn task: the cancellation skips _run_one_turn's outcome mapping, so the
@@ -1660,8 +1821,12 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             implicit = bool((state := mgr.state) and state.implicit)
-            if implicit and self._pending_prompts(session):
-                mgr.clear()  # the user typed the next prompt meanwhile: it replaces this one, unjudged
+            # the user typed the next prompt meanwhile (it replaces this one), or the scope gate settled the prompt on
+            # its first turn (see _gate_ended_task): the implicit goal ends unjudged
+            if implicit and (
+                self._pending_prompts(session) or (state.turns_used == 0 and self._gate_ended_task(session.turn_gate))
+            ):
+                mgr.clear()
                 self.emit_goal(session)
                 self._session_finished(session, status)
                 return status, final_text
@@ -1669,7 +1834,11 @@ class GatewayServer:
             # no strong-tier advisor veto on an implicit goal: it would review every answered question
             reviewer = None if implicit else self._goal_reviewer(session)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer
+                final_text,
+                judge,
+                cwd=session.stored.cwd or None,
+                reviewer=reviewer,
+                evidence=turn_evidence(session.stored.messages[n_before:]),
             )
             self.emit_goal(session)
             if decision.message:
@@ -1690,19 +1859,37 @@ class GatewayServer:
         (``session.background``/``task_kind``) and goal continuations do not. A /goal, active or paused, is the
         user's own and wins: a paused one waits for /goal resume, and the answer typed meanwhile must not erase it.
         A leftover implicit goal (a daemon that died mid-loop) is replaced, or cleared with the setting off.
+
+        On by default in the auto and yolo permission modes (``auto_continue: auto``), capped at
+        ``auto_continue_max_turns`` judged turns. A plain question gets no goal; a prompt the scope gate rates trivial
+        ends after its first turn (see ``_run_turn_locked``).
         """
         if session.background or session.task_kind or session.goal_continuation:
             return
         state = mgr.state
         if state is not None and not state.implicit and state.status in ("active", "paused"):
             return
-        if autonomy_cfg(self.config).get("auto_continue"):
-            mgr.set(text, implicit=True)
+        acfg = autonomy_cfg(self.config)
+        if auto_continue_on(acfg, session.perms.mode) and not is_plain_question(text):
+            mgr.set(text, implicit=True, max_turns=max(0, int(acfg["auto_continue_max_turns"])))
         elif state is not None and state.implicit:
             mgr.clear()
         else:
             return
         self.emit_goal(session)
+
+    def _goal_continuation(self, session: LiveSession) -> bool:
+        """The turn running is a goal's judge-driven continuation (implicit or /goal): the same task, gated once on
+        the goal's first turn. A gate here re-ran the classifier, the strong-tier planner and its hooks every turn."""
+        return session.goal_continuation and self.goal_manager(session).state is not None
+
+    @staticmethod
+    def _gate_ended_task(gate: GateResult | None) -> bool:
+        """The scope gate settled the prompt: rated it trivial (an answer, one located edit), or ran no task (the plan
+        was refused) or the whole of it (a fan-out). Nothing is left for an implicit goal to continue."""
+        if gate is None:
+            return False
+        return not gate.proceed or (gate.verdict is not None and gate.verdict.scope == "trivial")
 
     # ── wake words and the ultracode mode ──
 
@@ -1840,6 +2027,8 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                attended=not (session.background or session.goal_continuation),
+                session_id=session.session_id,
             ),
             max_turns=self.config.max_turns,
             headless=False,
@@ -1862,8 +2051,12 @@ class GatewayServer:
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
             context_window=self._router_window(router, session),
         )
+        loop.on_unsandboxed = session.notify_unsandboxed
+        loop.on_home_started = session.notify_home_started
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
@@ -1879,7 +2072,9 @@ class GatewayServer:
                 session_id=session.session_id,
                 router=self._decision_router(decision),
             )
-        loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
+        loop.on_tool_outcome = lambda call, result, failure, **kw: self.learning.tool_outcome(
+            session, call, result, failure, **kw
+        )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1923,7 +2118,8 @@ class GatewayServer:
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
         specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
-        first = specs[0] if specs else ""
+        name = active_provider(self.config, session.stored.provider)  # /provider: that block's model goes first
+        first = next((s for p, s in zip(self.config.providers, specs, strict=False) if p.name == name), "")
         if isinstance(first, list):
             first = first[0] if first else ""
         return str(first or session.stored.model or self.config.default_model)
@@ -1960,7 +2156,7 @@ class GatewayServer:
         ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
-        self._ensure_router(session.stored.model or None)
+        tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
@@ -2000,7 +2196,7 @@ class GatewayServer:
         loop = self._build_loop(
             session,
             reliability,
-            self.tier_routers().get(tier),
+            tiers.get(tier),
             kind,
             approval,
             max_tool_errors=max_errors,
@@ -2031,8 +2227,10 @@ class GatewayServer:
                 hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
-                if not hooked.blocked:
+                # a goal's continuation is the same task: its prompt was gated (and any plan approved) once
+                if not hooked.blocked and not self._goal_continuation(session):
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                    session.turn_gate = gate
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value
@@ -2055,7 +2253,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors,
@@ -2072,7 +2270,10 @@ class GatewayServer:
             elif extra := hooked.context_text():
                 prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
-                fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
+                # M4b: parallel worktree children, within autonomy.fanout's agent/token budget (issue #136)
+                fan = await self.fanout.run(
+                    session, text, gate.plan, subtasks, budget=self.fanout.budget(len(subtasks))
+                )
                 if fan is not None and fan.ok:
                     gate.proceed, gate.message = False, fan.summary()
                     session.stored.messages = [
@@ -2130,7 +2331,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
@@ -2174,7 +2375,7 @@ class GatewayServer:
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
-            self._persist_turn(session, loop)
+            await self._persist_turn(session, loop)
             self.learning.record_turn_replay(
                 session,
                 list(loop.turn_messages),
@@ -2235,14 +2436,27 @@ class GatewayServer:
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
 
-    def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
-        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``."""
+    async def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
+        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``.
+
+        The JSON encoding and the SQLite write run on the store's writer thread, queued behind any checkpoint still
+        in flight (so a stale checkpoint can never land after this write). Shielded: a cancellation of the turn
+        (``/stop``, shutdown) must not drop the write."""
         try:
-            if loop.turn_messages:
-                session.stored.messages = _serialize_messages(loop.turn_messages)
-                session.stored.model = session.stored.model or self._chain_key or self.config.default_model
-                self.store.save(session.stored)
             session.last_checkpoint = time.monotonic()
+            pending = session.checkpoint_task
+            if pending is not None and not pending.done():
+                await asyncio.wait({pending})  # its write is queued first, so it cannot land after this one
+            if loop.turn_messages:
+                stored = session.stored
+                stored.messages = _serialize_messages(loop.turn_messages)
+                stored.model = stored.model or self.config.default_model  # keyless: runs on default
+                snapshot = dataclasses.replace(
+                    stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
+                )
+                await asyncio.shield(self.store.save_async(snapshot))
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
 
@@ -2289,13 +2503,42 @@ class GatewayServer:
 
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
-    def _checkpoint_turn(self, session: LiveSession) -> None:
-        """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
-        seconds of work instead of the whole turn."""
+    def _checkpoint_turn(self, session: LiveSession, *, force: bool = False) -> None:
+        """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
+        an OOM kill or a reboot loses seconds of work instead of the whole turn. ``force`` skips the time throttle and
+        leaves its clock alone: the turn's start, which a prompt drained right after the previous turn would otherwise
+        fall inside of, and which must not close the throttle on the turn's first tool call."""
         loop = session.loop
-        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or not loop.turn_messages:
             return
-        self._persist_turn(session, loop)
+        if not force and time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+            return
+        if session.checkpoint_task is not None and not session.checkpoint_task.done():
+            return
+        if not force:
+            session.last_checkpoint = time.monotonic()
+        messages = _serialize_messages(loop.turn_messages)
+        session.stored.messages = messages
+        session.stored.model = session.stored.model or self.config.default_model  # keyless: runs on default (#130)
+        session.checkpoint_task = asyncio.create_task(
+            self._write_checkpoint(session.session_id, messages, session.stored.model)
+        )
+
+    async def _checkpoint_turn_start(self, session: LiveSession) -> None:
+        """The turn's prompt reaches the store before the first model call. The write runs off the event loop, so it
+        is awaited here: left in flight it would make the turn's first tool-call checkpoint skip (one write at a time)
+        and that call would not be on disk before the tool runs. Waited with ``asyncio.wait`` as ``_persist_turn``
+        does, so a cancelled turn does not cancel the write."""
+        self._checkpoint_turn(session, force=True)
+        task = session.checkpoint_task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
+
+    async def _write_checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str) -> None:
+        try:
+            await self.store.checkpoint_async(session_id, messages, model)
+        except Exception:  # noqa: BLE001 - the next checkpoint or the end of the turn writes it again
+            logger.exception("could not checkpoint the session")
 
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
@@ -2347,6 +2590,7 @@ class GatewayServer:
                 config=self.config,
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
+                session_id=session.session_id,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
@@ -2425,12 +2669,15 @@ class GatewayServer:
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
+            preview = await _change_preview(tool_name, arguments, session.perms.cwd)
             try:
                 result = await self._ask_client(
                     "approval",
                     {
                         "request_id": next_request_id("approval"),
                         "command": _command_for_tool(tool_name, arguments),
+                        # what an edit/write would change (a unified diff); clients that predate it ignore it
+                        **({"preview": preview} if preview else {}),
                         "description": decision.message
                         or arguments.get("description")
                         or arguments.get("path")
@@ -2526,6 +2773,10 @@ class GatewayServer:
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
+        if "providers" in changed and fresh.providers == self.config.providers:
+            # Same chain: keep the list, so the providers and routers built from it stay as they are (a turn of
+            # another session may be calling them) instead of being rebuilt by the next turn.
+            changed.discard("providers")
         for key in changed:
             setattr(self.config, key, getattr(fresh, key))
         self._file_keys = keys
@@ -2734,15 +2985,23 @@ class GatewayServer:
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
         """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
-        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
-        are pruned as each is written)."""
+        written for ``retention.journal_days`` (the oldest ones beyond ``retention.journal_mb`` too), learning decisions
+        past ``retention.decisions_days`` (debug bundles are pruned as each is written)."""
         keep = retention(self.config)
         rows = self.usage.prune(keep["usage_days"], now=now)
         files = prune_journals(
-            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+            self._home(),
+            keep=lambda sid: sid in self.live,
+            max_age_s=keep["journal_days"] * 86400,
+            max_bytes=keep["journal_mb"] * 1024 * 1024,
+            now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
         return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+
+    def compact_storage(self) -> int:
+        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
+        return self.store.compact()
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
@@ -3111,6 +3370,20 @@ def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     return stored
 
 
+async def _change_preview(tool_name: str, arguments: dict[str, Any], cwd: Path) -> str | None:
+    """The approval prompt's diff for a write/edit (see tools.preview), read off the event loop; None for other tools
+    and whenever it cannot be made: a preview must never stand in the way of the prompt itself."""
+    if tool_name not in ("write", "edit"):
+        return None
+    from k3code.tools.preview import change_preview
+
+    try:
+        return await asyncio.to_thread(change_preview, tool_name, arguments, cwd)
+    except Exception:  # noqa: BLE001
+        logger.warning("approval preview failed for %s", tool_name, exc_info=True)
+        return None
+
+
 def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     """Human-readable command line shown in the approval prompt."""
     if tool_name == "bash":
@@ -3212,7 +3485,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
     """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
@@ -3223,7 +3496,7 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Store
             ids.append(sid)
             if len(ids) >= limit:
                 break
-    return [s for s in map(server.store.get, ids) if s is not None]
+    return server.store.summaries(ids)
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3234,20 +3507,16 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
     for s in sessions:
-        preview = ""
-        for m in s.messages:
-            if m.get("role") == "user" and m.get("content"):
-                preview = str(m["content"])[:120]
-                break
+        preview = s.preview
         live = server.live.get(s.session_id)
-        state = live.state if live is not None else ("completed" if s.messages else "new")
+        state = live.state if live is not None else ("completed" if s.message_count else "new")
         rows.append(
             {
                 "id": s.session_id,
                 "title": s.title or preview or "Session",
                 "preview": preview,
                 "started_at": s.created_at,
-                "message_count": len(s.messages),
+                "message_count": s.message_count,
                 "status": state,
                 "state": state,
                 "cwd": _norm_cwd(s.cwd),
@@ -3526,8 +3795,8 @@ async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    # M1: no clipboard integration; the TUI pastes text inline instead.
-    return {"text": "", "images": [], "files": []}
+    # M1: no clipboard integration and no image input (text-only providers); `message` is what /paste shows.
+    return {"attached": False, "message": "Image paste is not supported yet (text-only providers)"}
 
 
 async def _process_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3573,9 +3842,49 @@ async def _image_detach(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {"detached": 0, "count": 0}
 
 
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".heic"})
+#: Longest text ``input.detect_drop`` looks at; every submitted prompt passes through it, a dropped path is short.
+MAX_DROP_CHARS = 4096
+
+
+def _dropped_file(server: GatewayServer, params: dict[str, Any]) -> Path | None:
+    """The one existing file ``params["text"]`` names (quoted, backslash-escaped, ``~``, ``file://`` or relative to the
+    session directory), else None: a prompt that merely mentions a path is not a drop."""
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_DROP_CHARS or "\n" in text.strip():
+        return None
+    try:
+        words = shlex.split(text.strip())
+    except ValueError:  # an unbalanced quote: ordinary prose
+        return None
+    if len(words) != 1:
+        return None
+    word = words[0]
+    if word.startswith("file://"):
+        word = urllib.parse.unquote(urllib.parse.urlparse(word).path)
+    try:
+        path = Path(word).expanduser()
+        if not path.is_absolute():
+            path = _session_dir(server, params) / path
+        return path if path.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 async def _input_detect_drop(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    paths = params.get("paths") or []
-    return {"images": [], "files": [str(p) for p in paths if p]}
+    """The TUI's drop check (every submit, and a pasted path): ``{matched, text}`` where ``text`` is ``@path`` for a
+    dropped file (``@"path"`` if the path has whitespace). Images are not attached (no image input yet), so an image
+    drop is just a reference the model can open with its tools."""
+    path = _dropped_file(server, params)
+    if path is None:
+        return {"matched": False}
+    shown = f'"{path}"' if any(c.isspace() for c in str(path)) else str(path)
+    return {
+        "matched": True,
+        "text": f"@{shown}",
+        "name": path.name,
+        "is_image": path.suffix.lower() in IMAGE_SUFFIXES,
+    }
 
 
 async def _command_dispatch(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3598,19 +3907,22 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
 
 
 async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    # the session asked about (else the current one): its model key and its /provider pick, not only the defaults
+    session = server._session_for(params.get("session_id"))
+    active = active_provider(server.config, session.stored.provider if session is not None else "")
     providers = []
     for p in server.config.providers:
         providers.append(
             {
                 "slug": p.name,
                 "name": p.name,
-                "models": sorted(p.models.keys()),
+                "models": sorted(p.models.keys()),  # the keys /model and --provider take
+                "model_ids": {k: _first_model_id(spec) for k, spec in p.models.items()},  # key -> the model id it sends
                 "api_url": p.base_url,
+                "is_current": p.name == active,
             }
         )
-    # the model key of the session asked about (else the current one), not only the configured default
-    session = server._session_for(params.get("session_id"))
-    return {"providers": providers, "model": tune_cmd.current_model(server.config, session)}
+    return {"providers": providers, "model": tune_cmd.current_model(server.config, session), "provider": active}
 
 
 async def _tune_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3762,14 +4074,16 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
     """``config.set model``: value is ``<model-key> [--provider p] [--reasoning <level>] [--session|--global]``.
 
     ``--global`` also makes the key the saved default of new sessions; ``--reasoning`` sets the session's effort
-    (ignored without a session); ``--provider`` and the other picker flags are ignored."""
+    (ignored without a session); ``--provider`` pins the session to that provider block like /provider (without a
+    session: the daemon's default provider, not saved); the other picker flags are ignored."""
     parts = iter(str(params.get("value") or "").split())
     keys: list[str] = []
     reasoning: str | None = None
+    provider: str | None = None
     scope = "session"
     for part in parts:
         if part == "--provider":
-            next(parts, None)  # its value
+            provider = next(parts, None)
         elif part == "--reasoning":
             reasoning = next(parts, "")
         elif part == "--global":
@@ -3785,7 +4099,8 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
     session = server._session_for(params.get("session_id"))
     try:
         effort = tune_cmd.normalize_effort(reasoning, legacy=True) if reasoning is not None and session else None
-        tune_cmd.apply_tune(server, session, tune_cmd.TuneRequest(model=key, effort=effort, scope=scope))
+        req = tune_cmd.TuneRequest(model=key, effort=effort, provider=provider, scope=scope)
+        tune_cmd.apply_tune(server, session, req)
     except tune_cmd.TuneError as e:
         raise _InvalidParams(str(e)) from None
     return {"ok": True, "key": "model", "value": key}
@@ -3795,7 +4110,8 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {
         "provider_configured": bool(server.config.providers),
         "ready": bool(server.config.providers),
-        "version": __version__,  # doctor compares it with the installed `current` to spot a stale daemon
+        "version": build_version(),  # doctor and `k3code update` compare it with `current` to spot a stale daemon
+        "background_paused": server.background_paused,  # restart-storm safe mode; doctor warns about it
     }
 
 
@@ -3840,6 +4156,33 @@ async def _complete_slash(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"items": items[:50], "replace_from": 1}
 
 
+#: directory entries `complete.path` looks at before it stops reading; the rest of a huge directory is not offered
+COMPLETE_PATH_SCAN_CAP = 2000
+
+
+def _scan_path_matches(directory: Path, stem: str) -> list[tuple[str, bool]]:
+    """``(name, is_dir)`` of the entries in ``directory`` that complete ``stem``: at most 50, directories first.
+
+    Blocking; the caller runs it on a worker thread. Reads at most ``COMPLETE_PATH_SCAN_CAP`` entries and sorts
+    only the matches."""
+    low = stem.lower()
+    matches: list[tuple[str, bool]] = []
+    with os.scandir(directory) as it:
+        for entry in itertools.islice(it, COMPLETE_PATH_SCAN_CAP):
+            name = entry.name
+            if name.startswith(".") and not stem.startswith("."):
+                continue
+            if not name.lower().startswith(low):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            matches.append((name, is_dir))
+    matches.sort(key=lambda m: (not m[1], m[0].lower()))
+    return matches[:50]
+
+
 async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """Path completion for ``@file`` / ``./x`` words, relative to the session's directory."""
     word = str(params.get("word", ""))
@@ -3851,24 +4194,19 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     stem = "" if raw.endswith("/") else expanded.name
     items: list[dict[str, str]] = []
     try:
-        for entry in sorted(directory.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if entry.name.startswith(".") and not stem.startswith("."):
-                continue
-            if not entry.name.lower().startswith(stem.lower()):
-                continue
-            shown = raw[: len(raw) - len(stem)] + entry.name + ("/" if entry.is_dir() else "")
-            items.append(
-                {
-                    "text": ("@" if word.startswith("@") else "") + shown,
-                    "display": shown,
-                    "meta": "dir" if entry.is_dir() else "file",
-                    "kind": "path",
-                }
-            )
-            if len(items) >= 50:
-                break
+        matches = await asyncio.to_thread(_scan_path_matches, directory, stem)
     except OSError:
-        pass
+        matches = []
+    for name, is_dir in matches:
+        shown = raw[: len(raw) - len(stem)] + name + ("/" if is_dir else "")
+        items.append(
+            {
+                "text": ("@" if word.startswith("@") else "") + shown,
+                "display": shown,
+                "meta": "dir" if is_dir else "file",
+                "kind": "path",
+            }
+        )
     return {"items": items}
 
 
@@ -4013,7 +4351,18 @@ HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "Model and settings",
-        ("tune", "model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
+        (
+            "tune",
+            "model",
+            "effort",
+            "provider",
+            "settings",
+            "config",
+            "output-style",
+            "permissions",
+            "update-config",
+            "focus",
+        ),
     ),
     (
         "Autonomy",

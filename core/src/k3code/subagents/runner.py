@@ -22,7 +22,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.prompting import build_system_prompt
+from k3code.prompting import build_system_prompt, subagent_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
@@ -405,13 +405,23 @@ class SubagentManager:
 
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
-        perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
+        perms = PermissionState(
+            mode=PermissionMode(parent.perms.mode),
+            cwd=cwd,
+            add_dirs=list(parent.perms.add_dirs),
+            # a worktree child's cwd is a fresh path under the project: its config rules are the parent project's
+            project_dir=parent.perms.project_dir or parent.perms.cwd,
+            # the parent's session denies outrank a config allow there: the child may not run what the parent refuses
+            session_rules=[r for r in parent.perms.session_rules if r.action == "deny"],
+        )
         base = build_system_prompt(
             parent.system_prompt,
             cwd=cwd,
             config=server.config,
             session_meta=parent.stored.meta,
             mcp=server.mcp,
+            attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
+            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
         )
         note = ""
         if h.isolation == "worktree":
@@ -420,8 +430,9 @@ class SubagentManager:
                 "your changes are committed and merged back by the harness. Do not run git commands that "
                 "change branches."
             )
-        system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
-        router = server.tier_routers().get(Tier(h.tier))
+        system = subagent_system_prompt(base, name=atype.name, description=h.description, body=atype.prompt, note=note)
+        # the parent's key (#130) and its /provider pick
+        router = server._ensure_router(parent.stored.model or None, parent.stored.provider).get(Tier(h.tier))
         loop = AgentLoop(
             router,
             system_prompt=system,
@@ -468,7 +479,7 @@ class SubagentManager:
 
     async def _drive(self, parent: Any, h: Handle, atype: AgentType, prompt: str, cwd: Path) -> None:
         server = self.server
-        server._ensure_router(parent.stored.model or None)
+        server._ensure_router(parent.stored.model or None, parent.stored.provider)
         reliability = child_reliability(server.config, h.id, server._home())
         parent_approval = await server._approval_callback_for(parent)
         parent._approval_cb = parent_approval  # noqa: SLF001 - shared with every child of this session

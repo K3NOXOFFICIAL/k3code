@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -99,7 +100,10 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     for cmd in (
         "(cd core && uv run ruff check . ../scripts)",
         "(cd core && uv run ruff format --check . ../scripts)",
-        "(cd core && timeout --kill-after=30 2700 uv run pytest -q)",  # a stalled run fails (issue #42)
+        # a stalled run fails (issue #42); the suite runs in parallel, the `serial` tests alone after it
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -n ",
+        " -m not serial --basetemp ",
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -m serial --basetemp ",
         "(cd tui && npm run build:ink)",
         "(cd tui && npm run typecheck)",
         "(cd tui && npm run lint)",
@@ -115,6 +119,16 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     ):
         assert cmd in out, cmd
     assert "go test ./..." not in out  # panes' upstream remote-sync tests recurse without bound
+
+
+def test_pytest_basetemp_stays_short_whatever_tmpdir_is(tmp_path: Path) -> None:
+    """A Unix socket path caps at 108 bytes and an xdist worker adds popen-gwN/: a long TMPDIR (the Multica runtime's
+    /tmp/multica-task-<id>) must not lengthen the --basetemp of the pytest lanes."""
+    long_tmp = tmp_path / ("t" * 60)
+    long_tmp.mkdir()
+    out = _run(["bash", str(CHECK), "--plan", "--only", "core"], REPO, _env(tmp_path, TMPDIR=str(long_tmp))).stdout
+    bases = [w for line in out.splitlines() for w in line.split() if w.startswith("/") and "/k3ci-" in w]
+    assert len(bases) == 2 and all(b.startswith("/tmp/k3ci-") and len(b) < 30 for b in bases), bases
 
 
 def test_quick_plan_has_no_builds_or_test_suites(tmp_path: Path) -> None:
@@ -329,9 +343,9 @@ def test_install_hooks_sets_a_repo_local_hooks_path_idempotently(tmp_path: Path)
 # --- merge-pr.sh ---------------------------------------------------------------------------------------------------
 
 
-def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
+def _pr_setup(tmp: Path, files: dict[str, str] | None = None, merges: int = 0) -> tuple[Path, dict[str, str], str]:
     """A bare origin with Main and a PR branch (one commit each side, so origin/Main must be merged in), a clone of it,
-    and stub tools on PATH."""
+    and stub tools on PATH. The PR adds `files` (feature.txt by default) and `merges` merge commits of side branches."""
     env = _env(tmp)
     origin = tmp / "origin.git"
     _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
@@ -343,9 +357,18 @@ def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
     _git(repo, env, "remote", "add", "origin", str(origin))
     _git(repo, env, "push", "-q", "origin", "Main")
     _git(repo, env, "switch", "-q", "-c", "feat/x")
-    (repo / "feature.txt").write_text("f\n")
+    for name, text in (files or {"feature.txt": "f\n"}).items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
     _git(repo, env, "add", "-A")
     _git(repo, env, "commit", "-q", "-m", "feature")
+    for i in range(merges):
+        _git(repo, env, "switch", "-q", "-c", f"side{i}", "Main")
+        (repo / f"side{i}.txt").write_text("s\n")
+        _git(repo, env, "add", "-A")
+        _git(repo, env, "commit", "-q", "-m", f"side {i}")
+        _git(repo, env, "switch", "-q", "feat/x")
+        _git(repo, env, "merge", "-q", "--no-ff", "--no-edit", f"side{i}")
     _git(repo, env, "push", "-q", "origin", "feat/x")
     head = _git(repo, env, "rev-parse", "HEAD")
     _git(repo, env, "switch", "-q", "Main")
@@ -357,8 +380,17 @@ def _pr_setup(tmp: Path) -> tuple[Path, dict[str, str], str]:
     return repo, env, head
 
 
-def _pr_tsv(head: str, *, state: str = "OPEN", base: str = "Main", cross: str = "false", draft: str = "true") -> str:
-    return "\t".join([state, base, "feat/x", head, cross, draft, "https://example.invalid/pr/7"])
+def _pr_tsv(
+    head: str,
+    *,
+    state: str = "OPEN",
+    base: str = "Main",
+    cross: str = "false",
+    draft: str = "true",
+    title: str = "fix: a thing",
+    labels: str = "",
+) -> str:
+    return "\t".join([state, base, "feat/x", head, cross, draft, "https://example.invalid/pr/7", title, labels])
 
 
 @pytest.mark.parametrize(
@@ -395,17 +427,123 @@ def test_merge_pr_pushes_the_checked_merge_posts_and_merges(tmp_path: Path) -> N
     calls = [c for c in _gh_calls(tmp_path) if not c.startswith(("pr view", "repo view"))]
     assert calls[0].startswith(f"api --silent repos/owner/repo/statuses/{merged} ")
     assert "state=success" in calls[0] and "context=local-ci" in calls[0]
+    assert "description=scoped: secrets passed on " in calls[0]  # the status says what was checked
     assert calls[1:] == ["pr ready 7", f"pr merge 7 --merge --match-head-commit {merged}"]
 
 
 def test_merge_pr_stops_when_the_check_fails(tmp_path: Path) -> None:
-    repo, env, head = _pr_setup(tmp_path)
+    repo, env, head = _pr_setup(tmp_path, files={"core/feature.py": "x\n"})  # core is in the scoped check
     env["FAKE_PR_TSV"] = _pr_tsv(head)
     (tmp_path / "bin" / "uv").write_text("#!/bin/sh\nexit 1\n")
     r = _run(["bash", str(MERGE_PR), "7"], repo, env)
-    assert r.returncode == 2 and "the full check failed" in r.stderr and "Logs: " in r.stderr
+    assert r.returncode == 2 and "the scoped (secrets,core) check failed" in r.stderr and "Logs: " in r.stderr
     assert _git(repo, env, "ls-remote", "origin", "refs/heads/feat/x").split()[0] == head
     assert [c for c in _gh_calls(tmp_path) if not c.startswith("pr view")] == []
+
+
+ALL = ",".join(AREAS)
+
+
+def _scope(
+    tmp: Path,
+    files: list[str],
+    *,
+    force: str = "0",
+    title: str = "fix: x",
+    labels: str = "",
+    lines: int = 10,
+    merges: int = 0,
+) -> list[str]:
+    """merge_scope (lib.sh) on these inputs: [full|scoped, areas, reason]."""
+    script = f'. "{REPO}/scripts/ci/lib.sh"; merge_scope "$@"'
+    args = ["bash", "-c", script, "merge_scope", force, title, labels, str(lines), str(merges)]
+    r = _run(args, tmp, _env(tmp), stdin="".join(f + "\n" for f in files))
+    assert r.returncode == 0, r.stderr
+    return r.stdout.rstrip("\n").split("\t")
+
+
+@pytest.mark.parametrize(
+    ("files", "areas"),
+    [
+        (["core/src/k3code/doctor.py", "tui/shared/x.ts", "README.md"], "vendor,secrets,core,tui"),
+        (["README.md", "docs/x.md"], "secrets"),
+        (["panes/internal/app/a.go"], "vendor,secrets,panes"),
+        (["scripts/dev/install-hooks.sh", ".githooks/pre-push"], "shell,secrets,core"),
+        ([f"core/f{i}.py" for i in range(40)], "secrets,core"),  # 40 files is still small
+    ],
+)
+def test_merge_scope_runs_only_the_areas_a_small_pr_touches(tmp_path: Path, files: list[str], areas: str) -> None:
+    scope, got, why = _scope(tmp_path, files, lines=1500)
+    assert (scope, got) == ("scoped", areas)
+    assert why == f"{len(files)} files, 1500 changed lines, nothing that needs the full check"
+
+
+@pytest.mark.parametrize(
+    ("files", "kw", "why"),
+    [
+        (["core/a.py"], {"force": "1"}, "--full"),
+        (["core/a.py"], {"labels": "bug,full-ci"}, "label full-ci"),
+        (["core/a.py"], {"title": "feat(tui): a pane"}, "the title names a feature"),
+        (["core/a.py"], {"title": "Add the Feature flag"}, "the title names a feature"),
+        ([f"core/f{i}.py" for i in range(41)], {}, "41 files (over 40)"),
+        (["core/a.py"], {"lines": 1501}, "1501 changed lines (over 1500)"),
+        (["core/a.py"], {"merges": 2}, "2 merge commits over Main (an integration branch)"),
+        (["README.md", "scripts/ci/check.sh"], {}, "touches scripts/ci/check.sh"),
+        (["install/install.sh"], {}, "touches install/install.sh"),
+        (["VENDOR.toml"], {}, "touches VENDOR.toml"),
+        (["core/uv.lock"], {}, "touches core/uv.lock"),
+        (["tui/package-lock.json"], {}, "touches tui/package-lock.json"),
+        (["panes/go.mod"], {}, "touches panes/go.mod"),
+        (["panes/go.sum"], {}, "touches panes/go.sum"),
+    ],
+)
+def test_merge_scope_runs_the_full_check_for_big_or_risky_prs(
+    tmp_path: Path, files: list[str], kw: dict[str, Any], why: str
+) -> None:
+    assert _scope(tmp_path, files, **kw) == ["full", ALL, why]
+
+
+def test_merge_scope_names_every_reason_and_honours_the_threshold_variables(tmp_path: Path) -> None:
+    scope, _, why = _scope(tmp_path, ["install/x.sh"], force="1", merges=3)
+    assert why == "--full; 3 merge commits over Main (an integration branch); touches install/x.sh"
+    assert _scope(tmp_path, ["core/a.py"], merges=1)[0] == "scoped"  # one merge of Main into the branch is normal
+    env = _env(tmp_path, K3CODE_CI_FULL_FILES="1", K3CODE_CI_FULL_LINES="5")
+    script = f'. "{REPO}/scripts/ci/lib.sh"; merge_scope 0 fix "" 6 0'
+    r = _run(["bash", "-c", script], tmp_path, env, stdin="a\nb\n")
+    assert r.stdout.split("\t")[2] == "2 files (over 1); 6 changed lines (over 5)\n"
+
+
+@pytest.mark.parametrize(
+    ("setup", "args", "tsv", "extra_env", "expect"),
+    [
+        ({"files": {"core/a.py": "x\n"}}, [], {}, {}, "scoped (secrets,core) check: 1 files, 1 changed lines"),
+        ({}, ["--full"], {}, {}, "full check: --full"),
+        ({}, [], {"labels": "full-ci"}, {}, "full check: label full-ci"),
+        ({}, [], {"title": "feat: x"}, {}, "full check: the title names a feature"),
+        ({"merges": 2}, [], {}, {}, "full check: 2 merge commits over Main"),
+        ({"files": {"core/a.py": "1\n2\n3\n"}}, [], {}, {"K3CODE_CI_FULL_LINES": "2"}, "full check: 3 changed lines"),
+    ],
+)
+def test_merge_pr_dry_run_prints_the_scope_and_checks_only_that(
+    tmp_path: Path,
+    setup: dict[str, Any],
+    args: list[str],
+    tsv: dict[str, str],
+    extra_env: dict[str, str],
+    expect: str,
+) -> None:
+    repo, env, head = _pr_setup(tmp_path, **setup)
+    env.update(extra_env, FAKE_PR_TSV=_pr_tsv(head, **tsv))
+    r = _run(["bash", str(MERGE_PR), "--dry-run", *args, "7"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"merge-pr: {expect}" in r.stdout
+    header = next(line for line in r.stdout.splitlines() if line.startswith("check.sh: full check of "))
+    if expect.startswith("scoped"):
+        assert header.split(": ")[2].split(" (logs")[0] == "secrets core"
+        assert "set local-ci=success on " in r.stdout and ": scoped: secrets,core passed on " in r.stdout
+    else:
+        assert header.split(": ")[2].split(" (logs")[0] == " ".join(AREAS)
+        assert ": full: local check passed on " in r.stdout
 
 
 # --- release.sh and the updater ------------------------------------------------------------------------------------
@@ -438,6 +576,56 @@ def test_release_ships_what_release_yml_shipped() -> None:
         "--prerelease",
     ):
         assert needle in text
+
+
+def _release_changelog_setup(tmp: Path, changelog: str) -> tuple[Path, dict[str, str]]:
+    """A copy of release.sh in a repository on Main with a bare origin, VERSION 1.2.3 and the given CHANGELOG.md. The
+    check it would run next fails, so a run that gets past the preconditions stops there and builds nothing."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": ".k3dev/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": changelog,
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 1\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    env["PATH"] = f"{_stub_bin(tmp)}:{env['PATH']}"
+    return repo, env
+
+
+_FOLDED = "# Changelog\n\n## Unreleased\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+_UNFOLDED = "# Changelog\n\n## Unreleased\n\n### Fixed\n\n- not in the notes\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+
+
+@pytest.mark.parametrize("dry", [False, True])
+def test_release_refuses_while_changelog_unreleased_has_content(tmp_path: Path, dry: bool) -> None:
+    """The notes are the '## [X.Y.Z]' section only, so whatever '## Unreleased' holds would be left out of them."""
+    repo, env = _release_changelog_setup(tmp_path, _UNFOLDED)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    verb = "a real release would refuse" if dry else "refused"
+    assert f"{verb}: CHANGELOG.md '## Unreleased' still holds 1 line" in r.stderr, r.stderr
+    assert "## [1.2.3] - <date>" in r.stderr  # it says what to do
+    if not dry:
+        assert r.returncode == 2 and "1 precondition(s) failed; nothing was built or published" in r.stderr
+        assert "the full check failed" not in r.stderr  # it stopped before the check
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize(
+    "text", [_FOLDED, _FOLDED.replace("## Unreleased\n", "## [Unreleased]\n\n### Added\n\n### Fixed\n")]
+)
+def test_release_accepts_an_empty_changelog_unreleased(tmp_path: Path, dry: bool, text: str) -> None:
+    """Folded: '## Unreleased' is empty (blank lines and '###' subheadings only), so the preconditions pass."""
+    repo, env = _release_changelog_setup(tmp_path, text)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    assert "Unreleased" not in r.stderr and "precondition" not in r.stderr, r.stderr
+    assert "the full check failed" in r.stderr  # past the preconditions, stopped at the stubbed check
 
 
 @pytest.mark.parametrize(("plat", "machine", "arch"), [("linux", "x86_64", "amd64"), ("darwin", "arm64", "arm64")])
@@ -483,3 +671,144 @@ def test_update_rejects_an_asset_that_does_not_match_sha256sums(
     rel = upd.Release(tag="v1.2.3", version="1.2.3", body="", prerelease=False, assets={n: n for n in names})
     with pytest.raises(ValueError, match="k3-linux-amd64"):
         upd.install_release(rel, None, uv="uv")
+
+
+# --- release.sh: a failed publish leaves no tag behind -------------------------------------------------------------
+
+_RELEASE_TOOLS = {
+    "uv": """#!/bin/sh
+case "$1" in
+  build) while [ $# -gt 0 ]; do [ "$1" = --out-dir ] && out=$2; shift; done
+         mkdir -p "$out" && echo wheel > "$out/k3code-1.2.3-py3-none-any.whl" ;;
+  export) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo requirements > "$out" ;;
+esac
+""",
+    "npm": "#!/bin/sh\nmkdir -p dist\n",
+    "go": '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo k3 > "$out"\n',
+    # The part of GitHub release.sh depends on: a draft release has no tag, publishing it creates the tag in the origin
+    # at the draft's target. State: $FAKE_GH_DIR/draft-<tag> (the target, then one asset name per line).
+    # `release list` prints what the script's --jq leaves of the list: the tags of the drafts. `release view` leaves
+    # out the asset named by FAKE_GH_HIDE (an upload that did not arrive).
+    "gh": """#!/bin/sh
+d=$FAKE_GH_DIR
+printf '%s\\n' "$*" >> "$d/gh.log"
+tag=$3
+publish() {
+  git --git-dir "$FAKE_GH_ORIGIN" rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
+    git --git-dir "$FAKE_GH_ORIGIN" tag "$tag" "$(head -n 1 "$d/draft-$tag")"
+  rm "$d/draft-$tag"
+}
+case "$1 $2" in
+  "release list") for f in "$d"/draft-*; do [ -f "$f" ] && basename "$f" | sed 's/^draft-//'; done; exit 0 ;;
+  "release view") tail -n +2 "$d/draft-$tag" | grep -v -x -e "${FAKE_GH_HIDE:-}" || exit 1 ;;
+  "release delete") rm "$d/draft-$tag" || exit 1 ;;
+  "release edit") [ "$FAKE_GH_FAIL" = edit ] && exit 1; publish ;;
+  "release create")
+    [ -f "$d/draft-$tag" ] && { echo "release $tag already exists" >&2; exit 1; }
+    shift 3; draft=0; : > "$d/new"; : > "$d/target"
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --target) echo "$2" > "$d/target"; shift ;;
+        --title | --notes-file) shift ;;
+        --draft) draft=1 ;;
+        -*) ;;
+        *) [ -f "$1" ] && basename "$1" >> "$d/new" ;;
+      esac
+      shift
+    done
+    { cat "$d/target"; cat "$d/new"; } > "$d/draft-$tag"; rm "$d/new" "$d/target"
+    [ "$FAKE_GH_FAIL" = create ] && exit 1  # an upload that fails leaves the draft behind
+    [ "$draft" = 1 ] || publish ;;
+esac
+exit 0
+""",
+}
+
+
+def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
+    """A copy of the release scripts in a repository on Main with a bare origin, and stand-ins for uv, npm, go, gh."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": "node_modules/\n.k3dev/\ntui/dist/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": "# Changelog\n\n## [1.2.3] - 2026-01-01\n\n- a change\n",
+        "core/k": "",
+        "tui/k": "",
+        "panes/k": "",
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 0\n",
+        "scripts/release/build_release.sh": "#!/bin/sh\nexit 0\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    bindir = _stub_bin(tmp)
+    for tool, text in _RELEASE_TOOLS.items():
+        (bindir / tool).write_text(text)
+        (bindir / tool).chmod(0o755)
+    (tmp / "gh-state").mkdir()
+    env.update(PATH=f"{bindir}:{env['PATH']}", FAKE_GH_DIR=str(tmp / "gh-state"), FAKE_GH_ORIGIN=str(origin))
+    return repo, env, origin
+
+
+def _release_calls(env: dict[str, str]) -> list[str]:
+    log = Path(env["FAKE_GH_DIR"]) / "gh.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _remote_tags(env: dict[str, str], origin: Path) -> list[str]:
+    return _git(origin, env, "tag", "--list").split()
+
+
+def test_release_creates_the_tag_only_by_publishing_a_complete_draft(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sha = _git(repo, env, "rev-parse", "HEAD")
+    calls = [c for c in _release_calls(env) if c.startswith("release")]
+    assert [c.split()[1] for c in calls] == ["list", "create", "view", "edit"]
+    create = calls[1].split()
+    assert "--draft" in create and create[create.index("--target") + 1] == sha  # the tag will name the checked commit
+    assert "--verify-tag" not in create  # there is no tag yet to verify
+    assert calls[3] == "release edit v1.2.3 --draft=false"
+    assert _remote_tags(env, origin) == ["v1.2.3"]  # created by publishing...
+    assert _git(origin, env, "rev-parse", "v1.2.3") == sha
+    assert _git(repo, env, "tag", "--list") == ""  # ...not pushed by the script
+
+
+@pytest.mark.parametrize("failing_step", ["create", "edit"])
+def test_release_failing_before_the_publish_leaves_no_tag_and_can_be_rerun(tmp_path: Path, failing_step: str) -> None:
+    """A tag that exists blocks a rerun (release.sh refuses an existing tag) and is what install.sh takes as the
+    newest version. A gh failure must leave neither."""
+    repo, env, origin = _release_setup(tmp_path)
+    script = str(repo / "scripts/release/release.sh")
+    r = _run(["bash", script, "1.2.3"], repo, {**env, "FAKE_GH_FAIL": failing_step})
+    assert r.returncode != 0
+    assert _remote_tags(env, origin) == [] and _git(repo, env, "tag", "--list") == ""
+    assert _git(repo, env, "ls-remote", "--tags", "origin") == ""
+    assert (Path(env["FAKE_GH_DIR"]) / "draft-v1.2.3").is_file()  # the half-made release is still a draft
+    r = _run(["bash", script, "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "replacing the draft release v1.2.3" in r.stderr
+    assert "release delete v1.2.3 --yes" in _release_calls(env)  # the draft only: never --cleanup-tag
+    assert _remote_tags(env, origin) == ["v1.2.3"]
+
+
+def test_release_refuses_a_draft_that_lacks_an_asset(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, {**env, "FAKE_GH_HIDE": "SHA256SUMS"})
+    assert r.returncode == 2 and "stays a draft" in r.stderr
+    assert not any(c.startswith("release edit") for c in _release_calls(env))
+    assert _remote_tags(env, origin) == []
+
+
+def test_release_dry_run_describes_the_draft_flow_and_contacts_no_release(tmp_path: Path) -> None:
+    repo, env, _ = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "--dry-run", "--no-check", "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--draft --target" in r.stdout and "release edit v1.2.3 --draft=false" in r.stdout
+    assert "git push" not in r.stdout and "git tag" not in r.stdout
+    assert [c for c in _release_calls(env) if c.startswith("release")] == []

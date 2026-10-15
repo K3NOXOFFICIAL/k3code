@@ -129,9 +129,83 @@ def test_rollback_reports_a_daemon_that_does_not_come_back(data: Path) -> None:
     def refuse() -> None:
         raise service.ServiceError("systemctl --user restart k3code.service failed: start-limit-hit")
 
-    res = upd.activate("1.1.0", restart=refuse, daemon_installed=lambda: True, wait=lambda h: True)
+    res = upd.activate(
+        "1.1.0",
+        restart=refuse,
+        daemon_installed=lambda: True,
+        daemon_stopped=lambda: False,
+        manager_reachable=lambda: True,  # systemd answered and refused: a real failure
+        wait=lambda h: True,
+    )
     assert not res.ok and res.rolled_back and "did not restart" in res.message
     assert upd.current_version() == "1.0.0"
+
+
+def _no_bus() -> None:
+    raise service.ServiceError("systemctl --user restart k3code.service failed: Failed to connect to bus")
+
+
+def test_an_unreachable_user_manager_keeps_the_new_version_and_warns(data: Path) -> None:
+    """#115: a unit file on a box whose user manager does not answer (WSL without systemd, `su`) is no daemon to
+    restart; the smoke-tested version stays instead of every update rolling back."""
+    _version(data, "1.0.0", [])
+    _version(data, "1.1.0", [])
+    upd.switch_to("1.0.0")
+    res = upd.activate(
+        "1.1.0",
+        restart=_no_bus,
+        daemon_installed=lambda: True,
+        daemon_stopped=lambda: False,
+        manager_reachable=lambda: False,
+        wait=lambda h: True,
+    )
+    assert res.ok and not res.rolled_back and upd.current_version() == "1.1.0"
+    assert upd.MANAGER_UNREACHABLE in res.message
+
+
+def test_rollback_with_an_unreachable_user_manager_keeps_the_switch_and_warns(data: Path) -> None:
+    _version(data, "1.0.0", [])
+    _version(data, "1.1.0", [])
+    upd.switch_to("1.0.0")
+    upd.switch_to("1.1.0")
+    res = upd.rollback(
+        restart=_no_bus, daemon_installed=lambda: True, daemon_stopped=lambda: False, manager_reachable=lambda: False
+    )
+    assert res.ok and res.rolled_back and upd.current_version() == "1.0.0"
+    assert upd.MANAGER_UNREACHABLE in res.message
+
+
+def test_service_install_with_an_unreachable_user_manager_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    calls: list[tuple[str, ...]] = []
+
+    def no_bus(*args: str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "Failed to connect to bus: No medium found")
+
+    monkeypatch.setattr(service, "systemd_available", lambda: True)
+    monkeypatch.setattr(service, "_systemctl", no_bus)
+    assert not service.manager_reachable()
+    r = CliRunner().invoke(cli, ["service", "install"])
+    assert r.exit_code == 1 and "not reachable" in r.output and "Traceback" not in r.output
+    assert not (tmp_path / "cfg").exists() and calls == [("show-environment",), ("show-environment",)]
+
+
+def test_the_wizard_service_step_reports_an_unreachable_manager(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from k3code.setup import steps
+
+    def refuse() -> list[str]:
+        raise service.ServiceError("systemd user manager not reachable")
+
+    said: list[str] = []
+    monkeypatch.setattr(service, "install", refuse)
+    ctx = SimpleNamespace(p=SimpleNamespace(confirm=lambda *a: True), say=said.append)
+    assert steps.step_service(ctx) == {"install": False}
+    assert any("not reachable" in line for line in said)
 
 
 def test_service_install_without_systemd_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,3 +231,23 @@ def test_fetch_latest_honours_the_api_override(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("K3CODE_UPDATE_API", "http://127.0.0.1:9/mirror/")
     upd.fetch_latest(repo="o/r")
     assert seen == ["http://127.0.0.1:9/mirror/repos/o/r/releases?per_page=30"]
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [(403, {"x-ratelimit-remaining": "0", "retry-after": "60"}), (429, {"retry-after": "60"})],
+)
+def test_fetch_latest_reports_a_rate_limit_not_a_private_repo(monkeypatch, status, headers) -> None:
+    """#143: GitHub answers an exhausted unauthenticated limit with 403 (or 429); that is not 'private or missing'."""
+    resp = upd.httpx.Response(status, headers=headers, json={"message": "API rate limit exceeded"})
+    monkeypatch.setattr(upd.httpx, "get", lambda url, **k: resp)
+    with pytest.raises(RuntimeError, match="rate limit") as e:
+        upd.fetch_latest(repo="o/r")
+    assert "private" not in str(e.value) and "retry after 60s" in str(e.value)
+
+
+def test_fetch_latest_still_calls_a_plain_403_private(monkeypatch) -> None:
+    resp = upd.httpx.Response(403, headers={"x-ratelimit-remaining": "42"}, json={})
+    monkeypatch.setattr(upd.httpx, "get", lambda url, **k: resp)
+    with pytest.raises(PermissionError, match="private or does not exist"):
+        upd.fetch_latest(repo="o/r")

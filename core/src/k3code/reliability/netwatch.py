@@ -7,7 +7,8 @@ States and their meaning (M2 task spec):
 - ``PROVIDER_DOWN``: the internet works, but registered provider endpoints do
   not. One provider being down does NOT mean offline — it means "fail over".
 - ``CAPTIVE``: an HTTP probe was redirected to a captive portal page.
-- ``OFFLINE``: no usable internet connectivity.
+- ``OFFLINE``: no usable internet connectivity: the generic probe fails and no provider endpoint answers its own
+  probe (a provider that does answer, say on loopback or the LAN, keeps the state ``ONLINE``).
 
 Signals: NetworkManager over ``nmcli`` (subprocess, degrade gracefully when
 absent), a per-endpoint HTTP probe per registered provider base URL, and a
@@ -57,6 +58,8 @@ class ProviderProbeState:
     last_ok: float = 0.0
     last_fail: float = 0.0
     consecutive_fails: int = 0
+    #: The most recent probe got an answer (``state`` only turns PROVIDER_DOWN after several fails).
+    answering: bool = False
 
 
 @dataclass
@@ -71,10 +74,12 @@ class NetWatchConfig:
     http_timeout: float = 5.0
     tcp_timeout: float = 3.0
 
-    # Polling: 5 s base, rising to 60 s while unhealthy.
+    # Polling: 60 s while healthy (#109: an idle daemon probed the internet and every provider each 5 s); an outage
+    # is watched from 5 s, backing off toward 60 s while it lasts.
     base_interval: float = 5.0
     max_interval: float = 60.0
     backoff_factor: float = 2.0
+    healthy_interval: float = 60.0
 
     # Per-provider probe: HEAD/GET against base_url + path with a short timeout.
     provider_probe_path: str = "/v1/models"
@@ -384,17 +389,23 @@ class NetWatch:
                     self._wakeup.clear()
                 except TimeoutError:
                     pass
+                was_usable = self._state.usable_for_llm
                 await self._probe_all()
-                # 5 s while healthy, backoff (×2) toward 60 s while bad.
-                self._interval = (
-                    self.config.base_interval
-                    if self._state.usable_for_llm
-                    else min(self._interval * self.config.backoff_factor, self.config.max_interval)
-                )
+                self._interval = self._next_interval(was_usable)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - monitor must never crash
                 logger.debug("NetWatch monitor error: %s", e)
+
+    def _next_interval(self, was_usable: bool) -> float:
+        """The wait before the next probe round: ``healthy_interval`` while the state is usable; ``base_interval``
+        right after a usable -> unusable transition (the outage is watched closely at first), then backoff (×factor)
+        toward ``max_interval`` while it lasts."""
+        if self._state.usable_for_llm:
+            return self.config.healthy_interval
+        if was_usable:
+            return self.config.base_interval
+        return min(self._interval * self.config.backoff_factor, self.config.max_interval)
 
     async def _nm_watch_loop(self) -> None:
         """Poll nmcli for NetworkManager state changes; re-probe immediately on change."""
@@ -447,14 +458,17 @@ class NetWatch:
                 status, _body, _final = await self._probes.provider(prov.base_url, self.config.provider_probe_timeout)
                 if 0 < status < 500:
                     prov.state = NetState.ONLINE
+                    prov.answering = True
                     prov.last_ok = time.monotonic()
                     prov.consecutive_fails = 0
                 else:
+                    prov.answering = False
                     prov.consecutive_fails += 1
                     prov.last_fail = time.monotonic()
                     if prov.consecutive_fails >= self.config.provider_fail_threshold:
                         prov.state = NetState.PROVIDER_DOWN
             except Exception:
+                prov.answering = False
                 prov.consecutive_fails += 1
                 prov.last_fail = time.monotonic()
                 if prov.consecutive_fails >= self.config.provider_fail_threshold:
@@ -466,6 +480,11 @@ class NetWatch:
         if internet.captive:
             return NetState.CAPTIVE
         if not internet.ok:
+            # The generic probe stands in for "can we reach a provider". One that answered its own probe in this
+            # round proves it: an Ollama or vLLM on loopback or the LAN of a host with no internet, or gstatic and
+            # 1.1.1.1 blocked on a network that lets the provider through.
+            if any(p.answering for p in self._providers.values()):
+                return NetState.ONLINE
             return NetState.OFFLINE
         # Internet works: a specific provider being down is not offline.
         if provider_states and self.all_providers_down():

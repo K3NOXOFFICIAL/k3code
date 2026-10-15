@@ -91,6 +91,7 @@ async def test_a_failed_empty_session_sweep_is_logged(caplog):
         stopping=False,
         sweep_empty_sessions_async=sweep,
         prune_retention=lambda: {"usage_rows": 0, "journal_files": 0, "decisions": 0},
+        compact_storage=lambda: 0,
     )
     with caplog.at_level(logging.ERROR, logger="k3code.daemon"):
         await daemon._sweep_empty_sessions(server)

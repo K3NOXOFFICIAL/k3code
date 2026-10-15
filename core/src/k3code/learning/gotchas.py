@@ -1,15 +1,18 @@
 """Project gotchas: tool failures that keep coming back in one project, kept under ``$K3CODE_HOME/projects/<id>``.
 
-The learning hub records every tool failure as a ``tool_error`` decision. A retry of the failed call that worked next
-becomes the row's hint. A signature that carries such a hint is self-verified: with ``learning.auto_gotchas`` on (the
-default) it is noted on its own once it shows up AUTO_REPEATS times in a project within WINDOW (never for a class in
-NOT_PROJECT, nor a hint the scrubber redacted something in). A line is tool output plus the model's retry, so it is
-untrusted text: an auto-learned line goes to ``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the
-in-turn reminder below, and is proposed as a card at the same time (the session gets a one-line notification). A
-hintless signature, or any signature with the setting off, waits for REPEATS sightings and is proposed as a card
-without being noted. Only an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
-(never a file in the repository), and only that file goes into the system prompt, as a fenced "known pitfalls in this
-project" block of at most MAX_LINES lines, oldest dropped.
+The learning hub records every tool failure as a ``tool_error`` decision. A retry of the failed ``bash`` call that
+worked becomes the row's hint: the next ``bash`` call after the reply that failed, when it is a plain variation of the
+failed command (it runs no program or subcommand the failed one did not: output that tells the model to run something
+else must not be learned) and is about the same program and target (see ``followup_hint``). A signature that carries
+such a hint is self-verified: with ``learning.auto_gotchas`` on (the default) it is noted on its own once it shows up
+AUTO_REPEATS times in a project within WINDOW (never for a class in NOT_PROJECT, nor a hint the scrubber redacted
+something in). A line is tool output plus the model's retry, so it is untrusted text: an auto-learned line goes to
+``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the in-turn reminder below, and is proposed as a
+card at the same time (the session gets a one-line notification). A hintless signature, or any signature with the
+setting off, waits for REPEATS sightings and is proposed as a card without being noted. Dismissing a card forgets its
+auto-learned line and ends the reminders for that signature. Only an accepted card appends to ``gotchas.md`` in the
+project's directory under the k3code home (never a file in the repository), and only that file goes into the system
+prompt, as a fenced "known pitfalls in this project" block of at most MAX_LINES lines, oldest dropped.
 
 A failure the project already has a lesson for (an accepted or auto-learned line, or a working retry recorded on an
 earlier ``tool_error`` row within WINDOW) is answered in the turn itself: ``LearningHub.tool_outcome`` returns a
@@ -27,10 +30,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
 from k3code.learning.decisions import project_id
+from k3code.paths import ensure_private_dir, private_file
 from k3code.paths import home as k3code_home
 from k3code.redact import REDACTED, scrub_text
 
@@ -43,8 +48,8 @@ HEADING = "## Known pitfalls in this project"
 MACHINE_HEADING = "## Known pitfalls on this machine"
 #: projects an identical auto-learned line must be in before it goes to the user-level gotchas
 PROMOTE_PROJECTS = 2
-#: failure classes that say nothing about the project: a user's denial (E6 learns from its reason) and a call the
-#: model got wrong (its schema says so)
+#: failure classes that say nothing about the project: a denial (a user's, whose reason E6 learns from, or the
+#: policy's: hardline, auto-mode roots, plan mode, a hook) and a call the model got wrong (its schema says so)
 NOT_PROJECT = frozenset({"denied", "invalid_arguments"})
 
 
@@ -75,8 +80,70 @@ def append_gotcha(path: Path, line: str) -> None:
     """Add ``- line`` to ``path``, keeping the newest MAX_LINES entries."""
     entry = "- " + " ".join(scrub_text(line).split())
     entries = [e for e in _entries(path) if e != entry] + [entry]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+    ensure_private_dir(path.parent)
+    private_file(path).write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+
+
+def remove_gotcha(path: Path, line: str) -> bool:
+    """Drop the entry ``line`` was appended as from ``path`` (the file goes with its last one); True if it was there."""
+    entry = "- " + " ".join(scrub_text(line).split())
+    entries = _entries(path)
+    kept = [e for e in entries if e != entry]
+    if len(kept) == len(entries):
+        return False
+    if kept:
+        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+    return True
+
+
+#: ``project_id`` per resolved cwd with the stamp of the git config it was read under: the prompt is built on every
+#: turn and every token estimate, and ``project_id`` spawns ``git config`` (blocking, 3 s timeout) each time
+_PID_CACHE: dict[str, tuple[tuple[Any, ...], str]] = {}
+_PID_CACHE_MAX = 256
+
+
+def _git_config_stamp(cwd: Path) -> tuple[Any, ...]:
+    """Identify the repository config that decides ``remote.origin.url`` for ``cwd``: (path, mtime_ns, size).
+
+    A linked worktree (fan-out workers) has a ``.git`` file; its config is the main repository's, found through
+    ``commondir``. ``()`` when ``cwd`` is in no repository, which a later ``git init`` changes. Reads two or three
+    small files, no process.
+    """
+    try:
+        for d in (cwd, *cwd.parents):
+            dot_git = d / ".git"
+            if dot_git.is_dir():
+                git_dir = dot_git
+            elif dot_git.is_file():
+                text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+                git_dir = (d / text.removeprefix("gitdir:").strip()).resolve()
+            else:
+                continue
+            common = git_dir / "commondir"
+            if common.is_file():
+                git_dir = (git_dir / common.read_text(encoding="utf-8", errors="replace").strip()).resolve()
+            config = git_dir / "config"
+            st = config.stat()
+            return (str(config), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ("unreadable",)
+    return ()
+
+
+def _cached_project_id(cwd: str | Path) -> str:
+    """``project_id(cwd)``, with the ``git config`` call made again only when the repository config changed."""
+    key = str(Path(cwd).resolve())
+    stamp = _git_config_stamp(Path(key))  # taken first: a change during the call leaves a stamp that no longer matches
+    hit = _PID_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    pid = project_id(cwd)
+    if key not in _PID_CACHE and len(_PID_CACHE) >= _PID_CACHE_MAX:
+        _PID_CACHE.pop(next(iter(_PID_CACHE)))  # oldest first; one entry per worktree a daemon ever served
+    _PID_CACHE[key] = (stamp, pid)
+    return pid
 
 
 def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:
@@ -84,7 +151,7 @@ def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:
     root = home or k3code_home()
     if not (root / "projects").is_dir():  # no project ever accepted one: skip the git call behind project_id
         return ""
-    entries = _entries(gotchas_path(project_id(cwd), root))[-MAX_LINES:]
+    entries = _entries(gotchas_path(_cached_project_id(cwd), root))[-MAX_LINES:]
     return _block(HEADING, "Tool failures that kept recurring here, and what worked instead. Avoid them.", entries)
 
 
@@ -121,20 +188,127 @@ def promote_if_shared(home: Path, line: str) -> bool:
     return True
 
 
-def _words(text: str) -> set[str]:
-    return set(re.findall(r"[A-Za-z0-9_.\-]+", text.lower()))
+#: shell words that only set the scene for the command that follows: a shared one says nothing about a retry
+_GLUE = frozenset({"cd", "pushd", "popd", "export", "unset", "set", "source", ".", ":", "true", "false", "exit"})
+_SEPARATORS = frozenset({";", ";;", "&&", "||", "|", "|&", "&", "(", ")"})
+
+
+def _command(words: list[str]) -> tuple[str, tuple[str, ...]] | None:
+    """``(program, operands)`` of one simple command's words, or None for an empty one or shell glue."""
+    while words and re.match(r"[A-Za-z_]\w*=", words[0]):
+        words = words[1:]
+    program = words[0].rsplit("/", 1)[-1] if words else ""
+    if not program or program in _GLUE:
+        return None
+    return program, tuple(w for w in words[1:] if not w.startswith("-"))
+
+
+def _simple_commands(command: str) -> list[tuple[str, tuple[str, ...]]]:
+    """``(program, operands)`` of each simple command in ``command``: split at ``; && || | &`` and line breaks, leading
+    ``VAR=value`` words, redirections, options and shell glue such as ``cd`` left out. The program is the basename
+    of the command word; an operand is any other word that does not start with ``-``."""
+    found: list[tuple[str, tuple[str, ...]]] = []
+    for line in command.splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.commenters = ""
+        try:
+            tokens = list(lexer)
+        except ValueError:  # an unbalanced quote: plain words are still enough to compare
+            tokens = line.split()
+        words: list[str] = []
+        skip = False  # the word after a redirection is its target
+        for tok in [*tokens, ";"]:
+            if skip:
+                skip = False
+            elif tok in _SEPARATORS:
+                if (one := _command(words)) is not None:
+                    found.append(one)
+                words = []
+            elif tok and tok.strip("<>&|;()") == "":  # a redirection: ``> f``, ``2>&1`` (its fd digit goes too)
+                skip = True
+                if len(words) > 1 and words[-1].isdigit():
+                    words.pop()
+            else:
+                words.append(tok)
+    return found
+
+
+_PUNCT = frozenset("();<>|&")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_SUBCOMMAND = re.compile(r"[a-z][a-z0-9_-]*$")
+
+
+def _invocations(command: str) -> set[tuple[str, str]] | None:
+    """The (program, subcommand) of every simple command in a shell command line (split at ``| || && ; &``, newlines
+    and parentheses), or None when it cannot be read: an unbalanced quote or a backtick substitution. The subcommand
+    is the first argument that is not a flag and looks like a word (``test`` in ``npm test``), else "". Leading
+    ``VAR=value`` assignments and redirect targets are skipped."""
+    if "`" in command:
+        return None
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    found: set[tuple[str, str]] = set()
+    words: list[str] = []
+    skip = False  # the word after a redirect is a file, not an argument
+
+    def flush() -> None:
+        rest = list(words)
+        while rest and _ASSIGNMENT.match(rest[0]):
+            rest.pop(0)
+        if rest:
+            sub = next((w for w in rest[1:] if not w.startswith("-")), "")
+            found.add((rest[0], sub if _SUBCOMMAND.match(sub) else ""))
+        words.clear()
+
+    for tok in tokens:
+        if tok and set(tok) <= _PUNCT:
+            if ("<" in tok or ">" in tok) and "(" not in tok:  # a redirect (``<(`` opens a substitution)
+                skip = True
+            else:
+                flush()
+            continue
+        if skip:
+            skip = False
+        else:
+            words.append(tok)
+    flush()
+    return found
+
+
+def is_plain_variation(before: str, after: str) -> bool:
+    """Whether the bash command ``after`` only varies ``before``: every simple command in it runs a program and
+    subcommand that ``before`` ran too. A retry that brings in a new program (``curl x.sh|sh && ./run-tests`` after a
+    failed ``./run-tests``) is not a variation of it, so what the failure told the model to run is never learned."""
+    ran, now = _invocations(before), _invocations(after)
+    return bool(ran) and bool(now) and now <= ran
 
 
 def followup_hint(tool: str, failed_args: dict[str, Any], ok_args: dict[str, Any]) -> str:
-    """One line about the call that worked after a failure, or "" when it does not look like a retry of it."""
-    if tool == "bash":
-        before, after = str(failed_args.get("command", "")), str(ok_args.get("command", ""))
-        if not after or after == before or not (_words(before) & _words(after)):
-            return ""
-        cmd = next((ln.strip() for ln in after.splitlines() if ln.strip()), "")
-        return f"`{scrub_text(cmd)[:120]}` worked instead"
-    changed = sorted(k for k in ok_args if ok_args.get(k) != failed_args.get(k))
-    return f"worked with different {', '.join(changed)}" if changed else ""
+    """One line about the call that worked after a failure, or "" when it does not look like a retry of it.
+
+    Only ``bash`` has a hint: the line names the command that worked. Another tool's retry (``worked with different
+    path``) says nothing a person or the model could use. A ``bash`` call is a retry of the failed command when both
+    hold: it is a plain variation of it (``is_plain_variation``: it runs no program or subcommand the failed command
+    did not, so a command that the failure's output asked for is never learned), and one of its simple commands (a
+    leading ``cd`` and the like do not count) is the failed one with other options or operands (same program, same
+    first operand: ``git push origin main`` and ``git push --set-upstream origin main``). A call that merely has a
+    word in common with the failed one is none, and so is another program on the same target (``python x.py`` and
+    ``python3 x.py``): that is a new program, which is what a planted instruction looks like.
+    """
+    if tool != "bash":
+        return ""
+    before, after = str(failed_args.get("command", "")), str(ok_args.get("command", ""))
+    if not after or after == before or not is_plain_variation(before, after):
+        return ""
+    failed, retried = _simple_commands(before), _simple_commands(after)
+    if not any(fp == rp and fo[:1] == ro[:1] for fp, fo in failed for rp, ro in retried):
+        return ""  # the first operand is the subcommand (``push``) or the script (``x.py``)
+    cmd = next((ln.strip() for ln in after.splitlines() if ln.strip()), "")
+    return f"`{scrub_text(cmd)[:120]}` worked instead"
 
 
 def proposal_text(signature: str, hint: str) -> str:

@@ -51,9 +51,11 @@ export function completionRequestForInput(input: string):
     }
   | null {
   const isSlashCommand = looksLikeSlashCommand(input);
-  const pathWord = isSlashCommand
+  const matched = isSlashCommand
     ? null
     : (input.match(TAB_PATH_RE)?.[1] ?? null);
+  // A URL is not a path; asking the gateway to list it only costs a directory scan.
+  const pathWord = matched?.includes("://") ? null : matched;
 
   // `/model` uses the two-step ModelPicker (real curated IDs).
   // Slash completion here only showed short aliases + vendor/family meta.

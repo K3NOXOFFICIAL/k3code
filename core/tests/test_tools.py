@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from k3code.tools import build_registry, tool_bash, tool_edit, tool_glob, tool_grep, tool_read, tool_write
+from k3code.tools import (
+    _atomic_write,
+    build_registry,
+    format_tool_result,
+    tool_bash,
+    tool_edit,
+    tool_glob,
+    tool_grep,
+    tool_read,
+    tool_write,
+)
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -144,6 +155,61 @@ async def test_edit_replace_all(temp_dir):
     assert f.read_text() == "bar\nbar\n"
 
 
+async def test_edit_by_similarity_shows_the_text_it_replaced(temp_dir):
+    # #103: old_string only resembled the file, a different value was rewritten and the result did not say which
+    f = temp_dir / "conf.py"
+    f.write_text("MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30\n")
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "context_aware"
+    assert format_tool_result(result) == (
+        "Edited: 1 replacement (matched by context_aware, not exactly)\n"
+        "old_string is not in the file; it replaced this similar text at lines 1-3. Check it is what you meant:\n"
+        "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30"
+    )
+
+    f.write_bytes(b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 30\r\n")  # matched as LF text, written as CRLF
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert (result["line"], result["replaced"]) == (2, "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30")
+    assert f.read_bytes() == b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 60\r\n"
+
+    g = temp_dir / "g.py"
+    g.write_text("import os\n\ndef g():\n    x = 1\n    y = 2\n    z = 3\n    return x\n")
+    result = await tool_edit(
+        {
+            "path": str(g),
+            "old_string": "def g():\n    x = 10\n    y = 20\n    q = 99\n    return x",
+            "new_string": "def g():\n    x = 7\n    return x",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "block_anchor"
+    text = format_tool_result(result)
+    assert "at lines 3-7" in text
+    assert text.endswith("def g():\n    x = 1\n    y = 2\n    z = 3\n    return x")  # z = 3 is gone: now it says so
+
+
+async def test_edit_with_a_precise_match_stays_one_line(temp_dir):
+    f = temp_dir / "conf.py"
+    f.write_text("TIMEOUT = 30\n")
+    result = await tool_edit({"path": str(f), "old_string": " TIMEOUT = 30", "new_string": "TIMEOUT = 6"}, cwd=temp_dir)
+    assert result == {"ok": True, "replacements": 1, "strategy": "line_trimmed"}
+    assert format_tool_result(result) == "Edited: 1 replacement (matched by line_trimmed, not exactly)"
+
+
 async def test_bash_simple(temp_dir):
     result = await tool_bash({"command": "echo hello"}, cwd=temp_dir)
     assert result["stdout"].strip() == "hello"
@@ -206,6 +272,127 @@ async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir)
     (temp_dir / "notes.txt").write_text("the flag --files is literal here\n")
     result = await tool_grep({"pattern": "--files", "path": "."}, cwd=temp_dir)
     assert "notes.txt:1:the flag --files is literal here" in result["matches"]
+
+
+# ── grep never hands a credential file to the model (K3NOX-68, GitHub #138) ──
+
+
+def _secret_project(root: Path) -> Path:
+    (root / ".env").write_text("API_KEY=sk-dotenv-secret\n")
+    (root / ".env.local").write_text("API_KEY=sk-local-secret\n")
+    (root / ".env.example").write_text("API_KEY=example-template\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "a.js").write_text("API_KEY in a dependency\n")
+    (root / "app.py").write_text("API_KEY = os.environ['API_KEY']\n")
+    return root
+
+
+def _no_rg(monkeypatch, root: Path) -> None:
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("PATH", str(root / "no-bin"))  # no rg (and no git): the Python fallback
+
+
+@pytest.fixture
+def rg():
+    import shutil
+
+    if not shutil.which("rg"):
+        pytest.skip("rg not installed")
+
+
+@pytest.mark.parametrize("include", ["*", ".env*", ["*.py", ".*"], "**"])
+async def test_grep_include_glob_does_not_reopen_dotenv_files_or_node_modules(temp_dir, rg, include):
+    # rg's last matching glob wins and an include glob overrides its hidden-file filter: `include: "*"` used to
+    # return .env (and node_modules) while read/grep of `.env` itself is a sensitive-path hardline deny.
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".", "include": include}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "node_modules" not in res["matches"]
+    if include != ".env*":
+        assert "app.py:1:API_KEY" in res["matches"]
+    if include in ("*", ".env*", "**"):
+        assert ".env.example:1:API_KEY=example-template" in res["matches"]  # a template is no secret
+
+
+async def test_grep_ignore_file_negation_does_not_reopen_dotenv(temp_dir, rg):
+    # A hostile repository can whitelist its .env for rg without any include: `!.env` in .ignore or .gitignore.
+    _secret_project(temp_dir)
+    (temp_dir / ".ignore").write_text("!.env\n!.env.local\n")
+    res = await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "app.py:1:API_KEY" in res["matches"]
+
+
+async def test_grep_include_can_still_search_inside_node_modules_by_path(temp_dir, rg):
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": "node_modules/pkg", "include": "*.js"}, cwd=temp_dir)
+    assert "a.js:1:API_KEY in a dependency" in res["matches"]
+
+
+async def test_grep_fallback_skips_dotenv_files(temp_dir, monkeypatch):
+    # The Python fallback walks hidden files (and `git ls-files -co` lists a .env that is not ignored).
+    _secret_project(temp_dir)
+    _no_rg(monkeypatch, temp_dir)
+    for include in (None, "*", ".env*"):
+        args = {"pattern": "API_KEY", "path": ".", **({"include": include} if include else {})}
+        res = await tool_grep(args, cwd=temp_dir)
+        assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"], include
+        assert "API_KEY=example-template" in res["matches"], include
+    assert "app.py" in (await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir))["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_home_directory_skips_key_and_k3code_secret_files(temp_dir, monkeypatch, fallback):
+    import shutil
+
+    if not fallback and not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    home = temp_dir / "home"
+    for rel, text in {
+        ".ssh/id_ed25519": "API_KEY ssh-private-key",
+        ".aws/credentials": "API_KEY aws_secret_access_key",
+        ".config/k3code/env": "API_KEY=sk-daemon-env",
+        "notes/todo.txt": "API_KEY rotate me",
+    }.items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in res["matches"]
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+
+
+async def test_grep_hides_key_files_under_a_home_whose_name_is_not_utf8(temp_dir, monkeypatch, rg):
+    # rg prints the raw name bytes. Decoded with replacement characters first, `$HOME/.ssh` would no longer match.
+    home = temp_dir / os.fsdecode(b"h\xffome")
+    try:
+        (home / ".ssh").mkdir(parents=True)
+    except (OSError, UnicodeError):
+        pytest.skip("filesystem refuses non-UTF-8 names")
+    (home / ".ssh" / "id_ed25519").write_text("API_KEY ssh-private-key\n")
+    (home / "todo.txt").write_text("API_KEY rotate me\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in res["matches"]
+    assert "ssh-private-key" not in res["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_dotenv_file_itself_is_refused(temp_dir, monkeypatch, fallback):
+    _secret_project(temp_dir)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".env"}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in str(res)
+    assert "sensitive-path" in res["error"]
+    template = await tool_grep({"pattern": "API_KEY", "path": ".env.example"}, cwd=temp_dir)
+    assert "example-template" in template["matches"]
 
 
 async def test_glob_finds(temp_dir):
@@ -283,6 +470,7 @@ async def test_bash_capture_keeps_the_head_and_the_tail_and_counts_what_it_dropp
     assert result["stdout"].endswith("30000\n")
 
 
+@pytest.mark.serial  # load-sensitive under the 8-worker run; passes alone
 async def test_bash_flood_is_killed_instead_of_filling_daemon_memory(temp_dir, monkeypatch):
     """communicate() buffered every byte: `yes` took the daemon to 1 GB/s of RSS until the OOM killer ran."""
     import resource
@@ -378,3 +566,133 @@ async def test_read_numbers_lines_like_an_editor(temp_dir):
     f.write_text("a\x0cb\nc\nd\n")  # a form feed is not a line break for editors (str.splitlines() splits on it)
     result = await tool_read({"path": str(f), "start": 2, "end": 2}, cwd=temp_dir)
     assert result["content"] == "c" and result["lines"] == "2-2 of 3"
+
+
+# ── _atomic_write falls back to an in-place write when the temp-file rename is not possible (#169) ──
+
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+
+
+def _no_temp_files(d: Path) -> bool:
+    return [p.name for p in d.iterdir() if "k3tmp" in p.name] == []
+
+
+@needs_non_root
+async def test_write_into_a_read_only_directory_rewrites_the_writable_file_in_place(temp_dir):
+    f = temp_dir / "locked_dir.py"
+    f.write_text("old\n")
+    f.chmod(0o640)
+    inode = f.stat().st_ino
+    temp_dir.chmod(0o555)
+    try:
+        assert (await tool_write({"path": str(f), "content": "new\n"}, cwd=temp_dir))["ok"] is True
+        assert f.read_text() == "new\n"
+        assert f.stat().st_ino == inode and (f.stat().st_mode & 0o777) == 0o640  # same file, same mode
+    finally:
+        temp_dir.chmod(0o755)
+    assert _no_temp_files(temp_dir)
+
+
+@needs_non_root
+async def test_edit_in_a_read_only_directory_rewrites_the_writable_file_in_place(temp_dir):
+    f = temp_dir / "locked_dir.py"
+    f.write_text("alpha beta\n")
+    temp_dir.chmod(0o555)
+    try:
+        result = await tool_edit({"path": str(f), "old_string": "beta", "new_string": "gamma"}, cwd=temp_dir)
+    finally:
+        temp_dir.chmod(0o755)
+    assert result["ok"] is True and f.read_text() == "alpha gamma\n"
+
+
+@needs_non_root
+def test_a_new_file_in_a_read_only_directory_still_fails(temp_dir):
+    temp_dir.chmod(0o555)
+    try:
+        with pytest.raises(PermissionError):
+            _atomic_write(temp_dir / "new.txt", b"x")
+    finally:
+        temp_dir.chmod(0o755)
+
+
+@pytest.mark.parametrize("code", [errno.EXDEV, errno.EBUSY, errno.EACCES, errno.EPERM])
+def test_a_rename_that_fails_with_a_mount_or_lock_error_falls_back_to_an_in_place_write(temp_dir, monkeypatch, code):
+    f = temp_dir / "bind.txt"
+    f.write_bytes(b"old content that is longer\n")
+    f.chmod(0o640)
+    inode = f.stat().st_ino
+
+    def refuse(src, dst):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(os, "replace", refuse)
+    _atomic_write(f, b"new\n")
+    assert f.read_bytes() == b"new\n"  # shorter than before: the tail is truncated
+    assert f.stat().st_ino == inode and (f.stat().st_mode & 0o777) == 0o640
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_rename_that_fails_with_a_full_disk_does_not_touch_the_file(temp_dir, monkeypatch):
+    f = temp_dir / "full.txt"
+    f.write_bytes(b"precious\n")
+
+    def full(src, dst):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(os, "replace", full)
+    with pytest.raises(OSError) as exc:
+        _atomic_write(f, b"new\n")
+    assert exc.value.errno == errno.ENOSPC
+    assert f.read_bytes() == b"precious\n"  # never rewritten in place on ENOSPC
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_failed_in_place_write_puts_the_old_bytes_back(temp_dir, monkeypatch):
+    f = temp_dir / "restore.txt"
+    f.write_bytes(b"old bytes\n")
+    real_fsync = os.fsync
+    calls = []
+
+    def replace_refused(src, dst):
+        raise OSError(errno.EXDEV, "cross-device")
+
+    def fsync_fails_once_in_place(fd):
+        calls.append(fd)
+        if len(calls) == 2:  # 1st: the temp file; 2nd: the in-place write
+            raise OSError(errno.EIO, "io error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", replace_refused)
+    monkeypatch.setattr(os, "fsync", fsync_fails_once_in_place)
+    with pytest.raises(OSError) as exc:
+        _atomic_write(f, b"a completely different new content\n")
+    assert exc.value.errno == errno.EIO
+    assert f.read_bytes() == b"old bytes\n"
+    assert _no_temp_files(temp_dir)
+
+
+def test_a_root_run_write_keeps_the_original_owner(temp_dir, monkeypatch):
+    f = temp_dir / "owned.txt"
+    f.write_text("old\n")
+    st = f.stat()
+    chowned = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        os, "chown", lambda p, uid, gid: chowned.append((Path(p).name.startswith(".owned.txt.k3tmp-"), uid, gid))
+    )
+    _atomic_write(f, b"new\n")
+    assert chowned == [(True, st.st_uid, st.st_gid)]  # the temp file is handed to the original owner before the rename
+    assert f.read_text() == "new\n"
+
+
+def test_a_non_root_write_does_not_chown(temp_dir, monkeypatch):
+    f = temp_dir / "plain.txt"
+    f.write_text("old\n")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    def boom(*a):
+        raise AssertionError("chown must only run as root")
+
+    monkeypatch.setattr(os, "chown", boom)
+    _atomic_write(f, b"new\n")
+    assert f.read_text() == "new\n"

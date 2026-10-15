@@ -329,13 +329,61 @@ def test_reads_of_key_and_daemon_env_files_are_denied_in_every_mode(tmp_path, mo
     assert decide(mode="default", tool="read", args={"path": ".env.example"}, cwd=proj).action == "allow"
 
 
-def test_auto_mode_reads_outside_the_roots_are_not_silently_allowed() -> None:
+def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
+    # system/toolchain locations: allowed (and logged as an auto allow), also headless
     d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD)
-    assert d.action == "ask" and not d.auto_allowed and d.needs_human
-    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD).action == "ask"
-    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "deny"
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "allow"
+    assert decide(mode="auto", tool="grep", args={"path": "/usr/lib/python3/x.py"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="read", args={"path": "~/.cargo/registry/src/x/lib.rs"}, cwd=CWD).action == "allow"
+    site = "/srv/venv/lib/site-packages/a.py"
+    assert decide(mode="auto", tool="read", args={"path": site}, cwd=CWD).action == "allow"
+    # anything else: refused with guidance, no prompt
+    for tool, path in (("grep", "/var/log"), ("read", "/tmp/bootstrap.py"), ("glob", "~/.keno")):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "deny" and not d.needs_human, (tool, path, d)
+        assert "outside the project" in (d.message or "") and "/add-dir" in (d.message or "")
+    # credential paths stay hard-denied, a user rule still wins (allow and ask), default mode still asks a person
+    assert decide(mode="auto", tool="read", args={"path": "~/.ssh/id_rsa"}, cwd=CWD).hardline == "sensitive-path"
     user = [_r("read", "/etc/hosts", "allow")]
     assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/var/log*", "allow")]
+    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/etc/hosts", "ask")]
+    d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user)
+    assert d.action == "ask" and d.needs_human
+    d = decide(mode="default", tool="read", args={"path": "/tmp/bootstrap.py"}, cwd=CWD)
+    assert d.action == "ask" and d.needs_human
+
+
+def test_auto_mode_reads_of_the_uv_credentials_store_ask_a_person(tmp_path, monkeypatch) -> None:
+    # PR 347 review: `uv auth dir` is ~/.local/share/uv/credentials; the uv toolchain allow must not cover it
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+    ):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human and not d.auto_allowed, (tool, path, d)
+    # uv's interpreters and tools stay a toolchain read; the uv root itself (it holds credentials/) does not
+    for path in ("~/.local/share/uv/python/cpython-3.12/lib/os.py", "~/.local/share/uv/tools/ruff/bin/ruff"):
+        assert decide(mode="auto", tool="read", args={"path": path}, cwd=CWD).action == "allow", path
+    d = decide(mode="auto", tool="grep", args={"path": "~/.local/share/uv", "pattern": "."}, cwd=CWD)
+    assert d.action != "allow", d
+
+
+def test_a_blank_extra_hardline_pattern_matches_nothing_and_is_reported() -> None:
+    from k3code.permissions.state import parse_permissions
+
+    # the owner's config had `hardline: ['']`: '' matched every command, so plain `ls` was a hardline deny
+    for mode in ("default", "auto"):
+        d = decide(mode=mode, tool="bash", args={"command": "ls"}, cwd=CWD, hardline_extra=["", "  "])
+        assert d.action == "allow" and d.hardline is None, (mode, d)
+    _, hard, problems = parse_permissions("permissions:\n  hardline: ['', 'ssh \\S+ reboot']\n")
+    assert hard == [r"ssh \S+ reboot"]
+    assert any("permissions.hardline[0]" in p and "blank" in p for p in problems), problems
+    d = decide(mode="auto", tool="bash", args={"command": "ssh box reboot"}, cwd=CWD, hardline_extra=hard)
+    assert d.action == "deny" and d.hardline == "config-hardline-0"  # a real pattern still denies
     assert decide(mode="auto", tool="read", args={"path": "src/a.py"}, cwd=CWD).action == "allow"
     assert decide(mode="yolo", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
 
@@ -368,3 +416,102 @@ def test_an_always_rule_never_carries_an_inline_environment_value() -> None:
         assert not any("sk-live" in p for p in patterns)
     d = decide(mode="default", tool="bash", args={"command": "API_KEY=sk-live-123"}, cwd=CWD)
     assert all("sk-live" not in r.pattern for r in suggest_rules("bash", d))
+
+
+@pytest.mark.parametrize(
+    ("command", "ok"),
+    [
+        ("ls -la", True),
+        ("cat notes.txt; ls", True),
+        ("grep -n KEY notes.txt | cat", True),
+        ("grep -rn KEY .", False),
+        ("grep -nR KEY .", False),
+        ("grep -d recurse KEY .", False),
+        ("grep --dir=recurse KEY .", False),
+        ("grep --recur KEY .", False),
+        ("grep --deref KEY .", False),
+        ("ls -R", False),
+        ("ls --recursive", False),
+        ("rg KEY", False),
+        ("git status", True),
+        ("git diff --no-index a b", False),
+        ("cat */notes", False),
+        ("cat .e{n,}v", False),
+        ("cat 'notes'", False),
+        ("cat ~/notes", False),
+        ("cat $F", False),
+        ("cat notes > out", False),
+        ("ls; python3 x", False),
+        ("FOO=1 cat notes", False),
+        ("", False),
+    ],
+)
+def test_home_read_only_takes_only_plain_non_recursive_readers(command, ok):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is ok
+
+
+# --- dot-paths under $HOME keep the prompt (PR 347 review: credential stores no denylist names) ----------------
+
+
+@pytest.mark.parametrize("mode", ["auto", "default", "accept-edits"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat .cache/huggingface/token",
+        "cat {home}/.config/git/credentials",
+        "cat .config/github-copilot/hosts.json",
+        "cat .local/share/opencode/auth.json",
+        "cat notes/../.config/git/credentials",
+        "grep -n token .cache/huggingface/token",
+        "grep --file=.config/git/credentials notes",
+        "cat creds",  # a symlink to ~/.config/git/credentials
+    ],
+)
+def test_builtin_reads_of_a_home_dot_path_ask_at_home(tmp_path, monkeypatch, mode, command) -> None:
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:tok@example.com\n")
+    (home / "creds").symlink_to(home / ".config" / "git" / "credentials")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    d = decide(mode=mode, tool="bash", args={"command": command.format(home=home)}, cwd=str(home))
+    assert d.action == "ask", d
+    assert d.needs_human and not d.auto_allowed
+
+
+@pytest.mark.parametrize("command", ["cat notes.txt", "ls", "ls .", "ls -la", "grep -n KEY notes.txt"])
+def test_builtin_reads_of_plain_home_paths_keep_the_fast_path(tmp_path, monkeypatch, command) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
+    assert d.action == "allow" and not d.auto_allowed and d.rule is not None and d.rule.layer == 0, d
+
+
+def test_builtin_reads_of_dot_paths_inside_a_project_under_home_stay_allowed(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    proj = home / "src" / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for command in ("cat .gitignore", "cat .github/workflows/ci.yml", "ls .github"):
+        d = decide(mode="default", tool="bash", args={"command": command}, cwd=str(proj))
+        assert d.action == "allow" and d.rule is not None and d.rule.layer == 0, (command, d)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat /home/u/.cache/huggingface/token",
+        "ls notes .local/share/opencode",
+        "grep --file=.config/git/credentials notes",
+        "grep -f.config/git/credentials notes",
+    ],
+)
+def test_home_read_only_refuses_dot_paths(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is False

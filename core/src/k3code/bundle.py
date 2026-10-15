@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import re
@@ -18,7 +19,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, redact, redact_session_json
+from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, is_secret_key, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -28,6 +29,7 @@ _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose).
 _UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode"})
+_TOKENS_WORD = re.compile(r"tokens(?![a-z])", re.I)
 
 
 class BundleError(ValueError):
@@ -42,34 +44,104 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession) -> dict[str, Any]:
-    return redact_session_json(asdict(s))
+def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
+    return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _known_secrets(config: Any, cwd: Path) -> list[str]:
-    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first."""
-    from k3code.debugdump import secret_values
+def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
+    """Where the export learns the secret values: the loaded config (default: loaded for ``cwd``), and the user config
+    and the trusted project config as written. A file that does not load still names its secrets, and so does a
+    section ``load_config`` drops (a project's ``providers``): with the env vars alone a copy of an MCP value elsewhere
+    in the settings would leave in clear (K3NOX-519).
 
+    Also the project config as written whatever its trust state, for the sessions only: a session can quote one never
+    trusted, or changed after it was (K3NOX-575). It loads no setting and hides nothing in the user's settings file: a
+    file the user never trusted must not hide part of one of their rules."""
     if config is None:
         from k3code.config import load_config
 
         try:
             config = load_config(project_dir=cwd)
-        except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
+        except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
-    return secret_values(config)
+    user = _read(user_config_path())
+    written = _read(project_config_path(cwd))
+    trusted = trust.trusted_text(cwd)
+    project = None if trusted is None else _read(project_config_path(cwd), trusted)
+    return [config, user, project], written
 
 
-def _drop_values(obj: Any, secrets: list[str]) -> Any:
-    """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
+def _read(path: Path, text: str | None = None) -> Any:
+    """The config file ``path`` as written, or ``text``, its trusted copy. One that exists but does not parse names no
+    secrets: refuse rather than export its copies in clear. The error carries no parser text, not even chained (it is
+    raised after the ``suppress``): a YAML error quotes the line, which may hold the secret, and a traceback or
+    ``logger.exception`` prints the whole chain."""
+    with contextlib.suppress(OSError, ValueError, yaml.YAMLError):
+        return confio.read_yaml(path) if text is None else yaml.safe_load(text)
+    raise BundleError(_unparsed(path))
+
+
+def _unparsed(path: Path) -> str:
+    return f"{path} does not parse: fix it first, or the export cannot tell which of its values to hide"
+
+
+def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:
+    """Every secret value the ``configs`` and this process know (provider keys, secret-named env vars, MCP values),
+    longest first; and the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
+    from k3code.debugdump import secret_values
+
+    def known(guesses: bool) -> list[str]:
+        return sorted(set().union(*(secret_values(c, guesses=guesses) for c in configs)), key=len, reverse=True)
+
+    return known(True), known(False)
+
+
+def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
+    if not isinstance(rules, dict):  # `bash: ask`, or the hardline regexes
+        return drop_values(rules, certain if tool == "hardline" else secrets)
+    # only an exact `deny` or `ask` is a rule that hiding a guessed value would break (rules.Rule rejects any other)
+    drop = {p: certain if a in ("deny", "ask") else secrets for p, a in rules.items()}
+    return {drop_values(p, drop[p]): drop_values(a, secrets) for p, a in rules.items()}
+
+
+def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]) -> dict[str, Any]:
+    """``settings`` without the known secret values (``drop_values``). A deny or ask rule's pattern and a hardline
+    regex lose only the ``certain`` ones: hiding a guessed value (an MCP root path, a region) there leaves a rule that
+    never matches, and the import then allows what it denied. Every other rule (allow, or an action no rule accepts)
+    and every key, tool names included, loses every known value: an allow rule then only asks again."""
+    return {
+        drop_values(key, secrets): {
+            drop_values(tool, secrets): _drop_rules(tool, rules, secrets, certain) for tool, rules in value.items()
+        }
+        if key == "permissions" and isinstance(value, dict)
+        else drop_values(value, secrets)
+        for key, value in settings.items()
+    }
+
+
+def _secret_scalar_key(key: Any) -> bool:
+    """``key`` names a secret (``is_secret_key``) for a number or bool under it. The word ``tokens`` alone names a
+    count (`max_tokens: 4096`, `tokens_per_usd`), not a credential; ``token`` still names one."""
+    return is_secret_key(_TOKENS_WORD.sub("", str(key)))
+
+
+def _secret_scalars_as_text(obj: Any, secrets: list[str], section: bool = False) -> Any:
+    """``obj`` with each number or bool that is a secret as its text, so ``drop_values`` and ``redact`` (strings
+    only) hide it: one in an MCP ``env``/``headers`` section, one under a secret-named key, however short (a top-level
+    or provider `api_key: 58217`), or one whose text holds a known secret (an unquoted `SERVICE_TOKEN: 8274619305`).
+    Any other keeps its type (`max_tokens: 4096`)."""
     if isinstance(obj, dict):
-        return {k: _drop_values(v, secrets) for k, v in obj.items()}
+        return {
+            k: _secret_scalars_as_text(
+                v, secrets, section or str(k).lower() in _SECRET_SECTIONS or _secret_scalar_key(k)
+            )
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
-        return [_drop_values(v, secrets) for v in obj]
-    if isinstance(obj, str):
-        for s in secrets:
-            if s in obj:
-                obj = obj.replace(s, REDACTED)
+        return [_secret_scalars_as_text(v, secrets, section) for v in obj]
+    if isinstance(obj, int | float | bool) and (section or any(s in str(obj) for s in secrets)):
+        return str(obj)
     return obj
 
 
@@ -83,20 +155,28 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    secrets = _known_secrets(config, cwd)
+    configs, written = _configs(config, cwd)
+    secrets = _known_secrets(*configs)[0]
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = _drop_values(redact(confio.read_yaml(src)), secrets)
+                raw = _read(src)
+                # its own values hide their copies in it even when nothing else counts it (an untrusted project
+                # config), but only in it: a file the user never trusted must not hide part of one of their rules
+                secrets_here, certain = _known_secrets(*configs, raw)
+                data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
+    # the project config as written, trusted or not, hides its values in the sessions: the certain ones only, so a file
+    # the user never trusted cannot blank out a region or path their transcripts name (a guess, see secret_values)
+    secrets = sorted({*secrets, *_known_secrets(written)[1]}, key=len, reverse=True)
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = _drop_values(session_to_dict(stored), secrets)
+        session = session_to_dict(stored, secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
@@ -176,11 +256,12 @@ def read_bundle(path: Path) -> Bundle:
 
 
 def _strip_redacted(obj: Any) -> Any:
-    """Drop ``<redacted>`` placeholders anywhere inside ``obj`` (they must never be written to config)."""
+    """Drop ``<redacted>`` values from the dicts inside ``obj``. A list keeps the marker in place: without it every
+    later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
     if isinstance(obj, dict):
         return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
     if isinstance(obj, list):
-        return [_strip_redacted(v) for v in obj if v != REDACTED]
+        return [_strip_redacted(v) for v in obj]
     return obj
 
 

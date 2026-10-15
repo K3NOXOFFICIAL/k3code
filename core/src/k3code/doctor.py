@@ -6,8 +6,10 @@ Secrets are never printed: API keys are only checked for presence.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,16 +19,21 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from k3code import service
 from k3code.config import Settings, default_project_dir, load_config
 from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
+from k3code.halt import load_halt
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
 from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe, default_internet_probe
 from k3code.router.cooldown import clear_auth_cooldowns
 
 OK, WARN, FAIL = "ok", "warn", "fail"
+#: A probe that did not run (--no-probe, no network): neither ok nor a problem, counted on its own.
+SKIP = "skip"
 #: Hosts that mean "this chain entry goes through OmniRoute".
 OMNIROUTE_MARKERS = ("omniroute", ":20128")
 MIN_FREE_GB = 5.0
@@ -44,10 +51,6 @@ class Check:
 def _is_omniroute(name: str, base_url: str) -> bool:
     text = f"{name} {base_url}".lower()
     return any(m in text for m in OMNIROUTE_MARKERS)
-
-
-async def _noop_probe() -> tuple[bool, float | None, str]:
-    return True, None, "local"
 
 
 async def _probe_provider(base_url: str, timeout: float = 5.0) -> tuple[bool, float | None, str]:
@@ -76,18 +79,26 @@ async def _probe_key(p: Any) -> tuple[bool, float | None, str]:
     return False, ms, detail
 
 
+async def _probe_claude_login() -> tuple[bool, float | None, str]:
+    """`claude` on PATH is not a login. Only a Claude Code that says it is logged out fails; no answer is fine."""
+    from k3code.providers import claude_cli
+
+    logged_in = await asyncio.to_thread(claude_cli.login_status)
+    return logged_in is not False, None, "not logged in" if logged_in is False else "local"
+
+
 async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     checks: list[Check] = []
     if not config.providers:
-        return [Check("providers", FAIL, "no providers configured", f"add providers to {k3_home() / 'config.yaml'}")]
+        return [Check("providers", FAIL, "no providers configured", "run `k3code onboard` to add one")]
     results: list[tuple[bool, float | None, str]] = []
     if probe:
         results = await asyncio.gather(
             *(
-                _noop_probe()
+                _probe_claude_login()
                 if p.kind == "claude-cli"
-                else _probe_key(p)
-                if p.api_key or (p.api_key_env and os.environ.get(p.api_key_env))
+                else _probe_key(p)  # a keyless entry (api_key_env "") lists its models without a key
+                if p.api_key or not p.api_key_env or os.environ.get(p.api_key_env)
                 else _probe_provider(p.base_url)
                 for p in config.providers
             )
@@ -95,18 +106,20 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     for i, p in enumerate(config.providers):
         if p.kind == "claude-cli":  # local binary, nothing to reach over HTTP
             path = shutil.which("claude")
+            logged_out = bool(path and probe and not results[i][0])
+            if not path:
+                status, detail = FAIL, "Claude Code CLI not found on PATH"
+                fix = "install Claude Code and run `claude` once to log in, or remove this entry"
+            elif logged_out:
+                status, detail, fix = WARN, f"Claude Code CLI at {path}, but not logged in", "run `claude`, then /login"
+            else:
+                status, detail, fix = OK, f"Claude Code CLI at {path}", ""
             checks.append(
-                Check(
-                    f"provider:{p.name}",
-                    OK if path else FAIL,
-                    f"Claude Code CLI at {path}" if path else "Claude Code CLI not found on PATH",
-                    "" if path else "install Claude Code and run `claude` once to log in, or remove this entry",
-                    {"kind": "claude-cli", "command": path or ""},
-                )
+                Check(f"provider:{p.name}", status, detail, fix, {"kind": "claude-cli", "command": path or ""})
             )
             continue
         if not probe:
-            checks.append(Check(f"provider:{p.name}", OK, "probe skipped", data={"base_url": p.base_url}))
+            checks.append(Check(f"provider:{p.name}", SKIP, "probe skipped", data={"base_url": p.base_url}))
             continue
         ok, ms, detail = results[i]
         status = OK if ok else FAIL
@@ -114,7 +127,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         if ok and not keyless:
             # the key answered: an auth cooldown armed by an earlier rejection is stale (the key was fixed in place)
             clear_auth_cooldowns(k3_home() / "cooldowns.json", provider=p.name)
-        if ok and keyless:
+        if ok and keyless and p.api_key_env:
             # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
             checks.append(
                 Check(
@@ -191,20 +204,57 @@ def check_context_windows(config: Settings) -> list[Check]:
     ]
 
 
+def check_prompt_cache(config: Settings) -> list[Check]:
+    """Chain models of an openai-kind relay that ``prompt_cache: auto`` leaves without cache breakpoints because the id
+    does not say Claude and no family is known (mostly a gateway alias in front of a large model)."""
+    checks: list[Check] = []
+    for p in config.providers:
+        if p.kind != "openai" or p.prompt_cache != "auto" or httpx.URL(p.base_url).host == "api.openai.com":
+            continue
+        aliases: list[str] = []
+        for spec in [*p.models.values(), *p.tiers.values()]:
+            for model_id in [spec] if isinstance(spec, str) else spec:
+                name = model_id.lower()
+                if (
+                    model_id
+                    and model_id not in aliases
+                    and "claude" not in name
+                    and family_window(model_id) is None
+                    and not any(fnmatch.fnmatchcase(name, pat.lower()) for pat in p.cache_models)
+                ):
+                    aliases.append(model_id)
+        if aliases:
+            checks.append(
+                Check(
+                    f"prompt-cache:{p.name}",
+                    WARN,
+                    f"{', '.join(aliases)}: no 'claude' in the id, so prompt_cache auto sends no cache breakpoints",
+                    "if a Claude model sits behind it, set prompt_cache: on on this provider entry, or list the id "
+                    "under cache_models: [pattern] to opt only these in",
+                    {"provider": p.name, "models": aliases},
+                )
+            )
+    return checks or [Check("prompt-cache", OK, "no relay alias ids without cache breakpoints")]
+
+
 def check_keys(config: Settings) -> Check:
     # p.api_key is what load_config resolved from the process environment *or* ~/.config/k3code/env, where the setup
     # wizard stores keys: checking os.environ alone failed every shell run, and so did the update smoke test.
     missing = [
         p.api_key_env
         for p in config.providers
-        if p.kind != "claude-cli" and not (p.api_key or os.environ.get(p.api_key_env))
+        # claude-cli uses the local login, and an entry with api_key_env "" (Ollama) declares that it takes no key
+        if p.kind != "claude-cli" and p.api_key_env and not (p.api_key or os.environ.get(p.api_key_env))
     ]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
         fake = bool(os.environ.get("K3CODE_FAKE_PROVIDER"))
         # FAIL only when no chain entry can run: a keyless fallback behind a working entry is a warning
-        usable = any(p.kind == "claude-cli" or p.api_key or os.environ.get(p.api_key_env) for p in config.providers)
+        usable = any(
+            p.kind == "claude-cli" or not p.api_key_env or p.api_key or os.environ.get(p.api_key_env)
+            for p in config.providers
+        )
         return Check(
             "api-keys",
             WARN if fake or usable else FAIL,
@@ -212,7 +262,7 @@ def check_keys(config: Settings) -> Check:
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
         )
-    keyed = sum(1 for p in config.providers if p.kind != "claude-cli")  # claude-cli uses the local login, no key
+    keyed = sum(1 for p in config.providers if p.kind != "claude-cli" and p.api_key_env)  # claude-cli, keyless: none
     return Check("api-keys", OK, f"{keyed} key env var(s) present" if keyed else "no provider needs a key")
 
 
@@ -222,7 +272,8 @@ async def check_netwatch_async() -> Check:
         return Check("netwatch", WARN, "captive portal detected", "log in to the network's portal page")
     if res.ok:
         return Check("netwatch", OK, f"online ({res.latency_ms:.0f} ms)" if res.latency_ms else "online")
-    return Check("netwatch", FAIL, "offline", "k3code pauses and resumes by itself; check Wi-Fi / cable")
+    # a warning, not a failure: k3code pauses and resumes by itself, and a local-only chain (claude-cli) works offline
+    return Check("netwatch", WARN, "offline", "k3code pauses and resumes by itself; check Wi-Fi / cable")
 
 
 def check_disk(home: Path) -> Check:
@@ -280,12 +331,39 @@ async def check_daemon(sock: Path | None = None) -> Check:
             if reply.get("id") == "doctor":
                 break
         ms = (time.monotonic() - start) * 1000
-        version = str((reply.get("result") or {}).get("version") or "")
-        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data={"socket": str(sock), "version": version})
+        result = reply.get("result") or {}
+        version = str(result.get("version") or "")
+        data = {"socket": str(sock), "version": version}
+        if result.get("background_paused"):  # restart-storm safe mode is in the daemon's memory only
+            return Check(
+                "daemon",
+                WARN,
+                f"answering on {sock} ({ms:.0f} ms) but background work is paused (restart-storm safe mode)",
+                "fix what keeps restarting the daemon (journalctl --user -u k3code), then /daemon resume "
+                "(or: k3code slash /daemon resume)",
+                data,
+            )
+        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data=data)
     except (OSError, TimeoutError, ValueError, ConnectionError) as e:
         return Check("daemon", FAIL, f"not answering: {e}", "restart: systemctl --user restart k3code")
     finally:
         writer.close()
+
+
+def check_halt(home: Path) -> Check:
+    """``/daemon pause`` is persisted in ``halt.json``, so it is visible without the daemon (and with --no-probe) and it
+    outlasts a daemon restart: until ``/daemon resume`` nothing reaches a provider."""
+    halt = load_halt(home)
+    if halt is None:
+        return Check("daemon-paused", OK, "background work not halted")
+    since = time.strftime("%Y-%m-%d %H:%M", time.localtime(halt.since)) if halt.since else "unknown time"
+    return Check(
+        "daemon-paused",
+        WARN,
+        f"background work is halted ({halt.reason}, since {since}): no turn, loop, job or sub-agent starts",
+        "/daemon resume (or: k3code slash /daemon resume)",
+        {"reason": halt.reason, "since": halt.since},
+    )
 
 
 def check_systemd() -> Check:
@@ -413,29 +491,30 @@ def find_repo_root() -> Path | None:
 
 
 def check_tui() -> Check:
-    from k3code.paths import find_node
+    from k3code.paths import MIN_NODE_MAJOR, NODE_ENV, resolve_node
 
-    node = find_node()
+    choice = resolve_node()
     root = find_repo_root()
     entry = root / "tui" / "dist" / "entry.js" if root else None
-    version = ""
-    if node:
-        r = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
-        version = r.stdout.strip()
-    if not node:
-        return Check("tui", FAIL, "node not found", "install Node.js >= 20")
-    major = int(version.lstrip("v").split(".")[0] or 0) if version else 0
+    fix = f"install Node.js >= {MIN_NODE_MAJOR}, run the k3code installer, or set {NODE_ENV}"
+    if not choice.path:
+        status = WARN if choice.old else FAIL
+        return Check("tui", status, choice.reason, fix, {"node": choice.old.split(" ")[0]} if choice.old else {})
+    used = f"node {choice.version} ({choice.reason}: {choice.path})"
+    data = {"node": choice.version, "path": choice.path, "source": choice.source}
     if entry is None or not entry.is_file():
-        return Check(
-            "tui",
-            WARN,
-            f"node {version}, TUI build missing",
-            "cd tui && npm install && npm run build",
-            {"node": version},
+        # An install keeps only tui/dist, so with no sources there is no tui/ to build in. The installer keeps a
+        # version it already built (`version X already installed`), so only an uninstall makes it build again.
+        build_fix = (
+            "cd tui && npm install && npm run build"
+            if root
+            else f"check Node.js >= {MIN_NODE_MAJOR} with npm and the network, run `sh install/uninstall.sh` (it keeps "
+            "your data), then `sh install/install.sh` again; re-running the installer alone keeps this version as it is"
         )
-    if major < 20:
-        return Check("tui", WARN, f"node {version} is old", "upgrade to Node.js >= 20", {"node": version})
-    return Check("tui", OK, f"node {version}, tui/dist/entry.js present", data={"node": version})
+        return Check("tui", WARN, f"{used}, TUI build missing", build_fix, data)
+    if choice.major < MIN_NODE_MAJOR:  # only K3CODE_NODE can name a node that old
+        return Check("tui", WARN, f"{used} is old", f"use Node.js >= {MIN_NODE_MAJOR} (or unset {NODE_ENV})", data)
+    return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
 
 
 def check_home(home: Path) -> Check:
@@ -448,10 +527,32 @@ def check_home(home: Path) -> Check:
     return Check("k3code-home", OK, f"{home} writable")
 
 
+#: ``check_journal`` parses whole journals, so it reads only the newest files and stops once the budget is spent
+#: (#82: 61 journals of 7 MB took the doctor 7.4 s).
+JOURNAL_MAX_FILES = 20
+JOURNAL_BUDGET_S = 2.0
+
+
+def _newest_journals(jdir: Path) -> list[Path]:
+    stamped: list[tuple[float, Path]] = []
+    for path in jdir.glob("*.jsonl") if jdir.is_dir() else []:
+        try:
+            stamped.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    return [p for _, p in sorted(stamped, key=lambda t: (-t[0], t[1].name))]
+
+
 def check_journal(home: Path) -> Check:
     jdir = home / "journal"
     open_sessions: dict[str, int] = {}
-    for path in sorted(jdir.glob("*.jsonl")) if jdir.is_dir() else []:
+    paths = _newest_journals(jdir)
+    deadline = time.monotonic() + JOURNAL_BUDGET_S
+    checked = 0
+    for path in paths[:JOURNAL_MAX_FILES]:
+        if time.monotonic() > deadline:
+            break
+        checked += 1
         try:
             j = ToolJournal(home, path.stem)
             try:
@@ -463,16 +564,18 @@ def check_journal(home: Path) -> Check:
             continue
         if pending:
             open_sessions[path.stem] = len(pending)
+    unchecked = len(paths) - checked
+    note = f" ({unchecked} older journal(s) not checked)" if unchecked else ""
     if open_sessions:
         names = ", ".join(f"{k} ({v if v >= 0 else 'unreadable'})" for k, v in open_sessions.items())
         return Check(
             "journal",
             WARN,
-            f"unresolved tool intents in: {names}",
+            f"unresolved tool intents in: {names}{note}",
             "k3code --resume --session <id> completes them (side-effect tools are never re-run)",
-            {"sessions": open_sessions},
+            {"sessions": open_sessions, "unchecked": unchecked},
         )
-    return Check("journal", OK, "no unresolved intents")
+    return Check("journal", OK, f"no unresolved intents{note}", data={"unchecked": unchecked})
 
 
 def check_vendor() -> Check:
@@ -487,26 +590,59 @@ def check_vendor() -> Check:
     return Check("vendor", FAIL, last, "fix VENDOR.toml / the vendored file headers")
 
 
+#: Ubuntu 23.10+ (24.04 LTS) sets this to 1: an unprivileged program may create a user namespace only under an
+#: AppArmor profile that allows ``userns``, and bwrap has none by default.
+_APPARMOR_USERNS = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+
+
+def _unusable_bwrap_fix(bwrap: str) -> str:
+    try:
+        restricted = _APPARMOR_USERNS.read_text().strip() == "1"
+    except OSError:
+        restricted = False
+    if restricted:
+        return (
+            "Ubuntu restricts user namespaces with AppArmor. Allow bwrap: write these 3 lines to "
+            "/etc/apparmor.d/bwrap: `abi <abi/4.0>,` `include <tunables/global>` "
+            f"`profile bwrap {bwrap} flags=(unconfined) {{ userns, }}`, then `sudo apparmor_parser -r "
+            "/etc/apparmor.d/bwrap`; or lift the restriction for every program: "
+            "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist it in /etc/sysctl.d/)"
+        )
+    return "allow unprivileged user namespaces for bwrap (run `bwrap --ro-bind / / true` to see why it fails)"
+
+
 def check_sandbox(probe: bool = True) -> Check:
     from k3code.reliability import sandbox
 
     path = sandbox.bwrap_path()
     if path:
-        # bwrap present is not enough: user namespaces may be blocked, and then every sandboxed command fails
-        if probe and not sandbox.usable():
+        # bwrap present is not enough: user namespaces may be blocked, and then every sandboxed command fails. The
+        # self-test is local and cheap, so --no-probe (which skips the network) runs it too.
+        if not sandbox.usable():
             return Check(
                 "sandbox",
                 WARN,
                 "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash is refused, "
-                "interactive auto/yolo bash runs unsandboxed",
-                "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
+                "interactive auto mode asks before each command it would have sandboxed, yolo bash runs unsandboxed",
+                _unusable_bwrap_fix(path),
+            )
+        # bwrap starting is not enough either: a resolver file the sandbox cannot read means no host name resolves
+        hidden = sandbox.hidden_name_lookup_files() if probe else []
+        if hidden:
+            return Check(
+                "sandbox",
+                WARN,
+                f"bubblewrap at {path}, but sandboxed commands cannot read {', '.join(hidden)}: host name lookups "
+                "there may fail (git fetch, pip/npm install, curl)",
+                f"see where it links to (ls -l {hidden[0]}); the sandbox never shows a file under $HOME or the "
+                "k3code home",
             )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
         "sandbox",
         WARN,
-        "bwrap not found: unattended bash (background, goal, sub-agent) is refused; auto/yolo bash runs WITHOUT a "
-        "sandbox",
+        "bwrap not found: unattended bash (background, goal, sub-agent) is refused; auto mode asks before each "
+        "command it would have sandboxed; yolo bash runs WITHOUT a sandbox",
         "install bubblewrap (dnf/apt install bubblewrap)",
     )
 
@@ -528,6 +664,46 @@ def check_isolation() -> Check:
     return Check("hermes-isolation", OK, "no Hermes env; k3code reads only its own config and environment")
 
 
+# The libraries a bare Debian/Ubuntu is missing for Chromium's headless shell (seen on a fresh Ubuntu 24.04 WSL), and
+# the apt package that ships each. Any other missing library is left to Playwright, which keeps the full list.
+_CHROMIUM_APT_LIBS = {
+    "libnspr4.so": "libnspr4",
+    "libnss3.so": "libnss3",
+    "libnssutil3.so": "libnss3",
+    "libasound.so.2": "libasound2",
+}
+
+
+def _missing_libraries(binary: Path) -> list[str]:
+    """The shared libraries the loader cannot find for ``binary``, from ldd (the browser itself is not started)."""
+    ldd = shutil.which("ldd")
+    if ldd is None:
+        return []
+    try:
+        r = subprocess.run([ldd, str(binary)], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln.split("=>")[0].strip() for ln in r.stdout.splitlines() if ln.rstrip().endswith("=> not found")]
+
+
+def _apt_package(name: str) -> str:
+    """Ubuntu 24.04 renamed some libraries to ``<name>t64`` (libasound2 among them); older releases keep ``name``."""
+    try:
+        r = subprocess.run(["apt-cache", "show", name + "t64"], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return name
+    return name + "t64" if r.returncode == 0 else name
+
+
+def _libraries_fix(missing: list[str]) -> str:
+    if shutil.which("apt-get") is None:
+        return f"install the packages that provide {', '.join(missing)} with your system package manager"
+    packages = [_CHROMIUM_APT_LIBS.get(lib) for lib in missing]
+    if None in packages:
+        return f"sudo {shlex.quote(sys.executable)} -m playwright install-deps chromium-headless-shell"
+    return "sudo apt-get install -y " + " ".join(_apt_package(p) for p in dict.fromkeys(packages) if p)
+
+
 def check_browser() -> Check:
     """The optional browser tool: Playwright importable and Chromium where presetup puts it (local probe only)."""
     import importlib.util
@@ -538,23 +714,37 @@ def check_browser() -> Check:
     location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
     has_chromium = location.is_dir() and any(location.glob("chromium*"))
     if has_playwright and has_chromium:
-        # a directory is not a browser: look for the executable (never launched here)
+        # a directory is not a browser: look for the executable (never launched here); Playwright 1.63's headless
+        # shell is chrome-headless-shell, older builds named it headless_shell
+        names = ("chrome-headless-shell", "chrome-headless-shell.exe", "chrome", "headless_shell", "chrome.exe")
         binary = next(
             (
                 p
                 for d in location.glob("chromium*")
-                for name in ("chrome", "headless_shell", "chrome.exe")
+                for name in names
                 for p in d.rglob(name)
                 if p.is_file() and os.access(p, os.X_OK)
             ),
             None,
         )
         if binary is None:
+            # the installer and a plain `playwright install` both skip a directory they already installed into
             return Check(
                 "browser",
                 WARN,
                 f"Chromium directory at {location} has no executable browser; the browser tool is off",
-                "re-run the installer without --minimal",
+                f"PLAYWRIGHT_BROWSERS_PATH={location} {sys.executable} -m playwright install"
+                " --force --only-shell chromium",
+            )
+        missing = _missing_libraries(binary)
+        if missing:
+            return Check(
+                "browser",
+                WARN,
+                f"Chromium at {location} cannot start: the system libraries {', '.join(missing)} are missing; "
+                "the browser tool is off",
+                _libraries_fix(missing),
+                data={"path": str(location), "exe": str(binary), "missing_libraries": missing},
             )
         return Check(
             "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}
@@ -617,6 +807,70 @@ def check_project(project_dir: Path) -> Check:
     return Check("project", OK, f"{detected}; {config} ({project_dir})", data={"stacks": found})
 
 
+def check_permissions(home: Path, project_dir: Path) -> Check:
+    """Every ``permissions:`` entry k3code cannot read and enforces as a deny: the user config, the rules accepted from
+    this project's recipe and the project config as trusted. The session logs each one once; this lists them all.
+    A ``permissions.hardline`` k3code cannot read fails the check: no bash command can run until it is fixed."""
+    from k3code import trust
+    from k3code.learning.projectstate import rules_path
+    from k3code.permissions.state import UNREADABLE_HARDLINE, parse_permissions, read_permissions
+
+    problems: list[str] = []
+    hard: list[str] = []
+    for path in (home / "config.yaml", rules_path(project_dir)):
+        _, extra, found = read_permissions(path)
+        problems += [f"{path}: {p}" for p in found]
+        hard += extra
+    if (text := trust.trusted_text(project_dir)) is not None:
+        _, extra, found = parse_permissions(text)
+        problems += [f"{trust.config_path(project_dir)}: {p}" for p in found]
+        hard += extra
+    if problems:
+        fix = (
+            "fix each named entry (an action is allow, ask or deny, lower case; permissions.hardline is a list of"
+            " quoted regexes); until then it is a deny (a blank hardline pattern is ignored instead)"
+        )
+        status = FAIL if UNREADABLE_HARDLINE in hard else WARN
+        return Check("permissions", status, "; ".join(problems), fix, {"problems": len(problems)})
+    return Check("permissions", OK, "every permissions entry is valid")
+
+
+async def check_worktrees(project_dir: Path) -> Check:
+    """Fan-out and sub-agent leftovers in this project's repo: worktrees whose process died and k3/* branches. A
+    gateway start reaps them (``subagents.worktree.reap``); this only lists them."""
+    from k3code.subagents import worktree
+
+    found = await worktree.scan(project_dir)
+    if found is None:
+        return Check("worktrees", OK, "not in a git repository")
+
+    def count(n: int, one: str, many: str) -> str:
+        return f"{n} {one if n == 1 else many}"
+
+    leftovers = [
+        count(len(found.worktrees), "orphaned worktree", "orphaned worktrees") if found.worktrees else "",
+        count(len(found.merged), "merged k3/* branch", "merged k3/* branches") if found.merged else "",
+        count(len(found.expired), "expired k3/* branch", "expired k3/* branches") if found.expired else "",
+    ]
+    kept = count(len(found.unmerged), "unmerged k3/* branch", "unmerged k3/* branches") + " kept"
+    data = {
+        "worktrees": [str(w.path) for w in found.worktrees],
+        "merged": found.merged,
+        "expired": [name for name, _ in found.expired],
+        "unmerged": found.unmerged,
+    }
+    if not any(leftovers):
+        return Check("worktrees", OK, kept if found.unmerged else "no fan-out leftovers", data=data)
+    detail = f"{', '.join(x for x in leftovers if x)} left by fan-out or sub-agents in {found.repo}"
+    return Check(
+        "worktrees",
+        WARN,
+        f"{detail}; {kept}" if found.unmerged else detail,
+        "restart the daemon (it reaps them at start), or: git worktree remove --force <path>; git branch -D <branch>",
+        data,
+    )
+
+
 def install_subset(home: Path | None = None) -> list[Check]:
     """What the installer prints after activation. Warnings only: no check here can fail an install.
 
@@ -628,18 +882,24 @@ def install_subset(home: Path | None = None) -> list[Check]:
     return [Check(c.name, WARN if c.status == FAIL else c.status, c.detail, c.fix, c.data) for c in checks]
 
 
-async def run_checks(config: Settings | None = None, *, probe: bool = True, home: Path | None = None) -> list[Check]:
+async def run_checks(
+    config: Settings | None = None, *, probe: bool = True, network: bool = True, home: Path | None = None
+) -> list[Check]:
+    """``probe=False`` skips every probe; ``network=False`` skips only the ones that leave the machine (the providers,
+    the internet), so the daemon and the sandbox are still tried."""
     home = home or k3_home()
     config = config or load_config(project_dir=Path.cwd())
     checks: list[Check] = []
-    checks += await check_providers(config, probe=probe)
+    checks += await check_providers(config, probe=probe and network)
     checks.append(check_keys(config))
     checks += check_context_windows(config)
-    checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
+    checks += check_prompt_cache(config)
+    checks.append(await check_netwatch_async() if probe and network else Check("netwatch", SKIP, "probe skipped"))
     checks += [check_disk(home), check_psi()]
-    daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
+    daemon_check = await check_daemon() if probe else Check("daemon", SKIP, "probe skipped")
     checks.append(daemon_check)
     checks += [
+        check_halt(home),
         check_daemon_version(daemon_check.data.get("version")),
         check_systemd(),
         check_linger(),
@@ -649,16 +909,18 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         check_home(home),
         check_journal(home),
         check_vendor(),
-        # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
+        # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
+        check_permissions(home, default_project_dir()),
         await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
+        await check_worktrees(default_project_dir()),
     ]
     return checks
 
 
 def summary(checks: list[Check]) -> dict[str, int]:
-    return {s: sum(1 for c in checks if c.status == s) for s in (OK, WARN, FAIL)}
+    return {s: sum(1 for c in checks if c.status == s) for s in (OK, WARN, FAIL, SKIP)}
 
 
 def to_json(checks: list[Check]) -> str:
@@ -666,12 +928,12 @@ def to_json(checks: list[Check]) -> str:
 
 
 def format_report(checks: list[Check]) -> str:
-    marks = {OK: "✓", WARN: "!", FAIL: "✗"}
+    marks = {OK: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
     lines = []
     for c in checks:
         lines.append(f"{marks[c.status]} {c.name}: {c.detail}")
-        if c.fix and c.status != OK:
+        if c.fix and c.status not in (OK, SKIP):
             lines.append(f"    fix: {c.fix}")
     s = summary(checks)
-    lines.append(f"\n{s[OK]} ok, {s[WARN]} warn, {s[FAIL]} fail")
+    lines.append(f"\n{s[OK]} ok, {s[WARN]} warn, {s[FAIL]} fail" + (f", {s[SKIP]} skipped" if s[SKIP] else ""))
     return "\n".join(lines)

@@ -45,6 +45,26 @@ describe("describeTurnFailure", () => {
     expect(text).toContain("/retry");
   });
 
+  it("tells a claude-cli login failure to log in, not to set an API key (issue #146)", () => {
+    for (const code of ["auth", "auth_permanent"]) {
+      const text = describeTurnFailure({
+        error:
+          "provider authentication failed (last reason: auth): ProviderError: Not logged in · Please run /login. Hint: check the API keys with `k3code doctor`",
+        error_surface: { code, layer: "provider", retryable: false },
+        recoverable: true,
+      });
+
+      // The Details line is the raw error (the router's own words); the title and next step are ours.
+      const [title, , nextStep] = text.split("\n");
+
+      expect(title).toContain("Claude Code is not logged in");
+      expect(title).not.toContain("API key");
+      expect(nextStep).toContain("`claude`");
+      expect(nextStep).toContain("/login");
+      expect(nextStep).not.toContain("k3code onboard");
+    }
+  });
+
   it("falls back to the layer copy, and to a generic title, when the code is unknown", () => {
     const streaming = describeTurnFailure({
       error: "peer closed connection",

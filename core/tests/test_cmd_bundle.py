@@ -37,6 +37,7 @@ def write_user_config(h):
                     }
                 ],
                 "mem0": {"url": "http://m", "api_key_env": "MEM_KEY", "user_id": "u"},
+                "panes": {"keymap": "tuios"},
                 "mcp": {"servers": {"s": {"command": "x", "env": {"GITHUB_TOKEN": SECRET_TOKEN, "FOO": "bar"}}}},
                 "extra_password": SECRET_PASS,
             }
@@ -87,6 +88,7 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     for secret in (SECRET_KEY, SECRET_TOKEN, SECRET_PASS):
         assert secret.encode() not in blob
     assert b"MY_API_KEY" in blob and b"max_tokens: 4096" in blob
+    assert b"keymap: tuios" in blob  # 'key' inside 'keymap' is not a secret name
     await server.close()
 
     # Fresh install: has its own config (with a real secret that must survive) and no sessions.
@@ -101,6 +103,7 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     assert merged["max_turns"] == 7 and merged["max_tokens"] == 4096
     assert merged["mem0"]["api_key"] == "LOCAL-SECRET-VALUE"  # <redacted> never overwrites
     assert merged["mem0"]["url"] == "http://m"
+    assert merged["panes"] == {"keymap": "tuios"}
     assert REDACTED not in (h2 / "config.yaml").read_text()
     assert list(h2.glob("config.yaml.bak-*")), "existing config must be backed up"
     imported = server2.store.get(sid)  # id was free in the new store → kept
@@ -112,6 +115,23 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     assert "id collided" in res["output"]
     assert len([s for s in server2.store.list() if s.title == "first"]) == 2
     await server2.close()
+
+
+async def test_export_refuses_a_project_config_that_does_not_parse_without_quoting_its_line(tmp_path, monkeypatch):
+    """K3NOX-575: a YAML error quotes the line, which may hold a secret; `dispatch` puts any error that is not a
+    BundleError into the chat reply, so the export must refuse such a file with its path only, trusted or not."""
+    server, _ = make_server(tmp_path / "a", monkeypatch)
+    tok = "Svc" + "AccessTok" + "Qz81xW4p"
+    proj = tmp_path / "proj"
+    (proj / ".k3code").mkdir(parents=True)
+    (proj / ".k3code" / "config.yaml").write_text(f"mcp:\n  servers:\n    s:\n      env:\n        X_TOKEN: {tok}: x\n")
+    sid = await new_session(server, proj)
+    for flags in ("", " --session-only"):
+        out = tmp_path / "x.k3bundle"
+        res = await cmd(server, f"/export {out}{flags}", sid)
+        refused = "does not parse" in res["output"] and tok not in json.dumps(res)
+        assert refused and not out.exists()
+    await server.close()
 
 
 async def test_import_asks_for_confirmation(tmp_path, monkeypatch):

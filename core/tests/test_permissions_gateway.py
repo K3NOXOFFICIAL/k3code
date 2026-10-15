@@ -47,6 +47,9 @@ def bash(cmd: str, id: str = "c1") -> ToolCall:
 def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str = "default", **cfg):
     monkeypatch.setenv("K3CODE_HOME", str(tmp.parent / f"{tmp.name}-k3home"))  # beside, not inside, the project
     store = SessionStore(tmp / "sessions.db")
+    # these turns are scripted one reply per model call: auto-continue (on by default in auto/yolo) would add judge
+    # calls and continuation turns; tests about it ask for it (test_auto_continue)
+    cfg["autonomy"] = {"auto_continue": False, **(cfg.get("autonomy") or {})}
     config = Settings(
         # a closed localhost port: background calls fail at once (no DNS lookup of a made-up host)
         providers=[ProviderEntry(name="t", kind="openai", base_url="http://127.0.0.1:9", api_key_env="NOPE")],

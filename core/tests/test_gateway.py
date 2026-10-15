@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -605,12 +606,18 @@ async def test_tool_results_checkpoint_the_turn_before_it_ends(tmp_path, monkeyp
     stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
     saved_sizes: list[int] = []
-    real_save = srv.store.save
-    srv.store.save = lambda s: (saved_sizes.append(len(s.messages)), real_save(s))[1]  # type: ignore[method-assign]
+    real_checkpoint = SessionStore.checkpoint
+
+    def spy(self, session_id, messages, model=""):
+        saved_sizes.append(len(messages))
+        real_checkpoint(self, session_id, messages, model)
+
+    monkeypatch.setattr(SessionStore, "checkpoint", spy)
     status, text = await srv._run_turn(live, "run echo")
     assert status == "done", (text, live.last_error)
     final = len(live.stored.messages)
     assert any(0 < n < final for n in saved_sizes), (saved_sizes, final)  # a checkpoint landed before the end
+    assert len(srv.store.get(live.session_id).messages) == final  # and the end of the turn wrote everything
 
 
 async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_path, monkeypatch):
@@ -663,11 +670,52 @@ async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path
     assert srv.providers is providers and srv.cooldowns is cooldowns
     assert srv.router is main and srv._chain_key == "default"
     assert len(srv._router_cache) == 2
-    # replacing the provider config (/config reload) does rebuild everything, once
+    # replacing the provider config (/config reload) rebuilds the routers, once (see test_gateway_provider_reload)
     srv.config.providers = [prov]
     srv._chain_key = None
     srv._ensure_router("default")
     assert srv.providers is not providers and len(srv._router_cache) == 1
+    await srv.close()
+
+
+async def test_a_turn_keeps_its_model_key_when_another_session_switches_the_router(tmp_path, monkeypatch):
+    """_ensure_router points one daemon-wide router at the key of whichever turn started last. A turn read it again
+    after awaiting MCP start-up and the approval callback, so a session starting a turn on another key in that window
+    sent this turn to the other session's model, and its checkpoint stamped that key on this session (#130)."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "text", "text": "ok"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(
+        name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m", "alt": "m-alt"}
+    )
+    srv = GatewayServer(
+        config=Settings(
+            providers=[prov],
+            default_model="default",
+            permission_mode="yolo",
+            autonomy={"plan_first": False, "proposals": False, "auto_continue": False},  # one call per turn
+        ),
+        store=SessionStore(tmp_path / "s.db"),
+    )
+    srv._write = lambda s: None
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME
+    proj.mkdir()
+    mine = srv.live_for(srv.store.create(title="mine", cwd=str(proj)))  # no model key: the default one
+    other = srv.live_for(srv.store.create(title="other", model="alt", cwd=str(proj)))
+    real_start = srv.mcp.ensure_started
+
+    async def other_turn_starts(*args, **kwargs):
+        srv._ensure_router(other.stored.model)  # the other session's turn begins while this one awaits
+        return await real_start(*args, **kwargs)
+
+    monkeypatch.setattr(srv.mcp, "ensure_started", other_turn_starts)
+    status, text = await srv._run_turn(mine, "hi")
+    assert status == "done", (text, mine.last_error)
+    assert [c["model"] for c in srv.providers[0].log] == ["m"]
+    assert mine.stored.model == "default"
     await srv.close()
 
 
@@ -702,6 +750,44 @@ async def test_the_prompt_and_the_tool_call_are_on_disk_before_the_first_tool_ru
             await task
 
 
+async def test_the_prompt_is_on_disk_while_the_model_is_still_streaming(tmp_path, monkeypatch):
+    """A terminal closed (SIGHUP) 3 s into a streaming answer left an empty session row: the prompt reached the store
+    only with the first tool call or at the turn's end, so /resume listed nothing. It is saved as the turn starts."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "text", "text": "never reached"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+
+    async def never_answers(self, *a, **k):  # a model stream that is still going when the terminal goes away
+        await asyncio.sleep(60)
+        yield  # makes this an async generator
+
+    monkeypatch.setattr(FakeProvider, "stream", never_answers)
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    db = tmp_path / "s.db"
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"), store=SessionStore(db)
+    )
+    srv._write = lambda s: None
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir(exist_ok=True)
+    stored = srv.store.create(title="t", model="default", cwd=str(proj))
+    live = srv.live_for(stored)
+    live.last_checkpoint = time.monotonic()  # the previous turn just ended: the mid-turn throttle is closed
+    task = asyncio.create_task(srv._run_turn(live, "answer slowly"))
+    try:
+        await asyncio.sleep(1.5)  # the turn is waiting for the model
+        other = SessionStore(db)  # a separate connection: what a restarted daemon would read
+        users = [m["content"] for m in other.get(live.session_id).messages if m["role"] == "user"]
+        assert users == ["answer slowly"], users
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 async def test_a_prompt_submitted_mid_turn_is_queued_and_runs_after_it(tmp_path, monkeypatch):
     """prompt.submit during a turn answered {"status": "queued"} and discarded the text: nothing ran, no error."""
     import json as _json
@@ -711,7 +797,10 @@ async def test_a_prompt_submitted_mid_turn_is_queued_and_runs_after_it(tmp_path,
     script.write_text(_json.dumps([{"type": "text", "text": "done"}]))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
-    server = make_server(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"))
+    settings = Settings(  # one turn per prompt: no auto-continue (on by default in yolo)
+        providers=[prov], default_model="default", permission_mode="yolo", autonomy={"auto_continue": False}
+    )
+    server = make_server(config=settings)
     created = await rpc(server, "session.create", {"cwd": str(tmp_path)})
     live = server.session
     assert live is not None and created["result"]["session_id"] == live.session_id
