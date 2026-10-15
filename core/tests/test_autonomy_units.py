@@ -249,6 +249,42 @@ def test_a_negation_or_docs_word_elsewhere_never_clears_a_real_danger(prompt):
     assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What does the delete function do?",
+        "Explain how the deploy script works",
+        "Where is the password hashed?",
+        "how do I rotate the api key in this repo?",
+        "Is the migration reversible?",
+        "Describe what the purge command removes. Why is it slow?",
+        "Explain how the deploy script works and why it needs a lock",
+    ],
+)
+def test_an_answer_only_question_naming_a_danger_word_does_not_force_a_plan(prompt):
+    # these forced a strong-tier plan and, in auto mode, an approval modal on a read-only question
+    v = apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt)
+    assert not v.needs_plan and v.risk == "low" and "danger" not in v.reason
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "delete the old logs",
+        "deploy to prod",
+        "Can you delete the old logs?",
+        "Why don't you delete the old logs?",
+        "What does the deploy script do? Run the deploy script.",
+        "Explain how the migration works, then run the migration",
+        "Explain the loader and delete the old API",
+        "Where is the password hashed? Rotate the credentials too",
+        "What about deleting the old logs?",
+    ],
+)
+def test_a_request_still_forces_a_plan_next_to_or_phrased_as_a_question(prompt):
+    assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
+
+
 def test_the_classifier_reason_saying_no_deletion_does_not_force_a_plan():
     v = apply_floor(ScopeVerdict(scope="small", reason="no credentials involved, nothing deleted"), "rename a var")
     assert not v.needs_plan and v.risk == "low"

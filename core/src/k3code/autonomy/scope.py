@@ -57,6 +57,13 @@ _DOCS_CLAUSE_RE = re.compile(
 #: Where a negation's or a docs mention's reach ends: punctuation, a dash, or a word that starts another action.
 #: "don't worry, just delete the prod db" and "deploy to production and update the changelog" keep their danger.
 _CLAUSE_END_RE = re.compile(r"[.;!?\n,:]|\s[-—–]\s|[—–]|\b(?:and|then|but|after\s+that)\b", re.IGNORECASE)
+#: A clause that opens as a question or an explanation request, not as a request phrased as one ("can you delete…?",
+#: "why don't you…", "what about deleting…"). A danger word inside it is the thing being asked about.
+_INQUIRY_RE = re.compile(
+    r"^\s*(?:(?:what|which|where|when|who|whose|how|why|is|are|does|did|was|were)\b(?!\s+(?:about|you\b|don'?t|not\b))"
+    r"|explain\b|describe\b|summari[sz]e\b|tell\s+me\b|walk\s+me\s+through\b|show\s+me\s+(?:where|how|what|which)\b)",
+    re.IGNORECASE,
+)
 
 
 def danger_hit(text: str) -> str:
@@ -64,9 +71,11 @@ def danger_hit(text: str) -> str:
 
     :data:`DANGER_RE` alone fired on "don't delete anything", "update the deployment docs" or "label the password
     field", forcing a high-risk plan (a strong-tier planner call and a slower start) on harmless tasks. A match is
-    skipped only when a negation governs it directly (see :data:`_NEG_ACTION_RE`, :data:`_NEG_NOUN_RE`), or when it is a
-    noun-like danger word in a clause about documentation; a negation or a docs word never reaches past a comma, a
-    colon or an "and". Everything else still counts, so "don't worry, just delete the prod db" or "no backup needed:
+    skipped only when its clause is an answer-only question or explanation request (:data:`_INQUIRY_RE`: "what does
+    the delete function do?", "explain how the deploy script works"), when a negation governs it directly (see
+    :data:`_NEG_ACTION_RE`, :data:`_NEG_NOUN_RE`), or when it is a noun-like danger word in a clause about
+    documentation; a question, a negation or a docs word never reaches past a comma, a colon or an "and".
+    Everything else still counts, so "don't worry, just delete the prod db" or "no backup needed:
     drop table users" keep their plan."""
     for m in DANGER_RE.finditer(text):
         starts = [c.end() for c in _CLAUSE_END_RE.finditer(text, 0, m.start())]
@@ -74,6 +83,8 @@ def danger_hit(text: str) -> str:
         nxt = _CLAUSE_END_RE.search(text, m.end())
         before = text[start : m.start()]
         clause = text[start : nxt.start() if nxt else len(text)]
+        if _INQUIRY_RE.match(clause):
+            continue
         noun = bool(_DANGER_NOUN_RE.match(m.group(0)))
         if (_NEG_NOUN_RE if noun else _NEG_ACTION_RE).search(before):
             continue
