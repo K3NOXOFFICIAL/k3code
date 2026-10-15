@@ -6,6 +6,7 @@ import {
   buildVerboseToolTrailLine,
   edgePreview,
   estimateRows,
+  formatToolCall,
   isToolTrailResultLine,
   lastCotTrailIndex,
   parseToolTrailResultLine,
@@ -13,7 +14,99 @@ import {
   sameToolTrailGroup,
   splitToolDuration,
   thinkingPreview,
+  toolCallSummary,
 } from "../lib/text.js";
+
+describe("toolCallSummary", () => {
+  it("puts the key argument first, one line per tool, never a dict repr", () => {
+    expect(
+      toolCallSummary("bash", {
+        command: "pwd; ls -la; git rev-parse --show-toplevel\necho done",
+      }),
+    ).toBe("Bash  pwd; ls -la; git rev-parse --show-toplevel");
+    expect(toolCallSummary("read", { path: "src/k3code/README.md" })).toBe(
+      "Read  src/k3code/README.md",
+    );
+    expect(
+      toolCallSummary("read", { path: "a.py", offset: 40, limit: 20 }),
+    ).toBe("Read  a.py  from 40 (20 lines)");
+    expect(
+      toolCallSummary("glob", { pattern: "**/k3code*", path: "src/k3code" }),
+    ).toBe("Glob  **/k3code*  in src/k3code");
+    expect(toolCallSummary("glob", { pattern: "*", path: "." })).toBe(
+      "Glob  *",
+    );
+    expect(
+      toolCallSummary("grep", { pattern: "foo", path: "src", include: "*.ts" }),
+    ).toBe("Grep  foo  in src");
+    expect(
+      toolCallSummary("edit", {
+        path: "x.ts",
+        old_string: "a\nb",
+        new_string: "c",
+      }),
+    ).toBe("Edit  x.ts");
+    expect(toolCallSummary("write", { path: "y.md", content: "# hi\n" })).toBe(
+      "Write  y.md",
+    );
+  });
+
+  it("phrases an unknown tool as key=value pairs, compactly", () => {
+    expect(
+      toolCallSummary("web_fetch", { url: "https://x.example", prompt: "p" }),
+    ).toBe("Web Fetch  https://x.example  prompt=p");
+    expect(toolCallSummary("todo", { items: [{ id: 1 }], merge: true })).toBe(
+      'Todo  items=[{"id":1}], merge=true',
+    );
+    expect(toolCallSummary("ping", {})).toBe("Ping");
+  });
+
+  it("truncates to the width and never keeps a line break", () => {
+    const summary = toolCallSummary(
+      "bash",
+      { command: `${"x".repeat(200)}\nsecond line` },
+      40,
+    );
+
+    expect(summary).toHaveLength(40);
+    expect(summary.endsWith("…")).toBe(true);
+    expect(summary).not.toContain("\n");
+    expect(
+      toolCallSummary("note", { text: "line one\nline two" }),
+    ).not.toContain("\n");
+  });
+});
+
+describe("formatToolCall", () => {
+  it("prefers structured args over the free-text context", () => {
+    expect(
+      formatToolCall("glob", "{'pattern': '*', 'path': '.'}", {
+        pattern: "*",
+        path: "src",
+      }),
+    ).toBe("Glob  *  in src");
+  });
+
+  it("falls back to the context preview without quotes", () => {
+    expect(formatToolCall("glob", "*.ts")).toBe("Glob  *.ts");
+    expect(formatToolCall("glob", "")).toBe("Glob");
+  });
+
+  it("phrases a context that is itself a dict repr or JSON (older gateways)", () => {
+    expect(
+      formatToolCall("glob", "{'pattern': '[!.]*/k3code*', 'path': '.'}"),
+    ).toBe("Glob  [!.]*/k3code*");
+    expect(formatToolCall("read", '{"path": "src/k3code/README.md"}')).toBe(
+      "Read  src/k3code/README.md",
+    );
+    expect(
+      formatToolCall(
+        "bash",
+        "{'command': 'pwd; ls -la; git rev-parse --show-toplevel 2>/dev/…",
+      ),
+    ).toBe("Bash  pwd; ls -la; git rev-parse --show-toplevel 2>/dev/…");
+  });
+});
 
 describe("isToolTrailResultLine", () => {
   it("detects completion markers", () => {
@@ -27,14 +120,14 @@ describe("buildToolTrailLine", () => {
   it("puts completion duration inline before the result marker", () => {
     const line = buildToolTrailLine("read_file", "x", false, "", 0.94);
 
-    expect(line).toBe('Read File("x") (0.9s) ✓');
+    expect(line).toBe("Read File  x (0.9s) ✓");
     expect(parseToolTrailResultLine(line)).toEqual({
-      call: 'Read File("x") (0.9s)',
+      call: "Read File  x (0.9s)",
       detail: "",
       mark: "✓",
     });
-    expect(splitToolDuration('Read File("x") (0.9s)')).toEqual({
-      label: 'Read File("x")',
+    expect(splitToolDuration("Read File  x (0.9s)")).toEqual({
+      label: "Read File  x",
       duration: " (0.9s)",
     });
   });
@@ -54,7 +147,7 @@ describe("buildVerboseToolTrailLine", () => {
     expect(line).toContain("Args:\n{");
     expect(line).toContain("Result:\nfirst line\nsecond :: line");
     expect(parseToolTrailResultLine(line)).toEqual({
-      call: 'Terminal("npm test") (1.3s)',
+      call: "Terminal  npm test (1.3s)",
       detail:
         'Args:\n{\n  "cmd": "npm test"\n}\nResult:\nfirst line\nsecond :: line',
       mark: "✓",
@@ -74,7 +167,7 @@ describe("buildVerboseToolTrailLine", () => {
     expect(line).toContain("Error:\ncommand failed");
     expect(line).not.toContain("Result:\ncommand failed");
     expect(parseToolTrailResultLine(line)).toEqual({
-      call: 'Terminal("npm test") (0.5s)',
+      call: "Terminal  npm test (0.5s)",
       detail: "Error:\ncommand failed",
       mark: "✗",
     });

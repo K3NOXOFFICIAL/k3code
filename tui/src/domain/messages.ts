@@ -1,5 +1,5 @@
 import { LONG_MSG } from "../config/limits.js";
-import { buildToolTrailLine } from "../lib/text.js";
+import { formatToolCall, toolTrailLine } from "../lib/text.js";
 import type { Msg, SessionInfo } from "../types.js";
 
 export const introMsg = (info: SessionInfo): Msg => ({
@@ -37,7 +37,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue;
     }
 
-    const { context, display_kind, name, role, text, timestamp } =
+    const { args, context, display_kind, name, role, text, timestamp } =
       row as TranscriptRow;
 
     const createdAt =
@@ -48,7 +48,19 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
         : undefined;
 
     if (role === "tool") {
-      pending.push(buildToolTrailLine(name ?? "tool", context ?? ""));
+      // `args` (the stored call's arguments) phrases the row; `context` is
+      // the older gateway's free-text preview and only the fallback.
+      pending.push(
+        toolTrailLine(
+          formatToolCall(
+            name ?? "tool",
+            context ?? "",
+            args && typeof args === "object" && !Array.isArray(args)
+              ? (args as Record<string, unknown>)
+              : undefined,
+          ),
+        ),
+      );
 
       continue;
     }
@@ -151,6 +163,7 @@ export const fmtDurationMinutes = (ms: number) => {
 };
 
 interface TranscriptRow {
+  args?: unknown;
   context?: string;
   display_kind?: string;
   display_metadata?: { task_count?: number; [key: string]: unknown };

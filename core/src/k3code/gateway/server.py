@@ -3639,28 +3639,39 @@ async def _session_active_list(server: GatewayServer, params: dict[str, Any]) ->
 
 
 def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Stored (OpenAI-shaped) messages -> the ``{role, text, name, context}`` rows the TUI renders on resume.
+    """Stored (OpenAI-shaped) messages -> the ``{role, text, name, context, args}`` rows the TUI renders on resume.
 
     System prompts and assistant tool-call stubs are dropped; a tool result becomes a ``tool`` row named after
-    the call that produced it.
+    the call that produced it. ``args`` carries the call's arguments as a dict when they are stored as one, so
+    the TUI can phrase the row (``Bash  pwd; ls``) instead of printing a dict repr; ``context`` keeps the first
+    80 characters of the argument text for older clients.
     """
-    names: dict[str, tuple[str, str]] = {}
+    names: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     rows: list[dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
         if role == "assistant":
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                names[str(tc.get("id"))] = (
-                    str(tc.get("name") or fn.get("name") or "tool"),
-                    str(tc.get("arguments") or fn.get("arguments") or "")[:80],
-                )
+                arguments = tc.get("arguments") if "arguments" in tc else fn.get("arguments")
+                args = arguments if isinstance(arguments, dict) else None
+                if args is None and isinstance(arguments, str):
+                    try:
+                        parsed = json.loads(arguments)
+                    except ValueError:
+                        parsed = None
+                    args = parsed if isinstance(parsed, dict) else None
+                ctx = json.dumps(args, ensure_ascii=False) if args is not None else str(arguments or "")
+                names[str(tc.get("id"))] = (str(tc.get("name") or fn.get("name") or "tool"), ctx[:80], args)
         content = m.get("content")
         if isinstance(content, list):
             content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
         if role == "tool":
-            name, ctx = names.get(str(m.get("tool_call_id")), (str(m.get("name") or "tool"), ""))
-            rows.append({"role": "tool", "name": name, "context": ctx})
+            name, ctx, args = names.get(str(m.get("tool_call_id")), (str(m.get("name") or "tool"), "", None))
+            row: dict[str, Any] = {"role": "tool", "name": name, "context": ctx}
+            if args is not None:
+                row["args"] = args
+            rows.append(row)
         elif role in ("user", "assistant") and isinstance(content, str) and content.strip():
             rows.append({"role": role, "text": content})
     return rows

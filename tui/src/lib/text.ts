@@ -199,11 +199,225 @@ export const toolTrailLabel = (name: string) =>
     .map((p) => p[0]!.toUpperCase() + p.slice(1))
     .join(" ") || name;
 
-export const formatToolCall = (name: string, context = "") => {
+/** The argument a reader wants first, per tool: the command, the path, the pattern, the url. */
+const KEY_ARGS = [
+  "command",
+  "path",
+  "file_path",
+  "pattern",
+  "url",
+  "query",
+  "prompt",
+  "description",
+  "question",
+] as const;
+
+const ARG_VALUE_MAX = 48;
+
+const argValueText = (value: unknown): string => {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return String(value);
+  }
+
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return String(value);
+  }
+};
+
+const firstLine = (text: string) => text.split("\n", 1)[0] ?? "";
+
+// One line a reader can scan: `Bash  pwd; ls -la`, `Read  src/x.py`,
+// `Glob  *.ts  in src`, `Grep  pattern  in path`, `Edit  path`. Unknown
+// tools get `Name  key=value, …`. Never a dict repr, never a line break; the
+// caller truncates to the column width.
+export const toolCallSummary = (
+  name: string,
+  args: Record<string, unknown> | null | undefined,
+  width = 120,
+): string => {
+  const label = toolTrailLabel(name);
+  const rest: Record<string, unknown> = { ...(args ?? {}) };
+
+  const take = (key: string): string => {
+    const value = rest[key];
+    delete rest[key];
+
+    return value === undefined || value === "" ? "" : argValueText(value);
+  };
+
+  const parts: string[] = [];
+
+  switch (name) {
+    case "bash": {
+      const command = take("command").trim();
+
+      if (command) {
+        parts.push(firstLine(command));
+      }
+
+      break;
+    }
+
+    case "read":
+    case "write":
+    case "edit": {
+      const path = take("path") || take("file_path");
+
+      if (path) {
+        parts.push(path);
+      }
+
+      if (name === "read") {
+        const offset = take("offset");
+        const limit = take("limit");
+
+        if (offset && offset !== "1") {
+          parts.push(`from ${offset}${limit ? ` (${limit} lines)` : ""}`);
+        }
+      }
+
+      // The payload argument of an edit/write is never worth a summary row.
+      delete rest.content;
+      delete rest.old_string;
+      delete rest.new_string;
+      delete rest.replace_all;
+      delete rest.limit;
+      break;
+    }
+
+    case "glob":
+    case "grep": {
+      const pattern = take("pattern");
+      const path = take("path");
+
+      if (pattern) {
+        parts.push(pattern);
+      }
+
+      if (path && path !== ".") {
+        parts.push(`in ${path}`);
+      }
+
+      delete rest.include;
+      delete rest.exclude;
+      break;
+    }
+
+    default: {
+      for (const key of KEY_ARGS) {
+        const value = take(key);
+
+        if (value) {
+          parts.push(firstLine(value));
+          break;
+        }
+      }
+
+      const pairs = Object.entries(rest)
+        .filter(([, value]) => value !== undefined && value !== null)
+        .map(
+          ([key, value]) =>
+            `${key}=${compactPreview(argValueText(value), ARG_VALUE_MAX)}`,
+        );
+
+      if (pairs.length) {
+        parts.push(pairs.join(", "));
+      }
+    }
+  }
+
+  // Two spaces separate label and arguments (one space can be inside a
+  // command), so the parts are collapsed one by one and the summary itself
+  // is only cut, never re-collapsed.
+  const summary = parts.length
+    ? `${label}  ${parts
+        .map((p) => p.replace(WS_RE, " ").trim())
+        .filter(Boolean)
+        .join("  ")}`
+    : label;
+  const max = Math.max(8, width);
+
+  return summary.length > max ? `${summary.slice(0, max - 1)}…` : summary;
+};
+
+/**
+ * Trail-row head for a call. `args` (the structured arguments) wins; the
+ * old free-text `context` is the fallback for gateways that send only it.
+ */
+export const formatToolCall = (
+  name: string,
+  context = "",
+  args?: Record<string, unknown> | null,
+) => {
+  if (args && Object.keys(args).length) {
+    return toolCallSummary(name, args);
+  }
+
   const label = toolTrailLabel(name);
   const preview = compactPreview(context, 64);
 
-  return preview ? `${label}("${preview}")` : label;
+  // A context that is itself a dict/JSON repr (an older gateway's `str(arguments)`)
+  // reads as `Glob  {'pattern': ...}` otherwise.
+  const parsed = preview ? parseArgsText(context) : null;
+
+  if (parsed) {
+    return toolCallSummary(name, parsed);
+  }
+
+  return preview ? `${label}  ${preview}` : label;
+};
+
+/** `{"a": 1}` or `{'a': 1}` (a Python repr; strings only) back to an object, else null. */
+export const parseArgsText = (text: string): Record<string, unknown> | null => {
+  const body = text.trim();
+
+  if (!body.startsWith("{") || body.length > 4096) {
+    return null;
+  }
+
+  const candidates = [body];
+
+  if (body.includes("'")) {
+    // A Python repr quotes with '…'. Swap quote styles when the text holds no
+    // double quotes at all; a repr with both is left alone.
+    if (!body.includes('"')) {
+      candidates.push(
+        body
+          .replace(/'/g, '"')
+          .replace(/\bTrue\b/g, "true")
+          .replace(/\bFalse\b/g, "false")
+          .replace(/\bNone\b/g, "null"),
+      );
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const value: unknown = JSON.parse(candidate);
+
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+      }
+    } catch {
+      // not JSON; try the next shape
+    }
+  }
+
+  // A repr cut mid-way (an 80-char resume preview): keep the first key and
+  // as much of its string value as survived.
+  const head = body.match(/^\{\s*(['"])(\w+)\1\s*:\s*(['"])((?:(?!\3).)*)/);
+
+  return head ? { [head[2]!]: head[4]! } : null;
 };
 
 /** One row's worth of a bridged call: the gateway already phrased it, preview included. */
@@ -310,11 +524,15 @@ export const parseToolTrailResultLine = (line: string) => {
     return { call: body.slice(0, sep), detail: body.slice(sep + 4), mark };
   }
 
+  // `Label: note` is the older row shape. A phrased summary (`Bash  git
+  // commit -m "x: y"`) or a quoted preview can carry ": " inside its
+  // argument, so the split only applies when the head is a bare label.
   const legacy = body.indexOf(": ");
+  const head = legacy > 0 ? body.slice(0, legacy) : "";
 
-  if (legacy > 0) {
+  if (legacy > 0 && !head.includes("  ") && !head.includes("(")) {
     return {
-      call: body.slice(0, legacy),
+      call: head,
       detail: body.slice(legacy + 2),
       mark,
     };
@@ -338,6 +556,7 @@ export const sameToolTrailGroup = (label: string, entry: string) =>
   entry === `${label} ✓` ||
   entry === `${label} ✗` ||
   entry.startsWith(`${label}(`) ||
+  entry.startsWith(`${label}  `) ||
   entry.startsWith(`${label} ::`) ||
   entry.startsWith(`${label}:`);
 

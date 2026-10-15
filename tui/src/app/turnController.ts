@@ -57,7 +57,7 @@ function toolTrailLines(
 ): string[] {
   const heads = labels.length
     ? labels.map(formatToolLabel)
-    : [formatToolCall(name, done?.context || "")];
+    : [formatToolCall(name, done?.context || "", done?.args)];
   const verbose = Boolean(done?.verboseArgs || resultText);
 
   return heads.map((head, index) => {
@@ -216,6 +216,10 @@ class TurnController {
   sealedInterrupt: null | SealedInterrupt = null;
   lastStatusNote = "";
   persistedToolLabels = new Set<string>();
+  // Call ids tool.complete already recorded this turn. A gateway that
+  // re-sends the event (reconnect replay, a provider that reports the same
+  // result twice) would otherwise append the same finished row again.
+  private completedToolIds = new Set<string>();
   persistSpawnTree?: (
     subagents: SubagentProgress[],
     sessionId: null | string,
@@ -721,6 +725,7 @@ class TurnController {
     this.segmentMessages = [];
     this.turnTools = [];
     this.persistedToolLabels.clear();
+    this.completedToolIds.clear();
 
     // Real turn end: surface any notice held back while busy.
     this.flushPendingNotice();
@@ -856,6 +861,7 @@ class TurnController {
     this.clearReasoning();
     this.turnTools = [];
     this.persistedToolLabels.clear();
+    this.completedToolIds.clear();
     this.bufRef = "";
     this.interrupted = false;
     this.sealedInterrupt = null;
@@ -1007,7 +1013,14 @@ class TurnController {
       return;
     }
 
+    // The todo snapshot is state, not a trail row: a replayed event still
+    // carries the newest list, so apply it before the replay check.
     this.recordTodos(todos);
+
+    if (this.completedToolIds.has(toolId)) {
+      return;
+    }
+
     const lines = this.completeTool(
       toolId,
       fallbackName,
@@ -1030,7 +1043,7 @@ class TurnController {
     resultText?: string,
     labels?: ToolLabel[],
   ) {
-    if (this.interrupted) {
+    if (this.interrupted || this.completedToolIds.has(toolId)) {
       return;
     }
 
@@ -1072,6 +1085,10 @@ class TurnController {
 
     this.activeTools = this.activeTools.filter((tool) => tool.id !== toolId);
 
+    if (toolId) {
+      this.completedToolIds.add(toolId);
+    }
+
     const next = this.turnTools.filter(
       (item) => !sameToolTrailGroup(label, item),
     );
@@ -1099,8 +1116,15 @@ class TurnController {
     context: string,
     verboseArgs?: string,
     labels?: ToolLabel[],
+    args?: Record<string, unknown>,
   ) {
     if (this.interrupted) {
+      return;
+    }
+
+    // A gateway that re-sends tool.start for a call already in flight
+    // (reconnect replay) must not list the call twice.
+    if (this.activeTools.some((tool) => tool.id === toolId)) {
       return;
     }
 
@@ -1109,12 +1133,20 @@ class TurnController {
     this.pruneTransient();
     this.endReasoningPhase();
 
-    const sample = `${name} ${context}`.trim();
+    const sample = `${name} ${context || JSON.stringify(args ?? "")}`.trim();
 
     this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0;
     this.activeTools = [
       ...this.activeTools,
-      { context, id: toolId, labels, name, startedAt: Date.now(), verboseArgs },
+      {
+        args,
+        context,
+        id: toolId,
+        labels,
+        name,
+        startedAt: Date.now(),
+        verboseArgs,
+      },
     ];
 
     patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools });
@@ -1137,6 +1169,7 @@ class TurnController {
     this.turnTools = [];
     this.toolTokenAcc = 0;
     this.persistedToolLabels.clear();
+    this.completedToolIds.clear();
     // Session boundary: drop notice state so session A's sticky can't bleed
     // into session B (R3-H5). reset()/fullReset() CLEAR — they never flush.
     this.clearNoticeState();
@@ -1195,6 +1228,7 @@ class TurnController {
     this.interrupted = false;
     this.sealedInterrupt = null;
     this.persistedToolLabels.clear();
+    this.completedToolIds.clear();
     // "Flash and yield" notices clear when a new turn starts: a usage-band heads-up
     // (credits.usage, 50/75/90%) and the one-time "grant spent" transition
     // (credits.grant_spent) should show once, then get out of the way — not camp the

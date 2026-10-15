@@ -1304,6 +1304,7 @@ export function createGatewayEventHandler(
             ? stripAnsi(String(ev.payload.args_text))
             : undefined,
           ev.payload.labels ?? undefined,
+          ev.payload.args ?? undefined,
         );
 
         return;

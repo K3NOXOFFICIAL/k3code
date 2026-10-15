@@ -6,6 +6,8 @@ import type {
 } from "@k3code/shared/gateway-events";
 
 export interface ActiveTool {
+  /** The call's structured arguments (tool.start `args`); the summary row is built from them. */
+  args?: Record<string, unknown> | null;
   context?: string;
   id: string;
   labels?: ToolLabel[];

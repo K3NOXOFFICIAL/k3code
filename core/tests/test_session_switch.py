@@ -174,6 +174,33 @@ def test_transcript_rows_shape():
     ]
 
 
+def test_transcript_rows_carry_structured_args():
+    """A stored call's dict arguments reach the TUI as ``args``: the row is phrased from them, never from a
+    Python dict repr. OpenAI-shaped (JSON string) arguments are parsed the same way."""
+    rows = transcript_rows(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "name": "glob", "arguments": {"pattern": "**/k3code*", "path": "src"}},
+                    {"id": "c2", "type": "function", "function": {"name": "read", "arguments": '{"path": "a.py"}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "x"},
+            {"role": "tool", "tool_call_id": "c2", "content": "y"},
+        ]
+    )
+    assert rows[0] == {
+        "role": "tool",
+        "name": "glob",
+        "context": '{"pattern": "**/k3code*", "path": "src"}',
+        "args": {"pattern": "**/k3code*", "path": "src"},
+    }
+    assert rows[1] == {"role": "tool", "name": "read", "context": '{"path": "a.py"}', "args": {"path": "a.py"}}
+    assert "{'" not in rows[0]["context"]
+
+
 class _FlakyProvider(m1.TextProvider):
     """Plays the scripted replies; while ``fail`` is set every stream raises, so the turn ends with status "error"."""
 
