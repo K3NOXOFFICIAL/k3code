@@ -817,6 +817,8 @@ _WRAPPER_CHDIR_OPTS: dict[str, tuple[str, frozenset[str]]] = {
     "env": ("C", frozenset({"--chdir"})),
     "sudo": ("D", frozenset({"--chdir"})),
 }
+#: What ``xargs -i`` and ``--replace`` swap for each input item when they are given no string.
+_XARGS_REPLACE = "{}"
 #: git options before the subcommand that take a value (``git -C dir push`` is ``git push``).
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"})
 #: ssh client short options taking a value.
@@ -905,6 +907,7 @@ def _skip_wrapper_options(
     spec: tuple[str, frozenset[str], int],
     reads: list[str] | None = None,
     chdirs: list[str] | None = None,
+    replaces: list[str] | None = None,
 ) -> list[str]:
     """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
     none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
@@ -937,8 +940,14 @@ def _skip_wrapper_options(
                 reads.append(value)
             if key in chdir_long and value and chdirs is not None:
                 chdirs.append(value)
+            if name == "xargs" and replaces is not None and len(key) >= 5 and "--replace".startswith(key):
+                replaces.append(value or _XARGS_REPLACE)
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
+                if name == "xargs" and ch == "i":  # ``-i[STRING]``: the string is glued on, ``{}`` without one
+                    if replaces is not None:
+                        replaces.append(a[k + 1 :] or _XARGS_REPLACE)
+                    break
                 if ch in short_val:
                     value = a[k + 1 :]
                     if not value:
@@ -950,6 +959,8 @@ def _skip_wrapper_options(
                         reads.append(value)
                     if ch in chdir_short and value and chdirs is not None:
                         chdirs.append(value)
+                    if name == "xargs" and ch == "I" and value and replaces is not None:
+                        replaces.append(value)
                     break
         else:
             break
@@ -958,12 +969,18 @@ def _skip_wrapper_options(
     return args[i + positionals :]
 
 
-def normalize_argv(tokens: list[str], reads: list[str] | None = None, chdirs: list[str] | None = None) -> list[str]:
+def normalize_argv(
+    tokens: list[str],
+    reads: list[str] | None = None,
+    chdirs: list[str] | None = None,
+    replaces: list[str] | None = None,
+) -> list[str]:
     """The command that really runs: leading ``VAR=x`` assignments and wrappers (sudo, env, nice, timeout, xargs,
     ...) with their options dropped, ``eval`` arguments re-split, git's global options (``-C dir``, ``-c k=v``, ...)
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS);
-    ``chdirs`` the directories a dropped option runs the command in (``env -C DIR``, ``sudo -D DIR``, ``git -C DIR``).
+    ``chdirs`` the directories a dropped option runs the command in (``env -C DIR``, ``sudo -D DIR``, ``git -C DIR``),
+    ``replaces`` the strings ``xargs -I``/``-i``/``--replace`` swaps for its input in the command it runs.
     """
     argv = list(tokens)
     # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
@@ -987,7 +1004,7 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None, chdirs: li
         spec = _WRAPPER_SPECS.get(name)
         if spec is None:
             return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec, reads, chdirs)
+        rest = _skip_wrapper_options(name, argv[1:], spec, reads, chdirs, replaces)
         if not rest:
             return argv
         argv = rest

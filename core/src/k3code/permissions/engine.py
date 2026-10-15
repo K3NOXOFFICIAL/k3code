@@ -985,12 +985,14 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
     return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
-def _argv(sub: str, reads: list[str] | None = None, chdirs: list[str] | None = None) -> list[str]:
+def _argv(
+    sub: str, reads: list[str] | None = None, chdirs: list[str] | None = None, replaces: list[str] | None = None
+) -> list[str]:
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
-    runs the command in (``env -C DIR``, ``git -C DIR``)."""
+    runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
     words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs)
+    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs, replaces)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -1208,6 +1210,7 @@ class _Where:
 
     dirs: tuple[str, ...]
     unknown: bool = False
+    home_moved: bool = False  # ``HOME`` is assigned on the line: ``~`` and ``$HOME`` may not mean the daemon's home
 
 
 def _classify_arg(arg: str, where: _Where, home: str) -> str | None:
@@ -1220,7 +1223,13 @@ def _classify_arg(arg: str, where: _Where, home: str) -> str | None:
             worst = _worse(worst, _classify_word(word, cwd, home))
         if where.unknown and _relative_word(word) and _may_be_credential(word, home):
             worst = _worse(worst, "human")
+        if where.home_moved and (m := _HOME_PREFIX.match(word.strip("'\""))) and _may_be_credential(m.group(1), home):
+            worst = _worse(worst, "human")  # ``HOME=~/.ssh; cat ~/id_rsa``: a name in a home that is not the daemon's
     return worst
+
+
+#: ``~/NAME``, ``$HOME/NAME`` and ``${HOME}/NAME``: a path below the home directory.
+_HOME_PREFIX = re.compile(r"(?:~|\$HOME|\$\{HOME\})/+(.+)")
 
 
 def _relative_word(word: str) -> bool:
@@ -1440,31 +1449,75 @@ _RUNS_UNREAD_TEXT = frozenset({"source", ".", "alias", "trap"})
 #: returns to, ``cdable_vars`` (``cd x`` goes to the directory ``$x`` names).
 _CD_SETTINGS = ("DIRSTACK", "cdable_vars")
 _HOME_ASSIGNMENT = re.compile(r"^HOME\+?=")
+#: Commands whose ``-C DIR``/``--directory DIR`` runs them in DIR, and the short options of each that take a value.
+_DIR_OPTION_COMMANDS = {
+    "tar": "fCTXbHIgFVLNK",
+    "gtar": "fCTXbHIgFVLNK",
+    "bsdtar": "fCTXbHIgFVLNK",
+    "make": "CfIoWEL",
+    "gmake": "CfIoWEL",
+}
 
 
 @dataclass
 class _CdScan:
     """The directory changes on a command line: each ``cd``/``pushd`` as (name, arguments), and what makes the
     directories reachable unclear: ``CDPATH`` set (a relative ``cd`` may go elsewhere), or ``unknown`` (a command the
-    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS)."""
+    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS). ``home``: ``HOME`` is
+    assigned. ``links``: the line makes a symbolic link, which a later ``cd`` can pass through. ``replaces``: the
+    strings ``xargs -I`` fills with its input, which a ``cd`` operand must not hold."""
 
     found: list[tuple[str, list[str]]] = field(default_factory=list)
     cdpath: bool = False
     unknown: bool = False
+    home: bool = False
+    links: bool = False
+    replaces: list[str] = field(default_factory=list)
+
+
+def _dir_option_values(name: str, args: list[str]) -> list[str]:
+    """The directories ``tar -C DIR``, ``--directory DIR`` and ``make -C DIR`` run in (an old-style ``tar cf x -C DIR``
+    bundle and an abbreviated ``--dir`` included)."""
+    if name.endswith("tar") and args and not args[0].startswith("-"):
+        args = [f"-{args[0]}", *args[1:]]
+    spelled: list[str] = []
+    for a in args:
+        key, eq, value = a.partition("=")
+        long = a.startswith("--") and len(key) >= 5 and "--directory".startswith(key)  # getopt takes any prefix
+        spelled.append("--directory" + eq + value if long else a)
+    opts, _ = _options(spelled, _DIR_OPTION_COMMANDS[name], frozenset({"--directory"}))
+    return [value for opt, value in opts if opt in ("-C", "--directory") and value]
+
+
+def _makes_symlink(name: str, args: list[str]) -> bool:
+    """``ln -s``, ``cp -s`` (also ``--symbolic``/``--symbolic-link``, clustered or abbreviated)."""
+    if name not in ("ln", "cp"):
+        return False
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("--"):
+            if len(a) >= 4 and "--symbolic-link".startswith(a.partition("=")[0]):
+                return True
+        elif a.startswith("-") and "s" in a[1:]:
+            return True
+    return False
 
 
 def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
     """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
     included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
-    ``sudo -D`` or ``git -C`` runs its command in."""
+    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in."""
     scan = scan or _CdScan()
     for sub in parsed.subs:
         scan.cdpath = scan.cdpath or "CDPATH" in sub
         scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
         raw = hardline.tokens(sub)
-        scan.unknown = scan.unknown or any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        homed = any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        scan.home = scan.home or homed
+        scan.unknown = scan.unknown or homed
         chdirs: list[str] = []
-        argv = _argv(sub, None, chdirs)
+        argv = _argv(sub, None, chdirs, scan.replaces)
         scan.found += [("cd", [d]) for d in chdirs]
         while argv and (argv[0] in _SHELL_KEYWORDS or argv[0] == "function" or argv[0] in ("builtin", "command")):
             argv = argv[2:] if argv[0] == "function" else argv[1:]  # ``function NAME {``: the name is no command
@@ -1474,6 +1527,9 @@ def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdSca
             scan.unknown = True  # ``$c ~``, ``$(echo cd) ~``, ``. ./x.sh``, ``alias c='cd ~'``
         if argv[0] in _CD_BUILTINS:
             scan.found.append((argv[0], argv[1:]))
+        if argv[0] in _DIR_OPTION_COMMANDS:
+            scan.found += [("cd", [d]) for d in _dir_option_values(argv[0], argv[1:])]
+        scan.links = scan.links or _makes_symlink(argv[0], argv[1:])
     for child in parsed.children:
         _cd_commands(child, scan)
     return scan
@@ -1536,13 +1592,19 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
     scan = _cd_commands(parsed)
     cds, cdpath = scan.found, scan.cdpath
     dirs = list(start.dirs)
+    home_moved = start.home_moved or scan.home
     unknown = start.unknown or scan.unknown
+    # a link made on the line is not on disk yet when the line is judged, so a ``cd`` may go through it anywhere
+    unknown = unknown or (scan.links and any(_cd_operand(name, args) is not None for name, args in cds))
     passes_allowed = _CD_PASSES if _loops(parsed) else 1
     for passes in range(passes_allowed):
         grew = False
         for name, args in cds:
             operand = _cd_operand(name, args)
             if operand is None:
+                continue
+            if any(r in operand for r in scan.replaces):
+                unknown = True  # ``xargs -I{} sh -c 'cd {}'``: the directory is whatever the input names
                 continue
             targets = _cd_targets(operand, tuple(dirs), home, cdpath)
             if targets is None:
@@ -1553,12 +1615,12 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
                     dirs.append(d)
                     grew = True
             if len(dirs) > _CD_MAX_DIRS:
-                return _Where(tuple(dirs[:_CD_MAX_DIRS]), True)
+                return _Where(tuple(dirs[:_CD_MAX_DIRS]), True, home_moved)
         if not grew:
             break
         if passes_allowed > 1 and passes == passes_allowed - 1:
             unknown = True  # still reaching new directories after the last replay
-    return _Where(tuple(dirs), unknown)
+    return _Where(tuple(dirs), unknown, home_moved)
 
 
 def _sub_secret_access(sub: str, piped: bool, where: _Where, home: str) -> str | None:
