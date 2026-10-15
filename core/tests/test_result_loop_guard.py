@@ -90,6 +90,25 @@ def test_three_identical_failures_with_different_args_remind_once():
     assert g.observe_tool_result("db", {"n": 9}, "connection refused").verdict is Verdict.OK  # a new turn starts over
 
 
+def test_the_same_call_failing_twice_is_noted_at_once():
+    g = LoopGuard()
+    same = ("edit", {"path": "a.py", "old_string": "x"}, "Could not find a match", "edit a.py")
+    assert g.observe_tool_result(*same).verdict is Verdict.OK
+    out = g.observe_tool_result(*same)  # the very same call again: a blind retry
+    assert out.verdict is Verdict.NOTE and out.key == "same:edit:" + '{"old_string": "x", "path": "a.py"}'
+    assert "edit a.py failed 2 times in a row with the same arguments" in out.note
+    assert "Could not find a match" in out.note and "Do not send it again unchanged" in out.note
+    assert g.observe_tool_result(*same).verdict is Verdict.OK  # once per call per turn (the request guard takes over)
+    # a changed argument is not a blind retry; the same-failure reminder (the signature, 3+ in a row) still comes
+    out = g.observe_tool_result("edit", {"path": "a.py", "old_string": "y"}, "Could not find a match")
+    assert out.verdict is Verdict.NOTE and "failed the same way" in out.note
+    g.reset()
+    out = [g.observe_tool_result("db", {"n": 1}, "down") for _ in range(2)]
+    assert [o.verdict for o in out] == [Verdict.OK, Verdict.NOTE]
+    g.reset()
+    assert [g.observe_tool_result("db", {"n": i}, "down").verdict for i in range(2)] == [Verdict.OK] * 2
+
+
 def test_success_breaks_the_failure_run():
     g = LoopGuard()
     for i, failure in enumerate(["e", "e", None, "e", "e"]):
@@ -113,6 +132,15 @@ async def test_loop_injects_a_specific_reminder_after_three_identical_failures(t
     assert "The last 3 tool calls failed the same way" in note and "connection refused to" in note
     # sent with the next request, after the third result (WS4 turns it into a user-side reminder)
     assert any(m.role == "system" and m.content == note for m in provider.seen[3])
+
+
+@pytest.mark.asyncio
+async def test_loop_tells_the_model_to_change_approach_after_the_same_call_failed_twice(tmp_path):
+    loop, provider = _loop(tmp_path, [ToolCall(id=f"c{i}", name="db", arguments={"n": 7}) for i in range(2)])
+    await _drain(loop)
+    (note,) = _notes(loop.turn_messages)
+    assert "db failed 2 times in a row with the same arguments" in note and "connection refused" in note
+    assert any(m.role == "system" and m.content == note for m in provider.seen[2])  # with the next request
 
 
 @pytest.mark.asyncio

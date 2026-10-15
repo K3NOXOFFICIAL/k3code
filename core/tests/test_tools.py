@@ -223,8 +223,16 @@ async def test_bash_timeout_kill(temp_dir):
     # Sleep longer than timeout
     result = await tool_bash({"command": "sleep 10", "timeout": 0.1}, cwd=temp_dir)
     assert "error" in result
-    assert "timed out" in result["error"].lower()
+    assert "timed out" in result["error"].lower() and "printed nothing" in result["error"]
     assert result["exit_code"] == -1
+
+
+async def test_bash_timeout_reports_the_partial_output_and_the_timeout(temp_dir):
+    result = await tool_bash({"command": "echo start; echo oops >&2; sleep 10; echo end", "timeout": 0.3}, cwd=temp_dir)
+    assert result["stdout"] == "start\n" and result["stderr"] == "oops\n" and result["exit_code"] == -1
+    text = format_tool_result(result)
+    assert text.startswith("start\n[stderr]\noops\n[Command timed out after 0.3s and was killed; the output above")
+    assert "larger timeout (up to 600)" in text and "background: true" in text and text.endswith("[exit code -1]")
 
 
 async def test_grep_finds(temp_dir):

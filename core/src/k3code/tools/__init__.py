@@ -554,9 +554,11 @@ async def tool_bash(
             await asyncio.wait_for(asyncio.gather(*readers, proc.wait()), timeout=timeout)
         except TimeoutError:
             await _kill_group(proc)
+            had = out.total + err.total
+            shown = "the output above is what it printed before" if had else "it printed nothing before"
             return {
-                "error": f"Command timed out after {timeout:g}s; retry with timeout up to {BASH_MAX_TIMEOUT} "
-                "or background: true",
+                "error": f"Command timed out after {timeout:g}s and was killed; {shown}. Pass a larger timeout "
+                f"(up to {BASH_MAX_TIMEOUT}) if it only needs longer, or background: true for a server or watcher",
                 "stdout": out.text(),
                 "stderr": err.text(),
                 "exit_code": -1,

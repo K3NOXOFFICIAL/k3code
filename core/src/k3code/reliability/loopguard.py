@@ -3,8 +3,9 @@
 Triggers:
 - the same tool + normalized args called 3+ times in a row;
 - an identical assistant message (without tool calls) repeated 2+ times;
-- on results (a reminder only, once per pattern and turn): the same failure signature 3 tool calls in a row, whatever
-  their args, and ABABAB alternation of two calls (with their outcomes) over the last 6 calls.
+- on results (a reminder only, once per pattern and turn): the same call (tool and args) failing twice in a row, the
+  same failure signature 3 tool calls in a row, whatever their args, and ABABAB alternation of two calls (with their
+  outcomes) over the last 6 calls.
 
 Behavior on first trigger: inject a corrective system note telling the model
 what it is repeating and to try a different approach (once). On a second
@@ -34,6 +35,13 @@ CORRECTIVE_NOTE = (
 )
 
 FAILURE_REPEATS = 3  # the same failure signature N tool calls in a row (the args may differ)
+SAME_CALL_FAILURES = 2  # the very same call (tool and args) failing N times in a row
+
+SAME_CALL_NOTE = (
+    "[loop guard] {call} failed {n} times in a row with the same arguments. Error: {error}. "
+    "Do not send it again unchanged: fix what the error names (read the file again, correct the path, the "
+    "arguments or the command), take another approach, or ask the user."
+)
 ALTERNATION_WINDOW = 6  # ABABAB over the last N calls (call and outcome alike)
 
 SAME_FAILURE_NOTE = (
@@ -86,6 +94,7 @@ class LoopGuard:
     tool_repeats: int = TOOL_REPEATS
     text_repeats: int = TEXT_REPEATS
     failure_repeats: int = FAILURE_REPEATS
+    same_call_failures: int = SAME_CALL_FAILURES
 
     def __post_init__(self) -> None:
         self._last_tool_key: str | None = None
@@ -101,6 +110,8 @@ class LoopGuard:
         self._recent: deque[str] = deque(maxlen=ALTERNATION_WINDOW)  # call+outcome keys, newest last
         self._fail_key: str | None = None
         self._fail_run = 0
+        self._call_key: str | None = None  # the last failed call (tool and args) and how often in a row
+        self._call_run = 0
         self._result_notes: set[str] = set()  # result patterns already reminded about this turn
 
     def reset(self) -> None:
@@ -135,15 +146,32 @@ class LoopGuard:
         Requests alone miss loops whose calls differ: the same failing command with tweaked args, and ABAB
         alternation between two calls. ``call`` names the call in the reminder (``bash `npm test` ``).
         """
-        key = f"{tool}:{normalize_args(args)}->{failure or 'ok'}"
+        call_key = f"{tool}:{normalize_args(args)}"
+        key = f"{call_key}->{failure or 'ok'}"
         self._recent.append(key)
         if failure is None:
             self._fail_key, self._fail_run = None, 0
+            self._call_key, self._call_run = None, 0
         else:
+            self._call_run = self._call_run + 1 if call_key == self._call_key else 1
+            self._call_key = call_key
             fail_key = f"{tool}:{failure}"
             self._fail_run = self._fail_run + 1 if fail_key == self._fail_key else 1
             self._fail_key = fail_key
-            if self._fail_run >= self.failure_repeats and fail_key not in self._result_notes:
+            if self._call_run >= self.same_call_failures and call_key not in self._result_notes:
+                # the same call failed again: a blind retry (the request guard waits for a third one)
+                self._result_notes.add(call_key)
+                return GuardOutcome(
+                    Verdict.NOTE,
+                    note=SAME_CALL_NOTE.format(call=call or tool, n=self._call_run, error=failure),
+                    key=f"same:{call_key}",
+                )
+            # (a call already noted as a blind retry does not get the same-failure reminder on top)
+            if (
+                self._fail_run >= self.failure_repeats
+                and fail_key not in self._result_notes
+                and call_key not in self._result_notes
+            ):
                 self._result_notes.add(fail_key)
                 return GuardOutcome(
                     Verdict.NOTE,
