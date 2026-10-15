@@ -12,9 +12,13 @@ export const SECTION_NAMES = [
 // Out-of-the-box per-section defaults — applied when the user hasn't pinned
 // an explicit override and layered ABOVE the global details_mode:
 //
-//   - thinking / tools: expanded — stream open so the turn reads like a
-//     live transcript (reasoning + tool calls side by side) instead of a
-//     wall of chevrons the user has to click every turn.
+//   - thinking: collapsed — the `▸ thinking` panel opens by itself while
+//     reasoning streams and folds the moment the answer starts, so the
+//     reader sees the model think without the text staying in the way.
+//   - tools: collapsed — each call is a one-line summary (name, key
+//     argument, duration) under a `▸ N tool calls (Glob ×4, Read)` header;
+//     running and failed calls stay listed while collapsed. Expand with
+//     the chevron or `/details tools expanded`.
 //   - activity: hidden — ambient meta (gateway hints, terminal-parity
 //     nudges, background notifications) is noise for typical use.  Tool
 //     failures still render inline on the failing tool row, and ambient
@@ -26,8 +30,8 @@ export const SECTION_NAMES = [
 // Opt out of any of these with `display.sections.<name>` in config.yaml
 // or at runtime via `/details <name> collapsed|hidden`.
 const SECTION_DEFAULTS: SectionVisibility = {
-  thinking: "expanded",
-  tools: "expanded",
+  thinking: "collapsed",
+  tools: "collapsed",
   activity: "hidden",
 };
 
@@ -72,10 +76,10 @@ export const resolveSections = (raw: unknown): SectionVisibility =>
 //
 // The `commandOverride` flag is set for in-session `/details <mode>` changes.
 // That command should immediately apply to every section, including sections
-// with built-in defaults like thinking/tools=expanded and activity=hidden. On
+// with built-in defaults like thinking/tools=collapsed and activity=hidden. On
 // startup/config sync we keep those defaults layered above the persisted global
-// config so the TUI still opens live reasoning/tools by default unless the user
-// pins explicit per-section overrides.
+// config so the TUI still folds tool calls by default unless the user pins
+// explicit per-section overrides.
 export const sectionMode = (
   name: SectionName,
   global: DetailsMode,

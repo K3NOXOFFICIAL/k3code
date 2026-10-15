@@ -40,6 +40,8 @@ export const SKIN_COLOR_TOKENS = [
   // Element-specific (fall back to accent/muted when unset).
   "ui_tool",
   "ui_thinking",
+  "ui_user",
+  "ui_assistant",
   "diff_added",
   "diff_removed",
   "diff_added_word",

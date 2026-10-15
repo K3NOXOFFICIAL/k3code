@@ -30,6 +30,10 @@ export interface ThemeColors {
   tool: string;
   /** Reasoning/thinking body text. Defaults to `muted`. */
   thinking: string;
+  /** The user's own prompts: the `❯ you` header and the gutter bar. Defaults to `primary`. */
+  userAccent: string;
+  /** The assistant's final answer header (`● k3code`). Defaults to `accent`. */
+  assistantAccent: string;
 
   /** Code-block syntax highlight. Default to accent/text/border/muted. */
   syntaxString: string;
@@ -104,6 +108,8 @@ const ANSI_NORMALIZED_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
   "statusCritical",
   "shellDollar",
   "tool",
+  "userAccent",
+  "assistantAccent",
 ];
 
 const ANSI_MUTED_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
@@ -391,6 +397,8 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
     // parents (tool marker → accent, reasoning body → muted).
     tool: seeds.accent,
     thinking: muted,
+    userAccent: seeds.primary,
+    assistantAccent: seeds.accent,
 
     // Code-syntax tokens default to brand tokens (unchanged highlighting)
     // but are independently skinnable.
@@ -1038,6 +1046,9 @@ export function fromSkin(
     // just derived.muted, so recoloring muted carries the reasoning body with it.
     tool: c("ui_tool") ?? derived.tool,
     thinking: c("ui_thinking") ?? c("banner_dim") ?? derived.thinking,
+    userAccent: c("ui_user") ?? c("ui_primary") ?? derived.userAccent,
+    assistantAccent:
+      c("ui_assistant") ?? c("ui_accent") ?? derived.assistantAccent,
     diffAdded: c("diff_added") ?? derived.diffAdded,
     diffRemoved: c("diff_removed") ?? derived.diffRemoved,
     diffAddedWord: c("diff_added_word") ?? derived.diffAddedWord,

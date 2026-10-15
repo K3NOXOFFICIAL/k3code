@@ -33,6 +33,7 @@ const paint = (liveDetails: boolean) => {
       cols: 100,
       liveDetails,
       msg: { kind: "trail", role: "system", text: "", tools: trail },
+      sections: { tools: "expanded" },
       t: DEFAULT_THEME,
     }),
     {
@@ -59,7 +60,7 @@ describe("tool trail row cap in the live area", () => {
     expect(rendered).not.toContain(`marker${hidden - 1}x`);
     expect(rendered).not.toContain("marker0x");
     expect(rendered).toContain(`${hidden} earlier tool calls`);
-    expect(rendered).toContain(`Tool calls (${COUNT})`);
+    expect(rendered).toContain(`${COUNT} tool calls`);
   });
 
   it("keeps every row once the message is settled in the transcript", () => {

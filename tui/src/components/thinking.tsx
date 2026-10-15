@@ -775,7 +775,48 @@ interface Group {
   details: DetailRow[];
   key: string;
   label: string;
+  /** A collapsed tools panel still lists calls that are in flight or failed. */
+  failed?: boolean;
+  running?: boolean;
+  /** An in-flight call whose content carries its own spinner glyph. */
+  live?: boolean;
 }
+
+/** "Glob ×4, Read, Bash": the collapsed tools header's at-a-glance summary. */
+export const toolNamesSummary = (groups: readonly { label: string }[]) => {
+  const counts = new Map<string, number>();
+
+  for (const { label } of groups) {
+    // A bridged call's label starts with its emoji; a plain one with the name.
+    const bare = label.replace(/^[^\p{L}\p{N}]+/u, "");
+    const name = bare.split(/[(\s:]/, 1)[0] || bare || label;
+
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+
+  const parts = [...counts].map(([name, n]) =>
+    n > 1 ? `${name} ×${n}` : name,
+  );
+
+  return parts.length > 4
+    ? `${parts.slice(0, 4).join(", ")}, +${parts.length - 4}`
+    : parts.join(", ");
+};
+
+const STATUS_GLYPH = { done: "✓", failed: "✗", running: "●" } as const;
+
+// `Result:` / `Error:` blocks persisted by verboseToolTrailLine; the preview
+// row shows the first line of the result, the rest stays behind the row.
+const resultPreviewOf = (detail: string, max: number) => {
+  const body = detail.replace(
+    /^Args:\n[\s\S]*?(?=\n(?:Result|Error):\n|$)/,
+    "",
+  );
+  const marked = body.match(/^(?:Result|Error):\n([\s\S]*)$/);
+  const text = (marked ? marked[1]! : body).replace(/^\[[^\]\n]*\]\n/, "");
+
+  return compactPreview(text.split("\n", 1)[0] ?? "", max);
+};
 
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
@@ -855,8 +896,13 @@ export const ToolTrail = memo(function ToolTrail({
   // label. This only affects the initial mount value; the re-sync effect
   // below deliberately does NOT re-apply it, so a manual collapse still
   // sticks (see the no-OR-at-effect-time warning above, #14968).
+  // Under the `collapsed` auto mode a panel that mounts mid-stream opens at
+  // once (the effect below keeps it in step afterwards), so the first paint
+  // of a thinking turn is never a closed chevron.
   const [openThinking, setOpenThinking] = useState(
-    thinkingDefaultExpanded || reasoningAlwaysVisible,
+    thinkingDefaultExpanded ||
+      reasoningAlwaysVisible ||
+      (visible.thinking === "collapsed" && reasoningActive),
   );
   const [openTools, setOpenTools] = useState(visible.tools === "expanded");
   const [openSubagents, setOpenSubagents] = useState(
@@ -951,25 +997,46 @@ export const ToolTrail = memo(function ToolTrail({
   const pushDetail = (row: DetailRow) =>
     (groups.at(-1)?.details ?? meta).push(row);
 
+  // The same finished call can reach one trail twice (a live shelf flush
+  // and the turn's final segment, or a gateway that re-sends tool.complete
+  // on reconnect). An identical result line, duration included, is the same
+  // call: render it once.
+  const seenResults = new Set<string>();
+
   for (const [i, line] of trail.entries()) {
     const parsed = parseToolTrailResultLine(line);
 
     if (parsed) {
+      if (seenResults.has(line)) {
+        continue;
+      }
+
+      seenResults.add(line);
+
+      const failed = parsed.mark === "✗";
+
       groups.push({
-        color: parsed.mark === "✗" ? t.color.error : t.color.text,
+        color: failed ? t.color.error : t.color.muted,
         content: parsed.call,
         details: [],
+        failed,
         key: `tr-${i}`,
         label: parsed.call,
       });
 
       if (parsed.detail) {
-        pushDetail({
-          color: parsed.mark === "✗" ? t.color.error : t.color.muted,
-          content: parsed.detail,
-          dimColor: parsed.mark !== "✗",
-          key: `tr-${i}-d`,
-        });
+        // One dim preview row per call: the first line of the result (or
+        // the note). The full Args/Result bodies stay in the session store.
+        const preview = resultPreviewOf(parsed.detail, 96);
+
+        if (preview) {
+          pushDetail({
+            color: failed ? t.color.error : t.color.muted,
+            content: preview,
+            dimColor: !failed,
+            key: `tr-${i}-d`,
+          });
+        }
       }
 
       continue;
@@ -979,7 +1046,7 @@ export const ToolTrail = memo(function ToolTrail({
       const label = toolTrailLabel(line.slice(9).replace(/…$/, "").trim());
 
       groups.push({
-        color: t.color.text,
+        color: t.color.muted,
         content: label,
         details: [
           {
@@ -991,6 +1058,7 @@ export const ToolTrail = memo(function ToolTrail({
         ],
         key: `tr-${i}`,
         label,
+        running: true,
       });
 
       continue;
@@ -1025,22 +1093,30 @@ export const ToolTrail = memo(function ToolTrail({
     // A bridged call names its inner calls; anything else is still name + preview.
     const label = tool.labels?.length
       ? formatToolLabels(tool.labels)
-      : formatToolCall(tool.name, tool.context || "");
+      : formatToolCall(tool.name, tool.context || "", tool.args);
 
     groups.push({
       color: t.color.text,
       key: tool.id,
       label,
-      details: tool.verboseArgs
-        ? [
-            {
-              color: t.color.muted,
-              content: `Args:\n${boundedLiveRenderText(tool.verboseArgs)}`,
-              dimColor: true,
-              key: `${tool.id}-args`,
-            },
-          ]
-        : [],
+      running: true,
+      // The summary row already carries the arguments; a running call shows
+      // the raw args block only when the gateway sent one and the summary
+      // had nothing to work with.
+      details:
+        tool.verboseArgs && !tool.args
+          ? [
+              {
+                color: t.color.muted,
+                content: compactPreview(tool.verboseArgs, 96),
+                dimColor: true,
+                key: `${tool.id}-args`,
+              },
+            ]
+          : [],
+      // The spinner is this row's status glyph (toolGlyph adds none for a
+      // live row), so a running call reads `⠋ Bash  npm test (2.0s)`.
+      live: true,
       content: (
         <>
           <Spinner color={t.color.tool} variant="tool" /> {label}
@@ -1070,6 +1146,11 @@ export const ToolTrail = memo(function ToolTrail({
   // ── Derived ────────────────────────────────────────────────────
 
   const hasTools = groups.length > 0;
+  // Collapsed tools panel: the header carries the names; only calls that
+  // are still running or failed stay listed under it.
+  const shownGroups = openTools
+    ? groups
+    : groups.filter((g) => g.running || g.failed);
   const hasSubagents = subagents.length > 0;
   const hasMeta = meta.length > 0;
   const hasThinking = !!cot || reasoningActive || reasoningStreaming;
@@ -1103,19 +1184,39 @@ export const ToolTrail = memo(function ToolTrail({
     hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null;
 
   const toolLabel = (group: Group) => {
-    const { duration, label } = splitToolDuration(String(group.content));
+    if (typeof group.content !== "string") {
+      return group.content;
+    }
 
-    return duration ? (
+    const { duration, label } = splitToolDuration(group.content);
+
+    return (
       <>
-        {label}
-        <Text color={t.color.statusFg} dim>
-          {duration}
+        <Text
+          color={group.failed ? t.color.error : t.color.muted}
+          dim={!group.failed}
+        >
+          {label}
         </Text>
+        {duration ? (
+          <Text color={t.color.statusFg} dim>
+            {duration}
+          </Text>
+        ) : null}
       </>
-    ) : (
-      group.content
     );
   };
+
+  const toolGlyph = (group: Group) =>
+    group.live ? null : group.running ? (
+      <Text color={t.color.tool}>{STATUS_GLYPH.running} </Text>
+    ) : group.failed ? (
+      <Text color={t.color.error}>{STATUS_GLYPH.failed} </Text>
+    ) : (
+      <Text color={t.color.muted} dim>
+        {STATUS_GLYPH.done}{" "}
+      </Text>
+    );
 
   // ── Backstop: floating alerts when every panel is hidden ─────────
   //
@@ -1224,11 +1325,11 @@ export const ToolTrail = memo(function ToolTrail({
             <Text color={t.color.accent}>{openThinking ? "▾ " : "▸ "}</Text>
             {thinkingLive ? (
               <Text bold color={t.color.text}>
-                Thinking
+                thinking
               </Text>
             ) : (
               <Text color={t.color.muted} dim>
-                Thinking
+                thinking
               </Text>
             )}
             {thinkingTokensLabel ? (
@@ -1258,14 +1359,16 @@ export const ToolTrail = memo(function ToolTrail({
 
   if (hasTools && visible.tools !== "hidden") {
     const folded = capRows
-      ? Math.max(0, groups.length - LIVE_TOOL_ROWS_MAX)
+      ? Math.max(0, shownGroups.length - LIVE_TOOL_ROWS_MAX)
       : 0;
-    const shown = folded ? groups.slice(folded) : groups;
+    const shown = folded ? shownGroups.slice(folded) : shownGroups;
+    const n = groups.length;
+    const title = `${n} tool call${n === 1 ? "" : "s"}`;
+    const names = toolNamesSummary(groups);
 
     panels.push({
       header: (
         <Chevron
-          count={groups.length}
           onClick={(shift) => {
             if (shift) {
               expandAll();
@@ -1274,13 +1377,19 @@ export const ToolTrail = memo(function ToolTrail({
             }
           }}
           open={openTools}
-          suffix={toolTokensLabel}
+          suffix={
+            [openTools ? "" : names && `(${names})`, toolTokensLabel]
+              .filter(Boolean)
+              .join("  ") || undefined
+          }
           t={t}
-          title="Tool calls"
+          title={title}
         />
       ),
       key: "tools",
-      open: openTools,
+      // Collapsed still lists what is running or failed, so a long call is
+      // visibly alive and a failure is never hidden behind the chevron.
+      open: openTools || shown.length > 0,
       render: (rails) => (
         <Box flexDirection="column">
           {folded ? (
@@ -1310,7 +1419,7 @@ export const ToolTrail = memo(function ToolTrail({
                   color={group.color}
                   content={
                     <>
-                      <Text color={t.color.tool}>● </Text>
+                      {toolGlyph(group)}
                       {toolLabel(group)}
                       {isDelegateGroup ? (
                         <Text color={t.color.statusFg} dim>
@@ -1321,6 +1430,7 @@ export const ToolTrail = memo(function ToolTrail({
                   }
                   rails={rails}
                   t={t}
+                  wrap="truncate-end"
                 />
                 {group.details.map((detail, detailIndex) => (
                   <Detail

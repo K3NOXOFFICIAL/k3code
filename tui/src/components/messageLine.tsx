@@ -9,7 +9,7 @@ import { hasLeadGap } from "../domain/blockLayout.js";
 import { splitComposerHighlights } from "../domain/composerHighlights.js";
 import { sectionMode } from "../domain/details.js";
 import { userDisplay } from "../domain/messages.js";
-import { ROLE } from "../domain/roles.js";
+import { ROLE, roleHeader, userPromptSource } from "../domain/roles.js";
 import {
   transcriptBodyWidth,
   transcriptGutterWidth,
@@ -34,6 +34,19 @@ import { TodoPanel } from "./todoPanel.js";
 
 // Collapse threshold for long system messages (system prompt etc.)
 const SYSTEM_COLLAPSE_CHARS = 400;
+
+// The `┃` down the left of a user prompt, drawn as a border so it covers
+// every wrapped row (ROLE.user's glyph is the same bar).
+const USER_GUTTER_BAR = {
+  bottom: " ",
+  bottomLeft: " ",
+  bottomRight: " ",
+  left: "┃",
+  right: " ",
+  top: " ",
+  topLeft: " ",
+  topRight: " ",
+} as const;
 
 // `display.timestamps` label — same HH:MM shape the classic CLI's default
 // `display.timestamp_format` ("%H:%M") produces on its message labels, so
@@ -215,7 +228,11 @@ export const MessageLine = memo(function MessageLine({
     (toolsMode !== "hidden" && Boolean(msg.tools?.length)) ||
     (thinkingMode !== "hidden" && Boolean(thinking));
 
-  const showResponseSeparator = shouldShowResponseSeparator(msg, showDetails);
+  // Role header: `❯ you` above a prompt the person typed, `● k3code` above
+  // an answer with body text. Harness-written prompts (a goal kick, the
+  // max_tokens continuation) get a dim `goal` / `system` label instead.
+  const promptSource = msg.role === "user" ? userPromptSource(msg.text) : null;
+  const header = roleBlockHeader(msg, promptSource);
 
   const content = (() => {
     if (msg.kind === "slash") {
@@ -359,18 +376,39 @@ export const MessageLine = memo(function MessageLine({
         </Box>
       )}
 
-      {showResponseSeparator && (
-        <Box marginBottom={1}>
-          <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
-            <Text color={t.color.border}>└─ </Text>
+      {header === "role" && (
+        <Box>
+          <NoSelect flexShrink={0} fromLeftEdge>
+            <Text bold color={prefix}>
+              {roleHeader(msg.role, t)}
+            </Text>
           </NoSelect>
-          <Text color={t.color.muted} dim>
-            Response
-          </Text>
+          {stamp && (
+            <Text color={t.color.muted} dim>
+              {"  "}
+              {stamp}
+            </Text>
+          )}
         </Box>
       )}
 
-      {stamp && (
+      {header === "label" && (
+        <Box>
+          <NoSelect flexShrink={0} fromLeftEdge>
+            <Text color={t.color.muted} dim>
+              {promptSource}
+            </Text>
+          </NoSelect>
+          {stamp && (
+            <Text color={t.color.muted} dim>
+              {"  "}
+              {stamp}
+            </Text>
+          )}
+        </Box>
+      )}
+
+      {stamp && header === null && (
         <Box>
           <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
             <Text> </Text>
@@ -382,11 +420,25 @@ export const MessageLine = memo(function MessageLine({
       )}
 
       <Box>
-        <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
-          <Text bold={msg.role === "user"} color={prefix}>
-            {glyph}{" "}
-          </Text>
-        </NoSelect>
+        {msg.role === "user" ? (
+          // The bar is a left border so it runs down every row the prompt
+          // wraps to, and a multi-line prompt reads as one block.
+          <NoSelect
+            borderBottom={false}
+            borderColor={promptSource === "user" ? prefix : t.color.muted}
+            borderDimColor={promptSource !== "user"}
+            borderRight={false}
+            borderStyle={USER_GUTTER_BAR}
+            borderTop={false}
+            flexShrink={0}
+            fromLeftEdge
+            width={gutterWidth}
+          />
+        ) : (
+          <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
+            <Text color={prefix}>{glyph} </Text>
+          </NoSelect>
+        )}
 
         <Box
           width={transcriptBodyWidth(
@@ -403,10 +455,25 @@ export const MessageLine = memo(function MessageLine({
   );
 });
 
-export const shouldShowResponseSeparator = (
-  msg: Msg,
-  showDetails: boolean,
-): boolean => msg.role === "assistant" && showDetails && /\S/.test(msg.text);
+/**
+ * Which header a block gets: the `❯ you` / `● name` role header, a dim
+ * `goal` / `system` label for a harness-written prompt, or none (slash
+ * echoes, diff segments, blank assistant rows).
+ */
+export const roleBlockHeader = (
+  msg: Pick<Msg, "kind" | "role" | "text">,
+  promptSource: "goal" | "system" | "user" | null,
+): "label" | "role" | null => {
+  if (msg.kind) {
+    return null;
+  }
+
+  if (msg.role === "user") {
+    return promptSource === "user" ? "role" : "label";
+  }
+
+  return msg.role === "assistant" && /\S/.test(msg.text) ? "role" : null;
+};
 
 // A MoA reference block (msg.isMoaReference) is the user-facing
 // mixture-of-agents process the user opted into, not private model

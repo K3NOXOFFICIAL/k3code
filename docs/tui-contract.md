@@ -27,7 +27,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.create` | `{profile?, cwd?, model?, goal?, tools?, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | New chat session |
 | `session.list` | `{limit?, offset?, include_hidden?, cwd?}` | `{sessions: SessionListItem[]}` | ✅ | Session picker/history; `cwd` keeps that project's non-empty, non-automation sessions (limit applied after) |
 | `session.active_list` | `{current_session_id?}` | `{sessions: ActiveSession[]}` | ✅ | Agent strip / switcher; a live session's row carries `offline_protection` (false when its NetWatch failed to start: no offline pause/resume), `started_at` (when the stored session was created: age and sorting only) and `turn_started_at` (epoch s the turn in flight started, also while paused or waiting on an approval; `null` between turns): the "working N" time counts from `turn_started_at`, and a row without one shows no time |
-| `session.resume` | `{session_id, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | Resume stored session |
+| `session.resume` | `{session_id, compact?}` | `{session_id, info: SessionLiveInfo, messages: TranscriptRow[], message_count, running, status}` | ✅ | Resume stored session. A `TranscriptRow` is `{role, text?, name?, context?, args?, display_kind?, timestamp?}`; a `tool` row carries the call's `name`, its `args` (the stored arguments as a dict, when stored as one, or parsed from the JSON string) and `context` (the first 80 chars of the argument text, the fallback for a row without `args`). The TUI phrases the row from `args` (`Bash  pwd; ls`, `Read  src/x.py`, `Glob  **/*.ts  in src`) and never prints a dict repr |
 | `session.activate` | `{session_id}` | `{session_id, info: SessionLiveInfo}` | ✅ | Switch active session |
 | `session.delete` | `{session_id}` | `{deleted: boolean}` | ✅ | Delete session |
 | `session.title` | `{session_id, title}` | `{ok: boolean}` | | Auto-titling (server sends `session.title` event) |
@@ -169,8 +169,8 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `message.interim` | `{text, already_streamed}` | ✅ | Interim assistant text |
 | `message.complete` | `{text, usage, status, reasoning, warning, billing, error, ...}` | ✅ | Turn complete (`usage` as in `session.usage`) |
 | `status.update` | `{kind, text}` | ✅ | Status line |
-| `tool.start` | `{tool_id, name, context?, args?, args_text?, preview?, labels?}` | ✅ | Tool call start |
-| `tool.complete` | `{tool_id, name, args?, duration_s, result, summary, result_text, inline_diff?, todos?, revision?, labels?}` | ✅ | Tool call done |
+| `tool.start` | `{tool_id, name, context?, args?, args_text?, preview?, labels?}` | ✅ | Tool call start. `args` is the structured argument dict; the TUI builds the one-line call summary from it (key argument first: `command`, `path`, `pattern`, `url`), falling back to `context`. A replay of an id already in flight is ignored |
+| `tool.complete` | `{tool_id, name, args?, duration_s, result, summary, result_text, inline_diff?, todos?, revision?, labels?}` | ✅ | Tool call done. A replay of an id already completed this turn adds no second trail row (its `todos` snapshot is still applied) |
 | `tool.generating` | `{name}` | ✅ | Model emitting tool args |
 | `tool.output_risk` | `{tool_id, name, risk, findings[], redacted}` | | Risk classification |
 | `todo.updated` | `{todos[], revision}` | ✅ | Todo list |

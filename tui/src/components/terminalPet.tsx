@@ -1,4 +1,4 @@
-import { Box, Text } from "@k3code/ink";
+import { Box, NoSelect, Text } from "@k3code/ink";
 import { useStore } from "@nanostores/react";
 import { useEffect, useReducer, useRef, useState } from "react";
 
@@ -55,8 +55,12 @@ export function PetCorner({
     overlay.sudo,
   );
 
+  // The corner is its own column (TranscriptPane subtracts petColumnWidth
+  // from the transcript width, so transcript text never runs under it) and
+  // a NoSelect one, so a drag across the transcript never copies the art
+  // or its quip into the text.
   return (
-    <Box
+    <NoSelect
       flexDirection="row"
       flexShrink={0}
       justifyContent="flex-end"
@@ -79,7 +83,7 @@ export function PetCorner({
           />
         </Box>
       ))}
-    </Box>
+    </NoSelect>
   );
 }
 

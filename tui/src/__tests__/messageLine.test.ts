@@ -1,39 +1,54 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  shouldShowResponseSeparator,
+  roleBlockHeader,
   shouldShowThinkingTrail,
 } from "../components/messageLine.js";
+import { userPromptSource } from "../domain/roles.js";
 
-describe("shouldShowResponseSeparator", () => {
-  it("separates assistant response text from visible details", () => {
-    expect(
-      shouldShowResponseSeparator(
-        { role: "assistant", text: "final", thinking: "plan" },
-        true,
-      ),
-    ).toBe(true);
+describe("roleBlockHeader", () => {
+  it("gives an answer with body text the role header, a blank one none", () => {
+    expect(roleBlockHeader({ role: "assistant", text: "final" }, null)).toBe(
+      "role",
+    );
+    expect(roleBlockHeader({ role: "assistant", text: "   " }, null)).toBe(
+      null,
+    );
   });
 
-  it("does not add a response separator without details or body text", () => {
+  it("gives a typed prompt the role header and a harness prompt a label", () => {
+    expect(roleBlockHeader({ role: "user", text: "prompt" }, "user")).toBe(
+      "role",
+    );
     expect(
-      shouldShowResponseSeparator({ role: "assistant", text: "final" }, false),
-    ).toBe(false);
-    expect(
-      shouldShowResponseSeparator(
-        { role: "assistant", text: "   ", thinking: "plan" },
-        true,
-      ),
-    ).toBe(false);
+      roleBlockHeader({ role: "user", text: "[Standing goal]" }, "goal"),
+    ).toBe("label");
   });
 
-  it("does not add response separators to non-assistant transcript rows", () => {
+  it("leaves slash echoes, diffs and system notes without a header", () => {
     expect(
-      shouldShowResponseSeparator({ role: "user", text: "prompt" }, true),
-    ).toBe(false);
+      roleBlockHeader({ kind: "slash", role: "user", text: "/help" }, "user"),
+    ).toBe(null);
     expect(
-      shouldShowResponseSeparator({ role: "system", text: "note" }, true),
-    ).toBe(false);
+      roleBlockHeader({ kind: "diff", role: "assistant", text: "x" }, null),
+    ).toBe(null);
+    expect(roleBlockHeader({ role: "system", text: "note" }, null)).toBe(null);
+  });
+});
+
+describe("userPromptSource", () => {
+  it("tells goal kicks and continuations from the person's own words", () => {
+    expect(userPromptSource("[Standing goal]\nGoal: x")).toBe("goal");
+    expect(
+      userPromptSource("[Continuing toward your standing goal — 2/5]\nGoal: x"),
+    ).toBe("goal");
+    expect(
+      userPromptSource(
+        "Your previous answer was cut off at the output token limit. Continue.",
+      ),
+    ).toBe("system");
+    expect(userPromptSource("fix the transcript")).toBe("user");
+    expect(userPromptSource("[note] not a goal")).toBe("user");
   });
 });
 

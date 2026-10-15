@@ -141,7 +141,7 @@ describe("toTranscriptMessages", () => {
 });
 
 describe("MessageLine", () => {
-  it("preserves a separator after compound user prompt glyphs in transcript rows", () => {
+  it("keeps a compound brand prompt glyph in the user header, with the bar on the text row", () => {
     const stdout = new PassThrough();
     const stdin = new PassThrough();
     const stderr = new PassThrough();
@@ -176,11 +176,12 @@ describe("MessageLine", () => {
     instance.unmount();
     instance.cleanup();
 
-    const renderedLine = stripAnsi(output)
-      .split("\n")
-      .find((line) => line.includes("Okay"));
+    const lines = stripAnsi(output).split("\n");
+    const header = lines.find((line) => line.includes("you"));
+    const renderedLine = lines.find((line) => line.includes("Okay"));
 
-    expect(renderedLine).toContain("Ψ > Okay");
+    expect(header).toContain("Ψ > you");
+    expect(renderedLine).toMatch(/^┃\s+Okay/);
   });
 
   it("keeps historical thinking blocks collapsed by default", () => {
@@ -224,7 +225,7 @@ describe("MessageLine", () => {
     expect(rendered).not.toContain("step two");
   });
 
-  it("keeps live thinking blocks expanded while streaming", () => {
+  it("keeps live thinking blocks expanded while reasoning streams", () => {
     const stdout = new PassThrough();
     const stdin = new PassThrough();
     const stderr = new PassThrough();
@@ -247,6 +248,7 @@ describe("MessageLine", () => {
           text: "",
           thinking: "step one\nstep two",
         },
+        reasoningActive: true,
         t: DEFAULT_THEME,
       }),
       {
