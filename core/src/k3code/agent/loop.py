@@ -40,6 +40,11 @@ CUT_OFF_CALL = (
     "Your reply hit the output token limit before this call's arguments were complete, so it did not run. "
     "Re-send it; split large content (a long file, a big edit) into several smaller calls."
 )
+UNATTENDED_BWRAP_REFUSAL = "bubblewrap is unusable here: unattended bash is refused; see /doctor"
+#: Follows a refusal of unattended bash only when the cwd itself is the refused root (adding a dir never fixes that).
+PROJECT_ROOT_HINT = (
+    "Unattended work needs a project directory as its root: start it there; read, glob and grep still work here"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +537,9 @@ class AgentLoop:
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
             return {"error": f"Permission denied (unattended run): {decision.message}"}
+        # before the prompt too: approving bash the sandbox refuses runs nothing (the probe runs a subprocess)
+        if tool_call.name == "bash" and (refused := await asyncio.to_thread(self._unattended_refusal)) is not None:
+            return {"error": self._bash_refusal(refused)}
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
@@ -649,10 +657,7 @@ class AgentLoop:
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
-            result = {
-                "error": f"bash refused: {exc}. Unattended work needs a project directory as its root: start it "
-                "there (or add one with add_dirs); read, glob and grep still work here"
-            }
+            result = {"error": self._bash_refusal(exc)}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
@@ -804,6 +809,23 @@ class AgentLoop:
         except Exception:  # noqa: BLE001 - a notice must never break a turn
             logger.warning("unsandboxed notice failed", exc_info=True)
 
+    def _unattended_refusal(self) -> sandbox.SandboxRefused | None:
+        """What :meth:`_sandbox_argv` will raise for this session's bash (bwrap unusable, or a root the sandbox will
+        not bind writable), or None. Only unattended sessions are refused; an interactive one falls back or asks."""
+        if not (self.background or self.unattended):
+            return None
+        if not sandbox.usable():
+            return sandbox.SandboxUnavailable(UNATTENDED_BWRAP_REFUSAL)
+        why = sandbox.root_refusal(self.cwd, self.permissions.add_dirs)
+        return None if why is None else sandbox.SandboxRefused(why)
+
+    def _bash_refusal(self, exc: sandbox.SandboxRefused) -> str:
+        """The error for refused bash: the sandbox's reason, and the project-directory hint only when the refused root
+        is the cwd (not when bwrap is unusable or an added dir is refused: moving the session fixes neither)."""
+        if isinstance(exc, sandbox.SandboxUnavailable) or sandbox.root_refusal(self.cwd) is None:
+            return f"bash refused: {exc}"
+        return f"bash refused: {exc}. {PROJECT_ROOT_HINT}"
+
     def _can_contain(self) -> bool:
         """The bwrap sandbox can run a bash call here: bwrap is usable and it accepts the session's roots."""
         return sandbox.usable() and sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is None
@@ -827,7 +849,7 @@ class AgentLoop:
         unattended = self.background or self.unattended
         if not sandbox.usable():
             if unattended:
-                raise sandbox.SandboxUnavailable("bubblewrap is unusable here: unattended bash is refused; see /doctor")
+                raise sandbox.SandboxUnavailable(UNATTENDED_BWRAP_REFUSAL)
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
