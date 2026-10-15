@@ -233,6 +233,11 @@ def _no_host_secrets(monkeypatch):
 
     for name in [n for n in os.environ if _SECRET_NAME.search(n)]:
         monkeypatch.delenv(name)
+    # git's environment config is one set: GIT_CONFIG_COUNT=N and GIT_CONFIG_KEY_i/VALUE_i for i < N. The loop above
+    # drops the KEY_i variables (they match *_KEY*) and left COUNT, so every `git` a test ran failed with "missing
+    # config key GIT_CONFIG_KEY_0" on a host that sets them (a proxied cloud workspace does). Tests get none of it.
+    for name in [n for n in os.environ if n.startswith("GIT_CONFIG_") or n == "GIT_CONFIG_PARAMETERS"]:
+        monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
