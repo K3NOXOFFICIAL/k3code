@@ -69,32 +69,39 @@ def danger_hit(text: str) -> str:
 
 
 CLASSIFIER_SYSTEM = """\
-You classify a coding task by the amount of work it needs, before any work starts.
+You classify a coding task by the amount of work it needs, before any work starts. Never do the task, answer it or
+ask for files: size it from its words, without tools or code.
 Reply with ONE JSON object and nothing else (no prose, no code fence):
 {"scope": "trivial|small|medium|large|huge", "needs_plan": bool, "risk": "low|med|high",
  "parallelizable": bool, "suggested_subtasks": [str], "reason": str}
+Keep the reason under 15 words; list at most 5 short subtasks, none for trivial or small.
 
-Levels. Judge by the work the request literally implies, not by how important it sounds:
-- trivial: no design decisions. An answer-only question or explanation, or ONE located edit (a typo, a literal
-  value, a version/year/default, a rename on a named line). Under ~5 minutes, nothing to test.
-- small: ONE file or function. New or changed logic, a flag, a bug fix, a single unit test, a script. Tests for that
-  one change are included. Needs a little reading but no plan.
+Levels. Judge by the work the request literally implies, not by how important it sounds or how big the repo is:
+- trivial: no new or changed logic. An answer-only question or explanation, or ONE located edit of text or a literal
+  (a typo, a value such as a timeout or default, a version/year, a rename on a named line). Nothing to test.
+- small: ONE file or function with new or changed logic: a bug fix (even of one line), a new flag or option, a single
+  unit test, a script. Tests for that one change are included. Needs a little reading but no plan.
 - medium: a feature slice across roughly 2-8 files: e.g. handler + router + tests + docs, a shared module extracted
-  from a few callers, one package-wide mechanical change, UI component + styles + persistence.
+  from a few callers, a mechanical change across one package with no stated count, UI component + styles + storage.
 - large: a whole feature or one subsystem, roughly 9-60 files or several layers (DB schema, backend, UI, tests): new
-  auth/sync/plugin/i18n machinery, a mechanical change across a whole layer or a stated count of 10+ files, a
+  auth/sync/plugin/i18n machinery, a mechanical change across a whole layer or a stated count of 9+ files, a
   complete test suite for one subsystem.
 - huge: the entire repo or a whole product: build an application from scratch, change the language or framework of
   the whole codebase, rewrite into a different architecture, split into several deployables, a new engine.
 
 Rules:
-- Count scope words: "everywhere", "all", "every", "whole", "throughout" and stated file counts set the level by
-  the number of files they imply. A named single file, line or function keeps it at trivial/small.
+- A stated or implied file count beats every other cue, also for one repeated mechanical change: 1 file small, 2-8
+  medium, 9-60 large. Each named part (handler, router, docs, UI, config) is a file; N modules with their tests are 2N
+  files, but one file with its own tests stays small; "everywhere", "all", "every", "whole", "throughout" cover every
+  file of what they name. A named single file, line or function keeps it at trivial/small.
+- The Repo line describes the repository, not the task: a big repository never raises a level.
 - Tie-break between neighbours: choose the lower level if the request names one place and no extra wiring; choose the
   higher level if it also needs tests, docs, a migration, UI or several layers. Do not add a level out of caution.
-- Never pick huge for one subsystem, and never pick small for work that spans several packages.
-- If the likely actions delete data, migrate, deploy, touch credentials or force-push, set needs_plan=true and
-  risk=high. Set parallelizable=true only when the work splits into independent parts (usually large/huge).
+- huge needs the whole codebase or a whole new product: one feature or subsystem is large, however many parts it
+  lists. Never pick small for work that spans several packages.
+- Below medium, needs_plan=true only when the likely actions delete data, migrate, deploy, touch credentials or
+  force-push; at any level those set risk=high. Set parallelizable=true only when the work splits into independent
+  parts (usually large/huge).
 
 Recent context. The user message may end with a <recent_context> block: the last messages of the conversation, oldest
 first, tool output included, each cut short.
@@ -313,8 +320,14 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
 _RECENT_TAG_RE = re.compile(r"</?recent_context\s*>", re.IGNORECASE)
 
 
+#: Heads the user message. A provider that frames every call as an agent turn (claude-cli: "write the assistant's next
+#: turn") made the cheap model start the task instead ("let me look at server.py…", no JSON: the ``small`` fallback) on
+#: about one task in twelve, mostly questions and named-file fixes; the reminder sits next to the task it is about.
+CLASSIFY_LEAD = "Classify this task; do not do it or answer it. Reply with the JSON object only."
+
+
 def classifier_messages(prompt: str, summary: str, recent: str) -> list[Message]:
-    body = f"Task:\n{prompt}\n\nRepo: {summary}\n"
+    body = f"{CLASSIFY_LEAD}\n\nTask:\n{prompt}\n\nRepo: {summary}\n"
     if recent:
         # fenced, and the fence cannot be closed from inside: the block carries tool output the model did not write
         body += f"\n<recent_context>\n{_RECENT_TAG_RE.sub('', recent)}\n</recent_context>\n"

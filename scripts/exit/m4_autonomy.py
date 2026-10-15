@@ -134,7 +134,7 @@ def scope_set(name: str) -> list[str]:
     import datetime
     import hashlib
 
-    from k3code.autonomy.scope import CLASSIFIER_SYSTEM, SCOPES
+    from k3code.autonomy.scope import CLASSIFIER_SYSTEM, CLASSIFY_LEAD, SCOPES
 
     file, count = SCOPE_SETS[name]
     rows = [json.loads(x) for x in (HERE / file).read_text().splitlines() if x.strip()]
@@ -149,7 +149,8 @@ def scope_set(name: str) -> list[str]:
         "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
         "set": name,
         "backend": BACKEND["label"],
-        "prompt_sha": hashlib.sha256(CLASSIFIER_SYSTEM.encode()).hexdigest()[:12],
+        # the system prompt and the lead line of the user message: a change to either is a new prompt
+        "prompt_sha": hashlib.sha256(f"{CLASSIFIER_SYSTEM}\n{CLASSIFY_LEAD}".encode()).hexdigest()[:12],
         "agree": hit,
         **res,
     }
