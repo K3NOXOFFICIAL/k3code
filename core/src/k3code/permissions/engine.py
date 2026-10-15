@@ -13,6 +13,7 @@ import functools
 import glob
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1465,10 +1466,27 @@ _INEXACT = re.compile(r"[*?$`;&|<>\n]")
 
 def _rule_pattern_base(sub: str) -> str:
     """What a bash decision records for ``sub``: its arity prefix, or the exact command for the commands whose
-    arguments name what runs (hardline.WILDCARD_UNSAFE: ``uv run pytest``, ``docker run --rm alpine``)."""
+    arguments name what runs (hardline.WILDCARD_UNSAFE: ``uv run pytest``, ``docker run --rm alpine``).
+
+    The prefix drops flags but keeps their values (``git -C sub commit`` -> ``git sub``, ``git --no-pager log`` ->
+    ``git log``), so it is used only when the command starts with it as written; otherwise ``<prefix> *`` would never
+    match the approved command (it asked again every time) or would name another one, and the exact command is
+    recorded instead (#170)."""
     if hardline.wildcard_unsafe(sub):
         return sub
-    return hardline.command_prefix(sub) or sub
+    prefix = hardline.command_prefix(sub)
+    return prefix if prefix and _starts_with(sub, prefix) else sub
+
+
+def _starts_with(sub: str, prefix: str) -> bool:
+    """True when the words of ``sub`` (leading ``NAME=value`` assignments dropped) begin with exactly ``prefix``."""
+    try:
+        words = shlex.split(sub, posix=True)
+    except ValueError:
+        words = sub.split()
+    while words and "=" in words[0] and words[0].split("=", 1)[0].isidentifier():
+        words.pop(0)
+    return any(" ".join(words[:n]) == prefix for n in range(1, len(words) + 1))
 
 
 def exact_rule_pattern(command: str) -> str | None:
@@ -1489,7 +1507,9 @@ def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
         for p in dict.fromkeys(_drop_assignments(p) for p in dec.patterns):
             if not p or hardline.is_launcher(p):
                 continue
-            pattern = exact_rule_pattern(p) if hardline.wildcard_unsafe(p) else f"{p} *"
+            # a recorded pattern that is not its own arity prefix is an exact command (see _rule_pattern_base)
+            exact = hardline.wildcard_unsafe(p) or hardline.command_prefix(p) != p
+            pattern = exact_rule_pattern(p) if exact else f"{p} *"
             if pattern:
                 out.append(Rule(tool="bash", pattern=pattern, action="allow"))
         return out
