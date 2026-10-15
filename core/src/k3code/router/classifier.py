@@ -908,7 +908,16 @@ def _extract_message(error: BaseException, body: dict[str, Any]) -> str:
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def summarize(error: BaseException, limit: int = 160) -> str:
-    """One-line error summary for event logs. Never includes credentials."""
-    text = _WHITESPACE_RE.sub(" ", f"{type(error).__name__}: {error}").strip()
+def summarize(error: BaseException, limit: int = 500) -> str:
+    """One-line error summary for event logs. Never includes credentials.
+
+    The text goes through the secret scrubber before it is cut: a provider can echo the key, an ``Authorization``
+    header or a ``?key=`` URL back in its error body, and a credential cut in half no longer matches the patterns.
+    ``opaque=True`` also hides a bare 32+ character token (a key with no known prefix); a provider error has no git
+    SHA to keep. The default of 500 characters keeps the provider's explanation, which usually follows a long
+    preamble (status line, URL, request id): 160 cut most of them off (issue #163)."""
+    from k3code.redact import scrub_text, scrub_urls  # here: the vendored module stays free of k3code imports
+
+    text = scrub_text(scrub_urls(f"{type(error).__name__}: {error}"), opaque=True)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
