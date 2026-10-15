@@ -282,7 +282,7 @@ MUST_STOP: list[tuple[Call, str]] = [
     (write("../other-project/x.py"), "deny"),
     (write("/tmp/scratch.py"), "deny"),  # the write tool runs in the daemon, on the host's /tmp
     (read("../other-project/secrets.yaml"), "deny"),
-    (read("/home/someone-else/notes.txt"), "deny"),
+    (read("/home/someone/notes.txt"), "deny"),
     (read("/var/log/syslog"), "deny"),
     (read("/tmp/test-output.txt"), "deny"),  # the host's /tmp, not the sandbox's
     (glob("**/*", "~"), "deny"),

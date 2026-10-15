@@ -30,21 +30,33 @@ DANGER_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: A negation shortly before a danger word: "don't delete", "do not touch production", "without deleting", "no
-#: credentials involved" (the classifier's own reason often says so). The danger is then what the task rules out.
-_NEGATION_RE = re.compile(
-    r"\b(?:don'?t|do\s+not|never|without|no|not(?!\s+only)|nor|avoid(?:ing)?|must\s*n[o']t|shouldn'?t|won'?t|cannot|can'?t)"
-    r"(?:\W+\w+){0,2}\W+$",
+_NEGATION = (
+    r"(?:don'?t|do\s+not|does\s+not|doesn'?t|never|not(?!\s+only)|no|without|avoid(?:ing)?|must\s*n[o']t"
+    r"|shouldn'?t|won'?t|cannot|can'?t)"
+)
+#: A negation that governs an action word directly: "don't delete", "never force-push", "without deleting", "no
+#: migrations". Nothing may stand between them: "don't hesitate to delete", "don't just delete" and "no need to
+#: delete" keep the plan.
+_NEG_ACTION_RE = re.compile(rf"\b{_NEGATION}\s+$", re.IGNORECASE)
+#: A negation that governs a noun-like danger word, directly or through one verb and a determiner: "no credentials
+#: involved", "do not touch production", "don't commit any secrets".
+_NEG_NOUN_RE = re.compile(
+    rf"\b{_NEGATION}\s+(?:(?:touch|chang|modif|edit|us|commit|includ|expos|log|print|stor|leak|hardcod|need|requir"
+    r"|involv|read|show)\w*\s+)?(?:(?:the|any|a|an|real|our|your|its|their)\s+)?$",
     re.IGNORECASE,
 )
-#: Danger words that name a thing, not an action: in a documentation-only clause ("fix the typo in the deployment
-#: docs", "README section on secrets") they describe text, not something the task does to it. Action words (delete,
-#: rm -r, drop table, force-push, reset --hard, …) keep forcing a plan whatever the clause is about.
-_DANGER_NOUN_RE = re.compile(r"^(credential|secret|password|api|deploy|migrat|production)", re.IGNORECASE)
+#: Danger words that name a thing, not an action. Only these can be skipped in a clause about documentation ("fix the
+#: typo in the deployment docs", "README section on secrets"), where they describe text. Verbs (deploy, migrate,
+#: delete, force push, …) keep forcing a plan whatever else the clause mentions.
+_DANGER_NOUN_RE = re.compile(
+    r"^(?:credentials?|secrets?|passwords?|api[ _-]?keys?|production|deployments?)$", re.IGNORECASE
+)
 _DOCS_CLAUSE_RE = re.compile(
     r"\b(docs?|documentation|readme|guide|changelog|comments?|docstrings?|typos?|wording|spelling)\b", re.IGNORECASE
 )
-_CLAUSE_END_RE = re.compile(r"[.;!?\n]|\b(?:then|and\s+then|after\s+that)\b", re.IGNORECASE)
+#: Where a negation's or a docs mention's reach ends: punctuation, a dash, or a word that starts another action.
+#: "don't worry, just delete the prod db" and "deploy to production and update the changelog" keep their danger.
+_CLAUSE_END_RE = re.compile(r"[.;!?\n,:]|\s[-—–]\s|[—–]|\b(?:and|then|but|after\s+that)\b", re.IGNORECASE)
 
 
 def danger_hit(text: str) -> str:
@@ -52,17 +64,20 @@ def danger_hit(text: str) -> str:
 
     :data:`DANGER_RE` alone fired on "don't delete anything", "update the deployment docs" or "label the password
     field", forcing a high-risk plan (a strong-tier planner call and a slower start) on harmless tasks. A match is
-    skipped when a negation precedes it in its clause, or when it is a noun-like danger word in a clause about
-    documentation; everything else still counts, so a real deletion, migration or credential change keeps its plan."""
+    skipped only when a negation governs it directly (see :data:`_NEG_ACTION_RE`, :data:`_NEG_NOUN_RE`), or when it is a
+    noun-like danger word in a clause about documentation; a negation or a docs word never reaches past a comma, a
+    colon or an "and". Everything else still counts, so "don't worry, just delete the prod db" or "no backup needed:
+    drop table users" keep their plan."""
     for m in DANGER_RE.finditer(text):
         starts = [c.end() for c in _CLAUSE_END_RE.finditer(text, 0, m.start())]
         start = starts[-1] if starts else 0
         nxt = _CLAUSE_END_RE.search(text, m.end())
         before = text[start : m.start()]
         clause = text[start : nxt.start() if nxt else len(text)]
-        if _NEGATION_RE.search(before):
+        noun = bool(_DANGER_NOUN_RE.match(m.group(0)))
+        if (_NEG_NOUN_RE if noun else _NEG_ACTION_RE).search(before):
             continue
-        if _DANGER_NOUN_RE.match(m.group(0)) and _DOCS_CLAUSE_RE.search(clause):
+        if noun and _DOCS_CLAUSE_RE.search(clause):
             continue
         return m.group(0).lower()
     return ""
