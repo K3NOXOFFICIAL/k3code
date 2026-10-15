@@ -204,6 +204,36 @@ def test_danger_classes_force_plan_and_high_risk(prompt):
     assert v.needs_plan and v.risk == "high" and v.wants_plan
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "don't delete anything, just list the stale files",
+        "do not touch production, only fix the failing test",
+        "refactor the loader without deleting the old API",
+        "fix the typo in the deployment docs",
+        "update the README section on secrets",
+        "add a comment explaining the password check",
+    ],
+)
+def test_a_negated_or_documentation_only_danger_word_does_not_force_a_plan(prompt):
+    # these forced a high-risk plan (a strong-tier planner call before any work) on harmless tasks
+    v = apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt)
+    assert not v.needs_plan and v.risk == "low" and "danger" not in v.reason
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["delete the docs folder", "fix the tests. then deploy to staging", "not only delete the cache but rebuild it"],
+)
+def test_an_action_still_counts_next_to_docs_words_or_after_a_finished_clause(prompt):
+    assert apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt).risk == "high"
+
+
+def test_the_classifier_reason_saying_no_deletion_does_not_force_a_plan():
+    v = apply_floor(ScopeVerdict(scope="small", reason="no credentials involved, nothing deleted"), "rename a var")
+    assert not v.needs_plan and v.risk == "low"
+
+
 def test_danger_in_predicted_actions_counts():
     v = apply_floor(ScopeVerdict(scope="small", suggested_subtasks=["then drop table users"]), "tidy the schema")
     assert v.needs_plan and v.risk == "high"

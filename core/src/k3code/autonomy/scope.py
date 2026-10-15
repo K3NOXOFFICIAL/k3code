@@ -30,6 +30,44 @@ DANGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A negation shortly before a danger word: "don't delete", "do not touch production", "without deleting", "no
+#: credentials involved" (the classifier's own reason often says so). The danger is then what the task rules out.
+_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|never|without|no|not(?!\s+only)|nor|avoid(?:ing)?|must\s*n[o']t|shouldn'?t|won'?t|cannot|can'?t)"
+    r"(?:\W+\w+){0,2}\W+$",
+    re.IGNORECASE,
+)
+#: Danger words that name a thing, not an action: in a documentation-only clause ("fix the typo in the deployment
+#: docs", "README section on secrets") they describe text, not something the task does to it. Action words (delete,
+#: rm -r, drop table, force-push, reset --hard, …) keep forcing a plan whatever the clause is about.
+_DANGER_NOUN_RE = re.compile(r"^(credential|secret|password|api|deploy|migrat|production)", re.IGNORECASE)
+_DOCS_CLAUSE_RE = re.compile(
+    r"\b(docs?|documentation|readme|guide|changelog|comments?|docstrings?|typos?|wording|spelling)\b", re.IGNORECASE
+)
+_CLAUSE_END_RE = re.compile(r"[.;!?\n]|\b(?:then|and\s+then|after\s+that)\b", re.IGNORECASE)
+
+
+def danger_hit(text: str) -> str:
+    """The first danger word in ``text`` the task really implies (lowercased), or "" when there is none.
+
+    :data:`DANGER_RE` alone fired on "don't delete anything", "update the deployment docs" or "label the password
+    field", forcing a high-risk plan (a strong-tier planner call and a slower start) on harmless tasks. A match is
+    skipped when a negation precedes it in its clause, or when it is a noun-like danger word in a clause about
+    documentation; everything else still counts, so a real deletion, migration or credential change keeps its plan."""
+    for m in DANGER_RE.finditer(text):
+        starts = [c.end() for c in _CLAUSE_END_RE.finditer(text, 0, m.start())]
+        start = starts[-1] if starts else 0
+        nxt = _CLAUSE_END_RE.search(text, m.end())
+        before = text[start : m.start()]
+        clause = text[start : nxt.start() if nxt else len(text)]
+        if _NEGATION_RE.search(before):
+            continue
+        if _DANGER_NOUN_RE.match(m.group(0)) and _DOCS_CLAUSE_RE.search(clause):
+            continue
+        return m.group(0).lower()
+    return ""
+
+
 CLASSIFIER_SYSTEM = """\
 You classify a coding task by the amount of work it needs, before any work starts.
 Reply with ONE JSON object and nothing else (no prose, no code fence):
@@ -212,13 +250,14 @@ def fallback_verdict(why: str) -> ScopeVerdict:
 
 def apply_floor(verdict: ScopeVerdict, prompt: str) -> ScopeVerdict:
     """Safety floor: danger classes in the prompt or the predicted actions force a high-risk plan."""
-    haystack = " ".join([prompt, verdict.reason, *verdict.suggested_subtasks])
-    hit = DANGER_RE.search(haystack)
+    haystack = [prompt, verdict.reason, *verdict.suggested_subtasks]
+    # each part on its own: a clause never runs from the prompt into the classifier's reason
+    hit = next((h for part in haystack if (h := danger_hit(part))), "")
     if hit:
         verdict.needs_plan = True
         verdict.risk = "high"
-        if f"danger: {hit.group(0).lower()}" not in verdict.reason:
-            verdict.reason = (verdict.reason + f" [danger: {hit.group(0).lower()}]").strip()
+        if f"danger: {hit}" not in verdict.reason:
+            verdict.reason = (verdict.reason + f" [danger: {hit}]").strip()
     if verdict.scope in ("large", "huge"):
         verdict.fanout_candidate = True
     return verdict

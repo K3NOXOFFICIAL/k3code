@@ -24,6 +24,8 @@ UPDATE = "K3CODE_UPDATE_SNAPSHOTS"
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     proj = tmp_path / "proj"
     proj.mkdir()
+    # the prompt's "Session scope" names the working directory: under $HOME it reads `~/proj`, the same every run
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(proj)
     monkeypatch.delenv("K3CODE_PROJECT_DIR", raising=False)
     return proj

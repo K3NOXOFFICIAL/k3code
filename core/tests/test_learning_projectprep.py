@@ -109,3 +109,17 @@ async def test_a_bare_git_init_directory_is_scratch_too(tmp_path):
     store = ProposalStore(tmp_path / "home")
     assert await projectprep.prepare(bare, store=store) == []
     assert not projectstate.state_path(bare).exists() and store.all() == []
+
+
+@pytest.mark.parametrize("where", ["home", "above"])
+async def test_a_session_in_home_scans_nothing(tmp_path, monkeypatch, where):
+    # a session started in $HOME scanned the whole home on every start and proposed recipes for what it met there
+    home = tmp_path / "users" / "me"
+    make(home, {"package.json": json.dumps({"scripts": {"test": "jest"}}), "proj/go.mod": "module x"})
+    monkeypatch.setenv("HOME", str(home))
+    store = ProposalStore(tmp_path / "k3")
+    root = home if where == "home" else home.parent
+    assert await projectprep.prepare(root, store=store) == []
+    assert not projectstate.state_path(root).exists() and store.all() == []
+    # a project below home is still prepared
+    assert await projectprep.prepare(home / "proj", store=store)
