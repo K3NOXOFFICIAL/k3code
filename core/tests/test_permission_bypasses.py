@@ -120,6 +120,10 @@ HARDLINE_DENY: list[str] = [
     "builtin trap 'rm -rf ~' EXIT",
     "bash -c \"trap 'rm -rf ~' DEBUG; true\"",
     "echo hi; trap 'echo bye; rm -rf /' 0",
+    # a +word is never a trap option (bash, dash and ash run it as the action); zsh reads any first word but --
+    "trap '+:; rm -rf ~' EXIT",
+    "sh -c \"trap '+:; rm -rf ~' EXIT\"",
+    "trap '-x; rm -rf ~' EXIT",
 ]
 
 
@@ -286,6 +290,7 @@ SENSITIVE_DENY: list[str] = [
     'trap "head .env" ERR',
     "trap -- 'head .env' EXIT",
     "bash -c \"trap 'head .env' EXIT\"",
+    "trap '+:; head .env' EXIT",
     "echo $(head ~/.ssh/id_rsa)",
     # echo is only exempt while its text stays text
     "echo .env | xargs cat",
@@ -674,6 +679,7 @@ SUGGEST: list[tuple[str, list[str]]] = [
     ("API_KEY=sk-live-1 uvx ruff check", ["uvx ruff check"]),
     ("npx eslint src/*.ts", []),  # an exact rule cannot carry a wildcard
     ("node scripts/x.js", []),  # launchers are never proposed
+    ("trap 'echo done' EXIT", []),
     ("python -m pytest", []),
     ("npm test", ["npm test *"]),
     ("git commit -m x", ["git commit *"]),
@@ -733,6 +739,7 @@ LEARNED: list[tuple[str, bool]] = [
     ("pip install *", True),
     ("make *", True),
     ("git -c *", True),
+    ("trap *", True),
     ("uv run pytest", False),
     ("docker ps *", False),
     ("kubectl get *", False),

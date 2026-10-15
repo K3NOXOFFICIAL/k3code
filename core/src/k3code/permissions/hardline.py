@@ -250,6 +250,7 @@ LAUNCHERS = frozenset(
         "ksh",
         "fish",
         "eval",
+        "trap",
         "ssh",
         "xargs",
         "su",
@@ -1663,14 +1664,25 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
     return out, remote
 
 
-def _trap_action(args: list[str]) -> str:
-    """The action string of ``trap`` with arguments ``args``: shell that runs later (at exit, on a signal, on
-    ERR/DEBUG), so it is read like a ``bash -c`` payload. "" when there is none: ``trap -l``, ``trap -p``, a lone ``-``
-    (resets the traps) or an empty action (ignores the signals)."""
-    letters, operands = _builtin_options(args)
-    if set(letters) & set("lp") or not operands or operands[0] == "-":
-        return ""
-    return operands[0]
+def _trap_actions(args: list[str]) -> list[str]:
+    """The action strings of ``trap`` with arguments ``args``: shell that runs later (at exit, on a signal, on
+    ERR/DEBUG), so each is read like a ``bash -c`` payload. The shells disagree on what an option is: bash takes
+    ``-l``/``-p``/``-P`` and fails on any other ``-x``, dash and ash fail on any ``-x``, and a ``+x`` word is the action
+    in all three; zsh reads every first word but ``--`` as the action. Both readings are returned (reading one too
+    many is safe). Nothing for ``trap -l``/``-p`` in bash, a lone ``-`` (resets the traps) or an empty action."""
+    out: list[str] = []
+    i = 0
+    while i < len(args) and len(args[i]) > 1 and args[i].startswith("-") and args[i] != "--":
+        i += 1
+    letters = "".join(a[1:] for a in args[:i])
+    if i < len(args) and args[i] == "--":
+        i += 1
+    if not set(letters) & set("lp") and i < len(args):
+        out.append(args[i])
+    first = args[1:] if args[:1] == ["--"] else args
+    if first:
+        out.append(first[0])
+    return [a for a in dict.fromkeys(out) if a not in ("", "-")]
 
 
 def _launcher_payloads(sub: str) -> list[str]:
@@ -1691,8 +1703,8 @@ def _launcher_payloads(sub: str) -> list[str]:
         real = normalize_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
-        if real and real[0] == "trap" and (action := _trap_action(real[1:])):
-            out.append(action)
+        if real and real[0] == "trap":
+            out += _trap_actions(real[1:])
         if real:
             out += ssh_option_commands(real[0], real[1:])
             out += _windows_command_line(real[0], real[1:])
