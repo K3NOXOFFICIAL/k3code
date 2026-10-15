@@ -95,7 +95,7 @@ from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
-from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
+from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, shared_netwatch
 from k3code.reliability import events as rev
 from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
@@ -629,6 +629,11 @@ class GatewayServer:
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
+        #: One NetWatch for the whole daemon (#109): every session's reliability bundle shares it, so there is a single
+        #: monitor loop and a single nmcli poll instead of a pair per session. None when netwatch is off in the config.
+        #: Built on first use (``_shared_netwatch``); the bundles refcount it, so it polls only while a session is live.
+        self._netwatch: Any = None
+        self._netwatch_built = False
         self.mcp = McpManager(mcpjson.merged(self.config.mcp.servers, default_project_dir()))
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
@@ -1630,10 +1635,22 @@ class GatewayServer:
         assert self._tiers is not None
         return self._tiers
 
+    def _shared_netwatch(self) -> Any:
+        """The daemon's single NetWatch (#109), built once from the config. None when netwatch is off. Sessions'
+        bundles share it; it is refcounted, so its monitor and nmcli poll run only while a session holds it started."""
+        if not self._netwatch_built:
+            self._netwatch = shared_netwatch(self.config)
+            self._netwatch_built = True
+        return self._netwatch
+
     async def _reliability_for(self, session: LiveSession) -> Reliability:
-        """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
+        """One Reliability bundle per session, all sharing the daemon's single NetWatch (#109): one monitor loop and
+        one nmcli poll for the whole process; each session's bundle subscribes its own forwarder so events still reach
+        that session's clients, and the idle sweeper releases a session's reference."""
         if session.reliability is None:
-            rel = build_reliability(self.config, session=session.session_id, home=self._home())
+            rel = build_reliability(
+                self.config, session=session.session_id, home=self._home(), netwatch=self._shared_netwatch()
+            )
             rel.events.add(lambda e: self._on_reliability_event(session, e), key="gateway")
             session.reliability = rel
         assert self.router is not None
@@ -2100,6 +2117,9 @@ class GatewayServer:
             session, call, result, failure, **kw
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
+        # MCP tools mcp_tool_search activated stay advertised in every later loop of the session (each turn, each
+        # tier), at the end of the tools array in activation order: the provider's cached prefix survives (#168)
+        loop.tools.keep_activated_in(session.stored.meta)
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
             install(loop.tools)

@@ -29,12 +29,26 @@ from k3code.tools.jobs import MAX_UNREAD_BYTES
 
 
 class ToolRegistry:
-    """Registry of available tools with JSON-schema specs."""
+    """Registry of available tools with JSON-schema specs.
+
+    :meth:`specs` is the tools array of every model request, and providers cache the request from its first byte (the
+    system prompt, then the tools array): it must only ever grow at its end. So the always-advertised tools come first,
+    in registration order, and deferred tools (MCP) that ``mcp_tool_search`` activated follow, in activation order. An
+    activated tool listed at its registration position landed mid-array (after ``skill``, before ``mcp_tool_search``
+    and the task and web tools) and invalidated the cached prefix of every later request (#168).
+
+    The activation order lives in ``state`` (see :meth:`keep_activated_in`): the session's persisted meta in the
+    gateway, so the next turn's loop, or a higher tier's after an escalation, starts with the same tools in the same
+    order instead of losing them (and the cache) and searching again.
+    """
+
+    #: The key of ``state`` that holds the activated deferred tools' names, in activation order.
+    ACTIVATED_KEY = "mcp_activated"
 
     def __init__(self) -> None:
         self._tools: dict[str, tuple[ToolSpec, callable]] = {}
         self._deferred: set[str] = set()  # registered + callable, but schema hidden until activated
-        self._active: set[str] = set()
+        self._state: dict[str, Any] = {}  # where the activation order lives (see keep_activated_in)
 
     def register(self, spec: ToolSpec, handler: callable, *, deferred: bool = False) -> None:
         self._tools[spec.name] = (spec, handler)
@@ -43,15 +57,34 @@ class ToolRegistry:
         else:
             self._deferred.discard(spec.name)
 
+    def keep_activated_in(self, state: dict[str, Any]) -> None:
+        """Keep the activation order in ``state`` (the session's meta), from now on and including what was activated
+        here before: every registry built on the same ``state`` advertises the same activated tools, in one order."""
+        earlier = self.activated()
+        self._state = state
+        self.activate(earlier)
+
+    def activated(self) -> list[str]:
+        """Names activated so far, in activation order (a malformed stored value counts as none)."""
+        raw = self._state.get(self.ACTIVATED_KEY)
+        return [n for n in raw if isinstance(n, str)] if isinstance(raw, list) else []
+
     def activate(self, names: list[str]) -> None:
-        """Start advertising the schemas of deferred tools (``mcp_tool_search``)."""
-        self._active.update(n for n in names if n in self._deferred)
+        """Start advertising the schemas of deferred tools (``mcp_tool_search``): appended after every tool already
+        advertised, so the tools array of the requests before stays its prefix."""
+        order = self.activated()
+        new = [n for n in dict.fromkeys(names) if n in self._deferred and n not in order]
+        if new:
+            self._state[self.ACTIVATED_KEY] = [*order, *new]
 
     def get(self, name: str) -> tuple[ToolSpec, callable] | None:
         return self._tools.get(name)
 
     def specs(self) -> list[ToolSpec]:
-        return [spec for n, (spec, _) in self._tools.items() if n not in self._deferred or n in self._active]
+        """Always-advertised tools in registration order, then the activated deferred ones in activation order (a
+        name activated in an earlier loop whose MCP server has gone since is skipped)."""
+        plain = [spec for n, (spec, _) in self._tools.items() if n not in self._deferred]
+        return plain + [self._tools[n][0] for n in self.activated() if n in self._deferred and n in self._tools]
 
     def names(self) -> list[str]:
         return list(self._tools.keys())

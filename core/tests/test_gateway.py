@@ -648,6 +648,37 @@ async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_
     await srv.close()
 
 
+async def test_every_session_shares_one_netwatch_refcounted(tmp_path, monkeypatch):
+    """#109: the daemon ran one NetWatch per session (a monitor loop + an nmcli poll each). Now there is a single
+    shared instance; sessions acquire/release it, so it polls once per interval and only while a session holds it."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "text", "text": "ok"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        store=SessionStore(tmp_path / "s.db"),
+    )
+    srv._write = lambda s: None
+    proj = tmp_path / "proj"
+    proj.mkdir(exist_ok=True)
+    a = srv.live_for(srv.store.create(title="a", model="default", cwd=str(proj)))
+    b = srv.live_for(srv.store.create(title="b", model="default", cwd=str(proj)))
+    await srv._run_turn(a, "hi")
+    await srv._run_turn(b, "hi")
+    nw = srv._shared_netwatch()
+    assert nw is not None
+    assert a.reliability.netwatch is nw and b.reliability.netwatch is nw  # one instance, not one per session
+    assert len(nw._tasks) == 2 and nw.refcount == 2  # two holders, still a single monitor + nmcli pair
+    # one session going idle releases its reference; the loops keep running for the other
+    assert await srv.sweep_idle_reliability(now=a.idle_since + srv.IDLE_RELIABILITY_S + 1) == 2  # both idle
+    assert nw.refcount == 0 and not nw._running  # last holder gone: the single instance stopped
+    await srv.close()
+
+
 async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path, monkeypatch):
     """Sessions on different model keys (a cron job with model: next to an interactive one) rebuilt providers, the
     cooldown store and every tier router on each alternating turn, closing none of the old ones."""

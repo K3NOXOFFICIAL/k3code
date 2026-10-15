@@ -292,6 +292,9 @@ class NetWatch:
         self._last_nm_verdict: str = "unknown"
         self._wakeup: asyncio.Event | None = None  # kicks the monitor loop
         self._nm_wakeup: asyncio.Event | None = None  # the NM poll loop's own (stop only): a shared one lost kicks
+        #: Reference count for the shared-per-process instance (#109): :meth:`acquire` starts it on the first holder,
+        #: :meth:`release` stops it after the last one leaves. One monitor loop and one nmcli poll serve every session.
+        self._refs = 0
 
     # ── public API ──
 
@@ -300,7 +303,11 @@ class NetWatch:
         return self._state
 
     def add_provider(self, name: str, base_url: str) -> None:
-        self._providers[name] = ProviderProbeState(name=name, base_url=base_url.rstrip("/"))
+        base_url = base_url.rstrip("/")
+        prev = self._providers.get(name)
+        if prev is not None and prev.base_url == base_url:
+            return  # same endpoint already registered (every session registers its chain): keep its probe state
+        self._providers[name] = ProviderProbeState(name=name, base_url=base_url)
         self._kick()  # re-probe promptly with the new provider
 
     def remove_provider(self, name: str) -> None:
@@ -320,6 +327,31 @@ class NetWatch:
     def subscribe(self, callback: Callable[[NetState, NetState], Any]) -> None:
         """Subscribe to (old_state, new_state) changes."""
         self._callbacks.append(callback)
+
+    def unsubscribe(self, callback: Callable[[NetState, NetState], Any]) -> None:
+        """Drop a subscription added with :meth:`subscribe` (a session leaving the shared instance). Silent if absent;
+        removes the first matching entry so an accidental double-subscribe still leaves one."""
+        with contextlib.suppress(ValueError):
+            self._callbacks.remove(callback)
+
+    async def acquire(self) -> None:
+        """Add a reference to this shared instance and start it on the first one (#109: one monitor per process)."""
+        self._refs += 1
+        if self._refs == 1:
+            await self.start()
+
+    async def release(self) -> None:
+        """Drop a reference; stop the instance once the last holder leaves. A release without a matching acquire (the
+        count already 0) is a no-op, so an idle sweep that releases twice never drives it negative or stops it early."""
+        if self._refs == 0:
+            return
+        self._refs -= 1
+        if self._refs == 0:
+            await self.stop()
+
+    @property
+    def refcount(self) -> int:
+        return self._refs
 
     def next_interval(self) -> float:
         return self._interval

@@ -374,9 +374,39 @@ async def test_start_stop_lifecycle():
     await nw.stop()
 
 
+async def test_acquire_release_refcounts_the_shared_instance():
+    """#109: the gateway shares one NetWatch; acquire() starts it on the first holder and release() stops it after the
+    last one leaves, so the monitor and nmcli loops run only while a session has it."""
+    nw = _watch()
+    await nw.acquire()
+    assert nw.refcount == 1 and nw._running and len(nw._tasks) == 2
+    await nw.acquire()  # a second session: no new tasks
+    assert nw.refcount == 2 and len(nw._tasks) == 2
+    await nw.release()
+    assert nw.refcount == 1 and nw._running  # still held by the first
+    await nw.release()
+    assert nw.refcount == 0 and not nw._running and nw._tasks == []
+    await nw.release()  # a release past zero (a double idle-sweep) does not go negative or restart anything
+    assert nw.refcount == 0 and not nw._running
+
+
+async def test_a_duplicate_provider_registration_is_deduped():
+    """Every session registers its whole chain; the same name+url must not reset the probe state or multiply work."""
+    nw = _watch()
+    nw.add_provider("p", "https://api.example.com/v1")
+    first = nw._providers["p"]
+    first.consecutive_fails = 2  # pretend a probe already ran
+    nw.add_provider("p", "https://api.example.com/v1/")  # same endpoint (trailing slash): keep the existing state
+    assert nw._providers["p"] is first and nw._providers["p"].consecutive_fails == 2
+    nw.add_provider("p", "https://other.example.com/v1")  # a real change replaces it
+    assert nw._providers["p"] is not first
+
+
 async def test_rearming_a_bundle_subscribes_the_net_state_forwarder_once():
     """start() ran _forward_net_states() again after every stop(): each idle-sweep re-arm stacked one more
-    subscriber, so one connectivity change was delivered N times to the session's clients."""
+    subscriber, so one connectivity change was delivered N times to the session's clients. Now stop() also
+    unsubscribes (a session leaving a shared NetWatch), so after many start/stop cycles a started bundle has exactly
+    one forwarder and a stopped one has none."""
     from k3code.reliability import Reliability
     from k3code.reliability import events as ev
 
@@ -387,6 +417,11 @@ async def test_rearming_a_bundle_subscribes_the_net_state_forwarder_once():
     for _ in range(10):
         await rel.start()
         await rel.stop()
+    await rel.start()  # a connectivity change while started reaches the session's clients exactly once
+    for cb in list(rel.netwatch._callbacks):
+        cb(NetState.ONLINE, NetState.OFFLINE)
+    assert len(delivered) == 1
+    await rel.stop()  # stopped: the forwarder is gone, so a change no longer reaches a session that left
     for cb in list(rel.netwatch._callbacks):
         cb(NetState.ONLINE, NetState.OFFLINE)
     assert len(delivered) == 1

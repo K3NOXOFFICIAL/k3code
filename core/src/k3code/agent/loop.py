@@ -630,7 +630,20 @@ class AgentLoop:
                     argv = await asyncio.to_thread(self._contained_argv)
                 else:
                     argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
-                result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+                # #101: with sandbox.git_writable the .git root stays writable for git's lock files, so a command can
+                # plant a commondir / worktree admin dir / config.worktree code key that the next harness git (outside
+                # the sandbox) would run. Snapshot the git metadata before, undo only what the command added after.
+                guard = (
+                    await asyncio.to_thread(sandbox.snapshot_git_writable, self.cwd, self.permissions.add_dirs)
+                    if argv is not None and sandbox.configured_git_writable()
+                    else None
+                )
+                try:
+                    result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+                finally:
+                    if guard is not None:
+                        for note in await asyncio.to_thread(sandbox.scrub_git_writable_changes, guard):
+                            logger.warning("sandbox: %s", note)
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
