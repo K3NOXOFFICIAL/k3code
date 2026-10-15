@@ -3858,6 +3858,9 @@ async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[
             "goal": h.description,
             "model": h.model or h.tier,
             "started_at": h.started_wall,
+            # how long a finished child ran (None while it runs): the TUI's strip drops a finished child a minute
+            # after its end, and without this one known only from this list never left it and kept repainting
+            "duration_seconds": h.finished_at - h.started_at if h.done and h.finished_at else None,
             "status": h.status,
             "tool_count": h.tool_count,
             "last_tool": h.last_tool,

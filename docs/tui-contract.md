@@ -68,7 +68,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session with no active loop or automation bound to it (its stored row stays); a session with messages, work or a bound automation is left alone with `{closed: false, reason}`, not an error |
 | `delegation.status` | `{}` | `{active[], paused, max_depth, max_concurrent}` | Sub-agent panel |
 | `delegation.pause` | `{paused}` | `{paused: boolean}` | Pause delegation |
-| `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel |
+| `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel; a finished child's row carries `duration_seconds` (`null` while it runs), which the agent strip uses to drop it a minute after its end |
 | `subagent.steer` | `{session_id, subagent_id, text}` | `{steered: boolean}` | Steer sub-agent |
 | `subagent.tail` | `{session_id, subagent_id}` | `{text}` | View sub-agent output |
 | `subagent.interrupt` | `{session_id, subagent_id}` | `{interrupted: boolean}` | Interrupt sub-agent |
