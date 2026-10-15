@@ -716,6 +716,7 @@ class TurnEvidence:
         for path, pos in self.edited.items():
             out.note_edit(rel(path), pos)
         out.errors = {(tool, rel(path)): v for (tool, path), v in self.errors.items()}
+        return out
 
     def last_status(self) -> str | None:
         """The turn's last test/check as one word: ``passed``, ``failed`` (a non-zero exit, or the call itself
