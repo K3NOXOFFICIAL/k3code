@@ -630,21 +630,30 @@ class AgentLoop:
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
             if tool_call.name == "bash":
+                # A background job outlives this call: the handler returns as soon as the job has started, so the
+                # git_writable scrub below would run before the job writes anything and miss what it plants in .git
+                # later. Its sandbox therefore binds the git metadata read-only whatever sandbox.git_writable says
+                # (False here, None = the user's setting); a commit or a branch is a foreground command.
+                background = bool(args.get("background"))
+                git_writable = False if background else None
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
                 if readonly_home:
                     argv = await asyncio.to_thread(
                         sandbox.build_argv, self.cwd, self.permissions.add_dirs, readonly_home=True
                     )
                 elif contained:
-                    argv = await asyncio.to_thread(self._contained_argv)
+                    argv = await asyncio.to_thread(self._contained_argv, git_writable=git_writable)
                 else:
-                    argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
+                    argv = (
+                        None if home_rooted else await asyncio.to_thread(self._sandbox_argv, git_writable=git_writable)
+                    )
                 # #101: with sandbox.git_writable the .git root stays writable for git's lock files, so a command can
                 # plant a commondir / worktree admin dir / config.worktree code key that the next harness git (outside
                 # the sandbox) would run. Snapshot the git metadata before, undo only what the command added after.
+                # (A background job has no writable .git to scrub: see above.)
                 guard = (
                     await asyncio.to_thread(sandbox.snapshot_git_writable, self.cwd, self.permissions.add_dirs)
-                    if argv is not None and sandbox.configured_git_writable()
+                    if argv is not None and not background and sandbox.configured_git_writable()
                     else None
                 )
                 try:
@@ -831,19 +840,20 @@ class AgentLoop:
         """The bwrap sandbox can run a bash call here: bwrap is usable and it accepts the session's roots."""
         return sandbox.usable() and sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is None
 
-    def _contained_argv(self) -> list[str]:
-        """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode."""
+    def _contained_argv(self, git_writable: bool | None = None) -> list[str]:
+        """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode.
+        ``git_writable``: as :func:`sandbox.build_argv` (None = the user's ``sandbox.git_writable``)."""
         unattended = self.background or self.unattended
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
 
-    def _sandbox_argv(self) -> list[str] | None:
+    def _sandbox_argv(self, git_writable: bool | None = None) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
 
         None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once; the session is told
         and auto mode asks first, see _bwrap_unusable). An unattended session (background, goal continuation,
         sub-agent) has no human to see a warning, so it raises :class:`sandbox.SandboxUnavailable` instead: fail
-        closed, nothing runs.
+        closed, nothing runs. ``git_writable``: as :func:`sandbox.build_argv` (None = the user's setting).
         """
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
@@ -856,7 +866,7 @@ class AgentLoop:
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
             return None
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
 
     # ── M2 reliability helpers ──
 

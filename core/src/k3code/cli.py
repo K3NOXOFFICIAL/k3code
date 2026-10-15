@@ -887,11 +887,27 @@ _TUI_WAITER = (
 )
 
 
-def _exec_tui(argv: list[str], env: dict[str, str]) -> NoReturn:
-    """Replace this process with the TUI's waiter (:data:`_TUI_WAITER`) running ``argv``."""
+#: The shell the waiter runs in, by absolute path (see :func:`_waiter_shell`).
+_WAITER_SH = "/bin/sh"
+
+
+def _waiter_shell(path: str | None) -> str:
+    """The ``sh`` for the TUI's waiter: :data:`_WAITER_SH`, or where it does not exist the first ``sh`` in an absolute
+    entry of ``path`` (the PATH). Never one found through a relative entry: an empty entry or ``.`` in PATH is the
+    current directory, the project, whose ``./sh`` would then run with the TUI's environment and as its parent."""
+    if os.path.isfile(_WAITER_SH) and os.access(_WAITER_SH, os.X_OK):
+        return _WAITER_SH
     import shutil
 
-    sh = shutil.which("sh") or "/bin/sh"
+    for entry in (path if path is not None else os.defpath).split(os.pathsep):
+        if os.path.isabs(entry) and (found := shutil.which("sh", path=entry)):
+            return found
+    return _WAITER_SH  # nothing better: execve then fails as it would have
+
+
+def _exec_tui(argv: list[str], env: dict[str, str]) -> NoReturn:
+    """Replace this process with the TUI's waiter (:data:`_TUI_WAITER`) running ``argv``."""
+    sh = _waiter_shell(env.get("PATH"))
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(OSError, ValueError):
             stream.flush()

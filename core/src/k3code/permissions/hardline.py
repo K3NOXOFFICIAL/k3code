@@ -50,12 +50,34 @@ _SSH_RESTART_PATTERNS = [
 ]
 
 #: A Windows drive target whose recursive deletion wipes the host (issue #169): a drive root (``C:``, ``C:\``, ``C:/``),
-#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``) or the Windows directory (``C:\Windows``), with ``/`` or ``\``
-#: separators. The trailing boundary (``(?=[\s"']|$)``) stops it at the end of the word, so a *deeper* path such as
-#: ``C:\Users\<name>\project`` -- an ordinary project folder -- is NOT one of these. A string fragment (no flags), used
-#: inside the case-insensitive launcher patterns below; backslashes survive here because these run on the raw simple
-#: command, before the posix tokenizer (which would eat them) ever sees it.
-_WIN_DRIVE = r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows)?)?[\\/]?(?=[\s\"']|$)"
+#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``), the Windows directory (``C:\Windows``) or the installed
+#: programs (``C:\Program Files``, ``C:\Program Files (x86)``, ``C:\ProgramData``), with ``/`` or ``\`` separators. A
+#: string fragment (no flags), used inside the case-insensitive launcher patterns below; backslashes survive here
+#: because these run on the raw simple command, before the posix tokenizer (which would eat them) ever sees it.
+#: ``Program Files`` has a space in it, so it counts only where the quoted word (or the command) ends after it:
+#: ``"C:\Program Files Custom"`` is another folder.
+_WIN_DRIVE_DIR = (
+    r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows|programdata"
+    r"|program files(?: \(x86\))?(?=[\\/]?(?:\*(?:\.\*)?)?(?:[\"']|$))))?"
+)
+#: The user's profile (or the system drive or Windows directory) named through a variable: cmd's ``%USERPROFILE%``
+#: (``%HOMEDRIVE%%HOMEPATH%``, ``%SystemDrive%``, ``%SystemRoot%``, ``%windir%``), PowerShell's ``$env:USERPROFILE``
+#: (``${env:...}``) and ``$HOME``, and ``~``. It must start a word, so ``backup~`` is a file name, not the profile.
+_WIN_VARS = r"(?:userprofile|homedrive|homepath|systemdrive|systemroot|windir)"
+_WIN_PROFILE_VAR = (
+    r"(?:(?<=[\s\"'=(,:])|^)"
+    r"(?:(?:%" + _WIN_VARS + r"%)+|(?:\$\{?env:" + _WIN_VARS + r"\}?)+|\$\{?home\}?|~)"
+)
+#: A whole-tree target: one of the two above, then an optional separator and the ``*`` / ``*.*`` wildcard of everything
+#: in it (``C:\*``, ``C:\*.*``, ``%USERPROFILE%\*``), then the end of the word (``(?=[\s"']|$)``). That end stops it at
+#: the word's end, so a *deeper* path such as ``C:\Users\<name>\project`` or ``$env:USERPROFILE\proj\build`` -- an
+#: ordinary project folder -- is NOT one of these.
+_WIN_DRIVE = r"(?:" + _WIN_DRIVE_DIR + "|" + _WIN_PROFILE_VAR + r")[\\/]?(?:\*(?:\.\*)?)?(?=[\s\"']|$)"
+#: PowerShell's ``-Recurse``: any unambiguous prefix of it (``-r``, ``-rec``, ``-Recurse``; Remove-Item has no other
+#: parameter starting with r), starting a word, after a hyphen or the en/em dash PowerShell also accepts.
+_PS_RECURSE = r"(?<![\w-])[-\u2013\u2014]r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b"
+#: Remove-Item and the PowerShell aliases for it.
+_PS_REMOVE = r"\b(?:remove-item|rm|ri|del|erase|rd|rmdir)\b"
 
 #: A verb that is the command being run: at the start of the simple command, right after a launcher token
 #: (``powershell Format-Volume``), or after a launcher's opening quote (``cmd /c "diskpart"``). Keeps the format/
@@ -63,21 +85,22 @@ _WIN_DRIVE = r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows)?)?[\\/]?
 _WIN_CMD_POS = r"(?:^\s*|\b(?:cmd(?:\.exe)?|powershell|pwsh(?:\.exe)?)\b[^\"'\n]*[\s\"'])"
 
 #: Windows / WSL destroyers, matched on each simple command (``cmd /c "..."`` and ``powershell -Command "..."`` keep
-#: their quoted script in the sub, so the verb and target are visible). The recursive-delete launchers fire only with a
-#: launcher AND a recursive flag AND a drive target from :data:`_WIN_DRIVE`; a bare ``rmdir /s /q build`` or
-#: ``Remove-Item -Recurse .\build`` has no launcher and no drive target, so a project subfolder delete is never caught.
+#: their quoted script in the sub, so the verb and target are visible). The recursive-delete rules fire only with a
+#: launcher (or the verb starting the command) AND a recursive flag AND a whole-tree target from :data:`_WIN_DRIVE`,
+#: in any order; ``rmdir /s /q build`` or ``Remove-Item -Recurse .\build`` has no such target, so a project subfolder
+#: delete is never caught.
 _WINDOWS_PATTERNS: list[tuple[str, str]] = [
-    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows
+    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows / the programs
     (
         "win-cmd-recursive-delete",
-        r"(?i)\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
+        r"(?i)(?:\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)|^\s*(?:del|erase|rd|rmdir)\b)"
+        r"(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
     ),
-    # powershell|pwsh (with -Command/-c or bare)  Remove-Item|rm|ri|del ... -Recurse  on those targets
+    # powershell|pwsh (with -Command/-c or bare)  Remove-Item or an alias of it ... -Recurse  on those targets
     (
         "win-powershell-recursive-delete",
-        r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*\b(?:remove-item|rm|ri|del)\b)(?=.*-recurse\b)(?=.*"
-        + _WIN_DRIVE
-        + ")",
+        r"(?i)(?:\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*" + _PS_REMOVE + r")|^\s*remove-item\b)"
+        r"(?=.*" + _PS_RECURSE + r")(?=.*" + _WIN_DRIVE + ")",
     ),
     # Format-Volume (PowerShell cmdlet), diskpart (partition tool) and the legacy `format X:` command only count as the
     # command being run, not as a word in prose or a filename (`cat notes-about-diskpart.md`, `echo "run diskpart"`):
@@ -101,7 +124,7 @@ HARDLINE_NAMES: list[str] = [
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
-    "env-dump",  # env / printenv / export -p / set printing the environment (see _env_dump_check)
+    "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -231,11 +254,14 @@ _DANGEROUS_RM_TARGETS = frozenset(
     }
 )
 
-#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, or the Windows
-#: directory: ``rm -rf`` on any of these wipes the Windows host from inside WSL (issue #169). Matched against the
-#: expanded rm target (optionally a trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such
-#: as ``/mnt/c/Users/nils/project`` is a project folder, not one of these, and is not matched.
-_MNT_DRIVE_RM = re.compile(r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows))?(?:/\*)?", re.IGNORECASE)
+#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, the Windows
+#: directory or the installed programs (``Program Files``, ``Program Files (x86)``, ``ProgramData``): ``rm -rf`` on any
+#: of these wipes the Windows host from inside WSL (issue #169). Matched against the expanded rm target (optionally a
+#: trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such as ``/mnt/c/Users/nils/project``
+#: is a project folder, not one of these, and is not matched.
+_MNT_DRIVE_RM = re.compile(
+    r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows|program files(?: \(x86\))?|programdata))?(?:/\*)?", re.IGNORECASE
+)
 
 
 def check(
@@ -626,7 +652,7 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
         0,
     ),
     "doas": ("uC", frozenset(), 0),
-    "env": ("uSC", frozenset({"--unset", "--split-string", "--chdir"}), 0),
+    "env": ("uSCa", frozenset({"--unset", "--split-string", "--chdir", "--argv0", "--env0-from"}), 0),
     "xargs": (
         "nIPdLaEs",
         frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file", "--eof", "--max-chars"}),
@@ -643,6 +669,25 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
     "taskset": ("", frozenset(), 1),
     "setsid": ("", frozenset(), 0),
 }
+#: Every long option of GNU env (``--argv0``/``-a`` and ``--env0-from`` are newer than coreutils 9.4). getopt_long
+#: takes any unambiguous prefix of one (``env --u PATH`` is ``env --unset PATH``), so :func:`_env_long_option`
+#: resolves a prefix against the whole list, not only the ones taking a value.
+_ENV_LONG_OPTS = (
+    "--ignore-environment",
+    "--null",
+    "--unset",
+    "--chdir",
+    "--split-string",
+    "--argv0",
+    "--env0-from",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+    "--list-signal-handling",
+    "--debug",
+    "--help",
+    "--version",
+)
 #: Wrapper options whose value names a file the wrapper reads and hands on as text: ``xargs -a FILE echo`` prints FILE.
 _WRAPPER_READ_OPTS: dict[str, tuple[str, frozenset[str]]] = {"xargs": ("a", frozenset({"--arg-file"}))}
 #: git options before the subcommand that take a value (``git -C dir push`` is ``git push``).
@@ -719,12 +764,24 @@ def ssh_option_commands(name: str, args: list[str]) -> list[str]:
     return out
 
 
+def _env_long_option(key: str) -> str:
+    """The env long option ``key`` names: itself, or the one option it is an unambiguous prefix of."""
+    if key in _ENV_LONG_OPTS:
+        return key
+    hits = [opt for opt in _ENV_LONG_OPTS if opt.startswith(key)]
+    return hits[0] if len(hits) == 1 else key
+
+
 def _skip_wrapper_options(
     name: str, args: list[str], spec: tuple[str, frozenset[str], int], reads: list[str] | None = None
 ) -> list[str]:
+    """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
+    none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
+    option's place and are parsed in turn as env's own options, assignments and command, so ``env -S '-u PATH'`` is
+    ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make' test`` runs ``make test``."""
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
-    prefix: list[str] = []  # env -S "cmd args" splits its value into the command
+    args = list(args)
     i = 0
     while i < len(args):
         a = args[i]
@@ -734,18 +791,19 @@ def _skip_wrapper_options(
         if name == "env" and (a == "-" or _is_assignment(a)):
             i += 1
             continue
+        split: list[str] = []  # env -S: the words that take the option's place
         if a.startswith("--"):
             key, eq, value = a.partition("=")
+            if name == "env":
+                key = _env_long_option(key)
             if key in long_val and not eq:
                 i += 1
                 value = args[i] if i < len(args) else ""
             if name == "env" and key == "--split-string":
-                prefix += _tokens(value)
+                split = _tokens(value)
             if key in read_long and value and reads is not None:
                 reads.append(value)
-            i += 1
-            continue
-        if a.startswith("-") and len(a) > 1:
+        elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
                 if ch in short_val:
                     value = a[k + 1 :]
@@ -753,14 +811,15 @@ def _skip_wrapper_options(
                         i += 1
                         value = args[i] if i < len(args) else ""
                     if name == "env" and ch == "S":
-                        prefix += _tokens(value)
+                        split = _tokens(value)
                     if ch in read_short and value and reads is not None:
                         reads.append(value)
                     break
-            i += 1
-            continue
-        break
-    return prefix + args[i + positionals :]
+        else:
+            break
+        i += 1
+        args[i:i] = split  # STRING's words are never longer than STRING, so this ends
+    return args[i + positionals :]
 
 
 def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[str]:
@@ -769,7 +828,8 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[st
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS)."""
     argv = list(tokens)
-    for _ in range(len(tokens) + 1):  # every round drops at least one token
+    # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
+    for _ in range(sum(len(t) + 1 for t in tokens) + 1):
         while argv and _is_assignment(argv[0]):
             argv = argv[1:]
         if not argv:
@@ -932,23 +992,46 @@ def _git_push_check(argv: list[str]) -> str | None:
 
 
 def _env_dump_check(sub: str) -> str | None:
-    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript.
+    """``env`` / ``printenv`` / ``export -p`` / ``set`` / ``declare -x`` printing the environment (secrets) to the
+    transcript.
 
     Decided on the *normalised* argv of the simple command ``sub`` (see :func:`normalize_argv`), so that a wrapped run —
     ``env FOO=1 make test``, ``env -u X cmd``, ``env -i cmd``, ``env -C dir cmd`` — is *not* an environment dump: there
     ``env`` only sets up the environment of ``cmd`` and reduces to ``cmd``, whose own checks still apply (``env X=1 rm
     -rf /`` is refused as the rm rule). Only a bare ``env`` / ``printenv`` with no command to run prints the
-    environment: it reduces to ``env`` / ``printenv`` itself (``env``, ``env -i``, ``env -u X``, ``sudo env``,
-    ``FOO=1 env``, ``env -S printenv``). A redirection (``env > file``, ``env 2>/dev/null``) is not a wrapped command:
-    the redirect words are dropped first, so those stay refused (a pipe such as ``env | grep`` is already its own
-    simple command ``env``)."""
+    environment: it reduces to ``env`` / ``printenv`` itself (``env``, ``env -i``, ``env -u X``, ``env X=1``, ``sudo
+    env``, ``FOO=1 env``, ``env -S printenv``, and ``env -S 'X=1'`` / ``env -S -0`` / ``nice env -S X=1``, whose -S
+    words are env's own options and assignments). A redirection (``env > file``, ``env 2>/dev/null``) is not a wrapped
+    command: the redirect words are dropped first, so those stay refused (a pipe such as ``env | grep`` is already its
+    own simple command ``env``).
+
+    The shell builtins that list variables with their values when given no name: ``set``, ``export`` (``-p``, ``-n``,
+    ``--``) and ``declare`` / ``typeset`` (``-x``, ``-p``, ``-g``, none, ...); ``export -f`` and ``declare -f``/``-F``
+    list functions instead. ``compgen -e`` / ``-v`` print variable names only, never a value, and are left alone."""
     argv = normalize_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
     name, args = os.path.basename(argv[0]), argv[1:]
-    if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
+    if name in ("env", "printenv") or (name == "set" and not args):
         return "env-dump"
+    if name in ("export", "declare", "typeset"):
+        options, names = _builtin_options(args)
+        if not names and not (set(options) & set("fF")):
+            return "env-dump"
     return None
+
+
+def _builtin_options(args: list[str]) -> tuple[str, list[str]]:
+    """The option letters (``-x``/``+x`` alike) of a bash builtin's ``args`` and its operands, which start at the first
+    word that is not an option or right after ``--``."""
+    letters = ""
+    for i, a in enumerate(args):
+        if a == "--":
+            return letters, args[i + 1 :]
+        if len(a) < 2 or a[0] not in "-+":
+            return letters, args[i:]
+        letters += a[1:]
+    return letters, []
 
 
 _HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
