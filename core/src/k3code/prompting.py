@@ -101,11 +101,15 @@ def prompt_sections(
     advisor: bool = True,
     attended: bool = True,
     session_id: str | None = None,
+    frozen: dict[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
     """The prompt as ``(name, text)`` sections in the order they are sent.
 
     With ``session_id``, the settings are the session's own (``optimizer.session_settings``): a session in the
-    treatment arm of a concurrent config experiment gets its memory and skills limits."""
+    treatment arm of a concurrent config experiment gets its memory and skills limits.
+
+    ``frozen`` is a session's snapshot of the learned tail (``learned_sections``, see
+    ``LiveSession.prompt_frozen``): empty, it is filled from disk; filled for the same inputs, it is used as it is."""
     from k3code.learning.optimizer import session_settings
 
     config = session_settings(config, session_id)
@@ -131,6 +135,13 @@ def prompt_sections(
     # where the session works: project-specific like everything after it, and fixed for the session (an /add-dir
     # changes it, rarely), so it sits ahead of the facts and learned sections
     parts.append(("scope", scope_prompt(cwd, (session_meta or {}).get("add_dirs"))))
+    return parts + frozen_learned_sections(frozen, cwd=cwd, config=config, session_id=session_id)
+
+
+def learned_sections(cwd: str | Path, config: Any, session_id: str | None = None) -> list[tuple[str, str]]:
+    """The prompt's tail: what learning and the user's memory files put in it (stack facts, memory files, learned
+    notes, gotchas, the optimizer overlay), read from disk now. ``config`` is the session's own settings."""
+    parts: list[tuple[str, str]] = []
     from k3code.learning.projectprep import facts_prompt
 
     if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
@@ -156,6 +167,26 @@ def prompt_sections(
     return parts
 
 
+def frozen_learned_sections(
+    frozen: dict[str, Any] | None, *, cwd: str | Path, config: Any, session_id: str | None = None
+) -> list[tuple[str, str]]:
+    """``learned_sections``, kept in ``frozen`` for a session: its background writers (the review at user turn 7,
+    13, ..., the daily distill of USER.md, a re-scan, an overlay) rewrite those files mid-session, and a prompt read
+    from disk every turn then changed its prefix and missed the provider's cache. The snapshot is taken at the first
+    prompt and kept until the session clears it (``LiveSession.refresh_prompt_inputs``: compaction, /clear, a
+    project move, /memory add) or the inputs it was taken for change (the directory, learning on or off, the cap)."""
+    if frozen is None:
+        return learned_sections(cwd, config, session_id)
+    from k3code.learning import learning_cfg
+
+    key = [str(Path(cwd).resolve()), bool(learning_cfg(config)["enabled"]), memory_limit(config), session_id or ""]
+    if frozen.get("key") != key:
+        frozen.clear()
+        frozen["key"] = key
+        frozen["sections"] = learned_sections(cwd, config, session_id)
+    return list(frozen["sections"])
+
+
 def build_system_prompt(
     base: str,
     *,
@@ -167,6 +198,7 @@ def build_system_prompt(
     advisor: bool = True,
     attended: bool = True,
     session_id: str | None = None,
+    frozen: dict[str, Any] | None = None,
 ) -> str:
     sections = prompt_sections(
         base,
@@ -178,6 +210,7 @@ def build_system_prompt(
         advisor=advisor,
         attended=attended,
         session_id=session_id,
+        frozen=frozen,
     )
     return "\n\n".join(text for _, text in sections) + "\n"
 
