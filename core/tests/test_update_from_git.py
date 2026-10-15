@@ -391,6 +391,20 @@ def test_an_installer_that_kept_the_installed_build_is_not_activated(remote, dat
     assert r.exit_code != 0 and f"kept the installed {cur}" in r.output and no_release == []
 
 
+def test_a_ref_whose_installer_prints_a_path_deletes_and_activates_nothing(remote, data, no_release, monkeypatch):
+    """The version name is the last line of the ref's own installer: `../victim` named `<data>/victim`, and vet_staged
+    removed it as a staged build that lost the TUI (K3NOX-300)."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui")
+    (data / "victim").mkdir()
+    (data / "victim" / "keep.me").write_text("x")
+    monkeypatch.setenv("K3_STUB_VERSION", "../victim")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and "did not print a version name" in r.output and "Traceback" not in r.output
+    assert no_release == [] and (data / "victim" / "keep.me").is_file()
+    assert Path(os.readlink(data / "current")).name == cur
+
+
 # -- a build that lost the TUI or the k3 binary (#95) -------------------------------
 
 
