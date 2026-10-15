@@ -141,7 +141,7 @@ async def test_edit_ambiguous(temp_dir):
     f.write_text("foo\nfoo\n")
     result = await tool_edit({"path": str(f), "old_string": "foo", "new_string": "bar"}, cwd=temp_dir)
     assert "error" in result
-    assert "Found 2 matches" in result["error"]
+    assert "matches 2 places" in result["error"]
 
 
 async def test_edit_replace_all(temp_dir):

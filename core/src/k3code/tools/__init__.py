@@ -17,6 +17,7 @@ from typing import Any
 from k3code.permissions.engine import search_withheld, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
+from k3code.tools.editmatch import no_match_hint
 from k3code.tools.fuzzy_match import (
     SIMILARITY_STRATEGIES,
     STRATEGIES,
@@ -410,8 +411,12 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
         content, old_string, new_string, replace_all=replace_all
     )
     if error:
-        hint = format_no_match_hint(error, count, old_string, content)
-        return {"error": error + hint}
+        if error.startswith("Could not find"):
+            # the closest region, numbered as read numbers it, and why it missed (whitespace, a blank line)
+            return {"error": error + no_match_hint(old_string, content)}
+        if error.startswith("Found ") and not replace_all:
+            return {"error": _ambiguous_error(content, old_string)}
+        return {"error": error + format_no_match_hint(error, count, old_string, content)}
     replaced, line = None, 0
     if strategy in SIMILARITY_STRATEGIES:
         # old_string only resembles what is replaced (a value the model misremembered): name the file's real text.
@@ -419,6 +424,32 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
         [(start, end)] = dict(STRATEGIES)[strategy](content, old_string)
         replaced, line = content[start:end], content.count("\n", 0, start) + 1
     return EditPlan(path, content, new_content, crlf, count, strategy, replaced, line)
+
+
+#: ambiguous edit: the most matches listed with their first line
+_AMBIGUOUS_SHOWN = 8
+
+
+def _ambiguous_error(content: str, old_string: str) -> str:
+    """The refusal of an old_string that matches more than once: every match's line (numbered as ``read`` numbers
+    them) so the model can widen old_string to the one it means, or set replace_all for all of them."""
+    spans = next((fn(content, old_string) for _, fn in STRATEGIES if fn(content, old_string)), [])
+    rows = []
+    for start, end in spans[:_AMBIGUOUS_SHOWN]:
+        first = content.count("\n", 0, start) + 1
+        last = first + content.count("\n", start, max(start, end - 1))
+        line_start = content.rfind("\n", 0, start) + 1
+        line_end = content.find("\n", line_start)
+        line = content[line_start : len(content) if line_end == -1 else line_end]
+        where = f"{first}" if first == last else f"{first}-{last}"
+        rows.append(f"{where:>{_NUMBER_WIDTH}}\t{_cap_line(line)}")
+    if len(spans) > _AMBIGUOUS_SHOWN:
+        rows.append(f"  ... and {len(spans) - _AMBIGUOUS_SHOWN} more")
+    return (
+        f"old_string matches {len(spans)} places in the file; nothing was changed. Include more surrounding lines so "
+        "it matches only the one you mean, or set replace_all: true to change every one. Matches (line, first "
+        "line of the match):\n" + "\n".join(rows)
+    )
 
 
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -1341,7 +1372,8 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="edit",
-            description="Edit a file by replacing old_string with new_string.\n"
+            description="Edit a file by replacing old_string with new_string. Copy old_string from a read result "
+            "without the line-number prefix; a miss shows the closest lines, a second match lists every match.\n"
             "Limits: old_string must match exactly once unless replace_all (whitespace-tolerant matching is a "
             "fallback); UTF-8 files only; line endings are kept; the file must be read first and unchanged since.",
             parameters={
