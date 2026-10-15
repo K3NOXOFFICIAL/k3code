@@ -2076,6 +2076,9 @@ class GatewayServer:
             session, call, result, failure, **kw
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
+        # MCP tools mcp_tool_search activated stay advertised in every later loop of the session (each turn, each
+        # tier), at the end of the tools array in activation order: the provider's cached prefix survives (#168)
+        loop.tools.keep_activated_in(session.stored.meta)
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
             install(loop.tools)
