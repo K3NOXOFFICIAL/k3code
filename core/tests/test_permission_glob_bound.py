@@ -54,7 +54,7 @@ def test_deep_glob_that_matches_nothing_stops_at_the_entry_cap(
     _tree(tmp_path, fanout=6, depth=4)  # 1554 directories below the root
     monkeypatch.setattr(engine, "_GLOB_MAX_ENTRIES", 200, raising=False)
     pattern = f"{tmp_path}/*/*/*/*/nomatch"
-    verdict = engine._classify_word(pattern, str(tmp_path), "/home/nobody")
+    verdict = engine._classify_word(pattern, str(tmp_path), "/home/user")
     assert scandir_entries[0] <= 200 + 64
     assert verdict == "human"  # the walk gave up: unknown, so a person is asked, never an allow
 
@@ -64,7 +64,7 @@ def test_deep_glob_decides_within_a_fixed_time(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(engine, "_GLOB_BUDGET_S", 0.0, raising=False)
     pattern = f"{tmp_path}/*/*/*/*/*/nomatch"
     start = time.monotonic()
-    verdict = engine._classify_word(pattern, str(tmp_path), "/home/nobody")
+    verdict = engine._classify_word(pattern, str(tmp_path), "/home/user")
     assert time.monotonic() - start < 1.0
     assert verdict == "human"
 
@@ -73,7 +73,7 @@ def test_ordinary_globs_are_unchanged(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x")
     (tmp_path / "src" / ".hidden").write_text("x")
-    cwd, home = str(tmp_path), "/home/nobody"
+    cwd, home = str(tmp_path), "/home/user"
     assert engine._classify_word(f"{tmp_path}/src/*.py", cwd, home) is None
     assert engine._classify_word(f"{tmp_path}/*/*", cwd, home) is None
     assert engine._classify_word(f"{tmp_path}/nothing/*", cwd, home) is None
