@@ -243,3 +243,61 @@ def test_a_link_to_the_user_config_while_it_is_checked_does_not_unlock_the_plain
         assert not _exported_mark_603(tmp_path, proj)
     except BundleError as e:
         assert MARK not in str(e)
+
+
+def _no_proc(monkeypatch) -> dict[int, str]:
+    """A system without ``/proc`` (macOS): reading ``/proc/self/fd/N`` fails. Returns where each fd really is, for a
+    stand-in ``F_GETPATH``."""
+    real_readlink = os.readlink
+    seen: dict[int, str] = {}
+
+    def readlink(path, *a, **kw):
+        if str(path).startswith("/proc/self/fd/"):
+            seen[int(str(path).rsplit("/", 1)[1])] = real_readlink(path, *a, **kw)
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_readlink(path, *a, **kw)
+
+    monkeypatch.setattr(trust.os, "readlink", readlink)
+    return seen
+
+
+class _FakeFcntl:
+    """``fcntl`` as macOS has it: ``F_GETPATH`` writes the opened file's path into the buffer it is given."""
+
+    F_GETPATH = 50
+
+    def __init__(self, where: dict[int, str]) -> None:
+        self.where = where
+
+    def fcntl(self, fd: int, cmd: int, arg: bytes) -> bytes:
+        assert cmd == self.F_GETPATH
+        return os.fsencode(self.where[fd]).ljust(len(arg), b"\0")  # the failed /proc lookup recorded it
+
+
+def test_without_proc_the_place_is_read_with_f_getpath(tmp_path: Path, monkeypatch) -> None:
+    """macOS has no /proc: the opened file's place comes from ``F_GETPATH`` there, so a config linked inside the
+    project still exports and one linked out is still refused."""
+    where = _no_proc(monkeypatch)
+    monkeypatch.setattr(trust, "fcntl", _FakeFcntl(where))
+    proj = _project(tmp_path)
+    (proj / "shared.yaml").write_text("note: inside-marker\n")
+    (proj / ".k3code" / "config.yaml").symlink_to(proj / "shared.yaml")
+    with tarfile.open(_export(tmp_path, proj, True)) as tar:
+        assert b"inside-marker" in tar.extractfile("settings/project.config.yaml").read()
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text(f"note: {MARK}\n")
+    _swap_link(proj / ".k3code" / "config.yaml", outside)
+    (tmp_path / "x.k3bundle").unlink()
+    with pytest.raises(BundleError, match="does not parse") as e:
+        _export(tmp_path, proj, True)
+    assert MARK not in str(e.value)
+
+
+def test_without_proc_or_f_getpath_the_read_is_refused(tmp_path: Path, monkeypatch) -> None:
+    _no_proc(monkeypatch)
+    monkeypatch.setattr(trust, "fcntl", None)
+    proj = _project(tmp_path)
+    (proj / ".k3code" / "config.yaml").write_text("note: x\n")
+    with pytest.raises(OSError):
+        trust.read_bounded(proj / ".k3code" / "config.yaml", within=proj)
+    assert trust.read_bounded(proj / ".k3code" / "config.yaml") == b"note: x\n"  # no place to check: read

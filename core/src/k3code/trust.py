@@ -29,6 +29,11 @@ import yaml
 
 from k3code.paths import ensure_private_dir, home, main_checkout
 
+try:
+    import fcntl
+except ImportError:  # Windows: no F_GETPATH, and no /proc either, so a contained read is refused there
+    fcntl = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 STORE_NAME = "trusted_projects.json"
@@ -74,14 +79,28 @@ def _key(project_dir: str | Path) -> str:
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
+def _opened_path(fd: int) -> Path:
+    """Where the open file ``fd`` is, read off the descriptor itself: ``/proc/self/fd`` on Linux, ``F_GETPATH`` on
+    macOS, which has no ``/proc`` (a project config was otherwise never exported there). OSError where neither is
+    there: no lookup by name stands in for them, as a link swapped between the open and that lookup would pass."""
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError:
+        get_path = getattr(fcntl, "F_GETPATH", None)
+        if get_path is None:
+            raise
+    buf = fcntl.fcntl(fd, get_path, bytes(1024))  # MAXPATHLEN: the kernel writes a NUL-terminated path into it
+    return Path(os.fsdecode(buf.split(b"\0", 1)[0]))
+
+
 def read_bounded(path: Path, *, within: Path | None = None) -> bytes:
     """``path``'s bytes when it is a regular file of at most ``MAX_CONFIG_BYTES``; OSError otherwise. A FIFO would
     block a plain read for good (it is opened non-blocking and refused on its type), a device or a huge file would
     fill memory.
 
     ``within`` is a directory the file must be inside once links are followed. The place is read off the opened file
-    (``/proc/self/fd``), not looked up by name again: a script that swaps a link between two lookups gets the file
-    it opened refused, not read. Where ``/proc`` is missing the read is refused."""
+    (see _opened_path), not looked up by name again: a script that swaps a link between two lookups gets the file
+    it opened refused, not read. Where the system cannot say where an open file is, the read is refused."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         st = os.fstat(fd)
@@ -90,7 +109,7 @@ def read_bounded(path: Path, *, within: Path | None = None) -> bytes:
         if st.st_size > MAX_CONFIG_BYTES:
             raise OSError(errno.EFBIG, "file too large", str(path))
         if within is not None:
-            real = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            real = _opened_path(fd)
             if not real.is_relative_to(Path(within).resolve()):
                 raise OSError(errno.EXDEV, "file leaves the project", str(path))
     except BaseException:
