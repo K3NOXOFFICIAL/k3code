@@ -513,12 +513,36 @@ def _unquoted_brace(unit: str) -> str:
     return "".join(out)
 
 
-def _shell_words(sub: str, unquote_braces: bool = False) -> list[str]:
+def _dquoted_brace(unit: str) -> str:
+    """The ``${...}`` ``unit`` of a double-quoted word as the shell passes it on: bash and dash drop the backslash of
+    `` \\` ``, ``\\$``, ``\\"``, ``\\\\`` and ``\\}`` in it and remove ``\\<newline>`` (any other ``\\x`` stays), so the
+    inner shell of ``bash -c "${x:+\\`y\\`}"`` runs ``y``. The ``$(...)`` and backtick units in it are kept as written:
+    the outer shell runs them and parse reads them."""
+    out: list[str] = []
+    i, n = 0, len(unit)
+    while i < n:
+        c = unit[i]
+        if c == "\\" and i + 1 < n:
+            nxt = unit[i + 1]
+            out.append(nxt if nxt in '$`"\\}' else "" if nxt == "\n" else unit[i : i + 2])
+            i += 2
+        elif (c == "`" or unit.startswith("$(", i)) and (end := _unit_end(unit, i)) >= 0:
+            out.append(unit[i : end + 1])
+            i = end + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _shell_words(sub: str, unquote_braces: bool = False, dquoted_braces: bool = True) -> list[str]:
     """``sub`` split into words with quotes removed as the shell removes them: like :func:`_tokens`, except that in
     double quotes a backslash before `` ` ``, ``$`` or a newline goes too (shlex keeps it), so the argument of
     ``bash -c "echo \\`x\\`"`` is the line the inner shell runs, and a ``$(...)``, backtick or ``${...}`` is one unit
     whose quotes are its own (see _unit_end). With ``unquote_braces`` an unquoted ``${...}`` is read as the text its
-    word gives instead (see _unquoted_brace). An open quote or unit falls back to :func:`_tokens`."""
+    word gives instead (see _unquoted_brace); with ``dquoted_braces`` a ``${...}`` in double quotes loses the
+    backslashes the shell drops there (see _dquoted_brace), without it it is kept as written. An open quote or unit
+    falls back to :func:`_tokens`."""
     words: list[str] = []
     word: list[str] | None = None
     i, n = 0, len(sub)
@@ -556,7 +580,8 @@ def _shell_words(sub: str, unquote_braces: bool = False) -> list[str]:
                 elif (end := _unit_end(sub, j)) != -1:
                     if end < 0:
                         return _tokens(sub)
-                    word.append(sub[j : end + 1])
+                    unit = sub[j : end + 1]
+                    word.append(_dquoted_brace(unit) if dquoted_braces and unit.startswith("${") else unit)
                     j = end + 1
                 else:
                     word.append(sub[j])
@@ -1426,9 +1451,11 @@ def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
     the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands, unquoted as the
     shell unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word
-    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), and shlex's reading is checked as well."""
+    gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the
+    backslashes the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the
+    two, and shlex's reading is checked as well. Identical readings are one reading."""
     out: list[str] = []
-    readings = [tuple(_shell_words(sub, unquote)) for unquote in (False, True)]
+    readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
         pre = _strip_wrappers(list(toks))
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from k3code.permissions import Rule, decide
-from k3code.permissions.hardline import check, parse
+from k3code.permissions.hardline import _shell_words, check, parse
 
 MODES = ["default", "accept-edits", "auto", "yolo"]
 HIDDEN = "rm -rf ~"  # a hardline payload: whatever reaches the checks as a command is denied
@@ -549,6 +549,44 @@ def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
     # and the raw text of the payload, as Main read it
     assert body.heredocs[0][0].payloads == [r"a \`b\` \"d\"", r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
     assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
+
+
+# K3NOX-615: in a double-quoted argument the shell drops the backslash of `\``, `\$`, `\"` and `\\` inside a ${...}
+# too, so the inner shell runs what was escaped there. The parser kept the ${...} as written and never ran a command.
+BRACE_ESCAPES = [
+    r'x=1; bash -c "${x:+\`rm -rf ~\`}"',
+    r'x=1; bash -c "${x:+${y:-\`rm -rf ~\`}}"',
+    r'sh -c "${x:+\`rm -rf ~\`}"',
+    r'eval "${x:-\`rm -rf ~\`}"',
+    r'bash -c "echo ${x:+\$(rm -rf ~)}"',
+    r'bash -c "${x:+\"\`rm -rf ~\`\"}"',
+]
+
+
+@pytest.mark.parametrize("cmd", BRACE_ESCAPES)
+def test_an_escape_in_a_brace_expansion_of_a_launcher_argument_is_unescaped(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    for mode in MODES:
+        dec = _bash(cmd, mode, tmp_path)
+        assert dec.action == "deny" and dec.hardline == "rm-rf-home", (mode, dec)
+
+
+#: the inner shell gets an escaped backtick or plain text here: nothing runs
+BRACE_TEXT = [r'bash -c "${x:+\\\`rm -rf ~\\\`}"', r'bash -c "echo ${x:-rm -rf ~}"']
+
+
+@pytest.mark.parametrize("cmd", BRACE_TEXT)
+def test_an_escaped_backtick_in_a_brace_expansion_stays_text(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) is None
+    assert _bash(cmd, "yolo", tmp_path).action == "allow"
+
+
+def test_a_brace_expansion_in_a_double_quoted_word_loses_the_backslashes_the_shell_drops() -> None:
+    # bash 5.3 and dash agree: in "${...}" the backslash of \` \$ \" \\ \} goes, \<newline> is removed, \q stays;
+    # a $(...) or backtick in it is the outer shell's and stays as written
+    word = r'"${x:+a\`b\` \$c \"d\" \\ \q \}${y:-\`e\`}$(f \`g\`)`h \`i\``}"' + ' "${x:+j\\\nk}"'
+    assert _shell_words(word) == [r'${x:+a`b` $c "d" \ \q }${y:-`e`}$(f \`g\`)`h \`i\``}', "${x:+jk}"]
+    assert _shell_words(r"${x:+\`b\`}") == [r"${x:+\`b\`}"]  # unquoted: unchanged here
 
 
 @pytest.mark.parametrize("depth", [1, 32, 33, 40, 200])
