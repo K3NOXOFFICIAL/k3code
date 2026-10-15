@@ -92,6 +92,25 @@ async def repo_root(path: str | Path) -> Path | None:
     return Path(out.strip()) if rc == 0 and out.strip() else None
 
 
+async def worktrees_dir_safe(repo: str | Path) -> bool:
+    """False when the repository's ``<common dir>/worktrees`` is a symlink or does not resolve inside the common dir.
+
+    ``git worktree add`` / ``prune`` follow that folder wherever it points: a link planted there (by a sandboxed
+    command under ``sandbox.git_writable``, a fan-out child, or a turn killed before its scrub ran) would make them
+    write into, or empty, a folder outside the repository. A missing folder is fine: git makes a real one."""
+    rc, out = await git(repo, "rev-parse", "--git-common-dir")
+    if rc != 0 or not out.strip():
+        return False
+    common = Path(repo) / out.strip().splitlines()[-1]
+    folder = common / "worktrees"
+    if folder.is_symlink():
+        return False
+    try:
+        return not folder.exists() or folder.resolve().is_relative_to(common.resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
 @dataclass
 class Worktree:
     id: str
@@ -151,6 +170,8 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
     path = root / ".k3code" / "worktrees" / child_id
     branch = f"k3/{child_id}"
     async with worktree_lock(root):  # parallel adds on one repo race on .git/worktrees (see worktree_lock)
+        if not await worktrees_dir_safe(root):
+            raise RuntimeError("git worktree add refused: the git dir's worktrees folder is a symlink (or leads out)")
         k3 = root / ".k3code"
         k3.mkdir(exist_ok=True)
         gi = k3 / ".gitignore"
@@ -397,7 +418,10 @@ async def reap(path: str | Path, *, expire_days: float = BRANCH_EXPIRY_DAYS) -> 
         done.append(tree)
     # under the lock a session in this process cannot be between `git worktree add`'s branch and its checkout
     async with worktree_lock(found.repo):
-        await git(found.repo, "worktree", "prune")  # entries whose directory is gone
+        if await worktrees_dir_safe(found.repo):
+            await git(found.repo, "worktree", "prune")  # entries whose directory is gone
+        else:
+            logger.warning("not pruning worktrees in %s: its git dir's worktrees folder is a symlink", found.repo)
         rest = await scan(path, expire_days=expire_days)  # the reaped workers' branches are plain branches now
         if rest is None:
             return found

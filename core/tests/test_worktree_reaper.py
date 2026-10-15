@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from k3code import doctor
 from k3code.config import Settings
 from k3code.gateway.server import GatewayServer
@@ -199,3 +201,42 @@ async def test_a_gateway_start_reaps_the_repos_its_sessions_worked_in(tmp_path, 
 
     assert not (repo / ".k3code" / "worktrees" / "w3").exists()
     assert sh(repo, "show", "k3/w3:half.txt") == "work in progress\n"
+
+
+def planted_worktrees_link(repo: Path, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """``.git/worktrees`` as a link to a folder outside the repository, holding a stale-looking admin entry (what
+    ``git worktree prune`` removes) and a plain file, both harmless markers."""
+    victim = tmp_path / "victim"
+    stale = victim / "stale"
+    stale.mkdir(parents=True)
+    (stale / "gitdir").write_text(str(tmp_path / "gone" / ".git") + "\n")
+    plain = victim / "plain.txt"
+    plain.write_text("keep\n")
+    (repo / ".git" / "worktrees").symlink_to(victim, target_is_directory=True)
+    return victim, stale, plain
+
+
+async def test_reap_does_not_prune_through_a_worktrees_link(tmp_path):
+    """A link planted at ``.git/worktrees`` (by a sandboxed command, a killed turn whose scrub never ran) would make
+    the host-side ``git worktree prune`` of the start-up reap empty the folder it points to."""
+    repo = git_repo(tmp_path / "repo")
+    victim, stale, plain = planted_worktrees_link(repo, tmp_path)
+    await wt.reap(repo)
+    assert plain.read_text() == "keep\n" and (stale / "gitdir").is_file()
+
+
+async def test_reap_still_prunes_a_vanished_worktree_when_worktrees_is_a_real_folder(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    sh(repo, "worktree", "add", "-q", str(tmp_path / "other"), "-b", "other")
+    shutil.rmtree(tmp_path / "other")
+    await wt.reap(repo)
+    assert not (repo / ".git" / "worktrees" / "other").exists()
+
+
+async def test_create_refuses_to_add_a_worktree_through_a_worktrees_link(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    victim, stale, plain = planted_worktrees_link(repo, tmp_path)
+    before = sorted(p.name for p in victim.iterdir())
+    with pytest.raises(RuntimeError, match="symlink"):
+        await wt.create(repo, "child1")
+    assert sorted(p.name for p in victim.iterdir()) == before
