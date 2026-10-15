@@ -896,6 +896,36 @@ def test_chromium_opt_outs_write_no_marker(tmp_path: Path) -> None:
     assert not (minimal / ".local" / "share" / "k3code" / CHROMIUM_MARKER).exists()
 
 
+OCR_MARKER = Path("presetup") / "ocr-stub"
+
+
+def test_ocr_packages_are_on_by_default_and_opt_outs_skip_them(tmp_path: Path) -> None:
+    """The offline OCR extra installs with presetup (under K3_STUB_VENV a marker stands for the pip step); a second
+    run sees it and does nothing; K3CODE_SKIP_OCR=1 and --minimal leave it out."""
+    home = tmp_path / "default"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-source", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert "OCR stub" in r.stderr
+    assert (home / ".local" / "share" / "k3code" / OCR_MARKER).is_file()
+    again = run(home, INSTALL, "--from-source", "--yes")
+    assert "OCR packages already installed" in again.stderr
+
+    skipped = tmp_path / "skip"
+    skipped.mkdir()
+    r = run(skipped, INSTALL, "--from-source", "--yes", env_extra={"K3CODE_SKIP_OCR": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "OCR packages skipped" in r.stderr
+    assert not (skipped / ".local" / "share" / "k3code" / OCR_MARKER).exists()
+
+    minimal = tmp_path / "minimal"
+    minimal.mkdir()
+    m = run(minimal, INSTALL, "--from-source", "--yes", "--minimal")
+    assert m.returncode == 0, m.stderr
+    assert "OCR" not in m.stderr
+    assert not (minimal / ".local" / "share" / "k3code" / OCR_MARKER).exists()
+
+
 def _seed_chromium(home: Path, body: str) -> None:
     """An earlier run's Chromium (its marker and a headless shell that runs ``body``) so presetup only probes it."""
     data = home / ".local" / "share" / "k3code"

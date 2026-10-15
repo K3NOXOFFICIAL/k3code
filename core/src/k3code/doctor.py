@@ -792,6 +792,33 @@ def check_browser() -> Check:
     )
 
 
+def check_ocr() -> Check:
+    """The optional offline OCR (k3code.ocr): which engine would run, and whether a PDF can be rendered for it."""
+    from k3code import ocr
+
+    status = ocr.engine_status()
+    pdf = status.get("pdf")
+    pdf_note = f", PDF via {pdf}" if pdf else ", no PDF renderer (pypdfium2 or pdftoppm): scanned PDFs are off"
+    data = {k: v for k, v in status.items() if k != "detail"}
+    if status["engine"] == "rapidocr":
+        return Check("ocr", OK, f"{status['detail']}{pdf_note}", data=data)
+    if status["engine"] == "tesseract":
+        return Check(
+            "ocr",
+            OK,
+            f"{status['detail']}{pdf_note}",
+            "for the bundled offline model, re-run the installer without --minimal (adds the ocr extra)",
+            data=data,
+        )
+    return Check(
+        "ocr",
+        WARN,
+        "not installed (optional: images and scanned PDFs cannot be read without a vision model)",
+        "re-run the installer without --minimal (it installs the ocr extra), or " + ocr.install_hint(),
+        data=data,
+    )
+
+
 def check_searxng() -> Check:
     """Web search through a SearXNG instance: the research setting, the legacy top-level key, or an MCP server."""
     from k3code import confio
@@ -908,7 +935,7 @@ def install_subset(home: Path | None = None) -> list[Check]:
     sandbox is reported by the installer's own presetup step.
     """
     home = home or k3_home()
-    checks = [check_home(home), check_disk(home), check_tui(), check_browser(), check_searxng()]
+    checks = [check_home(home), check_disk(home), check_tui(), check_browser(), check_ocr(), check_searxng()]
     return [Check(c.name, WARN if c.status == FAIL else c.status, c.detail, c.fix, c.data) for c in checks]
 
 
@@ -943,6 +970,7 @@ async def run_checks(
         # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
+        await asyncio.to_thread(check_ocr),  # tesseract --list-langs is a subprocess
         check_permissions(home, default_project_dir()),
         await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
         await check_worktrees(default_project_dir()),

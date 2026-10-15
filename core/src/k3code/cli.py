@@ -1252,6 +1252,32 @@ def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
     sys.exit(1 if doctor.summary(checks)[doctor.FAIL] else 0)
 
 
+@cli.command("ocr")
+@click.argument("path", type=click.Path(path_type=Path, exists=True, dir_okay=False))
+@click.option("--pages", type=int, default=None, help="PDF: pages to read (default 20)")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+def ocr_cmd(path: Path, pages: int | None, as_json: bool) -> None:
+    """Text of an image or a scanned PDF through the offline OCR (for testing the engine)."""
+    from k3code import ocr
+
+    try:
+        result = ocr.ocr_file(path, pages or ocr.DEFAULT_MAX_PAGES)
+    except ocr.OcrUnavailable as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        data = {
+            "engine": result.engine,
+            "confidence": result.confidence,
+            "pages": result.pages,
+            "skipped_pages": result.skipped_pages,
+            "blocks": [{"text": b.text, "confidence": b.confidence} for b in result.blocks],
+            "text": result.text,
+        }
+        click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    click.echo(result.render())
+
+
 @cli.command("stats")
 @click.option("--by", type=click.Choice(["day", "session", "turn"]), default="day")
 @click.option("--days", type=int, default=None, help="Only the last N days")

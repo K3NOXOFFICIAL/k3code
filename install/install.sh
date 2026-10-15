@@ -19,9 +19,10 @@
 # manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches none of
 # these toolchains; the PyPI, npm and Go module packages the build needs still download. The installer never
 # runs onboarding; it ends by telling you to run `k3code onboard`.
-# Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
-# prints a health subset. It never fails the install.
-# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium), K3_CONNECT_TIMEOUT=SECS (a download connection gives up after
+# Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and the
+# offline OCR packages, and prints a health subset. It never fails the install.
+# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium), K3CODE_SKIP_OCR=1 (presetup: no OCR packages),
+#   K3_CONNECT_TIMEOUT=SECS (a download connection gives up after
 #   SECS seconds and is retried; default 15). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
@@ -58,7 +59,7 @@ Options:
   --yes, -y             accepted for older callers; with it, presetup never prompts for sudo
   --no-install-deps     fetch no toolchains (uv, Python, Node, Go, bubblewrap, Chromium; fail or skip with the hints
                         instead); PyPI, npm and Go module packages still download
-  --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
+  --minimal             skip presetup: no sandbox check, no Chromium, no OCR packages, no doctor subset
   --check               print the platform and dependency report, change nothing
   --allow-root          install as root anyway (for example in a container); refused by default
   --force               replace a k3code or k3 in the bin directory that this installer did not create
@@ -70,7 +71,8 @@ Fetched when missing (into PREFIX/share/k3code, no root): uv, Python 3.12+, Node
 pane binary). bubblewrap (sandbox, Linux) is installed only when root or passwordless sudo is available.
 
 Presetup (on by default, after the version is activated; never fails the install): checks the sandbox, installs
-Chromium for the browser tool (about 115 MiB; K3CODE_SKIP_CHROMIUM=1 skips only that) and prints a health subset.
+Chromium for the browser tool (about 115 MiB; K3CODE_SKIP_CHROMIUM=1 skips only that), the offline OCR packages
+(about 120 MiB; K3CODE_SKIP_OCR=1 skips only that) and prints a health subset.
 Without bubblewrap it prints the install command and runs nothing; it asks before a sudo run only on a terminal.
 EOF
 }
@@ -1294,6 +1296,7 @@ presetup() {
   log "presetup (optional; --minimal skips it):"
   presetup_step sandbox presetup_sandbox
   presetup_step chromium presetup_chromium
+  presetup_step ocr presetup_ocr
   presetup_step doctor presetup_doctor
   return 0
 }
@@ -1419,6 +1422,46 @@ presetup_chromium() {
   if chromium_starts; then log "presetup: Chromium installed in $DATA/browsers"; fi
   return 0
 }
+# Offline OCR (core/src/k3code/ocr.py): RapidOCR's PP-OCR models ship inside the rapidocr wheel, onnxruntime runs
+# them on the CPU, pypdfium2 renders scanned PDFs. No download after this step: `read` of a screenshot works offline.
+# The versions are the ones core/pyproject.toml's `ocr` extra was tested with (core/uv.lock); they go into the
+# version's venv, so a new version repeats the step (uv's cache makes a repeat cheap). About 120 MiB download
+# (opencv-python-headless is most of it), about 350 MB on disk.
+OCR_PACKAGES="rapidocr==3.10.0 onnxruntime==1.31.0 pypdfium2==5.14.0"
+ocr_present() {
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then [ -f "$DATA/presetup/ocr-stub" ]; return; fi
+  "$VERDIR/venv/bin/python" -c "import rapidocr, onnxruntime, pypdfium2" >/dev/null 2>&1
+}
+
+presetup_ocr() {
+  if [ "${K3CODE_SKIP_OCR:-0}" = 1 ]; then
+    log "presetup: OCR packages skipped (K3CODE_SKIP_OCR=1)"
+    return 0
+  fi
+  if ocr_present; then
+    log "presetup: OCR packages already installed (offline OCR is on)"
+    return 0
+  fi
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
+    mkdir -p "$DATA/presetup"
+    printf 'stub\n' >"$DATA/presetup/ocr-stub"
+    log "presetup: OCR stub (K3_STUB_VENV)"
+    return 0
+  fi
+  if [ "$NO_DEPS" = 1 ]; then
+    log "presetup: OCR packages not installed (--no-install-deps; they download about 120 MiB)"
+    return 0
+  fi
+  log "presetup: installing the offline OCR packages (about 120 MiB download; K3CODE_SKIP_OCR=1 skips it)"
+  # shellcheck disable=SC2086 # OCR_PACKAGES is a list of pinned requirements
+  if ! "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" $OCR_PACKAGES >&2; then
+    log "presetup: WARNING: the OCR packages did not install; images are read with tesseract if it is on PATH, else not at all (run the installer again to retry)"
+    return 0
+  fi
+  if ocr_present; then log "presetup: offline OCR installed (rapidocr; the models are inside the package)"; fi
+  return 0
+}
+
 presetup_doctor() {
   if [ ! -x "$DATA/current/venv/bin/k3code" ]; then
     log "presetup: health subset skipped (k3code is not installed)"

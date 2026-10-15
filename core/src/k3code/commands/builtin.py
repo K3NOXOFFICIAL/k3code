@@ -11,6 +11,7 @@ from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, 
 from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
+from k3code.commands.ocr_cmd import OcrCommand
 from k3code.commands.stats import StatsCommand
 from k3code.commands.tune import TuneCommand
 from k3code.commands.update_cmd import UpdateCommand
@@ -400,6 +401,7 @@ def build_registry() -> CommandRegistry:
         _ExitCommand(),
         _HelpCommand(),
         DoctorCommand(),
+        OcrCommand(),
         UpdateCommand(),
         StatsCommand(),
         DebugCommand(),

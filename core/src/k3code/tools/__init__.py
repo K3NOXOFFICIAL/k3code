@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code import ocr
 from k3code.permissions.engine import search_withheld, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
@@ -319,6 +320,8 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
+    if ocr.is_ocr_candidate(path):
+        return _read_ocr(path)
     explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
     first, count = _read_window(arguments)
     size = path.stat().st_size
@@ -352,6 +355,24 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
         "last": last,
         "total": total,
     }
+
+
+def _read_ocr(path: Path) -> dict[str, Any]:
+    """An image or a PDF: its text through the offline OCR (k3code.ocr), with a header line naming the engine.
+
+    Text-only models never see pixels and the owner's vision-capable models may be unreachable, so the bytes are
+    never returned: the model gets what a person would read off the image. A PDF with a text layer is extracted,
+    not OCR'd. Without an engine the error says how to install one."""
+    try:
+        result = ocr.ocr_file(path)
+    except ocr.OcrUnavailable as exc:
+        return {"error": f"cannot read {path.name}: {exc}"}
+    except Exception as exc:  # noqa: BLE001 - a file the engine cannot decode, a crashed subprocess
+        return {"error": f"OCR of {path} failed: {type(exc).__name__}: {exc}"}
+    text = result.render()
+    if len(text) > READ_MAX_CHARS:
+        text = clip_head_tail(text, READ_MAX_CHARS, "use /ocr <path> for the whole text")
+    return {"content": text, "ocr": {"engine": result.engine, "confidence": result.confidence, "pages": result.pages}}
 
 
 async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -1300,7 +1321,8 @@ def build_registry() -> ToolRegistry:
             description=(
                 "Read a text file. Lines come numbered (number, tab, line); the numbers are not part of the file. "
                 f"Returns up to {READ_DEFAULT_LIMIT} lines; a longer file ends with a note saying which offset "
-                "continues it.\n"
+                "continues it. An image (png, jpg, webp, gif, bmp, tiff) or a PDF returns its text through offline "
+                "OCR (a PDF's text layer when it has one), unnumbered, after a header line naming the engine.\n"
                 f"Limits: {READ_DEFAULT_LIMIT} lines and {READ_MAX_CHARS} chars per call, lines cut at "
                 f"{READ_MAX_LINE_CHARS} chars; a file over {MAX_READ_BYTES // (1024 * 1024)} MB needs offset+limit."
             ),

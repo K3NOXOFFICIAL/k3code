@@ -17,6 +17,10 @@ dependencies = [
 [project.optional-dependencies]
 # the browser tool (research/browser.py): optional, the tool reports when it is missing; `playwright install chromium`
 browser = ["playwright>=1.63"]
+# offline OCR (ocr.py): RapidOCR's PP-OCR models ship inside the rapidocr wheel (no download after the install),
+# onnxruntime runs them on the CPU, pypdfium2 renders scanned PDFs and reads text layers. The installer's presetup
+# adds this extra unless --minimal; without it `read` of an image falls back to tesseract on PATH or says how to enable it.
+ocr = ["rapidocr>=3.10,<4", "onnxruntime>=1.17", "pypdfium2>=4"]
 
 [project.scripts]
 k3code = "k3code.cli:cli"

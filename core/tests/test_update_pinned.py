@@ -163,6 +163,29 @@ def test_carry_playwright_does_nothing_when_the_old_venv_has_none_or_the_new_has
     assert _calls(log) == []
 
 
+def _ocr_venv(data: Path, ver: str, pins: str | None) -> Path:
+    """A version dir whose ``python`` answers the OCR probe with ``pins`` (``rapidocr==3.10.0 ...``) or an error."""
+    d = _venv(data, ver, None)
+    answer = f"echo '{pins}'; exit 0" if pins else "echo 'No module named rapidocr' >&2; exit 1"
+    py = d / "venv" / "bin" / "python"
+    py.write_text(f'#!/bin/sh\ncase "$2" in *rapidocr*) {answer} ;; esac\nexit 2\n')
+    return d
+
+
+def test_carry_ocr_installs_the_same_versions_into_the_new_venv(data: Path, fake_uv: tuple[str, Path]) -> None:
+    uv, log = fake_uv
+    pins = "rapidocr==3.10.0 onnxruntime==1.31.0 pypdfium2==5.14.0"
+    old, new = _ocr_venv(data, "1.0.0", pins), _ocr_venv(data, "1.1.0", None)
+    msg = upd.carry_ocr(old, new, uv=uv)
+    assert msg is not None and "rapidocr==3.10.0" in msg
+    assert _calls(log) == [f"pip install --quiet --python {new / 'venv' / 'bin' / 'python'} {pins}"]
+    assert upd.carry_ocr(_ocr_venv(data, "2.0.0", None), _ocr_venv(data, "2.1.0", None), uv=uv) is None
+    assert upd.carry_ocr(_ocr_venv(data, "3.0.0", pins), _ocr_venv(data, "3.1.0", pins), uv=uv) is None
+    assert len(_calls(log)) == 1
+    # the default carry runs both: a venv with neither extra installs nothing
+    assert upd.carry_extras(_ocr_venv(data, "4.0.0", None), _ocr_venv(data, "4.1.0", None), uv=uv) is None
+
+
 def test_activate_carries_playwright_before_the_smoke_test(data: Path, fake_uv: tuple[str, Path]) -> None:
     uv, log = fake_uv
     _venv(data, "1.0.0", "1.63.0")

@@ -309,6 +309,51 @@ def carry_playwright(prev_vdir: Path, new_vdir: Path, uv: str | None = None) -> 
     return f"carried Playwright {ver} over to the new version"
 
 
+#: The packages of core/pyproject.toml's ``ocr`` extra: what carry_ocr installs again after an update.
+OCR_PACKAGES = ("rapidocr", "onnxruntime", "pypdfium2")
+
+
+def carry_ocr(prev_vdir: Path, new_vdir: Path, uv: str | None = None) -> str | None:
+    """Install the offline OCR packages of ``prev_vdir``'s venv (same versions) into ``new_vdir``'s, like Playwright.
+
+    The installer's presetup adds them and an update builds a fresh venv without them, so `read` of a screenshot
+    would stop working on the first update. The models are inside the rapidocr wheel: nothing else to carry."""
+    old_py = prev_vdir / "venv" / "bin" / "python"
+    new_py = new_vdir / "venv" / "bin" / "python"
+    if not old_py.exists() or not new_py.exists():
+        return None
+    probe = (
+        f"from importlib.metadata import version; print(' '.join(f'{{n}}=={{version(n)}}' for n in {OCR_PACKAGES!r}))"
+    )
+    try:
+        old = subprocess.run([str(old_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if old.returncode != 0 or not old.stdout.strip():
+            return None  # OCR was off before the update: keep it off
+        pins = old.stdout.strip().splitlines()[-1].split()
+        new = subprocess.run([str(new_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if new.returncode == 0:
+            return None  # the new version brings its own
+        r = subprocess.run(
+            [uv or uv_path(), "pip", "install", "--quiet", "--python", str(new_py), *pins],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"warning: could not carry the OCR packages over ({type(e).__name__}: {e}); offline OCR is off"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()[-300:]
+        return f"warning: could not install the OCR packages into the new version ({err}); offline OCR is off"
+    return f"carried the OCR packages over to the new version ({' '.join(pins)})"
+
+
+def carry_extras(prev_vdir: Path, new_vdir: Path, uv: str | None = None) -> str | None:
+    """Every optional package set the previous venv had (Playwright, OCR), one log line or None."""
+    lines = [m for m in (carry_playwright(prev_vdir, new_vdir, uv), carry_ocr(prev_vdir, new_vdir, uv)) if m]
+    return "; ".join(lines) if lines else None
+
+
 def activate(
     version: str,
     *,
@@ -319,14 +364,14 @@ def activate(
     manager_reachable: Callable[[], bool] = service.manager_reachable,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
-    carry: Callable[[Path, Path], str | None] = carry_playwright,
+    carry: Callable[[Path, Path], str | None] = carry_extras,
 ) -> UpdateResult:
     """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure.
 
     A daemon that was stopped before the switch stays stopped: the new version is activated and nothing is started.
 
     Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
-    package the current one has (before the smoke test, which then runs the venv as it will be used)."""
+    and OCR packages the current one has (before the smoke test, which then runs the venv as it will be used)."""
     vdir = version_dir(version)
     prev = current_version()
     log: list[str] = []
