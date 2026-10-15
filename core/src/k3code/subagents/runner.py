@@ -13,6 +13,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,10 @@ class Handle:
     tail: list[str] = field(default_factory=list)
     index: int = 0
     count: int = 1
+    #: called as ``on_usage(handle, final)`` right after each model call adds to ``tokens_in``/``tokens_out``, from
+    #: the child's own task; ``final`` = the reply has no tool calls, so the child makes no further call. A fan-out
+    #: with a token cap stops its running children there once the cap is crossed
+    on_usage: Callable[[Handle, bool], None] | None = field(default=None, repr=False)
 
     @property
     def done(self) -> bool:
@@ -515,6 +520,11 @@ class SubagentManager:
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens
+                        if h.on_usage is not None:
+                            try:
+                                h.on_usage(h, not msg.tool_calls)
+                            except Exception:  # noqa: BLE001 - a budget watcher must not take the child down
+                                logger.exception("sub-agent %s: usage callback failed", h.id)
                     if msg.content:
                         final = msg.content
                         if msg.tool_calls:
