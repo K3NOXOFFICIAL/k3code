@@ -1663,14 +1663,25 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
     return out, remote
 
 
+def _trap_action(args: list[str]) -> str:
+    """The action string of ``trap`` with arguments ``args``: shell that runs later (at exit, on a signal, on
+    ERR/DEBUG), so it is read like a ``bash -c`` payload. "" when there is none: ``trap -l``, ``trap -p``, a lone ``-``
+    (resets the traps) or an empty action (ignores the signals)."""
+    letters, operands = _builtin_options(args)
+    if set(letters) & set("lp") or not operands or operands[0] == "-":
+        return ""
+    return operands[0]
+
+
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
-    values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and the command line of ``wsl.exe``, ``cmd.exe /c``
-    and ``powershell.exe -Command`` (see _windows_command_line): strings run as commands, unquoted as the shell
-    unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word gives
-    (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the backslashes
-    the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the two, and
-    shlex's reading is checked as well. Identical readings are one reading."""
+    action string of ``trap`` (see _trap_action), the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and
+    the command line of ``wsl.exe``, ``cmd.exe /c`` and ``powershell.exe -Command`` (see _windows_command_line):
+    strings run as commands, unquoted as the shell unquotes them (see _shell_words). An unquoted ``${...}`` is read
+    both as written and as the text its word gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double
+    quotes both as written and with the backslashes the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs
+    `` `a` ``), every combination of the two, and shlex's reading is checked as well. Identical readings are one
+    reading."""
     out: list[str] = []
     readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote in (False, True) for unescape in (True, False)]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
@@ -1680,6 +1691,8 @@ def _launcher_payloads(sub: str) -> list[str]:
         real = normalize_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real and real[0] == "trap" and (action := _trap_action(real[1:])):
+            out.append(action)
         if real:
             out += ssh_option_commands(real[0], real[1:])
             out += _windows_command_line(real[0], real[1:])
