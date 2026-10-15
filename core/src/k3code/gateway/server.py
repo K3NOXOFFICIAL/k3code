@@ -95,7 +95,7 @@ from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
-from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, shared_netwatch
+from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, sandbox, shared_netwatch
 from k3code.reliability import events as rev
 from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
@@ -750,6 +750,7 @@ class GatewayServer:
         self.live.pop(sid, None)
         self.learning.settle_turns(sid)  # the session ended: its last turn can no longer be undone
         await tool_jobs.reap(sid)  # background bash jobs end with their session
+        await asyncio.to_thread(sandbox.remove_session_tmp, self._home(), sid)  # so does its private /tmp
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -3062,7 +3063,8 @@ class GatewayServer:
         return n
 
     def remove_session_files(self, sid: str) -> None:
-        """A deleted or swept session's files: its tool journal, transcript checkpoint and stored pastes.
+        """A deleted or swept session's files: its tool journal, transcript checkpoint, stored pastes and private
+        ``/tmp``.
 
         ``sid`` comes from a client (session.delete): only a plain name is used, never ``.``, ``..`` or a path (``..``
         would have made the pastes directory ``$K3CODE_HOME`` itself)."""
@@ -3073,6 +3075,7 @@ class GatewayServer:
         pastes = home / PASTES_DIR / sid
         if pastes.is_dir() and not pastes.is_symlink():
             shutil.rmtree(pastes, ignore_errors=True)
+        sandbox.remove_session_tmp(home, sid)  # the private /tmp of its sandboxed bash calls
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
         """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
@@ -3091,7 +3094,12 @@ class GatewayServer:
         return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
 
     def compact_storage(self) -> int:
-        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
+        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem, and
+        remove the private ``/tmp`` directories of sessions that are not live (a session that ended with the last
+        daemon, or was deleted while it was down; see :func:`sandbox.prune_session_tmps`)."""
+        removed = sandbox.prune_session_tmps(self._home(), keep=lambda sid: sid in self.live)
+        if removed:
+            logger.info("removed the private /tmp of %d ended session(s)", removed)
         return self.store.compact()
 
     async def resume_goals(self) -> int:

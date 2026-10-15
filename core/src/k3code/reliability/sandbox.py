@@ -35,7 +35,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,18 @@ logger = logging.getLogger(__name__)
 HOME_CACHE = ".cache"
 SANDBOX_CACHE = "sandbox-cache"
 HOME_UV = (".local/share/uv/python", ".local/share/uv/tools")
+#: Package caches of ``$HOME`` shown read-only, like uv's: a ``cargo build`` or ``go build`` with its dependencies
+#: already fetched finds them there instead of downloading again (or failing offline). Read-only is enough for that
+#: (a fetch of a new dependency needs the host, as with uv); they are not given a writable copy under the sandbox
+#: cache the way ``~/.cache`` is, because cargo's registry index and go's module cache are large and the sandbox
+#: cache would double them. ``~/.cargo/credentials.toml`` (registry tokens) is not under these and stays hidden; an
+#: entry that is a link into a secrets folder or back to ``$HOME`` is skipped (see _home_readonly_paths).
+HOME_PACKAGE_CACHES = (".cargo/registry", ".cargo/git", "go/pkg/mod")
+#: Where each session's private ``/tmp`` lives below the k3code home (``tmp/<session id>``, 0700): bound at ``/tmp``
+#: for every sandboxed bash call of that session, so a file written there is still there in the next call, and
+#: removed when the session ends (see :func:`remove_session_tmp`) or at daemon start for sessions that are not live
+#: (see :func:`prune_session_tmps`). A call with no session (a probe, an automation shell) gets a tmpfs instead.
+SESSION_TMP = "tmp"
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
@@ -137,12 +149,16 @@ def configured_home_readonly() -> list[str]:
 HOME_READONLY_REFUSED = (".gnupg", ".aws")
 
 
-def _home_readonly_paths(home: Path, entries: Iterable[object], writable: Iterable[Path] = ()) -> list[Path]:
+def _home_readonly_paths(
+    home: Path, entries: Iterable[object], writable: Iterable[Path] = (), *, quiet: bool = False
+) -> list[Path]:
     """The entries that may be bound read-only: relative to ``$HOME``, present, and neither ``$HOME`` itself, nor
     above or inside a secret (``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code home), nor above a writable root
     (``writable``: the project, added dirs, the cache), which a read-only bind would shadow. Anything else is
-    skipped with a warning; an entry that cannot be inspected (name too long, no permission) is skipped too, never
-    raised: a sandbox that cannot be built would leave bash running without one."""
+    skipped with a warning (``quiet``: at debug level, for the built-in entries nobody configured); an entry that
+    cannot be inspected (name too long, no permission) is skipped too, never raised: a sandbox that cannot be built
+    would leave bash running without one."""
+    warn = logger.debug if quiet else logger.warning
     xdg = os.environ.get("XDG_CONFIG_HOME")
     guarded = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED)] + [paths.home()]
     if xdg:
@@ -151,14 +167,14 @@ def _home_readonly_paths(home: Path, entries: Iterable[object], writable: Iterab
         secrets = [g.resolve() for g in guarded]
         roots = [Path(w).resolve() for w in writable]
     except (OSError, ValueError, RuntimeError):
-        logger.warning("sandbox: home_readonly ignored (could not resolve the guarded paths)", exc_info=True)
+        warn("sandbox: home_readonly ignored (could not resolve the guarded paths)", exc_info=True)
         return []
     out: list[Path] = []
     for raw in entries:
         text = raw.strip() if isinstance(raw, str) else ""
         rel = Path(text) if text else None
         if rel is None or rel.is_absolute() or ".." in rel.parts or rel.parts in ((), (".",)):
-            logger.warning("sandbox: ignoring home_readonly entry %r (must be a path below $HOME)", raw)
+            warn("sandbox: ignoring home_readonly entry %r (must be a path below $HOME)", raw)
             continue
         path = home / rel
         try:
@@ -166,16 +182,71 @@ def _home_readonly_paths(home: Path, entries: Iterable[object], writable: Iterab
                 continue
             real = path.resolve()
         except (OSError, ValueError, RuntimeError):
-            logger.warning("sandbox: ignoring home_readonly entry %r (cannot be inspected)", raw)
+            warn("sandbox: ignoring home_readonly entry %r (cannot be inspected)", raw)
             continue
         if exposes_home(real, home) or any(real.is_relative_to(s) or s.is_relative_to(real) for s in secrets):
-            logger.warning("sandbox: ignoring home_readonly entry %r (reaches $HOME or a secrets folder)", raw)
+            warn("sandbox: ignoring home_readonly entry %r (reaches $HOME or a secrets folder)", raw)
             continue
         if any(r.is_relative_to(real) for r in roots):
-            logger.warning("sandbox: ignoring home_readonly entry %r (it contains a writable folder)", raw)
+            warn("sandbox: ignoring home_readonly entry %r (it contains a writable folder)", raw)
             continue
         out.append(path)
     return out
+
+
+def _hides_a_store(path: Path, home: Path) -> bool:
+    """A read-only bind of ``path`` would show a credential store of :data:`HOME_RO_HIDDEN` (``~/.cargo/credentials``,
+    a link ``~/.cargo/registry -> ~/.cargo`` would): the store lies at or below where ``path`` really is."""
+    try:
+        real = path.resolve()
+        return any((home / s).resolve().is_relative_to(real) for s in HOME_RO_HIDDEN if (home / s).exists())
+    except (OSError, ValueError, RuntimeError):
+        return True
+
+
+def _plain_session_id(session_id: str) -> bool:
+    """``session_id`` can name a directory of its own: no path separators, not ``.``/``..`` (``..`` would make the
+    session's tmp directory the k3code home itself)."""
+    return bool(session_id) and session_id not in (".", "..") and not any(c in session_id for c in "/\\\0")
+
+
+def session_tmp_dir(session_id: str) -> Path | None:
+    """The host directory bound at ``/tmp`` for ``session_id``'s sandboxed bash calls (``<k3code home>/tmp/<id>``,
+    created 0700 with its parent), or None when there is no session or it cannot be made: the call then gets a tmpfs
+    and keeps nothing between commands."""
+    if not _plain_session_id(session_id):
+        return None
+    try:
+        return paths.ensure_private_dir(paths.home() / SESSION_TMP / session_id)
+    except (OSError, RuntimeError):
+        logger.warning("sandbox: no tmp directory for session %s under the k3code home; /tmp is not kept", session_id)
+        return None
+
+
+def remove_session_tmp(home: Path, session_id: str) -> None:
+    """Remove the session's private ``/tmp`` (see :func:`session_tmp_dir`) when the session ends or is deleted. A
+    symlink in its place is left alone: a sandboxed command could not have made the directory itself one, but
+    nothing on the host is removed through a link."""
+    if not _plain_session_id(session_id):
+        return
+    path = home / SESSION_TMP / session_id
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def prune_session_tmps(home: Path, *, keep: Callable[[str], bool]) -> int:
+    """Daemon start: remove every session tmp directory whose session is not ``keep(session_id)`` (live). Returns how
+    many went. A session resumed later starts with an empty ``/tmp`` again."""
+    root = home / SESSION_TMP
+    if not root.is_dir() or root.is_symlink():
+        return 0
+    removed = 0
+    with contextlib.suppress(OSError):
+        for entry in os.scandir(root):
+            if entry.is_dir(follow_symlinks=False) and not keep(entry.name):
+                shutil.rmtree(entry.path, ignore_errors=True)
+                removed += 1
+    return removed
 
 
 def bwrap_path() -> str | None:
@@ -754,6 +825,7 @@ def build_argv(
     readonly_home: bool = False,
     cache_dir: Path | None = None,
     git_writable: bool | None = None,
+    tmp_dir: Path | None = None,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
 
@@ -778,6 +850,9 @@ def build_argv(
 
     ``cache_dir`` is the host directory shown as ``~/.cache`` (default: ``<k3code home>/sandbox-cache``, created on
     demand). The probes pass a scratch one so that asking whether bwrap works never creates state under the real home.
+
+    ``tmp_dir`` is the host directory bound at ``/tmp`` (a session's own, see :func:`session_tmp_dir`); without one
+    ``/tmp`` is a fresh tmpfs that is gone when the command ends. Either way nothing in ``/tmp`` is the host's.
     """
     home = Path(home or Path.home())
     roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
@@ -813,9 +888,10 @@ def build_argv(
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
             shown.append(path)
-    argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    argv += ["--proc", "/proc", "--dev", "/dev"]
+    argv += ["--bind", str(tmp_dir), "/tmp"] if tmp_dir is not None else ["--tmpfs", "/tmp"]
     # A resolver file linked anywhere else (WSL 2: /mnt/wsl/resolv.conf) is bound at its own path, after the /tmp
-    # tmpfs and before $HOME is masked; never from $HOME or the k3code home. Both spellings of those count: the later
+    # mount and before $HOME is masked; never from $HOME or the k3code home. Both spellings of those count: the later
     # mounts use the given path, and a link recreated above it would make bwrap fail to place them.
     xdg = os.environ.get("XDG_CONFIG_HOME")
     private = [home, paths.home(), *([Path(xdg) / "k3code"] if xdg else [])]
@@ -832,6 +908,9 @@ def build_argv(
         uv = home / entry
         if uv.is_dir():
             argv += ["--ro-bind", str(uv), str(uv)]
+    for path in _home_readonly_paths(home, HOME_PACKAGE_CACHES, [*roots, cache], quiet=True):
+        if path.is_dir() and not _hides_a_store(path, home):
+            argv += ["--ro-bind", str(path), str(path)]
     if git_writable is None:
         git_writable = configured_git_writable()
     seen: set[str] = set()

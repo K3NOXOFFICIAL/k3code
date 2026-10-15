@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from k3code import userhooks
+from k3code import paths, userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
 from k3code.goals import loop_evidence
@@ -26,6 +26,7 @@ from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt, subagent_system_prompt
 from k3code.providers.types import ToolCall
+from k3code.reliability import sandbox
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
 from k3code.subagents import worktree as wt_mod
@@ -541,6 +542,8 @@ class SubagentManager:
             # the child's background bash jobs are filed under its own id: no session close ever reaps them
             with contextlib.suppress(Exception):
                 await tool_jobs.reap(h.id)
+            with contextlib.suppress(Exception):  # its private /tmp goes with it
+                await asyncio.to_thread(sandbox.remove_session_tmp, paths.home(), h.id)
             await self._stop_reliability(reliability)
         if loop.interrupted:
             h.status = "interrupted"

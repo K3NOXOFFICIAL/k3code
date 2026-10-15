@@ -201,7 +201,6 @@ def test_answering_in_the_pane_cancels_the_hold(tuios):
 # ── new panes ────────────────────────────────────────────────────────
 
 
-@pytest.mark.serial  # load-sensitive under the 8-worker run; passes alone
 async def test_bg_pane_sends_start_agent(tuios, tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, monkeypatch, replies=["done"])
     server.panes = PaneLink.from_env(environ=tuios.env())
@@ -212,12 +211,16 @@ async def test_bg_pane_sends_start_agent(tuios, tmp_path, monkeypatch):
     new_sid = res["session_id"]
     assert res["open_pane"]["session_id"] == new_sid and not res["open_pane"]["readonly"]
     # the result frame is what the tap reads
-    await rpc(server, "slash.exec", {"command": "bg --pane again", "session_id": sid})
-    started = tuios.wait_for("start-agent")
-    assert started
-    p = started[0]
+    again = await rpc(server, "slash.exec", {"command": "bg --pane again", "session_id": sid})
+    again_sid = again["result"]["session_id"]
+    # each open_pane runs start-agent on a thread of its own, so the two calls reach the socket in either order:
+    # wait for both and pick each by its session id instead of trusting the order
+    started = tuios.wait_for("start-agent", n=2, timeout=20.0)
+    by_sid = {s: [p for p in started if s in p["agent"]] for s in (new_sid, again_sid)}
+    assert all(len(v) == 1 for v in by_sid.values()), started
+    p = by_sid[new_sid][0]
     assert p["session"] == "work" and p["focus"] is False
-    assert " attach " in p["agent"] and new_sid in p["agent"] and "--readonly" not in p["agent"]
+    assert " attach " in p["agent"] and "--readonly" not in p["agent"]
 
 
 async def test_bg_pane_outside_panes_is_a_plain_bg(tuios, tmp_path, monkeypatch):

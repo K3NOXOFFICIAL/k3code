@@ -573,10 +573,12 @@ _SENSITIVE_TARGET = re.compile(
 
 
 #: The one place outside the project roots an auto-mode bash redirect may write: auto-mode bash runs in the bwrap
-#: sandbox, whose ``/tmp`` is a fresh tmpfs of its own (``--tmpfs /tmp``, see sandbox.build_argv) that nothing on the
-#: host sees and that is gone when the command ends; without a usable bwrap the loop asks a person before it runs a
-#: command only auto mode allowed (no rule allow covers a redirect outside the roots: _voids_allow), and an unattended
-#: run refuses bash. Refusing ``pytest > /tmp/out.txt 2>&1; tail /tmp/out.txt`` protected nothing.
+#: sandbox, whose ``/tmp`` is the session's own directory under the k3code home (``~/.k3code/tmp/<session>``, 0700,
+#: bound at ``/tmp``; see sandbox.session_tmp_dir) or, with no session, a tmpfs gone when the command ends (see
+#: sandbox.build_argv). Either way nothing the host keeps in its ``/tmp`` is reachable there, and a file written to
+#: ``/tmp`` lands only in that directory; without a usable bwrap the loop asks a person before it runs a command only
+#: auto mode allowed (no rule allow covers a redirect outside the roots: _voids_allow), and an unattended run refuses
+#: bash. Refusing ``pytest > /tmp/out.txt 2>&1; tail /tmp/out.txt`` protected nothing.
 _SANDBOX_TMP = "/tmp"
 
 

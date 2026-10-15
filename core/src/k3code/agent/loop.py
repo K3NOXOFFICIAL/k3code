@@ -639,7 +639,11 @@ class AgentLoop:
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
                 if readonly_home:
                     argv = await asyncio.to_thread(
-                        sandbox.build_argv, self.cwd, self.permissions.add_dirs, readonly_home=True
+                        sandbox.build_argv,
+                        self.cwd,
+                        self.permissions.add_dirs,
+                        readonly_home=True,
+                        tmp_dir=self._session_tmp(),
                     )
                 elif contained:
                     argv = await asyncio.to_thread(self._contained_argv, git_writable=git_writable)
@@ -840,12 +844,23 @@ class AgentLoop:
         """The bwrap sandbox can run a bash call here: bwrap is usable and it accepts the session's roots."""
         return sandbox.usable() and sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is None
 
+    def _session_tmp(self) -> Path | None:
+        """The session's private ``/tmp`` for its sandboxed bash calls (see :func:`sandbox.session_tmp_dir`): the
+        same host directory for every call, so ``/tmp`` keeps its files between them."""
+        return sandbox.session_tmp_dir(self.session_id)
+
     def _contained_argv(self, git_writable: bool | None = None) -> list[str]:
         """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode.
         ``git_writable``: as :func:`sandbox.build_argv` (None = the user's ``sandbox.git_writable``)."""
         unattended = self.background or self.unattended
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
+        return sandbox.build_argv(
+            self.cwd,
+            self.permissions.add_dirs,
+            network=network,
+            git_writable=git_writable,
+            tmp_dir=self._session_tmp(),
+        )
 
     def _sandbox_argv(self, git_writable: bool | None = None) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
@@ -866,7 +881,13 @@ class AgentLoop:
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
             return None
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
+        return sandbox.build_argv(
+            self.cwd,
+            self.permissions.add_dirs,
+            network=network,
+            git_writable=git_writable,
+            tmp_dir=self._session_tmp(),
+        )
 
     # ── M2 reliability helpers ──
 
