@@ -102,6 +102,13 @@ export async function buildTui(options) {
       join(product, "package.json"),
       JSON.stringify({ type: "module" }) + "\n",
     );
+    // The same marker inside dist/, which is all the installer copies and the release tarball ships: without
+    // one above it Node took the ESM bundle for CommonJS and parsed it twice (start-up peak ~100 MB instead of
+    // ~88 MB), and a Node without module-syntax detection could not start it (#164).
+    writeFileSync(
+      join(product, "dist", "package.json"),
+      JSON.stringify({ type: "module" }) + "\n",
+    );
     recordProduct({
       source,
       product: "tui",
