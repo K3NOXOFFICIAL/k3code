@@ -1590,15 +1590,16 @@ def config_edit_cmd(project: bool) -> None:
 @click.argument("action", type=click.Choice(["edit", "list"]), default="list")
 @click.option("--user", is_flag=True, help="User memory instead of project memory")
 def memory_cmd(action: str, user: bool) -> None:
-    """List memory files, or open one in $EDITOR."""
+    """List the memory files the prompt reads here (the same listing as /memory), or open one in $EDITOR."""
     from k3code.commands.config_cmd import open_editor
+    from k3code.commands.memory_cmd import memory_listing
+    from k3code.config import load_config
     from k3code.memory import project_memory_path, user_memory_path
 
     target = user_memory_path() if user else project_memory_path(Path.cwd())
     if action == "edit":
         raise SystemExit(open_editor(target))
-    for scope, p in (("user", user_memory_path()), ("project", project_memory_path(Path.cwd()))):
-        click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
+    click.echo(memory_listing(Path.cwd(), load_config(project_dir=Path.cwd()))[0])
 
 
 # ── schedule (cron jobs) ──────────────────────────────────────────────
