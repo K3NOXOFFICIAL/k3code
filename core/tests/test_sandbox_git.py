@@ -183,3 +183,155 @@ async def test_a_linked_worktree_can_commit_but_not_plant_a_hook(tmp_path):
     assert not (common / "hooks" / "pre-commit").exists()
     assert (common / "config").read_bytes() == config
     assert (wt / ".git").read_bytes() == pointer
+
+
+# ── #101 leftover: a git_writable command can still plant a commondir / worktree admin dir / config.worktree key ──
+
+
+def _snapshot_scrub(repo: Path):
+    """Snapshot before, return a callable that scrubs and gives the notes (what the loop does around a bash call)."""
+    snap = sandbox.snapshot_git_writable(repo)
+    return lambda: sandbox.scrub_git_writable_changes(snap)
+
+
+@needs_bwrap
+async def test_a_planted_commondir_in_the_main_git_is_removed_after_the_command(tmp_path):
+    """The hole git_writable left (``_git_metadata_argv``): the .git root stays writable for git's lock files, so a
+    command can create a ``.git/commondir`` that points the next git run's config and hooks elsewhere. The scrub
+    removes a commondir that was not there before; the user's metadata (no commondir on a normal repo) is unchanged."""
+    repo = _repo(tmp_path / "repo")
+    assert not (repo / ".git" / "commondir").exists()
+    scrub = _snapshot_scrub(repo)
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", git_writable=True)
+    # the .git root is writable, so the command succeeds at planting the file
+    planted = await tool_bash({"command": "echo /tmp/evil > .git/commondir"}, cwd=repo, sandbox=argv)
+    assert planted["exit_code"] == 0, planted
+    assert (repo / ".git" / "commondir").exists()
+    notes = scrub()
+    assert not (repo / ".git" / "commondir").exists()  # removed
+    assert any("commondir" in n for n in notes), notes
+    # the repo still works under harness git (which is what runs outside the sandbox)
+    assert _git(repo, "rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
+
+
+@needs_bwrap
+async def test_a_new_worktree_admin_dir_planted_from_the_sandbox_is_removed(tmp_path):
+    """A command can also create a ``.git/worktrees/<x>`` admin dir (its own commondir redirects a later git run). The
+    scrub removes admin dirs that appeared; a real worktree's admin dir that existed before is kept."""
+    repo = _repo(tmp_path / "repo")
+    real_wt = tmp_path / "realwt"
+    _git(repo, "worktree", "add", "-q", str(real_wt), "-b", "real")
+    before = {d.name for d in (repo / ".git" / "worktrees").iterdir()}
+    scrub = _snapshot_scrub(repo)
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", git_writable=True)
+    plant = (
+        "mkdir -p .git/worktrees/evil && echo /tmp/evil > .git/worktrees/evil/commondir "
+        "&& echo x > .git/worktrees/evil/gitdir"
+    )
+    planted = await tool_bash({"command": plant}, cwd=repo, sandbox=argv)
+    assert planted["exit_code"] == 0, planted
+    assert (repo / ".git" / "worktrees" / "evil").is_dir()
+    notes = scrub()
+    assert not (repo / ".git" / "worktrees" / "evil").exists()  # the planted one is gone
+    assert {d.name for d in (repo / ".git" / "worktrees").iterdir()} == before  # the real one stays
+    assert any("evil" in n for n in notes), notes
+
+
+def test_config_worktree_bind_already_stops_a_sandboxed_write_of_it(tmp_path):
+    """``config.worktree`` is one of the GIT_CODE_ENTRIES, so build_argv binds it (or an empty stand-in) read-only:
+    a sandboxed command cannot write it in the first place. The scrub below is a second line of defence."""
+    repo = _repo(tmp_path / "repo")
+    cfgw = repo / ".git" / "config.worktree"
+    assert not cfgw.exists()
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", bwrap=BWRAP, git_writable=True)
+    assert str(cfgw) in _ro_binds(argv)  # bound read-only even though it did not exist (a stand-in was made)
+    assert cfgw.exists() and cfgw.read_bytes() == b""
+
+
+def test_the_scrub_strips_only_code_keys_a_command_added_to_config_worktree(tmp_path):
+    """Defence in depth for ``config.worktree``: compared against the snapshot, code keys that appeared after the
+    command are stripped, a code key the user already had is kept, and so are harmless keys. Driven at the host level
+    because the read-only bind means a sandboxed command never reaches the file."""
+    repo = _repo(tmp_path / "repo")
+    cfgw = repo / ".git" / "config.worktree"
+    _git(repo, "config", "extensions.worktreeConfig", "true")
+    # the user's own config.worktree already has one code key (a textconv driver) and a harmless one
+    cfgw.write_text('[diff "mine"]\n\ttextconv = my-own\n[user]\n\tname = keep\n')
+    snap = sandbox.snapshot_git_writable(repo)
+    # a command then appends more code keys and another harmless one
+    with cfgw.open("a") as fh:
+        fh.write(
+            "[core]\n\thooksPath = /tmp/evil\n\tpager = evil\n[include]\n\tpath = /tmp/e\n[user]\n\temail = also-keep\n"
+        )
+    notes = sandbox.scrub_git_writable_changes(snap)
+    text = cfgw.read_text()
+    assert "hooksPath" not in text and "pager" not in text and "include" not in text.lower(), text
+    assert "my-own" in text  # the user's own code key is kept (it was in the snapshot)
+    assert "name = keep" in text and "email = also-keep" in text  # harmless keys untouched
+    assert notes and "config.worktree" in notes[0]
+
+
+def test_a_repo_with_no_git_writable_planting_is_left_untouched(tmp_path):
+    """The scrub removes only what a command added: a clean repo (even one with a legitimate commondir in a linked
+    worktree) comes back with the same metadata and no notes."""
+    repo = _repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", str(wt), "-b", "work")
+    # snapshot from the linked worktree's cwd: its own admin dir has a commondir, which must NOT be removed
+    snap = sandbox.snapshot_git_writable(wt.resolve())
+    admin_commondir = (repo / ".git" / "worktrees" / "wt" / "commondir").resolve()
+    assert admin_commondir.exists()
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert notes == []
+    assert admin_commondir.exists()  # the worktree's real commondir is kept
+
+
+def test_harness_git_disables_hooks_and_fsmonitor(tmp_path):
+    """The next git run outside the sandbox is harness git; it must not run a hook or fsmonitor program even if one is
+    configured (the second line of defence behind the scrub)."""
+    import os
+
+    assert sandbox.harness_git_argv("status")[:5] == [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ]
+    env = sandbox.harness_git_env()
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_CONFIG_GLOBAL"] == os.devnull
+
+
+def test_code_config_key_matching():
+    """The subsection wildcard (``filter..clean``) matches any driver name; a plain key matches exactly."""
+    ok = sandbox._is_code_config_key
+    assert ok("core.hookspath") and ok("core.fsmonitor") and ok("core.sshcommand")
+    assert ok("filter.lfs.clean") and ok("diff.mydrv.textconv") and ok("merge.ours.driver")
+    assert ok("include.path") and ok("includeif.gitdir:/.path") and ok("credential.https://x.helper")
+    assert not ok("user.name") and not ok("core.editorzzz") and not ok("filter.lfs.required")
+
+
+@needs_bwrap
+async def test_the_agent_loop_scrubs_a_planted_commondir_around_a_git_writable_bash_call(tmp_path, monkeypatch):
+    """End to end: a yolo loop with ``sandbox.git_writable`` on runs a bash call that plants a ``.git/commondir``; the
+    loop snapshots before and scrubs after, so the file is gone when the call returns (the next git run is safe)."""
+    from k3code.providers.types import ToolCall
+    from test_token_context_budget import make_loop
+    from test_wire_clip import Recorder, text_reply, tool_reply
+
+    k3home = tmp_path / "k3home"
+    k3home.mkdir()
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    (k3home / "config.yaml").write_text(yaml.safe_dump({"sandbox": {"git_writable": True}}))
+    assert sandbox.configured_git_writable() is True
+
+    repo = _repo(tmp_path / "repo")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    call = ToolCall(id="b", name="bash", arguments={"command": "echo /tmp/evil > .git/commondir && echo planted"})
+    provider = Recorder([tool_reply(call), text_reply("done")])
+    loop = make_loop(repo, provider, window=None)
+    async for _ in loop.run("plant it"):
+        pass
+    result = next(m.content for m in loop.turn_messages if m.role == "tool")
+    assert "planted" in result  # the command ran (the .git root is writable)
+    assert not (repo / ".git" / "commondir").exists()  # but the loop removed what it planted

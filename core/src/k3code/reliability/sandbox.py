@@ -4,8 +4,11 @@ Sandboxed: auto/yolo sessions, and every unattended session (background run, loo
 sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (only the cache dirs come back), the
 project is writable, and its git metadata is read-only so a command cannot plant a hook. ``sandbox.git_writable: true``
 makes the git metadata writable (``git add``/``commit``/``branch`` work) except the parts git runs as code or reads to
-pick what it runs (hooks, config, ``info/``: see :data:`GIT_CODE_ENTRIES`); it leaves one hole open (a planted
-``commondir``, see :func:`_git_metadata_argv`), so it is off by default. The network stays on for
+pick what it runs (hooks, config, ``info/``: see :data:`GIT_CODE_ENTRIES`). The ``.git`` root stays writable for git's
+lock files, so a command there can still plant a ``commondir`` (or a new ``worktrees/<x>`` admin dir, or a code key in
+``config.worktree``) that the next git run would follow; the loop undoes exactly that after each ``git_writable`` bash
+call (:func:`snapshot_git_writable` / :func:`scrub_git_writable_changes`), and harness git runs with hooks and
+fsmonitor off regardless (see :func:`harness_git_argv`), so it is still off by default. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
 Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
@@ -30,7 +33,9 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from k3code import paths
 from k3code.paths import GATEWAY_ENV_VARS
@@ -315,6 +320,39 @@ def _git_metadata(root: Path) -> list[Path]:
 #: linked worktree's admin dir (``worktrees/<name>/``) too.
 GIT_CODE_ENTRIES = ("hooks", "config", "config.worktree", "info", "commondir", "modules")
 
+#: Git config keys that make git run a program (or read one), by lower-case ``section.key`` or, for a key inside a
+#: named subsection, ``section..key`` (the subsection name is whatever the repo chose). The post-command scrub
+#: (:func:`scrub_git_writable_changes`) strips these from a ``config.worktree`` a ``git_writable`` command planted,
+#: so the next harness git outside the sandbox does not run them. It mirrors what the sandbox already denies at the
+#: source (the edit tools and the read-only ``GIT_CODE_ENTRIES`` binds); the plain ``config`` cannot be written
+#: (it is bound read-only), so only ``config.worktree`` is scrubbed.
+GIT_CODE_CONFIG_KEYS = (
+    "core.hookspath",
+    "core.fsmonitor",
+    "core.sshcommand",
+    "core.editor",
+    "core.pager",
+    "core.askpass",
+    "core.gitproxy",
+    "diff..command",  # diff.<driver>.command
+    "diff..textconv",
+    "diff.external",
+    "filter..clean",  # filter.<name>.clean / .smudge / .process
+    "filter..smudge",
+    "filter..process",
+    "merge..driver",  # merge.<driver>.driver
+    "sequence.editor",
+    "gpg.program",
+    "gpg..program",  # gpg.<format>.program
+    "credential.helper",
+    "credential..helper",  # credential.<url>.helper
+    "ssh.variant",
+    "fsmonitor.hookversion",
+    "uploadpack.packobjectshook",
+)
+#: ``include.path`` / ``includeif.*.path`` pull another config file in (which could set any of the above); stripped too.
+_GIT_INCLUDE_KEYS = ("include.path", "includeif..path")
+
 
 #: Stand-ins for the :data:`GIT_CODE_ENTRIES` a git dir lacks, made on the host before the sandbox starts so a
 #: read-only bind can cover them and the command cannot create them: an empty directory or file reads as git's default.
@@ -371,10 +409,12 @@ def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: 
 
     A missing entry is made empty on the host first (:func:`_make_git_standins`), so the command cannot create it.
 
-    Not covered, and the reason ``sandbox.git_writable`` is off by default: a ``commondir`` file in the main ``.git``.
-    git dies on any stand-in for it, and the ``.git`` root must stay writable for git's lock files (``index.lock``,
-    ``HEAD.lock``), so the command can create one; the next git run outside the sandbox then takes its config and
-    hooks from wherever it points.
+    One hole this bind cannot close (``sandbox.git_writable`` is off by default partly for it): a ``commondir`` file in
+    the main ``.git``. git dies on any stand-in for it, and the ``.git`` root must stay writable for git's lock files
+    (``index.lock``, ``HEAD.lock``), so the command can create one and point the next git run's config and hooks
+    elsewhere. The loop closes it after the fact: it snapshots the writable git dirs before the command
+    (:func:`snapshot_git_writable`) and removes a commondir, a new ``worktrees/<x>`` admin dir or a ``config.worktree``
+    code key the command added (:func:`scrub_git_writable_changes`).
     """
     meta = _git_metadata(root)
     if not writable:
@@ -398,6 +438,198 @@ def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: 
     for p in dict.fromkeys(readonly):
         argv += ["--ro-bind", str(p), str(p)]
     return argv
+
+
+#: What :func:`snapshot_git_writable` records of one git dir, so the scrub can tell what a command added.
+@dataclass
+class _GitDirSnapshot:
+    gitdir: Path
+    had_commondir: bool
+    worktrees: frozenset[str]  # names of worktrees/<name> admin dirs that existed before the command
+    #: {config.worktree path -> the code keys (:func:`_is_code_config_key`) it already held}, so the scrub strips only
+    #: keys a command added, never one the user put there. Keyed by the main git dir's and each worktree admin's file.
+    config_code_keys: dict[str, frozenset[str]] = field(default_factory=dict)
+
+
+def _writable_gitdirs(root: Path, roots: Sequence[Path], home: Path) -> list[Path]:
+    """The git dirs :func:`_git_metadata_argv` left writable for ``root`` under ``git_writable`` (the main ``.git``,
+    and a linked worktree's own admin dir and common dir): the ones a sandboxed command could have written to."""
+    meta = _git_metadata(root)
+    gitdirs = [m for m in meta if m.is_dir() and not m.is_symlink()]
+    inside = [d for d in gitdirs if any(d.resolve().is_relative_to(r) for r in roots)]
+    outside = [d for d in gitdirs if d not in inside]
+    if outside and _linked_worktree_dirs(outside, home):
+        inside += outside  # a real linked worktree admin dir + common dir are writable too
+    return inside
+
+
+def snapshot_git_writable(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> dict:
+    """Record, before a ``git_writable`` sandboxed command, what the writable git dirs hold, so
+    :func:`scrub_git_writable_changes` can remove only what the command added. Opaque token; never raises."""
+    home = Path(home or Path.home())
+    roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
+    snaps: list[_GitDirSnapshot] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            for gitdir in _writable_gitdirs(root, roots, home):
+                g = gitdir.resolve()
+                if g in seen:
+                    continue
+                seen.add(g)
+                wts = set()
+                with contextlib.suppress(OSError):
+                    wts = {d.name for d in (g / "worktrees").iterdir() if d.is_dir() or d.is_symlink()}
+                snaps.append(
+                    _GitDirSnapshot(
+                        g,
+                        (g / "commondir").exists() or (g / "commondir").is_symlink(),
+                        frozenset(wts),
+                        _config_code_keys_of(_config_worktree_files(g, wts)),
+                    )
+                )
+        except (OSError, ValueError, RuntimeError):  # a snapshot that cannot be taken just scrubs nothing later
+            logger.warning("sandbox: could not snapshot git metadata of %s", root, exc_info=True)
+    return {"gitdirs": snaps}
+
+
+def scrub_git_writable_changes(snapshot: Mapping[str, Any]) -> list[str]:
+    """After a ``git_writable`` sandboxed command, undo the one hole git_writable leaves (see :func:`_git_metadata_argv`
+    on ``commondir``): a command could create a ``commondir`` in a git dir that lacked one (pointing the next git run's
+    config and hooks elsewhere), a new ``worktrees/<name>`` admin dir (same, via its own ``commondir``), or write code
+    keys into a writable ``config.worktree``. Compared against ``snapshot``:
+
+    - a ``commondir`` that appeared where there was none is removed;
+    - a ``worktrees/<name>`` admin dir that appeared is removed whole;
+    - the :data:`GIT_CODE_CONFIG_KEYS` and include keys are stripped from every ``config.worktree`` of a writable git
+      dir (the plain ``config`` is bound read-only and cannot be written).
+
+    Returns one human-readable line per thing removed (the caller logs them). Safe because it only *removes* what a
+    model-controlled command just planted and never existed in the user's own metadata; it runs outside the sandbox on
+    the host paths but touches nothing but these git-internal, code-running entries. Never raises.
+    """
+    removed: list[str] = []
+    for snap in snapshot.get("gitdirs", []) if isinstance(snapshot, Mapping) else []:
+        gitdir: Path = snap.gitdir
+        try:
+            if not snap.had_commondir:
+                removed += _remove_planted(gitdir / "commondir", "commondir file", kind="any")
+            wt_root = gitdir / "worktrees"
+            surviving = set(snap.worktrees)
+            with contextlib.suppress(OSError):
+                for d in sorted(wt_root.iterdir(), key=lambda p: p.name):
+                    if (d.is_dir() or d.is_symlink()) and d.name not in snap.worktrees:
+                        removed += _remove_planted(d, f"worktrees/{d.name} admin dir", kind="tree")
+            # config.worktree (the main git dir's and each surviving worktree admin's): strip code keys a command
+            # added. config.worktree is in GIT_CODE_ENTRIES and bound read-only, so this is a second line of defence;
+            # it never touches a code key the user already had (snapshot).
+            for cfg in _config_worktree_files(gitdir, surviving):
+                before = snap.config_code_keys.get(str(cfg), frozenset())
+                removed += _strip_config_code_keys(cfg, keep=before)
+        except Exception:  # noqa: BLE001 - a scrub that fails must not break the turn; the ro binds already held
+            logger.warning("sandbox: scrubbing git_writable changes in %s failed", gitdir, exc_info=True)
+    return removed
+
+
+def _config_worktree_files(gitdir: Path, worktrees: Iterable[str]) -> list[Path]:
+    """The ``config.worktree`` of ``gitdir`` and of each named ``worktrees/<name>`` admin dir under it."""
+    files = [gitdir / "config.worktree"]
+    files += [gitdir / "worktrees" / name / "config.worktree" for name in worktrees]
+    return files
+
+
+def _config_code_keys_of(files: Iterable[Path]) -> dict[str, frozenset[str]]:
+    """{path -> the code keys each ``config.worktree`` already holds}, for files that exist (used by the snapshot)."""
+    out: dict[str, frozenset[str]] = {}
+    for cfg in files:
+        if cfg.is_file() and not cfg.is_symlink():
+            out[str(cfg)] = frozenset(k for k in _list_config_keys(cfg) if _is_code_config_key(k))
+    return out
+
+
+def _remove_planted(path: Path, what: str, *, kind: str) -> list[str]:
+    """Remove a file/symlink (``kind='any'``) or a whole tree (``kind='tree'``) a command planted; returns a note or
+    nothing. Refuses a symlink's target: only the link itself goes."""
+    try:
+        if path.is_symlink() or kind == "any" and path.is_file():
+            path.unlink()
+        elif kind == "tree" and path.is_dir():
+            shutil.rmtree(path)
+        else:
+            return []
+    except OSError:
+        logger.warning("sandbox: could not remove planted %s at %s", what, path, exc_info=True)
+        return []
+    return [f"removed a {what} a sandboxed command planted in {path.parent}"]
+
+
+def _list_config_keys(cfg: Path) -> list[str] | None:
+    """The config keys of ``cfg`` (lower-case ``--name-only`` names), or None when git cannot parse the file. Reads
+    with the harness env (no system/global config, hooks and fsmonitor off), so listing runs nothing."""
+    try:
+        listed = subprocess.run(
+            ["git", *HARNESS_GIT_CONFIG, "config", "--file", str(cfg), "--name-only", "--list"],
+            capture_output=True,
+            text=True,
+            env=child_env(HARNESS_GIT_ENV),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listed.returncode != 0:
+        return None
+    return [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+
+
+def _strip_config_code_keys(cfg: Path, *, keep: frozenset[str] = frozenset()) -> list[str]:
+    """Remove the code-running keys (:data:`GIT_CODE_CONFIG_KEYS`, include keys) a command added to ``cfg`` (a
+    ``config.worktree``): every present code key except those in ``keep`` (the ones the snapshot found there before
+    the command, i.e. the user's own). Uses ``git config --file --unset-all`` so other settings stay intact; a file
+    git cannot parse that held no code key before is deleted whole (a command wrote it, not the user). Returns a note
+    per file touched."""
+    if not cfg.is_file() or cfg.is_symlink():
+        return []
+    present = _list_config_keys(cfg)
+    if present is None:  # unparsable now
+        if keep:  # the user had a real config here before; leave it rather than delete the user's file
+            return []
+        with contextlib.suppress(OSError):
+            cfg.unlink()
+            return [f"removed an unparsable config.worktree a sandboxed command left in {cfg.parent}"]
+        return []
+    env = child_env(HARNESS_GIT_ENV)
+    stripped: list[str] = []
+    for key in present:
+        if _is_code_config_key(key) and key not in keep:
+            try:
+                subprocess.run(
+                    ["git", *HARNESS_GIT_CONFIG, "config", "--file", str(cfg), "--unset-all", key],
+                    capture_output=True,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    timeout=10,
+                )
+                stripped.append(key)
+            except (OSError, subprocess.SubprocessError):
+                continue
+    if stripped:
+        return [f"stripped {', '.join(sorted(stripped))} from the config.worktree in {cfg.parent}"]
+    return []
+
+
+def _is_code_config_key(key: str) -> bool:
+    """``key`` (a lower-case ``section.key`` or ``section.sub.key`` from ``git config --name-only``) is one of the
+    code-running keys. A pattern with ``..`` matches any subsection name (``filter.lfs.clean`` ~ ``filter..clean``)."""
+    key = key.lower()
+    for pat in (*GIT_CODE_CONFIG_KEYS, *_GIT_INCLUDE_KEYS):
+        if ".." in pat:
+            head, tail = pat.split("..", 1)
+            if key.startswith(head + ".") and key.endswith("." + tail):
+                return True
+        elif key == pat:
+            return True
+    return False
 
 
 def _linked_worktree_dirs(dirs: Sequence[Path], home: Path) -> bool:
