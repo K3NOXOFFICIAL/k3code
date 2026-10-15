@@ -374,6 +374,12 @@ tests, summary}`, `ultra.progress {command, phase, detail, agents, tokens, max_a
 `research.progress {phase, detail}`, `session.background_done {session_id, state, origin_session}`; background
 sessions also notify through `notification.show {kind: "background"}`.
 
+Context compaction notifies through `notification.show {key: "k3.compact", kind: "info", text, tier, model}`. `text`
+says which tier summarized the folded part (`Context compacted with claude-sonnet: 40 older messages summarized`,
+`… compacted with local qwen2.5-1.5b …`, `… compacted extractive (no model reachable) …`); `tier` is `provider`,
+`local` or `extractive` and `model` the label the text carries. Both fields are additions; a TUI that ignores them
+sees the notice as before.
+
 ## k3code `/tune` additions (Python gateway; not part of the Hermes contract)
 
 One popup in the TUI sets the model, the reasoning effort and the ultracode mode. The TUI's `/tune`, bare `/model` and

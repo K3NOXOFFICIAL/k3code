@@ -1231,6 +1231,68 @@ def service_restart() -> None:
     click.echo(f"restarted {service.UNIT_NAME}")
 
 
+@cli.group("models")
+def models_group() -> None:
+    """The local compaction model under $K3CODE_HOME/models/ (offline fallback for context compaction)."""
+
+
+@models_group.command("list")
+def models_list() -> None:
+    """The built-in models and whether each is fetched."""
+    from k3code.compaction import local
+
+    for name, spec in local.MODELS.items():
+        state = "fetched" if local.present(name) else "not fetched"
+        default = " (default)" if name == local.DEFAULT_MODEL else ""
+        click.echo(f"{name}{default}: {state}; {spec.size / 1e9:.1f} GB; {spec.note}")
+    click.echo(f"directory: {local.models_dir()}")
+    if not local.llama_available():
+        click.echo("llama-cpp-python is not installed: install k3code with the 'local' extra to run a model")
+
+
+@models_group.command("fetch")
+@click.argument("name", required=False)
+@click.option("--force", is_flag=True, help="Download again even when a verified file is there")
+def models_fetch(name: str | None, force: bool) -> None:
+    """Download a model from Hugging Face and verify its sha256 against the built-in table."""
+    from k3code.compaction import local
+
+    name = name or local.DEFAULT_MODEL
+    if name not in local.MODELS:
+        raise click.ClickException(f"unknown model {name!r}; known: {', '.join(local.MODELS)}")
+    spec = local.MODELS[name]
+    click.echo(f"fetching {name} ({spec.size / 1e9:.1f} GB) into {local.models_dir()}", err=True)
+    last = [-1]
+
+    def progress(done: int, total: int) -> None:
+        pct = done * 100 // (total or spec.size)
+        if pct // 5 != last[0]:
+            last[0] = pct // 5
+            click.echo(f"  {pct}%", err=True)
+
+    try:
+        path = local.fetch(name, progress=progress, force=force)
+    except Exception as e:  # noqa: BLE001 - network, disk, a checksum mismatch: say which
+        raise click.ClickException(f"fetch failed: {e}") from e
+    click.echo(f"{name}: {path} (sha256 verified)")
+    if not local.llama_available():
+        click.echo("llama-cpp-python is not installed: install k3code with the 'local' extra to run it", err=True)
+
+
+@models_group.command("verify")
+@click.argument("name", required=False)
+def models_verify(name: str | None) -> None:
+    """Check a fetched model's size and sha256 against the built-in table."""
+    from k3code.compaction import local
+
+    name = name or local.DEFAULT_MODEL
+    if name not in local.MODELS:
+        raise click.ClickException(f"unknown model {name!r}; known: {', '.join(local.MODELS)}")
+    ok, why = local.verify(name)
+    click.echo(f"{name}: {why}")
+    sys.exit(0 if ok else 1)
+
+
 @cli.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 @click.option("--no-probe", is_flag=True, help="Skip network probes")

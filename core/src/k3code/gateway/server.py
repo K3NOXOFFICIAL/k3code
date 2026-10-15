@@ -57,6 +57,7 @@ from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
+from k3code.compaction.local import LocalSummarizer, build_summarizer, compaction_settings
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.context_select import decide, decision_settings
@@ -116,7 +117,7 @@ from k3code.routing.tiers import (
     tier_for,
     tier_model_specs,
 )
-from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
+from k3code.session_ai import SUMMARY_PREFIX, CompactionResult, compact_with_fallback, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
@@ -634,6 +635,10 @@ class GatewayServer:
         #: Built on first use (``_shared_netwatch``); the bundles refcount it, so it polls only while a session is live.
         self._netwatch: Any = None
         self._netwatch_built = False
+        #: The local compaction model (k3code.compaction.local), built on first use; None without a model file or
+        #: llama-cpp-python. Tests set a FakeLocalSummarizer here.
+        self.local_summarizer: LocalSummarizer | None = None
+        self._local_summarizer_built = False
         self.mcp = McpManager(mcpjson.merged(self.config.mcp.servers, default_project_dir()))
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
@@ -2619,49 +2624,83 @@ class GatewayServer:
         except Exception:  # noqa: BLE001 - the next checkpoint or the end of the turn writes it again
             logger.exception("could not checkpoint the session")
 
+    def _local_summarizer(self) -> LocalSummarizer | None:
+        """The local compaction model, built once; None when there is no model file or no llama-cpp-python."""
+        if not self._local_summarizer_built:
+            self._local_summarizer_built = True
+            try:
+                self.local_summarizer = build_summarizer(self.config)
+            except Exception:  # noqa: BLE001 - a broken install of the optional package: the other tiers still work
+                logger.warning("the local compaction model is not usable", exc_info=True)
+                self.local_summarizer = None
+        return self.local_summarizer
+
+    def _offline(self) -> bool:
+        """The daemon's NetWatch says no provider traffic can go out (offline or captive portal)."""
+        nw = self._netwatch if self._netwatch_built else None
+        state = getattr(nw, "state", None)
+        return state is not None and not getattr(state, "usable_for_llm", True)
+
+    async def compact_session(self, session: LiveSession, *, keep: int, max_input_chars: int) -> CompactionResult:
+        """One compaction of the session's stored messages through the tiers (provider, local model, extractive)."""
+        return await compact_with_fallback(
+            self.model_caller,
+            list(session.stored.messages),
+            keep=keep,
+            session_id=session.session_id,
+            max_input_chars=max_input_chars,
+            local=self._local_summarizer(),
+            prefer_local=bool(compaction_settings(self.config)["prefer_local"]),
+            offline=self._offline(),
+        )
+
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
 
         Nothing compacted automatically, so a `/loop` living in one session grew its history forever: every tick
         re-sent and re-stored all of it, and on a real model the context window was exceeded after a few hundred ticks
-        and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; failures are logged and
-        the turn goes on.
+        and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; when no provider
+        answers (or the network is down) the local model or the extractive summary folds instead, so a session at the
+        limit never dies for lack of a summary model (see k3code.compaction).
         """
         if self.halted:  # the compaction call is a model call too
             return 0
         own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
-        messages = session.stored.messages
         if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0
         try:
-            new, folded = await compact_messages(
-                self.model_caller,
-                list(messages),
-                keep=int(cfg["keep_messages"]),
-                session_id=session.session_id,
-                max_input_chars=int(cfg["compact_input_chars"]),
+            result = await self.compact_session(
+                session, keep=int(cfg["keep_messages"]), max_input_chars=int(cfg["compact_input_chars"])
             )
-        except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
+        except Exception:  # noqa: BLE001 - the extractive tier cannot fail; this guards a bug, not an outage
             logger.warning("automatic compaction failed", exc_info=True)
             return 0
-        if folded:
-            session.stored.messages = new
+        if result.folded:
+            session.stored.messages = result.messages
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
             # be matched to its turn, so their outcomes stop waiting for one
             self.learning.settle_turns(session.session_id)
             self.store.save(session.stored)
-            logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
+            logger.info(
+                "compacted %d messages of session %s (%d left, %s)",
+                result.folded,
+                session.session_id,
+                len(result.messages),
+                result.note,
+            )
             session.emit(
                 "notification.show",
                 {
-                    "text": f"Context compacted: {folded} older messages summarized",
+                    "text": f"Context {result.note}: {result.folded} older messages summarized",
                     "level": "info",
                     "kind": "info",
                     "key": "k3.compact",
+                    "tier": result.tier,
+                    "model": result.label,
                 },
             )
-        return folded
+        return result.folded
 
     def _request_tokens(self, session: LiveSession) -> int:
         """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:

@@ -225,6 +225,10 @@ class Settings(BaseModel):
     # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",
     # at_ratio: 0.5}: a small model picks which old tool results the main model still needs (k3code.context_select)
     context: dict[str, Any] = Field(default_factory=dict)
+    # Offline compaction: {local_model: "" (a name from k3code.compaction.local.MODELS, a file under
+    # $K3CODE_HOME/models/ or a path), local_threads: 0, prefer_local: false (true: the local model before the
+    # provider)}; see k3code.compaction and `k3code models`
+    compaction: dict[str, Any] = Field(default_factory=dict)
     # Per model id: {<model id>: {context_window: 200000}}; ids without an entry use k3code.context_budget's defaults
     models: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)

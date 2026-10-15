@@ -43,6 +43,7 @@ ANSWER_KEYS: dict[str, dict[str, str] | str] = {
         "searxng_url": VALUE,
         "test_mem0": VALUE,
         "test_searxng": VALUE,
+        "local_model": VALUE,
     },
     "theme": dict.fromkeys(("theme", "focus_mode", "keymap"), VALUE),
     "service": {"install": VALUE},

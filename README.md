@@ -400,6 +400,11 @@ ultracode:
 wake_words:
   enabled: true                     # false switches every wake word off
   # ultraplan: false                # or just one: ultracode | ultraplan | ultraresearch (all default to true)
+compaction:                         # offline fallback for context compaction (see "Offline" below)
+  local_model: ""                   # "" = the default model when fetched; a name (qwen2.5-1.5b | qwen2.5-0.5b),
+                                    #   a file under ~/.k3code/models/ or a path to a GGUF
+  local_threads: 0                  # 0 = let llama.cpp choose
+  prefer_local: false               # true: the local model before the provider (for offline work)
 mcp:
   servers:
     search: {url: "https://example.org/mcp"}
@@ -420,6 +425,8 @@ hooks:
 The command gets the event as JSON on stdin (`session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response` for PostToolUse, `prompt` for UserPromptSubmit). Exit 0 lets the action go on, and its stdout may be JSON `{"decision": "block"|"approve", "reason", "additionalContext"}`. Exit 2 blocks the action, and stderr is the reason the model sees. Any other exit status, or a run longer than `timeout` (default 60 s), is logged and blocks nothing. PreToolUse runs before the permission prompt: it can block a call or answer the prompt with `approve`, but it can never turn a deny (a hardline rule, a deny rule) into an allow. A Stop hook cannot extend a turn. Hooks run as you, outside the sandbox, with the same scrubbed environment as other child processes plus `CLAUDE_PROJECT_DIR`. Hooks in your user config always run; hooks in a project's `.k3code/config.yaml` run only once you trust the project, and the trust prompt lists each one.
 
 Other Claude Code files k3code reads: `CLAUDE.md` (see above), skills in `~/.claude/skills` (set `skills: {import_claude: false}` in your user config to skip them) and, in a trusted project, `.claude/skills` and `.agents/skills`. A trusted project's `.mcp.json` servers show in `/mcp` as available; none starts until you run `/mcp enable <name>` (`/mcp disable <name>` stops it). That choice is stored under `~/.k3code/projects/`, not in the repository, and a changed server definition has to be enabled again. `env` and `headers` values are used as written (no `${VAR}` expansion), and `sse` servers are skipped.
+
+**Offline.** When a session nears its context limit, the older messages are summarized on the cheap tier. Without a reachable provider (the gateway paused, no network) that used to fail and the session died at the limit. Compaction now falls through two more tiers: a small local model, when one is fetched (`k3code models fetch`, default `Qwen2.5-1.5B-Instruct` Q4_K_M, about 1.1 GB under `~/.k3code/models/`, sha256-verified; `k3code models fetch qwen2.5-0.5b` for a weaker machine; it runs through the optional `llama-cpp-python`: `uv pip install 'k3code[local]'` into the install's venv), and otherwise an extractive summary with no model: the prompts, the final answers, the files edited, the commands run with their exit status, the open todos and the errors seen. `k3code doctor` says whether a local model is present, and the compaction notice (and `/compact`) says which tier summarized. Set `compaction.prefer_local: true` to summarize locally first while you work offline.
 
 Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry looks like an OmniRoute gateway: its name contains `omniroute`, or it uses port 20128. It cannot recognise other gateways.)
 

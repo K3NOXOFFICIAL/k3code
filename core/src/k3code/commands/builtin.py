@@ -17,7 +17,7 @@ from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
 from k3code.routing.tiers import active_provider
-from k3code.session_ai import compact_messages
+from k3code.session_ai import COMPACT_INPUT_CHARS, compact_with_fallback
 
 _MODEL_USAGE = (
     "Usage: /model <key> [--reasoning <level>] [--global|--session] [reason] (a reason after -- is kept as is)"
@@ -223,15 +223,18 @@ class _CompactCommand(CommandDef):
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
         try:
-            messages, folded = await compact_messages(ctx.model_caller, list(live.messages), session_id=live.session_id)
-        except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
+            if hasattr(ctx, "compact_session"):  # the gateway: its tiers (provider, local model, extractive)
+                result = await ctx.compact_session(live, keep=6, max_input_chars=COMPACT_INPUT_CHARS)
+            else:
+                result = await compact_with_fallback(ctx.model_caller, list(live.messages), session_id=live.session_id)
+        except Exception as e:  # noqa: BLE001 - the extractive tier cannot fail; this guards a bug
             return {"type": "message", "message": f"Compact failed: {e}"}
-        if not folded:
+        if not result.folded:
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
-        live.messages = messages
+        live.messages = result.messages
         _settle_turns(ctx, live)
         ctx.store.save(live.stored)
-        note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
+        note = f"Compacted {result.folded} messages into a summary ({before} → {len(result.messages)}), {result.note}."
         return {"type": "message", "message": note}
 
 

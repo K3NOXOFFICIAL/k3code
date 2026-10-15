@@ -17,6 +17,8 @@ dependencies = [
 [project.optional-dependencies]
 # the browser tool (research/browser.py): optional, the tool reports when it is missing; `playwright install chromium`
 browser = ["playwright>=1.63"]
+# the local compaction model (compaction/local.py): optional, imported only when a model file is present
+local = ["llama-cpp-python>=0.3"]
 
 [project.scripts]
 k3code = "k3code.cli:cli"

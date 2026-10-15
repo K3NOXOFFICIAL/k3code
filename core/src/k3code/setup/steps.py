@@ -457,7 +457,37 @@ def step_integrations(c: Ctx) -> dict[str, Any]:
             if url and c.p.confirm(f"integrations.test_{label}", f"Test {label} now?", True):
                 ok, ms, detail = probe.probe_url(url)
                 c.say(f"  {label}: {'OK' if ok else 'FAIL'} {ms:.0f} ms ({detail})")
+    out["local_model"] = offer_local_model(c)
     return out
+
+
+def offer_local_model(c: Ctx) -> bool:
+    """Optional: fetch the local compaction model (k3code.compaction.local) so compaction works offline. Asked
+    only interactively or when the answers say so (default no: it is a 1 GB download); False when nothing was
+    fetched. Never downloads under ``do_probe=False`` (tests, ``--no-probe``)."""
+    from k3code.compaction import local
+
+    spec = local.MODELS[local.DEFAULT_MODEL]
+    if local.present(local.DEFAULT_MODEL):
+        c.say(f"Local compaction model: {spec.name} is fetched ({local.models_dir()}).")
+        return True
+    want = c.p.confirm(
+        "integrations.local_model",
+        f"Fetch the local compaction model {spec.name} ({spec.size / 1e9:.1f} GB) so context compaction works "
+        "offline? (later: `k3code models fetch`)",
+        False,
+    )
+    if not want or not c.do_probe:
+        return False
+    try:
+        local.fetch(local.DEFAULT_MODEL, progress=lambda done, total: None)
+    except Exception as e:  # noqa: BLE001 - network or disk: say so, the wizard goes on
+        c.say(f"  fetch failed: {e}; run `k3code models fetch` later")
+        return False
+    c.say(f"  fetched {spec.name} into {local.models_dir()} (sha256 verified)")
+    if not local.llama_available():
+        c.say("  llama-cpp-python is not installed: install k3code with the 'local' extra to run it")
+    return True
 
 
 def step_theme(c: Ctx) -> dict[str, Any]:

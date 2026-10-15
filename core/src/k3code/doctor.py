@@ -792,6 +792,31 @@ def check_browser() -> Check:
     )
 
 
+def check_local_model(config: Settings | None = None) -> Check:
+    """The local compaction model (k3code.compaction): a GGUF under $K3CODE_HOME/models/ and llama-cpp-python."""
+    from k3code.compaction import local
+
+    st = local.status(config or Settings())
+    if st["model"] and st["llama"]:
+        mode = "used first" if st["prefer_local"] else "used when no provider answers"
+        return Check("local-model", OK, f"{st['name']} at {st['model']} ({mode})", data=st)
+    if st["model"]:
+        return Check(
+            "local-model",
+            WARN,
+            f"{st['name']} is fetched but llama-cpp-python is not installed; offline compaction is extractive only",
+            "install k3code with the 'local' extra: uv pip install 'k3code[local]'",
+            data=st,
+        )
+    return Check(
+        "local-model",
+        WARN,
+        "no local compaction model (optional: compaction with no provider reachable is extractive only)",
+        "k3code models fetch",
+        data=st,
+    )
+
+
 def check_searxng() -> Check:
     """Web search through a SearXNG instance: the research setting, the legacy top-level key, or an MCP server."""
     from k3code import confio
@@ -940,6 +965,7 @@ async def run_checks(
         check_home_mode(home),
         check_journal(home),
         check_vendor(),
+        check_local_model(config),
         # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
