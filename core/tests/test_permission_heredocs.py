@@ -597,6 +597,7 @@ def test_a_launcher_argument_is_read_past_any_brackets_depth(tmp_path: Path, dep
     assert _bash(cmd, "yolo", tmp_path).action == "deny"
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 def test_a_launcher_argument_nested_in_brackets_is_decided_quickly(tmp_path: Path) -> None:
     # reading a ${...} as one unit must not recurse once per level (RecursionError) or rescan the text per level
     for cmd in ('bash -c "' + "${" * 5000 + 'x"', 'bash -c "' + "${x:+" * 5000 + "x" + "}" * 5000 + '"'):
@@ -916,6 +917,7 @@ NESTED_READINGS = [
 ]
 
 
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 @pytest.mark.parametrize(
     ("build", "size", "limit"), NESTED_READINGS, ids=["bodies-5k", "bodies-100k", "backticks-5k", "backticks-100k"]
 )
