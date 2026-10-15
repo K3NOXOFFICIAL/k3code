@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from k3code.config import ProviderEntry
 from k3code.permissions import PermissionMode
 from k3code.reliability import sandbox
 from k3code.subagents import DepthLimit
@@ -54,6 +55,29 @@ async def test_task_sync_returns_child_answer_and_emits_events(tmp_path, monkeyp
     assert done["goal"] == "child job" and done["parent_id"] is None
     (h,) = server.subagents.for_session(server.session.session_id)
     assert h.tier == "main" and h.agent_type == "worker"
+
+
+async def test_a_child_runs_on_its_parents_model_key_when_another_session_switches_the_router(tmp_path, monkeypatch):
+    """The child resolved the daemon-wide router after awaiting the parent's approval callback; a session starting a
+    turn on another model key in that window sent the child to the other session's main model (#130)."""
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    server.config.providers[0].models["alt"] = "m-alt"
+    await start(server, tmp_path)
+    real_approval = server._approval_callback_for
+
+    async def other_turn_starts(session):
+        server._ensure_router("alt")  # another session's turn begins while this one awaits
+        return await real_approval(session)
+
+    monkeypatch.setattr(server, "_approval_callback_for", other_turn_starts)
+    await run_turn(server, "PARENT: delegate it")
+    assert last_tool_result(server) == "the answer is 42"
+    assert "m-alt" not in models_called(server), models_called(server)
 
 
 async def test_subagent_list_reports_a_wall_clock_start(tmp_path, monkeypatch):
@@ -457,3 +481,25 @@ def test_child_max_turns_takes_the_smaller_positive_cap():
     assert _child_max_turns(Settings(max_turns=50)) == 50
     assert _child_max_turns(Settings(max_turns=500)) == 200
     assert _child_max_turns(Settings(subagents={"max_turns": 7})) == 7
+
+
+async def test_a_child_follows_its_parents_provider_pick(tmp_path, monkeypatch):
+    """/provider puts a block first for the session; the sub-agent's router is built from the parent's pick too, so the
+    child's first call goes to that block, not to the config's first one."""
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    server.config.providers.append(
+        ProviderEntry(name="b", kind="openai", base_url="http://b", api_key_env="NOPE", models={"default": "m-b"})
+    )
+    await start(server, tmp_path)
+    sid = server.session.session_id
+    out = await call(server, "command.dispatch", {"name": "provider", "arg": "b", "session_id": sid})
+    assert out["message"] == "Provider set to: b (from the next turn)"
+    await run_turn(server, "PARENT: delegate it")
+    assert last_tool_result(server) == "the answer is 42"
+    child = [c["model"] for p in server.providers for c in p.log if "[agent:worker]" in c["text"]]
+    assert child == ["m-b"], child

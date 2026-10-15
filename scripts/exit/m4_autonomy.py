@@ -2,6 +2,8 @@
 """M4 exit checks (autonomy). Fake provider for harness behaviour; live OmniRoute only for model quality.
 
 Run: scripts/exit/m4_autonomy.py  (re-execs under `uv run --project core` when k3code is not importable).
+Scope classifier on the live model, one set or all: `m4_autonomy.py eval|blind|followup|scores`. Each run is stored in
+scope_scores.jsonl and compared with the previous run of that set; `scores` exits 1 on a drop (the nightly check).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ except ImportError:
     os.execvp("uv", ["uv", "run", "--project", str(CORE), "python", __file__, *sys.argv[1:]])
 
 import lib  # noqa: E402
+import scope_score  # noqa: E402
 from lib import emit, tail  # noqa: E402
 
 M = "M4"
@@ -61,19 +64,31 @@ def sub(name: str) -> Path:
     return d
 
 
-def _score_scope(rows: list[dict]) -> tuple[int, list[str], list[str], dict[tuple[str, str], int]]:
+def _score_scope(
+    rows: list[dict],
+) -> tuple[int, list[str], list[str], dict[tuple[str, str], int], list[tuple[str, str]]]:
     """Run the product's classifier prompt + parser + danger floor over ``rows`` on the live backend.
 
-    Returns (hits, misses, errors, confusion) where confusion[(want, got)] counts rows; ``got`` is "unparsed" when the
-    reply was unusable (the product would then use the ``small`` fallback; here it counts as a miss).
+    A row may carry ``recent`` (the Recent-context text the gate would pass: a follow-up has no size without it).
+    Returns (hits, misses, errors, confusion, class pairs). confusion[(want, got)] counts rows; ``got`` is "unparsed"
+    when the reply was unusable. The class pairs are (label behaviour, verdict behaviour) per scored row; an unusable
+    reply counts as what the product then does (the ``small`` fallback).
     """
-    from k3code.autonomy.scope import apply_floor, classifier_messages, parse_reply, repo_summary
+    from k3code.autonomy.scope import (
+        ScopeVerdict,
+        apply_floor,
+        classifier_messages,
+        fallback_verdict,
+        parse_reply,
+        repo_summary,
+    )
 
     summary = repo_summary(REPO)
     hit, misses, errors = 0, [], []
     matrix: dict[tuple[str, str], int] = {}
+    pairs: list[tuple[str, str]] = []
     for r in rows:
-        msgs = classifier_messages(r["prompt"], summary, "")
+        msgs = classifier_messages(r["prompt"], summary, r.get("recent", ""))
         try:
             text = lib.live_chat(BACKEND, [{"role": m.role, "content": m.content} for m in msgs])
         except Exception as e:  # noqa: BLE001 - a provider error must not abort the other rows
@@ -83,11 +98,13 @@ def _score_scope(rows: list[dict]) -> tuple[int, list[str], list[str], dict[tupl
         v = apply_floor(v, r["prompt"]) if v else None
         got = v.scope if v else "unparsed"
         matrix[(r["scope"], got)] = matrix.get((r["scope"], got), 0) + 1
+        want_b = apply_floor(ScopeVerdict(scope=r["scope"]), "").behaviour
+        pairs.append((want_b, (v or apply_floor(fallback_verdict(why), r["prompt"])).behaviour))
         if got == r["scope"]:
             hit += 1
         else:
             misses.append(f"#{r['id']} want {r['scope']} got {got}" + ("" if v else f" ({why})"))
-    return hit, misses, errors, matrix
+    return hit, misses, errors, matrix, pairs
 
 
 def _fmt_matrix(matrix: dict[tuple[str, str], int]) -> str:
@@ -99,24 +116,71 @@ def _fmt_matrix(matrix: dict[tuple[str, str], int]) -> str:
     return "confusion matrix (rows = label, columns = classifier):\n" + "\n".join(lines)
 
 
-def scope_blind() -> None:
-    """Generalisation check on scope_eval_blind.jsonl (40 rows). Prints agreement; never an exit row.
+SCORES_FILE = Path(os.environ.get("K3_SCOPE_SCORES") or scope_score.SCORES)
+SCOPE_SETS = {  # name -> (file, rows it must have)
+    "eval": ("scope_eval.jsonl", 30),
+    "blind": ("scope_eval_blind.jsonl", 40),
+    "followup": ("scope_eval_followup.jsonl", 18),
+}
 
-    The blind set was written before the classifier prompt was tuned; never tune the prompt against it.
+
+def scope_set(name: str) -> list[str]:
+    """Score one scope set live: agreement, behaviour-class score (under-planning weighs double), the change since the
+    last stored run of this set on this backend, and store the run in ``scope_scores.jsonl``. Never an exit row.
+
+    Returns the regressions found. The blind set was written before the classifier prompt was tuned; never tune the
+    prompt against it (``followup`` is the set to tune against).
     """
-    from k3code.autonomy.scope import SCOPES
+    import datetime
+    import hashlib
 
-    rows = [json.loads(x) for x in (HERE / "scope_eval_blind.jsonl").read_text().splitlines() if x.strip()]
-    assert len(rows) == 40 and all(r["scope"] in SCOPES for r in rows)
+    from k3code.autonomy.scope import CLASSIFIER_SYSTEM, SCOPES
+
+    file, count = SCOPE_SETS[name]
+    rows = [json.loads(x) for x in (HERE / file).read_text().splitlines() if x.strip()]
+    assert len(rows) == count and all(r["scope"] in SCOPES for r in rows)
     if not LIVE_OK:
-        print(f"scope blind: not run, no live backend: {LIVE_DETAIL}")
-        return
-    hit, misses, errors, matrix = _score_scope(rows)
+        print(f"scope {name}: not run, no live backend: {LIVE_DETAIL}")
+        return []
+    hit, misses, errors, matrix, pairs = _score_scope(rows)
     scored = len(rows) - len(errors)
+    res = scope_score.score(pairs)
+    rec = {
+        "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "set": name,
+        "backend": BACKEND["label"],
+        "prompt_sha": hashlib.sha256(CLASSIFIER_SYSTEM.encode()).hexdigest()[:12],
+        "agree": hit,
+        **res,
+    }
+    found = scope_score.regressions(scope_score.previous(SCORES_FILE, name, BACKEND["label"]), rec)
     print(
-        f"scope blind ({BACKEND['label']}): agreement {hit}/{scored} = {100 * hit / max(scored, 1):.0f}%"
-        f" (errors: {len(errors)})\nmisses: {'; '.join(misses) or 'none'}\n{_fmt_matrix(matrix)}"
+        f"scope {name} ({BACKEND['label']}): agreement {hit}/{scored} = {100 * hit / max(scored, 1):.0f}%; behaviour "
+        f"class exact {res['exact']}/{res['n']}, under-plan {res['under']}, over-plan {res['over']}, weighted "
+        f"{res['weighted']:.2f} (errors: {len(errors)})\nmisses: {'; '.join(misses) or 'none'}\n{_fmt_matrix(matrix)}"
     )
+    if errors:
+        print(f"not stored, incomplete run: {'; '.join(errors[:3])}")
+    else:
+        scope_score.append(SCORES_FILE, rec)
+        print(f"stored in {SCORES_FILE.name} (prompt {rec['prompt_sha']})")
+    for line in found:
+        print(line)
+    return found
+
+
+def scope_scores() -> None:
+    """The nightly check: all three sets, stored, exit 1 when any set regressed against its previous stored run.
+
+    Wire it to a schedule (``0 3 * * * cd <checkout> && scripts/exit/m4_autonomy.py scores``); commit
+    ``scope_scores.jsonl`` when you want the history shared.
+    """
+    if not LIVE_OK:  # a nightly job that checked nothing must not look green
+        print(f"scope scores: not run, no live backend: {LIVE_DETAIL}")
+        sys.exit(2)
+    found = [line for name in SCOPE_SETS for line in scope_set(name)]
+    if found:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------- 1. scope eval
@@ -138,7 +202,7 @@ def scope_eval() -> None:
             f"The owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}",
         )
         return
-    hit, misses, errors, matrix = _score_scope(rows)
+    hit, misses, errors, matrix, _ = _score_scope(rows)
     scored = len(rows) - len(errors)
     pct = 100 * hit / max(scored, 1)
     ev = (
@@ -823,8 +887,11 @@ def mcp_context() -> None:
 def main() -> None:
     print(f"live backend: {BACKEND['kind']} ok={LIVE_OK} {LIVE_DETAIL[:120]}", file=sys.stderr)
     want = sys.argv[1:]  # e.g. `m4_autonomy.py preview scope_eval` runs only those rows
-    if want == ["blind"]:  # `m4_autonomy.py blind`: agreement on the blind scope set (not an exit row)
-        scope_blind()
+    if want in (["blind"], ["followup"], ["eval"]):  # one scope set, scored and stored (not an exit row)
+        scope_set(want[0])
+        return
+    if want == ["scores"]:  # all scope sets, stored; exit 1 on a regression (the nightly check)
+        scope_scores()
         return
     for name, fn in [
         ("scope eval", scope_eval),

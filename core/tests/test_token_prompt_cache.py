@@ -37,7 +37,7 @@ def breakpoints(payload: dict) -> int:
     return json.dumps(payload).count('"cache_control"')
 
 
-def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
+def test_the_anthropic_payload_marks_system_last_tool_newest_message_and_previous_request_end():
     p = AnthropicProvider(name="a", api_key="k")
     payload = p._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)
     eph = {"type": "ephemeral"}
@@ -45,8 +45,28 @@ def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
     assert payload["tools"][-1]["cache_control"] == eph and "cache_control" not in payload["tools"][0]
     last = payload["messages"][-1]["content"][-1]
     assert last["type"] == "tool_result" and last["cache_control"] == eph
-    assert all("cache_control" not in b for m in payload["messages"][:-1] for b in m["content"])
-    assert breakpoints(payload) == 3 <= 4
+    # the previous request ended at the message before the newest assistant message (#168)
+    assert payload["messages"][0]["content"] == [{"type": "text", "text": "look at a.py", "cache_control": eph}]
+    assert "cache_control" not in json.dumps(payload["messages"][1])
+    assert breakpoints(payload) == 4
+
+
+def test_a_step_with_many_parallel_tool_calls_keeps_a_breakpoint_where_the_previous_request_ended():
+    """#168: the API looks for an earlier cache entry only about 20 blocks back; 12 parallel calls add 25 blocks."""
+    calls = [ToolCall(id=f"c{i}", name="read", arguments={"path": f"{i}.py"}) for i in range(12)]
+    msgs = [
+        *conversation(),
+        Message(role="assistant", content="reading all", tool_calls=calls),
+        *[Message(role="tool", content=f"r{i}", tool_call_id=f"c{i}", name="read") for i in range(12)],
+    ]
+    payload = AnthropicProvider(name="a", api_key="k")._payload(
+        msgs, TOOLS, "claude-test", max_tokens=100, temperature=None
+    )
+    newest = max(i for i, m in enumerate(payload["messages"]) if m["role"] == "assistant")
+    before = payload["messages"][newest - 1]["content"][-1]
+    assert before["type"] == "tool_result" and before["tool_use_id"] == "c1"
+    assert before["cache_control"] == {"type": "ephemeral"}
+    assert breakpoints(payload) == 4
 
 
 def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_empty_text():
@@ -61,7 +81,8 @@ def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_e
     assert breakpoints(empty) == 0 and "system" not in empty
     silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]
     payload = p._payload(silent, [], "claude-test", max_tokens=100, temperature=None)
-    assert breakpoints(payload) == 1  # the system prompt only: never on an empty tool result
+    # the system prompt and the previous request's end (the user message), never on an empty tool result
+    assert breakpoints(payload) == 2
 
 
 def test_prompt_cache_off_sends_no_breakpoints():
@@ -79,13 +100,40 @@ def test_openai_compatible_marks_messages_only_for_claude_ids_and_never_on_opena
     off = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="off")
     assert breakpoints(off._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
     on = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="on")
-    assert breakpoints(on._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
     payload = on._payload(conversation(), TOOLS, "anthropic/claude-test", max_tokens=100, temperature=None)
     msgs = payload["messages"]
     assert msgs[0]["content"] == [{"type": "text", "text": "SYSTEM PROMPT", "cache_control": {"type": "ephemeral"}}]
     assert msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in json.dumps(payload["tools"])  # inside messages only
     assert breakpoints(payload) == 2
+
+
+def test_prompt_cache_on_marks_alias_ids_and_cache_models_opts_other_ids_in_under_auto():
+    """Issue #168/4: a gateway alias (auto/coding-manual) in front of Claude carries no 'claude' in its id."""
+
+    def marks(provider: OpenAICompatProvider, model: str) -> int:
+        return breakpoints(provider._payload(conversation(), TOOLS, model, max_tokens=100, temperature=None))
+
+    relay = "https://relay.test/v1"
+    on = OpenAICompatProvider(name="o", base_url=relay, api_key="k", prompt_cache="on")
+    assert marks(on, "auto/coding-manual") == 2 and marks(on, "gpt-4o") == 2
+    auto = OpenAICompatProvider(name="o", base_url=relay, api_key="k")
+    assert marks(auto, "auto/coding-manual") == 0  # auto keeps the Claude-id rule
+    listed = OpenAICompatProvider(name="o", base_url=relay, api_key="k", cache_models=["Auto/*", "coding-manual"])
+    assert marks(listed, "auto/coding-manual") == 2 and marks(listed, "coding-manual") == 2
+    assert marks(listed, "gpt-4o") == 0 and marks(listed, "claude-test") == 2
+    off = OpenAICompatProvider(name="o", base_url=relay, api_key="k", prompt_cache="off", cache_models=["*"])
+    assert marks(off, "auto/coding-manual") == 0
+    openai = OpenAICompatProvider(name="o", base_url="https://api.openai.com/v1", api_key="k", cache_models=["*"])
+    assert marks(openai, "gpt-4o") == 0  # OpenAI caches by itself: the guess never applies there
+
+
+def test_cache_models_is_validated_and_reaches_the_provider():
+    entry = ProviderEntry(name="o", kind="openai", base_url="https://o.test", api_key_env="E", cache_models=["auto/*"])
+    (provider,) = make_providers([entry])
+    assert provider._cache_models == ["auto/*"]
+    with pytest.raises(ValidationError):
+        ProviderEntry(name="o", kind="openai", base_url="u", api_key_env="E", cache_models="auto/*")
 
 
 def test_prompt_cache_is_validated_and_reaches_the_providers():
@@ -130,6 +178,19 @@ def test_openai_usage_reports_cached_tokens():
 
     u = _parse_usage({"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 80}})
     assert (u.cache_read_tokens, u.cache_creation_tokens) == (80, 0)
+
+
+def test_omniroute_cache_writes_are_parsed_and_counted_in_prompt_tokens():
+    # OmniRoute's claude-to-openai translator: prompt_tokens = input + cache read, writes only in the details (#129)
+    from k3code.providers.openai_compat import _parse_usage
+
+    details = {"cached_tokens": 90000, "cache_creation_tokens": 10000, "cache_creation_in_prompt": False}
+    u = _parse_usage({"prompt_tokens": 90005, "completion_tokens": 300, "prompt_tokens_details": details})
+    assert (u.prompt_tokens, u.cache_read_tokens, u.cache_creation_tokens) == (100005, 90000, 10000)
+    # without the flag the writes are taken to be part of prompt_tokens already
+    details = {"cached_tokens": 90000, "cache_creation_tokens": 10000}
+    u = _parse_usage({"prompt_tokens": 100005, "completion_tokens": 300, "prompt_tokens_details": details})
+    assert (u.prompt_tokens, u.cache_read_tokens, u.cache_creation_tokens) == (100005, 90000, 10000)
 
 
 def test_usage_db_records_cache_tokens_and_migrates_an_old_database(tmp_path):

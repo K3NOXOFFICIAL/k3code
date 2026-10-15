@@ -36,17 +36,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.providers.base import Provider
+from k3code.providers.base import Provider, ProviderDeadline
 from k3code.providers.retry_utils import jittered_backoff
+from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
     FailoverReason,
     classify_api_error,
     summarize,
 )
-from k3code.router.cooldown import CooldownStore, key_fingerprint
+from k3code.router.cooldown import BREAKER_REASONS, CooldownStore, key_fingerprint
 
 logger = logging.getLogger(__name__)
+
+#: retries of the same entry after a stream stalled (see providers/stall.py)
+STALL_RETRIES = 1
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -79,8 +83,8 @@ class ChainEntry:
         return not getattr(self.provider, "api_key", "")
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower())
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower(), self.key_fingerprint)
 
 
 def build_chain(providers: Sequence[Provider], models: Sequence[str | Sequence[str]]) -> list[ChainEntry]:
@@ -232,12 +236,14 @@ class Router:
         all_network = True  # tracks "every failure so far was a network failure"
         all_auth = True  # tracks "every failure and every cooldown seen so far was an auth rejection"
         auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
+        skipped = False  # an entry was passed over for a cooldown armed before this walk
         entry_index = 0
         while entry_index < len(self.chain):
             entry = self.chain[entry_index]
             target_model = model if entry_index == 0 and model else entry.model
             skip_reason = self._skip_in_cooldown(entry, target_model)
             if skip_reason is not None:
+                skipped = True
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
                     entry.provider_name,
@@ -249,6 +255,7 @@ class Router:
                     provider=entry.provider_name,
                     model=target_model,
                     base_url=entry.base_url,
+                    account=entry.key_fingerprint,
                     fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
@@ -268,7 +275,10 @@ class Router:
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
                             self.cooldowns.record_success(
-                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                                provider=entry.provider_name,
+                                model=target_model,
+                                base_url=entry.base_url,
+                                account=entry.key_fingerprint,
                             )
                         yield event
                     # The provider yields its "done" event then closes normally.
@@ -301,9 +311,32 @@ class Router:
                             retry_after=cooldown,
                         )
                         break
-                    # retryable: same entry with backoff, max_retries times, then fail over
-                    if attempt >= self.max_retries:
-                        self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
+                    # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
+                    # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
+                    breaker = classified.reason in BREAKER_REASONS
+                    if isinstance(exc, ProviderDeadline):
+                        retries = 0
+                    elif is_stall(exc):
+                        retries = min(self.max_retries, STALL_RETRIES)
+                    elif breaker and self.cooldowns.tripped(
+                        provider=entry.provider_name,
+                        model=target_model,
+                        base_url=entry.base_url,
+                        account=entry.key_fingerprint,
+                    ):
+                        retries = 0  # the half-open probe failed: one request, then the breaker reopens (doubled)
+                    else:
+                        retries = self.max_retries
+                    if attempt >= retries:
+                        self._failover(
+                            entry,
+                            target_model,
+                            classified.reason,
+                            attempt,
+                            exc,
+                            entry_index=entry_index,
+                            retry_after=classified.retry_after if breaker else None,
+                        )
                         break
                     attempt += 1
                     delay = self._backoff_for(classified, attempt)
@@ -334,6 +367,11 @@ class Router:
             )
         reason_name = last_reason.value if last_reason else "unknown"
         wait = self.earliest_reset(model, auth_failed=auth_failed)
+        if wait is not None and last_reason in BREAKER_REASONS and not skipped:
+            # Every entry failed in this very walk: the call reports its failure now, as before the breaker (an
+            # interactive turn fails fast, an unattended run parks on its own ladder). The windows just armed only
+            # change the next calls: they skip the entry, or wait for its window when it is the only one.
+            wait = None
         if last_reason is FailoverReason.auth and all_auth:
             # Not a rate limit: waiting does not help, only a new key does (the entries are cooling down so the next
             # call does not hammer them). No retry_after, so the persistent retry layer fails now instead of parking.
@@ -347,8 +385,9 @@ class Router:
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
+            state = "cooling down after failures" if last_reason in BREAKER_REASONS else "rate-limited"
             raise ChainExhausted(
-                f"all providers rate-limited until {clock} ({reason_name})",
+                f"all providers {state} until {clock} ({reason_name})",
                 last_reason=reason_name,
                 retry_after=wait,
                 until=until,
@@ -383,16 +422,28 @@ class Router:
             target = model if index == 0 and model else entry.model
             fp = entry.key_fingerprint
             if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             ):
                 if index in auth_failed:
                     continue
                 return None
             left = self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             cooled = self.cooldowns.reason_of(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
@@ -410,10 +461,18 @@ class Router:
             return None
         fp = entry.key_fingerprint
         if self.cooldowns.in_cooldown(
-            provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+            provider=entry.provider_name,
+            model=model,
+            base_url=entry.base_url,
+            account=fp,
+            fingerprint=fp,
         ):
             return self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=model,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
         return None
 
@@ -435,11 +494,12 @@ class Router:
             provider=entry.provider_name,
             model=target_model,
             base_url=entry.base_url,
+            account=entry.key_fingerprint,
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
         )
-        if retry_after is not None and armed:
+        if armed and (retry_after is not None or reason in BREAKER_REASONS):
             self._emit(
                 "router.cooldown",
                 entry,
@@ -481,17 +541,19 @@ class Router:
     ) -> None:
         if self.on_event is None:
             return
-        self.on_event(
-            RouterEvent(
-                kind=kind,
-                provider=entry.provider_name if entry else "",
-                model=(entry.model if entry else "") or (extra or {}).get("model", ""),
-                attempt=attempt,
-                reason=reason,
-                detail=detail,
-                extra={**(extra or {}), "tier": self.tier},
-            )
+        event = RouterEvent(
+            kind=kind,
+            provider=entry.provider_name if entry else "",
+            model=(entry.model if entry else "") or (extra or {}).get("model", ""),
+            attempt=attempt,
+            reason=reason,
+            detail=detail,
+            extra={**(extra or {}), "tier": self.tier},
         )
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001 - a sink that fails (a client gone mid-turn) must not abort the walk (#148)
+            logger.warning("router event sink failed on %s", kind, exc_info=True)
 
 
 class ProviderStreamError(Exception):

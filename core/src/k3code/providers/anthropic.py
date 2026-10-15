@@ -11,6 +11,7 @@ import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
 from k3code.providers.effort import anthropic_effort
+from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     EPHEMERAL,
     Message,
@@ -38,14 +39,21 @@ class AnthropicProvider(Provider):
         name: str,
         base_url: str = "https://api.anthropic.com",
         api_key: str,
+        keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        first_event_timeout: float | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
         self.name = name
+        #: stall limits in seconds (see stall.py); None = the defaults for the model
+        self._first_event_timeout = first_event_timeout
+        self._idle_timeout = idle_timeout
         #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
         self.prompt_cache = prompt_cache != "off"
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.keyless = keyless  # api_key_env "": the endpoint takes no key, send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
 
@@ -101,11 +109,14 @@ class AnthropicProvider(Provider):
         request = self._client.build_request(
             "POST",
             self._url(),
-            headers=request_headers("anthropic", self.api_key),
+            headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
             json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
         )
+        watchdog = StreamWatchdog.for_model(
+            "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
+        )
         try:
-            response = await self._client.send(request, stream=True)
+            response = await watchdog.guard(self._client.send(request, stream=True))
         except httpx.HTTPError as exc:
             raise to_provider_error(exc, kind="anthropic") from exc
         if response.status_code >= 400:
@@ -119,52 +130,61 @@ class AnthropicProvider(Provider):
             usage_in = usage_out = cache_read = cache_creation = 0
             stop_reason: str | None = None  # message_delta.delta.stop_reason: end_turn, tool_use, max_tokens, ...
             complete = False  # message_stop arrived
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data:
-                    continue
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                etype = event.get("type")
-                if etype == "error":
-                    raise _inband_error(event)  # overloaded_error etc. after a 200
-                if etype == "message_stop":
-                    complete = True
-                if etype == "content_block_start":
-                    block = event.get("content_block") or {}
-                    if block.get("type") == "tool_use":
-                        tool_blocks[event.get("index", 0)] = {
-                            "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
-                            "name": block.get("name") or "",
-                            "args": [],
-                        }
-                elif etype == "content_block_delta":
-                    delta = event.get("delta") or {}
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text") or ""
-                        if text:
-                            content_parts.append(text)
-                            yield StreamEvent(type="text_delta", text=text)
-                    elif delta.get("type") == "input_json_delta":
-                        slot = tool_blocks.get(event.get("index", 0))
-                        if slot is not None and (partial := delta.get("partial_json")):
-                            slot["args"].append(partial)
-                elif etype == "message_start":
-                    message = event.get("message") or {}
-                    usage = message.get("usage") or {}
-                    # prompt tokens = every input token the model read, cache hits and cache writes included, the same
-                    # definition as the claude-cli provider and the OpenAI-compatible one (whose count already has them)
-                    usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
-                    cache_read = int(usage.get("cache_read_input_tokens") or 0)
-                    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-                elif etype == "message_delta":
-                    usage = event.get("usage") or {}
-                    usage_out = int(usage.get("output_tokens") or 0)
-                    stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
+            try:
+                async for line in watchdog.lines(response):
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event.get("type")
+                    if etype == "error":
+                        raise _inband_error(event)  # overloaded_error etc. after a 200
+                    if etype != "ping":  # a ping is the relay's keepalive, not the model's progress
+                        watchdog.progress()
+                    if etype == "message_stop":
+                        complete = True
+                    if etype == "content_block_start":
+                        block = event.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            tool_blocks[event.get("index", 0)] = {
+                                "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                                "name": block.get("name") or "",
+                                "args": [],
+                            }
+                    elif etype == "content_block_delta":
+                        delta = event.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text") or ""
+                            if text:
+                                content_parts.append(text)
+                                yield StreamEvent(type="text_delta", text=text)
+                        elif delta.get("type") == "input_json_delta":
+                            slot = tool_blocks.get(event.get("index", 0))
+                            if slot is not None and (partial := delta.get("partial_json")):
+                                slot["args"].append(partial)
+                    elif etype == "message_start":
+                        message = event.get("message") or {}
+                        usage = message.get("usage") or {}
+                        # prompt tokens = every input token the model read, cache hits and cache writes included, the
+                        # same definition as the claude-cli provider and the OpenAI-compatible one (whose count already
+                        # has them)
+                        usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
+                        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+                        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+                    elif etype == "message_delta":
+                        usage = event.get("usage") or {}
+                        usage_out = int(usage.get("output_tokens") or 0)
+                        stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
+            except httpx.HTTPError:
+                if not complete:
+                    raise
+                # The answer is whole: a connection that drops while we wait for the trailing usage chunk (or the
+                # close) must not discard it and trigger a re-request; usage stays whatever arrived so far.
             if not complete:
                 raise to_provider_error(
                     httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
@@ -200,9 +220,12 @@ class AnthropicProvider(Provider):
 
 
 def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
-    """Mark three prompt-cache breakpoints (the API allows four): the system prompt, the last tool definition, and the
-    last block of the newest message. The last one moves forward every call, so each request reads the prefix the
-    request before it wrote instead of paying for the whole conversation again on every tool-loop step."""
+    """Mark the four prompt-cache breakpoints the API allows: the system prompt, the last tool definition, the last
+    block of the newest message, and the last block of the message before the newest assistant message. The newest
+    one moves forward every call, so each request reads the prefix the request before it wrote instead of paying for
+    the whole conversation again on every tool-loop step. The API looks for an earlier entry only about 20 blocks back
+    from a breakpoint, and a step with 10 parallel tool calls appends more than that; the fourth breakpoint sits where
+    the previous request ended, so its entry is always found (#168)."""
     if payload.get("system"):
         payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
     if payload.get("tools"):
@@ -210,6 +233,10 @@ def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
     messages = payload["messages"]
     if messages:
         messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}
+    newest_assistant = next((i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"), 0)
+    if newest_assistant > 0:
+        prev = messages[newest_assistant - 1]
+        messages[newest_assistant - 1] = {**prev, "content": with_cache_breakpoint(prev["content"])}
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
@@ -229,6 +256,7 @@ _INBAND_STATUS = {
     "rate_limit_error": 429,
     "api_error": 500,
     "authentication_error": 401,
+    "billing_error": 402,
     "permission_error": 403,
     "not_found_error": 404,
     "invalid_request_error": 400,
@@ -238,7 +266,7 @@ _INBAND_STATUS = {
 def _inband_error(event: dict[str, Any]) -> ProviderError:
     """An ``event: error`` inside a 200 stream, as a ProviderError the classifier understands."""
     err = event.get("error") if isinstance(event.get("error"), dict) else {}
-    status = _INBAND_STATUS.get(str(err.get("type") or ""), 500)
+    status = _INBAND_STATUS.get(str(err.get("type") or ""))  # unmapped: let the code/message stages decide
     message = str(err.get("message") or "error in stream")
     return ProviderError(message=message, status_code=status, headers={}, body=event)
 

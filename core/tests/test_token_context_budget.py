@@ -22,7 +22,7 @@ def test_context_windows_by_config_and_by_family():
     assert context_window(cfg, "claude-sonnet-4-5") == 200_000
     assert context_window(cfg, "anthropic/claude-haiku") == 200_000
     assert context_window(cfg, "gpt-4o-mini") == 128_000
-    assert context_window(cfg, "gpt-4.1") == 128_000
+    assert context_window(cfg, "gpt-4.1") == 1_047_576  # #168: a 1M-token model
     assert context_window(cfg, "llama-3-8b") == 128_000  # no known family: the fallback
     assert compact_threshold(cfg, "claude-x") == 140_000  # 0.7 of the window
     cfg.context = {"compact_at_ratio": 0.5}
@@ -110,8 +110,7 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
         assert f"file {i}" in sent[f"r{i}"] and len(sent[f"r{i}"]) > 3000
     stored = [m.content for m in loop.turn_messages if m.role == "tool"]
     assert all(len(c) > 3000 for c in stored)  # the conversation itself keeps every result
-    transcript = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
-    assert all(len(c) > 3000 for c in transcript)
+    assert loop.reliability.load_transcript() is None  # a finished turn leaves no checkpoint behind
 
 
 async def test_elision_runs_in_batches_so_the_request_prefix_rarely_changes(tmp_path):

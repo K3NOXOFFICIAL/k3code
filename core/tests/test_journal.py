@@ -161,3 +161,26 @@ def test_sessions_are_isolated_files(home: Path):
     finally:
         j1.close()
         j2.close()
+
+
+def test_only_side_effect_calls_are_fsynced(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """A batch of reads must not block on one fsync per call; a side-effect call still gets its records synced."""
+    import os
+
+    synced: list[int] = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
+    j = ToolJournal(home, "s-fsync")
+    try:
+        for i in range(5):
+            j.record_intent(f"r{i}", "read", {"path": str(i)}, side_effect=False)
+        for i in range(5):
+            j.record_done(f"r{i}", {"ok": True})
+        assert synced == []
+        j.record_intent("w1", "bash", {"command": "touch x"}, side_effect=True)
+        j.record_done("w1", {"ok": True})
+        assert len(synced) == 2
+        assert [r.type for r in j.read_all()].count("intent") == 6  # still journaled, just not synced
+        assert j.resume_plan() == []
+    finally:
+        j.close()

@@ -2,11 +2,16 @@
 
 Sandboxed: auto/yolo sessions, and every unattended session (background run, loop tick, cron job, goal continuation,
 sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (only the cache dirs come back), the
-project is writable, and its git metadata is read-only so a command cannot plant a hook. The network stays on for
+project is writable, and its git metadata is read-only so a command cannot plant a hook. ``sandbox.git_writable: true``
+makes the git metadata writable (``git add``/``commit``/``branch`` work) except the parts git runs as code or reads to
+pick what it runs (hooks, config, ``info/``: see :data:`GIT_CODE_ENTRIES`); it leaves one hole open (a planted
+``commondir``, see :func:`_git_metadata_argv`), so it is off by default. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
-Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed and ``/doctor``
-warns. An unattended session is refused instead (:class:`SandboxUnavailable`): it never falls back.
+Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed: auto mode asks
+before each command only the sandbox made safe, yolo runs it, the session shows a warning and ``/doctor`` reports it
+(see ``AgentLoop._bwrap_unusable``). An unattended session is refused instead (:class:`SandboxUnavailable`): it never
+falls back.
 
 Deliberate exceptions, not sandboxed: MCP stdio servers (see ``mcpclient.stdio_env``) and harness git, which is not
 model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_git_argv`).
@@ -15,6 +20,8 @@ model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import logging
 import os
 import re
@@ -28,6 +35,7 @@ from pathlib import Path
 from k3code import paths
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.permissions import PermissionMode
+from k3code.permissions.engine import sensitive_path, windows_drives
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +47,34 @@ SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
 #: :func:`child_env`.
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
-#: Harness git never runs a hook or a fsmonitor program: a sandboxed command could have written one into .git.
+#: Harness git (worktrees, merges, triggers, scope classification) runs in the daemon, outside the sandbox, on a
+#: repository the model may have written to. It never runs a hook or a fsmonitor program, and it reads no system or
+#: global git config (see :data:`HARNESS_GIT_ENV`). Diff callers add :data:`HARNESS_GIT_DIFF_FLAGS`.
+#:
+#: What this cannot prevent: a filter (``filter.<name>.clean``/``smudge``), a diff or merge driver, a signing program
+#: or an include, defined in the repository's own config (``.git/config``, ``.git/config.worktree``) still runs when
+#: git touches a file it applies to (``status``, ``add``, ``merge``, ``commit``), because git has no switch that
+#: ignores a configured driver by name. That is closed at the source: the write and edit tools always ask before they
+#: change those files (see :func:`k3code.permissions.engine.protected_path`) and the sandbox binds the git config,
+#: hooks and ``info/`` read-only (see :data:`GIT_CODE_ENTRIES`). It stays open for a repository config changed by
+#: anything else (an unsandboxed command someone approved, a process outside k3code) and for a driver the user keeps
+#: in the repository on purpose.
 HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+#: Environment of harness git: no system or global config (``~/.gitconfig`` could define a driver or an alias too).
+#: The cost is that the user's own settings do not apply to it either (``safe.directory``, LFS filters, a global
+#: ignore file).
+HARNESS_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+#: ``git diff`` runs ``diff.external`` and the textconv drivers by default; the harness only needs the plain text.
+HARNESS_GIT_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
 _GITDIR_LINE = re.compile(r"^gitdir:\s*(.+?)\s*$", re.MULTILINE)
+#: Files the C library reads to resolve a host name. Any of them may be a link out of the bound system dirs (WSL 2:
+#: /etc/resolv.conf -> /mnt/wsl/resolv.conf; Debian resolvconf: -> ../run/resolvconf/resolv.conf): see
+#: :func:`_name_lookup_argv`.
+NAME_LOOKUP_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf")
+_MAX_LINKS = 40  # the kernel's limit before ELOOP
 
 
 class SandboxRefused(RuntimeError):
@@ -58,6 +88,21 @@ class SandboxUnavailable(SandboxRefused):
 
 #: ``$HOME`` entries masked again after the project binds (a project bind can re-expose them: credentials, keys).
 HOME_SECRETS = (".config/k3code", ".ssh")
+
+
+def configured_git_writable() -> bool:
+    """``sandbox.git_writable`` from the user's ``config.yaml`` (never a project's): True lets ``git add``/``commit``/
+    ``branch`` write the git metadata in the sandbox (see :func:`_git_metadata_argv` for what stays open). False, the
+    git metadata fully read-only, when unset or not a boolean."""
+    try:
+        from k3code import config
+
+        section = config.load_user_section("sandbox")
+    except Exception:  # an unreadable config must not break bash: the sandbox then keeps its default view
+        logger.warning("sandbox: could not read sandbox.git_writable from the user config", exc_info=True)
+        return False
+    value = section.get("git_writable") if isinstance(section, dict) else None
+    return value if isinstance(value, bool) else False
 
 
 def configured_home_readonly() -> list[str]:
@@ -144,8 +189,14 @@ def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def harness_git_argv(*args: str) -> list[str]:
-    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled."""
+    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled. Run it
+    with :func:`harness_git_env`."""
     return ["git", *HARNESS_GIT_CONFIG, *args]
+
+
+def harness_git_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The :func:`child_env` of a harness git process: no system or global git config (see HARNESS_GIT_ENV)."""
+    return child_env({**(extra or {}), **HARNESS_GIT_ENV})
 
 
 def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, network: bool = False) -> list[str]:
@@ -191,8 +242,9 @@ async def spawn_unattended_shell(
     )
 
 
-def _refuse_root(root: Path, home: Path) -> None:
-    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home."""
+def _refuse_root(root: Path, home: Path, drives: Iterable[str] | None = None) -> None:
+    """A writable root must not be ``$HOME``, a directory above it, or one above ``~/.ssh`` or the k3code home; nor,
+    under WSL, a Windows profile or a directory above one (see :func:`windows_profile_root`)."""
     for guarded in (home, home / ".ssh", paths.home()):
         target = guarded.resolve()
         if root == target or root in target.parents:
@@ -200,6 +252,28 @@ def _refuse_root(root: Path, home: Path) -> None:
                 f"refusing to make {root} writable inside the sandbox: it is or contains $HOME, ~/.ssh or the "
                 "k3code home; start the session in a project folder"
             )
+    if windows_profile_root(root, drives):
+        raise SandboxRefused(
+            f"refusing to make {root} writable inside the sandbox: it is or contains a Windows user profile (its "
+            ".ssh, .aws and AppData with the browsers' saved passwords); start the session in a project folder"
+        )
+
+
+def windows_profile_root(root: Path | str, drives: Iterable[str] | None = None) -> bool:
+    """``root`` is a Windows drive WSL mounts (``/mnt/c``), its ``Users`` folder or a profile in it
+    (``/mnt/c/Users/<name>``), or a directory above one (``/mnt``, ``/``): the Windows-side ``$HOME``, which the
+    k3code shim starts in when a Windows terminal opens in ``C:\\Users\\<name>`` (issue #134). drvfs is
+    case-insensitive, so is this. A project below a profile (``/mnt/c/Users/<name>/src/app``) is fine."""
+    folded = str(root).lower().rstrip("/")
+    for drive in windows_drives() if drives is None else drives:
+        drive = drive.lower().rstrip("/")
+        if folded == drive or drive.startswith(folded + "/"):
+            return True  # the drive itself, or above it
+        if folded.startswith(drive + "/"):
+            parts = folded[len(drive) + 1 :].split("/")
+            if parts[0] in ("users", "documents and settings") and len(parts) <= 2:
+                return True
+    return False
 
 
 def root_refusal(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> str | None:
@@ -234,10 +308,192 @@ def _git_metadata(root: Path) -> list[Path]:
     return [p for p in found if p.exists()]
 
 
+#: Entries of a git dir that stay read-only when the rest of it is writable (``sandbox.git_writable``): what git runs
+#: as code or reads to decide what it runs. ``hooks``; ``config`` and ``config.worktree`` (drivers, ``core.hooksPath``,
+#: aliases); ``info`` (``info/attributes`` picks the drivers); ``commondir`` (where a linked worktree's config and
+#: hooks come from); ``modules`` (each submodule's own git dir, hooks and config included). The same entries of every
+#: linked worktree's admin dir (``worktrees/<name>/``) too.
+GIT_CODE_ENTRIES = ("hooks", "config", "config.worktree", "info", "commondir", "modules")
+
+
+#: Stand-ins for the :data:`GIT_CODE_ENTRIES` a git dir lacks, made on the host before the sandbox starts so a
+#: read-only bind can cover them and the command cannot create them: an empty directory or file reads as git's default.
+#: A common dir gets all of them; a linked worktree's admin dir (it has a ``commondir``) only ``config.worktree``, the
+#: one of them git reads there. ``commondir`` has none: git dies on every stand-in (empty file, directory, dangling
+#: link), and ``.`` breaks commits with the reftable backend.
+_GIT_STANDIN_DIRS = ("hooks", "info", "modules")
+_GIT_STANDIN_FILES = ("config", "config.worktree")
+
+
+def _make_git_standins(gitdir: Path) -> None:
+    admin = (gitdir / "commondir").exists() or (gitdir / "commondir").is_symlink()
+    made = [(gitdir / name, False) for name in (("config.worktree",) if admin else _GIT_STANDIN_FILES)]
+    made += [] if admin else [(gitdir / name, True) for name in _GIT_STANDIN_DIRS]
+    for path, is_dir in made:
+        try:  # O_EXCL / mkdir: neither follows a link at the path
+            if is_dir:
+                path.mkdir()
+            else:
+                path.touch(exist_ok=False)
+        except FileExistsError:
+            pass
+        except OSError:
+            logger.warning("sandbox: could not create %s; the command can create it", path, exc_info=True)
+
+
+def _git_code_entries(gitdir: Path) -> list[Path] | None:
+    """The :data:`GIT_CODE_ENTRIES` of ``gitdir`` and of each ``worktrees/<name>/`` below it, missing ones made first
+    (:func:`_make_git_standins`), or None when one of them (or a ``worktrees/<name>``) is a symlink: a read-only bind
+    lands on the link's target, and the command could replace the link itself."""
+    dirs = [gitdir]
+    with contextlib.suppress(OSError):
+        dirs += sorted(d for d in (gitdir / "worktrees").iterdir() if d.is_dir() or d.is_symlink())
+    if any(d.is_symlink() for d in dirs):
+        return None
+    for d in dirs:
+        _make_git_standins(d)
+    found = [d / e for d in dirs for e in GIT_CODE_ENTRIES if (d / e).exists() or (d / e).is_symlink()]
+    if any(p.is_symlink() for p in found):
+        return None
+    return found
+
+
+def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: bool) -> list[str]:
+    """bwrap ops for the git metadata of ``root`` (bound read-write before this).
+
+    Read-only metadata (``writable`` False) is bound read-only whole. Writable metadata stays as the project bind
+    left it; only its :data:`GIT_CODE_ENTRIES` are bound read-only, so ``git add``/``commit``/``branch`` work and a
+    command still cannot plant a hook or a driver. A linked worktree's ``.git`` file (the pointer to its git dir)
+    stays read-only, and its git dir and common dir, which live outside the checkout, are bound read-write only when
+    they are a real worktree admin dir below a real common dir (``<common>/worktrees/<name>`` with a ``HEAD``, next to
+    ``<common>/objects``); a pointer anywhere else would hand the command a writable host folder, so that metadata
+    stays read-only as before.
+
+    A missing entry is made empty on the host first (:func:`_make_git_standins`), so the command cannot create it.
+
+    Not covered, and the reason ``sandbox.git_writable`` is off by default: a ``commondir`` file in the main ``.git``.
+    git dies on any stand-in for it, and the ``.git`` root must stay writable for git's lock files (``index.lock``,
+    ``HEAD.lock``), so the command can create one; the next git run outside the sandbox then takes its config and
+    hooks from wherever it points.
+    """
+    meta = _git_metadata(root)
+    if not writable:
+        return [op for m in meta for op in ("--ro-bind", str(m), str(m))]
+    argv: list[str] = []
+    rw: list[Path] = []
+    readonly: list[Path] = []
+    gitdirs = [m for m in meta if m.is_dir() and not m.is_symlink()]
+    readonly += [m for m in meta if m not in gitdirs]  # the worktree's .git file, or a symlinked .git
+    outside = [d for d in gitdirs if not any(d.resolve().is_relative_to(r) for r in roots)]
+    if outside and not _linked_worktree_dirs(outside, home):
+        readonly += outside
+    else:
+        rw += outside
+    for d in sorted(rw, key=lambda p: len(p.parts)):  # the common dir before the worktree admin dir inside it
+        argv += ["--bind", str(d), str(d)]
+    for d in gitdirs:
+        if d not in readonly:
+            entries = _git_code_entries(d)
+            readonly += [d] if entries is None else entries
+    for p in dict.fromkeys(readonly):
+        argv += ["--ro-bind", str(p), str(p)]
+    return argv
+
+
+def _linked_worktree_dirs(dirs: Sequence[Path], home: Path) -> bool:
+    """``dirs`` are a linked worktree's git dir and its common dir (``<common>/worktrees/<name>`` with a ``HEAD``,
+    ``<common>/objects``), none of which is a root :func:`_refuse_root` refuses."""
+    if len(dirs) != 2:
+        return False
+    gitdir, common = (d.resolve() for d in dirs)
+    if gitdir.parent != common / "worktrees" or not (gitdir / "HEAD").is_file() or not (common / "objects").is_dir():
+        return False
+    try:
+        for d in (gitdir, common):
+            _refuse_root(d, home)
+    except SandboxRefused:
+        return False
+    return True
+
+
+#: Entries of a project root the sandbox shows read-only, like its git hooks and config: the files git runs as code or
+#: reads for its drivers (``.gitattributes``, ``.gitmodules``, husky's ``.husky`` hooks), direnv's ``.envrc`` and the
+#: project's k3code config (``.k3code/config*``: permission rules and hooks). The set
+#: :func:`k3code.permissions.engine.protected_path` keeps the edit tools from; a sandboxed ``npm test`` could plant a
+#: ``.husky/pre-commit`` the user's next commit runs otherwise.
+PROTECTED_ENTRIES = (".gitattributes", ".gitmodules", ".husky", ".envrc")
+
+
+def protected_entries(root: Path) -> list[Path]:
+    """The existing :data:`PROTECTED_ENTRIES` of ``root`` plus its ``.k3code/config*`` files."""
+    found = [root / e for e in PROTECTED_ENTRIES]
+    found += sorted((root / ".k3code").glob("config*"))
+    return [p for p in found if p.exists()]
+
+
 def exposes_home(path: Path | str, home: Path | None = None) -> bool:
     """True when binding ``path`` would bring back all of ``$HOME``: it is ``$HOME`` or contains it (``/``)."""
     home = Path(home or Path.home()).resolve()
     return home.is_relative_to(Path(path).resolve())
+
+
+def _link_walk(path: str) -> tuple[list[tuple[str, str]], str]:
+    """Resolve the absolute ``path`` as the kernel does, one component at a time. Returns every link met on the way as
+    ``(where, target)``, ``where`` free of links itself, and the path it ends at. Raises ``OSError`` on a loop."""
+    links: list[tuple[str, str]] = []
+    pending = [p for p in path.split("/") if p][::-1]
+    done = "/"
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            done = os.path.dirname(done)
+        elif part != ".":
+            here = os.path.join(done, part)
+            if not os.path.islink(here):
+                done = here
+                continue
+            if len(links) >= _MAX_LINKS:
+                raise OSError(errno.ELOOP, "too many levels of symbolic links", path)
+            target = os.readlink(here)
+            links.append((here, target))
+            if target.startswith("/"):
+                done = "/"
+            pending += [p for p in target.split("/") if p][::-1]
+    return links, done
+
+
+def _name_lookup_argv(shown: Sequence[str], hidden: Sequence[Path]) -> list[str]:
+    """bwrap ops that keep each :data:`NAME_LOOKUP_FILES` entry readable when it links out of ``shown`` (the system
+    dirs already in the sandbox): the links on the way are recreated and the file at the end is bound read-only at its
+    own path. A file whose link or bind would land inside or above ``hidden`` ($HOME, the k3code home), or on or above
+    a shown dir or /tmp, is left out: the sandbox keeps hiding those, and an op that collides with another mount fails
+    the whole sandbox."""
+    shown_paths = [Path(s) for s in shown]
+    mounted = (*hidden, *shown_paths, Path("/tmp"))
+
+    def clashes(dest: Path) -> bool:
+        return any(dest.is_relative_to(h) for h in hidden) or any(m.is_relative_to(dest) for m in mounted)
+
+    out: list[str] = []
+    placed: set[str] = set()
+    for name in NAME_LOOKUP_FILES:
+        try:
+            links, end = _link_walk(name)
+        except (OSError, ValueError):
+            logger.debug("sandbox: cannot follow %s", name, exc_info=True)
+            continue
+        if not links or not os.path.isfile(end):
+            continue
+        ops = [("--symlink", target, where) for where, target in links] + [("--ro-bind", end, end)]
+        ops = [op for op in ops if not any(Path(op[2]).is_relative_to(s) for s in shown_paths)]
+        if any(clashes(Path(op[2])) for op in ops):
+            logger.warning("sandbox: %s links to %s, which the sandbox does not show; names may not resolve", name, end)
+            continue
+        for op in ops:
+            if op[2] not in placed:
+                placed.add(op[2])
+                out += op
+    return out
 
 
 def build_argv(
@@ -248,24 +504,37 @@ def build_argv(
     bwrap: str | None = None,
     network: bool = True,
     home_readonly: Iterable[str] | None = None,
+    readonly_home: bool = False,
+    git_writable: bool | None = None,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
 
     ``home_readonly`` lists ``$HOME`` entries that stay visible read-only (default: ``sandbox.home_readonly`` of the
     user's config). It exists for small marker files a tool must be able to read, e.g. ``.myapp``.
 
+    ``git_writable`` (default: ``sandbox.git_writable`` of the user's config, false) lets ``git add``/``commit``/
+    ``branch`` write the git metadata; its hooks, config and ``info/`` stay read-only (see :func:`_git_metadata_argv`).
+    False binds all of it read-only.
+
     A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
     command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case.
 
     Raises :class:`SandboxRefused` when the cwd or an added dir is ``$HOME``, a directory above it, or a directory
     above ``~/.ssh`` or the k3code home.
+
+    ``readonly_home``: the cwd is ``$HOME`` itself (see :func:`readonly_home_ok`). Nothing is writable but ``/tmp``
+    and there is no network: ``$HOME`` and the added dirs are bound read-only, with the credential folders and files
+    hidden (:data:`HOME_RO_HIDDEN`). For the plain builtin readers of a session started in the home directory (see
+    :func:`k3code.permissions.engine.home_read_only`).
     """
     home = Path(home or Path.home())
     roots = [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]
-    for root in roots:
+    if readonly_home and not readonly_home_ok(cwd, add_dirs, home=home):
+        raise SandboxRefused(f"a read-only home sandbox needs $HOME as its working directory, not {roots[0]}")
+    for root in roots[1:] if readonly_home else roots:
         _refuse_root(root, home)
     argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
-    if not network:
+    if not network or readonly_home:  # a read-only home view never has the network: nothing it reads leaves the host
         argv.append("--unshare-net")
     # The command gets a minimal environment, not the daemon's: it carries the provider API keys (OMNIROUTE_API_KEY,
     # ANTHROPIC_API_KEY, ...), so any command run by a prompt-injected turn could print them.
@@ -275,19 +544,32 @@ def build_argv(
         if value is not None:
             argv += ["--setenv", name, value]
     # System: read-only. /bin, /lib* are usually symlinks into /usr; recreate them as symlinks.
+    shown = ["/proc", "/dev"]
     for path in ("/usr", "/etc"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     for path in ("/bin", "/sbin", "/lib", "/lib32", "/lib64"):
         if os.path.islink(path):
             argv += ["--symlink", os.readlink(path), path]
+            shown.append(path)
         elif os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     # /etc/resolv.conf is often a link into /run; keep name resolution working (when the network is on).
     for path in ("/run/systemd/resolve", "/run/NetworkManager"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    # A resolver file linked anywhere else (WSL 2: /mnt/wsl/resolv.conf) is bound at its own path, after the /tmp
+    # tmpfs and before $HOME is masked; never from $HOME or the k3code home. Both spellings of those count: the later
+    # mounts use the given path, and a link recreated above it would make bwrap fail to place them.
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    private = [home, paths.home(), *([Path(xdg) / "k3code"] if xdg else [])]
+    argv += _name_lookup_argv(shown, [*private, *(Path(os.path.realpath(p)) for p in private)])
+    if readonly_home:
+        return [*argv, *_readonly_home_argv(home, roots[1:], xdg)]
     # $HOME hidden behind an empty tmpfs, then only the cache dirs and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
@@ -296,6 +578,8 @@ def build_argv(
     uv = home / HOME_UV
     if uv.is_dir():
         argv += ["--ro-bind", str(uv), str(uv)]
+    if git_writable is None:
+        git_writable = configured_git_writable()
     seen: set[str] = set()
     for root in roots:
         p = str(root)
@@ -305,21 +589,132 @@ def build_argv(
                 logger.warning("sandbox: not binding %s (it would expose $HOME)", p)
                 continue
             argv += ["--bind", p, p]
-            # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
-            for meta in _git_metadata(root):
+            # the git metadata is read-only (only its hooks, config and info with sandbox.git_writable true): a
+            # sandboxed command cannot plant a hook or change core.* config
+            argv += _git_metadata_argv(root, roots, home, git_writable)
+            for meta in protected_entries(root):
                 argv += ["--ro-bind", str(meta), str(meta)]
     # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
     extra = configured_home_readonly() if home_readonly is None else list(home_readonly)
     for path in _home_readonly_paths(home, extra, [*roots, cache]):
         argv += ["--ro-bind", str(path), str(path)]
     # $HOME secrets are masked again after the project binds: a bind above them would re-expose them
-    xdg = os.environ.get("XDG_CONFIG_HOME")
     secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])
     for path in dict.fromkeys(str(p) for p in secrets):
         if os.path.isdir(path):
             argv += ["--tmpfs", path]
     argv += ["--chdir", str(roots[0])]
     return argv
+
+
+#: What a read-only ``$HOME`` view hides on top of :data:`HOME_SECRETS`, :data:`HOME_READONLY_REFUSED`, the k3code
+#: home and the top-level dotenv files: well-known credential files and folders (tokens, registry logins, keyrings,
+#: cloud and agent logins, browser profiles) and shell/REPL histories (pasted tokens, ``export KEY=...``). A dotenv
+#: file deeper down cannot be hidden this way: :func:`k3code.permissions.engine.home_read_only` keeps every command
+#: that walks a tree or expands a glob out of this sandbox, and an explicitly named one is refused before it runs.
+HOME_RO_HIDDEN = (
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+    ".docker",
+    ".kube",
+    ".azure",
+    ".config/gcloud",
+    ".config/gh",
+    ".config/hub",
+    ".config/rclone",
+    ".password-store",
+    ".local/share/keyrings",
+    ".local/share/k3code",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".gem/credentials",
+    ".terraform.d",
+    ".claude",
+    ".claude.json",
+    ".codex",
+    ".mozilla",
+    ".thunderbird",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".var/app",
+    ".bash_history",
+    ".zsh_history",
+    ".zhistory",
+    ".histfile",
+    ".sh_history",
+    ".local/share/fish",
+    ".python_history",
+    ".node_repl_history",
+    ".psql_history",
+    ".mysql_history",
+    ".sqlite_history",
+    ".rediscli_history",
+    ".lesshst",
+)
+
+
+def readonly_home_ok(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> bool:
+    """``cwd`` is ``$HOME`` itself and no added dir is refused as a root (see :func:`_refuse_root`): a session a
+    read-only home sandbox can serve. A cwd above ``$HOME`` (``/``) is not."""
+    home = Path(home or Path.home())
+    try:
+        if Path(cwd).resolve() != home.resolve():
+            return False
+        for d in add_dirs:
+            _refuse_root(Path(d).resolve(), home)
+    except (OSError, SandboxRefused):
+        return False
+    return True
+
+
+def _readonly_home_argv(home: Path, add_dirs: Sequence[Path], xdg: str | None) -> list[str]:
+    """bwrap ops of :func:`build_argv` with ``readonly_home``: $HOME and the added dirs read-only, secrets hidden."""
+    argv = ["--ro-bind", str(home), str(home)]
+    # where each host directory shows inside the sandbox: (its realpath, the path it is mounted at)
+    shown = [(os.path.realpath(home), str(home))]
+    for d in add_dirs:
+        if d.is_dir() and not d.is_relative_to(home.resolve()) and not exposes_home(d, home):
+            argv += ["--ro-bind", str(d), str(d)]
+            shown.append((os.path.realpath(d), str(d)))
+    shown += [(os.path.realpath(p), p) for p in ("/usr", "/etc") if os.path.isdir(p)]
+    hidden = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED, *HOME_RO_HIDDEN)] + [paths.home()]
+    if xdg:
+        hidden.append(Path(xdg) / "k3code")
+    with contextlib.suppress(OSError):
+        hidden += [Path(e.path) for e in os.scandir(home) if sensitive_path(e.path)]  # ~/.env, ~/.env.local, ...
+    # Hidden where the file really is: a symlinked ~/.netrc (dotfile managers) is masked at its target, which is also
+    # what the link reaches inside the sandbox. A target the sandbox does not show is unreachable there anyway.
+    masked: set[str] = set()
+    for p in hidden:
+        real = os.path.realpath(p)
+        at = _shown_at(real, shown)
+        if at is None or at in masked:
+            continue
+        if os.path.isdir(real):
+            argv += ["--tmpfs", at]
+        elif os.path.exists(real):
+            argv += ["--ro-bind", os.devnull, at]
+        else:
+            continue
+        masked.add(at)
+    return [*argv, "--chdir", str(home)]
+
+
+def _shown_at(real: str, shown: Sequence[tuple[str, str]]) -> str | None:
+    """The path inside the sandbox at which the host path ``real`` (a realpath) shows, or None."""
+    for host, inside in sorted(shown, key=lambda s: len(s[0]), reverse=True):
+        if real == host:
+            return inside
+        if real.startswith(host.rstrip("/") + "/"):
+            return os.path.join(inside, os.path.relpath(real, host))
+    return None
 
 
 def with_chdir(argv: Sequence[str], cwd: Path | str) -> list[str]:
@@ -372,3 +767,26 @@ def _probe_bwrap() -> bool:
     except (OSError, subprocess.SubprocessError, SandboxRefused):
         return False
     return r.returncode == 0
+
+
+def hidden_name_lookup_files() -> list[str]:
+    """The :data:`NAME_LOOKUP_FILES` readable here but not inside the sandbox, where host names then do not resolve
+    although the network is on. Reads files only, no lookup. Spawns bwrap (up to 10 s); [] when it cannot run."""
+    path = bwrap_path()
+    wanted = [f for f in NAME_LOOKUP_FILES if os.access(f, os.R_OK)]
+    if path is None or not wanted:
+        return []
+    script = 'for f; do [ -r "$f" ] || echo "$f"; done'
+    try:
+        with tempfile.TemporaryDirectory(prefix="k3code-bwrap-") as scratch:
+            r = subprocess.run(
+                [*build_argv(scratch, bwrap=path), "/bin/sh", "-c", script, "sh", *wanted],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=child_env(),
+            )
+    except (OSError, subprocess.SubprocessError, SandboxRefused):
+        return []
+    return [f for f in r.stdout.splitlines() if f in wanted] if r.returncode == 0 else []

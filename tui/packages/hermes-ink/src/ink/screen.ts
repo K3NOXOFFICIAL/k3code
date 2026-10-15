@@ -1,6 +1,7 @@
 import { type AnsiCode, ansiCodesToString } from "@alcalzone/ansi-tokenize";
 
 import { transitionAnsiCodes } from "./ansi-transition.js";
+import { NO_COLOR_REQUESTED } from "./colorize.js";
 import {
   type Point,
   type Rectangle,
@@ -243,7 +244,9 @@ export class StylePool {
 
       // fg-yellow FIRST so inverse swaps it to bg. Bold after inverse is
       // fine — SGR 1 is fg-attribute-only, order-independent vs 7.
-      codes.push(YELLOW_FG_CODE);
+      if (!NO_COLOR_REQUESTED) {
+        codes.push(YELLOW_FG_CODE);
+      }
 
       if (!baseCodes.some((c) => c.endCode === "\x1b[27m")) {
         codes.push(INVERSE_CODE);

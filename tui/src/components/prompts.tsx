@@ -1,5 +1,5 @@
 import { Box, Text, useInput, wrapAnsi } from "@k3code/ink";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { isMac } from "../lib/platform.js";
 import { clarifyBatchRevisitState } from "../lib/text.js";
@@ -20,8 +20,48 @@ const LABELS = {
   session: "Allow this session",
 } as const;
 const CMD_PREVIEW_LINES = 10;
+/** Rows of an edit/write diff shown at once; `[` and `]` page through the rest. */
+export const DIFF_VIEW_LINES = 16;
 
 type ApprovalChoice = "always" | "deny" | "once" | "session";
+
+/**
+ * The rows of an approval's change preview (a unified diff) to show from
+ * `offset`: clamped so the window never runs past the end. Pure, for tests.
+ */
+export function previewWindow(
+  preview: string,
+  offset: number,
+  height: number = DIFF_VIEW_LINES,
+): { lines: string[]; offset: number; total: number } {
+  const all = preview.split("\n");
+  const start = Math.max(0, Math.min(offset, all.length - height));
+
+  return {
+    lines: all.slice(start, start + height),
+    offset: start,
+    total: all.length,
+  };
+}
+
+/** How a diff row is drawn: added, removed, hunk header or context. */
+export function diffLineKind(
+  line: string,
+): "add" | "context" | "del" | "file" | "hunk" {
+  if (line.startsWith("+++ ") || line.startsWith("--- ")) {
+    return "file";
+  }
+
+  if (line.startsWith("@@")) {
+    return "hunk";
+  }
+
+  if (line.startsWith("+")) {
+    return "add";
+  }
+
+  return line.startsWith("-") ? "del" : "context";
+}
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   if (req.choices) {
@@ -62,16 +102,26 @@ export function approvalLabel(
 }
 
 type ApprovalKey = {
+  ctrl?: boolean;
   downArrow?: boolean;
   escape?: boolean;
+  isPasted?: boolean;
+  meta?: boolean;
   return?: boolean;
   upArrow?: boolean;
 };
 
 type ApprovalAction =
+  | { kind: "arm" }
   | { kind: "choose"; choice: ApprovalChoice }
+  | { kind: "disarm" }
   | { kind: "move"; delta: -1 | 1 }
-  | { kind: "noop" };
+  | { kind: "noop" }
+  | { kind: "scroll"; delta: -1 | 1 };
+
+// Any character outside the C0/C1 control ranges.
+// eslint-disable-next-line no-control-regex
+const TEXT_RE = /[^\x00-\x1f\x7f-\x9f]/;
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -81,35 +131,63 @@ type ApprovalAction =
  *
  * Esc and number keys both terminate the prompt; Esc maps to deny (parity
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
- * for approvals).  Numbers 1..opts.length pick the labelled choice.  Enter
- * confirms the current selection.  ↑/↓ moves the selection within bounds.
+ * for approvals).  One typed digit 1..opts.length picks the labelled choice;
+ * any other digit is text.
+ * Enter confirms the current selection.  ↑/↓ moves the selection within
+ * bounds.  `[` / `]` page the change preview of an edit/write when it is
+ * `scrollable` (PgUp/PgDn already scroll the transcript while a prompt is
+ * open); without one they are typed text.
+ *
+ * The prompt takes every key while it is open, so text typed for the
+ * composer lands here.  Any other text, a paste or a typing burst ("3 tests
+ * failed" arrives as one string) disarms the prompt: until ↑/↓ re-arm it,
+ * Enter and the allow digits do nothing and only deny answers.  A scroll
+ * neither arms nor disarms.
  */
 export function approvalAction(
   ch: string,
   key: ApprovalKey,
   sel: number,
   opts: readonly ApprovalChoice[] = APPROVAL_OPTS,
+  disarmed = false,
+  scrollable = false,
 ): ApprovalAction {
   if (key.escape) {
     return { kind: "choose", choice: "deny" };
   }
 
-  const n = parseInt(ch, 10);
+  if (scrollable && !key.isPasted && (ch === "[" || ch === "]")) {
+    return { kind: "scroll", delta: ch === "[" ? -1 : 1 };
+  }
+
+  const n = !key.isPasted && /^\d$/.test(ch) ? Number(ch) : NaN;
 
   if (n >= 1 && n <= opts.length) {
-    return { kind: "choose", choice: opts[n - 1]! };
+    const choice = opts[n - 1]!;
+
+    return disarmed && choice !== "deny"
+      ? { kind: "noop" }
+      : { kind: "choose", choice };
   }
 
   if (key.return) {
-    return { kind: "choose", choice: opts[sel]! };
+    return disarmed ? { kind: "noop" } : { kind: "choose", choice: opts[sel]! };
   }
 
-  if (key.upArrow && sel > 0) {
-    return { kind: "move", delta: -1 };
+  if (key.upArrow || key.downArrow) {
+    const delta = key.upArrow ? -1 : 1;
+    const next = sel + delta;
+
+    if (next >= 0 && next < opts.length) {
+      return { kind: "move", delta };
+    }
+
+    return disarmed ? { kind: "arm" } : { kind: "noop" };
   }
 
-  if (key.downArrow && sel < opts.length - 1) {
-    return { kind: "move", delta: 1 };
+  // A digit outside 1..opts.length is no quick pick: it is text and disarms.
+  if (key.isPasted || (!key.ctrl && !key.meta && TEXT_RE.test(ch))) {
+    return { kind: "disarm" };
   }
 
   return { kind: "noop" };
@@ -121,17 +199,57 @@ export function ApprovalPrompt({
   req,
   t,
 }: ApprovalPromptProps) {
-  const [sel, setSel] = useState(0);
+  const [view, setView] = useState({ disarmed: false, sel: 0 });
+  // Ink handles all keys of one stdin read in one batch, before a re-render,
+  // so the handler reads and writes this ref: "x" then Enter in one read must
+  // see the prompt already disarmed, ↓ then Enter the moved selection.
+  const live = useRef(view);
+  const { disarmed, sel } = view;
+  const [diffTop, setDiffTop] = useState(0);
   const opts = approvalOptions(req);
+  const diff = req.preview
+    ? previewWindow(req.preview, diffTop, DIFF_VIEW_LINES)
+    : null;
 
-  useInput((ch, key) => {
-    const action = approvalAction(ch, key, sel, opts);
+  useInput((ch, key, event) => {
+    const cur = live.current;
+
+    const action = approvalAction(
+      ch,
+      { ...key, isPasted: Boolean(event.keypress.isPasted) },
+      cur.sel,
+      opts,
+      cur.disarmed,
+      // the condition that shows the `[ / ] scroll` footer below
+      Boolean(diff && diff.total > DIFF_VIEW_LINES),
+    );
 
     if (action.kind === "choose") {
       onChoice(action.choice);
-    } else if (action.kind === "move") {
-      setSel((s) => s + action.delta);
+
+      return;
     }
+
+    if (action.kind === "scroll") {
+      if (diff) {
+        // a page minus one row of overlap; previewWindow clamps the end
+        const step = Math.max(1, DIFF_VIEW_LINES - 1) * action.delta;
+
+        setDiffTop(previewWindow(req.preview!, diff.offset + step).offset);
+      }
+
+      return;
+    }
+
+    if (action.kind === "noop") {
+      return;
+    }
+
+    live.current =
+      action.kind === "move"
+        ? { disarmed: false, sel: cur.sel + action.delta }
+        : { ...cur, disarmed: action.kind === "disarm" };
+    setView(live.current);
   });
 
   // Wrap long single-line commands to the panel width instead of clipping the
@@ -173,6 +291,54 @@ export function ApprovalPrompt({
         ) : null}
       </Box>
 
+      {diff ? (
+        <Box
+          borderColor={t.color.muted}
+          borderStyle="single"
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+        >
+          {diff.lines.map((line, i) => {
+            const kind = diffLineKind(line);
+
+            return (
+              <Text
+                backgroundColor={
+                  kind === "add"
+                    ? t.color.diffAdded
+                    : kind === "del"
+                      ? t.color.diffRemoved
+                      : undefined
+                }
+                bold={kind === "file"}
+                color={
+                  kind === "add"
+                    ? t.color.diffAddedWord
+                    : kind === "del"
+                      ? t.color.diffRemovedWord
+                      : kind === "hunk"
+                        ? t.color.muted
+                        : t.color.text
+                }
+                dimColor={kind === "context"}
+                key={diff.offset + i}
+                wrap="truncate-end"
+              >
+                {line || " "}
+              </Text>
+            );
+          })}
+
+          {diff.total > DIFF_VIEW_LINES ? (
+            <Text color={t.color.muted}>
+              lines {diff.offset + 1}–{diff.offset + diff.lines.length} of{" "}
+              {diff.total} · [ / ] scroll
+            </Text>
+          ) : null}
+        </Box>
+      ) : null}
+
       <Text />
 
       {opts.map((o, i) => (
@@ -184,10 +350,16 @@ export function ApprovalPrompt({
         </Text>
       ))}
 
-      <Text color={t.color.muted}>
-        ↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C
-        deny
-      </Text>
+      {disarmed ? (
+        <Text color={t.color.warn}>
+          typed text ignored · ↑/↓ to choose again · Esc/Ctrl+C deny
+        </Text>
+      ) : (
+        <Text color={t.color.muted}>
+          ↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C
+          deny
+        </Text>
+      )}
     </Box>
   );
 }

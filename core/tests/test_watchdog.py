@@ -14,7 +14,7 @@ NO_ADVISOR = {"advisor_on_goal": False}
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False

@@ -292,3 +292,17 @@ async def test_worktree_child_runs_trusted_project_hooks_in_its_worktree(tmp_pat
     worktree = repo / ".k3code" / "worktrees" / h.id
     assert json.loads(dump.read_text())["cwd"] == str(worktree)
     assert where.read_text().strip() == str(worktree)
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+async def test_matching_hooks_run_concurrently_and_the_first_block_wins(tmp_path: Path) -> None:
+    """Five 0.3 s hooks cost about one hook's time, not five; of two blocking hooks the first in config order wins."""
+    slow = HookRunner([Hook("PreToolUse", "sleep 0.3") for _ in range(5)], session_id="s", cwd=tmp_path)
+    begin = time.monotonic()
+    outcome = await slow.run("PreToolUse", {"tool_name": "bash"}, tool_name="bash")
+    assert time.monotonic() - begin < 1.0
+    assert not outcome.blocked
+
+    two = [Hook("PreToolUse", "sleep 0.2; echo first >&2; exit 2"), Hook("PreToolUse", "echo second >&2; exit 2")]
+    outcome = await HookRunner(two, session_id="s", cwd=tmp_path).run("PreToolUse", {}, tool_name="bash")
+    assert outcome.blocked and "first" in outcome.reason and "second" not in outcome.reason

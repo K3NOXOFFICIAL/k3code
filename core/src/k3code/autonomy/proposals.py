@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import private_file
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -79,14 +80,14 @@ def parse_proposals(text: str) -> list[dict[str, str]]:
 
 
 class ProposalStore:
-    """Append-only jsonl: each line is a proposal snapshot; the last line per id wins."""
+    """jsonl, one line per proposal. New proposals are appended; a status change rewrites the file so it holds no
+    superseded snapshots (older files may still carry some: the last line per id wins)."""
 
     def __init__(self, home: Path) -> None:
         self.path = Path(home) / "proposals.jsonl"
 
     def _write(self, p: Proposal) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        with private_file(self.path).open("a", encoding="utf-8") as f:  # what the owner approved: 0600
             f.write(json.dumps(p.as_dict(), ensure_ascii=False) + "\n")
 
     def all(self) -> list[Proposal]:
@@ -137,13 +138,24 @@ class ProposalStore:
         self._write(p)
         return p
 
+    def dismissed(self, key: str) -> bool:
+        """Whether the proposal with this dedup key was dismissed."""
+        return any(p.key == key and p.status == "dismissed" for p in self.all())
+
     def set_status(self, pid: str, status: str) -> Proposal | None:
         p = self.get(pid)
         if p is None:
             return None
         p.status = status
-        self._write(p)
+        self._rewrite([p if q.id == pid else q for q in self.all()])
         return p
+
+    def _rewrite(self, proposals: list[Proposal]) -> None:
+        """Replace the file by one line per proposal, so status changes do not pile up superseded snapshots."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text("".join(json.dumps(q.as_dict(), ensure_ascii=False) + "\n" for q in proposals), encoding="utf-8")
+        tmp.replace(self.path)
 
 
 async def propose(

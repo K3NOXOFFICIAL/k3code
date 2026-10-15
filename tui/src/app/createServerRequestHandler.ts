@@ -124,6 +124,7 @@ export function createServerRequestHandler(
               p.labels && typeof p.labels === "object"
                 ? (p.labels as Record<string, string>)
                 : undefined,
+            preview: str(p.preview) || undefined,
             requestId: request.id,
             rules: approvalRules(p.rules),
             smartDenied: p.smart_denied === true,

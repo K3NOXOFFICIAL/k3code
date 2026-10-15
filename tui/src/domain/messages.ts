@@ -142,6 +142,14 @@ export const fmtDuration = (ms: number) => {
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
 };
 
+/** Minute-granular `fmtDuration` for idle status read-outs that repaint once a minute. */
+export const fmtDurationMinutes = (ms: number) => {
+  const t = Math.max(0, Math.floor(ms / 60_000));
+  const h = Math.floor(t / 60);
+
+  return t < 1 ? "<1m" : h > 0 ? `${h}h ${t % 60}m` : `${t}m`;
+};
+
 interface TranscriptRow {
   context?: string;
   display_kind?: string;

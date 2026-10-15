@@ -660,6 +660,7 @@ export interface ModelOptionProvider {
   slug: string
   name: string
   models?: string[]
+  model_ids?: Record<string, string> | null
   total_models?: number | null
   is_current?: boolean | null
   is_user_defined?: boolean | null
