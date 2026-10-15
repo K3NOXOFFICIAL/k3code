@@ -1638,9 +1638,16 @@ def _home_stores() -> list[str]:
     return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
 
 
+def _norm(path: str) -> str:
+    """``os.path.normpath`` with a leading ``//`` collapsed: POSIX keeps exactly two slashes, and ``//home/u/.npmrc``
+    is ``/home/u/.npmrc`` on Linux but matches no prefix written with one."""
+    out = os.path.normpath(path)
+    return "/" + out.lstrip("/") if out.startswith("//") else out
+
+
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((os.path.normpath(path), os.path.realpath(path))))
+    return list(dict.fromkeys((_norm(path), _norm(os.path.realpath(path)))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -1698,7 +1705,7 @@ def _link_hops(path: str) -> list[str]:
     cur = path
     try:
         for _ in range(_MAX_LINK_HOPS):
-            hops.append(os.path.normpath(cur))
+            hops.append(_norm(cur))
             done: list[str] = []
             rest = cur.split("/")
             for i, comp in enumerate(rest):
@@ -1710,26 +1717,37 @@ def _link_hops(path: str) -> list[str]:
                     continue
                 probe = "/" + "/".join([*done, comp])
                 if os.path.islink(probe):
-                    cur = "/".join([os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :]])
+                    cur = os.path.join("/" + "/".join(done), os.readlink(probe), *(c for c in rest[i + 1 :] if c))
                     break
                 done.append(comp)
             else:
                 break
     except (OSError, ValueError):
         pass
-    return list(dict.fromkeys([*hops, os.path.realpath(path)]))
+    return list(dict.fromkeys([*hops, _norm(os.path.realpath(path))]))
 
 
 _MAX_LINK_HOPS = 40  # as the kernel's symlink limit
 
 
-def _under(path: str, base: str) -> bool:
-    """``path`` is ``base`` or lies below it, by name (not resolved again), compared case-insensitively."""
-    low, root = path.casefold(), base.casefold().rstrip("/")
-    return low == root or low.startswith(root + "/")
+def _under(path: str, base: str, fold: bool = False) -> bool:
+    """``path`` is ``base`` or lies below it, by name (not resolved again). ``fold``: compared case-insensitively, as
+    for a credential store; a root covers a path by its exact name (on a case-sensitive file system ``MEMORY`` is not
+    ``memory``)."""
+    if fold:
+        path, base = path.casefold(), base.casefold()
+    root = base.rstrip("/")
+    return path == root or path.startswith(root + "/")
 
 
-def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
+def _without_mirror(path: str, mirror: str) -> str:
+    """``path`` with the first ``/<mirror>`` cut out: ``~/dotfiles/k3code/.k3code/memory/USER.md`` is
+    ``~/dotfiles/k3code/USER.md`` for the mirror ``.k3code/memory``."""
+    at = path.find("/" + mirror + "/") if mirror else -1
+    return path if at < 0 else path[:at] + path[at + len(mirror) + 1 :]
+
+
+def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = "") -> bool:
     """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
     has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
     (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
@@ -1742,7 +1760,14 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     makes its dot folders ordinary (``.github`` of a repository). A root counts as written and by its realpath, and a
     spelling lies in it by name: a spelling is never resolved a second time, or a memory folder kept in a dotfiles
     repository (``~/.k3code/memory -> ~/dotfiles/k3code/memory``) would stop being its own. Callers have already
-    checked the target lies in the roots, so a store outside every root needs no test here."""
+    checked the target lies in the roots, so a store outside every root needs no test here.
+
+    ``mirror`` is the memory folder relative to ``$HOME`` (``.k3code/memory``), given for the user's memory: GNU stow
+    without folding links the file, not the folder, so its real place is
+    ``<dotfiles>/<package>/.k3code/memory/USER.md``. That spelling is judged by the dot rule with the mirror cut out
+    of it, so the dotfiles folder and anything below the mirror still count (``~/.dotfiles/...`` and a ``.hidden``
+    below it stay refused). Every other spelling, the realpath of a link in the mirror among them, is judged on its
+    own."""
     spellings = _link_hops(path)
     if any(sensitive_path(p) for p in spellings):
         return True
@@ -1752,7 +1777,7 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
         return all(any(_under(p, f) for f in forms[root]) for p in paths)
 
     for store in [*_home_stores(), *extra_stores]:
-        held = [p for p in spellings if _under(p, store)]
+        held = [p for p in spellings if _under(p, store, fold=True)]
         if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
             return True
     home = os.path.normpath(os.path.expanduser("~"))
@@ -1760,7 +1785,10 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
         return False
     projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not any(_under(p, f) for f in projects) for p in spellings)
+    return any(
+        _below_home_dot(_without_mirror(p, mirror), homes) and not any(_under(p, f) for f in projects)
+        for p in spellings
+    )
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:
