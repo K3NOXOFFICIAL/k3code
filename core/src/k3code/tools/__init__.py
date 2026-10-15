@@ -248,8 +248,9 @@ def _too_big_to_read(path: Path) -> dict[str, Any] | None:
     return {"error": f"{_file_size_note(size)}: edit cannot load it; change it with bash (sed, python) instead"}
 
 
-def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
-    """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them."""
+def _read_range(path: Path, start: int, end: int, *, stop_at_budget: bool = False) -> dict[str, Any]:
+    """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them (``stop_at_budget``: a range
+    past that stops there instead of failing; the result says where to continue)."""
     selected: list[str] = []
     total = used = 0
     too_big = {"error": f"Lines {start}-{end} exceed {MAX_READ_BYTES // (1024 * 1024)} MB: request a smaller range"}
@@ -267,6 +268,8 @@ def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
             elif number >= start:
                 total += len(raw)
                 if total > MAX_READ_BYTES:
+                    if stop_at_budget and selected:
+                        break
                     return too_big
                 line = _cap_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
                 used += len(line) + _NUMBER_WIDTH + 2
@@ -324,13 +327,12 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     first, count = _read_window(arguments)
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
-        # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
-        if not explicit:
-            return {
-                "error": f"{_file_size_note(size)}: "
-                "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
-            }
-        return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
+        # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines
+        # (the first window when the call names none, with a note saying how big the file is and how to go on)
+        result = _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1, stop_at_budget=not explicit)
+        if not explicit and "error" not in result:
+            result["note"] = f"{_file_size_note(size)}: showing the first lines only; grep it, or read a range"
+        return result
     text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
     total = len(lines)
@@ -653,7 +655,8 @@ def _numbered_read(result: dict[str, Any]) -> str:
     lines = str(result["content"]).split("\n")
     body = "\n".join(f"{n:>{_NUMBER_WIDTH}}\t{line}" for n, line in enumerate(lines, first))
     if total is None:  # a huge file, streamed: its length is not known
-        return f"{body}\n[showed {first}-{last}; continue with offset={last + 1}]"
+        note = f"{result['note']}; " if result.get("note") else ""
+        return f"{body}\n[{note}showed {first}-{last}; continue with offset={last + 1}]"
     if last < total:
         return f"{body}\n[file has {total} lines; showed {first}-{last}; continue with offset={last + 1}]"
     return body
@@ -804,6 +807,42 @@ def _grep_line(raw: bytes, verdicts: dict[bytes, bool], withheld: Callable[[str]
     return f"{name.decode('utf-8', errors='replace')}:{rest.decode('utf-8', errors='replace')}", hide
 
 
+def _is_match_line(raw: bytes) -> bool:
+    """With context, rg writes ``name\0N:text`` for a match and ``name\0N-text`` for a context line (and ``N:``/``N-``
+    alone for a single file)."""
+    _, sep, rest = raw.partition(b"\0")
+    rest = rest if sep else raw
+    digits = rest[: len(rest) - len(rest.lstrip(b"0123456789"))]
+    return bool(digits) and rest[len(digits) : len(digits) + 1] == b":"
+
+
+async def _count_rest(proc: asyncio.subprocess.Process, *, context: bool = False) -> tuple[int, bool]:
+    """(matching lines rg still had after the cap, whether the count is exact): up to _GREP_COUNT_REST lines are read
+    before rg is killed, so a search of a huge tree still returns at once."""
+    assert proc.stdout is not None
+    more, read = 1, 0  # the line that proved the cut is a match
+    try:
+        while read < _GREP_COUNT_REST:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+            if not raw:
+                return more, True
+            read += 1
+            raw = raw.rstrip(b"\n")
+            if raw != b"--" and (not context or _is_match_line(raw)):
+                more += 1
+    except TimeoutError:
+        pass
+    return more, False
+
+
+def _more_matches(cap: int, rest: tuple[int, bool]) -> str:
+    more, exact = rest
+    return (
+        f"truncated to the first {cap} matching lines; {more}{'' if exact else '+'} more not shown: {_NARROW}, or "
+        f"pass limit (up to {MAX_SEARCH_RESULTS})"
+    )
+
+
 def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
     """``result`` with ``note`` added to its warnings (a string, or a list of stderr lines)."""
     warnings = result.get("warnings")
@@ -825,12 +864,16 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
+    context = min(max(0, int(arguments.get("context") or 0)), GREP_MAX_CONTEXT)
+    cap = min(max(1, int(arguments.get("limit") or GREP_DEFAULT_LIMIT)), MAX_SEARCH_RESULTS)
     if sensitive_path(str(path)):
         return {"error": f"Hardline deny (sensitive-path): {path}"}
     try:
         # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
         cmd += [f"--max-columns={_RG_MAX_COLUMNS}", "--max-columns-preview"]
+        if context:
+            cmd += ["-C", str(context)]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
@@ -854,6 +897,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         )
         assert proc.stdout is not None and proc.stderr is not None
         lines: list[str] = []
+        matched = 0  # matching lines kept (context lines and "--" separators are not matches)
         withheld = 0
         cut = ""
         verdicts: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
@@ -863,19 +907,25 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             try:
                 raw = await asyncio.wait_for(proc.stdout.readline(), timeout=max(0.0, deadline - time.monotonic()))
             except TimeoutError:
-                cut = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(lines)} matching lines so far: {_NARROW}"
+                cut = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {matched} matching lines so far: {_NARROW}"
                 break
             if not raw:
                 break
-            line, secret = _grep_line(raw.rstrip(b"\n"), verdicts, secret_file)
+            raw = raw.rstrip(b"\n")
+            if context and raw == b"--":  # rg's separator between context groups
+                lines.append("--")
+                continue
+            line, secret = _grep_line(raw, verdicts, secret_file)
             if secret:
                 withheld += 1
                 continue
-            lines.append(line)
-            if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
-                lines = lines[:MAX_SEARCH_RESULTS]
-                cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
+            is_match = not context or _is_match_line(raw)
+            if is_match and matched >= cap:
+                # one past the cap proves the cut; stop rg instead of reading on, and count what it still had
+                cut = _more_matches(cap, await _count_rest(proc, context=bool(context)))
                 break
+            lines.append(line)
+            matched += is_match
         if cut:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -904,7 +954,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         import re
 
         try:
-            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, context=context, cap=cap)
         except re.error:
             if isinstance(rg_failure, RuntimeError):  # a pattern neither engine takes: rg's message names the fault
                 raise rg_failure from None
@@ -933,8 +983,15 @@ SKIP_DIRS = frozenset(
 WALK_SKIP_DIRS = SKIP_DIRS | {"build", "target"}
 #: Sub-paths never entered at any depth: other sessions' worktrees and background-job scratch directories.
 SKIP_SUBPATHS = (".claude/worktrees", ".claude/jobs")
-#: Most paths a glob returns, and most lines grep returns; past it the result says it was cut.
+#: Most paths a glob returns, and most matching lines grep returns (``limit`` at most); past it the result says so.
 MAX_SEARCH_RESULTS = 1000
+#: Matching lines grep returns when the call names no ``limit``: 200 lines of 80 chars are 16k chars, about what the
+#: model is sent of one result; 1000 came back clipped to head and tail with the middle gone.
+GREP_DEFAULT_LIMIT = 200
+#: Most lines of context (``context``) around a match, each way.
+GREP_MAX_CONTEXT = 10
+#: Past the cap, this many more lines of rg output are counted so the note can say how many matches were not shown.
+_GREP_COUNT_REST = 50_000
 #: Wall-clock budget of one glob or grep; past it the partial result comes back with a note to narrow the search.
 SEARCH_BUDGET_S = 10.0
 _NARROW = "narrow the pattern or pass a smaller path (a project directory, not $HOME)"
@@ -1094,18 +1151,26 @@ _GREP_PIECE_BYTES = 1 << 20
 _GREP_CLOCK_BYTES = 64 * 1024
 
 
-def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> Iterator[str | None]:
-    """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
-    preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
-    matches`` line, as rg says. Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
-    _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
-    anchor at one, is approximate."""
+def _grep_file(
+    fp: Path, rx: Any, deadline: float, *, named: bool = False, context: int = 0
+) -> Iterator[tuple[str, bool] | None]:
+    """``(path:line:text, True)`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like
+    rg's preview; with ``context``, ``(path:line-text, False)`` for up to that many lines before and after a match
+    and ``("--", False)`` between groups, as rg prints them. A binary file found in a walk is skipped; one ``named``
+    on purpose gives a single ``path: binary file matches`` line, as rg says. Past ``deadline`` (``time.monotonic``)
+    it yields None once and stops. A line longer than _GREP_PIECE_BYTES is searched piece by piece under its own line
+    number, so a match across a piece edge, or an anchor at one, is approximate."""
+    from collections import deque
+
     with fp.open("rb") as f:
         binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
         if binary and not named:
             return
         f.seek(0)
         number, line_start, unclocked = 0, True, 0
+        before: deque[tuple[int, str]] = deque(maxlen=context)  # the lines before a match, for context
+        after = 0  # context lines still owed after the last match
+        last_shown = 0  # line number last yielded: a gap between groups gets the "--" separator
         for raw in iter(lambda: f.readline(_GREP_PIECE_BYTES), b""):
             unclocked += len(raw)
             if unclocked >= _GREP_CLOCK_BYTES:
@@ -1117,14 +1182,29 @@ def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> It
                 number += 1
             line_start = raw.endswith(b"\n")
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not rx.search(line):
-                continue
-            if binary:
-                yield f"{fp}: binary file matches"
-                return
+            hit = rx.search(line)
             if len(line) > _RG_MAX_COLUMNS:
                 line = line[:_RG_MAX_COLUMNS] + " [... omitted end of long line]"
-            yield f"{fp}:{number}:{line}"
+            if not hit:
+                if after > 0:
+                    after -= 1
+                    last_shown = number
+                    yield f"{fp}:{number}-{line}", False
+                elif context:
+                    before.append((number, line))
+                continue
+            if binary:
+                yield f"{fp}: binary file matches", True
+                return
+            if context:
+                if last_shown and (before[0][0] if before else number) > last_shown + 1:
+                    yield "--", False
+                for n, text in before:
+                    yield f"{fp}:{n}-{text}", False
+                before.clear()
+                after = context
+            last_shown = number
+            yield f"{fp}:{number}:{line}", True
 
 
 def _search_glob_match(rel: str, pattern: str) -> bool:
@@ -1137,7 +1217,9 @@ def _search_glob_match(rel: str, pattern: str) -> bool:
     return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
 
 
-def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
+def _grep_fallback(
+    pattern: str, path: Path, include: Any, exclude: Any, *, context: int = 0, cap: int = MAX_SEARCH_RESULTS
+) -> dict[str, Any]:
     import re
 
     includes = include if isinstance(include, list) else [include] if include else []
@@ -1151,6 +1233,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         base, candidates = path, _iter_tree(path, deadline)
     real_base = os.path.realpath(base)  # base itself may be a link the engine decided on
     matches: list[str] = []
+    matched = 0  # matching lines in ``matches`` (context lines and separators are not)
+    more = 0  # matching lines past the cap (counted, not kept)
     skipped = 0
     timed_out = False
     secret_file = sensitive_path if named else search_withheld(str(path))  # a named file: tool_grep decided on it
@@ -1171,21 +1255,32 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             skipped += 1
             continue
         try:
-            for hit in _grep_file(fp, rx, deadline, named=named):
+            for hit in _grep_file(fp, rx, deadline, named=named, context=context):
                 if hit is None:
                     timed_out = True
                     break
-                matches.append(hit)
-                if len(matches) > MAX_SEARCH_RESULTS:
-                    break
+                line, is_match = hit
+                if more or (is_match and matched >= cap):
+                    # past the cap: count the matches still found (up to _GREP_COUNT_REST) so the note can say so
+                    more += is_match
+                    if more >= _GREP_COUNT_REST:
+                        break
+                    continue
+                if not is_match and line == "--" and matches and matches[-1] != "--":
+                    matches.append(line)
+                elif is_match or line != "--":
+                    matches.append(line)
+                    matched += is_match
         except OSError:  # unreadable, or an index entry deleted from the work tree (see _git_files)
             continue
-        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
+        if timed_out or more >= _GREP_COUNT_REST:
             break
-    shown, note = _capped(matches)
+    while matches and matches[-1] == "--":  # a group separator is for what follows; nothing does past the cap
+        matches.pop()
+    note = _more_matches(cap, (more, more < _GREP_COUNT_REST)) if more else ""
     if timed_out:
-        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
-    result = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
+        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {matched} matching lines so far: {_NARROW}"
+    result = {"matches": "\n".join(matches), **({"warnings": note} if note else {})}
     if skipped:
         _note_withheld(result, f"{skipped} credential file(s) (.env, keys, home dot folders) not searched")
     return result
@@ -1333,7 +1428,8 @@ def build_registry() -> ToolRegistry:
                 f"Returns up to {READ_DEFAULT_LIMIT} lines; a longer file ends with a note saying which offset "
                 "continues it.\n"
                 f"Limits: {READ_DEFAULT_LIMIT} lines and {READ_MAX_CHARS} chars per call, lines cut at "
-                f"{READ_MAX_LINE_CHARS} chars; a file over {MAX_READ_BYTES // (1024 * 1024)} MB needs offset+limit."
+                f"{READ_MAX_LINE_CHARS} chars; a file over {MAX_READ_BYTES // (1024 * 1024)} MB is streamed: its "
+                "first window, or offset+limit."
             ),
             parameters={
                 "type": "object",
@@ -1454,8 +1550,11 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="grep",
-            description="Search for a regex in files (ripgrep; .gitignore is respected). Returns path:line:text.\n"
-            f"Limits: stops after 10 s; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail).",
+            description="Search for a regex in files (ripgrep; .gitignore is respected). Returns path:line:text; "
+            "with context, path:line-text around each match and -- between groups.\n"
+            f"Limits: the first {GREP_DEFAULT_LIMIT} matching lines (limit: up to {MAX_SEARCH_RESULTS}; a cut result "
+            f"says how many more there were); stops after 10 s; you see at most {MAX_TOOL_RESULT_CHARS} chars (head "
+            "and tail).",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1463,6 +1562,15 @@ def build_registry() -> ToolRegistry:
                     "path": {"type": "string", "default": "."},
                     "include": {"type": ["string", "array"]},
                     "exclude": {"type": ["string", "array"]},
+                    "context": {
+                        "type": "integer",
+                        "description": f"Lines shown before and after each match (0-{GREP_MAX_CONTEXT})",
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"Most matching lines returned (default {GREP_DEFAULT_LIMIT})",
+                    },
                 },
                 "required": ["pattern"],
             },

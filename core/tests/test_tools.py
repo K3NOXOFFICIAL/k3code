@@ -93,8 +93,11 @@ async def test_read_of_a_huge_file_is_refused_or_streamed_as_a_range(temp_dir, m
     monkeypatch.setattr(tools, "MAX_READ_BYTES", 100)
     f = temp_dir / "big.log"
     f.write_text("".join(f"line{i}\n" for i in range(1, 51)))  # ~340 bytes
-    result = await tool_read({"path": str(f)}, cwd=temp_dir)
-    assert "start and end" in result["error"]
+    result = await tool_read({"path": str(f)}, cwd=temp_dir)  # no range: the first window, streamed, with a note
+    assert result["content"].startswith("line1\nline2\n") and result["total"] is None
+    assert "showing the first lines only" in result["note"]
+    text = format_tool_result(result)
+    assert text.startswith("     1\tline1\n") and text.endswith("; showed 1-15; continue with offset=16]")
     result = await tool_read({"path": str(f), "start": 10, "end": 12}, cwd=temp_dir)
     assert result["content"] == "line10\nline11\nline12"
     assert result["lines"] == "10-12"

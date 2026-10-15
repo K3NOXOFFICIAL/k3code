@@ -285,8 +285,9 @@ async def test_glob_and_the_grep_fallback_run_off_the_event_loop(tmp_path, no_gi
 async def test_the_grep_fallback_caps_its_matches(tmp_path, no_git_env, monkeypatch):
     (tmp_path / "big.txt").write_text("needle\n" * (MAX_SEARCH_RESULTS + 50))
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
-    res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+    res = await tool_grep({"pattern": "needle", "limit": MAX_SEARCH_RESULTS}, cwd=tmp_path)
     assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS and "truncated" in res["warnings"]
+    assert "50 more not shown" in res["warnings"]
 
 
 async def test_project_prep_scans_risks_off_the_event_loop(tmp_path, monkeypatch):
@@ -334,9 +335,9 @@ async def test_grep_stops_reading_at_the_result_cap(tmp_path, no_git_env):
     if not shutil.which("rg"):
         pytest.skip("rg not installed")
     (tmp_path / "big.txt").write_text("needle\n" * (MAX_SEARCH_RESULTS * 3))
-    res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+    res = await tool_grep({"pattern": "needle", "limit": MAX_SEARCH_RESULTS * 2}, cwd=tmp_path)  # capped at the max
     assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS
-    assert "truncated" in res["warnings"]
+    assert "truncated" in res["warnings"] and f"{MAX_SEARCH_RESULTS * 2} more not shown" in res["warnings"]
 
 
 def _git_init(root: Path) -> None:
