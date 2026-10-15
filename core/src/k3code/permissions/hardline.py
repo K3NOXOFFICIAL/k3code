@@ -11,7 +11,6 @@ lone ``&``, a quote or a substitution.
 
 from __future__ import annotations
 
-import functools
 import os
 import re
 import shlex
@@ -111,9 +110,67 @@ WINDOWS_LAUNCHERS = frozenset(
 _WINDOWS_EXEC_SUFFIX = re.compile(r"\.(?:exe|com|bat)$")
 
 
+def _windows_program(name: str) -> str:
+    """``name`` (an argv0 basename) lower-cased and without a Windows executable suffix: ``PowerShell.EXE`` ->
+    ``powershell``."""
+    return _WINDOWS_EXEC_SUFFIX.sub("", name.lower())
+
+
 def _windows_launcher(name: str) -> bool:
     """``name`` (an argv0 basename) is a Windows interpreter reached through WSL interop (see WINDOWS_LAUNCHERS)."""
-    return _WINDOWS_EXEC_SUFFIX.sub("", name.lower()) in WINDOWS_LAUNCHERS
+    return _windows_program(name) in WINDOWS_LAUNCHERS
+
+
+#: wsl.exe options that take a value; ``-e``/``--exec``/``--`` end its options.
+_WSL_VALUE_OPTS = frozenset({"-d", "--distribution", "--distribution-id", "-u", "--user", "--cd", "--shell-type"})
+#: PowerShell parameters that take a value (lower case, no leading ``-``): any prefix of one is the parameter, as
+#: PowerShell accepts abbreviations (``-ExecutionPol``). Aliases that are no prefix are listed apart.
+_PS_VALUE_PARAMS = (
+    *("executionpolicy", "windowstyle", "version", "psconsolefile", "inputformat", "outputformat"),
+    *("configurationname", "configurationfile", "settingsfile", "workingdirectory", "custompipename"),
+)
+_PS_VALUE_ALIASES = frozenset({"ep", "if", "of", "wd"})
+
+
+def _windows_command_line(name: str, args: list[str]) -> list[str]:
+    """The command line a Windows launcher runs from its arguments, joined as it joins them: ``wsl.exe [options]
+    <command ...>`` (also after ``-e``/``--exec``/``--``), ``cmd.exe ... /c <command ...>`` (``/k``, ``/r``) and
+    ``powershell.exe ... -Command <command ...>`` (any prefix of ``-Command``, or the first positional argument, which
+    Windows PowerShell runs as the command). Read like the script of ``bash -c``, so the hardline sees an unquoted
+    ``wsl.exe rm -rf ~`` or ``cmd.exe /c wsl rm -rf ~`` (issue #169). ``-File`` and ``-EncodedCommand`` give none."""
+    prog = _windows_program(name)
+    rest: list[str] = []
+    if prog == "wsl":
+        i = 1 if args[:1] == ["~"] else 0  # `wsl ~ ...` starts in the home directory
+        while i < len(args) and args[i].startswith("-"):
+            i += 1
+            if args[i - 1] in ("-e", "--exec", "--"):
+                break
+            if args[i - 1] in _WSL_VALUE_OPTS:
+                i += 1
+        rest = args[i:]
+    elif prog == "cmd":
+        for i, a in enumerate(args):
+            if a[:2].lower() in ("/c", "/k", "/r"):
+                rest = [a[2:], *args[i + 1 :]] if a[2:] else args[i + 1 :]
+                break
+    elif prog in ("powershell", "pwsh"):
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a[:1] not in ("-", "/"):
+                rest = args[i:]
+                break
+            word, colon, _ = a.lstrip("-/").lower().partition(":")
+            if word and "command".startswith(word):
+                rest = args[i + 1 :]
+                break
+            encoded = word in ("e", "ec") or (len(word) > 1 and "encodedcommand".startswith(word))
+            if word and ("file".startswith(word) or encoded):
+                break
+            value = word in _PS_VALUE_ALIASES or any(p.startswith(word) for p in _PS_VALUE_PARAMS)
+            i += 2 if word and value and not colon else 1
+    return [" ".join(rest)] if rest else []
 
 
 #: Commands that run arbitrary code from their arguments: an "always allow <prefix>" rule must never be offered for
@@ -227,33 +284,8 @@ _DANGEROUS_RM_TARGETS = frozenset(
 #: Top-level folders of a Windows drive whose recursive delete wipes the host side (lower case, as drvfs folds case).
 _WINDOWS_DRIVE_SUBDIRS = frozenset({"users", "windows", "program files", "program files (x86)", "programdata"})
 #: The default WSL automount: a Windows drive is mounted at ``/mnt/<letter>``. A custom ``automount.root`` is read
-#: from /proc/mounts instead (see :func:`windows_drives`).
-_DEFAULT_MNT_DRIVE = re.compile(r"^(/mnt/[a-z0-9])(?:/|$)")
-
-
-def windows_drives(mounts: str | None = None) -> list[str]:
-    """Mount points (lower case, trailing slash dropped) of the Windows drives WSL mounts: ``drvfs``, or ``9p`` with
-    ``aname=drvfs`` on WSL 2, read from ``mounts`` or ``/proc/mounts``. Empty off WSL. Lets a custom ``automount.root``
-    (e.g. ``/win/c``) be protected like the default ``/mnt/c`` (issue #169)."""
-    if mounts is None:
-        mounts = _read_proc_mounts()
-    out: list[str] = []
-    for line in mounts.splitlines():
-        fields = line.split()
-        if len(fields) >= 4 and (fields[2] == "drvfs" or (fields[2] == "9p" and "aname=drvfs" in fields[3])):
-            point = fields[1].replace("\\040", " ").rstrip("/").lower() or "/"
-            if point not in out:
-                out.append(point)
-    return out
-
-
-@functools.cache
-def _read_proc_mounts() -> str:
-    try:
-        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
+#: from /proc/mounts instead (see :func:`k3code.permissions.engine.windows_drives`).
+_DEFAULT_MNT_DRIVE = re.compile(r"^(/mnt/[a-z])(?:/|$)")
 
 
 def _windows_drive_of(base: str, drives: list[str]) -> str | None:
@@ -847,6 +879,8 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     if not recursive:
         return None
     dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
+    from .engine import windows_drives  # engine imports this module
+
     drives = windows_drives()
     for t in targets:
         target = _expand_target(t, cwd, home) if t else t
@@ -1279,8 +1313,9 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
 
 
 def _launcher_payloads(sub: str) -> list[str]:
-    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
-    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands."""
+    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
+    values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and the command line of ``wsl.exe``, ``cmd.exe /c``
+    and ``powershell.exe -Command`` (see _windows_command_line): strings run as commands."""
     toks = _tokens(sub)
     out: list[str] = []
     pre = _strip_wrappers(toks)
@@ -1291,6 +1326,7 @@ def _launcher_payloads(sub: str) -> list[str]:
         out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
     if real:
         out += ssh_option_commands(real[0], real[1:])
+        out += _windows_command_line(real[0], real[1:])
     return out
 
 

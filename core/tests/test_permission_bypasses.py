@@ -739,12 +739,53 @@ def test_learned_wildcards_on_windows_launchers_are_rejected(pattern: str) -> No
         "cmd.exe /c 'cat .env'",
         'powershell.exe -Command "rm -rf ~"',
         "wsl.exe -e sh -c 'rm -rf /'",
+        # wsl.exe, cmd.exe /c and powershell -Command run their remaining arguments, joined, as one command line
+        "wsl.exe rm -rf ~",
+        "wsl -e rm -rf ~",
+        "wsl.exe --exec rm -rf /",
+        "wsl -u root -- rm -rf /",
+        "WSL.EXE -d Ubuntu --cd /tmp rm -rf /mnt/c/Users/me",
+        "wsl.exe --user=root rm -rf /",
+        "wsl.exe ~ rm -rf /mnt/c",
+        "wsl ~ -u root -e rm -rf /",
+        "cmd.exe /c wsl rm -rf ~",
+        "CMD.EXE /S /C wsl.exe -e rm -rf /",
+        "cmd.exe /k wsl rm -rf ~",
+        'cmd.exe /d /c"wsl rm -rf ~"',
+        "powershell.exe -NoProfile -Command wsl rm -rf ~",
+        "powershell.exe wsl rm -rf ~",  # Windows PowerShell runs its first positional argument as -Command
+        "powershell.exe -ExecutionPolicy:Bypass -WindowStyle Hidden wsl rm -rf ~",
+        "powershell.exe -conf X -ExecutionPol Bypass -NoP wsl -e rm -rf ~",
+        'powershell.exe -c "wsl rm -rf ~"',
+        "PowerShell.exe -ExecutionPolicy Bypass -Comm wsl rm -rf ~",
+        "pwsh -c wsl -e rm -rf /",
+        "pwsh.exe --command wsl rm -rf ~",
+        "sudo wsl.exe rm -rf ~",
     ],
 )
 def test_hardline_sees_into_windows_launcher_arguments(tmp_path: Path, cmd: str) -> None:
     for mode in ("default", "auto", "yolo"):
         d = _decide(cmd, mode, tmp_path)
         assert (d.action, bool(d.hardline)) == ("deny", True), (cmd, mode)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "wsl.exe -e ls",
+        "wsl.exe --cd ~ ls -la",
+        "wsl -d Ubuntu -u root -- apt list --installed",
+        "wsl.exe --list --verbose",
+        "cmd.exe /c dir",
+        "cmd.exe /c echo rm -rf",
+        "powershell.exe -NoProfile -Command Get-Date",
+        "pwsh -File build.ps1 -Target rm",
+        "powershell.exe -EncodedCommand ZQBjAGgAbwA=",
+        "wsl.exe ~",
+    ],
+)
+def test_harmless_windows_launcher_commands_are_not_hardline(cmd: str) -> None:
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
 
 
 #: A Windows drive, its system folders and a profile root under the WSL mount (any case: drvfs folds it).
@@ -786,15 +827,13 @@ def test_rm_inside_a_windows_profile_is_not_hardline(cmd: str) -> None:
     assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
 
 
-def test_windows_drives_are_parsed_from_proc_mounts() -> None:
-    mounts = (
-        "/dev/sdc / ext4 rw,relatime 0 0\n"
-        "C:\\134 /win/c 9p rw,noatime,dirsync,aname=drvfs;path=C:\\;uid=1000 0 0\n"
-        "D:\\134 /win/data\\040drive drvfs rw,noatime 0 0\n"
-        "tmpfs /mnt/wsl tmpfs rw 0 0\n"
-    )
-    assert hardline.windows_drives(mounts) == ["/win/c", "/win/data drive"]
-    assert hardline.windows_drives("tmpfs /mnt/wsl tmpfs rw 0 0\n") == []
+def test_rm_reads_the_drives_wsl_mounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.permissions import engine
+
+    monkeypatch.setattr(engine, "_mounted_windows_drives", lambda: ("/win/c",))  # automount.root = /win/
+    for cmd in ("rm -rf /win/c", "rm -rf /win/C/Users/me", "rm -rf /win/c/Windows"):
+        assert hardline.check(cmd, cwd="/work/proj", home="/home/user") == "rm-rf-root", cmd
+    assert hardline.check("rm -rf /win/c/Users/me/build", cwd="/work/proj", home="/home/user") is None
 
 
 def test_rm_of_a_drive_at_a_custom_automount_root_is_recognised() -> None:
