@@ -202,3 +202,59 @@ def test_the_unit_directory_follows_xdg_config_home(monkeypatch: pytest.MonkeyPa
         for mode in MODES:
             assert _asks(mode, tool, path, _home()), (mode, path)
     assert decide(mode="auto", tool=tool, args={"path": str(xdg / "app.conf")}, cwd=_home()).action == "allow"
+
+
+UNIT_ENV_FILES = [
+    ".config/systemd/user.control/k3code.service.d/x.conf",  # a drop-in from any unit directory applies
+    ".config/systemd/user/default.target.wants/x.service",
+    ".config/systemd/user.conf",
+    ".config/systemd/user.conf.d/x.conf",  # DefaultEnvironment=
+    ".config/environment.d/x.conf",  # the environment the user manager starts the daemon with
+    ".local/share/systemd/user/k3code.service.d/x.conf",
+    ".local/share/systemd/user/service.d/x.conf",
+]
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+def test_everything_that_shapes_the_unit_and_its_environment_asks(layout: tuple[Path, Path], tool: str) -> None:
+    for rel in UNIT_ENV_FILES:
+        for mode in MODES:
+            assert _asks(mode, tool, _home() / rel, _home()), (mode, rel)
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+def test_the_runtime_unit_directories_ask(
+    monkeypatch: pytest.MonkeyPatch, layout: tuple[Path, Path], tool: str
+) -> None:
+    run = _home() / "run" / "user" / "1000"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(run))
+    for rel in ("systemd/user/k3code.service", "systemd/user.control/k3code.service.d/x.conf", "systemd/transient/x"):
+        for mode in MODES:
+            assert _asks(mode, tool, run / rel, _home()), (mode, rel)
+    assert decide(mode="yolo", tool=tool, args={"path": str(run / "other" / "x")}, cwd=_home()).action == "allow"
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+def test_the_default_and_the_xdg_directories_are_both_guarded(monkeypatch: pytest.MonkeyPatch, tool: str) -> None:
+    """The daemon may have XDG_CONFIG_HOME / XDG_DATA_HOME set where the user manager has not, or the reverse."""
+    monkeypatch.delenv("K3CODE_DATA", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(_home() / "cfg"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(_home() / "dat"))
+    for rel in (
+        ".config/systemd/user/k3code.service",
+        ".config/environment.d/x.conf",
+        ".local/share/systemd/user/k3code.service.d/x.conf",
+        "cfg/systemd/user/k3code.service",
+        "cfg/environment.d/x.conf",
+        "dat/systemd/user/k3code.service.d/x.conf",
+    ):
+        for mode in MODES:
+            assert _asks(mode, tool, _home() / rel, _home()), (mode, rel)
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+def test_the_uv_the_updater_runs_sits_with_the_links(layout: tuple[Path, Path], tool: str) -> None:
+    _, bindir = layout
+    for name in ("uv", "uvx"):
+        for mode in MODES:
+            assert _asks(mode, tool, bindir / name, _home()), (mode, name)
