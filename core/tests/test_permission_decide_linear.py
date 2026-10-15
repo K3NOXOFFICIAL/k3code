@@ -72,7 +72,7 @@ def test_deciding_a_call_is_linear_in_its_simple_commands(tmp_path: Path, spelli
 
 @pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
 def test_a_256_kb_heredoc_of_simple_commands_is_decided_in_seconds_not_minutes(tmp_path: Path) -> None:
-    # 20,000 commands, 256 KB. Measured on kokadock: 1.3 s (Main: 11.7 s for 13,000 commands and 163 s for 52,000).
+    # 20,000 commands, 256 KB. Measured on kokadock: 1.3 s (Main: 29 s; 13 s for 13,000 commands).
     # The step count above pins the growth; this only catches a gross slowdown, so its limit leaves room for load.
     cmd = "bash <<EOF\n" + "echo hi > f1\n" * 20_000 + "EOF\n"
     assert len(cmd) > 256_000
