@@ -22,6 +22,7 @@ from typing import Any
 
 from k3code.autonomy import DEFAULTS, autonomy_cfg
 from k3code.autonomy.plan_first import parse_plan
+from k3code.goals import TurnEvidence
 from k3code.reliability.governor import Governor
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
@@ -169,6 +170,10 @@ class FanoutResult:
     stopped: str = ""  # budget message
     tests_passed: int = 0  # merged subtasks whose merged result passed the tests
     tests_failed: int = 0  # merge attempts rejected because the tests failed
+    #: what the fan-out did, in order, for the parent's goal judge (the parent stores only the task and the summary,
+    #: so ``turn_evidence`` of its messages saw no test and no edit): each worker's own tool calls, then what its
+    #: merge brought into the checkout and the test run on the merged result (see FanoutExecutor._merge)
+    evidence: TurnEvidence = field(default_factory=TurnEvidence)
 
     def by_state(self, *states: str) -> list[Subtask]:
         return [s for s in self.subtasks if s.state in states]
@@ -537,9 +542,11 @@ class FanoutExecutor:
                         ctx.result.tests_failed += 1
                         await wt_mod.abort_merge(wt)
                         error = f"tests failed after merging ({ctx.test_cmd}):\n{tail}"
+                        self._record_test(ctx, st, passed=False)
                 if not error:
                     committed, cout = await wt_mod.commit_merge(wt)
                     if committed:
+                        await self._record_merge(ctx, st, wt, tested=bool(ctx.test_cmd))
                         self.progress(ctx, st, "merged")
                         return
                     await wt_mod.abort_merge(wt)
@@ -567,6 +574,31 @@ class FanoutExecutor:
             if err:
                 self.progress(ctx, st, "escalated", f"{error}\nThe reviewer rejected the fix:\n{err}")
                 return
+
+    # ── evidence for the parent's goal judge (FanoutResult.evidence) ──
+
+    @staticmethod
+    def _record_test(ctx: _Ctx, st: Subtask, *, passed: bool) -> None:
+        """The project's tests on the merged result of ``st`` (run_tests reports pass/fail, not the code: a failure
+        is recorded as exit 1)."""
+        ctx.result.evidence.add_check(
+            f"{ctx.test_cmd}  # fan-out: tests on the merged result of {st.id}", 0 if passed else 1
+        )
+
+    async def _record_merge(self, ctx: _Ctx, st: Subtask, wt: wt_mod.Worktree, *, tested: bool) -> None:
+        """``st`` merged: its workers' own tool calls (their tests, run in the worktree), then the files the merge
+        brought into the checkout, then the test run on the merged result when there was one. Only merged work is
+        recorded: an escalated subtask's files never reached the checkout. The workers' tool errors stay out (a
+        reviewer passed the work). Runs under the merge lock, so the order is the order the merges landed in."""
+        try:
+            for h in st.handles:
+                if h.agent_type == "worker" and h.evidence is not None:
+                    ctx.result.evidence.extend(h.evidence, errors=False)
+            ctx.result.evidence.add_edits(await wt_mod.changed_files(wt))
+            if tested:
+                self._record_test(ctx, st, passed=True)
+        except Exception:  # noqa: BLE001 - evidence for a judge must never fail the merge that already landed
+            logger.debug("fan-out evidence for %s not recorded", st.id, exc_info=True)
 
     async def _cleanup(self, result: FanoutResult) -> None:
         for st in result.subtasks:

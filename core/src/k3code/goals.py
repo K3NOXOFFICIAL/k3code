@@ -7,15 +7,18 @@
 """Persistent session goals — the "Ralph loop".
 
 Judge failures are fail-OPEN (``continue``); repeated judge failures, a ``blocked`` verdict and an optional turn
-budget (``max_turns``, 0 = none, the default) pause the goal. The continuation is a normal user message, so the
+budget (``max_turns``, 0 = none, the default) pause the goal. An implicit goal (auto-continue) ends instead, and on
+the first judge reply that is not a verdict. The continuation is a normal user message, so the
 system prompt (and prompt caching) never changes mid-goal.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
+import shlex
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
@@ -23,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.memory import fenced
+from k3code.permissions import hardline
 
 #: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done, judged blocked or paused.
 DEFAULT_MAX_TURNS = 0
@@ -32,6 +36,7 @@ DEFAULT_GATE_TIMEOUT_SECONDS = 300
 #: that can never pass (a typo, a missing tool) would otherwise burn tokens until someone looks. /goal resume starts
 #: the count again.
 DEFAULT_GATE_MAX_RETRIES = 20
+#: Unparseable judge replies in a row before a /goal pauses (an implicit goal ends on the first one).
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
@@ -278,8 +283,8 @@ _VERIFY_SEGMENT_RE = re.compile(
     r"(?:(?:uv|poetry|pdm|hatch|pipenv)\s+run\s+|npx\s+|(?:\S*/)?python[\d.]*\s+-m\s+)*"
     r"(?:\S*/)?" + _VERIFY_TOOL + r"(?![\w.\-])"
 )
-#: The operators that split a command line into the segments it runs.
-_SHELL_OPERATOR_RE = re.compile(r"(\|\||&&|\|&|[|;\n])")
+#: The operators between two simple commands of a command line (``hardline.parse`` splits on them, and on parentheses).
+_SHELL_OPERATOR_RE = re.compile(r"&&|\|\||\|&|[|;&\n]")
 _EXIT_CODE_RE = re.compile(r"\[exit code (-?\d+)\]\s*$")
 _EDIT_TOOLS = ("write", "edit")
 EVIDENCE_DIGEST_CHARS = 1500
@@ -296,21 +301,342 @@ def _one_line(text: str, limit: int = _DIGEST_LINE_CHARS) -> str:
     return _truncate(" ".join(str(text).split()), limit)
 
 
+@dataclass
+class _CommandLine:
+    """A bash command line taken apart for the evidence: its simple commands and what lies between them."""
+
+    parsed: hardline.Parsed
+    #: ``gaps[k]``: the text before ``subs[k]`` (after ``subs[k - 1]``); ``gaps[-1]``: the text after the last one.
+    #: Only operators, parentheses and blanks: the command line's own words are all in ``subs``.
+    gaps: list[str]
+    #: index in ``subs`` of the last test/check command, None when it runs none
+    check: int | None = None
+
+    @property
+    def subs(self) -> list[str]:
+        return self.parsed.subs
+
+
+def _command_line(command: str) -> _CommandLine:
+    """Split ``command`` with the permission layer's quote-aware bash parser (``hardline.parse``): an operator inside
+    quotes (``echo "x; pytest"``, ``git commit -m "fix; pytest passes"``), a comment or a heredoc body splits nothing,
+    so only a word at a real command position can be a check.
+
+    ``parsed.clean`` is the line without comments, line continuations and heredoc bodies; each simple command is a
+    piece of it, in order, and the text between two of them holds the operators that joined them."""
+    parsed = hardline.parse(command)
+    check = max((i for i, sub in enumerate(parsed.subs) if _VERIFY_SEGMENT_RE.match(sub)), default=None)
+    return _CommandLine(parsed, _gaps(parsed), check)
+
+
+def _gaps(parsed: hardline.Parsed) -> list[str]:
+    """``_CommandLine.gaps`` of a parsed command line."""
+    clean, pos, gaps = parsed.clean, 0, []
+    for sub in parsed.subs:
+        at = clean.find(sub, pos)
+        if at < 0:  # not expected (see above): an unknown join says nothing about whose exit status it is
+            gaps.append(";")
+            continue
+        gaps.append(clean[pos:at])
+        pos = at + len(sub)
+    gaps.append(clean[pos:])
+    return gaps
+
+
+def _status_kept(gap: str, pipefail: bool) -> bool:
+    """The join ``gap`` hands the exit status on: ``&&`` (the next command runs only after a pass, and a fail ends the
+    line with the check's status), or a pipe under ``pipefail``."""
+    ops = _SHELL_OPERATOR_RE.findall(gap)
+    return bool(ops) and all(op == "&&" or (pipefail and op in ("|", "|&")) for op in ops)
+
+
+def _line_status(line: _CommandLine, command: str) -> bool | None:
+    """``_check_status`` of an already split command line."""
+    if line.check is None:
+        return None
+    if "&" in _SHELL_OPERATOR_RE.findall(line.gaps[-1]):
+        return False  # `pytest &`: the shell reports the start of a background job, not the check
+    pipefail = "pipefail" in command
+    return all(_status_kept(gap, pipefail) for gap in line.gaps[line.check + 1 : len(line.subs)])
+
+
 def _check_status(command: str) -> bool | None:
     """``None``: the command line runs no test/check. ``True``: its exit status is the last check's (only ``&&``
-    follows it). ``False``: a later pipe, ``||`` or ``;`` sets the exit status (``pytest | tail``, ``pytest || true``),
-    so it says nothing about the check; a pipe counts as the check's own under ``pipefail``."""
-    parts = _SHELL_OPERATOR_RE.split(command)
-    segments, operators = parts[0::2], parts[1::2]
-    last = max((i for i, seg in enumerate(segments) if _VERIFY_SEGMENT_RE.match(seg)), default=None)
-    if last is None:
-        return None
-    pipefail = "pipefail" in command
-    return all(
-        op == "&&" or (pipefail and op in ("|", "|&"))
-        for op, seg in zip(operators[last:], segments[last + 1 :], strict=True)
-        if seg.strip()
+    follows it). ``False``: a later pipe, ``||``, ``;`` or ``&`` sets the exit status (``pytest | tail``,
+    ``pytest || true``), so it says nothing about the check; a pipe counts as the check's own under ``pipefail``.
+    Split quote-aware (see ``_command_line``): ``echo "x; pytest"`` runs no check."""
+    return _line_status(_command_line(command), command)
+
+
+# ── files a bash command writes (the evidence's "files written/edited") ──
+
+#: Redirect and ``tee`` targets that are no project file: device files and scratch space (a test's log in /tmp).
+_NOT_A_PROJECT_FILE = ("/dev/", "/tmp/", "/var/tmp/")
+#: A redirection word ``_argv`` drops with its target: ``2>&1``, ``>out``, ``<in``, ``<<EOF``, ``&>log``.
+_REDIRECT_WORD_RE = re.compile(r"(?:\d*|&)(?:<<?<?|>>?|<>|>\||[<>]&)")
+#: Shells whose ``-c`` argument (and whose heredoc, ``bash <<EOF``) is a command line: what it writes counts. Other
+#: interpreters' code (``python -c``, ``awk``) is not shell: a ``>`` in it is no redirection.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+#: How deep ``_writes_of`` follows command lines nested in ``$(...)``, ``bash -c "..."`` or a heredoc a shell runs.
+_WRITES_MAX_DEPTH = 3
+#: The files a patch names: ``+++ b/path`` (unified diff) and ``*** Update File: path`` (the apply_patch format).
+_PATCH_PATH_RE = re.compile(r"^(?:\+\+\+ (?:[ab]/)?|\*\*\* (?:Add|Update|Delete) File: )(\S[^\t\n]*?)\s*$", re.M)
+
+
+def _skip_group(text: str, i: int, opener: str, closer: str) -> int:
+    """Index after the ``closer`` that closes the ``opener`` at ``i`` (quote-aware), or ``len(text)``."""
+    depth, quote, n = 0, "", len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _redirect_targets(sub: str) -> list[str]:
+    """The files the output redirections of one simple command write: ``> f``, ``>> f``, ``>| f``, ``2> f``,
+    ``&> f``, ``>& f``. Quoted and escaped text and substitutions are skipped (a command nested in one is read on its
+    own), so ``grep ">" x`` and ``echo a\\>b`` write nothing; ``2>&1``, ``>&-`` and ``/dev/null`` are no file."""
+    targets: list[str] = []
+    i, n = 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            end = sub.find("'", i + 1)
+            i = n if end < 0 else end + 1
+        elif c == '"':
+            i += 1
+            while i < n and sub[i] != '"':
+                if sub[i] == "\\":
+                    i += 1
+                elif sub.startswith("$(", i):
+                    i = _skip_group(sub, i + 1, "(", ")") - 1
+                i += 1
+            i += 1
+        elif c == "`":
+            end = sub.find("`", i + 1)
+            i = n if end < 0 else end + 1
+        elif sub.startswith(("$(", "<(", ">("), i):
+            i = _skip_group(sub, i + 1, "(", ")")
+        elif sub.startswith("${", i):
+            i = _skip_group(sub, i + 1, "{", "}")
+        elif c == ">":
+            j = i + 1
+            if sub.startswith((">", "|"), j):  # >> and >|
+                j += 1
+            dup = sub.startswith("&", j)  # >&word: a file, unless the word is a descriptor (2>&1, >&-)
+            j += 1 if dup else 0
+            while j < n and sub[j] in " \t":
+                j += 1
+            k = j
+            while k < n and sub[k] not in " \t;&|<>()":
+                if sub[k] in "'\"":
+                    end = sub.find(sub[k], k + 1)
+                    k = n if end < 0 else end + 1
+                else:
+                    k += 2 if sub[k] == "\\" else 1
+            word = sub[j:k]
+            with contextlib.suppress(ValueError):
+                word = " ".join(shlex.split(word))
+            if word and not (dup and (word.isdigit() or word == "-")):
+                targets.append(word)
+            i = max(k, i + 1)
+        else:
+            i += 1
+    return targets
+
+
+def _argv(sub: str) -> list[str]:
+    """``sub``'s words without its redirections, wrappers (sudo, env, timeout, xargs, ...) and leading assignments."""
+    out: list[str] = []
+    skip = False
+    for word in hardline.tokens(sub):
+        if skip:
+            skip = False
+            continue
+        m = _REDIRECT_WORD_RE.match(word)
+        if m:
+            skip = m.end() == len(word)  # a lone operator takes the next word as its target
+        else:
+            out.append(word)
+    return hardline.normalize_argv(out)
+
+
+def _operands(args: list[str], value_opts: str = "", long_value_opts: tuple[str, ...] = ()) -> list[str]:
+    """The operands among ``args``: options, and the values of ``value_opts``/``long_value_opts``, skipped."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            return out + args[i:]
+        if a.startswith("--") and len(a) > 2:
+            i += 1 if a in long_value_opts else 0
+        elif a.startswith("-") and len(a) > 1:
+            i += 1 if len(a) == 2 and a[1] in value_opts else 0
+        else:
+            out.append(a)
+    return out
+
+
+def _in_place_files(name: str, args: list[str]) -> list[str]:
+    """The files ``sed -i``/``perl -i`` edit in place ([] without ``-i``: then they only print)."""
+    short = [a for a in args if a.startswith("-") and not a.startswith("--") and len(a) > 1]
+    sed = name != "perl"
+    in_place = any(a == "--in-place" or a.startswith("--in-place=") for a in args) or any(
+        # sed: -i, -i.bak, -ni; perl: -i, -i.bak, -pi, -pie
+        a.startswith("-i") or ("i" in a[1:] and a[1:].isalpha() and (not sed or not a.endswith("e")))
+        for a in short
     )
+    if not in_place:
+        return []
+    script_opts = ("-e", "-f", "--expression", "--file") if sed else ("-e", "-E")
+    script_given = any(a in script_opts or a.startswith(("--expression=", "--file=")) for a in args) or any(
+        a[1:].isalpha() and a[-1] in ("ef" if sed else "eE") and len(a) > 2 for a in short
+    )
+    files = _operands(args, "ef" if sed else "eEIMm", ("--expression", "--file"))
+    files = files if script_given else files[1:]  # without -e the first operand is the script
+    return files or [f"(via {name} -i)"]  # file names from stdin (xargs) or a glob: the files are unknown
+
+
+def _patch_files(text: str) -> list[str]:
+    """The files a patch text changes (``+++ b/x``, ``*** Update File: x``); /dev/null is a deleted or added side."""
+    return [p for p in _PATCH_PATH_RE.findall(text or "") if p != "/dev/null"]
+
+
+def _argv_writes(argv: list[str], stdin: str = "") -> list[str]:
+    """The files a command that edits by its arguments writes: ``sed -i``, ``perl -i``, ``tee`` (``-a`` too),
+    ``patch``, ``git apply``/``git am`` and these run by ``find -exec``. ``stdin``: a heredoc fed to the command (a
+    patch's text). A patch whose text is not on the command line shows as ``(via patch)``. The read-only forms
+    (``sed`` without ``-i``, ``patch --dry-run``, ``git apply --check``) write nothing."""
+    if not argv:
+        return []
+    name, args = argv[0], argv[1:]
+    if name in ("sed", "gsed", "perl"):
+        return _in_place_files(name, args)
+    if name == "tee":
+        return _operands(args)
+    if name == "patch":
+        if any(a in args for a in ("--dry-run", "-C", "--check")):
+            return []
+        if "-o" in args[:-1]:
+            return [args[args.index("-o") + 1]]
+        for a in args:
+            if a.startswith("--output="):
+                return [a.split("=", 1)[1]]
+        named = _operands(args, "pdDFgiorBVYz", ("--input", "--directory", "--strip", "--fuzz", "--reject-file"))
+        return named[:1] or _patch_files(stdin) or ["(via patch)"]
+    if name == "git" and args[:1] in (["apply"], ["am"]):
+        read_only = ("--check", "--stat", "--numstat", "--summary")
+        if args[0] == "apply" and any(a in args for a in read_only) and "--apply" not in args:
+            return []
+        return _patch_files(stdin) or [f"(via git {args[0]})"]
+    if name in ("find", "fd"):  # find ... -exec sed -i ... {} +
+        for k, a in enumerate(args):
+            if a in ("-exec", "-execdir", "-ok", "-okdir", "-x", "--exec", "-X", "--exec-batch"):
+                inner = [w for w in args[k + 1 :] if w not in (";", "+", "{}")]
+                return _argv_writes(hardline.normalize_argv(inner))
+    return []
+
+
+def _shell_payloads(line: _CommandLine, k: int) -> list[str]:
+    """Command lines nested in ``line``'s ``k``-th simple command that a shell runs: ``$(...)``, backticks, process
+    substitutions, ``bash -c "..."`` and a heredoc fed to a shell (``bash <<EOF``)."""
+    parsed = line.parsed
+    out = list(parsed.sub_payloads[k]) if k < len(parsed.sub_payloads) else []
+    argv = _argv(line.subs[k])
+    if argv and argv[0] in _SHELLS:
+        for i, a in enumerate(argv[1:], 1):
+            if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
+                out += [w for w in argv[i + 1 :] if not w.startswith("-")][:1]
+                break
+    if k < len(parsed.code_heredoc) and parsed.code_heredoc[k] == "shell":
+        out += [h.body for h in parsed.heredocs[k]]
+    return out
+
+
+def _writes_of(line: _CommandLine, depth: int = 0) -> list[list[str]]:
+    """Per simple command of ``line``: the files it writes (redirections, ``sed -i``, ``tee``, ``patch``,
+    ``git apply``), including those of the shell command lines nested in it. Read-only commands write nothing:
+    ``cat``, ``grep ">"``, ``sed 's/a/b/'``, a comparison in ``(( a > b ))`` or ``[[ a > b ]]``; nor do
+    ``/dev/null`` and ``/tmp`` targets count (see _NOT_A_PROJECT_FILE)."""
+    out: list[list[str]] = []
+    for k, sub in enumerate(line.subs):
+        comparison = line.gaps[k].rstrip().endswith("((") or sub.lstrip().startswith("[[")
+        writes = [] if comparison else _redirect_targets(sub)
+        stdin = "\n".join(h.body for h in line.parsed.heredocs[k]) if k < len(line.parsed.heredocs) else ""
+        writes += _argv_writes(_argv(sub), stdin)
+        if depth < _WRITES_MAX_DEPTH:
+            for payload in _shell_payloads(line, k):
+                nested = _writes_of(_command_line(payload), depth + 1)
+                writes += [w for ws in nested for w in ws]
+        out.append([w for w in writes if not w.startswith(_NOT_A_PROJECT_FILE)])
+    return out
+
+
+def _bash_writes(line: _CommandLine) -> list[tuple[int, list[str]]]:
+    """``(index of the simple command, files it writes)`` for a bash call, without the check's own output: a
+    redirection of the test/check command and the later stages of its pipeline (``pytest > log``,
+    ``pytest | tee log``) record its run, they change no code."""
+    writes = _writes_of(line)
+    own: set[int] = set()
+    if line.check is not None:
+        start = 0
+        for stages in line.parsed.pipelines:  # the pipelines list the simple commands in order
+            if start <= line.check < start + len(stages):
+                own = set(range(line.check, start + len(stages)))
+                break
+            start += len(stages)
+    return [(k, ws) for k, ws in enumerate(writes) if ws and k not in own]
+
+
+#: Tools other than the built-in write/edit that change files, by the words of their name (``mcp__<server>__<tool>``
+#: split on ``_``, ``-`` and ``.``): ``apply_patch``, ``mcp__filesystem__write_file``, ``edit_file``, ``multi_edit``,
+#: ``str_replace_editor``, ``search_replace``, ``mcp__fs__create_file``. A name with a read word is no edit
+#: (``read_file``, ``list_edits``, ``get_patch``, ``search_replace_preview``), nor a create/update/delete that is not
+#: about a file (``create_issue``).
+_EDIT_TOOL_WORDS = frozenset({"write", "writes", "edit", "edits", "multiedit", "patch", "replace"})
+_FILE_MUTATION_WORDS = frozenset({"create", "update", "append", "insert", "delete", "remove", "move", "rename"})
+_READ_TOOL_WORDS = frozenset(
+    {"read", "get", "list", "search", "find", "view", "show", "preview", "history", "status", "query", "diff"}
+)
+_TOOL_NAME_PARTS_RE = re.compile(r"[_\-.]+")
+#: Argument names that hold the file such a tool changes.
+_TOOL_PATH_ARGS = ("path", "file_path", "filepath", "filename", "file", "target_file", "notebook_path", "destination")
+
+
+def _edit_tool_files(name: str, args: dict[str, Any]) -> list[str] | None:
+    """The files a write/edit tool call changed: the built-in ``write``/``edit`` (its ``path``) and other tools whose
+    name says they write, edit or patch (``apply_patch``, ``mcp__*__write_file``, ``mcp__*__edit_file``): the path
+    argument, else the files named in a patch argument, else ``(via <tool>)``. None: not an edit tool."""
+    if name in _EDIT_TOOLS:
+        return [str(args["path"])] if args.get("path") else []
+    parts = {p for p in _TOOL_NAME_PARTS_RE.split(name.rsplit("__", 1)[-1].lower()) if p}
+    mutates = bool(parts & _EDIT_TOOL_WORDS) or ("file" in parts and bool(parts & _FILE_MUTATION_WORDS))
+    if not mutates or parts & _READ_TOOL_WORDS - {"search"} or (parts & {"search"} and "replace" not in parts):
+        return None
+    for key in _TOOL_PATH_ARGS:
+        if isinstance(args.get(key), str) and args[key].strip():
+            return [args[key].strip()]
+    named = [p for v in args.values() if isinstance(v, str) for p in _patch_files(v)]
+    return list(dict.fromkeys(named)) or [f"(via {name})"]
 
 
 def _outcome(code: int | None, own: bool) -> str:
@@ -324,14 +650,73 @@ class TurnEvidence:
     """What a goal turn's tool calls showed (``turn_evidence``); ``render`` is the digest the judge reads."""
 
     #: (position, command, exit code; None = the call errored, whether the exit status is the check's own)
-    checks: list[tuple[int, str, int | None, bool]] = field(default_factory=list)
-    edited: dict[str, int] = field(default_factory=dict)  # path -> position of its last successful write/edit
-    errors: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)  # (tool, path) -> (position, line)
+    #: Positions order what happened in the turn: a tool result's index among the turn's messages, plus a fraction
+    #: for the simple commands of one bash call (``sed -i x && pytest``: the edit comes before the test).
+    checks: list[tuple[float, str, int | None, bool]] = field(default_factory=list)
+    #: path -> position of its last successful change: a write/edit tool (built-in, ``apply_patch``, an MCP server's
+    #: ``write_file``/``edit_file``) or a bash command that writes it (``sed -i``, ``>``, ``tee``, ``patch``)
+    edited: dict[str, float] = field(default_factory=dict)
+    errors: dict[tuple[str, str], tuple[float, str]] = field(default_factory=dict)  # (tool, path) -> (position, line)
     #: Set by GoalManager when this turn ran no check: the goal's last one (``GoalState.last_check``), with the files
     #: edited since, this turn's included.
     earlier_check: dict[str, Any] | None = None
     #: Set by GoalManager: a --check gate runs after a done verdict (a harness fact, rendered outside the fence).
     check_configured: bool = False
+
+    def note_edit(self, path: str, pos: float) -> None:
+        """``path`` was written at ``pos``; re-inserted so the dict keeps the order of the last edits."""
+        self.edited.pop(path, None)
+        self.edited[path] = pos
+
+    def _positions(self) -> list[float]:
+        return [c[0] for c in self.checks] + list(self.edited.values()) + [e[0] for e in self.errors.values()]
+
+    def next_position(self) -> float:
+        """A position after everything recorded so far."""
+        return max(self._positions(), default=-1.0) + 1
+
+    def add_check(self, command: str, code: int | None, own: bool = True) -> None:
+        """A test/check that ran after everything recorded so far (one the harness ran itself: fan-out's merge test)."""
+        self.checks.append((self.next_position(), command, code, own))
+
+    def add_edits(self, paths: list[str]) -> None:
+        """Files changed after everything recorded so far."""
+        pos = self.next_position()
+        for path in paths:
+            self.note_edit(path, pos)
+
+    def extend(self, later: TurnEvidence, *, errors: bool = True) -> None:
+        """Append what ``later`` recorded after everything recorded here, in ``later``'s own order. ``errors=False``
+        leaves ``later``'s tool errors out (a sub-agent's: the reviewer and the merge judged its work)."""
+        positions = later._positions()
+        if not positions:
+            return
+        shift = self.next_position() - min(positions)
+        self.checks += [(pos + shift, command, code, own) for pos, command, code, own in later.checks]
+        for path, pos in later.edited.items():
+            self.note_edit(path, pos + shift)
+        if errors:
+            for key, (pos, line) in later.errors.items():
+                self.errors[key] = (pos + shift, line)
+
+    def followed_by(self, later: TurnEvidence) -> TurnEvidence:
+        """A copy of this evidence with ``later``'s appended (see ``extend``)."""
+        out = TurnEvidence(list(self.checks), dict(self.edited), dict(self.errors))
+        out.extend(later)
+        return out
+
+    def relative_to(self, root: str | Path) -> TurnEvidence:
+        """A copy whose paths under ``root`` (a sub-agent's worktree) are relative to it, as in the project."""
+        base = str(root).rstrip("/") + "/"
+
+        def rel(path: str) -> str:
+            return path[len(base) :] if path.startswith(base) else path
+
+        out = TurnEvidence(list(self.checks))
+        for path, pos in self.edited.items():
+            out.note_edit(rel(path), pos)
+        out.errors = {(tool, rel(path)): v for (tool, path), v in self.errors.items()}
+        return out
 
     def carry(self, turn: int) -> dict[str, Any] | None:
         """This turn's last check as ``GoalState.last_check``; None when the turn ran none."""
@@ -392,6 +777,11 @@ def turn_evidence(messages: list[dict[str, Any]]) -> TurnEvidence:
     ``messages`` are the turn's stored messages (``{"role", "content", "tool_calls", "tool_call_id", "name"}``).
     A non-zero exit of a bash command that is not a test/check (``grep`` with no match, ``test -f``) is not listed as
     an error: exploring routinely exits non-zero.
+
+    Files count as edited when a write/edit tool changed them (the built-in ones, ``apply_patch``, an MCP server's
+    ``write_file``/``edit_file``) and when a bash command wrote them: ``sed -i``, ``perl -i``, a ``>``/``>>``
+    redirection, ``tee``, ``patch``, ``git apply`` (see ``_writes_of``). A read-only command (``cat``, ``grep``,
+    ``sed`` without ``-i``) is no edit, nor is a check's own output (``pytest > log``).
     """
     ev = TurnEvidence()
     calls: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -412,15 +802,39 @@ def turn_evidence(messages: list[dict[str, Any]]) -> TurnEvidence:
             ev.errors[key] = (pos, _one_line(text))
         else:
             ev.errors.pop(key, None)
-        if name in _EDIT_TOOLS and not failed and args.get("path"):
-            ev.edited.pop(str(args["path"]), None)  # re-insert: the dict keeps the order of the last edits
-            ev.edited[str(args["path"])] = pos
+        if not failed and (paths := _edit_tool_files(name, args)):
+            for path in paths:
+                ev.note_edit(path, pos)
         if name == "bash" and not args.get("background"):
             command = str(args.get("command") or "")
-            if (own := _check_status(command)) is not None:
+            line = _command_line(command)
+            n = len(line.subs) + 1
+            if not failed:  # a refused or timed-out call changed nothing the harness can tell
+                for k, paths in _bash_writes(line):
+                    for path in paths:
+                        ev.note_edit(path, pos + k / n)
+            if (own := _line_status(line, command)) is not None:
                 match = _EXIT_CODE_RE.search(text)
-                ev.checks.append((pos, command, None if failed else int(match.group(1)) if match else 0, own))
+                code = None if failed else int(match.group(1)) if match else 0
+                ev.checks.append((pos + (line.check or 0) / n, command, code, own))
     return ev
+
+
+def loop_evidence(messages: list[Any]) -> TurnEvidence:
+    """``turn_evidence`` of an agent loop's own messages (``providers.types.Message``: a sub-agent's, whose turn is
+    never stored as dicts)."""
+    return turn_evidence(
+        [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "name": m.name,
+                "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls],
+            }
+            for m in messages
+        ]
+    )
 
 
 def turn_evidence_digest(messages: list[dict[str, Any]], *, limit: int = EVIDENCE_DIGEST_CHARS) -> str:
@@ -698,6 +1112,16 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
             )
+        if parse_failed and s.implicit:
+            # A /goal fails open (continue) for up to MAX_CONSECUTIVE_PARSE_FAILURES turns: the user set it and watches
+            # its notices. Auto-continue is the harness's own guess that the turn is unfinished: on a verdict nobody
+            # could read it does not run more unattended turns, it ends here and says why.
+            self.clear()
+            message = (
+                "↻ Auto-continue stopped: the completion judge's reply was not a verdict (check goal.judge_model). "
+                "Send 'continue' or set a /goal."
+            )
+            return Decision("cleared", False, None, "continue", reason, message)
         if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures
             return self._pause_decision(
