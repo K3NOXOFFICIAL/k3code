@@ -344,3 +344,99 @@ def test_implicit_is_persisted_in_the_snapshot_and_old_states_load_without_it():
     old = state.to_dict()
     del old["implicit"]
     assert GoalState.from_dict(old).implicit is False
+
+
+async def test_a_judge_reply_that_is_not_a_verdict_ends_auto_continue_after_one_turn(tmp_path, monkeypatch):
+    from k3code.goals import make_judge
+
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "step 2"], autonomy=DEFAULT, permission_mode="auto"
+    )
+    replies: list[str] = []
+
+    async def complete(system, user):
+        replies.append(user)
+        return "Sure! The agent made good progress."  # no JSON verdict
+
+    server.goal_judge = make_judge(complete)
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 1 and len(replies) == 1  # no unattended turn on an unreadable verdict
+    assert mgr.state is None
+    assert [n["text"] for n in _goal_notices(server)][-1].startswith("↻ Auto-continue stopped: the completion judge")
+    await server.close()
+
+
+async def test_a_bad_turn_cap_set_at_runtime_falls_back_to_the_default_instead_of_failing_the_prompt(
+    tmp_path, monkeypatch
+):
+    """The cap was read with ``int(...)`` at prompt time: a value that bypassed the config-load check (set at runtime,
+    or a typo) raised and the prompt failed."""
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["a"], autonomy=dict(DEFAULT), permission_mode="auto"
+    )
+    judge = server.goal_judge = scripted_judge(["continue"])
+    for bad in ("eight", -1, None):
+        server.config.autonomy["auto_continue_max_turns"] = bad
+        status, _ = await server._run_turn(live, "build everything")
+        assert status == "done"
+    assert len(judge.calls) == 3 * 8  # each prompt ran to the default 8-turn cap
+    server.config.autonomy["auto_continue"] = "sometimes"  # invalid: the default "auto" (on in auto mode)
+    server.config.autonomy["auto_continue_max_turns"] = "2"
+    await server._run_turn(live, "build everything")
+    assert len(judge.calls) == 3 * 8 + 2
+    await server.close()
+
+
+# ── /undo after an auto-continued run ──
+
+
+async def _undo(server, live) -> dict:
+    from m1cmd_helpers import rpc
+
+    return (await rpc(server, "session.undo", {"session_id": live.session_id}))["result"]
+
+
+def _conversation(messages) -> list[dict]:
+    """The stored messages without the system entry (each turn re-stores it)."""
+    return [m for m in messages if m["role"] != "system"]
+
+
+async def test_undo_after_an_auto_continued_run_drops_the_whole_run_back_to_the_users_prompt(tmp_path, monkeypatch):
+    """Every continuation is stored as a user message: /undo dropped only the last continuation turn, and the run's
+    earlier turns stayed in the conversation the next prompt (and /retry) went on from."""
+    from k3code.providers.types import messages_to_anthropic, messages_to_openai
+
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["hello back", "step 1", "step 2", "all built"], autonomy={**AUTO}
+    )
+    server.goal_judge = scripted_judge(["continue", "continue", "done"])
+    server.config.autonomy["auto_continue"] = False
+    await server._run_turn(live, "first question")  # a normal turn: no goal
+    kept = _conversation(live.messages)
+    server.config.autonomy["auto_continue"] = True
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 4 and mgr.state is None
+    run = _conversation(live.messages)[len(kept) :]
+    assert [m["role"] for m in run] == ["user", "assistant"] * 3
+    assert [bool((m.get("meta") or {}).get("continuation")) for m in run[0::2]] == [False, True, True]
+    sent = provider.seen[-1]  # the marker stays in the store: it never reaches a model
+    assert all("meta" not in entry for entry in messages_to_openai(sent))
+    assert "continuation" not in str(messages_to_anthropic(sent))
+
+    assert await _undo(server, live) == {"removed": 6}  # the user's prompt, two continuations and three replies
+    assert _conversation(live.messages) == kept
+    assert _conversation(server.store.get(live.session_id).messages) == kept  # persisted
+    assert await _undo(server, live) == {"removed": 2}  # a normal turn: its prompt and reply, as before
+    assert await _undo(server, live) == {"removed": 0}
+    await server.close()
+
+
+async def test_undo_after_a_goal_run_drops_its_continuations_too(tmp_path, monkeypatch):
+    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "all built"])
+    server.goal_judge = scripted_judge(["continue", "done"])
+    mgr.set("ship the release")
+    await server._run_turn(live, "go")
+    assert provider.n == 2
+    assert await _undo(server, live) == {"removed": 4}
+    assert _conversation(live.messages) == []
+    await server.close()

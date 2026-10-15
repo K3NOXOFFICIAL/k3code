@@ -16,7 +16,7 @@ from typing import Any
 import yaml
 
 from k3code import __version__ as k3_version
-from k3code import confio, trust
+from k3code import confio, mcpjson, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
 from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, is_secret_key, redact, redact_session_json
@@ -44,9 +44,12 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
-    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
-    return redact_session_json(drop_values(asdict(s), secrets or []))
+def session_to_dict(
+    s: StoredSession, secrets: list[str] | None = None, untrusted: list[str] | None = None
+) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind. The
+    ``untrusted`` ones, known only from a file the user may never have trusted, after it (``redact_session_json``)."""
+    return redact_session_json(asdict(s), secrets, untrusted)
 
 
 def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
@@ -66,24 +69,78 @@ def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
         except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
     user = _read(user_config_path())
-    written = _read(project_config_path(cwd))
+    written = _read(project_config_path(cwd), project=cwd)
     trusted = trust.trusted_text(cwd)
-    project = None if trusted is None else _read(project_config_path(cwd), trusted)
+    project = None if trusted is None else _read(project_config_path(cwd), trusted, project=cwd)
     return [config, user, project], written
 
 
-def _read(path: Path, text: str | None = None) -> Any:
+#: Deepest nesting a project config may have (a real one has 4 or 5 levels).
+_MAX_DEPTH = 64
+
+
+class _TreeLoader(yaml.SafeLoader):
+    """``safe_load`` for a file someone else wrote: no aliases (a few lines of them expand to billions of nodes, and
+    every walk over the tree below would follow each one) and a bounded depth (past it the parser overflows the
+    stack)."""
+
+    _depth = 0
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.composer.ComposerError(None, None, "aliases are not read in a project config", None)
+        self._depth += 1
+        try:
+            if self._depth > _MAX_DEPTH:
+                raise yaml.composer.ComposerError(None, None, "nested too deeply", None)
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
+
+
+def _read_project(path: Path, project: Path, text: str | None) -> Any:
+    """A project's config file (or ``text``, its trusted copy) through ``_TreeLoader``: a regular file of bounded size
+    that, if it is a symlink, stays inside ``project``. A missing one is ``{}``, as with ``confio.read_yaml``."""
+    if text is None:
+        if not path.is_file():
+            return {}
+        text = trust.read_bounded(path, within=project).decode("utf-8")
+    data = yaml.load(text, Loader=_TreeLoader) or {}  # noqa: S506 - a SafeLoader subclass
+    if not isinstance(data, dict):
+        raise confio.ConfigError(f"{path}: top level must be a mapping")
+    return data
+
+
+def _read(path: Path, text: str | None = None, *, project: Path | None = None) -> Any:
     """The config file ``path`` as written, or ``text``, its trusted copy. One that exists but does not parse names no
     secrets: refuse rather than export its copies in clear. The error carries no parser text, not even chained (it is
     raised after the ``suppress``): a YAML error quotes the line, which may hold the secret, and a traceback or
-    ``logger.exception`` prints the whole chain."""
-    with contextlib.suppress(OSError, ValueError, yaml.YAMLError):
+    ``logger.exception`` prints the whole chain.
+
+    ``project`` is the project directory when ``path`` is its config, which a cloned repo may have made hostile: it is
+    read as ``_read_project`` does, and a file that hangs, overflows or points out of the project is refused too. Not
+    when ``path`` is the user's own config (a session in ``~`` with ``K3CODE_HOME=~/.k3code`` sees it as the project's):
+    that is theirs, aliases and a link to a dotfiles repo included."""
+    if project is not None and trust.project_dir_of(path) is None:
+        path, project = user_config_path(), None
+    with contextlib.suppress(OSError, ValueError, yaml.YAMLError, RecursionError):
+        if project is not None:
+            return _read_project(path, project, text)
         return confio.read_yaml(path) if text is None else yaml.safe_load(text)
     raise BundleError(_unparsed(path))
 
 
 def _unparsed(path: Path) -> str:
     return f"{path} does not parse: fix it first, or the export cannot tell which of its values to hide"
+
+
+def _mcp_json(project: Path) -> dict[str, Any]:
+    """The project's ``.mcp.json`` as written, trusted or not (``mcpjson.as_config``): a session can quote one of its
+    values whatever its trust state (K3NOX-581). One that does not parse is refused like a config file (``_read``)."""
+    data = mcpjson.as_config(project)
+    if data is None:
+        raise BundleError(_unparsed(project / mcpjson.FILE))
+    return data
 
 
 def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:
@@ -162,21 +219,27 @@ def write_bundle(
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                raw = _read(src)
+                raw = _read(src, project=cwd if kind == "project" else None)
                 # its own values hide their copies in it even when nothing else counts it (an untrusted project
                 # config), but only in it: a file the user never trusted must not hide part of one of their rules
                 secrets_here, certain = _known_secrets(*configs, raw)
                 data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
-    # the project config as written, trusted or not, hides its values in the sessions: the certain ones only, so a file
-    # the user never trusted cannot blank out a region or path their transcripts name (a guess, see secret_values)
-    secrets = sorted({*secrets, *_known_secrets(written)[1]}, key=len, reverse=True)
-    exported: list[str] = []
+    sessions: list[tuple[str, StoredSession]] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = session_to_dict(stored, secrets)
+        sessions.append((sid, stored))
+    # the project config, and the .mcp.json of this project and of each exported session's own, as written, trusted or
+    # not, hide their values in the sessions: the certain ones only, so a file the user never trusted cannot blank out
+    # a region or path their transcripts name (a guess, see secret_values), and after the shape pass (session_to_dict)
+    projects = {cwd, *(Path(stored.cwd) for _, stored in sessions if stored.cwd)} if sessions else set()
+    mcp = [_mcp_json(project) for project in sorted(projects)]
+    untrusted = sorted(set(_known_secrets(written, *mcp)[1]) - set(secrets), key=len, reverse=True)
+    exported: list[str] = []
+    for sid, stored in sessions:
+        session = session_to_dict(stored, secrets, untrusted)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {

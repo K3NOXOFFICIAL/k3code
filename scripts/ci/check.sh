@@ -4,7 +4,7 @@
 #   core     ruff check + ruff format --check (core/ and scripts/), pytest
 #   tui      npm ci, build:ink, build, typecheck, eslint, prettier --check, vitest (minus tui/.ci-test-excludes)
 #   panes    go build ./cmd/k3, go vet and go test on the packages k3 depends on (never `go test ./...`)
-#   vendor   scripts/vendor_check.py (license bookkeeping)
+#   vendor   scripts/vendor_check.py (license bookkeeping); full: the core wheel ships LICENSE, NOTICE, LICENSES/
 #   secrets  gitleaks on the commits this branch adds over origin/Main, plus uncommitted and staged changes
 #   shell    shellcheck and a syntax check (sh -n / bash -n) of install/*.sh, scripts/**/*.sh and .githooks/*
 #
@@ -253,6 +253,12 @@ area_panes() {
 area_vendor() {
   need python3
   step "vendor_check" . python3 scripts/vendor_check.py
+  if full; then
+    # The wheel release.sh publishes must carry k3code's license files (core/hatch_build.py, issue #165): build it as
+    # release.sh does, into a temporary directory, and compare them with the repository's.
+    need uv
+    step "wheel license files" . python3 scripts/release/third_party_notices.py check-wheel --repo . --build
+  fi
 }
 
 area_secrets() {

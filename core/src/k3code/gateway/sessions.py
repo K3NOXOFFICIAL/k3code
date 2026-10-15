@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.paths import ensure_private_dir
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class SessionStore:
         self.path = Path(path)
         self._executor: ThreadPoolExecutor | None = None
         self._writer: SessionStore | None = None
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists

@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from k3code import trust
 from k3code.config import Settings
+from k3code.paths import ensure_state_dir
 
 try:
     import fcntl
@@ -61,9 +62,9 @@ def locked(path: Path) -> Iterator[None]:
         yield
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(path.parent)
         fd = os.open(path.parent / f".{path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
+    except (OSError, RuntimeError):  # RuntimeError: a $K3CODE_HOME another user owns
         yield
         return
     held.add(key)
@@ -133,7 +134,9 @@ def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True, keep_tr
     ``keep_trust=False`` for content someone else wrote (an imported bundle): a project config written that way is
     left untrusted until the user approves it with `k3code trust`.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # the user config's directory is $K3CODE_HOME (0700, issue #163: onboarding creates it here); a project's
+    # .k3code/ is part of the repository and keeps the umask's mode
+    ensure_state_dir(path.parent)
     text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     bak: Path | None = None
     with locked(path):

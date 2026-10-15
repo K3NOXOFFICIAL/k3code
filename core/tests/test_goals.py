@@ -250,3 +250,31 @@ async def test_the_judge_receives_the_turns_evidence_digest(tmp_path, monkeypatc
     assert "No test/check command ran this turn." in evidence
     assert "Files written/edited: 1: fix.py" in evidence
     await server.close()
+
+
+async def test_an_unparseable_judge_reply_ends_an_implicit_goal_at_once_but_a_goal_fails_open_three_times():
+    """Auto-continue failed open on a reply that was not a verdict and ran up to 3 more unattended turns; a /goal keeps
+    that behaviour (the user set it), an implicit goal now ends on the first one, with a notice."""
+    from k3code.goals import MAX_CONSECUTIVE_PARSE_FAILURES
+
+    async def garbled(goal, response, evidence=None):
+        return "continue", "judge reply was not JSON: 'sure!'", True, False
+
+    implicit = _mem_manager()
+    implicit.set("fix the parser", implicit=True, max_turns=8)
+    decision = await implicit.evaluate_after_turn("I changed parse()", garbled)
+    assert not decision.should_continue and decision.prompt is None
+    assert implicit.state is None and decision.status == "cleared"
+    assert decision.message.startswith("↻ Auto-continue stopped: the completion judge's reply was not a verdict")
+
+    explicit = _mem_manager()
+    explicit.set("fix the parser")
+    for _ in range(MAX_CONSECUTIVE_PARSE_FAILURES - 1):
+        decision = await explicit.evaluate_after_turn("working", garbled)
+        assert decision.should_continue and explicit.state.status == "active"
+    decision = await explicit.evaluate_after_turn("working", garbled)
+    assert not decision.should_continue and explicit.state.status == "paused"
+    assert (
+        explicit.state.paused_reason
+        == f"judge returned unparseable output {MAX_CONSECUTIVE_PARSE_FAILURES} turns in a row"
+    )

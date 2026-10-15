@@ -46,6 +46,7 @@ class AutomationEngine:
         self._wait_online = wait_online
         self._use_netwatch = use_netwatch and wait_online is None
         self._rel: Any = None
+        self._net_change_cb: Any = None  # the automation's own NetWatch subscriber, dropped on stop()
         cfg = server.config.automation
         self.governor = Governor(GovernorConfig(max_total=max(1, cfg.max_concurrent), home=home))
         self.loops = LoopManager(self.db, self.runner, self.clock, wait_online=self._online, on_change=self.changed)
@@ -90,7 +91,11 @@ class AutomationEngine:
 
         try:
             self.server._ensure_router()
-            self._rel = build_reliability(self.server.config, session="automation", home=Path(self.server._home()))
+            # share the daemon's single NetWatch (#109) instead of starting a second monitor just for automation
+            shared = self.server._shared_netwatch() if hasattr(self.server, "_shared_netwatch") else None
+            self._rel = build_reliability(
+                self.server.config, session="automation", home=Path(self.server._home()), netwatch=shared
+            )
             self._rel.register_providers(self.server.router.chain if self.server.router else [])
             await self._rel.start()
         except Exception:  # noqa: BLE001 - no providers configured etc.: run without the offline gate
@@ -106,9 +111,8 @@ class AutomationEngine:
         if self._use_netwatch:
             await self._start_netwatch()
         if self._rel is not None and self._rel.netwatch is not None:
-            self._rel.netwatch.subscribe(
-                lambda old, new: self.automations.net_change(old.usable_for_llm, new.usable_for_llm)
-            )
+            self._net_change_cb = lambda old, new: self.automations.net_change(old.usable_for_llm, new.usable_for_llm)
+            self._rel.netwatch.subscribe(self._net_change_cb)
         stale = self.db.interrupt_stale_runs(self.clock.now())
         if stale:
             logger.info("%d run(s) were still marked running from before the restart: marked interrupted", stale)
@@ -157,7 +161,9 @@ class AutomationEngine:
         await self.automations.stop()
         if self._rel is not None:
             with contextlib.suppress(Exception):
-                await self._rel.stop()
+                if self._net_change_cb is not None and self._rel.netwatch is not None:
+                    self._rel.netwatch.unsubscribe(self._net_change_cb)  # leave the shared NetWatch clean
+                await self._rel.stop()  # releases this engine's reference to the shared NetWatch
         self.db.close()
         self.started = False
 

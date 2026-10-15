@@ -532,6 +532,8 @@ export interface SubagentListResponse {
     goal?: string | null;
     model?: string | null;
     started_at?: number | null;
+    /** How long a finished child ran (s); null while it runs. */
+    duration_seconds?: number | null;
     status?: string | null;
     tool_count?: number | null;
     last_tool?: string | null;

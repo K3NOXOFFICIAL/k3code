@@ -13,7 +13,7 @@ import yaml
 from k3code import confio
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, session_cwd, split_args
-from k3code.paths import project_config_path, user_config_path
+from k3code.paths import ensure_state_dir, project_config_path, user_config_path
 from k3code.redact import redact
 
 USAGE = "Usage: /config get [key] | set <key> <value> [--project] | edit [--project] | path | rollback [--project]"
@@ -43,7 +43,7 @@ def config_rollback(path: Path) -> Path:
 
 
 def open_editor(path: Path) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(path.parent)  # 0700 for the user config's $K3CODE_HOME, the umask's mode in a project
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
     return subprocess.call([*shlex.split(editor), str(path)])
 

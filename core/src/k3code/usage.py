@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.paths import ensure_private_dir
 
 logger = logging.getLogger("k3code.usage")
 
@@ -58,7 +59,7 @@ class UsageDB:
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         self._last_warn: float | None = None  # monotonic time of the last "write failed" warning
         self._db = sqlstore.connect(self.path)
         self._db.executescript(_SCHEMA)

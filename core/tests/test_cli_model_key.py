@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -71,9 +70,12 @@ def test_tui_gets_the_model_key_through_k3code_default_model(tmp_path, monkeypat
     monkeypatch.setattr(paths_mod, "find_node", lambda: "node")
     monkeypatch.setattr(cli_mod, "_find_repo_root", lambda: tmp_path)
     envs: list[dict[str, str]] = []
-    monkeypatch.setattr(
-        cli_mod.subprocess, "run", lambda argv, env, check: envs.append(env) or SimpleNamespace(returncode=0)
-    )
+
+    def handed_over(argv, env):  # the launcher execs into the TUI's waiter (#164)
+        envs.append(env)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_mod, "_exec_tui", handed_over)
     with pytest.raises(SystemExit):
         cli_mod._launch_tui(model="cheap")
     assert envs[0]["K3CODE_DEFAULT_MODEL"] == "cheap"

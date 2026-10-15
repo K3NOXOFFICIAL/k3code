@@ -65,6 +65,10 @@ export function mergeAgentRoster(
       model: s.model ?? previous?.model,
       startedAt:
         s.started_at != null ? s.started_at * 1000 : previous?.startedAt,
+      // A finished child's run time: the strip drops it a minute after its end. The turn's own complete event wins;
+      // after the turn only this snapshot knows the child, and without it the row never left the strip (#170).
+      durationSeconds:
+        previous?.durationSeconds ?? s.duration_seconds ?? undefined,
       // Snapshot replies may predate progress/completion events already rendered. A finished child keeps its
       // final status: mapping everything but "queued" to "running" showed last turn's agents as working forever
       // once the turn's own events were cleared.

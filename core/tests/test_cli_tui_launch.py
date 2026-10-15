@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -35,9 +34,12 @@ def launched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, 
     monkeypatch.setattr(cli_mod, "_is_interactive", lambda: True)
     monkeypatch.setattr(cli_mod, "_offer_project_trust", lambda project_dir: None)
     envs: list[dict[str, str]] = []
-    monkeypatch.setattr(
-        cli_mod.subprocess, "run", lambda argv, env, check: envs.append(env) or SimpleNamespace(returncode=0)
-    )
+
+    def handed_over(argv, env):  # the launcher execs into the TUI's waiter (#164)
+        envs.append(env)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli_mod, "_exec_tui", handed_over)
     work = tmp_path / "work"
     work.mkdir()
     monkeypatch.chdir(work)

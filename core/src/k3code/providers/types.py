@@ -63,6 +63,9 @@ class Message:
     usage: Usage | None = None
     #: why the model stopped (provider-neutral; "max_tokens" = cut off at the output limit). Not persisted.
     stop_reason: str | None = None
+    #: the harness's own notes on the message, stored with it and never sent to a provider: ``{"continuation": True}``
+    #: marks a user message the harness wrote to continue a goal (see GatewayServer._run_turn_locked, session.undo)
+    meta: dict[str, Any] | None = None
 
 
 @dataclass

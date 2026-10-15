@@ -11,10 +11,14 @@
 #   1. scripts/ci/check.sh --post: the full local check, and the local-ci status on the commit
 #   2. the personal-data scan of the source export (scripts/release/build_release.sh; the export is not published)
 #   3. the assets, in .k3dev/release/VERSION/assets/:
-#        k3code-<pep440 version>-py3-none-any.whl   uv build --wheel
+#        k3code-<pep440 version>-py3-none-any.whl   uv build --wheel, with LICENSE, NOTICE and LICENSES/ in k3code/
+#                                                   (checked: a wheel without them stops the release)
 #        k3code-VERSION-requirements.txt            uv export --locked: the hashed runtime dependencies
-#        k3code-tui-VERSION.tar.gz                  the built TUI (tui/dist)
+#        k3code-tui-VERSION.tar.gz                  the built TUI (tui/dist), LICENSE, NOTICE, LICENSES/ and
+#                                                   THIRD_PARTY_NOTICES.txt (the npm packages bundled into dist)
 #        k3-{linux,darwin}-{amd64,arm64}            the k3 pane binary, CGO_ENABLED=0 cross builds
+#        THIRD_PARTY_NOTICES.txt                    the notices of everything above: NOTICE and LICENSES/, the TUI's
+#                                                   npm packages, and the Go modules and runtime linked into k3
 #        SHA256SUMS                                 a sha256 line for every other asset
 #   4. the release notes: the CHANGELOG.md section of VERSION
 #   5. gh release create --draft with every asset (--prerelease when VERSION contains "-"), a check that the draft holds
@@ -51,6 +55,7 @@ asset_names() {
       echo "k3-$os-$arch"
     done
   done
+  echo "THIRD_PARTY_NOTICES.txt"
   echo "SHA256SUMS"
 }
 
@@ -118,7 +123,7 @@ unreleased=$(awk '
 if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null || [ -n "$(git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null)" ]; then
   problem "tag $TAG already exists"
 fi
-for t in uv npm go gh; do
+for t in uv npm go gh python3; do
   have "$t" || problem "$(install_hint "$t")"
 done
 if [ "$problems" -gt 0 ] && [ "$DRY" = 0 ]; then
@@ -146,8 +151,16 @@ echo "release: personal-data scan of the export of ${SHA:0:12}"
 sh "$HERE/build_release.sh" -o "$OUT/export" HEAD
 
 # --- 3. assets ---------------------------------------------------------------------------------------------------
+# The third-party notices (issue #165): k3code's own license files go into every asset that ships code, and
+# THIRD_PARTY_NOTICES files name what the TUI bundle and the k3 binaries link in. third_party_notices.py fails on a
+# package or module whose license it cannot find, which stops the release.
+NOTICES="$HERE/third_party_notices.py"
+
 echo "release: core wheel"
 (cd core && uv build --quiet --wheel --out-dir "$OUT/build/wheel")
+# core/hatch_build.py copies LICENSE, NOTICE and LICENSES/ into the wheel; a wheel without them is not published
+python3 "$NOTICES" check-wheel --repo "$ROOT" "$OUT"/build/wheel/*.whl ||
+  die "the wheel does not ship LICENSE, NOTICE and LICENSES/ (core/hatch_build.py); nothing was published"
 cp "$OUT"/build/wheel/*.whl "$ASSETS/"
 
 echo "release: locked requirements"
@@ -157,20 +170,35 @@ echo "release: locked requirements"
   -o "$ASSETS/k3code-$VER-requirements.txt")
 
 echo "release: TUI tarball"
+# dist/ is the bundle; beside it, the license files and the notices of the npm packages bundled into it (the
+# production dependencies in package-lock.json, with their license texts from node_modules after npm ci).
+mkdir -p "$OUT/build/tui"
 (
   cd tui
   npm ci --no-audit --no-fund
   npm run build:ink
   npm run build
-  tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist
+  python3 "$NOTICES" generate --npm-lock package-lock.json -o "$OUT/build/tui/THIRD_PARTY_NOTICES.txt"
+  tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist -C "$ROOT" LICENSE NOTICE LICENSES \
+    -C "$OUT/build/tui" THIRD_PARTY_NOTICES.txt
 ) >"$OUT/build/tui.log" 2>&1 || die "the TUI build failed; see $OUT/build/tui.log"
 
 echo "release: k3 binaries"
+# go list -deps names every module each build links in (per platform: some are linux- or darwin-only), from the
+# module cache the build just used; it compiles and runs nothing (never `go test`).
+: >"$OUT/build/go-modules.json"
 for os in linux darwin; do
   for arch in amd64 arm64; do
     (cd panes && GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$ASSETS/k3-$os-$arch" ./cmd/k3)
+    (cd panes && GOOS=$os GOARCH=$arch CGO_ENABLED=0 go list -deps -json=Module ./cmd/k3) >>"$OUT/build/go-modules.json" ||
+      die "go list could not name the modules of k3-$os-$arch"
   done
 done
+
+echo "release: THIRD_PARTY_NOTICES.txt"
+goroot=$(cd panes && go env GOROOT) || die "go env GOROOT failed"
+python3 "$NOTICES" generate --own "$ROOT" --npm-lock tui/package-lock.json --go-modules "$OUT/build/go-modules.json" \
+  --goroot "$goroot" -o "$ASSETS/THIRD_PARTY_NOTICES.txt" || die "the third-party notices could not be generated"
 
 echo "release: SHA256SUMS"
 (

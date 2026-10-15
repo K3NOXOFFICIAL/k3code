@@ -185,6 +185,12 @@ async def diff(wt: Worktree, limit: int = 200_000) -> str:
     return out if len(out) <= limit else out[:limit] + "\n[diff truncated]"
 
 
+async def changed_files(wt: Worktree) -> list[str]:
+    """The paths the child's branch changed against its base: what merging it brings into the parent checkout."""
+    _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, "--name-only", f"{wt.base}...{wt.branch}")
+    return [line for line in out.splitlines() if line.strip()]
+
+
 async def diff_stat(wt: Worktree) -> str:
     _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, "--stat", f"{wt.base}...{wt.branch}")
     return out.strip()

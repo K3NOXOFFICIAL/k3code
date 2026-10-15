@@ -13,6 +13,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from typing import Any
 from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
+from k3code.goals import loop_evidence
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt, subagent_system_prompt
@@ -79,6 +81,13 @@ class Handle:
     tail: list[str] = field(default_factory=list)
     index: int = 0
     count: int = 1
+    #: what the child's tool calls showed (``goals.TurnEvidence``: its tests with exit codes, the files it edited),
+    #: kept when its loop is dropped: a fan-out hands its workers' evidence to the parent's goal judge
+    evidence: Any = field(default=None, repr=False)
+    #: called as ``on_usage(handle, final)`` right after each model call adds to ``tokens_in``/``tokens_out``, from
+    #: the child's own task; ``final`` = the reply has no tool calls, so the child makes no further call. A fan-out
+    #: with a token cap stops its running children there once the cap is crossed
+    on_usage: Callable[[Handle, bool], None] | None = field(default=None, repr=False)
 
     @property
     def done(self) -> bool:
@@ -515,6 +524,11 @@ class SubagentManager:
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens
+                        if h.on_usage is not None:
+                            try:
+                                h.on_usage(h, not msg.tool_calls)
+                            except Exception:  # noqa: BLE001 - a budget watcher must not take the child down
+                                logger.exception("sub-agent %s: usage callback failed", h.id)
                     if msg.content:
                         final = msg.content
                         if msg.tool_calls:
@@ -522,6 +536,8 @@ class SubagentManager:
                     h.model = server.last_attempt[1] or h.model
         finally:
             h.result = final.strip()
+            with contextlib.suppress(Exception):  # evidence for a goal judge: never the child's outcome
+                h.evidence = loop_evidence(loop.turn_messages).relative_to(cwd)
             # the child's background bash jobs are filed under its own id: no session close ever reaps them
             with contextlib.suppress(Exception):
                 await tool_jobs.reap(h.id)

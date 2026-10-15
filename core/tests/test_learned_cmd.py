@@ -129,3 +129,109 @@ def test_learned_forget_preference_leaves_json_and_user_md(tmp_path, monkeypatch
     assert "learn it again" in run(f"forget {pref.id}")
     assert [p.text for p in distiller.load_preferences(home)] == ["be terse"]
     assert distiller.read_auto_section(user_memory_path()) == ["be terse"]
+
+
+def _decisions(home: Path, *rows: tuple[str, str]) -> None:
+    """Rows of the decision log: ``(cwd, choice)`` each, filed under ``project_id(cwd)`` as the hub files them."""
+    from k3code.learning.decisions import DecisionLog
+
+    log = DecisionLog(home)
+    for cwd, choice in rows:
+        log.record("approval", session="s1", cwd=cwd, subject="pytest *", choice=choice)
+    log.record("auto_apply", subject="terse overlay", choice="applied", actor="auto")  # the optimizer's: no project
+    log.close()
+
+
+def _rows(home: Path) -> list[tuple[str, str]]:
+    from k3code.learning.decisions import DecisionLog
+
+    log = DecisionLog(home)
+    try:
+        return [(r["cwd"], r["choice"]) for r in log.query(actor=None)]
+    finally:
+        log.close()
+
+
+def test_learned_purge_deletes_this_projects_decision_rows_only(tmp_path, monkeypatch):
+    """/learned purge left decisions.db alone (only the yearly age prune ever deleted from it), so the distiller
+    learned the same preferences again from the project's decisions. It now deletes the rows of this project: those
+    under its id and those recorded anywhere in it (a subdirectory has an id of its own when there is no remote)."""
+    home, cwd, run, _ = _setup(tmp_path, monkeypatch)
+    (cwd / ".git").mkdir()
+    (cwd / "pkg").mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    _decisions(home, (str(cwd), "allow"), (str(cwd / "pkg"), "allow"), (str(other), "deny"))
+
+    assert "decision log rows (learning/decisions.db)" in run("purge")  # the prompt says what goes
+    assert len(_rows(home)) == 4  # negative gate: nothing without --yes
+    out = run("purge --yes")
+    assert "2 decision log row(s) of this project" in out
+    assert _rows(home) == [(str(other), "deny"), ("", "applied")]  # another project's and the optimizer's stay
+
+
+def test_learned_purge_does_not_create_a_decision_log(tmp_path, monkeypatch):
+    """A context without a learning hub opens the log itself, and makes none that is missing."""
+    home, _cwd, run, _ = _setup(tmp_path, monkeypatch)
+    assert "0 decision log row(s)" in run("purge --yes")
+    assert not (home / "learning" / "decisions.db").exists()
+
+
+def test_learned_purge_all_clears_every_project_and_preferences_but_keeps_confirmed_items(tmp_path, monkeypatch):
+    """``--all`` also clears every project's decisions and the learned preferences (preferences.json and the auto
+    section of USER.md); accepted gotchas, the machine gotchas and the lines the user wrote in USER.md stay."""
+    from k3code.learning import distiller, gotchas
+    from k3code.learning.decisions import project_id
+
+    home, cwd, run, collect = _setup(tmp_path, monkeypatch)
+    other = tmp_path / "other"
+    other.mkdir()
+    _decisions(home, (str(cwd), "allow"), (str(other), "deny"))
+    gotchas.append_gotcha(gotchas.user_gotchas_path(home), "machine: use gmake")
+    (home / "decisions.jsonl.migrated").write_text('{"tool": "bash"}\n', encoding="utf-8")
+    prefs = [distiller.Preference("use tabs", 0.9, 5, "a"), distiller.Preference("be terse", 0.8, 4, "b")]
+    user_md = user_memory_path()
+    user_md.parent.mkdir(parents=True, exist_ok=True)
+    user_md.write_text("# Me\n- I wrote this myself\n", encoding="utf-8")
+    distiller.write_preferences_json(home, prefs)
+    distiller.write_auto_section(user_md, prefs)
+    user_md.write_text(user_md.read_text(encoding="utf-8") + "- added after the block\n", encoding="utf-8")
+
+    prompt = run("purge --all")
+    assert "every project's decision log rows" in prompt and "--all --yes" in prompt
+    assert len(_rows(home)) == 3 and distiller.load_preferences(home)  # negative gate: nothing without --yes
+    out = run("purge --all --yes")
+    assert "3 decision log row(s)" in out and "2 learned preference(s)" in out
+    assert _rows(home) == [] and not (home / "decisions.jsonl.migrated").exists()
+    assert not (home / "learning" / "preferences.json").exists()
+    assert distiller.read_auto_section(user_md) == []
+    text = user_md.read_text(encoding="utf-8")
+    assert "- I wrote this myself" in text and "- added after the block" in text  # the user's lines stay
+    assert "use tabs" not in text and "be terse" not in text
+    # what the user confirmed stays: the accepted project gotcha and the machine gotcha
+    assert gotchas.gotchas_path(project_id(cwd), home).read_text(encoding="utf-8").count("never run make clean") == 1
+    kinds = {i.kind for i in collect(cwd)}
+    assert kinds == {"gotcha", "machine gotcha"}
+
+
+def test_learned_purge_all_leaves_a_user_md_without_a_learned_block_alone(tmp_path, monkeypatch):
+    home, _cwd, run, _ = _setup(tmp_path, monkeypatch)
+    user_md = user_memory_path()
+    user_md.parent.mkdir(parents=True, exist_ok=True)
+    user_md.write_text("- only mine\n", encoding="utf-8")
+    assert "0 learned preference(s)" in run("purge --all --yes")
+    assert user_md.read_text(encoding="utf-8") == "- only mine\n"
+
+
+def test_learned_help_and_usage_say_what_each_purge_removes(tmp_path, monkeypatch):
+    from k3code.commands.learned_cmd import LearnedCommand
+
+    _home, _cwd, run, _ = _setup(tmp_path, monkeypatch)
+    help_text = LearnedCommand().help
+    assert help_text.splitlines()[0].endswith("/learned purge [--all] --yes")  # /help shows the first line
+    for needle in ("gotchas.auto.md", "learned.md", "learning/decisions.db", "overlay not in an active experiment"):
+        assert needle in help_text.splitlines()[1]
+    assert "preferences.json" in help_text.splitlines()[2] and "every project's" in help_text.splitlines()[2]
+    assert "accepted gotchas" in help_text.splitlines()[3] and "USER.md" in help_text.splitlines()[3]
+    assert "--all goes with purge only" in run("forget x --all")
+    assert "purge [--all] --yes" in run("bogus")

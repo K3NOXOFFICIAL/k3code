@@ -13,6 +13,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from k3code.paths import ensure_private_dir
+
 
 @dataclass(frozen=True)
 class Halt:
@@ -38,7 +40,7 @@ def load_halt(home: Path) -> Halt | None:
 def set_halt(home: Path, reason: str, now: float | None = None) -> Halt:
     """Persist the halt (atomic write, so a crash mid-write never leaves a half-written flag)."""
     halt = Halt(reason=reason, since=time.time() if now is None else now)
-    home.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(home)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     tmp = halt_path(home).with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"active": True, **asdict(halt)}))
     os.replace(tmp, halt_path(home))

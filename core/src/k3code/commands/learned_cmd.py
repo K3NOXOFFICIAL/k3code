@@ -1,4 +1,5 @@
-"""/learned [forget <id> | purge --yes]: see, drop and clear what learning stored for this project and this machine."""
+"""/learned [forget <id> | purge [--all] --yes]: see, drop and clear what learning stored for this project and this
+machine."""
 
 from __future__ import annotations
 
@@ -10,11 +11,21 @@ from typing import Any
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, session_cwd, split_args
 from k3code.learning import distiller, gotchas, optimizer
-from k3code.learning.decisions import project_id
+from k3code.learning.decisions import DecisionLog, project_id
 from k3code.memory import learned_notes_path, user_memory_path
 from k3code.paths import home
 
-USAGE = "/learned | /learned forget <id> | /learned purge --yes"
+USAGE = "/learned | /learned forget <id> | /learned purge [--all] --yes"
+#: Exactly what each purge removes and keeps; the help, the confirmation prompt and the README say the same.
+PURGE = (
+    "/learned purge removes this project's auto gotchas (gotchas.auto.md), learned notes (learned.md) and decision "
+    "log rows (learning/decisions.db), and every overlay not in an active experiment"
+)
+PURGE_ALL = (
+    "/learned purge --all also removes every project's decision log rows and the learned preferences "
+    "(learning/preferences.json and the auto section of USER.md)"
+)
+PURGE_KEEPS = "Both keep what you confirmed: accepted gotchas (gotchas.md, machine gotchas) and your own USER.md lines"
 TEXT_MAX = 100
 _LINE_KINDS = ("gotcha", "auto gotcha", "note", "machine gotcha")
 
@@ -103,15 +114,66 @@ def _forget(item: Item, exps: optimizer.Experiments) -> str:
     return f"Forgot {item.id} (overlay file deleted)."
 
 
+def _purge_decisions(ctx: Any, cwd: Path, *, everything: bool) -> int:
+    """Delete this project's decision log rows (``everything``: every row); returns how many. Uses the gateway's open
+    log; a context without a learning hub opens the file itself, and creates none that is missing."""
+    log = getattr(getattr(ctx, "learning", None), "log", None)
+    own = log is None
+    if own:
+        if not (home() / "learning" / "decisions.db").is_file():
+            return 0
+        log = DecisionLog(home())
+    try:
+        return log.delete_all() if everything else log.delete_project(cwd)
+    finally:
+        if own:
+            log.close()
+
+
+def _purge(ctx: Any, cwd: Path, *, everything: bool) -> str:
+    """Remove what PURGE (and with ``everything``, PURGE_ALL) names, keep what PURGE_KEEPS names; returns the report.
+    The decision log goes first: should it fail (a locked database), nothing else is gone yet and a retry is whole."""
+    rows = _purge_decisions(ctx, cwd, everything=everything)
+    active = _active_overlay_ids(_experiments(ctx))
+    h = home()
+    gone = 0
+    for p in (gotchas.auto_gotchas_path(project_id(cwd), h), learned_notes_path(cwd)):
+        if p.is_file():
+            p.unlink()
+            gone += 1
+    for f in (h / "overlays").glob("*.md"):
+        if _overlay_id(f) not in active:
+            f.unlink()
+            gone += 1
+    done = [f"{gone} file(s)", f"{rows} decision log row(s)" + ("" if everything else " of this project")]
+    if everything:
+        prefs = [p.text for p in distiller.load_preferences(h, top=1_000_000)]
+        user_md = user_memory_path()
+        text = user_md.read_text(encoding="utf-8") if user_md.is_file() else ""
+        if any(ln.strip() == distiller.HEADING for ln in text.splitlines()):  # no block, nothing to clear or create
+            # only the managed block is rewritten; ``known`` (what the distiller wrote, as in ``distill``) tells an
+            # old unclosed block's lines from the user's, which stay
+            distiller.write_auto_section(user_md, [], known=prefs)
+        (h / "learning" / "preferences.json").unlink(missing_ok=True)
+        done.append(f"{len(prefs)} learned preference(s)")
+    return "Purged " + ", ".join(done) + "."
+
+
 class LearnedCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="learned", help=f"List, forget or purge what k3code learned: {USAGE}")
+        super().__init__(
+            name="learned",
+            help=f"List, forget or purge what k3code learned: {USAGE}\n{PURGE}.\n{PURGE_ALL}.\n{PURGE_KEEPS}.",
+        )
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         args = split_args(arg)
         yes = pop_flag(args, "--yes") or pop_flag(args, "-y")
+        everything = pop_flag(args, "--all")
         cwd = session_cwd(ctx, session_id)
         sub = args[0] if args else "list"
+        if everything and sub != "purge":
+            return reply(f"--all goes with purge only. Usage: {USAGE}")
         if sub == "list" and len(args) <= 1:
             items = collect(cwd)
             if not items:
@@ -124,23 +186,10 @@ class LearnedCommand(CommandDef):
             return reply(_forget(item, _experiments(ctx)))
         if sub == "purge" and len(args) == 1:
             if not yes:
-                return reply(
-                    "This clears this project's auto gotchas and learned notes and every overlay not in an active "
-                    "experiment. Run /learned purge --yes to confirm."
-                )
-            exps = _experiments(ctx)
-            active = _active_overlay_ids(exps)
-            h = home()
-            gone = 0
-            for p in (gotchas.auto_gotchas_path(project_id(cwd), h), learned_notes_path(cwd)):
-                if p.is_file():
-                    p.unlink()
-                    gone += 1
-            for f in (h / "overlays").glob("*.md"):
-                if _overlay_id(f) not in active:
-                    f.unlink()
-                    gone += 1
-            return reply(f"Purged {gone} file(s).")
+                what = f"{PURGE}. {PURGE_ALL}." if everything else f"{PURGE}."
+                again = "/learned purge --all --yes" if everything else "/learned purge --yes"
+                return reply(f"{what} {PURGE_KEEPS}. Run {again} to confirm.")
+            return reply(_purge(ctx, cwd, everything=everything))
         return reply(f"Usage: {USAGE}")
 
 

@@ -40,6 +40,11 @@ CUT_OFF_CALL = (
     "Your reply hit the output token limit before this call's arguments were complete, so it did not run. "
     "Re-send it; split large content (a long file, a big edit) into several smaller calls."
 )
+UNATTENDED_BWRAP_REFUSAL = "bubblewrap is unusable here: unattended bash is refused; see /doctor"
+#: Follows a refusal of unattended bash only when the cwd itself is the refused root (adding a dir never fixes that).
+PROJECT_ROOT_HINT = (
+    "Unattended work needs a project directory as its root: start it there; read, glob and grep still work here"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,11 +238,13 @@ class AgentLoop:
         temperature: float | None = None,
         history: list[Message] | None = None,
         resume: bool = False,
+        prompt_meta: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent loop, yielding stream events.
 
         ``history`` is prior conversation messages (no system entry); when given,
-        the loop continues that conversation instead of starting fresh.
+        the loop continues that conversation instead of starting fresh. ``prompt_meta``: the harness's notes on the
+        prompt's message (``Message.meta``; a goal continuation's).
         """
         # The reliability bundle is shared per session; bind its retry wrapper to *this* loop's router
         # (another loop on a different tier may have attached its own since construction).
@@ -252,7 +259,7 @@ class AgentLoop:
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
-            Message(role="user", content=user_prompt),
+            Message(role="user", content=user_prompt, meta=prompt_meta),
         ]
         # The same list object the loop keeps appending to: a cancelled or crashed turn can still be persisted
         # (turn_messages used to be assigned only when a step finished, so /stop or SIGTERM lost the whole turn).
@@ -530,6 +537,9 @@ class AgentLoop:
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
             return {"error": f"Permission denied (unattended run): {decision.message}"}
+        # before the prompt too: approving bash the sandbox refuses runs nothing (the probe runs a subprocess)
+        if tool_call.name == "bash" and (refused := await asyncio.to_thread(self._unattended_refusal)) is not None:
+            return {"error": self._bash_refusal(refused)}
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
@@ -564,7 +574,8 @@ class AgentLoop:
                 )
             else:
                 why = "no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host"
-            decision = replace(decision, action="ask", sandbox_only=False, message=why)
+            # no_bwrap (auto/yolo, bwrap unusable): running on the host is a human-only call, as for auto_allowed below
+            decision = replace(decision, action="ask", sandbox_only=False, needs_human=no_bwrap, message=why)
         if home_rooted and not readonly_home:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
@@ -619,25 +630,44 @@ class AgentLoop:
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
             if tool_call.name == "bash":
+                # A background job outlives this call: the handler returns as soon as the job has started, so the
+                # git_writable scrub below would run before the job writes anything and miss what it plants in .git
+                # later. Its sandbox therefore binds the git metadata read-only whatever sandbox.git_writable says
+                # (False here, None = the user's setting); a commit or a branch is a foreground command.
+                background = bool(args.get("background"))
+                git_writable = False if background else None
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
                 if readonly_home:
                     argv = await asyncio.to_thread(
                         sandbox.build_argv, self.cwd, self.permissions.add_dirs, readonly_home=True
                     )
                 elif contained:
-                    argv = await asyncio.to_thread(self._contained_argv)
+                    argv = await asyncio.to_thread(self._contained_argv, git_writable=git_writable)
                 else:
-                    argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
-                result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+                    argv = (
+                        None if home_rooted else await asyncio.to_thread(self._sandbox_argv, git_writable=git_writable)
+                    )
+                # #101: with sandbox.git_writable the .git root stays writable for git's lock files, so a command can
+                # plant a commondir / worktree admin dir / config.worktree code key that the next harness git (outside
+                # the sandbox) would run. Snapshot the git metadata before, undo only what the command added after.
+                # (A background job has no writable .git to scrub: see above.)
+                guard = (
+                    await asyncio.to_thread(sandbox.snapshot_git_writable, self.cwd, self.permissions.add_dirs)
+                    if argv is not None and not background and sandbox.configured_git_writable()
+                    else None
+                )
+                try:
+                    result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+                finally:
+                    if guard is not None:
+                        for note in await asyncio.to_thread(sandbox.scrub_git_writable_changes, guard):
+                            logger.warning("sandbox: %s", note)
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
-            result = {
-                "error": f"bash refused: {exc}. Unattended work needs a project directory as its root: start it "
-                "there (or add one with add_dirs); read, glob and grep still work here"
-            }
+            result = {"error": self._bash_refusal(exc)}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
@@ -789,36 +819,54 @@ class AgentLoop:
         except Exception:  # noqa: BLE001 - a notice must never break a turn
             logger.warning("unsandboxed notice failed", exc_info=True)
 
+    def _unattended_refusal(self) -> sandbox.SandboxRefused | None:
+        """What :meth:`_sandbox_argv` will raise for this session's bash (bwrap unusable, or a root the sandbox will
+        not bind writable), or None. Only unattended sessions are refused; an interactive one falls back or asks."""
+        if not (self.background or self.unattended):
+            return None
+        if not sandbox.usable():
+            return sandbox.SandboxUnavailable(UNATTENDED_BWRAP_REFUSAL)
+        why = sandbox.root_refusal(self.cwd, self.permissions.add_dirs)
+        return None if why is None else sandbox.SandboxRefused(why)
+
+    def _bash_refusal(self, exc: sandbox.SandboxRefused) -> str:
+        """The error for refused bash: the sandbox's reason, and the project-directory hint only when the refused root
+        is the cwd (not when bwrap is unusable or an added dir is refused: moving the session fixes neither)."""
+        if isinstance(exc, sandbox.SandboxUnavailable) or sandbox.root_refusal(self.cwd) is None:
+            return f"bash refused: {exc}"
+        return f"bash refused: {exc}. {PROJECT_ROOT_HINT}"
+
     def _can_contain(self) -> bool:
         """The bwrap sandbox can run a bash call here: bwrap is usable and it accepts the session's roots."""
         return sandbox.usable() and sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is None
 
-    def _contained_argv(self) -> list[str]:
-        """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode."""
+    def _contained_argv(self, git_writable: bool | None = None) -> list[str]:
+        """bwrap prefix for a call that is allowed only sandboxed (Decision.sandbox_only), in any permission mode.
+        ``git_writable``: as :func:`sandbox.build_argv` (None = the user's ``sandbox.git_writable``)."""
         unattended = self.background or self.unattended
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
 
-    def _sandbox_argv(self) -> list[str] | None:
+    def _sandbox_argv(self, git_writable: bool | None = None) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
 
         None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once; the session is told
         and auto mode asks first, see _bwrap_unusable). An unattended session (background, goal continuation,
         sub-agent) has no human to see a warning, so it raises :class:`sandbox.SandboxUnavailable` instead: fail
-        closed, nothing runs.
+        closed, nothing runs. ``git_writable``: as :func:`sandbox.build_argv` (None = the user's setting).
         """
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
         unattended = self.background or self.unattended
         if not sandbox.usable():
             if unattended:
-                raise sandbox.SandboxUnavailable("bubblewrap is unusable here: unattended bash is refused; see /doctor")
+                raise sandbox.SandboxUnavailable(UNATTENDED_BWRAP_REFUSAL)
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
             return None
         network = self.unattended_network if unattended else True
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network, git_writable=git_writable)
 
     # ── M2 reliability helpers ──
 

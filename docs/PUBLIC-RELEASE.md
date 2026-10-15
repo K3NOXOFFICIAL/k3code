@@ -1,10 +1,32 @@
 # Making the repository public
 
-The repository is private. This is the checklist for the day it becomes public. Everything that could be done
-without rewriting history or deleting anything is already done (see [Already done](#already-done)). The history
-rewrite is scripted, verified and rehearsed on the final `Main` (see below), and an earlier run of it is already in a
-private staging repository, `K3NOXOFFICIAL/k3code-public`. Replacing this repository with the staging one waits
-until the switch: doing it earlier would diverge every clone and open branch while development continues.
+The repository is public: `github.com/K3NOXOFFICIAL/k3code` is readable without signing in (checked on
+2026-10-15). The switch followed the checklist below. The rewritten history from the staging repository
+`K3NOXOFFICIAL/k3code-public` replaced this repository's: the old name now leads to `k3code`, and pull request
+numbers start again at #1, merged on 2026-10-09. What is still open is in [Still open](#still-open). The rest of
+this file records how the switch was prepared and done.
+
+## Still open
+
+Checked from outside on 2026-10-15 at `Main` = `236d1eb`. The GitHub settings cannot be seen from outside, so only
+the owner can confirm or finish them:
+
+- **Repository settings** (step 5 below): private vulnerability reporting is on (the Security page offers
+  "Report a vulnerability"). Not checkable from outside, so confirm them in Settings: Dependabot alerts, secret
+  scanning with push protection, and branch protection on `Main` requiring the `local-ci` status
+  ([`docs/RELEASING.md`](RELEASING.md)).
+- **The archive** (step 3): `K3NOXOFFICIAL/k3code-archive` is not readable without signing in. If it exists, keep
+  it private: it holds the old history.
+- **Old clones** (step 4): a clone made before the switch still holds the old history. Re-clone and never push from
+  an old one; whether every machine was re-cloned cannot be checked from here.
+- **The first release** (step 6): there is no release and no tag yet.
+- **Clean-up** (step 7): this file, `rewrite_history.sh`, `remap_hashes.py` and the inert upstream workflows under
+  `panes/.github/` are still in the tree.
+- **History since the switch:** the rewritten part of `Main` (443 commits, up to `27700b0` "Point commit ids in files
+  at the rewritten history") has only noreply author and committer addresses and no `Claude-Session:` trailer. Of
+  the 930 commits made since, 345 have an author or committer address that is not a noreply one, and 155 have a
+  `Claude-Session:` trailer. They are public. The owner decides whether that matters and which address and trailers
+  new commits use.
 
 ## Already done
 
@@ -33,7 +55,11 @@ until the switch: doing it earlier would diverge every clone and open branch whi
   noreply author addresses. What is left that looks like a name is the public account name, the Go word "nils" in
   vendored code, and example addresses in tests and upstream fixtures.
 
-## Still in history (needs a rewrite)
+## What the rewrite removed
+
+The rewrite removed what this table lists from the published history. Checked on 2026-10-15: `panes/k3` is in no
+commit of `Main` or of any pull request, and the rewritten commits have only noreply addresses and no trailers. The
+`--replace-text` rules were not checked again, since only the rules folder names what they remove.
 
 | What | Where | Fix |
 |---|---|---|
@@ -56,12 +82,16 @@ The folder was missing on 2026-10-09 and was rebuilt from a scan of the history.
 the repository: nothing else holds these rules.
 
 **Why a fresh repository:** GitHub keeps every pull request's head as a read-only `refs/pull/<n>/head`. A force-push
-cannot remove them, so the old commits would stay reachable in this repository once it is public. Publish the
+cannot remove them, so the old commits would have stayed reachable in this repository once it was public. Publish the
 rewritten history to a new, empty repository instead (or ask GitHub Support to purge the old refs, which takes
 longer). `--main-only` publishes `Main` and tags only: the milestone, worker and agent branches stay in the old
 repository, which becomes the archive.
 
 ## On the day
+
+The rewrite and the swap (steps 2 and 3) were done by 2026-10-09, when the new repository's first pull request was
+merged, and the repository was public by 2026-10-15 (step 5). What is left of steps 4 to 7 is in
+[Still open](#still-open).
 
 1. **Merge the open pull request into `Main`** (and close any other you still want). With `--main-only` the other
    branches are not published, so they can stay as they are.

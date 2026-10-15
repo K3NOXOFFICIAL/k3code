@@ -53,14 +53,16 @@ class OptimizerCommand(CommandDef):
         sub = parts[0] if parts else "status"
         if sub == "status":
             on = "on" if hub.cfg["optimizer"]["enabled"] else "off (opt in: learning.optimizer.enabled: true)"
-            return reply(f"Optimizer: {on}\n{hub.experiments.format_status()}")
+            week = optimizer.describe_success(hub.metrics(since=hub.clock() - 7 * 86400))
+            return reply(f"Optimizer: {on}\nThis week: {week}\n{hub.experiments.format_status()}")
         if sub == "run":
             live = ctx.sessions.get(session_id) if session_id else None
             m = hub.metrics(since=hub.clock() - 7 * 86400)
             known = {x["id"] for x in hub.experiments.all()}
             made = await hub.run_optimizer(live)  # metric proposals, replayed token candidates, gated auto-apply
             lines = [
-                f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); {len(made)} new overlay proposal(s)."
+                f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); {len(made)} new overlay proposal(s).",
+                f"This week: {optimizer.describe_success(m)}",
             ]
             applied = [x for x in hub.experiments.all() if x["id"] not in known]
             if not hub.cfg["optimizer"]["enabled"]:

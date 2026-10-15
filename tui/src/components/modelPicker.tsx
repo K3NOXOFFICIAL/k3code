@@ -1,5 +1,5 @@
 import { Box, Text, useInput, useStdout } from "@k3code/ink";
-import { fuzzyRank } from "@k3code/shared/fuzzy";
+import { fuzzyRank, fuzzyScoreMulti } from "@k3code/shared/fuzzy";
 import type {
   ModelOptionProvider,
   ModelOptionsResult,
@@ -70,6 +70,124 @@ export function providerIndexAfterClearingFilter(
   return providerRows.findIndex((row) => row.provider.slug === provider.slug);
 }
 
+/** Where the model cursor starts: on the session's current model key when
+ *  this provider lists it, else on the first row. */
+export function initialModelIdx(
+  provider: ModelOptionProvider | undefined,
+  currentModel: string,
+): number {
+  return Math.max(0, (provider?.models ?? []).indexOf(currentModel));
+}
+
+/** The config `descriptions` the gateway sends per model key (not part of the
+ *  generated contract type, so read defensively). */
+export function modelDescriptions(
+  provider: ModelOptionProvider | undefined,
+): Record<string, string> {
+  const raw = provider?.descriptions;
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(raw).filter(
+      (e): e is [string, string] => typeof e[1] === "string" && !!e[1],
+    ),
+  );
+}
+
+/** One model row: the key, the model id it sends when that differs, and the
+ *  config description (`cheap (gpt-4o-mini) · Fast and cheap`). With
+ *  `providerName` the key is prefixed (`openai/cheap`), as in the search list. */
+export function modelRowLabel(
+  provider: ModelOptionProvider,
+  model: string,
+  providerName?: string,
+): string {
+  const id = provider.model_ids?.[model];
+  const description = modelDescriptions(provider)[model];
+  const head = providerName ? `${providerName}/${model}` : model;
+  const withId = id && id !== model ? `${head} (${id})` : head;
+
+  return description ? `${withId} · ${description}` : withId;
+}
+
+/** A row of the first screen's search: one model of one provider. */
+export type ModelHit = {
+  model: string;
+  name: string;
+  provider: ModelOptionProvider;
+};
+
+/** Typing on the first screen searches every provider's models at once: a
+ *  flat `provider/model` list, best match first. Each candidate text (the
+ *  `provider/key` pair by display name and by slug, the key, and the model id
+ *  it sends, the last two with their search aliases) is scored on its own and
+ *  the best one counts: in one long haystack the subsequence matcher found
+ *  "opus" in "anthropic/claude-sonnet-5". Descriptions are shown but not
+ *  searched. */
+export function flatModelHits(
+  providerRows: ProviderRow[],
+  query: string,
+): ModelHit[] {
+  const hits = providerRows.flatMap(({ name, provider }) =>
+    (provider.models ?? []).map((model) => ({ model, name, provider })),
+  );
+
+  if (!query.trim()) {
+    return hits;
+  }
+
+  const scored: { hit: ModelHit; index: number; score: number }[] = [];
+
+  hits.forEach((hit, index) => {
+    const id = hit.provider.model_ids?.[hit.model] ?? "";
+    const texts = [
+      `${hit.name}/${hit.model}`,
+      `${hit.provider.slug}/${hit.model}`,
+      modelSearchText(hit.model),
+      ...(id ? [modelSearchText(id)] : []),
+    ];
+    let best: number | null = null;
+
+    for (const text of texts) {
+      const match = fuzzyScoreMulti(text, query);
+
+      if (match && (best === null || match.score > best)) {
+        best = match.score;
+      }
+    }
+
+    if (best !== null) {
+      scored.push({ hit, index, score: best });
+    }
+  });
+
+  scored.sort((x, y) => y.score - x.score || x.index - y.index);
+
+  return scored.map((x) => x.hit);
+}
+
+/** A provider whose key is missing and can be pasted here (`model.save_key`). */
+export function pickerNeedsKey(provider: ModelOptionProvider | undefined) {
+  return (
+    provider?.authenticated === false &&
+    provider.auth_type === "api_key" &&
+    !!provider.key_env
+  );
+}
+
+/** Ctrl+D applies: a provider with a saved key (claude-cli and keyless
+ *  endpoints have nothing to remove). */
+export function pickerCanDisconnect(provider: ModelOptionProvider | undefined) {
+  return (
+    provider?.auth_type === "api_key" &&
+    !!provider.key_env &&
+    provider.authenticated !== false
+  );
+}
+
 export function ModelPicker({
   allowPersistGlobal = true,
   gw,
@@ -82,19 +200,22 @@ export function ModelPicker({
 }: ModelPickerProps) {
   const [providers, setProviders] = useState<ModelOptionProvider[]>([]);
   const [currentModel, setCurrentModel] = useState("");
+  const [currentProvider, setCurrentProvider] = useState("");
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
   const [persistGlobal, setPersistGlobal] = useState(false);
   const [providerIdx, setProviderIdx] = useState(0);
   const [modelIdx, setModelIdx] = useState(0);
+  const [hitIdx, setHitIdx] = useState(0);
   const [reasoningIdx, setReasoningIdx] = useState(0);
-  // Model chosen on step 2, awaiting the effort pick on step 3.
+  // Model chosen on the model step (or from the search), awaiting the effort pick.
   const [pendingModel, setPendingModel] = useState("");
   const [stage, setStage] = useState<Stage>("provider");
   const [keyInput, setKeyInput] = useState("");
   const [keySaving, setKeySaving] = useState(false);
   const [keyError, setKeyError] = useState("");
-  // Type-to-filter query, scoped per stage (cleared on stage change).
+  // Type-to-filter query, scoped per stage (cleared on stage change). On the
+  // first screen it searches every provider's models (flatModelHits).
   const [filter, setFilter] = useState("");
 
   const { stdout } = useStdout();
@@ -130,16 +251,20 @@ export function ModelPicker({
         }
 
         const next = r.providers ?? [];
-        setProviders(next);
-        setCurrentModel(String(r.model ?? ""));
-        setProviderIdx(
-          Math.max(
-            0,
-            next.findIndex((p) => p.is_current),
-          ),
+        const model = String(r.model ?? "");
+        const current = Math.max(
+          0,
+          next.findIndex((p) => p.is_current),
         );
-        setModelIdx(0);
-        setStage("provider");
+        const only = next.length === 1 ? next[0] : undefined;
+        setProviders(next);
+        setCurrentModel(model);
+        setCurrentProvider(String(r.provider ?? next[current]?.slug ?? ""));
+        setProviderIdx(current);
+        // One provider: there is nothing to choose on step 1, so open on its
+        // models (or its key prompt) with the cursor on the current model.
+        setModelIdx(initialModelIdx(next[current], model));
+        setStage(!only ? "provider" : pickerNeedsKey(only) ? "key" : "model");
         setErr("");
         setLoading(false);
       })
@@ -150,6 +275,7 @@ export function ModelPicker({
   }, [gw, initialRefresh, sessionId]);
 
   const names = useMemo(() => providerDisplayNames(providers), [providers]);
+  const singleProvider = providers.length === 1;
 
   // Provider rows carry their display name so fuzzy filtering can match on
   // name + slug while keeping the name/provider pairing intact across ranking.
@@ -162,23 +288,15 @@ export function ModelPicker({
     [providers, names],
   );
 
-  // providerIdx / modelIdx always index into the *displayed* (filtered) lists.
-  // With an empty filter the filtered list equals the full list, so navigation
-  // behaves exactly as before. Filtering only applies on the relevant stage.
-  const filteredProviderRows = useMemo(() => {
-    if (stage !== "provider" || !filter.trim()) {
-      return providerRows;
-    }
+  // Typing on the first screen switches it to a flat search over every
+  // provider's models: `provider/model`, best match first.
+  const searching = stage === "provider" && !!filter.trim();
+  const hits = useMemo(
+    () => (searching ? flatModelHits(providerRows, filter) : []),
+    [providerRows, filter, searching],
+  );
 
-    return fuzzyRank(
-      providerRows,
-      filter,
-      (row) =>
-        `${row.name} ${row.provider.slug} ${(row.provider.models ?? []).join(" ")}`,
-    ).map((r) => r.item);
-  }, [providerRows, filter, stage]);
-
-  const provider = filteredProviderRows[providerIdx]?.provider;
+  const provider = providerRows[providerIdx]?.provider;
   const allModels = useMemo(() => provider?.models ?? [], [provider]);
 
   const filteredModels = useMemo(() => {
@@ -187,21 +305,23 @@ export function ModelPicker({
     }
 
     // modelSearchText adds aliases for brand-less wire ids (e.g. Kimi
-    // Coding `k3` still matches a "kimi" query).
-    return fuzzyRank(allModels, filter, modelSearchText).map((r) => r.item);
-  }, [allModels, filter, stage]);
+    // Coding `k3` still matches a "kimi" query); the model id it sends
+    // counts too.
+    return fuzzyRank(allModels, filter, (m) => {
+      const id = provider?.model_ids?.[m];
+
+      return id ? `${modelSearchText(m)} ${modelSearchText(id)}` : m;
+    }).map((r) => r.item);
+  }, [allModels, filter, stage, provider]);
 
   const models = filteredModels;
 
   // Keep the active selection within the (possibly filtered) list bounds.
   useEffect(() => {
-    if (
-      providerIdx >= filteredProviderRows.length &&
-      filteredProviderRows.length > 0
-    ) {
-      setProviderIdx(0);
+    if (hitIdx >= hits.length && hits.length > 0) {
+      setHitIdx(0);
     }
-  }, [filteredProviderRows.length, providerIdx]);
+  }, [hits.length, hitIdx]);
 
   useEffect(() => {
     if (modelIdx >= models.length && models.length > 0) {
@@ -209,24 +329,38 @@ export function ModelPicker({
     }
   }, [models.length, modelIdx]);
 
+  /** Open a provider's models with the cursor on the current model. */
+  const openModels = (idx: number) => {
+    setProviderIdx(idx);
+    setModelIdx(initialModelIdx(providerRows[idx]?.provider, currentModel));
+    setStage("model");
+    setFilter("");
+  };
+
+  /** Step 3 for a model that may take an effort level, else switch now. */
+  const chooseModel = (p: ModelOptionProvider, model: string) => {
+    if (pickerOffersReasoning(p, model)) {
+      setPendingModel(model);
+      setReasoningIdx(0);
+      setStage("reasoning");
+
+      return;
+    }
+
+    onSelect(
+      modelPickerCommand(model, p.slug, allowPersistGlobal && persistGlobal),
+    );
+  };
+
   const back = () => {
     // Esc first clears an active filter on the list stages, before navigating.
     if ((stage === "provider" || stage === "model") && filter.trim()) {
-      // Preserve the selected provider across filter clear (same fix as
-      // Enter→key/model and Ctrl+D transitions above).
-      const fullProviderIdx = providerIndexAfterClearingFilter(
-        providerRows,
-        provider,
-      );
-
-      if (fullProviderIdx >= 0) {
-        setProviderIdx(fullProviderIdx);
-      } else if (stage === "provider") {
-        setProviderIdx(0);
-      }
-
       setFilter("");
-      setModelIdx(0);
+      setHitIdx(0);
+
+      if (stage === "model") {
+        setModelIdx(initialModelIdx(provider, currentModel));
+      }
 
       return;
     }
@@ -239,13 +373,22 @@ export function ModelPicker({
       return;
     }
 
-    if (stage === "model" || stage === "key" || stage === "disconnect") {
+    // With one provider there is no provider step to go back to.
+    if (
+      !singleProvider &&
+      (stage === "model" || stage === "key" || stage === "disconnect")
+    ) {
       setStage("provider");
-      setModelIdx(0);
       setKeyInput("");
       setKeyError("");
       setKeySaving(false);
       setFilter("");
+
+      return;
+    }
+
+    if (singleProvider && stage === "disconnect") {
+      setStage("model");
 
       return;
     }
@@ -259,6 +402,31 @@ export function ModelPicker({
     stage === "provider" || stage === "model" || stage === "reasoning";
   useOverlayKeys({ disabled: listStage, onBack: back, onClose: onCancel });
 
+  /** Replace one provider row with the gateway's fresh copy of it. */
+  const replaceProvider = (fresh: ModelOptionProvider | undefined) => {
+    if (fresh) {
+      setProviders((prev) =>
+        prev.map((p) => (p.slug === fresh.slug ? fresh : p)),
+      );
+    }
+  };
+
+  const startDisconnect = (target: ModelOptionProvider | undefined) => {
+    if (!pickerCanDisconnect(target)) {
+      return;
+    }
+
+    const idx = providerIndexAfterClearingFilter(providerRows, target);
+
+    if (idx >= 0) {
+      setProviderIdx(idx);
+    }
+
+    setKeyError("");
+    setStage("disconnect");
+    setFilter("");
+  };
+
   useInput((ch, key) => {
     // Key entry stage handles its own input
     if (stage === "key") {
@@ -267,14 +435,15 @@ export function ModelPicker({
       }
 
       if (key.return) {
-        if (!keyInput.trim()) {
+        if (!keyInput.trim() || !provider) {
           return;
         }
 
         setKeySaving(true);
         setKeyError("");
+        // ModelSaveKeyParams: { slug, api_key } (gateway-contract.generated.ts).
         gw.request<{ provider?: ModelOptionProvider }>("model.save_key", {
-          slug: provider?.slug,
+          slug: provider.slug,
           api_key: keyInput.trim(),
           ...(sessionId ? { session_id: sessionId } : {}),
         })
@@ -288,14 +457,11 @@ export function ModelPicker({
               return;
             }
 
-            // Update the provider in our list with fresh data
-            setProviders((prev) =>
-              prev.map((p) => (p.slug === r.provider!.slug ? r.provider! : p)),
-            );
+            replaceProvider(r.provider);
             setKeyInput("");
             setKeySaving(false);
             setStage("model");
-            setModelIdx(0);
+            setModelIdx(initialModelIdx(r.provider, currentModel));
           })
           .catch((e: unknown) => {
             setKeyError(rpcErrorMessage(e));
@@ -312,7 +478,7 @@ export function ModelPicker({
       }
 
       // ctrl+u clears input
-      if (ch === "\u0015") {
+      if (ch === "\u0015" || (key.ctrl && ch === "u")) {
         setKeyInput("");
 
         return;
@@ -327,53 +493,56 @@ export function ModelPicker({
 
     // Disconnect confirmation stage
     if (stage === "disconnect") {
+      if (keySaving) {
+        return;
+      }
+
       if (ch.toLowerCase() === "y" || key.return) {
         if (!provider) {
-          setStage("provider");
+          back();
 
           return;
         }
 
         setKeySaving(true);
-        gw.request<{ disconnected?: boolean }>("model.disconnect", {
-          slug: provider.slug,
-          ...(sessionId ? { session_id: sessionId } : {}),
-        })
+        setKeyError("");
+        gw.request<{ disconnected?: boolean; provider?: ModelOptionProvider }>(
+          "model.disconnect",
+          {
+            slug: provider.slug,
+            ...(sessionId ? { session_id: sessionId } : {}),
+          },
+        )
           .then((raw) => {
-            const r = asRpcResult<{ disconnected?: boolean }>(raw);
+            const r = asRpcResult<{
+              disconnected?: boolean;
+              provider?: ModelOptionProvider;
+            }>(raw);
 
-            if (r?.disconnected) {
-              // Mark provider as unauthenticated in local state
-              setProviders((prev) =>
-                prev.map((p) =>
-                  p.slug === provider.slug
-                    ? {
-                        ...p,
-                        authenticated: false,
-                        models: [],
-                        total_models: 0,
-                        warning: p.key_env
-                          ? `paste ${p.key_env} to activate`
-                          : "run `k3code model` to configure",
-                      }
-                    : p,
-                ),
-              );
+            setKeySaving(false);
+
+            if (!r?.disconnected) {
+              setKeyError("the key was not removed");
+
+              return;
             }
 
-            setKeySaving(false);
-            setStage("provider");
+            replaceProvider(r.provider);
+            back();
           })
-          .catch(() => {
+          .catch((e: unknown) => {
+            // Stay on the confirmation and say why (e.g. the key comes from
+            // the daemon's environment): never pretend it was removed.
             setKeySaving(false);
-            setStage("provider");
+            setKeyError(rpcErrorMessage(e));
           });
 
         return;
       }
 
       if (ch.toLowerCase() === "n" || key.escape) {
-        setStage("provider");
+        setKeyError("");
+        back();
 
         return;
       }
@@ -442,9 +611,14 @@ export function ModelPicker({
     }
 
     const count =
-      stage === "provider" ? filteredProviderRows.length : models.length;
-    const sel = stage === "provider" ? providerIdx : modelIdx;
-    const setSel = stage === "provider" ? setProviderIdx : setModelIdx;
+      stage === "model"
+        ? models.length
+        : searching
+          ? hits.length
+          : providerRows.length;
+    const sel = stage === "model" ? modelIdx : searching ? hitIdx : providerIdx;
+    const setSel =
+      stage === "model" ? setModelIdx : searching ? setHitIdx : setProviderIdx;
 
     if (key.upArrow && sel > 0) {
       setSel((v) => v - 1);
@@ -459,6 +633,40 @@ export function ModelPicker({
     }
 
     if (key.return) {
+      if (stage === "provider" && searching) {
+        const hit = hits[hitIdx];
+
+        if (!hit) {
+          return;
+        }
+
+        const idx = providerIndexAfterClearingFilter(
+          providerRows,
+          hit.provider,
+        );
+
+        if (idx >= 0) {
+          setProviderIdx(idx);
+        }
+
+        setFilter("");
+
+        if (pickerNeedsKey(hit.provider)) {
+          setStage("key");
+          setKeyInput("");
+          setKeyError("");
+
+          return;
+        }
+
+        setModelIdx(
+          Math.max(0, (hit.provider.models ?? []).indexOf(hit.model)),
+        );
+        chooseModel(hit.provider, hit.model);
+
+        return;
+      }
+
       if (stage === "provider") {
         if (!provider) {
           return;
@@ -466,16 +674,7 @@ export function ModelPicker({
 
         if (provider.authenticated === false) {
           // api_key providers: prompt for key inline
-          if (provider.auth_type === "api_key" && provider.key_env) {
-            const fullProviderIdx = providerIndexAfterClearingFilter(
-              providerRows,
-              provider,
-            );
-
-            if (fullProviderIdx >= 0) {
-              setProviderIdx(fullProviderIdx);
-            }
-
+          if (pickerNeedsKey(provider)) {
             setStage("key");
             setKeyInput("");
             setKeyError("");
@@ -486,18 +685,7 @@ export function ModelPicker({
           return;
         }
 
-        const fullProviderIdx = providerIndexAfterClearingFilter(
-          providerRows,
-          provider,
-        );
-
-        if (fullProviderIdx >= 0) {
-          setProviderIdx(fullProviderIdx);
-        }
-
-        setStage("model");
-        setModelIdx(0);
-        setFilter("");
+        openModels(providerIdx);
 
         return;
       }
@@ -505,21 +693,17 @@ export function ModelPicker({
       const model = models[modelIdx];
 
       if (provider && model) {
-        if (pickerOffersReasoning(provider, model)) {
-          // Step 3/3: effort for the picked model (skipped on reasoning-free routes).
-          setPendingModel(model);
-          setReasoningIdx(0);
-          setStage("reasoning");
-        } else {
-          onSelect(
-            modelPickerCommand(
-              model,
-              provider.slug,
-              allowPersistGlobal && persistGlobal,
-            ),
-          );
+        if (pickerNeedsKey(provider)) {
+          setStage("key");
+          setKeyInput("");
+          setKeyError("");
+          setFilter("");
+
+          return;
         }
-      } else {
+
+        chooseModel(provider, model);
+      } else if (!singleProvider) {
         setStage("provider");
       }
 
@@ -552,24 +736,14 @@ export function ModelPicker({
       return;
     }
 
-    // Disconnect (Ctrl+D): only in provider stage, only for authenticated providers.
-    if (
-      key.ctrl &&
-      ch === "d" &&
-      stage === "provider" &&
-      provider?.authenticated !== false
-    ) {
-      const fullProviderIdx = providerIndexAfterClearingFilter(
-        providerRows,
-        provider,
-      );
-
-      if (fullProviderIdx >= 0) {
-        setProviderIdx(fullProviderIdx);
+    // Disconnect (Ctrl+D): the highlighted provider (or the search hit's), or
+    // the only provider from its model list.
+    if (key.ctrl && ch === "d") {
+      if (stage === "provider") {
+        startDisconnect(searching ? hits[hitIdx]?.provider : provider);
+      } else if (singleProvider) {
+        startDisconnect(provider);
       }
-
-      setStage("disconnect");
-      setFilter("");
 
       return;
     }
@@ -603,6 +777,17 @@ export function ModelPicker({
     );
   }
 
+  const totalSteps = singleProvider ? 2 : 3;
+  const stepOf = (n: number) =>
+    `step ${singleProvider ? n - 1 : n}/${totalSteps}`;
+  const persistLine = (
+    <Text color={t.color.muted} wrap="truncate-end">
+      persist:{" "}
+      {allowPersistGlobal ? (persistGlobal ? "global" : "session") : "session"}
+      {allowPersistGlobal ? " · ^g toggle" : " only"}
+    </Text>
+  );
+
   // ── Key entry stage ──────────────────────────────────────────────────
   if (stage === "key" && provider) {
     const masked = keyInput ? "•".repeat(Math.min(keyInput.length, 40)) : "";
@@ -614,7 +799,7 @@ export function ModelPicker({
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
-          Paste your API key below (saved to ~/.k3code/.env)
+          Paste your API key below (saved 0600 to ~/.config/k3code/env)
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
@@ -667,16 +852,22 @@ export function ModelPicker({
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
-          This removes saved credentials for {provider.name}.
+          This removes the saved key {provider.key_env} for {provider.name}.
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
-          You can re-authenticate later by selecting it again.
+          Paste a key again later by selecting it.
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
           {" "}
         </Text>
+
+        {keyError ? (
+          <Text color={t.color.label} wrap="truncate-end">
+            error: {keyError}
+          </Text>
+        ) : null}
 
         {keySaving ? (
           <Text color={t.color.muted} wrap="truncate-end">
@@ -689,47 +880,65 @@ export function ModelPicker({
     );
   }
 
-  // ── Provider selection stage ─────────────────────────────────────────
+  // ── Provider selection stage, or the search over all models ──────────
   if (stage === "provider") {
-    const rows = filteredProviderRows.map(({ provider: p, name }) => {
-      const authMark =
-        p.authenticated === false ? "○" : p.is_current ? "*" : "●";
-      const modelCount = p.total_models ?? p.models?.length ?? 0;
+    const rows = searching
+      ? hits.map((h) => {
+          const mark =
+            h.provider.authenticated === false
+              ? "○"
+              : h.provider.slug === currentProvider && h.model === currentModel
+                ? "*"
+                : " ";
 
-      const suffix =
-        p.authenticated === false
-          ? p.auth_type === "api_key"
-            ? "(no key)"
-            : "(needs setup)"
-          : `${modelCount} models`;
+          return `${mark} ${modelRowLabel(h.provider, h.model, h.name)}`;
+        })
+      : providerRows.map(({ provider: p, name }) => {
+          const authMark =
+            p.authenticated === false ? "○" : p.is_current ? "*" : "●";
+          const modelCount = p.total_models ?? p.models?.length ?? 0;
 
-      return `${authMark} ${name} · ${suffix}`;
-    });
+          const suffix =
+            p.authenticated === false
+              ? p.auth_type === "api_key"
+                ? "(no key)"
+                : "(needs setup)"
+              : `${modelCount} models`;
 
-    const { items, offset } = windowItems(rows, providerIdx, VISIBLE);
-    const noMatches = !!filter.trim() && rows.length === 0;
+          return `${authMark} ${name} · ${suffix}`;
+        });
+
+    const sel = searching ? hitIdx : providerIdx;
+    const selProvider = searching ? hits[hitIdx]?.provider : provider;
+    const { items, offset } = windowItems(rows, sel, VISIBLE);
+    const noMatches = searching && rows.length === 0;
 
     return (
       <Box flexDirection="column" width={width}>
         <Text bold color={t.color.accent} wrap="truncate-end">
-          Select provider (step 1/3)
+          {searching
+            ? "Search models in every provider"
+            : `Select provider (${stepOf(1)})`}
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
-          Full model IDs on the next step · Enter to continue
+          {searching
+            ? "provider/model · Enter picks it"
+            : "Type to search all models · Enter to open a provider"}
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
           Current: {currentModel || "(unknown)"}
+          {currentProvider ? ` · ${currentProvider}` : ""}
         </Text>
         <Text
           color={filter ? t.color.accent : t.color.muted}
           wrap="truncate-end"
         >
-          {filter ? `filter: ${filter}▎` : "type to filter · ↑/↓ select"}
+          {filter ? `search: ${filter}▎` : "type to search · ↑/↓ select"}
         </Text>
         <Text color={t.color.label} wrap="truncate-end">
-          {provider?.warning ? `warning: ${provider.warning}` : " "}
+          {selProvider?.warning ? `warning: ${selProvider.warning}` : " "}
         </Text>
         <Text color={t.color.muted} wrap="truncate-end">
           {offset > 0 ? ` ↑ ${offset} more` : " "}
@@ -737,23 +946,28 @@ export function ModelPicker({
 
         {noMatches ? (
           <Text color={t.color.muted} wrap="truncate-end">
-            no providers match
+            no models match
           </Text>
         ) : (
           Array.from({ length: VISIBLE }, (_, i) => {
             const row = items[i];
             const idx = offset + i;
-            const p = filteredProviderRows[idx]?.provider;
+            const p = searching
+              ? hits[idx]?.provider
+              : providerRows[idx]?.provider;
             const dimmed = p?.authenticated === false;
+            const rowKey = searching
+              ? `${hits[idx]?.provider.slug}/${hits[idx]?.model}`
+              : (p?.slug ?? `row-${idx}`);
 
             return row ? (
               <Text
                 color={dimmed ? t.color.label : t.color.muted}
-                {...chipRowProps(t, providerIdx === idx)}
-                key={p?.slug ?? `row-${idx}`}
+                {...chipRowProps(t, sel === idx)}
+                key={rowKey}
                 wrap="truncate-end"
               >
-                {providerIdx === idx ? "▸ " : "  "}
+                {sel === idx ? "▸ " : "  "}
                 {idx + 1}. {row}
               </Text>
             ) : (
@@ -770,15 +984,7 @@ export function ModelPicker({
             : " "}
         </Text>
 
-        <Text color={t.color.muted} wrap="truncate-end">
-          persist:{" "}
-          {allowPersistGlobal
-            ? persistGlobal
-              ? "global"
-              : "session"
-            : "session"}
-          {allowPersistGlobal ? " · ^g toggle" : " only"}
-        </Text>
+        {persistLine}
         <OverlayHint t={t}>
           ↑/↓ select · Enter choose · ^d disconnect · Esc clear/back · q close
         </OverlayHint>
@@ -791,7 +997,7 @@ export function ModelPicker({
     return (
       <Box flexDirection="column" width={width}>
         <Text bold color={t.color.accent} wrap="truncate-end">
-          Reasoning effort (step 3/3)
+          Reasoning effort ({stepOf(3)})
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
@@ -810,15 +1016,7 @@ export function ModelPicker({
           </Text>
         ))}
 
-        <Text color={t.color.muted} wrap="truncate-end">
-          persist:{" "}
-          {allowPersistGlobal
-            ? persistGlobal
-              ? "global"
-              : "session"
-            : "session"}
-          {allowPersistGlobal ? " · ^g toggle" : " only"}
-        </Text>
+        {persistLine}
         <OverlayHint t={t}>
           ↑/↓ select · Enter switch · Esc back · q close
         </OverlayHint>
@@ -829,16 +1027,19 @@ export function ModelPicker({
   // ── Model selection stage ────────────────────────────────────────────
   const { items, offset } = windowItems(models, modelIdx, VISIBLE);
   const noModelMatches = !!filter.trim() && models.length === 0;
+  const isCurrent = (row: string) =>
+    row === currentModel &&
+    (!currentProvider || provider?.slug === currentProvider);
 
   return (
     <Box flexDirection="column" width={width}>
       <Text bold color={t.color.accent} wrap="truncate-end">
-        Select model (step 2/3)
+        Select model ({stepOf(2)})
       </Text>
 
       <Text color={t.color.muted} wrap="truncate-end">
-        {filteredProviderRows[providerIdx]?.name || "(unknown provider)"} · Esc
-        back
+        {providerRows[providerIdx]?.name || "(unknown provider)"}
+        {singleProvider ? " · Esc close" : " · Esc back"}
       </Text>
       <Text color={filter ? t.color.accent : t.color.muted} wrap="truncate-end">
         {filter ? `filter: ${filter}▎` : "type to filter · ↑/↓ select"}
@@ -868,8 +1069,7 @@ export function ModelPicker({
           );
         }
 
-        const prefix =
-          modelIdx === idx ? "▸ " : row === currentModel ? "* " : "  ";
+        const prefix = modelIdx === idx ? "▸ " : isCurrent(row) ? "* " : "  ";
 
         return (
           <Text
@@ -879,7 +1079,7 @@ export function ModelPicker({
             wrap="truncate-end"
           >
             {prefix}
-            {idx + 1}. {row}
+            {idx + 1}. {provider ? modelRowLabel(provider, row) : row}
           </Text>
         );
       })}
@@ -890,18 +1090,12 @@ export function ModelPicker({
           : " "}
       </Text>
 
-      <Text color={t.color.muted} wrap="truncate-end">
-        persist:{" "}
-        {allowPersistGlobal
-          ? persistGlobal
-            ? "global"
-            : "session"
-          : "session"}
-        {allowPersistGlobal ? " · ^g toggle" : " only"}
-      </Text>
+      {persistLine}
       <OverlayHint t={t}>
         {models.length
-          ? "↑/↓ select · Enter next · Esc clear/back · q close"
+          ? singleProvider && pickerCanDisconnect(provider)
+            ? "↑/↓ select · Enter next · ^d disconnect · Esc clear/close · q close"
+            : "↑/↓ select · Enter next · Esc clear/back · q close"
           : "Esc back · q close"}
       </OverlayHint>
     </Box>

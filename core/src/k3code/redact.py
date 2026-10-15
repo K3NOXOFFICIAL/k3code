@@ -265,6 +265,58 @@ def drop_values(obj: Any, secrets: list[str]) -> Any:
     return obj
 
 
+class _OverBudget(Exception):
+    pass
+
+
+def _lead(value: str, text: str, left: list[int]) -> int:
+    """The length of the longest suffix of ``value`` that ``text`` starts with; each try spends from ``left``."""
+    i = value.find(text[0]) if text else -1
+    while i != -1:
+        left[0] -= 64 + len(value) - i
+        if left[0] < 0:
+            raise _OverBudget
+        if text.startswith(value[i:]):
+            return len(value) - i
+        i = value.find(text[0], i + 1)
+    return 0
+
+
+def drop_after_shapes(shaped: str, original: str, values: list[str]) -> str:
+    """``shaped`` (``original`` through the known-value and shape passes) without ``values``: each whole, and what is
+    left of one those passes cut (a shape at a `,`, a quote or a space, a known value inside it): the part of it
+    beside, or between two of, their ``REDACTED``. For the values known only from a file the user may never have
+    trusted: dropped before the shape pass (``drop_values``), one could blank the word a shape needs (`Bearer`,
+    `token=`) and leave the credential after it in clear.
+
+    The search for what is left grows with the values and the markers: past a budget in proportion to the text,
+    the whole text is hidden instead (a file can name many long values and a session can hold many markers)."""
+    present = [v for v in values if v and v in original]
+    text = shaped
+    for v in present:
+        text = text.replace(v, REDACTED)
+    cut = [v for v in present if shaped.count(v) < original.count(v)]
+    if not cut:
+        return text
+    parts = text.split(REDACTED)
+    left = [16 * len(original) + 65_536 - 24 * len(cut) * len(parts)]  # every value beside every marker, three times
+    if left[0] < 0:
+        return REDACTED
+    try:
+        for v in cut:
+            for n in range(1, len(parts) - 1):
+                if parts[n] in v:
+                    parts[n] = ""
+            for n in range(1, len(parts)):
+                parts[n] = parts[n][_lead(v, parts[n][: len(v)], left) :]
+            for n in range(len(parts) - 1):
+                tail = parts[n][-len(v) :]
+                parts[n] = parts[n][: len(parts[n]) - _lead(v[::-1], tail[::-1], left)]
+    except _OverBudget:
+        return REDACTED
+    return REDACTED.join(parts)
+
+
 def _flag_value(flag: str, value: str) -> bool:
     """``value`` follows ``flag`` in an argv list and is its credential (after a bare ``--key``: if token-shaped)."""
     return bool(_SECRET_FLAG.fullmatch(flag)) or (bool(_KEY_FLAG.fullmatch(flag)) and _token_shaped(value, 8))
@@ -304,12 +356,19 @@ def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
     return obj
 
 
-def redact_session_json(obj: Any) -> Any:
-    """Session payloads: scrub credential-shaped substrings in every string."""
+def redact_session_json(obj: Any, known: list[str] | None = None, untrusted: list[str] | None = None) -> Any:
+    """Session payloads: in every string the ``known`` secret values first (``drop_values``: the shape pass can cut
+    one at a `,` or a quote and leave its tail behind), then the credential shapes, then the ``untrusted`` values
+    (``drop_after_shapes``). A key, which has no shape pass, loses both kinds."""
+    known, untrusted = known or [], untrusted or []
     if isinstance(obj, dict):
-        return {k: redact_session_json(v) for k, v in obj.items()}
+        return {
+            drop_values(drop_values(k, known), untrusted): redact_session_json(v, known, untrusted)
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
-        return [redact_session_json(v) for v in obj]
+        return [redact_session_json(v, known, untrusted) for v in obj]
     if isinstance(obj, str):
-        return scrub_text(obj)
+        shaped = scrub_text(drop_values(obj, known))
+        return drop_after_shapes(shaped, obj, untrusted) if untrusted else shaped
     return obj
