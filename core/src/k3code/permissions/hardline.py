@@ -252,6 +252,7 @@ LAUNCHERS = frozenset(
         "eval",
         "ssh",
         "xargs",
+        "parallel",
         "su",
         "watch",
         "find",
@@ -946,9 +947,9 @@ def _skip_wrapper_options(
                 split = _tokens(value)
             if key in read_long and value and reads is not None:
                 reads.append(value)
-            if key in chdir_long and value and chdirs is not None:
+            if key in chdir_long and chdirs is not None:
                 chdirs.append(value)
-            if name == "xargs" and replaces is not None and len(key) >= 5 and "--replace".startswith(key):
+            if name == "xargs" and replaces is not None and len(key) >= 3 and "--replace".startswith(key):
                 replaces.append(value or _XARGS_REPLACE)
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
@@ -965,7 +966,7 @@ def _skip_wrapper_options(
                         split = _tokens(value)
                     if ch in read_short and value and reads is not None:
                         reads.append(value)
-                    if ch in chdir_short and value and chdirs is not None:
+                    if ch in chdir_short and chdirs is not None:
                         chdirs.append(value)
                     if name == "xargs" and ch == "I" and value and replaces is not None:
                         replaces.append(value)
@@ -987,7 +988,8 @@ def normalize_argv(
     ...) with their options dropped, ``eval`` arguments re-split, git's global options (``-C dir``, ``-c k=v``, ...)
     removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS);
-    ``chdirs`` the directories a dropped option runs the command in (``env -C DIR``, ``sudo -D DIR``, ``git -C DIR``),
+    ``chdirs`` the directories a dropped option runs the command in (``env -C DIR``, ``sudo -D DIR``, ``git -C DIR``;
+    ``""`` for an option with no value, which ``xargs`` in front of the line fills with its first input word),
     ``replaces`` the strings ``xargs -I``/``-i``/``--replace`` swaps for its input in the command it runs.
     """
     argv = list(tokens)
@@ -1005,8 +1007,8 @@ def normalize_argv(
         if name == "git":
             i = 1
             while i < len(argv) and argv[i].startswith("-"):
-                if argv[i] == "-C" and chdirs is not None and i + 1 < len(argv):
-                    chdirs.append(argv[i + 1])
+                if argv[i] == "-C" and chdirs is not None:
+                    chdirs.append(argv[i + 1] if i + 1 < len(argv) else "")
                 i += 2 if argv[i] in _GIT_VALUE_OPTS else 1
             return [name, *argv[i:]]
         spec = _WRAPPER_SPECS.get(name)

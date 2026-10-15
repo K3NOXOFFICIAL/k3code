@@ -1223,13 +1223,13 @@ def _classify_arg(arg: str, where: _Where, home: str) -> str | None:
             worst = _worse(worst, _classify_word(word, cwd, home))
         if where.unknown and _relative_word(word) and _may_be_credential(word, home):
             worst = _worse(worst, "human")
-        if where.home_moved and (m := _HOME_PREFIX.match(word.strip("'\""))) and _may_be_credential(m.group(1), home):
-            worst = _worse(worst, "human")  # ``HOME=~/.ssh; cat ~/id_rsa``: a name in a home that is not the daemon's
+        if where.home_moved and _HOME_WORD.match(word.strip("'\"")):
+            worst = _worse(worst, "human")  # ``HOME=~/.ssh; cat ~/id_rsa``: a path in a home that is not the daemon's
     return worst
 
 
-#: ``~/NAME``, ``$HOME/NAME`` and ``${HOME}/NAME``: a path below the home directory.
-_HOME_PREFIX = re.compile(r"(?:~|\$HOME|\$\{HOME\})/+(.+)")
+#: ``~``, ``~/NAME``, ``$HOME``, ``${HOME}/NAME``, ``${HOME:-x}/NAME``: the home directory or a path below it.
+_HOME_WORD = re.compile(r"(?:~(?:/|$)|\$HOME(?![A-Za-z0-9_])|\$\{HOME(?![A-Za-z0-9_]))")
 
 
 def _relative_word(word: str) -> bool:
@@ -1448,24 +1448,59 @@ _RUNS_UNREAD_TEXT = frozenset({"source", ".", "alias", "trap"})
 #: Shell settings that move the directory in ways the check does not follow: a rewritten ``DIRSTACK`` that ``popd``
 #: returns to, ``cdable_vars`` (``cd x`` goes to the directory ``$x`` names).
 _CD_SETTINGS = ("DIRSTACK", "cdable_vars")
-_HOME_ASSIGNMENT = re.compile(r"^HOME\+?=")
-#: Commands whose ``-C DIR``/``--directory DIR`` runs them in DIR, and the short options of each that take a value.
+#: Commands that run a command with the words they read appended to it, so an option left without its value takes the
+#: first word of their input.
+_APPENDS_INPUT = frozenset({"xargs", "parallel"})
+#: The strings GNU parallel fills with an input item (``{}``, ``{.}``, ``{/}``, ``{//}``, ``{/.}``, ``{#}``, ``{%}``,
+#: the numbered ``{1}``, ``{2.}``, ... and the perl expression ``{= ... =}``), besides what ``-I``/``--replace`` names.
+_PARALLEL_REPLACES = ("{}", "{.}", "{/}", "{//}", "{/.}", "{#}", "{%}", "{=", *(f"{{{n}" for n in range(1, 10)))
+#: Builtins that assign the variable one of their words names, and the short options of each that take a value.
+_ASSIGNS_NAMED_WORD = {"read": "adinNptu", "mapfile": "dnOsuCc", "readarray": "dnOsuCc"}
+
+
+@dataclass(frozen=True)
+class _DirOptions:
+    """How a command is told to run somewhere else: the short options that take a value, the one of them that names
+    the directory, the long options that name it (``--directory``; getopt takes any prefix of one), and whether its
+    first argument may be an old-style bundle of option letters (``tar cfC out.tar DIR``)."""
+
+    short_values: str
+    short_dir: str
+    long_dirs: tuple[str, ...] = ("--directory",)
+    old_style: bool = False
+
+
+_GNU_TAR = _DirOptions("fCTXbHIgFVLNK", "C", ("--directory", "--cd"), old_style=True)
+#: bsdtar has its own table: ``-H`` and ``-L`` are flags (they follow symlinks), ``-s`` takes a substitution, and
+#: ``--cd`` is a second name of ``--directory``.
+_BSD_TAR = _DirOptions("bCfIsTWX", "C", ("--directory", "--cd"), old_style=True)
+#: GNU make: ``-L`` is a flag (``--check-symlink-times``), not an option with a value.
+_MAKE = _DirOptions("CfIoWE", "C")
+_CPIO = _DirOptions("CDEFHIMOR", "D")
+_UV = _DirOptions("", "")
 _DIR_OPTION_COMMANDS = {
-    "tar": "fCTXbHIgFVLNK",
-    "gtar": "fCTXbHIgFVLNK",
-    "bsdtar": "fCTXbHIgFVLNK",
-    "make": "CfIoWEL",
-    "gmake": "CfIoWEL",
+    "tar": _GNU_TAR,
+    "gtar": _GNU_TAR,
+    "bsdtar": _BSD_TAR,
+    "make": _MAKE,
+    "gmake": _MAKE,
+    "cpio": _CPIO,
+    "gcpio": _CPIO,
+    "uv": _UV,
+    "cmake": _UV,  # ``-E chdir DIR CMD`` (see _dir_option_values)
 }
+_TAR_COMMANDS = frozenset({"tar", "gtar", "bsdtar"})
 
 
 @dataclass
 class _CdScan:
     """The directory changes on a command line: each ``cd``/``pushd`` as (name, arguments), and what makes the
     directories reachable unclear: ``CDPATH`` set (a relative ``cd`` may go elsewhere), or ``unknown`` (a command the
-    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS). ``home``: ``HOME`` is
-    assigned. ``links``: the line makes a symbolic link, which a later ``cd`` can pass through. ``replaces``: the
-    strings ``xargs -I`` fills with its input, which a ``cd`` operand must not hold."""
+    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS, a directory option left
+    without a value in front of ``xargs``). ``home``: ``HOME`` is assigned. ``links``: the line makes a symbolic link,
+    which a later ``cd`` can pass through. ``replaces``: the strings ``xargs -I`` and ``parallel`` fill with their
+    input, which a ``cd`` operand must not hold. ``tar_options``: ``TAR_OPTIONS`` is assigned, ``tar``: the line runs
+    tar (GNU tar reads its options, ``-C DIR`` too, from that variable)."""
 
     found: list[tuple[str, list[str]]] = field(default_factory=list)
     cdpath: bool = False
@@ -1473,20 +1508,101 @@ class _CdScan:
     home: bool = False
     links: bool = False
     replaces: list[str] = field(default_factory=list)
+    tar_options: bool = False
+    tar: bool = False
 
 
-def _dir_option_values(name: str, args: list[str]) -> list[str]:
-    """The directories ``tar -C DIR``, ``--directory DIR`` and ``make -C DIR`` run in (an old-style ``tar cf x -C DIR``
-    bundle and an abbreviated ``--dir`` included)."""
-    if name.endswith("tar") and args and not args[0].startswith("-"):
-        args = [f"-{args[0]}", *args[1:]]
+_WORD_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+
+
+def _names(word: str, name: str) -> bool:
+    """``word`` is the variable ``name`` or one of its elements (``HOME[0]``)."""
+    return word == name or word.startswith(name + "[")
+
+
+def _assigns(raw: list[str], name: str) -> bool:
+    """The simple command with these words assigns the shell variable ``name``: ``NAME=x`` (also ``NAME+=x``,
+    ``NAME[0]=x``, after ``export``/``declare``/``env``), ``printf -v NAME``, ``read``/``mapfile``/``readarray``/
+    ``getopts`` naming it, ``for NAME in``, ``select NAME in``, or a nameref that points at it (``declare -n h=NAME``,
+    then ``h=x``)."""
+    if any(re.match(rf"{name}(?:\[[^\]]*\])?\+?=", t) for t in raw):
+        return True
+    i = 0
+    while i < len(raw) and (_WORD_ASSIGNMENT.match(raw[i]) or raw[i] in _SHELL_KEYWORDS):
+        i += 1
+    if i == len(raw):
+        return False
+    command, rest = os.path.basename(raw[i]), raw[i + 1 :]
+    if command in ("for", "select"):
+        return bool(rest) and _names(rest[0], name)
+    if command == "printf":
+        return any(
+            (t == "-v" and k + 1 < len(rest) and _names(rest[k + 1], name))
+            or (t.startswith("-v") and _names(t[2:], name))
+            for k, t in enumerate(rest)
+        )
+    if command in ("declare", "typeset", "local"):
+        flags = any(t.startswith("-") and not t.startswith("--") and "n" in t for t in rest)
+        return flags and any(re.fullmatch(rf"[A-Za-z_][A-Za-z0-9_]*={name}(?:\[[^\]]*\])?", t) for t in rest)
+    if command == "getopts":
+        return len(rest) > 1 and _names(rest[1], name)
+    if command in _ASSIGNS_NAMED_WORD:
+        value_options, k = _ASSIGNS_NAMED_WORD[command], 0
+        while k < len(rest):
+            t = rest[k]
+            k += 1
+            if t.startswith("-") and len(t) > 1 and not t.startswith("--"):
+                for pos, ch in enumerate(t[1:], 1):
+                    if ch in value_options:
+                        k += pos == len(t) - 1  # nothing glued on: the value is the next word
+                        break
+            elif _names(t, name):
+                return True
+    return False
+
+
+def _old_style_tar(args: list[str], spec: _DirOptions) -> tuple[list[str], list[str]]:
+    """GNU tar's reading of an old-style first argument (``tar cfC out.tar DIR``): each letter that takes a value takes
+    the next word, in order. The directories named so, and the arguments left."""
+    dirs: list[str] = []
+    rest = list(args[1:])
+    for ch in args[0]:
+        if ch in spec.short_values:
+            value = rest.pop(0) if rest else ""
+            if ch in spec.short_dir:
+                dirs.append(value)
+    return dirs, rest
+
+
+def _dir_options_in(args: list[str], spec: _DirOptions) -> list[str]:
+    """The values of the directory options in ``args``, ``""`` for one with no value. A long option counts when it is
+    a prefix of one of the spec's (getopt takes any unambiguous prefix; an ambiguous one is no valid command)."""
     spelled: list[str] = []
     for a in args:
         key, eq, value = a.partition("=")
-        long = a.startswith("--") and len(key) >= 5 and "--directory".startswith(key)  # getopt takes any prefix
+        long = a.startswith("--") and len(key) >= 3 and any(opt.startswith(key) for opt in spec.long_dirs)
         spelled.append("--directory" + eq + value if long else a)
-    opts, _ = _options(spelled, _DIR_OPTION_COMMANDS[name], frozenset({"--directory"}))
-    return [value for opt, value in opts if opt in ("-C", "--directory") and value]
+    opts, _ = _options(spelled, spec.short_values, frozenset({"--directory"}))
+    return [value for opt, value in opts if opt == "--directory" or (len(opt) == 2 and opt[1] in spec.short_dir)]
+
+
+def _dir_option_values(name: str, args: list[str]) -> list[str]:
+    """The directories ``tar -C DIR`` (an old-style ``tar cfC out.tar DIR`` bundle too), ``--directory DIR``, ``make
+    -C DIR``, ``cpio -D DIR``, ``cmake -E chdir DIR CMD`` and ``uv --directory DIR`` run in, ``""`` for an option left
+    without its value."""
+    if name == "cmake":
+        return [
+            args[k + 2] if k + 2 < len(args) else ""
+            for k, a in enumerate(args[:-1])
+            if a == "-E" and args[k + 1] == "chdir"
+        ]
+    spec = _DIR_OPTION_COMMANDS[name]
+    values: list[str] = []
+    if spec.old_style and args and not args[0].startswith("-"):
+        dirs, rest = _old_style_tar(args, spec)
+        values += dirs + _dir_options_in(rest, spec)
+        args = [f"-{args[0]}", *args[1:]]  # bsdtar reads the bundle as one cluster of options (``-cfC``)
+    return values + _dir_options_in(args, spec)
 
 
 def _makes_symlink(name: str, args: list[str]) -> bool:
@@ -1504,32 +1620,59 @@ def _makes_symlink(name: str, args: list[str]) -> bool:
     return False
 
 
+def _fills_input(raw: list[str]) -> list[str]:
+    """The strings GNU parallel swaps for its input in the command it runs: ``{}`` and its relatives, and what
+    ``-I``/``--replace`` name."""
+    if not any(os.path.basename(t) == "parallel" for t in raw):
+        return []
+    out = list(_PARALLEL_REPLACES)
+    for k, t in enumerate(raw):
+        if t in ("-I", "--replace") and k + 1 < len(raw):
+            out.append(raw[k + 1])
+        elif t.startswith("--replace="):
+            out.append(t.partition("=")[2])
+        elif t.startswith("-I") and len(t) > 2:
+            out.append(t[2:])
+    return out
+
+
 def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
     """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
     included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
-    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in."""
+    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C``, ``make -C``, ``cpio -D``, ``cmake -E chdir``
+    and ``uv --directory`` work in."""
     scan = scan or _CdScan()
     for sub in parsed.subs:
         scan.cdpath = scan.cdpath or "CDPATH" in sub
         scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
         raw = hardline.tokens(sub)
-        homed = any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        homed = _assigns(raw, "HOME")
         scan.home = scan.home or homed
         scan.unknown = scan.unknown or homed
+        scan.tar_options = scan.tar_options or _assigns(raw, "TAR_OPTIONS")
+        scan.replaces += _fills_input(raw)
+        appends = any(os.path.basename(t) in _APPENDS_INPUT for t in raw)
         chdirs: list[str] = []
         argv = _argv(sub, None, chdirs, scan.replaces)
-        scan.found += [("cd", [d]) for d in chdirs]
+        dirs = chdirs
         while argv and (argv[0] in _SHELL_KEYWORDS or argv[0] == "function" or argv[0] in ("builtin", "command")):
             argv = argv[2:] if argv[0] == "function" else argv[1:]  # ``function NAME {``: the name is no command
-        if not argv:
-            continue
-        if "$" in argv[0] or "`" in argv[0] or argv[0] in _RUNS_UNREAD_TEXT:
-            scan.unknown = True  # ``$c ~``, ``$(echo cd) ~``, ``. ./x.sh``, ``alias c='cd ~'``
-        if argv[0] in _CD_BUILTINS:
-            scan.found.append((argv[0], argv[1:]))
-        if argv[0] in _DIR_OPTION_COMMANDS:
-            scan.found += [("cd", [d]) for d in _dir_option_values(argv[0], argv[1:])]
-        scan.links = scan.links or _makes_symlink(argv[0], argv[1:])
+        if argv and argv[0] == "busybox" and len(argv) > 1:
+            argv = argv[1:]  # ``busybox tar -C DIR``, ``busybox ln -s``: the applet is the command
+        if argv:
+            if "$" in argv[0] or "`" in argv[0] or argv[0] in _RUNS_UNREAD_TEXT:
+                scan.unknown = True  # ``$c ~``, ``$(echo cd) ~``, ``. ./x.sh``, ``alias c='cd ~'``
+            if argv[0] in _CD_BUILTINS:
+                scan.found.append((argv[0], argv[1:]))
+            if argv[0] in _DIR_OPTION_COMMANDS:
+                dirs = [*dirs, *_dir_option_values(argv[0], argv[1:])]
+            scan.tar = scan.tar or argv[0] in _TAR_COMMANDS
+            scan.links = scan.links or _makes_symlink(argv[0], argv[1:])
+        for d in dirs:
+            if d:
+                scan.found.append(("cd", [d]))
+            elif appends:
+                scan.unknown = True  # ``xargs tar -cf - -C``: the first input word is the directory
     for child in parsed.children:
         _cd_commands(child, scan)
     return scan
@@ -1593,7 +1736,7 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
     cds, cdpath = scan.found, scan.cdpath
     dirs = list(start.dirs)
     home_moved = start.home_moved or scan.home
-    unknown = start.unknown or scan.unknown
+    unknown = start.unknown or scan.unknown or (scan.tar_options and scan.tar)  # TAR_OPTIONS may hold a -C DIR
     # a link made on the line is not on disk yet when the line is judged, so a ``cd`` may go through it anywhere
     unknown = unknown or (scan.links and any(_cd_operand(name, args) is not None for name, args in cds))
     passes_allowed = _CD_PASSES if _loops(parsed) else 1
