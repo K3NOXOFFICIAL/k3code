@@ -1682,17 +1682,12 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     of ``$HOME`` (or is a dotfile there), a root at or above ``$HOME`` covers it and no project root below ``$HOME``
     does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
     (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
-    return _home_dot_spelled(_spellings(path), roots)
-
-
-def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
-    """_home_dot_read for a path given as its spellings."""
     home = os.path.normpath(os.path.expanduser("~"))
     if not _inside(home, roots):
         return False
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in spellings)
+    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
 
 
 def _link_hops(path: str) -> list[str]:
@@ -1728,6 +1723,12 @@ def _link_hops(path: str) -> list[str]:
 _MAX_LINK_HOPS = 40  # as the kernel's symlink limit
 
 
+def _under(path: str, base: str) -> bool:
+    """``path`` is ``base`` or lies below it, by name (not resolved again), compared case-insensitively."""
+    low, root = path.casefold(), base.casefold().rstrip("/")
+    return low == root or low.startswith(root + "/")
+
+
 def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
     """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
     has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
@@ -1738,18 +1739,28 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
     a store, with the whole path inside that root, makes its own files ordinary (a session started in
     ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
-    makes its dot folders ordinary (``.github`` of a repository). Callers have already checked the target lies in the
-    roots, so a store outside every root needs no test here."""
+    makes its dot folders ordinary (``.github`` of a repository). A root counts as written and by its realpath, and a
+    spelling lies in it by name: a spelling is never resolved a second time, or a memory folder kept in a dotfiles
+    repository (``~/.k3code/memory -> ~/dotfiles/k3code/memory``) would stop being its own. Callers have already
+    checked the target lies in the roots, so a store outside every root needs no test here."""
     spellings = _link_hops(path)
     if any(sensitive_path(p) for p in spellings):
         return True
-    home_roots = [str(r) for r in roots]
+    forms = {r: _spellings(r) for r in map(str, roots)}  # each root as written and by realpath
+
+    def covers(root: str, paths: list[str]) -> bool:
+        return all(any(_under(p, f) for f in forms[root]) for p in paths)
+
     for store in [*_home_stores(), *extra_stores]:
-        low = store.casefold().rstrip("/")
-        held = [p for p in spellings if p.casefold() == low or p.casefold().startswith(low + "/")]
-        if held and not any(_inside(r, [store]) and all(_inside(p, [r]) for p in held) for r in home_roots):
+        held = [p for p in spellings if _under(p, store)]
+        if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
             return True
-    return _home_dot_spelled(spellings, home_roots)
+    home = os.path.normpath(os.path.expanduser("~"))
+    if not _inside(home, list(forms)):
+        return False
+    projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
+    homes = _home_prefixes()
+    return any(_below_home_dot(p, homes) and not any(_under(p, f) for f in projects) for p in spellings)
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:

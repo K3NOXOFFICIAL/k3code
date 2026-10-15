@@ -181,9 +181,11 @@ def _withheld(written: Path, roots: tuple[Path, ...]) -> bool:
     check = [*roots]
     state = home().resolve()
     user_home = Path.home().resolve()
-    stores = [] if state in (user_home, *user_home.parents) else [str(state)]  # $HOME or above it is no store
+    stores = (
+        [] if state in (user_home, *user_home.parents) else [str(state), os.path.abspath(home())]
+    )  # not $HOME or above
     if roots == _user_roots():
-        check = [roots[0], state / "memory"]  # all of $HOME and the memory folder; the rest of the state is not theirs
+        check = [roots[0], home() / "memory"]  # all of $HOME and the memory folder; the rest of the state is not theirs
     return memory_import_withheld(str(written), [str(r) for r in check], stores)
 
 

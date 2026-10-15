@@ -248,3 +248,50 @@ def test_a_dotdot_after_a_link_is_followed_on_disk_not_by_name(monkeypatch) -> N
     (home / "sub").symlink_to(home / "dotfiles" / "deep")
     _w(home / "AGENTS.md", "@sub/../x.md")
     assert _text(home) == "IN-DOTFILES"
+
+
+# User memory kept in a dotfiles repository through links (stow, a hand-made repo) is ordinary and must keep working:
+# the memory folder is its own place both where it sits and where it leads.
+
+
+def test_user_memory_file_that_is_a_link_into_a_dotfiles_repository_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / "USER.md", "MY-PREFS")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "USER.md").symlink_to(real)
+    assert "MY-PREFS" in _text(home / "nowhere")
+    assert next(s for s in scan_memory(home / "nowhere") if s.scope == "user").status == "read"
+
+
+def test_user_memory_folder_that_is_a_link_into_a_dotfiles_repository_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(home / "dotfiles" / "k3code" / "memory" / "USER.md", "@style.md")
+    _w(home / "dotfiles" / "k3code" / "memory" / "style.md", "MY-STYLE")
+    k3.mkdir(parents=True)
+    (k3 / "memory").symlink_to(home / "dotfiles" / "k3code" / "memory")
+    assert "MY-STYLE" in _text(home / "nowhere")
+
+
+def test_user_memory_import_that_is_a_link_into_a_dotfiles_repository_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "style.md", "MY-STYLE")
+    _w(k3 / "memory" / "USER.md", "@style.md")
+    (k3 / "memory" / "style.md").symlink_to(real)
+    assert "MY-STYLE" in _text(home / "nowhere")
+
+
+def test_a_link_from_the_memory_folder_to_a_credential_file_is_still_refused(monkeypatch) -> None:
+    """The memory folder is exempt for what sits in it, not for where a link in it leads."""
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(home / ".config" / "git" / "credentials", "https://u:" + TOKEN + "@h")
+    _w(home / ".config" / "gh" / "hosts.yml", "oauth_token: " + TOKEN)
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "a.md").symlink_to(home / ".config" / "git" / "credentials")
+    (k3 / "memory" / "b.md").symlink_to(home / ".config" / "gh" / "hosts.yml")
+    (k3 / "memory" / "ghdir").symlink_to(home / ".config" / "gh")
+    _w(k3 / "memory" / "USER.md", "@a.md\n@b.md\n@ghdir/hosts.yml")
+    assert TOKEN not in _text(home / "nowhere")
