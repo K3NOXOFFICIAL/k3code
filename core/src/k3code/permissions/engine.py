@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import fnmatch
 import functools
-import glob
 import os
 import re
 import shlex
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1158,10 +1158,60 @@ def _canonical_secrets(pattern: str, home: str) -> list[str]:
     return out
 
 
-def _glob_reads_secret(pattern: str, home: str) -> bool:
+#: Bounds of the on-disk walk of a glob: directory entries read and seconds spent. A pattern that matches nothing never
+#: yields a hit, so a cap on hits alone does not stop it; the walk runs on the daemon's event loop.
+_GLOB_MAX_ENTRIES = 20_000
+_GLOB_BUDGET_S = 0.5
+
+
+class _GlobBudget:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.deadline = time.monotonic() + _GLOB_BUDGET_S
+        self.spent = False
+
+    def charge(self) -> bool:
+        """Count one directory entry; False once the entry cap or the time budget is used up."""
+        self.entries += 1
+        if self.entries > _GLOB_MAX_ENTRIES or (self.entries % 64 == 0 and time.monotonic() > self.deadline):
+            self.spent = True
+        return not self.spent
+
+
+def _glob_walk(base: str, parts: list[str], budget: _GlobBudget) -> Iterator[str]:
+    """The paths ``glob.glob`` would find for ``base`` + ``parts`` (no ``**``, a wildcard skips dot names), stopping
+    when ``budget`` runs out."""
+    if budget.spent:
+        return
+    if not parts:
+        if os.path.lexists(base):
+            yield base
+        return
+    comp, rest = parts[0], parts[1:]
+    if not _GLOB_CHARS & set(comp):
+        yield from _glob_walk(os.path.join(base, comp), rest, budget)
+        return
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                if not budget.charge():
+                    return
+                name = entry.name
+                if (name.startswith(".") and not comp.startswith(".")) or not fnmatch.fnmatchcase(name, comp):
+                    continue
+                if rest and not entry.is_dir():
+                    continue
+                yield from _glob_walk(os.path.join(base, name), rest, budget)
+    except OSError:
+        return
+
+
+def _glob_reads_secret(pattern: str, home: str) -> bool | None:
     """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
-    against the canonical secret names."""
-    for k, hit in enumerate(glob.iglob(pattern)):
+    against the canonical secret names. None when none of these says so and the on-disk walk ran out of budget, so
+    the answer is unknown."""
+    budget = _GlobBudget()
+    for k, hit in enumerate(_glob_walk("/", pattern.split("/")[1:], budget)):
         if sensitive_path(hit):
             return True
         if k >= 1000:
@@ -1174,7 +1224,9 @@ def _glob_reads_secret(pattern: str, home: str) -> bool:
     base = "/".join(literal) or "/"
     if base != "/" and sensitive_path(base):
         return True
-    return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
+    if any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home)):
+        return True
+    return None if budget.spent else False
 
 
 _BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
@@ -1217,7 +1269,8 @@ def _classify_word(arg: str, cwd: str, home: str) -> str | None:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        return "deny" if _glob_reads_secret(path, home) else None
+        reads = _glob_reads_secret(path, home)
+        return "human" if reads is None else "deny" if reads else None
     return "deny" if sensitive_path(path) else None
 
 
