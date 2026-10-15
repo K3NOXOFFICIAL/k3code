@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -413,6 +414,25 @@ def _git_code_entries(gitdir: Path) -> list[Path] | None:
     return found
 
 
+def _pinned_parents(entries: Iterable[Path], mounts: Iterable[Path]) -> list[Path]:
+    """The directories between a read-only ``entries`` path and the nearest of ``mounts`` (paths already bound
+    read-write), shallowest first. A read-only bind makes only the bound path a mount point: its parent stays an
+    ordinary directory in the writable bind above it, so ``rename(2)`` on the parent succeeds and takes the protected
+    entry along, and the command recreates the parent with its own content. Binding each such parent onto itself makes
+    it a mount point too, which cannot be renamed (``EBUSY``). A parent that is a symlink is left out: a bind lands on
+    its target."""
+    bases = {str(m) for m in mounts}
+    pins: dict[str, Path] = {}
+    for entry in entries:
+        chain: list[Path] = []
+        for parent in entry.parents:
+            if str(parent) in bases:
+                pins.update((str(d), d) for d in chain)
+                break
+            chain.append(parent)
+    return sorted((d for d in pins.values() if d.is_dir() and not d.is_symlink()), key=lambda d: len(d.parts))
+
+
 def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: bool) -> list[str]:
     """bwrap ops for the git metadata of ``root`` (bound read-write before this).
 
@@ -432,6 +452,9 @@ def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: 
     elsewhere. The loop closes it after the fact: it snapshots the writable git dirs before the command
     (:func:`snapshot_git_writable`) and removes a commondir, a new ``worktrees/<x>`` admin dir or a ``config.worktree``
     code key the command added (:func:`scrub_git_writable_changes`).
+
+    The directories above the read-only entries are bound onto themselves (:func:`_pinned_parents`), so the command
+    cannot rename ``.git`` (or a common dir's ``worktrees`` folder) away and recreate it with its own hooks and config.
     """
     meta = _git_metadata(root)
     if not writable:
@@ -446,12 +469,15 @@ def _git_metadata_argv(root: Path, roots: Sequence[Path], home: Path, writable: 
         readonly += outside
     else:
         rw += outside
-    for d in sorted(rw, key=lambda p: len(p.parts)):  # the common dir before the worktree admin dir inside it
-        argv += ["--bind", str(d), str(d)]
     for d in gitdirs:
         if d not in readonly:
             entries = _git_code_entries(d)
             readonly += [d] if entries is None else entries
+    pins = _pinned_parents([*readonly, *rw], [*roots, *rw])  # a bound admin dir's parent too
+    # shallowest first: the common dir, its worktrees folder, then the admin dir inside it (a bind on top of a mount
+    # point would hide what is mounted below)
+    for d in sorted(dict.fromkeys([*rw, *pins]), key=lambda p: len(p.parts)):
+        argv += ["--bind", str(d), str(d)]
     for p in dict.fromkeys(readonly):
         argv += ["--ro-bind", str(p), str(p)]
     return argv
@@ -463,6 +489,9 @@ class _GitDirSnapshot:
     gitdir: Path
     had_commondir: bool
     worktrees: frozenset[str]  # names of worktrees/<name> admin dirs that existed before the command
+    #: (st_dev, st_ino) of the git dir, to tell it from whatever a command put in its place (a link, another directory)
+    ident: tuple[int, int]
+    worktrees_link: bool  # ``worktrees`` was already a symlink (the user's own): the scrub leaves it as it is
     #: {config.worktree path -> the code keys (:func:`_is_code_config_key`) it already held}, so the scrub strips only
     #: keys a command added, never one the user put there. Keyed by the main git dir's and each worktree admin's file.
     config_code_keys: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -498,11 +527,14 @@ def snapshot_git_writable(cwd: Path | str, add_dirs: Iterable[Path | str] = (), 
                 if not (g / "worktrees").is_symlink():  # never list through a link (the scrub notes it)
                     with contextlib.suppress(OSError):
                         wts = {d.name for d in (g / "worktrees").iterdir() if d.is_dir() or d.is_symlink()}
+                st = os.lstat(g)
                 snaps.append(
                     _GitDirSnapshot(
                         g,
                         (g / "commondir").exists() or (g / "commondir").is_symlink(),
                         frozenset(wts),
+                        (st.st_dev, st.st_ino),
+                        (g / "worktrees").is_symlink(),
                         _config_code_keys_of(_config_worktree_files(g, wts)[0]),
                     )
                 )
@@ -518,24 +550,33 @@ def scrub_git_writable_changes(snapshot: Mapping[str, Any]) -> list[str]:
     keys into a writable ``config.worktree``. Compared against ``snapshot``:
 
     - a ``commondir`` that appeared where there was none is removed;
-    - a ``worktrees/<name>`` admin dir that appeared is removed whole;
+    - a ``worktrees/<name>`` admin dir that appeared is removed whole, and a ``worktrees`` symlink that appeared is
+      unlinked (never followed: git would prune or add worktrees through it);
     - the :data:`GIT_CODE_CONFIG_KEYS` and include keys are stripped from every ``config.worktree`` of a writable git
       dir (the plain ``config`` is bound read-only and cannot be written).
 
     Returns one human-readable line per thing removed (the caller logs them). Safe because it only *removes* what a
     model-controlled command just planted and never existed in the user's own metadata; it runs outside the sandbox on
-    the host paths but touches nothing but these git-internal, code-running entries. Never raises.
+    the host paths but touches nothing but these git-internal, code-running entries. A git dir that is no longer the
+    directory the snapshot recorded (a link or another directory in its place) is skipped whole: the recorded path
+    would lead somewhere else. Never raises.
     """
     removed: list[str] = []
     for snap in snapshot.get("gitdirs", []) if isinstance(snapshot, Mapping) else []:
         gitdir: Path = snap.gitdir
         try:
+            if not _is_snapshotted_dir(gitdir, snap.ident):
+                removed.append(f"skipped {gitdir}: it is no longer the git dir recorded before the command; left as is")
+                continue
             if not snap.had_commondir:
                 removed += _remove_planted(gitdir / "commondir", "commondir file", kind="any", gitdir=gitdir)
             wt_root = gitdir / "worktrees"
             surviving = set(snap.worktrees)
             if wt_root.is_symlink():  # a command can replace it with a link out of the project: never walk through it
-                removed.append(f"skipped the git dir's worktrees in {gitdir}: it is a symlink (left as it is)")
+                if snap.worktrees_link:
+                    removed.append(f"skipped the git dir's worktrees in {gitdir}: it is a symlink (left as it is)")
+                else:  # only the link goes: git would prune or add worktrees through it later
+                    removed += _remove_planted(wt_root, "worktrees symlink", kind="any", gitdir=gitdir)
             else:
                 with contextlib.suppress(OSError):
                     for d in sorted(wt_root.iterdir(), key=lambda p: p.name):
@@ -552,6 +593,15 @@ def scrub_git_writable_changes(snapshot: Mapping[str, Any]) -> list[str]:
         except Exception:  # noqa: BLE001 - a scrub that fails must not break the turn; the ro binds already held
             logger.warning("sandbox: scrubbing git_writable changes in %s failed", gitdir, exc_info=True)
     return removed
+
+
+def _is_snapshotted_dir(gitdir: Path, ident: tuple[int, int]) -> bool:
+    """``gitdir`` is still a real directory (not a link) with the device and inode the snapshot recorded."""
+    try:
+        st = os.lstat(gitdir)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == ident
 
 
 def _config_worktree_files(gitdir: Path, worktrees: Iterable[str]) -> tuple[list[Path], list[str]]:
@@ -871,7 +921,10 @@ def build_argv(
             # the git metadata is read-only (only its hooks, config and info with sandbox.git_writable true): a
             # sandboxed command cannot plant a hook or change core.* config
             argv += _git_metadata_argv(root, roots, home, git_writable)
-            for meta in protected_entries(root):
+            protected = protected_entries(root)
+            for parent in _pinned_parents(protected, [root]):  # not renamable (see _pinned_parents)
+                argv += ["--bind", str(parent), str(parent)]
+            for meta in protected:
                 argv += ["--ro-bind", str(meta), str(meta)]
     # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
     extra = configured_home_readonly() if home_readonly is None else list(home_readonly)
