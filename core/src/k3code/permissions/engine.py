@@ -664,12 +664,23 @@ class _Opts(NamedTuple):
     longs_val: frozenset[str] = frozenset()  # ``--name``, ``--name=value``, exactly (the value is no path)
     words: frozenset[str] = frozenset()  # whole words as written (``find -name``)
     extra: re.Pattern[str] | None = None  # other whole spellings (``date -Iseconds``)
+    glued: str = ""  # short options whose value is optional and only glued (``git diff -U5``), never the next word
+    dashdash: bool = True  # ``--`` ends the options (not for find: its expression follows, primaries and all)
 
 
 _DIGITS = "0123456789"
 
 
-def _opts(flags: str = "", valued: str = "", longs: str = "", longs_val: str = "", words: str = "", extra: str = ""):
+def _opts(
+    flags: str = "",
+    valued: str = "",
+    longs: str = "",
+    longs_val: str = "",
+    words: str = "",
+    extra: str = "",
+    glued: str = "",
+    dashdash: bool = True,
+):
     return _Opts(
         flags,
         valued,
@@ -677,6 +688,8 @@ def _opts(flags: str = "", valued: str = "", longs: str = "", longs_val: str = "
         frozenset(f"--{w}" for w in longs_val.split()),
         frozenset(words.split()),
         re.compile(extra) if extra else None,
+        glued,
+        dashdash,
     )
 
 
@@ -737,6 +750,7 @@ _READONLY_OPTS: dict[str, _Opts] = {
         " -xdev -mount -perm -user -group -uid -gid -executable -readable -writable -regex -iregex -regextype"
         " -lname -ilname -true -false -nouser -nogroup -links -inum -samefile -quit -daystart -ls",
         extra=r"-\d+[A-Za-z]?",
+        dashdash=False,  # `find -- -files0-from F`: `--` ends -H/-L/-P only, the expression after it still runs
     ),
     "tree": _opts("adfiCnNqsDFpugxJ", "LIP", "dirsfirst noreport gitignore"),
     "file": _opts("bLhiNs", longs="brief mime mime-type mime-encoding dereference no-dereference"),
@@ -825,13 +839,13 @@ _READONLY_OPTS: dict[str, _Opts] = {
     ),
     "git status": _opts(
         "sbvz",
-        "u",
-        "short branch long ignored ahead-behind no-ahead-behind renames no-renames column no-column",
-        "porcelain untracked-files ignore-submodules find-renames",
+        longs="short branch long ignored ahead-behind no-ahead-behind renames no-renames column no-column",
+        longs_val="porcelain untracked-files ignore-submodules find-renames",
+        glued="u",  # `-uno`; `-u X` is `-u` and then X
     ),
-    "git diff": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
-    "git log": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
-    "git show": _opts("pusqbwaMCBRzicm" + _DIGITS, "UGSn", _GIT_LOG_LONGS, _GIT_LOG_VAL),
+    "git diff": _opts("pusqbwaMCBRzicm" + _DIGITS, "GSn", _GIT_LOG_LONGS, _GIT_LOG_VAL, glued="U"),
+    "git log": _opts("pusqbwaMCBRzicm" + _DIGITS, "GSn", _GIT_LOG_LONGS, _GIT_LOG_VAL, glued="U"),
+    "git show": _opts("pusqbwaMCBRzicm" + _DIGITS, "GSn", _GIT_LOG_LONGS, _GIT_LOG_VAL, glued="U"),
     "git blame": _opts(
         "wMCefpslntb", "L", "porcelain line-porcelain incremental show-email show-name show-number root"
     ),
@@ -893,7 +907,9 @@ def _opts_ok(spec: _Opts, args: list[str]) -> bool:
         a = args[i]
         i += 1
         if a == "--":
-            break
+            if spec.dashdash:
+                break
+            continue
         if a in spec.words or (spec.extra and spec.extra.fullmatch(a)):
             continue
         if a.startswith("--"):
@@ -909,6 +925,8 @@ def _opts_ok(spec: _Opts, args: list[str]) -> bool:
                     if k == len(a) - 1:
                         i += 1  # its value is the next word
                     break
+                if ch in spec.glued:
+                    break  # its value, if any, is the rest of the word: the next word is checked on its own
                 return False
     return True
 

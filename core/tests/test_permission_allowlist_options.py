@@ -140,3 +140,31 @@ def test_unlisted_option_asks(command: str, mode: PermissionMode, project) -> No
 def test_plain_form_still_allows(command: str, mode: PermissionMode, project) -> None:
     dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=project)
     assert dec.action == "allow", (command, dec.message)
+
+
+#: Spellings whose parse differs from the program's: git's ``-U`` takes its value only glued (``-U5``), so ``-U -O/F``
+#: is ``-U`` and then ``-O/F``; find's ``--`` ends only the leading options (``-H``, ``-L`` ...), and the expression
+#: after it runs its primaries (``find -- -files0-from F`` reads the starting points from F).
+PARSE_MISMATCH = [
+    "git show -U -O/MARK",
+    "git diff -U -O/MARK",
+    "git log -U -O/MARK",
+    "git status -u -X/MARK",
+    "find -- -files0-from MARK",
+    "find -- . -files0-from MARK",
+    "find -- . -L",
+]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("command", PARSE_MISMATCH)
+def test_option_parsed_as_the_program_parses_it(command: str, mode: PermissionMode, project) -> None:
+    assert _action(command, mode, project) in ("ask", "deny"), command
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    "command", ["git diff -U5 --stat", "git log -U3 -p -1", "git status -uno", "find -- . -name x"]
+)
+def test_glued_optional_value_and_find_dashdash_still_allow(command: str, mode: PermissionMode, project) -> None:
+    assert _action(command, mode, project) == "allow", command
