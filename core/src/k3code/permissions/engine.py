@@ -1105,8 +1105,9 @@ _REMOVERS = frozenset({"rm", "unlink", "shred"})
 _COPIERS = frozenset({"cp", "mv", "ln", "install"})
 _KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
 #: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
-#: container one. Both are an ask that a person answers.
-_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "deny": 3}
+#: container one. Both are an ask that a person answers. ``unchecked``: a glob was too large to check for credential
+#: files; a person is asked, and yolo (where nobody can be) refuses.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "unchecked": 3, "deny": 4}
 
 
 def _worse(a: str | None, b: str | None) -> str | None:
@@ -1158,10 +1159,13 @@ def _canonical_secrets(pattern: str, home: str) -> list[str]:
     return out
 
 
-#: Bounds of the on-disk walk of a glob: directory entries read and seconds spent. A pattern that matches nothing never
-#: yields a hit, so a cap on hits alone does not stop it; the walk runs on the daemon's event loop.
+#: Bounds of the on-disk walk of a glob, shared by every glob word of one bash decision: directory entries read and
+#: seconds spent. A pattern that matches nothing never yields a hit, so a cap on hits would not stop it; the walk runs
+#: on the daemon's event loop. ``_GLOB_MAX_WILD`` caps the wildcard components of one pattern (the walk recurses once
+#: for each); a pattern with more is not walked.
 _GLOB_MAX_ENTRIES = 20_000
 _GLOB_BUDGET_S = 0.5
+_GLOB_MAX_WILD = 32
 
 
 class _GlobBudget:
@@ -1180,17 +1184,18 @@ class _GlobBudget:
 
 def _glob_walk(base: str, parts: list[str], budget: _GlobBudget) -> Iterator[str]:
     """The paths ``glob.glob`` would find for ``base`` + ``parts`` (no ``**``, a wildcard skips dot names), stopping
-    when ``budget`` runs out."""
+    when ``budget`` runs out. Literal components are joined in a loop; only a wildcard component recurses."""
     if budget.spent:
         return
-    if not parts:
+    k = 0
+    while k < len(parts) and not _GLOB_CHARS & set(parts[k]):
+        base = os.path.join(base, parts[k])
+        k += 1
+    if k == len(parts):
         if os.path.lexists(base):
             yield base
         return
-    comp, rest = parts[0], parts[1:]
-    if not _GLOB_CHARS & set(comp):
-        yield from _glob_walk(os.path.join(base, comp), rest, budget)
-        return
+    comp, rest = parts[k], parts[k + 1 :]
     try:
         with os.scandir(base) as it:
             for entry in it:
@@ -1199,23 +1204,26 @@ def _glob_walk(base: str, parts: list[str], budget: _GlobBudget) -> Iterator[str
                 name = entry.name
                 if (name.startswith(".") and not comp.startswith(".")) or not fnmatch.fnmatchcase(name, comp):
                     continue
-                if rest and not entry.is_dir():
+                try:
+                    if rest and not entry.is_dir():
+                        continue
+                except OSError:  # a symlink that cannot be followed: glob skips it too
                     continue
                 yield from _glob_walk(os.path.join(base, name), rest, budget)
     except OSError:
         return
 
 
-def _glob_reads_secret(pattern: str, home: str) -> bool | None:
+def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | None:
     """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
-    against the canonical secret names. None when none of these says so and the on-disk walk ran out of budget, so
-    the answer is unknown."""
-    budget = _GlobBudget()
-    for k, hit in enumerate(_glob_walk("/", pattern.split("/")[1:], budget)):
+    against the canonical secret names. None when none of these says so and the on-disk walk did not finish within
+    ``budget`` (or was not tried: the budget was spent already, or the pattern is too deep): the answer is unknown."""
+    parts = pattern.split("/")[1:]
+    if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
+        budget.spent = True
+    for hit in _glob_walk("/", parts, budget):
         if sensitive_path(hit):
             return True
-        if k >= 1000:
-            break
     literal: list[str] = []
     for seg in pattern.split("/"):
         if _GLOB_CHARS & set(seg):
@@ -1251,16 +1259,18 @@ def _brace_expand(word: str, limit: int = 64) -> list[str]:
     return out
 
 
-def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
+def _classify_arg(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
-    front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
+    front of a credential name (``$DIR/.env``), ``unchecked`` when a glob could not be checked within ``budget``, else
+    None. ``{a,b}`` alternatives are classified one by one."""
+    budget = budget or _GlobBudget()
     worst: str | None = None
     for word in _brace_expand(arg):
-        worst = _worse(worst, _classify_word(word, cwd, home))
+        worst = _worse(worst, _classify_word(word, cwd, home, budget))
     return worst
 
 
-def _classify_word(arg: str, cwd: str, home: str) -> str | None:
+def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -1269,8 +1279,8 @@ def _classify_word(arg: str, cwd: str, home: str) -> str | None:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        reads = _glob_reads_secret(path, home)
-        return "human" if reads is None else "deny" if reads else None
+        reads = _glob_reads_secret(path, home, budget or _GlobBudget())
+        return "unchecked" if reads is None else "deny" if reads else None
     return "deny" if sensitive_path(path) else None
 
 
@@ -1422,44 +1432,47 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     return words, [], []
 
 
-def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str, budget: _GlobBudget) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
-        worst = _worse(worst, _classify_arg(source, cwd, home))
+        worst = _worse(worst, _classify_arg(source, cwd, home, budget))
     wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
     argv = _argv(sub, wrapper_reads)
     for arg in wrapper_reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
+        worst = _worse(worst, _classify_arg(arg, cwd, home, budget))
     if not argv:
         return worst
     for command in hardline.ssh_option_commands(argv[0], argv[1:]):
         # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
-        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
+        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True, budget=budget))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
-    if any(_classify_arg(arg, cwd, home) for arg in writes):
+        worst = _worse(worst, _classify_arg(arg, cwd, home, budget))
+    if any(_classify_arg(arg, cwd, home, budget) for arg in writes):
         worst = _worse(worst, "ask")
-    if any(_classify_arg(arg, cwd, home) for arg in confirm):
+    if any(_classify_arg(arg, cwd, home, budget) for arg in confirm):
         worst = _worse(worst, "confirm")
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
+def _secret_access(
+    parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False, budget: _GlobBudget | None = None
+) -> str | None:
     """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
-    point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
-    None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
-    tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
-    expanded, globs are matched."""
+    point at one), ``unchecked`` (a glob was too large to check), ``confirm`` (deletes, sources, stages one or hands
+    it to a container), ``ask`` (overwrites one), None. Every argument of every simple command and of everything
+    nested in it counts unless the command only prints, tests or authenticates with it (see _credential_roles), and
+    so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
+    budget = budget or _GlobBudget()  # one for the whole command line, nested commands included
     worst: str | None = None
     for sub in parsed.subs:
         piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
-        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home, budget))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
-        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
+        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst, budget))
     return worst
 
 
@@ -1477,6 +1490,9 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
         if norm and norm != nested:
             forms.append(norm)
     return list(dict.fromkeys(forms))
+
+
+_UNCHECKED_MSG = "The glob is too large to check for credential files; narrow it"
 
 
 def _decide_bash(
@@ -1498,6 +1514,8 @@ def _decide_bash(
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
+        if secret == "unchecked":
+            return Decision(action="deny", patterns=prefixes, message=f"{_UNCHECKED_MSG}: {command[:120]}")
         return Decision(action="allow", patterns=prefixes)
     if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
         # auto mode writes only inside the project roots; no allow rule overrides this
@@ -1543,12 +1561,12 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
-    if secret in ("human", "confirm") and worst.action != "deny":
-        why = (
-            "A variable may point at a credential file"
-            if secret == "human"
-            else "Deletes, sources, stages or hands a container a credential file"
-        )
+    if secret in ("human", "confirm", "unchecked") and worst.action != "deny":
+        why = {
+            "human": "A variable may point at a credential file",
+            "confirm": "Deletes, sources, stages or hands a container a credential file",
+            "unchecked": _UNCHECKED_MSG,
+        }[secret]
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
