@@ -364,3 +364,24 @@ async def test_a_judge_reply_that_is_not_a_verdict_ends_auto_continue_after_one_
     assert mgr.state is None
     assert [n["text"] for n in _goal_notices(server)][-1].startswith("↻ Auto-continue stopped: the completion judge")
     await server.close()
+
+
+async def test_a_bad_turn_cap_set_at_runtime_falls_back_to_the_default_instead_of_failing_the_prompt(
+    tmp_path, monkeypatch
+):
+    """The cap was read with ``int(...)`` at prompt time: a value that bypassed the config-load check (set at runtime,
+    or a typo) raised and the prompt failed."""
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["a"], autonomy=dict(DEFAULT), permission_mode="auto"
+    )
+    judge = server.goal_judge = scripted_judge(["continue"])
+    for bad in ("eight", -1, None):
+        server.config.autonomy["auto_continue_max_turns"] = bad
+        status, _ = await server._run_turn(live, "build everything")
+        assert status == "done"
+    assert len(judge.calls) == 3 * 8  # each prompt ran to the default 8-turn cap
+    server.config.autonomy["auto_continue"] = "sometimes"  # invalid: the default "auto" (on in auto mode)
+    server.config.autonomy["auto_continue_max_turns"] = "2"
+    await server._run_turn(live, "build everything")
+    assert len(judge.calls) == 3 * 8 + 2
+    await server.close()

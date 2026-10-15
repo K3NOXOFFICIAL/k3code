@@ -47,7 +47,7 @@ from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
-from k3code.autonomy import advisor, auto_continue_on, autonomy_cfg, is_plain_question
+from k3code.autonomy import advisor, auto_continue_on, auto_continue_turns, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -1873,7 +1873,8 @@ class GatewayServer:
             return
         acfg = autonomy_cfg(self.config)
         if auto_continue_on(acfg, session.perms.mode) and not is_plain_question(text):
-            mgr.set(text, implicit=True, max_turns=max(0, int(acfg["auto_continue_max_turns"])))
+            # read defensively: a value set at runtime never went through the config-load check
+            mgr.set(text, implicit=True, max_turns=auto_continue_turns(acfg))
         elif state is not None and state.implicit:
             mgr.clear()
         else:
