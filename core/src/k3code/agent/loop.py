@@ -44,6 +44,10 @@ CUT_OFF_CALL = (
 logger = logging.getLogger(__name__)
 
 
+#: Why an unattended session's bash cannot run without bwrap (it is never run unsandboxed).
+UNATTENDED_NO_BWRAP = "bubblewrap is unusable here: unattended bash is refused; see /doctor"
+
+
 @dataclass
 class ApprovalResult:
     """User's answer to an approval prompt."""
@@ -532,6 +536,10 @@ class AgentLoop:
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
             return {"error": f"Permission denied (unattended run): {decision.message}"}
+        # An unattended bash the sandbox will refuse is refused here, before the approval prompt: a /bg session's
+        # command used to be asked, approved and then refused anyway (#170). The same check as _sandbox_argv's.
+        if tool_call.name == "bash" and (refusal := await asyncio.to_thread(self._unattended_bash_refusal)):
+            return {"error": _bash_refused(refusal)}
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
@@ -649,10 +657,7 @@ class AgentLoop:
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
-            result = {
-                "error": f"bash refused: {exc}. Unattended work needs a project directory as its root: start it "
-                "there (or add one with add_dirs); read, glob and grep still work here"
-            }
+            result = {"error": _bash_refused(str(exc))}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
@@ -775,6 +780,17 @@ class AgentLoop:
             return False  # no bwrap: see _bwrap_unusable
         return sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is not None
 
+    def _unattended_bash_refusal(self) -> str | None:
+        """Why :meth:`_sandbox_argv` would refuse this unattended session's bash (no usable bwrap, or a root the
+        sandbox never binds such as ``$HOME``), or None: an interactive session, or one whose bash can run."""
+        if not (self.background or self.unattended):
+            return None
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
+            return None
+        if not sandbox.usable():
+            return UNATTENDED_NO_BWRAP
+        return sandbox.root_refusal(self.cwd, self.permissions.add_dirs)
+
     def _bwrap_unusable(self) -> bool:
         """An interactive sandboxed session (auto/yolo) on a host where bwrap is unusable: its bash runs on the host."""
         if self.background or self.unattended:
@@ -827,7 +843,7 @@ class AgentLoop:
         unattended = self.background or self.unattended
         if not sandbox.usable():
             if unattended:
-                raise sandbox.SandboxUnavailable("bubblewrap is unusable here: unattended bash is refused; see /doctor")
+                raise sandbox.SandboxUnavailable(UNATTENDED_NO_BWRAP)
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
@@ -954,3 +970,11 @@ def _preview(tool: str, args: dict[str, Any]) -> str:
     if tool == "bash":
         return str(args.get("command", ""))[:200]
     return f"{tool} {args.get('path', '')}".strip()
+
+
+def _bash_refused(why: str) -> str:
+    """The error the model gets for a bash call the sandbox refuses (``why``: the sandbox's reason)."""
+    return (
+        f"bash refused: {why}. Unattended work needs a project directory as its root: start it there (or add one "
+        "with add_dirs); read, glob and grep still work here"
+    )
