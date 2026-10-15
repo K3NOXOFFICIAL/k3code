@@ -19,11 +19,12 @@ from dataclasses import dataclass, field
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # rm -rf / and ~ are caught by _rm_check (token based: any flag spelling, quotes, sudo/env wrappers)
+    # env / printenv dumping the environment are caught by _env_dump_check (token based: it lets `env VAR=x cmd`,
+    # `env -u X cmd` and `env -i cmd` fall through to the real command's checks, which a raw regex could not)
     ("mkfs", r"\bmkfs(?:\.\w+)?\b"),  # mkfs / mkfs.ext4 ...
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
     ("wget-pipe-to-shell", r"\bwget\b[^|]*-O\s*-\s*[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),
-    ("env-dump", r"^\s*(?:sudo\s+)?(?:env|printenv)\b"),  # env / printenv
     # (?i): drvfs (/mnt/c) and macOS open ~/.ssh for ~/.SSH and .env for .ENV
     ("ssh-key-cat", r"(?i)\bcat\b[^\n;|&]*\.ssh/"),  # cat ~/.ssh/...
     # cat .env / *.env, but not the committed templates (.env.example ...)
@@ -41,11 +42,51 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
 #: ``&&``/``;`` inside the quotes, so these run on each *simple* command (quotes kept together), never on the raw
 #: multi-command line, where ``.*`` would mix unrelated commands.
 _REMOTE_HOSTS = ("protected-host-a", "protected-host-b")
-HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
+_SSH_RESTART_PATTERNS = [
     (f"{host}-{what}-restart", rf"\bssh\b.*\b{host}\b.*\b{tool}\b.*\b(?:restart|stop|kill|down|rm)\b")
     for host in _REMOTE_HOSTS
     for what, tool in (("service", "systemctl"), ("docker", "docker"), ("compose", "docker-compose"))
 ]
+
+#: A Windows drive target whose recursive deletion wipes the host (issue #169): a drive root (``C:``, ``C:\``, ``C:/``),
+#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``) or the Windows directory (``C:\Windows``), with ``/`` or ``\``
+#: separators. The trailing boundary (``(?=[\s"']|$)``) stops it at the end of the word, so a *deeper* path such as
+#: ``C:\Users\<name>\project`` -- an ordinary project folder -- is NOT one of these. A string fragment (no flags), used
+#: inside the case-insensitive launcher patterns below; backslashes survive here because these run on the raw simple
+#: command, before the posix tokenizer (which would eat them) ever sees it.
+_WIN_DRIVE = r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows)?)?[\\/]?(?=[\s\"']|$)"
+
+#: A verb that is the command being run: at the start of the simple command, right after a launcher token
+#: (``powershell Format-Volume``), or after a launcher's opening quote (``cmd /c "diskpart"``). Keeps the format/
+#: diskpart rules below off prose and filenames. A string fragment used inside those case-insensitive patterns.
+_WIN_CMD_POS = r"(?:^\s*|\b(?:cmd(?:\.exe)?|powershell|pwsh(?:\.exe)?)\b[^\"'\n]*[\s\"'])"
+
+#: Windows / WSL destroyers, matched on each simple command (``cmd /c "..."`` and ``powershell -Command "..."`` keep
+#: their quoted script in the sub, so the verb and target are visible). The recursive-delete launchers fire only with a
+#: launcher AND a recursive flag AND a drive target from :data:`_WIN_DRIVE`; a bare ``rmdir /s /q build`` or
+#: ``Remove-Item -Recurse .\build`` has no launcher and no drive target, so a project subfolder delete is never caught.
+_WINDOWS_PATTERNS: list[tuple[str, str]] = [
+    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows
+    (
+        "win-cmd-recursive-delete",
+        r"(?i)\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
+    ),
+    # powershell|pwsh (with -Command/-c or bare)  Remove-Item|rm|ri|del ... -Recurse  on those targets
+    (
+        "win-powershell-recursive-delete",
+        r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*\b(?:remove-item|rm|ri|del)\b)(?=.*-recurse\b)(?=.*"
+        + _WIN_DRIVE
+        + ")",
+    ),
+    # Format-Volume (PowerShell cmdlet), diskpart (partition tool) and the legacy `format X:` command only count as the
+    # command being run, not as a word in prose or a filename (`cat notes-about-diskpart.md`, `echo "run diskpart"`):
+    # _WIN_CMD_POS requires the verb to start the simple command, follow a launcher's quote (`cmd /c "diskpart ..."`),
+    # or directly follow a launcher token (`powershell Format-Volume ...`).
+    ("win-format-volume", r"(?i)" + _WIN_CMD_POS + r"format-volume\b"),
+    ("win-format-drive", r"(?i)" + _WIN_CMD_POS + r"format\s+[A-Za-z]:[\\/]?(?=[\s\"']|$)"),
+    ("win-diskpart", r"(?i)" + _WIN_CMD_POS + r"diskpart(?:\.exe)?\b"),
+]
+HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [*_SSH_RESTART_PATTERNS, *_WINDOWS_PATTERNS]
 
 #: Every hardline rule by name, for display (/permissions, the setup wizard): the regex ones, the token-based rm check
 #: (see _rm_check) and the per-command ssh checks.
@@ -59,6 +100,7 @@ HARDLINE_NAMES: list[str] = [
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
+    "env-dump",  # env / printenv / export -p / set printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -188,6 +230,12 @@ _DANGEROUS_RM_TARGETS = frozenset(
     }
 )
 
+#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, or the Windows
+#: directory: ``rm -rf`` on any of these wipes the Windows host from inside WSL (issue #169). Matched against the
+#: expanded rm target (optionally a trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such
+#: as ``/mnt/c/Users/nils/project`` is a project folder, not one of these, and is not matched.
+_MNT_DRIVE_RM = re.compile(r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows))?(?:/\*)?", re.IGNORECASE)
+
 
 def check(
     command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
@@ -222,7 +270,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
             or _simple_check(sub)
             or _rm_check(argv, cwd, home)
             or _git_push_check(argv)
-            or _env_dump_check(argv)
+            or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
@@ -692,11 +740,21 @@ def _git_push_check(argv: list[str]) -> str | None:
     return None
 
 
-def _env_dump_check(argv: list[str]) -> str | None:
-    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript."""
+def _env_dump_check(sub: str) -> str | None:
+    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript.
+
+    Decided on the *normalised* argv of the simple command ``sub`` (see :func:`normalize_argv`), so that a wrapped run —
+    ``env FOO=1 make test``, ``env -u X cmd``, ``env -i cmd``, ``env -C dir cmd`` — is *not* an environment dump: there
+    ``env`` only sets up the environment of ``cmd`` and reduces to ``cmd``, whose own checks still apply (``env X=1 rm
+    -rf /`` is refused as the rm rule). Only a bare ``env`` / ``printenv`` with no command to run prints the
+    environment: it reduces to ``env`` / ``printenv`` itself (``env``, ``env -i``, ``env -u X``, ``sudo env``,
+    ``FOO=1 env``, ``env -S printenv``). A redirection (``env > file``, ``env 2>/dev/null``) is not a wrapped command:
+    the redirect words are dropped first, so those stay refused (a pipe such as ``env | grep`` is already its own
+    simple command ``env``)."""
+    argv = normalize_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
-    name, args = argv[0], argv[1:]
+    name, args = os.path.basename(argv[0]), argv[1:]
     if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
         return "env-dump"
     return None
@@ -757,6 +815,10 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
         if target in dangerous:
             homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
             return "rm-rf-home" if homeish else "rm-rf-root"
+        # a WSL mount of a Windows drive (`/mnt/c`, `/mnt/c/Users`, `/mnt/c/Users/<name>`, `/mnt/c/Windows`): wiping it
+        # destroys the Windows host from inside WSL. A deeper path is a project folder and is left alone.
+        if target and _MNT_DRIVE_RM.fullmatch(target):
+            return "rm-rf-root"
     return None
 
 

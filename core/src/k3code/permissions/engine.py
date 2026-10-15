@@ -173,15 +173,18 @@ BUILTIN_BASH_ASK = [
 
 #: The builtin read-only programs a session started in ``$HOME`` runs without a person (see :func:`home_read_only`):
 #: they print only what is named on the command line (a named credential file is refused first). Not the tree walkers
-#: (``rg`` prints every match below ``$HOME``; ``find``, ``tree``, ``du`` list it) and not ``jq``/``yq`` (a program).
+#: ``rg``/``tree``/``du`` (``rg`` prints every match below ``$HOME``), and not ``jq``/``yq`` (a program). ``find`` is
+#: here, but only without the primaries that run a program, delete or write a file (see :data:`_HOME_FIND_RISKY`): on
+#: its own it lists names, which the sandbox credential masking already covers.
 _HOME_READERS = frozenset(
     {"ls", "cat", "head", "tail", "wc", "grep", "file", "stat", "df", "pwd", "which", "type", "command", "whoami"}
-    | {"id", "uname", "date", "sort", "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath"}
+    | {"id", "uname", "date", "sort", "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "find"}
     | {"readlink", "sha256sum", "sha1sum", "sha512sum", "md5sum", "git"}
 )
-#: What such a command may be spelled with: words and the ``; | &`` separators. No glob, brace, quote, escape, ``$``,
-#: ``~``, redirect, substitution, comment or newline, so the words the shell runs are the words written.
-_HOME_PLAIN = re.compile(r"[A-Za-z0-9._/@+=,: |;&-]+")
+#: Characters that only the shell may act on, forbidden *outside* quotes in a home-reader command: a glob/brace
+#: (expands to paths, possibly a hidden ``.env``), ``~`` (home expansion), ``$``/backtick (variable or substitution),
+#: ``\`` (escape), a redirect or a comment. Inside quotes these are literal and reach the program unchanged.
+_HOME_SHELL_CHARS = frozenset("*?[]{}~$`\\<>#")
 #: A path component that starts with a dot (``.config``, ``..x``), not the ``.`` and ``..`` steps.
 _DOT_SEGMENT = re.compile(r"(?:^|/)\.(?!\.?(?:/|$))")
 #: The options that make a reader walk or dump a directory tree: (short letters, long options; GNU getopt takes any
@@ -192,6 +195,11 @@ _HOME_RECURSIVE: dict[str, tuple[str, tuple[str, ...]]] = {
     "diff": ("r", ("recursive",)),
     "git": ("", ("no-index",)),
 }
+#: ``find`` primaries that run a program, delete or write a file: with any of these ``find`` is not read-only. (The
+#: same set the builtin allowlist uses, see :data:`_FIND_RISKY`.)
+_HOME_FIND_RISKY = frozenset(
+    {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+)
 #: git subcommands that print file contents (a $HOME repo tracking dotenv or .bashrc would show them unprompted), and
 #: the ``git log`` options that turn it into a patch dump.
 _HOME_GIT_CONTENT = frozenset({"show", "diff", "blame"})
@@ -199,24 +207,77 @@ _HOME_GIT_PATCH_SHORT = "puc"
 _HOME_GIT_PATCH_LONG = ("patch", "cc", "remerge-diff", "diff", "textconv", "ext-diff")
 
 
+def _home_split(sub: str) -> list[str] | None:
+    """Split a simple command into its words for :func:`home_read_only`, quote-aware. Single-quoted spans are literal;
+    double-quoted spans are literal too, but only when they hold no ``$``, backtick or backslash (those would expand or
+    escape). A ``$``, backtick, glob, brace, ``~``, backslash, redirect or comment *outside* quotes is something only
+    the shell acts on, so the words we would check are not the words that run: the command is rejected (None). Returns
+    the words with their quotes removed (the literal text that reaches the program), so a quoted glob such as
+    ``'*.py'`` is a plain argument, never a path expansion."""
+    words: list[str] = []
+    cur: list[str] = []
+    in_word = False
+    i, n = 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c in " \t":
+            if in_word:
+                words.append("".join(cur))
+                cur, in_word = [], False
+            i += 1
+            continue
+        in_word = True
+        if c in ";|&":  # a separator should have been split by parse(); treat it as unparseable here
+            return None
+        if c == "'":
+            j = sub.find("'", i + 1)
+            if j < 0:
+                return None  # unterminated
+            cur.append(sub[i + 1 : j])
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and sub[j] != '"':
+                j += 1
+            if j >= n:
+                return None  # unterminated
+            inner = sub[i + 1 : j]
+            if any(ch in inner for ch in "$`\\"):
+                return None  # a variable, substitution or escape: the running word is not what is written
+            cur.append(inner)
+            i = j + 1
+            continue
+        if c in _HOME_SHELL_CHARS:
+            return None  # a glob, ~, $, backtick, escape, redirect or comment outside quotes
+        cur.append(c)
+        i += 1
+    if in_word:
+        words.append("".join(cur))
+    return words
+
+
 def home_read_only(command: str) -> bool:
     """``command`` may run without a person in the read-only ``$HOME`` sandbox of a session started in the home
     directory: every part is a plain, non-recursive reader of :data:`_HOME_READERS`. Dotenv files lie anywhere below
     ``$HOME`` and the sandbox cannot hide them all, so nothing that walks a tree (``grep -r``, ``rg``, ``ls -R``,
-    ``diff -r``) or expands a glob (``cat */.env``) qualifies; an explicitly named credential file is refused by
-    :func:`decide` first. Credential stores sit in dot folders no list names in full (``~/.config/git/credentials``,
-    ``~/.cache/huggingface/token``), so no argument may have a dot-segment, nor an option a dot at all
-    (``--file=.x``, ``-f.x``). Over-matching only costs a prompt."""
-    if not _HOME_PLAIN.fullmatch(command):
-        return False
+    ``diff -r``, ``find -exec/-delete/...``) or expands a glob (``cat */.env``) qualifies; an explicitly named
+    credential file is refused by :func:`decide` first. Credential stores sit in dot folders no list names in full
+    (``~/.config/git/credentials``, ``~/.cache/huggingface/token``), so no argument may have a dot-segment, nor an
+    option a dot at all (``--file=.x``, ``-f.x``). Quoted literal arguments are allowed (a single-quoted span never
+    expands; a double-quoted span with no ``$``/backtick/backslash is literal too), so ``grep -n 'foo bar' notes`` and
+    ``find . -name '*.py'`` run without a prompt -- the quoted glob is passed to the program, not expanded by the
+    shell. An unquoted glob or ``$`` still asks. Over-matching only costs a prompt."""
     parsed = hardline.parse(command)
     if not parsed.subs or parsed.nested or parsed.children or parsed.unterminated:
         return False
     for sub in parsed.subs:
-        words = sub.split()
+        words = _home_split(sub)
         if not words or words[0] not in _HOME_READERS:
             return False
         letters, longs = _HOME_RECURSIVE.get(words[0], ("", ()))
+        if words[0] == "find" and any(w in _HOME_FIND_RISKY for w in words[1:]):
+            return False
         if words[0] == "git":
             if any(word in _HOME_GIT_CONTENT for word in words[1:]):
                 return False
