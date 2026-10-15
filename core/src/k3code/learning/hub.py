@@ -45,7 +45,8 @@ class LearningHub:
         self.store = store
         self.experiments = optimizer.Experiments(self.home, clock, live=server.config)
         self.experiments.on_config_rollback = self._config_rolled_back
-        self.replays = replay.ReplayStore(self.home)
+        # load() joins each record's real outcome from the decision log (issue #140)
+        self.replays = replay.ReplayStore(self.home, outcomes=self.log.turn_outcomes)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
         #: (session id, tool) -> (tool_error row id, signature, the failed call's args, the model reply it came from):
@@ -447,6 +448,86 @@ class LearningHub:
             self.replays.append(record)
         except Exception:  # noqa: BLE001 - recording must never break a turn
             logger.warning("replay record failed", exc_info=True)
+
+    # ── turn outcomes (issue #140): what the improvement engine scores a turn by ──
+
+    def record_turn_outcome(
+        self,
+        session: Any,
+        turn_id: str,
+        *,
+        status: str,
+        tier: str,
+        kind: str,
+        interrupted: bool,
+        test: str | None,
+        denials: int,
+        msg_start: int,
+        msg_end: int,
+    ) -> None:
+        """Keep one finished turn's outcome signals (see ``decisions._TURN_COLUMNS``). It stays pending until the
+        session's next turn, its end or ``OUTCOME_SETTLE_S`` shows it was not undone. Never raises: it runs at turn
+        end."""
+        if not self.enabled or not turn_id:
+            return
+        try:
+            self.log.record_turn(
+                turn_id,
+                ts=self.clock(),
+                session=session.session_id,
+                kind=kind,
+                tier=tier,
+                status=status,
+                interrupted=interrupted,
+                test=test,
+                denials=denials,
+                msg_start=msg_start,
+                msg_end=msg_end,
+                actor="auto" if getattr(session, "background", False) else "user",
+            )
+        except Exception:  # noqa: BLE001 - learning must never break a turn
+            logger.warning("turn outcome write failed", exc_info=True)
+
+    def turn_judged(self, turn_id: str, verdict: str, gate: str | None) -> None:
+        """The goal judge's verdict on a turn, and the ``--check`` result when one ran after it."""
+        if not self.enabled or not turn_id or verdict == "inactive":
+            return
+        try:
+            self.log.update_turn(turn_id, judge=verdict, gate=gate)
+        except Exception:  # noqa: BLE001
+            logger.warning("turn verdict write failed", exc_info=True)
+
+    def turn_undone(self, session: Any, index: int) -> str | None:
+        """/undo or /retry is about to drop the session's stored messages from ``index`` on: the pending turn those
+        messages belong to is marked undone, and the undo is logged. Returns the turn id, or None."""
+        if not self.enabled:
+            return None
+        try:
+            turn = self.log.mark_undone(session.session_id, index)
+        except Exception:  # noqa: BLE001
+            logger.warning("turn undo write failed", exc_info=True)
+            turn = None
+        self.record("undo", session, subject=turn or "", choice="turn-undo")
+        return turn
+
+    def settle_turns(self, session_id: str) -> None:
+        """The session moved on (its next prompt began, or it closed): its pending outcomes are final."""
+        if not self.enabled or not session_id:
+            return
+        try:
+            self.log.settle_turns(session_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("turn settle failed", exc_info=True)
+
+    def discard_turn(self, turn_id: str) -> None:
+        """An attempt that is thrown away and run again (context overflow): its outcome is not the turn's, so it is
+        kept as ``discarded`` (never scored). Deleting it would leave its replay record to read as a failed turn."""
+        if not self.enabled or not turn_id:
+            return
+        try:
+            self.log.update_turn(turn_id, status="discarded", settled=self.clock())
+        except Exception:  # noqa: BLE001
+            logger.warning("turn outcome discard failed", exc_info=True)
 
     async def turn_finished(self, session: Any, status: str) -> None:
         if not self.enabled:

@@ -333,6 +333,17 @@ class TurnEvidence:
     #: Set by GoalManager: a --check gate runs after a done verdict (a harness fact, rendered outside the fence).
     check_configured: bool = False
 
+    def last_status(self) -> str | None:
+        """The turn's last test/check as one word: ``passed``, ``failed`` (a non-zero exit, or the call itself
+        errored), ``unknown`` (a later pipe, ``||`` or ``;`` set the exit status) or None when none ran. The improvement
+        engine scores a turn whose last check failed as a failure (issue #140)."""
+        if not self.checks:
+            return None
+        _, _, code, own = self.checks[-1]
+        if code is not None and not own:
+            return "unknown"
+        return "passed" if code == 0 else "failed"
+
     def carry(self, turn: int) -> dict[str, Any] | None:
         """This turn's last check as ``GoalState.last_check``; None when the turn ran none."""
         if not self.checks:
@@ -458,6 +469,15 @@ class Decision:
     verdict: str
     reason: str
     message: str
+    #: The ``--check`` gates run after a done verdict: ``passed`` (all of them), ``failed`` (one did not), None when
+    #: none ran. The turn's outcome record keeps it (issue #140).
+    gate: str | None = None
+
+
+def _with_gate(decision: Decision, gate: str | None) -> Decision:
+    """``decision`` with the result of the ``--check`` gates that ran before it."""
+    decision.gate = gate
+    return decision
 
 
 class GoalManager:
@@ -636,15 +656,18 @@ class GoalManager:
                 s.last_verdict = "gate_failed"
                 s.last_reason = f"check failed (exit {code}): $ {gate.command}"
                 if 0 < gate.max_retries < gate.attempts:
-                    return self._pause_decision(
-                        s,
-                        f"check exhausted {gate.max_retries} retries: $ {gate.command}",
-                        "gate_failed",
-                        s.last_reason,
-                        f"⏸ Goal paused — check still failing after {gate.max_retries} retries: $ {gate.command}",
+                    return _with_gate(
+                        self._pause_decision(
+                            s,
+                            f"check exhausted {gate.max_retries} retries: $ {gate.command}",
+                            "gate_failed",
+                            s.last_reason,
+                            f"⏸ Goal paused — check still failing after {gate.max_retries} retries: $ {gate.command}",
+                        ),
+                        "failed",
                     )
                 if s.budget_spent():
-                    return self._budget_pause(s, "gate_failed", s.last_reason)
+                    return _with_gate(self._budget_pause(s, "gate_failed", s.last_reason), "failed")
                 self._save(s)
                 prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                     goal=s.goal,
@@ -661,7 +684,9 @@ class GoalManager:
                     s.last_reason,
                     f"✗ Check failed ({s.turns_text()}, attempt {_of(gate.attempts, gate.max_retries)}): "
                     f"$ {gate.command}",
+                    gate="failed",
                 )
+            gated = "passed" if s.gates else None  # every check passed (the loop returns at the first failure)
             if reviewer is not None:  # advisor veto: blocking issues keep the goal going
                 blocking, issues = await reviewer(s.goal)
                 if (gone := self._superseded(s)) is not None:
@@ -682,12 +707,13 @@ class GoalManager:
                         "advisor_blocked",
                         s.last_reason,
                         f"⚠ Advisor found blocking issues ({s.turns_text()}): {issues[0][:120]}",
+                        gate=gated,
                     )
             if s.implicit:
-                return self._end_implicit("done", reason)
+                return _with_gate(self._end_implicit("done", reason), gated)
             s.status = "done"
             self._save(s)
-            return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
+            return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}", gate=gated)
 
         if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
             n = s.consecutive_transport_failures

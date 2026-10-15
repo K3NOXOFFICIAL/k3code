@@ -737,3 +737,53 @@ async def test_a_rolled_back_auto_candidate_is_not_applied_again_next_week(tmp_p
 def test_quality_ignores_provider_failovers():
     base = metrics_for(0.2)
     assert optimizer.quality({**base, "failure_rate": 0.05}) == optimizer.quality({**base, "failure_rate": 0.0})
+
+
+def success_window(home, xid, treatment_kept, control_kept, per_arm=12, turns=4):
+    """One period split by ``optimizer.arm``, every session with the same calls and no escalation: only what happened
+    to its turns differs. ``*_kept`` of each session's ``turns`` turns were kept, the rest undone."""
+    log = DecisionLog(home, FakeClock())
+    usage, counts = [], {"treatment": 0, "control": 0}
+    while min(counts.values()) < per_arm:
+        sid = f"w{next(_sids)}"
+        side = optimizer.arm(xid, sid)
+        if counts[side] >= per_arm:
+            continue
+        counts[side] += 1
+        usage += rows(0, 10, 0, session=sid)
+        kept = treatment_kept if side == "treatment" else control_kept
+        for i in range(turns):
+            log.record_turn(f"{sid}-{i}", ts=1, session=sid, status="done", undone=i >= kept)
+        log.settle_turns(sid)
+    return optimizer.collect(usage, log, [], since=0)
+
+
+def test_ab_judges_turn_success_not_turn_completion(tmp_path, monkeypatch):
+    """Issue #140: every turn of both arms finished, so completion saw no difference. The treatment's turns were
+    mostly undone; it is rolled back, and the result says why."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start({"title": "p", "name": "terse", "prompt": "Be terse."}, metrics_for(0.1), sessions=1)
+    m = success_window(tmp_path / "w1", "x1", treatment_kept=1, control_kept=4)
+    assert m["turn_completion_rate"] is None and m["turn_success_rate"] == 0.625  # (12 + 48) / 96
+    notes: list[str] = []
+    xp.session_done(lambda since: m, notes.append)
+    x = xp.get("x1")
+    assert x["status"] == "rolled_back"
+    assert x["result"]["success"] == {"treatment": 0.25, "control": 1.0}
+    assert "turn success 25% vs 100%" in notes[0]
+    # with the turns kept alike, the same overlay is kept
+    xp2 = optimizer.Experiments(tmp_path / "again", FakeClock())
+    xp2.start({"title": "p", "name": "terse", "prompt": "Be terse."}, metrics_for(0.1), sessions=1)
+    xp2.session_done(lambda since: success_window(tmp_path / "w2", "x1", treatment_kept=4, control_kept=4))
+    assert xp2.get("x1")["status"] == "kept"
+
+
+def test_a_control_arm_without_turn_outcomes_is_compared_without_them():
+    """A before/after control stored by an older version has no scored turns: the treatment's failures alone would
+    bias the judgement, so neither arm's success term counts."""
+    base = {"calls": 10, "escalated": 0, "loop_guard": 0, "approvals": 0, "tokens": 0, "turns": 4}
+    treated = [{**base, "scored": 4, "passed": 0}] * 12
+    old_control = [dict(base)] * 12
+    t, c = optimizer.arm_scores(treated, old_control)
+    assert t == c

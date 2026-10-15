@@ -5,9 +5,13 @@ How an experiment is judged
 Only one experiment runs at a time (:meth:`Experiments.start` refuses a second): the score is one global
 measurement, so two overlays live at once would each be judged on the other's effect.
 
-Every session is one sample: its score is :func:`session_score` over that session's usage rows (escalation rate,
-loop guards, approval prompts, and tokens per turn against the control arm's tokens per turn, rewarded as well as
-penalised). The two arms are:
+Every session is one sample: its score is :func:`session_score` over that session's turns and usage rows. The headline
+is the turn success rate (issue #140): a turn succeeded when it finished, was not undone (/undo, /retry) and not
+stopped by the user, its last test/check did not fail and the goal judge did not call it blocked
+(``decisions.turn_passed``). A turn still waiting for a possible /undo is not scored. Merely finishing used to count as
+success (``turn_completion_rate``, kept as a secondary metric only). The rest of the score: escalation rate, loop
+guards, approval prompts, and tokens per turn against the control arm's tokens per turn, rewarded as well as
+penalised. The two arms are:
 
 - ``concurrent`` (prompt overlays): each session is assigned to ``treatment`` or ``control`` by a hash of the
   experiment id and the session id (:func:`arm`, 50/50), and control sessions are built without the overlay
@@ -54,10 +58,14 @@ MAX_WINDOW_FACTOR = 3
 BOOTSTRAP_RESAMPLES = 1000
 CONFIDENCE = 0.95
 #: Turn outcomes the scope gate's verdicts are checked against: "done" (the turn completed) and "error" (it failed).
-#: This is turn completion, not a verifier: no test or check ran. "outage" (providers unreachable), "interrupted" (the
-#: user stopped it) and "needs_input" (a budget or loop guard paused it) say nothing either way, so they are not
-#: judged.
+#: This is turn completion, not success (an undone or test-failing turn still "completed"): it feeds the scope accuracy
+#: and the secondary ``turn_completion_rate`` only; the score reads ``turn_success_rate``. "outage" (providers
+#: unreachable), "interrupted" (the user stopped it) and "needs_input" (a budget or loop guard paused it) say nothing
+#: either way, so they are not judged.
 VERIFIED_OUTCOMES = ("done", "error")
+#: Weight of the turn failure rate (1 - turn success rate) in the score: a session whose every turn was undone loses a
+#: full point, as much as one whose every call escalated.
+SUCCESS_WEIGHT = 1.0
 #: Kinds never moved down a tier by the optimizer (the user's own work), and the calls a kind needs first.
 TIER_DOWN_EXCLUDED = frozenset({"interactive_turn", "subagent", "plan", "review", "advisor"})
 TIER_DOWN_MIN_CALLS = 10
@@ -118,6 +126,7 @@ def collect(
     """Aggregate raw rows in [since, until) into rates. ``usage_rows`` are dicts with the usage ``events`` columns."""
     until = until if until is not None else float("inf")
     ev = [r for r in usage_rows if since <= r["ts"] < until]
+    outcomes = _turn_outcomes(log, since, until)
     sessions = {r["session"] for r in ev if r["session"]}
     n_sess = max(1, len(sessions))
     calls = [r for r in ev if r["kind"] == "call"]
@@ -179,7 +188,9 @@ def collect(
         "proposal_accept_rate": round(acc / len(props), 3) if props else None,
         "scope_judged": len(judged),
         "scope_accuracy": round(1 - wrong / len(judged), 3) if judged else None,
+        # secondary: the share of gated tasks that merely finished; the score reads turn_success_rate
         "turn_completion_rate": round(passed / len(judged), 3) if judged else None,
+        **_success_metrics(outcomes),
         "outage_rate": round(sum(1 for r in ev if r["kind"] == "outage") / total_calls, 3),
         "tiers": by_tier,
         "escalated_kinds": esc_kinds,
@@ -189,7 +200,49 @@ def collect(
         "tokens_by_tier": tokens_by_tier,
         "tokens_by_kind": tokens_by_kind,
         "kind_tier": kind_tier,
-        "per_session": _per_session(ev),
+        "per_session": _per_session(ev, outcomes),
+    }
+
+
+def _turn_outcomes(log: Any, since: float, until: float) -> list[dict[str, Any]]:
+    """The decision log's turn outcomes in [since, until) (``DecisionLog.turn_outcomes``); none from a log without
+    them."""
+    read = getattr(log, "turn_outcomes", None)
+    if read is None:
+        return []
+    return read(since=since, until=None if until == float("inf") else until)
+
+
+#: Why a scored turn failed, in the order :func:`failure_reason` checks them.
+FAILURE_REASONS = ("interrupted", "undone", "unfinished", "test_failed", "blocked")
+
+
+def failure_reason(row: dict[str, Any]) -> str:
+    """The first reason a failed turn failed (one of ``FAILURE_REASONS``)."""
+    if row.get("interrupted"):
+        return "interrupted"
+    if row.get("undone"):
+        return "undone"
+    if row.get("status") != "done":
+        return "unfinished"
+    if (row.get("gate") or row.get("test")) == "failed":
+        return "test_failed"
+    return "blocked"
+
+
+def _success_metrics(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+    """The headline success rate over the scored turns, how many are still pending, and why the others failed."""
+    scored = [o for o in outcomes if o["passed"] is not None]
+    failures = dict.fromkeys(FAILURE_REASONS, 0)
+    for o in scored:
+        if not o["passed"]:
+            failures[failure_reason(o)] += 1
+    return {
+        "turn_success_rate": round(sum(1 for o in scored if o["passed"]) / len(scored), 3) if scored else None,
+        "turns_scored": len(scored),
+        "turns_pending": sum(1 for o in outcomes if o["pending"]),
+        "turn_failures": failures,
+        "approval_denials": sum(int(o.get("denials") or 0) for o in outcomes),
     }
 
 
@@ -197,16 +250,19 @@ def _tier_row() -> dict[str, int]:
     return {"calls": 0, "escalated": 0, "loop_guard": 0}
 
 
-def _per_session(ev: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Counts per session id (the A/B samples): calls, escalations, loop guards, approvals, call tokens, turns."""
+def _session_row() -> dict[str, int]:
+    return dict.fromkeys(("calls", "escalated", "loop_guard", "approvals", "tokens", "turns", "scored", "passed"), 0)
+
+
+def _per_session(ev: list[dict[str, Any]], outcomes: list[dict[str, Any]] | None = None) -> dict[str, dict[str, int]]:
+    """Counts per session id (the A/B samples): calls, escalations, loop guards, approvals, call tokens, turns, and the
+    scored turns (``scored``) of which ``passed`` succeeded."""
     out: dict[str, dict[str, int]] = {}
     turns: dict[str, set[str]] = {}
     for r in ev:
         if not r["session"]:
             continue
-        s = out.setdefault(
-            r["session"], {"calls": 0, "escalated": 0, "loop_guard": 0, "approvals": 0, "tokens": 0, "turns": 0}
-        )
+        s = out.setdefault(r["session"], _session_row())
         if r["kind"] == "call":
             s["calls"] += 1
             s["tokens"] += int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
@@ -220,6 +276,12 @@ def _per_session(ev: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
             s["approvals"] += 1
     for sid, ts in turns.items():
         out[sid]["turns"] = len(ts)
+    for o in outcomes or []:
+        if o["passed"] is None or not o["session"]:
+            continue
+        s = out.setdefault(o["session"], _session_row())
+        s["scored"] += 1
+        s["passed"] += bool(o["passed"])
     return out
 
 
@@ -232,9 +294,13 @@ def accept_change(quality_gain: float, token_increase_pct: float) -> bool:
 
 
 def quality(m: dict[str, Any]) -> float:
-    """Quality part of the score (higher is better), from the headline rates. ``failure_rate`` (provider failovers)
-    is an availability event, not quality, and is left out like the outage rate."""
+    """Quality part of the score (higher is better), from the headline rates: the turn failure rate first (weighted
+    ``SUCCESS_WEIGHT``; left out while no turn is scored), then escalations, loop guards and approval prompts.
+    ``failure_rate`` (provider failovers) is an availability event, not quality, and is left out like the outage rate.
+    ``turn_completion_rate`` is not read: finishing is not succeeding."""
     s = 1.0 - m["escalation_rate"] - 0.5 * min(1.0, m["loop_guard_per_session"])
+    if m.get("turn_success_rate") is not None:
+        s -= SUCCESS_WEIGHT * (1.0 - m["turn_success_rate"])
     s -= 0.02 * min(10.0, m["approval_prompts_per_session"])
     if m.get("proposal_accept_rate") is not None:
         s += 0.2 * (m["proposal_accept_rate"] - 0.5)
@@ -272,24 +338,41 @@ def _tokens_per_turn(stats: list[dict[str, int]]) -> float | None:
 
 
 def session_score(s: dict[str, int], ref_tokens_per_turn: float | None) -> float:
-    """One session's score (higher is better): the per-session part of :func:`quality`, minus ``COST_WEIGHT`` per
-    100% its tokens per turn lie above ``ref_tokens_per_turn`` (plus the same credit below it, capped at +100%).
+    """One session's score (higher is better): the per-session part of :func:`quality` (its turn failure rate, when
+    it has scored turns, and its escalations, loop guards and approvals), minus ``COST_WEIGHT`` per 100% its tokens
+    per turn lie above ``ref_tokens_per_turn`` (plus the same credit below it, capped at +100%).
 
     Proposal accept rate and scope accuracy are not per session (their rows carry no session id), so they stay out.
+    A control arm stored before turn outcomes were recorded has no ``scored`` count: its sessions score as before.
     """
     calls = max(1, s["calls"])
     q = 1.0 - min(1.0, s["escalated"] / calls) - 0.5 * min(1.0, s["loop_guard"])
+    if s.get("scored"):
+        q -= SUCCESS_WEIGHT * (1.0 - s.get("passed", 0) / s["scored"])
     q -= 0.02 * min(10.0, s["approvals"])
     if ref_tokens_per_turn and s["turns"] and s["tokens"]:
         q -= COST_WEIGHT * min(1.0, s["tokens"] / s["turns"] / ref_tokens_per_turn - 1.0)
     return q
 
 
+def success_rate(stats: list[dict[str, int]]) -> float | None:
+    """The turn success rate over an arm's sessions (pooled over their scored turns); None when none is scored."""
+    scored = sum(s.get("scored", 0) for s in stats)
+    return round(sum(s.get("passed", 0) for s in stats) / scored, 3) if scored else None
+
+
 def arm_scores(treatment: list[dict[str, int]], control: list[dict[str, int]]) -> tuple[list[float], list[float]]:
     """Per-session scores of both arms (sessions without a model call say nothing and are left out), with tokens per
-    turn measured against the control arm's for both."""
+    turn measured against the control arm's for both.
+
+    The turn success term counts only when both arms have scored turns: a control arm stored before turn outcomes were
+    recorded (a before/after experiment started by an older version) has none, and scoring only the treatment's
+    failures would bias the judgement toward a rollback."""
     treatment = [s for s in treatment if s["calls"]]
     control = [s for s in control if s["calls"]]
+    if not (any(s.get("scored") for s in treatment) and any(s.get("scored") for s in control)):
+        treatment = [{**s, "scored": 0} for s in treatment]
+        control = [{**s, "scored": 0} for s in control]
     ref = _tokens_per_turn(control)
     return [session_score(s, ref) for s in treatment], [session_score(s, ref) for s in control]
 
@@ -450,13 +533,36 @@ class ExperimentBusy(RuntimeError):
     """Another experiment is still active: they share one score, so only one runs at a time."""
 
 
+def _pct(rate: float | None) -> str:
+    return "n/a" if rate is None else f"{rate:.0%}"
+
+
 def _describe(result: dict[str, Any]) -> str:
-    """One line for a judged experiment: the score difference, its interval and the arm sizes."""
+    """One line for a judged experiment: the score difference, its interval, the arm sizes and each arm's turn
+    success rate."""
     arms = f"{result['n_treatment']} treatment / {result['n_control']} control sessions"
+    success = result.get("success")
+    if success:
+        arms += f"; turn success {_pct(success.get('treatment'))} vs {_pct(success.get('control'))}"
     if "ci" not in result:
         return f"too few sessions to judge ({arms}; {MIN_SESSIONS_PER_ARM} per arm needed)"
     lo, hi = result["ci"]
     return f"score {result['diff']:+.3f} vs control ({CONFIDENCE:.0%} interval {lo:+.3f} to {hi:+.3f}; {arms})"
+
+
+def describe_success(m: dict[str, Any]) -> str:
+    """The headline metrics in one line: turn success (scored turns, pending ones, why the others failed) and, as a
+    secondary number, the share of tasks that merely finished."""
+    rate = m.get("turn_success_rate")
+    pending = m.get("turns_pending") or 0
+    wait = f", {pending} pending" if pending else ""
+    head = f"turn success {_pct(rate)} of {m.get('turns_scored') or 0} scored turns{wait}"
+    failed = {k: v for k, v in (m.get("turn_failures") or {}).items() if v}
+    if failed:
+        head += " (failed: " + ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in failed.items()) + ")"
+    if m.get("turn_completion_rate") is not None:
+        head += f"; finished {_pct(m['turn_completion_rate'])} (secondary)"
+    return head
 
 
 class Experiments:
@@ -622,6 +728,7 @@ class Experiments:
                 control = list(before.values())
             t_scores, c_scores = arm_scores(treatment, control)
             result = decide(t_scores, c_scores, seed=zlib.crc32(x["id"].encode()))
+            result["success"] = {"treatment": success_rate(treatment), "control": success_rate(control)}
             if result["decision"] is None:
                 if x["sessions_done"] < MAX_WINDOW_FACTOR * x["target_sessions"]:
                     continue  # too few sessions in an arm yet: keep collecting
@@ -648,8 +755,9 @@ class Experiments:
     def _judge_legacy(
         self, x: dict[str, Any], m: dict[str, Any], notify: Callable[[str], None] | None, config_path: Path | None
     ) -> None:
-        """Experiments without a ``design`` field: compare the window's score to the stored baseline score."""
-        after = score(m, x.get("baseline"))
+        """Experiments without a ``design`` field: compare the window's score to the stored baseline score. That
+        baseline was scored before turn success was part of the score, so the window is scored without it too."""
+        after = score({**m, "turn_success_rate": None}, x.get("baseline"))
         x["after"], x["after_score"] = {k: v for k, v in m.items() if k != "per_session"}, after
         if after < x["baseline_score"] - ROLLBACK_MARGIN:
             x["result"] = {"decision": "rolled_back"}
