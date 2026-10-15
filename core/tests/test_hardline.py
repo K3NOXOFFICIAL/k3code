@@ -117,6 +117,109 @@ def test_env_wrapping_a_dangerous_command_keeps_that_rule(command: str, rule: st
     assert hardline.check(command) == rule, command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # GNU env parses the words of -S / --split-string in place as its own options and assignments: with no
+        # command left, each of these prints the whole environment (checked against coreutils 9.4)
+        "env -S 'FOO=1'",
+        "env -S FOO=1",
+        "env -SFOO=1",
+        "env -S -0",
+        "env -S '-u PATH'",
+        "env -S '-i'",
+        "env -S 'A=1 B=2'",
+        "env -S ''",
+        "env --split-string=X=1",
+        "env --split-string='-u X'",
+        "env --split-string X=1",
+        "env -vS X=1",
+        "env -iS X=1",
+        "env -0S X=1",
+        "env -S 'FOO=1' > out.txt",
+        # an unambiguous prefix of a long option is that option (getopt_long)
+        "env --u PATH",
+        "env --unse=PATH",
+        "env --sp=X=1",
+        "env --split 'X=1 -0'",
+        # an env with only assignments and options left, behind other wrappers
+        "env X=1",
+        "nice env -S X=1",
+        "sudo env X=1",
+        "sudo env -S X=1",
+        "command env",
+        "command env -S X=1",
+        "timeout 5 env -S X=1",
+        "echo $(env -S X=1)",
+        "bash -c \"env -S 'X=1'\"",
+    ],
+)
+def test_env_split_string_with_nothing_to_run_is_an_env_dump(command: str) -> None:
+    assert hardline.check(command) == "env-dump", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # bash builtins that list every variable with its value when no name is given
+        "declare -x",
+        "declare -p",
+        "declare -px",
+        "declare -gx",
+        "declare +x",
+        "declare",
+        "declare --",
+        "typeset -x",
+        "typeset -p",
+        "typeset",
+        "export -n",
+        "export -pn",
+        "export --",
+        "export",
+        "command declare -x",
+        "builtin export -n",
+        "bash -c 'declare -x'",
+        "declare -x > vars.txt",
+    ],
+)
+def test_builtins_listing_the_environment_are_an_env_dump(command: str) -> None:
+    assert hardline.check(command) == "env-dump", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -S 'make test'",
+        "env -S 'X=1 make' test",
+        "env -S '-u X make'",
+        "env --split-string='-i make'",
+        "env --split 'X=1 make'",
+        "env --unset=PATH make",
+        "nice env -S X=1 make",
+        "declare -x FOO=bar",
+        "declare -a arr",
+        "declare -f",
+        "declare -F",
+        "typeset -i n=1",
+        "export FOO=1",
+        "export -n FOO",
+        "export -f",
+        # names only, never a value: not a dump
+        "compgen -e",
+        "compgen -v",
+        "set -e",
+        "set -o pipefail",
+    ],
+)
+def test_env_split_string_and_builtins_that_print_no_values_are_allowed(command: str) -> None:
+    assert hardline.check(command) is None, command
+
+
+def test_env_split_string_still_reaches_the_wrapped_dangerous_command() -> None:
+    assert hardline.check("env -S 'rm -rf /'") == "rm-rf-root"
+    assert hardline.check("env -S 'X=1 -u Y rm -rf ~'") == "rm-rf-home"
+
+
 def test_env_dump_is_a_named_hardline_rule() -> None:
     assert "env-dump" in hardline.HARDLINE_NAMES
 
