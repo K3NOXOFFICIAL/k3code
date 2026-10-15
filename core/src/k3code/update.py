@@ -43,6 +43,27 @@ def versions_dir() -> Path:
     return data_dir() / "versions"
 
 
+#: The names install.sh gives a version (a release's ``X.Y.Z[-pre]``, a checkout's ``<VERSION>-src.<sha>``): one path
+#: component starting with a digit, so never ``.``, ``..``, an absolute path, a ``/`` or an option.
+VERSION_NAME = re.compile(r"[0-9][0-9A-Za-z.+-]{0,127}")
+
+
+class InvalidVersionName(ValueError):
+    """A version name that install.sh does not make; as a path it could name a directory outside ``versions/``."""
+
+
+def is_version_name(name: str) -> bool:
+    return VERSION_NAME.fullmatch(name) is not None
+
+
+def version_dir(version: str) -> Path:
+    """``versions/<version>``. The name comes from a release tag, the installer's output or the ``previous`` file, and
+    the update deletes or switches to this directory: anything but a version name is refused before it is a path."""
+    if not is_version_name(version):
+        raise InvalidVersionName(f"refusing {version[:80]!r}: not a k3code version name")
+    return versions_dir() / version
+
+
 def current_link() -> Path:
     return data_dir() / "current"
 
@@ -66,7 +87,7 @@ def previous_version() -> str | None:
         v = previous_file().read_text().strip()
     except OSError:
         return None
-    return v if v and (versions_dir() / v).is_dir() else None
+    return v if is_version_name(v) and (versions_dir() / v).is_dir() else None
 
 
 def stale_build() -> str | None:
@@ -110,7 +131,7 @@ def up_to_date(behind: str | None, text: str) -> str:
 
 def switch_to(version: str) -> None:
     """Atomically point ``current`` at ``versions/<version>`` and remember the old one as ``previous``."""
-    target = versions_dir() / version
+    target = version_dir(version)
     if not target.is_dir():
         raise FileNotFoundError(f"no such version dir: {target}")
     old = current_version()
@@ -306,7 +327,7 @@ def activate(
 
     Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
     package the current one has (before the smoke test, which then runs the venv as it will be used)."""
-    vdir = versions_dir() / version
+    vdir = version_dir(version)
     prev = current_version()
     log: list[str] = []
     if prev and prev != version and (carried := carry(versions_dir() / prev, vdir)):
@@ -504,7 +525,10 @@ def _headers(token: str | None, accept: str = "application/vnd.github+json") -> 
 def fetch_latest(
     channel: str = "stable", repo: str = DEFAULT_REPO, token: str | None = None, api: str | None = None
 ) -> Release | None:
-    """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
+    """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything).
+
+    A release whose tag does not give a version name (``v1.0.0/../../x``, ``v/abs``) is no candidate: it would name a
+    directory outside ``versions/``, and such a tag sorts above the real releases."""
     base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
     r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
     if r.status_code == 429 or (r.status_code == 403 and r.headers.get("x-ratelimit-remaining") == "0"):
@@ -531,6 +555,7 @@ def fetch_latest(
         for x in r.json()
         if not x.get("draft")
     ]
+    rels = [x for x in rels if is_version_name(x.version)]
     if channel == "stable":
         rels = [x for x in rels if not x.prerelease]
     return max(rels, key=lambda x: version_key(x.version), default=None)
@@ -745,7 +770,7 @@ def install_release(rel: Release, token: str | None, uv: str | None = None, *, a
 
 def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unpinned: bool) -> Path:
     uv = uv or uv_path()
-    vdir = versions_dir() / rel.version
+    vdir = version_dir(rel.version)
     if vdir.exists():
         if (vdir / ".complete").is_file():
             return vdir  # already installed: nothing to download or rebuild
@@ -985,12 +1010,13 @@ def vet_staged(version: str) -> list[str]:
     build of the same commit), so that the next update builds it again instead of finding it installed. install.sh
     fails that build itself under K3_REQUIRE_TUI; this covers a ref whose installer predates it and a TUI that was
     skipped (Node could not be fetched). k3 is optional, so a missing one only warns."""
+    vdir = version_dir(version)
     cur = current_version()
     if not cur or cur == version:
         return []
     if has_file(cur, TUI_ENTRY) and not has_file(version, TUI_ENTRY):
         if version not in {previous_version(), *running_versions()}:
-            shutil.rmtree(versions_dir() / version, ignore_errors=True)
+            shutil.rmtree(vdir, ignore_errors=True)
         raise SourceUpdateError(
             f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's "
             f"messages are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when "
@@ -1052,6 +1078,18 @@ def _run_installer(
     return subprocess.CompletedProcess(r.args, r.returncode, r.stdout, "".join(lines))
 
 
+def printed_version(stdout: str) -> str:
+    """The version name the installer printed last (``--print-version``). A last line that is no version name (an
+    installer that predates the flag, a ref's own installer) would name a directory outside ``versions/``."""
+    lines = stdout.strip().splitlines()
+    ver = lines[-1] if lines else ""
+    if not is_version_name(ver):
+        raise SourceUpdateError(
+            f"the installer did not print a version name (its last line: {ver[:80]!r}); nothing was activated"
+        )
+    return ver
+
+
 def update_from_source(checkout: Path, *, pull: bool = True, progress: Callable[[str], None] = _show_progress) -> str:
     """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name.
 
@@ -1074,7 +1112,7 @@ def update_from_source(checkout: Path, *, pull: bool = True, progress: Callable[
     if r.returncode:
         tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
         raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
-    return r.stdout.strip().splitlines()[-1]
+    return printed_version(r.stdout)
 
 
 # -- installs made with `install.sh --from-git` -----------------------------------
@@ -1261,6 +1299,6 @@ def update_from_git(url: str, ref: str, *, progress: Callable[[str], None] = _sh
         if r.returncode or not r.stdout.strip():
             tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
             raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
-        return r.stdout.strip().splitlines()[-1]
+        return printed_version(r.stdout)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
