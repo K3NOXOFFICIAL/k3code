@@ -26,14 +26,22 @@ def effective_style(config: Any, session_meta: dict[str, Any] | None) -> str:
 
 
 def _shown(path: Path) -> str:
-    """``path`` as the prompt shows it: ``~/…`` under the home directory (shorter, and what a person reads), else
-    absolute. The file tools expand ``~``, so the model can pass either form back."""
+    """``path`` as the prompt shows it, quoted: ``~/…`` under the home directory (shorter, and what a person reads),
+    else absolute; the file tools expand ``~``, so the model can pass either form back.
+
+    A directory name is not trusted text (an unpacked archive or a cloned repo chooses it) and the system prompt
+    outranks tool output, so a name that could end the quote or start a line of its own (a backtick, a newline or
+    another control character) is shown JSON-escaped in double quotes instead of between backticks."""
     home = Path.home().resolve()
     if path == home:
-        return "~"
-    if path.is_relative_to(home):
-        return f"~/{path.relative_to(home).as_posix()}"
-    return path.as_posix()
+        text = "~"
+    elif path.is_relative_to(home):
+        text = f"~/{path.relative_to(home).as_posix()}"
+    else:
+        text = path.as_posix()
+    if "`" in text or any(ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or c in "\u2028\u2029" for c in text):
+        return json.dumps(text)
+    return f"`{text}`"
 
 
 def scope_prompt(cwd: str | Path, add_dirs: list[str] | None = None) -> str:
@@ -51,9 +59,9 @@ def scope_prompt(cwd: str | Path, add_dirs: list[str] | None = None) -> str:
     head = ["## Session scope", ""]
     if home.is_relative_to(where):  # $HOME itself, or / or /home above it
         kind = "your home directory" if where == home else "a directory that contains your home directory"
-        lines = [*head, f"- Working directory: `{_shown(where)}`: {kind}, not a project."]
+        lines = [*head, f"- Working directory: {_shown(where)}: {kind}, not a project."]
         if extra:
-            lines.append("- Added with /add-dir: " + ", ".join(f"`{d}`" for d in extra))
+            lines.append("- Added with /add-dir: " + ", ".join(extra))
         lines += [
             "",
             "This session did not start inside a project. Work only on the paths the task names; never search, list "
@@ -63,16 +71,16 @@ def scope_prompt(cwd: str | Path, add_dirs: list[str] | None = None) -> str:
         return "\n".join(lines)
     root = project_root(where)
     shown = _shown(where)
-    lines = [*head, f"- Working directory: `{shown}`: this session's project; relative paths and commands start here."]
+    lines = [*head, f"- Working directory: {shown}: this session's project; relative paths and commands start here."]
     if not (root / ".git").exists():
         lines.append("- Not inside a git repository.")
     elif root != where:
         lines.append(
-            f"- Git repository root: `{_shown(root)}` (above the working directory: files outside the working "
+            f"- Git repository root: {_shown(root)} (above the working directory: files outside the working "
             "directory are outside this session's scope)."
         )
     if extra:
-        lines.append("- Also in scope (added with /add-dir): " + ", ".join(f"`{d}`" for d in extra))
+        lines.append("- Also in scope (added with /add-dir): " + ", ".join(extra))
     lines += [
         "",
         "Search and read inside these directories only. Start from what the task names (a file, symbol or error text) "
