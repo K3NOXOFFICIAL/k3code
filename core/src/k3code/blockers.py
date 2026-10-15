@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.paths import ensure_private_dir
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS blockers (
@@ -30,7 +31,7 @@ CREATE TABLE IF NOT EXISTS blockers (
 class BlockerStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
         self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute(_SCHEMA)

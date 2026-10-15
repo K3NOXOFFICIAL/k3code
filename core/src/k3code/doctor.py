@@ -26,6 +26,7 @@ from k3code.config import Settings, default_project_dir, load_config
 from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
 from k3code.halt import load_halt
+from k3code.paths import ensure_private_dir
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
 from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe, default_internet_probe
@@ -519,12 +520,41 @@ def check_tui() -> Check:
 
 def check_home(home: Path) -> Check:
     try:
-        home.mkdir(parents=True, exist_ok=True)
+        if not home.is_dir():
+            ensure_private_dir(home)  # created 0700 like every other k3code writer does (issue #163)
         with tempfile.NamedTemporaryFile(dir=home, prefix=".doctor-"):
             pass
-    except OSError as e:
+    except (OSError, RuntimeError) as e:
         return Check("k3code-home", FAIL, f"{home} not writable: {e}", "fix permissions or set K3CODE_HOME")
     return Check("k3code-home", OK, f"{home} writable")
+
+
+def check_home_mode(home: Path) -> Check:
+    """``$K3CODE_HOME`` holds transcripts, journals, usage, the gateway token and learned notes: only its owner may
+    read it. Startup tightens a 0755 home left by older versions (:func:`k3code.paths.tighten_home`); one that another
+    user owns is never changed and is reported here."""
+    try:
+        st = home.stat()
+    except OSError:
+        return Check("k3code-home-mode", OK, f"{home} not created yet (it is created 0700)")
+    mode = st.st_mode & 0o777
+    if st.st_uid != os.getuid():
+        return Check(
+            "k3code-home-mode",
+            WARN,
+            f"{home} is owned by uid {st.st_uid}, not by you (uid {os.getuid()})",
+            "point K3CODE_HOME at a directory of your own",
+            {"mode": f"{mode:04o}", "uid": st.st_uid},
+        )
+    if mode & 0o077:
+        return Check(
+            "k3code-home-mode",
+            WARN,
+            f"{home} is mode {mode:04o}: other users on this machine can read your sessions and journals",
+            f"chmod 700 {home}",
+            {"mode": f"{mode:04o}"},
+        )
+    return Check("k3code-home-mode", OK, f"{home} mode {mode:04o} (owner only)", data={"mode": f"{mode:04o}"})
 
 
 #: ``check_journal`` parses whole journals, so it reads only the newest files and stops once the budget is spent
@@ -907,6 +937,7 @@ async def run_checks(
         check_install_links(),
         check_tui(),
         check_home(home),
+        check_home_mode(home),
         check_journal(home),
         check_vendor(),
         # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon

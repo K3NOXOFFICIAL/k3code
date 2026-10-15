@@ -1018,6 +1018,12 @@ def cli(
     max_wait: float | None,
 ) -> None:
     """k3code — terminal coding agent."""
+    from k3code.paths import tighten_home
+
+    # Every entry point passes here (the systemd unit runs `k3code daemon`): a $K3CODE_HOME that an older version made
+    # 0755 under the usual umask is made 0700 once, before anything reads or writes in it (issue #163).
+    if tighten_home():
+        logger.info("made %s owner-only (0700)", os.environ.get("K3CODE_HOME") or "~/.k3code")
     if ctx.invoked_subcommand is None:
         if prompt is None and _is_interactive():
             from k3code.setup.onboard import first_run
