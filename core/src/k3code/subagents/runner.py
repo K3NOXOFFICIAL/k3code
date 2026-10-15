@@ -461,6 +461,14 @@ class SubagentManager:
         )
         from k3code.extratools import register_skill_tool
 
+        parent_approval = getattr(parent, "_approval_cb", None)
+        if parent_approval is not None:
+            # the parent's callback reads the parent's live project, which a workspace move changes under a running
+            # child: the child's prompts name its own state, so "always" lands in the project the child works in
+            async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> Any:
+                return await parent_approval(tool_name, arguments, decision, perms=perms)
+
+            loop.approval_callback = approve
         # trust is keyed on the project the user trusted (a worktree child's cwd is a fresh path under it);
         # the hook commands run where the child works
         loop.hooks = userhooks.load(parent.perms.cwd, h.id)
