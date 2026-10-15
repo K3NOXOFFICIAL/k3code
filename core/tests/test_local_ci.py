@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import platform
 import shutil
@@ -113,6 +114,7 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
         "go test -race ./internal/k3keys/... ./internal/harness/...",
         "go test -timeout 30m ./internal/input/ ./internal/app/",
         "python3 scripts/vendor_check.py",
+        "python3 scripts/release/third_party_notices.py check-wheel --repo . --build",
         "gitleaks detect --source . --config .gitleaks.toml",
         "--log-opts=origin/Main..HEAD",
         "(cd . && shell_lint)",
@@ -469,6 +471,9 @@ def _scope(
         (["README.md", "docs/x.md"], "secrets"),
         (["panes/internal/app/a.go"], "vendor,secrets,panes"),
         (["scripts/dev/install-hooks.sh", ".githooks/pre-push"], "shell,secrets,core"),
+        # what decides the wheel's license files also runs the vendor area, which builds the wheel and checks them
+        (["core/hatch_build.py"], "vendor,secrets,core"),
+        (["scripts/release/third_party_notices.py", "LICENSE"], "vendor,secrets,core"),
         ([f"core/f{i}.py" for i in range(40)], "secrets,core"),  # 40 files is still small
     ],
 )
@@ -565,11 +570,14 @@ def test_release_ships_what_release_yml_shipped() -> None:
         "k3-linux-arm64",
         "k3-darwin-amd64",
         "k3-darwin-arm64",
+        "THIRD_PARTY_NOTICES.txt",
         "SHA256SUMS",
     ]
     text = RELEASE.read_text()
     for needle in (
         "uv build --wheel",
+        "check-wheel --repo",  # a wheel without LICENSE, NOTICE and LICENSES/ stops the release (issue #165)
+        "go list -deps -json=Module",  # never go test
         "CGO_ENABLED=0",
         "uv export --quiet --locked",
         "gh release create",
@@ -676,15 +684,41 @@ def test_update_rejects_an_asset_that_does_not_match_sha256sums(
 # --- release.sh: a failed publish leaves no tag behind -------------------------------------------------------------
 
 _RELEASE_TOOLS = {
-    "uv": """#!/bin/sh
+    # `uv build` makes a wheel the way core/hatch_build.py does: k3code/LICENSE, NOTICE and LICENSES/ from the
+    # repository root (cwd is core/), or without them when FAKE_WHEEL_BARE is set.
+    "uv": f"""#!{sys.executable}
+import os, sys, zipfile
+from pathlib import Path
+args = sys.argv[1:]
+if args[0] == "build":
+    out = Path(args[args.index("--out-dir") + 1])
+    out.mkdir(parents=True, exist_ok=True)
+    root = Path.cwd().parent
+    with zipfile.ZipFile(out / "k3code-1.2.3-py3-none-any.whl", "w") as z:
+        z.writestr("k3code/__init__.py", "")
+        if not os.environ.get("FAKE_WHEEL_BARE"):
+            for name in ("LICENSE", "NOTICE"):
+                z.write(root / name, "k3code/" + name)
+            for p in sorted((root / "LICENSES").iterdir()):
+                z.write(p, "k3code/LICENSES/" + p.name)
+elif args[0] == "export":
+    Path(args[args.index("-o") + 1]).write_text("requirements\\n")
+""",
+    # `npm ci` installs the one production package of the fake lock, with its license file
+    "npm": """#!/bin/sh
+mkdir -p dist
+if [ "$1" = ci ]; then mkdir -p node_modules/dep && echo "dep license text" > node_modules/dep/LICENSE; fi
+""",
+    # `go list -deps -json=Module` names a module in a fake module cache, `go env GOROOT` a fake Go installation
+    "go": """#!/bin/sh
 case "$1" in
-  build) while [ $# -gt 0 ]; do [ "$1" = --out-dir ] && out=$2; shift; done
-         mkdir -p "$out" && echo wheel > "$out/k3code-1.2.3-py3-none-any.whl" ;;
-  export) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo requirements > "$out" ;;
+  build) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo k3 > "$out" ;;
+  list) printf '{"Module": {"Path": "example.com/godep", "Version": "v1.0.0", "Dir": "%s"}}\\n' \\
+          "$FAKE_GO_MODCACHE/godep"
+        printf '{}\\n{"Module": {"Path": "github.com/Gaurav-Gosain/tuios", "Main": true}}\\n' ;;
+  env) echo "$FAKE_GOROOT" ;;
 esac
 """,
-    "npm": "#!/bin/sh\nmkdir -p dist\n",
-    "go": '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo k3 > "$out"\n',
     # The part of GitHub release.sh depends on: a draft release has no tag, publishing it creates the tag in the origin
     # at the draft's target. State: $FAKE_GH_DIR/draft-<tag> (the target, then one asset name per line).
     # `release list` prints what the script's --jq leaves of the list: the tags of the drafts. `release view` leaves
@@ -725,6 +759,16 @@ exit 0
 }
 
 
+_FAKE_LOCK = {
+    "lockfileVersion": 3,
+    "packages": {
+        "": {"name": "@k3code/tui"},
+        "node_modules/dep": {"version": "2.0.0", "license": "MIT"},
+        "node_modules/devtool": {"version": "9.9.9", "license": "MIT", "dev": True},
+    },
+}
+
+
 def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
     """A copy of the release scripts in a repository on Main with a bare origin, and stand-ins for uv, npm, go, gh."""
     env = _env(tmp)
@@ -737,10 +781,14 @@ def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
         "core/k": "",
         "tui/k": "",
         "panes/k": "",
+        "LICENSE": "k3code MIT license text\n",
+        "NOTICE": "k3code NOTICE text\n",
+        "LICENSES/vendored-MIT.txt": "vendored license text\n",
+        "tui/package-lock.json": json.dumps(_FAKE_LOCK),
         "scripts/ci/check.sh": "#!/bin/sh\nexit 0\n",
         "scripts/release/build_release.sh": "#!/bin/sh\nexit 0\n",
     }
-    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh", "scripts/release/third_party_notices.py"):
         files[rel] = (REPO / rel).read_text()
     repo = _repo(tmp, env, files)
     _git(repo, env, "remote", "add", "origin", str(origin))
@@ -749,8 +797,14 @@ def _release_setup(tmp: Path) -> tuple[Path, dict[str, str], Path]:
     for tool, text in _RELEASE_TOOLS.items():
         (bindir / tool).write_text(text)
         (bindir / tool).chmod(0o755)
+    (bindir / "python3").unlink()  # the notices are generated and checked for real
+    (bindir / "python3").symlink_to(sys.executable)
+    for d, text in (("gomod/godep", "godep license text"), ("goroot", "Go runtime license text")):
+        (tmp / d).mkdir(parents=True)
+        (tmp / d / "LICENSE").write_text(text + "\n")
     (tmp / "gh-state").mkdir()
     env.update(PATH=f"{bindir}:{env['PATH']}", FAKE_GH_DIR=str(tmp / "gh-state"), FAKE_GH_ORIGIN=str(origin))
+    env.update(FAKE_GO_MODCACHE=str(tmp / "gomod"), FAKE_GOROOT=str(tmp / "goroot"))
     return repo, env, origin
 
 
@@ -802,6 +856,41 @@ def test_release_refuses_a_draft_that_lacks_an_asset(tmp_path: Path) -> None:
     r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, {**env, "FAKE_GH_HIDE": "SHA256SUMS"})
     assert r.returncode == 2 and "stays a draft" in r.stderr
     assert not any(c.startswith("release edit") for c in _release_calls(env))
+    assert _remote_tags(env, origin) == []
+
+
+def test_release_ships_license_files_and_third_party_notices(tmp_path: Path) -> None:
+    """Issue #165: the TUI tarball held only dist/ and the k3 binaries shipped bare. The tarball now carries LICENSE,
+    NOTICE, LICENSES/ and the notices of its npm packages; THIRD_PARTY_NOTICES.txt beside the binaries adds the Go
+    modules and runtime linked into k3. Both are uploaded and listed in SHA256SUMS."""
+    repo, env, _ = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assets = repo / ".k3dev/release/1.2.3/assets"
+    with tarfile.open(assets / "k3code-tui-1.2.3.tar.gz") as t:
+        names = set(t.getnames())
+        tui_notices = t.extractfile("THIRD_PARTY_NOTICES.txt").read().decode()  # type: ignore[union-attr]
+        assert t.extractfile("NOTICE").read() == b"k3code NOTICE text\n"  # type: ignore[union-attr]
+    assert {"dist", "LICENSE", "NOTICE", "LICENSES/vendored-MIT.txt", "THIRD_PARTY_NOTICES.txt"} <= names
+    assert "dep" in tui_notices and "2.0.0" in tui_notices and "dep license text" in tui_notices
+    assert "devtool" not in tui_notices  # a dev dependency is not in the bundle
+    notices = (assets / "THIRD_PARTY_NOTICES.txt").read_text()
+    for needle in ("k3code NOTICE text", "vendored license text", "dep license text"):
+        assert needle in notices, needle
+    assert "example.com/godep" in notices and "godep license text" in notices
+    assert "Go standard library and runtime" in notices and "Go runtime license text" in notices
+    assert "Gaurav-Gosain/tuios" not in notices  # k3 itself is k3code's code, under NOTICE
+    assert "THIRD_PARTY_NOTICES.txt" in (assets / "SHA256SUMS").read_text()
+    create = next(c for c in _release_calls(env) if c.startswith("release create"))
+    assert "THIRD_PARTY_NOTICES.txt" in create
+
+
+def test_release_refuses_a_wheel_without_license_files(tmp_path: Path) -> None:
+    repo, env, origin = _release_setup(tmp_path)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), "1.2.3"], repo, {**env, "FAKE_WHEEL_BARE": "1"})
+    assert r.returncode == 2
+    assert "k3code/LICENSE is missing" in r.stderr and "does not ship LICENSE, NOTICE and LICENSES/" in r.stderr
+    assert not any(c.startswith("release create") for c in _release_calls(env))
     assert _remote_tags(env, origin) == []
 
 

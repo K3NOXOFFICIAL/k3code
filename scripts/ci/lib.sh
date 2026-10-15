@@ -88,11 +88,14 @@ areas_for_files() {
   local f a areas=" secrets " out=""
   while IFS= read -r f; do
     case $f in
+      # what decides the license files in the release wheel (check.sh's vendor area builds it and checks them);
+      # before core/*, since case takes the first pattern that matches
+      core/pyproject.toml | core/hatch_build.py | scripts/release/third_party_notices.py) areas="$areas core vendor " ;;
       core/* | install/*) areas="$areas core " ;;
       scripts/ci/* | .githooks/*) areas="$areas core shell " ;;
       tui/*) areas="$areas tui vendor " ;;
       panes/*) areas="$areas panes vendor " ;;
-      VENDOR.toml | NOTICE | LICENSES/* | scripts/vendor_check.py) areas="$areas vendor " ;;
+      VENDOR.toml | NOTICE | LICENSE | LICENSES/* | scripts/vendor_check.py) areas="$areas vendor " ;;
     esac
     case $f in
       scripts/*.py) areas="$areas core " ;;

@@ -4000,22 +4000,50 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
         _ctx_cwd.reset(token)
 
 
+def _model_capabilities(entry: Any) -> dict[str, dict[str, bool]]:
+    """``{key: {reasoning, fast}}`` for the model keys of ``entry`` whose effort support is known.
+
+    ``reasoning`` is :func:`effort.takes_effort` on the key's first model id, the test the provider applies when it
+    builds a request. A claude-cli entry passes ``--effort`` to the CLI for any model, so its keys are True there. A key
+    whose answer is unknown (no model id, a provider kind effort.py does not know) is left out: the picker then keeps
+    offering the effort step for it rather than hiding a control that may work. ``fast`` is not known per model here
+    and is always False (the field is required by the contract)."""
+    out: dict[str, dict[str, bool]] = {}
+    for key, spec in entry.models.items():
+        model = _first_model_id(spec)
+        takes = (True if model else None) if entry.kind == "claude-cli" else effort_mod.takes_effort(model, entry.kind)
+        if takes is not None:
+            out[key] = {"reasoning": takes, "fast": False}
+    return out
+
+
+def _provider_option(entry: Any, active: str) -> dict[str, Any]:
+    """One ``model.options`` provider row (the ``ModelOptionProvider`` shape the TUI picker reads)."""
+    keyed = entry.kind != "claude-cli" and bool(entry.api_key_env)  # claude-cli and keyless endpoints take no key
+    row: dict[str, Any] = {
+        "slug": entry.name,
+        "name": entry.name,
+        "models": sorted(entry.models.keys()),  # the keys /model and --provider take
+        "model_ids": {k: _first_model_id(spec) for k, spec in entry.models.items()},  # key -> the model id it sends
+        "descriptions": {k: v for k, v in entry.descriptions.items() if v},  # key -> config `descriptions` text
+        "capabilities": _model_capabilities(entry),
+        "api_url": entry.base_url,
+        "is_current": entry.name == active,
+        "auth_type": "api_key" if keyed else "none",
+        "authenticated": bool(entry.api_key) if keyed else True,
+    }
+    if keyed:
+        row["key_env"] = entry.api_key_env  # the variable's name only, never its value
+        if not entry.api_key:
+            row["warning"] = f"paste {entry.api_key_env} to activate"
+    return row
+
+
 async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     # the session asked about (else the current one): its model key and its /provider pick, not only the defaults
     session = server._session_for(params.get("session_id"))
     active = active_provider(server.config, session.stored.provider if session is not None else "")
-    providers = []
-    for p in server.config.providers:
-        providers.append(
-            {
-                "slug": p.name,
-                "name": p.name,
-                "models": sorted(p.models.keys()),  # the keys /model and --provider take
-                "model_ids": {k: _first_model_id(spec) for k, spec in p.models.items()},  # key -> the model id it sends
-                "api_url": p.base_url,
-                "is_current": p.name == active,
-            }
-        )
+    providers = [_provider_option(p, active) for p in server.config.providers]
     return {"providers": providers, "model": tune_cmd.current_model(server.config, session), "provider": active}
 
 
@@ -4034,15 +4062,115 @@ async def _tune_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, 
     return {**tune_cmd.snapshot(server, session), "ok": True, "changed": outcome.changed}
 
 
+def _keyed_provider(server: GatewayServer, params: dict[str, Any]) -> Any:
+    """The provider block ``params['slug']`` names, which must take an API key from an environment variable."""
+    slug = str(_require(params, "slug"))
+    entry = next((p for p in server.config.providers if p.name == slug), None)
+    if entry is None:
+        valid = ", ".join(p.name for p in server.config.providers) or "none configured"
+        raise _InvalidParams(f"Unknown provider: {slug} (valid: {valid})")
+    if entry.kind == "claude-cli" or not entry.api_key_env:
+        how = "it uses the Claude Code login" if entry.kind == "claude-cli" else "its endpoint takes none"
+        raise _InvalidParams(f"{slug} takes no API key ({how})")
+    # load_config: the process environment wins over the env file. Under systemd the unit loads that file
+    # (EnvironmentFile=), so a saved key is in the environment too, with the same value: that one is ours to change.
+    # A different value was exported some other way, and a key saved or removed here would be ignored.
+    from k3code.setup.state import read_env_file
+
+    exported = os.environ.get(entry.api_key_env)
+    if exported and exported != read_env_file().get(entry.api_key_env):
+        raise _InvalidParams(
+            f"{entry.api_key_env} is set in the daemon's environment, which wins over the saved keys: change or unset "
+            "it there and restart the daemon"
+        )
+    return entry
+
+
+#: What a pasted key may not contain: whitespace and control characters (a line break would add a line of its own to
+#: the env file, which systemd loads into the daemon's environment), quotes and backslashes (they change how systemd's
+#: EnvironmentFile= and read_env_file read the line; a trailing backslash joins the next line).
+_BAD_KEY_CHARS = frozenset("'\"`\\")
+
+
+def _use_saved_key(server: GatewayServer, name: str, value: str) -> None:
+    """Give every provider block whose key variable is ``name`` the key ``value`` (what load_config would read now).
+
+    The blocks are replaced, not edited, in a new list: the routers are rebuilt from it on the next turn and only the
+    changed providers are swapped (``_swap_providers``), as after a config reload; a turn in flight keeps its own. The
+    daemon's environment follows when the variable came from the env file (_keyed_provider allowed only that), as the
+    setup wizard does: a later config reload then reads the same key. Child processes never see it (child_env)."""
+    if name in os.environ:
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+    server.config.providers = [
+        p.model_copy(update={"api_key": value}) if p.api_key_env == name else p for p in server.config.providers
+    ]
+    server.router = None
+    server._tiers = None
+
+
+def _option_for(server: GatewayServer, params: dict[str, Any], slug: str) -> dict[str, Any] | None:
+    session = server._session_for(params.get("session_id"))
+    active = active_provider(server.config, session.stored.provider if session is not None else "")
+    entry = next((p for p in server.config.providers if p.name == slug), None)
+    return _provider_option(entry, active) if entry is not None else None
+
+
 async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    _require(params, "provider")
-    _require(params, "key")
-    # M1: keys come from config env vars; persisting new keys is a later milestone.
-    return {"provider": params.get("provider")}
+    """``model.save_key {slug, api_key}``: store the key of provider ``slug`` and use it from the next turn.
+
+    The key goes where the setup wizard puts it (``set_env_var``): the 0600 env file ``~/.config/k3code/env`` under the
+    variable the user's provider block names (``api_key_env``), never into config.yaml; the client cannot pick another
+    variable. The daemon reads that file at start (systemd ``EnvironmentFile=``, load_config), and the running gateway
+    uses the key from the next turn. Refused: a variable the daemon's environment sets (it would win over the saved
+    key), and one another endpoint also uses (its requests would carry this key, issues #114 and #120). Nothing
+    echoes the key: not the reply, not an error, not the log."""
+    from k3code.setup.state import set_env_var
+
+    entry = _keyed_provider(server, params)
+    key = params.get("api_key")
+    if not isinstance(key, str) or not key.strip():
+        raise _InvalidParams("missing required param: api_key")
+    key = key.strip()
+    if any(c.isspace() or not c.isprintable() or c in _BAD_KEY_CHARS for c in key):
+        raise _InvalidParams("that does not look like an API key (spaces, quotes or control characters): paste the key")
+    name = entry.api_key_env
+    url = entry.base_url.rstrip("/")
+    others = sorted(
+        {p.name for p in server.config.providers if p.api_key_env == name and p.base_url.rstrip("/") != url}
+    )
+    if others:
+        raise _InvalidParams(
+            f"{name} is also the key variable of {', '.join(others)} (another endpoint), which would then send this "
+            f"key there too: give {entry.name} a variable of its own (k3code setup --step providers) first"
+        )
+    set_env_var(name, key)
+    _use_saved_key(server, name, key)
+    logger.info("model.save_key: stored %s for provider %s", name, entry.name)
+    return {"provider": _option_for(server, params, entry.name)}
 
 
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    return {"disconnected": False}
+    """``model.disconnect {slug}``: remove the saved key of provider ``slug`` and stop using it from the next turn.
+
+    Only the line the picker or the setup wizard wrote (``api_key_env`` in ``~/.config/k3code/env``) is removed
+    (``unset_env_var``); the provider block stays in config.yaml, so pasting a key brings it back. A key in the daemon's
+    own environment is refused (_keyed_provider): the picker never says "disconnected" while that key is still used."""
+    from k3code.setup.state import unset_env_var
+
+    entry = _keyed_provider(server, params)
+    name = entry.api_key_env
+    if unset_env_var(name):
+        logger.info("model.disconnect: removed %s (provider %s) from the saved keys", name, entry.name)
+    _use_saved_key(server, name, "")
+    return {
+        "slug": entry.name,
+        "name": entry.name,
+        "disconnected": True,
+        "provider": _option_for(server, params, entry.name),
+    }
 
 
 async def _mode_session(server: GatewayServer, params: dict[str, Any]) -> LiveSession:

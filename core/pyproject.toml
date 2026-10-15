@@ -42,6 +42,15 @@ pattern = "(?P<version>[0-9][^\\s]*)"
 [tool.hatch.build.targets.wheel]
 packages = ["src/k3code"]
 
+# hatch_build.py copies LICENSE, NOTICE and LICENSES/ from the repository root into the wheel's k3code/ (issue #165)
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+# the sdist carries them at its root, so a wheel built from the sdist gets them as well
+[tool.hatch.build.targets.sdist.force-include]
+"../LICENSE" = "LICENSE"
+"../NOTICE" = "NOTICE"
+"../LICENSES" = "LICENSES"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
