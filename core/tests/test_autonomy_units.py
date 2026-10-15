@@ -402,6 +402,29 @@ def test_recent_context_is_fenced_and_cannot_close_its_own_fence():
     assert "<recent_context>" not in classifier_messages("fix a typo", "3 files", "")[1].content
 
 
+def test_the_classifier_is_told_to_size_the_task_not_do_it():
+    # On the claude-cli provider (every call framed as "the assistant's next turn") the cheap model started about one
+    # task in twelve ("let me look at server.py…", no JSON), and the gate fell back to `small`. The user message leads
+    # with the reminder, before the task, and the system prompt says the same.
+    head = classifier_messages("Explain what main() in server.py does", "3 files", "")[1].content.split("Task:")[0]
+    assert "do not do it" in head.lower() and "json" in head.lower()
+    low = CLASSIFIER_SYSTEM.lower()
+    assert "never do the task" in low and "without tools or code" in low
+
+
+def test_the_classifier_prompt_sizes_by_file_count_and_not_by_the_repo():
+    # Misses of the live eval (scope_scores.jsonl, 2026-10-15): "about 15 files" and "the other 14 route files" came
+    # back medium (a "package" wins over the count), one-line bug fixes and a new flag came back trivial (under-planned
+    # onto the cheap tier), and reasons cited the repo's 4000 files to pick huge for one subsystem.
+    low = " ".join(CLASSIFIER_SYSTEM.lower().split())
+    assert "file count beats every other cue, also for one repeated mechanical change" in low and "9-60 large" in low
+    assert "trivial: no new or changed logic" in low and "a bug fix (even of one line)" in low
+    assert "a big repository never raises a level" in low
+    assert "one feature or subsystem is large" in low
+    # output stays short: the gate runs before every task
+    assert "reason under 15 words" in low
+
+
 def test_behaviour_is_what_the_gate_does_with_a_verdict():
     def behaviour(scope, prompt="tidy up"):
         return apply_floor(ScopeVerdict(scope=scope), prompt).behaviour
