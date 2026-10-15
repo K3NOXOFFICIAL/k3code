@@ -3791,7 +3791,14 @@ async def _session_workspace_move(server: GatewayServer, params: dict[str, Any])
     session = server.session
     if session is None:
         raise _InvalidParams("no active session")
+    if session.turn_in_flight:  # its loop, tools and approvals work in the old directory until it ends
+        raise _InvalidParams("a turn is running in this session; move the workspace when it ends")
     session.stored.cwd = str(path)
+    # everything a loop reads comes from perms.cwd: the prompt's scope and memory, the tools, the sandbox root, the
+    # project's rules (and where an "always" answer stores one). The banner's tools and skills follow the directory too.
+    session.perms.cwd = path
+    session.perms.reload()
+    session._tools_cache = session._skills_cache = None
     server.store.save(session.stored)
     return {"ok": True, "cwd": str(path)}
 
