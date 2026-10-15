@@ -115,7 +115,7 @@ from k3code.routing.tiers import (
     tier_for,
     tier_model_specs,
 )
-from k3code.session_ai import compact_messages, make_title
+from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
@@ -427,6 +427,8 @@ class LiveSession:
                         )
                         for tc in (m.get("tool_calls") or [])
                     ],
+                    # kept for the next turn's persist (the history is re-stored from these): never sent to a provider
+                    meta=m.get("meta") if isinstance(m.get("meta"), dict) else None,
                 )
             )
         return out
@@ -2293,12 +2295,16 @@ class GatewayServer:
             if not gate.proceed:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})
+            # a goal's continuation prompt is the harness's, not the user's: marked, so /undo goes back past it to the
+            # prompt the user sent (see _session_undo); a stall prompt inside a continuation turn is part of it too
+            prompt_meta = dict(CONTINUATION_META) if session.goal_continuation else None
             while gate.proceed:
                 async for event in loop.run(
                     prompt,
                     max_tokens=config.max_tokens,
                     temperature=config.temperature,
                     history=history,
+                    prompt_meta=prompt_meta,
                 ):
                     self._on_stream_event(session, event)
                 attempt_reason = loop.escalation_reason or ""
@@ -3353,6 +3359,11 @@ def _resolve_model_specs(config: Any, key: str) -> list[str | list[str]]:
     return resolved
 
 
+#: ``Message.meta`` of a user message the harness wrote to continue a goal (implicit or /goal): stored with it as
+#: ``"meta"``, never sent to a provider. /undo skips these to reach the prompt the user sent.
+CONTINUATION_META: dict[str, Any] = {"continuation": True}
+
+
 def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for m in messages:
@@ -3363,6 +3374,8 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
             entry["name"] = m.name
         if m.tool_calls:
             entry["tool_calls"] = [_stored_tool_call(tc) for tc in m.tool_calls]
+        if m.meta:
+            entry["meta"] = dict(m.meta)
         out.append(entry)
     return out
 
@@ -4254,15 +4267,33 @@ async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
     }
 
 
+def _is_continuation(message: dict[str, Any]) -> bool:
+    """A user message the harness wrote to continue a goal (``CONTINUATION_META``), not one the user sent."""
+    meta = message.get("meta")
+    return isinstance(meta, dict) and bool(meta.get("continuation"))
+
+
 async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """/undo and /retry: drop the last user message and everything after it."""
+    """/undo and /retry: drop the last user message and everything after it.
+
+    The goal's continuation prompts are no user messages here: after an auto-continued (or /goal) run, /undo drops
+    the whole run back to the prompt the user sent, as the TUI's transcript does (it never showed the continuations).
+    It used to drop only the last continuation turn, so the run's earlier turns stayed in the conversation the next
+    prompt (and /retry) went on from. ``removed``: the number of messages dropped."""
     session = server._session_for(params.get("session_id"))
     if session is None:
         raise _InvalidParams("no active session")
     if session.turn_in_flight:
         raise _InvalidParams("a turn is running in this session; /undo when it ends")
     messages = list(session.messages)
-    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    users = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    last_user = users[-1] if users else None
+    for i in reversed(users):
+        if str(messages[i].get("content") or "").startswith(SUMMARY_PREFIX):
+            break  # the run's own prompt was compacted into this summary: drop only the last turn, as before
+        if not _is_continuation(messages[i]):
+            last_user = i
+            break
     if last_user is None:
         return {"removed": 0}
     session.messages = messages[:last_user]

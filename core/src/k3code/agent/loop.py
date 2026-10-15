@@ -233,11 +233,13 @@ class AgentLoop:
         temperature: float | None = None,
         history: list[Message] | None = None,
         resume: bool = False,
+        prompt_meta: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent loop, yielding stream events.
 
         ``history`` is prior conversation messages (no system entry); when given,
-        the loop continues that conversation instead of starting fresh.
+        the loop continues that conversation instead of starting fresh. ``prompt_meta``: the harness's notes on the
+        prompt's message (``Message.meta``; a goal continuation's).
         """
         # The reliability bundle is shared per session; bind its retry wrapper to *this* loop's router
         # (another loop on a different tier may have attached its own since construction).
@@ -252,7 +254,7 @@ class AgentLoop:
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
-            Message(role="user", content=user_prompt),
+            Message(role="user", content=user_prompt, meta=prompt_meta),
         ]
         # The same list object the loop keeps appending to: a cancelled or crashed turn can still be persisted
         # (turn_messages used to be assigned only when a step finished, so /stop or SIGTERM lost the whole turn).
