@@ -470,6 +470,29 @@ def _stricter(a: Decision, b: Decision) -> Decision:
     return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human, d.always_ask))
 
 
+#: The arguments that name a command, a path or a directory; a file body or an edit string may hold any character.
+_NAMING_ARGS = ("command", "path", "file", "pattern", "cwd")
+
+
+def _unusable_argument(args: dict[str, object]) -> str | None:
+    """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no shell
+    argument and no file open (both fail), and a lone surrogate cannot be encoded for the OS; a ``~`` before either
+    raised in the user-name lookup, and inside a protected path or a hardline command it broke the matching, so the
+    spelling got a weaker decision than the plain one. A surrogate escape (``\\udc80``, a name the OS could not decode)
+    encodes and is not refused. Checked before any path handling, so no later expansion can raise."""
+    for key in _NAMING_ARGS:
+        value = args.get(key)
+        if not isinstance(value, str):
+            continue
+        if "\0" in value:
+            return f"A NUL byte cannot be passed to a command or a path ({key})."
+        try:
+            os.fsencode(value)
+        except UnicodeError:
+            return f"The {key} argument cannot be encoded for the operating system."
+    return None
+
+
 def decide(
     *,
     mode: PermissionMode | str,
@@ -495,6 +518,9 @@ def decide(
     auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
     mode = PermissionMode(mode)
+    args = args or {}
+    if (bad := _unusable_argument(args)) is not None:
+        return _finish(Decision(action="deny", patterns=["*"], message=bad), mode, headless)
     # The planning turn of an auto session reads outside the roots what the session's own turns read there: toolchain
     # and system dirs without a prompt, anything else refused with a hint. Plan mode asked a person for both, in a
     # session whose user chose not to be asked (and the turn after the plan refuses the second kind anyway).
@@ -503,7 +529,6 @@ def decide(
         if mode == PermissionMode.PLAN and plan_for is not None and PermissionMode(plan_for) == PermissionMode.AUTO
         else mode
     )
-    args = args or {}
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
     ruleset = merge(builtin_defaults(mode), user_rules or [], project_rules or [], session_rules or [])
