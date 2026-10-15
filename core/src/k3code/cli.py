@@ -8,12 +8,11 @@ import logging
 import os
 import selectors
 import shlex
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
@@ -875,19 +874,29 @@ _TERMINAL_RESET = (
 )
 
 
-def _restore_terminal() -> None:
-    """Put the terminal back after a TUI that exited abnormally (OOM kill, crash): the shell would otherwise stay in
-    the alternate screen with mouse tracking and bracketed paste on and the cursor hidden. Harmless after a TUI that
-    did reset. Nothing is written when stdout is not a terminal."""
-    with contextlib.suppress(OSError, ValueError):
-        if sys.stdout.isatty():
-            sys.stdout.write(_TERMINAL_RESET)
-            sys.stdout.flush()
+#: The process the launcher becomes once the TUI is found (#164). The launcher has imported most of the gateway by
+#: then, and waiting for the TUI kept that Python process resident (about 47 MB) for the whole session. This ``sh``
+#: waiter runs the TUI (``"$@"``), puts the terminal back when the TUI did not exit cleanly (an OOM kill, a crash: the
+#: shell would otherwise stay in the alternate screen with mouse tracking and bracketed paste on and the cursor hidden,
+#: #153) when stdout is a terminal, and exits with the TUI's status (a signal death as 128 + signo, as a shell reports
+#: it). ``$1`` is the reset. The no-op INT/QUIT trap keeps the waiter alive through a Ctrl+C that reaches the whole
+#: process group before the TUI has its terminal in raw mode; the TUI itself gets those signals as usual.
+_TUI_WAITER = (
+    'trap : INT QUIT; reset=$1; shift; "$@"; rc=$?; '
+    'if [ "$rc" -ne 0 ] && [ -t 1 ]; then printf "%s" "$reset" 2>/dev/null; fi; exit "$rc"'
+)
 
 
-def _exit_status(returncode: int) -> int:
-    """A child killed by signal N has returncode -N (``sys.exit(-9)`` gives 247): report 128 + N, as a shell does."""
-    return 128 - returncode if returncode < 0 else returncode
+def _exec_tui(argv: list[str], env: dict[str, str]) -> NoReturn:
+    """Replace this process with the TUI's waiter (:data:`_TUI_WAITER`) running ``argv``."""
+    import shutil
+
+    sh = shutil.which("sh") or "/bin/sh"
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(OSError, ValueError):
+            stream.flush()
+    logging.shutdown()  # exec runs no atexit handlers: flush the log file now
+    os.execve(sh, [sh, "-c", _TUI_WAITER, "k3code", _TERMINAL_RESET, *argv], env)
 
 
 def _launch_tui(
@@ -944,10 +953,7 @@ def _launch_tui(
     if project_dir is not None:
         env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
-    result = subprocess.run([node, str(entry)], env=env, check=False)
-    if result.returncode != 0:
-        _restore_terminal()  # a TUI that died on a signal never ran its own exit reset
-    sys.exit(_exit_status(result.returncode))
+    _exec_tui([node, str(entry)], env)
 
 
 def _find_repo_root() -> Path | None:
