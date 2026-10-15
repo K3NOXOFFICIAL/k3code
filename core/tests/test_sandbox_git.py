@@ -287,6 +287,90 @@ def test_a_repo_with_no_git_writable_planting_is_left_untouched(tmp_path):
     assert admin_commondir.exists()  # the worktree's real commondir is kept
 
 
+def _outside_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """A directory outside the repository holding a harmless marker subtree (what a planted link would point at)."""
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    marker = outside / "sub" / "marker.txt"
+    marker.write_text("keep\n")
+    return outside, marker
+
+
+def test_the_scrub_does_not_follow_a_symlinked_worktrees_dir(tmp_path):
+    """A command can swap ``.git/worktrees`` for a link to a directory outside the project; the scrub runs on the
+    host and must neither list nor remove anything through it, and says so."""
+    repo = _repo(tmp_path / "repo")
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert marker.read_text() == "keep\n" and (outside / "sub").is_dir()
+    assert (repo / ".git" / "worktrees").is_symlink()
+    assert len([n for n in notes if "symlink" in n and "worktrees" in n]) == 1, notes
+
+
+def test_the_snapshot_does_not_list_through_a_symlinked_worktrees_dir(tmp_path):
+    """Names listed through a link would make the scrub think the link target's children are the repository's own."""
+    repo = _repo(tmp_path / "repo")
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    snap = sandbox.snapshot_git_writable(repo)
+    assert all(not s.worktrees for s in snap["gitdirs"])
+    assert sandbox.scrub_git_writable_changes(snap)
+    assert marker.read_text() == "keep\n"
+
+
+def test_a_symlinked_worktrees_dir_makes_the_git_dir_fully_read_only_and_makes_no_stand_ins(tmp_path):
+    """The host side of the bind setup also lists ``worktrees`` to make stand-ins; through a link that would create
+    files in the link's target. The git dir stays whole read-only instead."""
+    repo = _repo(tmp_path / "repo")
+    outside, _ = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    before = sorted(p.relative_to(outside) for p in outside.rglob("*"))
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", bwrap=BWRAP, git_writable=True)
+    assert str(repo / ".git") in _ro_binds(argv)
+    assert sorted(p.relative_to(outside) for p in outside.rglob("*")) == before
+
+
+def test_a_worktree_admin_dir_swapped_for_a_symlink_is_not_scrubbed_through(tmp_path):
+    """A surviving ``worktrees/<name>`` replaced by a link: its ``config.worktree`` is the link target's file, which the
+    scrub must not rewrite."""
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "-b", "work")
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, _ = _outside_tree(tmp_path)
+    target_cfg = outside / "config.worktree"
+    text = "[core]\n\thooksPath = /tmp/mine\n"
+    target_cfg.write_text(text)
+    admin = repo / ".git" / "worktrees" / "wt"
+    shutil.rmtree(admin)
+    admin.symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert target_cfg.read_text() == text
+    assert any("symlink" in n and "wt" in n for n in notes), notes
+
+
+def test_a_symlinked_entry_in_a_real_worktrees_dir_is_unlinked_and_its_target_kept(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / ".git" / "worktrees").mkdir()
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees" / "evil").symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert not (repo / ".git" / "worktrees" / "evil").is_symlink()
+    assert marker.read_text() == "keep\n"
+    assert any("evil" in n for n in notes), notes
+
+
+def test_remove_planted_refuses_a_path_that_resolves_outside_the_git_dir(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    outside, marker = _outside_tree(tmp_path)
+    gitdir = (repo / ".git").resolve()
+    notes = sandbox._remove_planted(outside / "sub", "worktrees/sub admin dir", kind="tree", gitdir=gitdir)
+    assert marker.exists()
+    assert len(notes) == 1 and "refus" in notes[0]
+
+
 def test_harness_git_disables_hooks_and_fsmonitor(tmp_path):
     """The next git run outside the sandbox is harness git; it must not run a hook or fsmonitor program even if one is
     configured (the second line of defence behind the scrub)."""

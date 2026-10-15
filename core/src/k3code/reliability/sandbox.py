@@ -396,9 +396,11 @@ def _make_git_standins(gitdir: Path) -> None:
 
 def _git_code_entries(gitdir: Path) -> list[Path] | None:
     """The :data:`GIT_CODE_ENTRIES` of ``gitdir`` and of each ``worktrees/<name>/`` below it, missing ones made first
-    (:func:`_make_git_standins`), or None when one of them (or a ``worktrees/<name>``) is a symlink: a read-only bind
-    lands on the link's target, and the command could replace the link itself."""
+    (:func:`_make_git_standins`), or None when one of them (or ``worktrees`` itself, or a ``worktrees/<name>``) is a
+    symlink: a read-only bind lands on the link's target, and the command could replace the link itself."""
     dirs = [gitdir]
+    if (gitdir / "worktrees").is_symlink():  # listing it would make stand-ins in the link's target
+        return None
     with contextlib.suppress(OSError):
         dirs += sorted(d for d in (gitdir / "worktrees").iterdir() if d.is_dir() or d.is_symlink())
     if any(d.is_symlink() for d in dirs):
@@ -493,14 +495,15 @@ def snapshot_git_writable(cwd: Path | str, add_dirs: Iterable[Path | str] = (), 
                     continue
                 seen.add(g)
                 wts = set()
-                with contextlib.suppress(OSError):
-                    wts = {d.name for d in (g / "worktrees").iterdir() if d.is_dir() or d.is_symlink()}
+                if not (g / "worktrees").is_symlink():  # never list through a link (the scrub notes it)
+                    with contextlib.suppress(OSError):
+                        wts = {d.name for d in (g / "worktrees").iterdir() if d.is_dir() or d.is_symlink()}
                 snaps.append(
                     _GitDirSnapshot(
                         g,
                         (g / "commondir").exists() or (g / "commondir").is_symlink(),
                         frozenset(wts),
-                        _config_code_keys_of(_config_worktree_files(g, wts)),
+                        _config_code_keys_of(_config_worktree_files(g, wts)[0]),
                     )
                 )
         except (OSError, ValueError, RuntimeError):  # a snapshot that cannot be taken just scrubs nothing later
@@ -528,17 +531,22 @@ def scrub_git_writable_changes(snapshot: Mapping[str, Any]) -> list[str]:
         gitdir: Path = snap.gitdir
         try:
             if not snap.had_commondir:
-                removed += _remove_planted(gitdir / "commondir", "commondir file", kind="any")
+                removed += _remove_planted(gitdir / "commondir", "commondir file", kind="any", gitdir=gitdir)
             wt_root = gitdir / "worktrees"
             surviving = set(snap.worktrees)
-            with contextlib.suppress(OSError):
-                for d in sorted(wt_root.iterdir(), key=lambda p: p.name):
-                    if (d.is_dir() or d.is_symlink()) and d.name not in snap.worktrees:
-                        removed += _remove_planted(d, f"worktrees/{d.name} admin dir", kind="tree")
+            if wt_root.is_symlink():  # a command can replace it with a link out of the project: never walk through it
+                removed.append(f"skipped the git dir's worktrees in {gitdir}: it is a symlink (left as it is)")
+            else:
+                with contextlib.suppress(OSError):
+                    for d in sorted(wt_root.iterdir(), key=lambda p: p.name):
+                        if (d.is_dir() or d.is_symlink()) and d.name not in snap.worktrees:
+                            removed += _remove_planted(d, f"worktrees/{d.name} admin dir", kind="tree", gitdir=gitdir)
             # config.worktree (the main git dir's and each surviving worktree admin's): strip code keys a command
             # added. config.worktree is in GIT_CODE_ENTRIES and bound read-only, so this is a second line of defence;
             # it never touches a code key the user already had (snapshot).
-            for cfg in _config_worktree_files(gitdir, surviving):
+            cfgs, skipped = _config_worktree_files(gitdir, surviving)
+            removed += [f"skipped worktrees/{name} in {gitdir}: it is a symlink (left as it is)" for name in skipped]
+            for cfg in cfgs:
                 before = snap.config_code_keys.get(str(cfg), frozenset())
                 removed += _strip_config_code_keys(cfg, keep=before)
         except Exception:  # noqa: BLE001 - a scrub that fails must not break the turn; the ro binds already held
@@ -546,11 +554,18 @@ def scrub_git_writable_changes(snapshot: Mapping[str, Any]) -> list[str]:
     return removed
 
 
-def _config_worktree_files(gitdir: Path, worktrees: Iterable[str]) -> list[Path]:
-    """The ``config.worktree`` of ``gitdir`` and of each named ``worktrees/<name>`` admin dir under it."""
+def _config_worktree_files(gitdir: Path, worktrees: Iterable[str]) -> tuple[list[Path], list[str]]:
+    """The ``config.worktree`` of ``gitdir`` and of each named ``worktrees/<name>`` admin dir under it, and the names
+    left out because ``worktrees`` or ``worktrees/<name>`` is now a symlink (its file would be the link target's)."""
     files = [gitdir / "config.worktree"]
-    files += [gitdir / "worktrees" / name / "config.worktree" for name in worktrees]
-    return files
+    skipped: list[str] = []
+    wt_root = gitdir / "worktrees"
+    for name in sorted(worktrees):
+        if wt_root.is_symlink() or (wt_root / name).is_symlink():
+            skipped.append(name)
+        else:
+            files.append(wt_root / name / "config.worktree")
+    return files, skipped
 
 
 def _config_code_keys_of(files: Iterable[Path]) -> dict[str, frozenset[str]]:
@@ -562,9 +577,19 @@ def _config_code_keys_of(files: Iterable[Path]) -> dict[str, frozenset[str]]:
     return out
 
 
-def _remove_planted(path: Path, what: str, *, kind: str) -> list[str]:
-    """Remove a file/symlink (``kind='any'``) or a whole tree (``kind='tree'``) a command planted; returns a note or
-    nothing. Refuses a symlink's target: only the link itself goes."""
+def _remove_planted(path: Path, what: str, *, kind: str, gitdir: Path) -> list[str]:
+    """Remove a file/symlink (``kind='any'``) or a whole tree (``kind='tree'``) a command planted below ``gitdir``;
+    returns a note or nothing. Refuses a symlink's target: only the link itself goes. Refuses (with a note) a path
+    whose parent, or whose own real location for a tree, is not inside the real ``gitdir``."""
+    real = gitdir.resolve()
+    try:
+        inside = path.parent.resolve().is_relative_to(real) and (
+            path.is_symlink() or path.resolve().is_relative_to(real)
+        )
+    except (OSError, RuntimeError):
+        inside = False
+    if not inside:
+        return [f"refused to remove {what} in {path.parent}: it is not inside the git dir {real}"]
     try:
         if path.is_symlink() or kind == "any" and path.is_file():
             path.unlink()
