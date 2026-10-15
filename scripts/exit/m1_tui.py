@@ -19,11 +19,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-try:
-    import pexpect  # noqa: F401
-    import pyte  # noqa: F401
-except ImportError:
-    os.execvp("uv", ["uv", "run", "--with", "pexpect", "--with", "pyte", "python", __file__, *sys.argv[1:]])
+if __name__ == "__main__":  # imported (core/tests/test_m1_tui_tapes.py), it needs neither
+    try:
+        import pexpect  # noqa: F401
+        import pyte  # noqa: F401
+    except ImportError:
+        os.execvp("uv", ["uv", "run", "--with", "pexpect", "--with", "pyte", "python", __file__, *sys.argv[1:]])
 
 from lib import emit, live_backend, live_providers_yaml, run  # noqa: E402
 from tui_harness import Tui, core_python, write_home  # noqa: E402
@@ -117,6 +118,27 @@ def tail_screen(t: Tui, n: int = 14) -> str:
 TOOL_DONE = {"type": "text", "text": "turn-complete", "when": "turn_after_tool"}
 
 
+def tape(tag: str) -> str:
+    """What a prompt carries so that its turn answers with :func:`done_step`'s marker (``(tape-N)``)."""
+    return f"({tag})"
+
+
+def done_step(tag: str, *, after_tool: bool = True) -> dict:
+    """The final answer of the turn whose prompt carries ``tape(tag)``: ``done-<tag>``.
+
+    A tape that runs several turns waits for each turn's own marker. A shared answer ("turn-complete") stays on screen
+    from the first turn, so every later wait for it returned at once, before that turn's tool had run: the checks after
+    it raced the gateway (#170). The fake provider matches against the whole conversation, so turn N answers with the
+    markers of turns 1..N; only turn N's is new. ``after_tool=False``: a turn that calls no tool."""
+    step = {"type": "text", "text": f"done-{tag} ", "match": tape(tag)}
+    return {**step, "when": "turn_after_tool"} if after_tool else step
+
+
+def done(tag: str) -> str:
+    """The pattern that waits for :func:`done_step` of ``tag``."""
+    return rf"done-{tag}\b"
+
+
 def bash_step(cmd: str) -> dict:
     return {"type": "tool_call", "id": "b1", "name": "bash", "arguments": {"command": cmd}, "when": "turn_first"}
 
@@ -191,34 +213,35 @@ def plan_approve() -> str:
     "TUI tape: same bash call 4 turns: once, deny, always, then no prompt",
 )
 def perm() -> str:
-    t, home, cwd = mk("perm", [bash_step("touch ran.txt"), TOOL_DONE])
+    turns = ("tape-1", "tape-2", "tape-3", "tape-4")
+    t, home, cwd = mk("perm", [bash_step("touch ran.txt"), *(done_step(tag) for tag in turns)])
     ran = cwd / "ran.txt"
     try:
-        t.line("run it")
+        t.line(f"run it {tape('tape-1')}")
         need(t.wait(r"approval required", 20), "no ask dialog\n" + tail_screen(t))
         t.key("enter")  # Allow once
-        need(t.wait(r"turn-complete", 20), "turn 1 did not finish")
+        need(t.wait(done("tape-1"), 20), "turn 1 did not finish")
         need(ran.exists(), "allow once: not run")
         ran.unlink()
         t.wait_gone(r"approval required", 5)
         t.mark()
-        t.line("run it again")
+        t.line(f"run it again {tape('tape-2')}")
         need(t.wait(r"approval required", 20), "once did not re-ask")
         t.child.send("4")
         t.pump(1)  # Deny
-        need(t.wait(r"turn-complete", 20), "turn 2 did not finish")
+        need(t.wait(done("tape-2"), 20), "turn 2 did not finish")
         need(not ran.exists(), "deny: command ran")
         t.mark()
-        t.line("run it a third time")
+        t.line(f"run it a third time {tape('tape-3')}")
         need(t.wait(r"approval required", 20), "deny did not re-ask")
         t.child.send("3")
         t.pump(1)  # Always allow
-        need(t.wait(r"turn-complete", 20), "turn 3 did not finish")
+        need(t.wait(done("tape-3"), 20), "turn 3 did not finish")
         need(ran.exists(), "always: not run")
         ran.unlink()
         t.mark()
-        t.line("and a fourth")
-        t.pump(5)
+        t.line(f"and a fourth {tape('tape-4')}")
+        need(t.wait(done("tape-4"), 20), "turn 4 did not finish")
         need("approval required" not in t.ever_text(), "prompted again after 'Always allow'")
         need(ran.exists(), "turn 4 did not run without a prompt")
         cfg = cwd / ".k3code" / "config.yaml"
@@ -234,16 +257,20 @@ def perm() -> str:
     "TUI tape on a temp git repo; asserts command output on screen",
 )
 def cmds() -> str:
+    questions = [f"q{i}" for i in range(4)]
     t, home, cwd = mk(
         "cmds",
-        [{"type": "text", "text": "reply-one"}, {"type": "usage", "prompt_tokens": 5, "completion_tokens": 2}],
+        [
+            *(done_step(tag, after_tool=False) for tag in questions),
+            {"type": "usage", "prompt_tokens": 5, "completion_tokens": 2},
+        ],
         git=True,
     )
     ev = []
     try:
-        for i in range(4):
-            t.line(f"question {i}")
-            need(t.wait(r"reply-one", 15), "no reply")
+        for i, tag in enumerate(questions):
+            t.line(f"question {i} {tape(tag)}")
+            need(t.wait(done(tag), 15), "no reply")
             t.wait(r"ready", 10)
         for cmd, pat in [
             ("/compact", r"Compacted \d+ messages"),
@@ -483,13 +510,15 @@ def agent_view_keys() -> str:
 
 @flow("focus", "Focus mode hides tool output", "TUI tape: /focus on -> tool block absent; /focus off -> present")
 def focus() -> str:
-    t, home, cwd = mk("focus", [bash_step("echo TOOLOUT-MARKER"), TOOL_DONE], permission_mode="yolo")
+    t, home, cwd = mk(
+        "focus", [bash_step("echo TOOLOUT-MARKER"), done_step("tape-1"), done_step("tape-2")], permission_mode="yolo"
+    )
     try:
         t.line("/focus on")
         need(wait_badge(t, True), "FOCUS badge not shown\n" + tail_screen(t))
         t.mark()
-        t.line("run the tool")
-        need(t.wait(r"turn-complete", 20), "no final answer")
+        t.line(f"run the tool {tape('tape-1')}")
+        need(t.wait(done("tape-1"), 20), "no final answer")
         t.pump(1)
         need(
             "TOOLOUT-MARKER" not in t.text() and "Tool calls" not in t.text(),
@@ -499,8 +528,8 @@ def focus() -> str:
         need(t.wait(r"focus view disabled", 10, ever=True), "focus not disabled")
         need(wait_badge(t, False), "FOCUS badge still shown")
         t.mark()
-        t.line("run the tool again")
-        need(t.wait(r"turn-complete", 20), "no final answer 2")
+        t.line(f"run the tool again {tape('tape-2')}")
+        need(t.wait(done("tape-2"), 20), "no final answer 2")
         need(t.wait(r"Tool calls", 5), "tool block missing with focus off\n" + tail_screen(t))
         return (
             "focus on: FOCUS badge, final answer shown, no 'Tool calls'/tool output; "

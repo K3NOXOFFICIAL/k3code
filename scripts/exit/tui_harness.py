@@ -15,8 +15,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pexpect
-import pyte
+try:
+    import pexpect
+    import pyte
+except ImportError:  # a test that stands in for the TUI (core/tests/test_m1_tui_tapes.py) needs neither
+    pexpect = pyte = None  # type: ignore[assignment]
 
 REPO = Path(__file__).resolve().parents[2]
 ROWS, COLS = 50, 160
