@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import re
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -182,9 +185,72 @@ def build_system_prompt(
     return "\n\n".join(text for _, text in sections) + "\n"
 
 
-def subagent_system_prompt(base: str, *, name: str, description: str, body: str, note: str = "") -> str:
-    """A sub-agent's prompt: its header, the composed prompt of the session, then the agent type's own text."""
-    return f"[agent:{name}] {description}\n\n{base}\n\n{body}{note}"
+#: The heading of the base prompt's last section: every line of the base that names a tool is in it (a test pins that)
+TOOL_USE_HEADING = "## Tool Use"
+_TOOL_REF = re.compile(r"`([a-z_]+)`")
+
+
+@functools.cache
+def _known_tools() -> frozenset[str]:
+    """Every tool name the base prompt can mention: the registry's, plus the ones a loop registers on top of it."""
+    from k3code.tools import build_registry
+
+    return frozenset(build_registry().names()) | {"skill", "task", "task_result", "advisor"}
+
+
+def split_tool_use(base: str) -> tuple[str, str]:
+    """``base`` as (everything before its tool-use section, that section); the section is "" when there is none."""
+    at = base.find(f"\n{TOOL_USE_HEADING}\n")
+    return (base, "") if at < 0 else (base[: at + 1], base[at + 1 :])
+
+
+def tool_use_for(section: str, tools: Collection[str]) -> str:
+    """``section`` without the lines that name a tool outside ``tools``; "" when nothing is left under its heading."""
+    kept = [ln for ln in section.splitlines() if all(n in tools for n in _TOOL_REF.findall(ln) if n in _known_tools())]
+    return "\n".join(kept).strip() if sum(1 for ln in kept if ln.strip()) > 1 else ""
+
+
+def subagent_sections(
+    base: str,
+    *,
+    name: str,
+    description: str,
+    body: str,
+    tools: Collection[str],
+    cwd: str | Path,
+    config: Any,
+    session_meta: dict[str, Any] | None = None,
+    session_id: str | None = None,
+    note: str = "",
+) -> list[tuple[str, str]]:
+    """A sub-agent's prompt as ``(name, text)`` sections, with what its types share first.
+
+    The provider's cache matches a prompt from the top, so the base (without its tool-use section) and the session's own
+    sections come first and are the same for every child of a session. What follows differs by type: the tool-use lines
+    for the tools the child has, the skills index when it has the ``skill`` tool to load them, the type's own text; the
+    task, which differs per child, is last. A child never hears of a tool it does not have: it has no MCP tools and no
+    advisor, so neither's note is in its prompt either."""
+    head, tool_use = split_tool_use(base)
+    sections = prompt_sections(
+        head,
+        cwd=cwd,
+        config=config,
+        session_meta=session_meta,
+        mcp=None,
+        skills="skill" in tools,
+        advisor=False,
+        attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
+        session_id=session_id,
+    )
+    skills = [s for s in sections if s[0] == "skills"]
+    sections = [s for s in sections if s[0] != "skills"]
+    if text := tool_use_for(tool_use, tools):
+        sections.append(("tools", text))
+    return [*sections, *skills, ("agent-type", body), ("agent-task", f"[agent:{name}] {description}{note}")]
+
+
+def subagent_system_prompt(base: str, **kwargs: Any) -> str:
+    return "\n\n".join(text for _, text in subagent_sections(base, **kwargs)) + "\n"
 
 
 def prompt_hash(text: str) -> str:
@@ -221,12 +287,11 @@ def assemble_mode(mode: str, *, cwd: str | Path, config: Any) -> tuple[str, list
         atype = load_agent_types(cwd).get(name)
         if atype is None:
             raise ValueError(f"unknown sub-agent type {name!r} (one of {', '.join(mode_names(cwd))})")
-        session = prompt_sections(base, cwd=cwd, config=config, attended=False)  # as SubagentManager.build_loop
-        text = subagent_system_prompt(
-            "\n\n".join(t for _, t in session), name=name, description="<task description>", body=atype.prompt
+        tools = set(atype.tools) or {*_known_tools()}  # a type without a tools list gets them all
+        sections = subagent_sections(  # as SubagentManager.build_loop
+            base, name=name, description="<task description>", body=atype.prompt, tools=tools, cwd=cwd, config=config
         )
-        header = f"[agent:{name}] <task description>"
-        return text + "\n", [("agent-header", header), *session, ("agent-type", atype.prompt)]
+        return "\n\n".join(t for _, t in sections) + "\n", sections
     else:
         raise ValueError(f"unknown mode {mode!r} (one of {', '.join(mode_names(cwd))})")
     return "\n\n".join(t for _, t in sections) + "\n", sections
