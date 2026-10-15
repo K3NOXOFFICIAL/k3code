@@ -863,6 +863,7 @@ HOME_RO_HIDDEN = (
     ".password-store",
     ".local/share/keyrings",
     ".local/share/k3code",
+    ".local/share/uv/credentials",  # `uv auth dir`: index tokens (the project sandbox binds only uv's python/, tools/)
     ".cargo/credentials",
     ".cargo/credentials.toml",
     ".gem/credentials",

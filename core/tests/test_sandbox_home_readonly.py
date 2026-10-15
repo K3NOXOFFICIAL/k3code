@@ -274,3 +274,25 @@ async def test_uv_credentials_are_unreadable_inside_the_real_sandbox(tmp_path):
     assert "fake-uv-token" not in res["stdout"]
     assert "No such file" in res["stderr"]
     assert res["stderr"].count("No such file") == 1  # python/ is still there
+
+
+def test_uv_credentials_are_hidden_in_the_read_only_home_view(tmp_path, monkeypatch):
+    """The read-only $HOME view shows all of $HOME but its credential stores: uv's (`uv auth dir`) is one of them, as
+    in the project sandbox, which binds only uv's python/ and tools/."""
+    home = _uv_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    argv = sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    tmpfs = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert str(home / ".local/share/uv/credentials") in tmpfs
+    assert str(home / ".local/share/uv/python") not in tmpfs
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_uv_credentials_are_unreadable_in_the_real_read_only_home_view(tmp_path, monkeypatch):
+    home = _uv_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    creds = home / ".local" / "share" / "uv" / "credentials" / "credentials.toml"
+    argv = sandbox.build_argv(home, home=home, readonly_home=True)
+    res = await tool_bash({"command": f"cat {creds}; ls {home}/.local/share/uv/python"}, cwd=home, sandbox=argv)
+    assert "fake-uv-token" not in res["stdout"]
+    assert res["stderr"].count("No such file") == 1  # python/ is still there
