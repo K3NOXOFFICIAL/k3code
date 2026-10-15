@@ -7,7 +7,8 @@
 """Persistent session goals — the "Ralph loop".
 
 Judge failures are fail-OPEN (``continue``); repeated judge failures, a ``blocked`` verdict and an optional turn
-budget (``max_turns``, 0 = none, the default) pause the goal. The continuation is a normal user message, so the
+budget (``max_turns``, 0 = none, the default) pause the goal. An implicit goal (auto-continue) ends instead, and on
+the first judge reply that is not a verdict. The continuation is a normal user message, so the
 system prompt (and prompt caching) never changes mid-goal.
 """
 
@@ -35,6 +36,7 @@ DEFAULT_GATE_TIMEOUT_SECONDS = 300
 #: that can never pass (a typo, a missing tool) would otherwise burn tokens until someone looks. /goal resume starts
 #: the count again.
 DEFAULT_GATE_MAX_RETRIES = 20
+#: Unparseable judge replies in a row before a /goal pauses (an implicit goal ends on the first one).
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
@@ -1110,6 +1112,16 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
             )
+        if parse_failed and s.implicit:
+            # A /goal fails open (continue) for up to MAX_CONSECUTIVE_PARSE_FAILURES turns: the user set it and watches
+            # its notices. Auto-continue is the harness's own guess that the turn is unfinished: on a verdict nobody
+            # could read it does not run more unattended turns, it ends here and says why.
+            self.clear()
+            message = (
+                "↻ Auto-continue stopped: the completion judge's reply was not a verdict (check goal.judge_model). "
+                "Send 'continue' or set a /goal."
+            )
+            return Decision("cleared", False, None, "continue", reason, message)
         if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures
             return self._pause_decision(

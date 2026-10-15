@@ -344,3 +344,23 @@ def test_implicit_is_persisted_in_the_snapshot_and_old_states_load_without_it():
     old = state.to_dict()
     del old["implicit"]
     assert GoalState.from_dict(old).implicit is False
+
+
+async def test_a_judge_reply_that_is_not_a_verdict_ends_auto_continue_after_one_turn(tmp_path, monkeypatch):
+    from k3code.goals import make_judge
+
+    server, provider, live, mgr = await _setup(
+        tmp_path, monkeypatch, replies=["step 1", "step 2"], autonomy=DEFAULT, permission_mode="auto"
+    )
+    replies: list[str] = []
+
+    async def complete(system, user):
+        replies.append(user)
+        return "Sure! The agent made good progress."  # no JSON verdict
+
+    server.goal_judge = make_judge(complete)
+    await server._run_turn(live, "build the parser")
+    assert provider.n == 1 and len(replies) == 1  # no unattended turn on an unreadable verdict
+    assert mgr.state is None
+    assert [n["text"] for n in _goal_notices(server)][-1].startswith("↻ Auto-continue stopped: the completion judge")
+    await server.close()
