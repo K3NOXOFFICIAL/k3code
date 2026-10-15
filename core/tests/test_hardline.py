@@ -121,6 +121,74 @@ def test_env_dump_is_a_named_hardline_rule() -> None:
     assert "env-dump" in hardline.HARDLINE_NAMES
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # WSL mounts of a Windows drive wiped from inside Linux (issue #169)
+        "rm -rf /mnt/c",
+        "rm -rf /mnt/c/Users",
+        "rm -rf /mnt/c/Users/nils",
+        "rm -rf /mnt/c/Windows",
+        "rm -rf /mnt/d",
+        "rm -rf /mnt/c/*",
+        "sudo rm -rf /mnt/c/Users",
+        # cmd.exe recursive deletes on a drive root / Users / Windows
+        r"cmd.exe /c del /s /q C:\ ",
+        r"cmd /c rd /s /q C:\Users",
+        r'cmd /c "del /s /q C:\Users\nils"',
+        # powershell / pwsh recursive deletes
+        r"powershell Remove-Item -Recurse -Force C:\ ",
+        r'powershell.exe -Command "Remove-Item -Recurse C:/"',
+        r'powershell -c "ri -Recurse C:\Users\nils"',
+        r'pwsh -Command "rm -Recurse C:\"',
+        r"powershell del -Recurse C:\Users",
+        # formatting and partitioning
+        "Format-Volume -DriveLetter D",
+        "format C:",
+        'cmd /c "format D:"',
+        "diskpart",
+        "ls && diskpart",
+    ],
+)
+def test_windows_and_wsl_destroyers_are_denied(command: str) -> None:
+    assert hardline.check(command) is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # deleting a project subfolder, not a drive root: no launcher + drive target combination
+        r"Remove-Item -Recurse .\build",
+        r"rmdir /s /q build",
+        "rm -rf /mnt/c/Users/nils/project",
+        "rm -rf /mnt/c/Users/nils/project/build",
+        "rm -rf /mnt",
+        "rm -rf build",
+        "rm -rf ./node_modules",
+        # the verbs as prose or data, not as the command being run
+        'echo "format C:"',
+        'echo "run diskpart later"',
+        "cat notes-about-diskpart.md",
+        "cmd /c echo hi",
+        r'powershell -Command "Get-ChildItem C:\Users"',
+        'git commit -m "reformat C: drive docs"',
+    ],
+)
+def test_windows_rules_do_not_overblock(command: str) -> None:
+    assert hardline.check(command, cwd="/work/proj", home="/home/user") is None, command
+
+
+def test_windows_rules_are_named_hardline_rules() -> None:
+    for name in (
+        "win-cmd-recursive-delete",
+        "win-powershell-recursive-delete",
+        "win-format-volume",
+        "win-format-drive",
+        "win-diskpart",
+    ):
+        assert name in hardline.HARDLINE_NAMES, name
+
+
 def test_config_extension() -> None:
     assert hardline.check("echo hi", ["^echo"]) == "config-hardline-0"
     assert hardline.check("echo hi") is None
