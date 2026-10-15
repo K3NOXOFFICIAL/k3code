@@ -174,6 +174,27 @@ def test_only_a_tool_at_command_position_is_a_check():
         assert "Last test/check: passed, after the last edit." in digest, command
 
 
+def test_an_operator_inside_quotes_a_comment_or_a_heredoc_splits_nothing():
+    """The command line used to be split on every ``;``, ``|`` and ``&&`` by a regex, quotes or not: an ``echo`` or a
+    commit message that mentions a test run counted as running it, and passing."""
+    for command in (
+        'echo "x; pytest"',
+        'git commit -m "fix; pytest passes"',
+        "echo 'done && pytest -q'",
+        "echo hi # ; pytest",
+        "cat > notes.md <<'EOF'\nthen run:\npytest -q\nEOF",
+    ):
+        digest = turn_evidence_digest(Turn().bash(command, "ok").messages)
+        assert "No test/check command ran this turn." in digest, command
+    # a quoted pipe or semicolon in the test's own arguments does not mask its exit status
+    for command in ("pytest -k 'parse|lex'", 'pytest -k "a; b" && echo ok'):
+        digest = turn_evidence_digest(Turn().bash(command, "ok").messages)
+        assert "Last test/check: passed, after the last edit." in digest, command
+    # a test started in the background reports nothing yet: the shell's status is the job start
+    digest = turn_evidence_digest(Turn().bash("pytest -q &", "").messages)
+    assert "Last test/check: exit status not the test's (piped or masked)" in digest
+
+
 def test_a_tool_name_in_a_later_command_does_not_hide_the_failed_test():
     turn = Turn().bash("pytest -q", "1 failed\n[exit code 1]").edit("src/app.py").bash("cat pytest.ini", "[pytest]")
     digest = turn_evidence_digest(turn.messages)

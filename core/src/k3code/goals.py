@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.memory import fenced
+from k3code.permissions import hardline
 
 #: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done, judged blocked or paused.
 DEFAULT_MAX_TURNS = 0
@@ -278,8 +279,8 @@ _VERIFY_SEGMENT_RE = re.compile(
     r"(?:(?:uv|poetry|pdm|hatch|pipenv)\s+run\s+|npx\s+|(?:\S*/)?python[\d.]*\s+-m\s+)*"
     r"(?:\S*/)?" + _VERIFY_TOOL + r"(?![\w.\-])"
 )
-#: The operators that split a command line into the segments it runs.
-_SHELL_OPERATOR_RE = re.compile(r"(\|\||&&|\|&|[|;\n])")
+#: The operators between two simple commands of a command line (``hardline.parse`` splits on them, and on parentheses).
+_SHELL_OPERATOR_RE = re.compile(r"&&|\|\||\|&|[|;&\n]")
 _EXIT_CODE_RE = re.compile(r"\[exit code (-?\d+)\]\s*$")
 _EDIT_TOOLS = ("write", "edit")
 EVIDENCE_DIGEST_CHARS = 1500
@@ -296,21 +297,71 @@ def _one_line(text: str, limit: int = _DIGEST_LINE_CHARS) -> str:
     return _truncate(" ".join(str(text).split()), limit)
 
 
+@dataclass
+class _CommandLine:
+    """A bash command line taken apart for the evidence: its simple commands and what lies between them."""
+
+    parsed: hardline.Parsed
+    #: ``gaps[k]``: the text before ``subs[k]`` (after ``subs[k - 1]``); ``gaps[-1]``: the text after the last one.
+    #: Only operators, parentheses and blanks: the command line's own words are all in ``subs``.
+    gaps: list[str]
+    #: index in ``subs`` of the last test/check command, None when it runs none
+    check: int | None = None
+
+    @property
+    def subs(self) -> list[str]:
+        return self.parsed.subs
+
+
+def _command_line(command: str) -> _CommandLine:
+    """Split ``command`` with the permission layer's quote-aware bash parser (``hardline.parse``): an operator inside
+    quotes (``echo "x; pytest"``, ``git commit -m "fix; pytest passes"``), a comment or a heredoc body splits nothing,
+    so only a word at a real command position can be a check.
+
+    ``parsed.clean`` is the line without comments, line continuations and heredoc bodies; each simple command is a
+    piece of it, in order, and the text between two of them holds the operators that joined them."""
+    parsed = hardline.parse(command)
+    check = max((i for i, sub in enumerate(parsed.subs) if _VERIFY_SEGMENT_RE.match(sub)), default=None)
+    return _CommandLine(parsed, _gaps(parsed), check)
+
+
+def _gaps(parsed: hardline.Parsed) -> list[str]:
+    """``_CommandLine.gaps`` of a parsed command line."""
+    clean, pos, gaps = parsed.clean, 0, []
+    for sub in parsed.subs:
+        at = clean.find(sub, pos)
+        if at < 0:  # not expected (see above): an unknown join says nothing about whose exit status it is
+            gaps.append(";")
+            continue
+        gaps.append(clean[pos:at])
+        pos = at + len(sub)
+    gaps.append(clean[pos:])
+    return gaps
+
+
+def _status_kept(gap: str, pipefail: bool) -> bool:
+    """The join ``gap`` hands the exit status on: ``&&`` (the next command runs only after a pass, and a fail ends the
+    line with the check's status), or a pipe under ``pipefail``."""
+    ops = _SHELL_OPERATOR_RE.findall(gap)
+    return bool(ops) and all(op == "&&" or (pipefail and op in ("|", "|&")) for op in ops)
+
+
+def _line_status(line: _CommandLine, command: str) -> bool | None:
+    """``_check_status`` of an already split command line."""
+    if line.check is None:
+        return None
+    if "&" in _SHELL_OPERATOR_RE.findall(line.gaps[-1]):
+        return False  # `pytest &`: the shell reports the start of a background job, not the check
+    pipefail = "pipefail" in command
+    return all(_status_kept(gap, pipefail) for gap in line.gaps[line.check + 1 : len(line.subs)])
+
+
 def _check_status(command: str) -> bool | None:
     """``None``: the command line runs no test/check. ``True``: its exit status is the last check's (only ``&&``
-    follows it). ``False``: a later pipe, ``||`` or ``;`` sets the exit status (``pytest | tail``, ``pytest || true``),
-    so it says nothing about the check; a pipe counts as the check's own under ``pipefail``."""
-    parts = _SHELL_OPERATOR_RE.split(command)
-    segments, operators = parts[0::2], parts[1::2]
-    last = max((i for i, seg in enumerate(segments) if _VERIFY_SEGMENT_RE.match(seg)), default=None)
-    if last is None:
-        return None
-    pipefail = "pipefail" in command
-    return all(
-        op == "&&" or (pipefail and op in ("|", "|&"))
-        for op, seg in zip(operators[last:], segments[last + 1 :], strict=True)
-        if seg.strip()
-    )
+    follows it). ``False``: a later pipe, ``||``, ``;`` or ``&`` sets the exit status (``pytest | tail``,
+    ``pytest || true``), so it says nothing about the check; a pipe counts as the check's own under ``pipefail``.
+    Split quote-aware (see ``_command_line``): ``echo "x; pytest"`` runs no check."""
+    return _line_status(_command_line(command), command)
 
 
 def _outcome(code: int | None, own: bool) -> str:
