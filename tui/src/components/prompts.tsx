@@ -2,7 +2,7 @@ import { Box, Text, useInput, wrapAnsi } from "@k3code/ink";
 import { useEffect, useRef, useState } from "react";
 
 import { isMac } from "../lib/platform.js";
-import { clarifyBatchRevisitState } from "../lib/text.js";
+import { clarifyBatchRevisitState, visibleControls } from "../lib/text.js";
 import type { Theme } from "../theme.js";
 import type { ApprovalReq, ClarifyReq, ConfirmReq } from "../types.js";
 
@@ -34,7 +34,7 @@ export function previewWindow(
   offset: number,
   height: number = DIFF_VIEW_LINES,
 ): { lines: string[]; offset: number; total: number } {
-  const all = preview.split("\n");
+  const all = visibleControls(preview).split("\n");
   const start = Math.max(0, Math.min(offset, all.length - height));
 
   return {
@@ -86,7 +86,7 @@ export function approvalLabel(
   req: ApprovalReq,
   choice: ApprovalChoice,
 ): string {
-  const label = req.labels?.[choice] ?? LABELS[choice];
+  const label = visibleControls(req.labels?.[choice] ?? LABELS[choice]);
   const rules =
     choice === "always" || choice === "session"
       ? req.rules?.[choice]
@@ -97,7 +97,7 @@ export function approvalLabel(
   }
 
   return rules.length > 0
-    ? `${label} · ${rules.join(", ")}`
+    ? `${label} · ${visibleControls(rules.join(", "))}`
     : `${label} · adds no rule, allows this call only`;
 }
 
@@ -257,7 +257,7 @@ export function ApprovalPrompt({
   // reviewable before approving). Border + paddingX + inner padding ≈ 8 cols.
   const innerWidth = Math.max(20, cols - 8);
 
-  const rawLines = req.command
+  const rawLines = visibleControls(req.command)
     .split("\n")
     .flatMap((line) =>
       wrapAnsi(line, innerWidth, { hard: true, trim: false }).split("\n"),
@@ -274,7 +274,7 @@ export function ApprovalPrompt({
       paddingX={1}
     >
       <Text bold color={t.color.warn}>
-        ⚠ approval required · {req.description}
+        ⚠ approval required · {visibleControls(req.description)}
       </Text>
 
       <Box flexDirection="column" paddingLeft={1}>
@@ -432,7 +432,7 @@ export function ClarifyPrompt({
       <Text color={t.color.accent}>ask</Text>
       <Text color={t.color.text}>
         {" "}
-        {isBatch ? `${batch.length} questions` : req.question}
+        {isBatch ? `${batch.length} questions` : visibleControls(req.question)}
       </Text>
     </Text>
   );
@@ -567,7 +567,7 @@ export function ClarifyPrompt({
                   bold={isActive}
                   color={isActive ? t.color.text : t.color.muted}
                 >
-                  {marker} {q.question}
+                  {marker} {visibleControls(q.question)}
                 </Text>
               </Text>
 
@@ -579,7 +579,7 @@ export function ClarifyPrompt({
                     color={answer ? t.color.ok : t.color.muted}
                     italic={!answer}
                   >
-                    {answer || "(skipped)"}
+                    {visibleControls(answer) || "(skipped)"}
                   </Text>
                 </Box>
               ) : null}
@@ -606,7 +606,7 @@ export function ClarifyPrompt({
                             {...chipRowProps(t, sel === ci)}
                           >
                             {sel === ci ? "▸ " : "  "}
-                            {ci + 1}. {c}
+                            {ci + 1}. {visibleControls(c)}
                           </Text>
                         </Text>
                       ),
@@ -657,7 +657,7 @@ export function ClarifyPrompt({
         <Text key={i}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? "▸ " : "  "}
-            {i + 1}. {c}
+            {i + 1}. {visibleControls(c)}
           </Text>
         </Text>
       ))}
