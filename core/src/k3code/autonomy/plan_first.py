@@ -90,7 +90,10 @@ class PlanFirst:
         return autonomy_cfg(self.server.config)
 
     def gate_applies(self, session: Any) -> bool:
-        cfg = self.cfg
+        # the session's own settings: a concurrent config experiment on gate_modes reaches its treatment arm only
+        from k3code.learning.optimizer import session_settings
+
+        cfg = autonomy_cfg(session_settings(self.server.config, getattr(session, "session_id", None)))
         if session.background and not cfg["gate_unattended"]:
             return False  # unattended runs are pre-approved: nobody is there to approve a plan
         override = getattr(session, "scope_override", None)

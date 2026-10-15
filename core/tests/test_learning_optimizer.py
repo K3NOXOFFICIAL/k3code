@@ -283,14 +283,14 @@ def test_rollback_of_a_key_that_was_absent_resets_the_live_value_to_its_default(
     live = Settings()
     xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
     xp.start(
-        {"title": "t", "patch": {"context": {"compact_input_chars": 9000}}},
+        {"title": "t", "patch": {"router": {"max_inline_wait": 45}}},  # shared by every session: before/after
         metrics_for(0.1),
         sessions=1,
         config_path=cfg,
     )
-    assert live.context == {"compact_input_chars": 9000}
+    assert live.router == {"max_inline_wait": 45}
     xp.rollback("x1", config_path=cfg)
-    assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
+    assert live.router == Settings().router and "router" not in confio.read_yaml(cfg)
 
 
 def test_a_second_experiment_is_refused_while_one_is_active(tmp_path):
@@ -576,7 +576,8 @@ def test_the_optimizer_allowlist_rejects_permissions_sandbox_caps_halt_channels_
         check_optimizer_patch(ok)
 
 
-def test_an_auto_applied_change_that_regresses_is_rolled_back_and_the_live_value_restored(tmp_path):
+def test_an_auto_applied_change_that_regresses_is_rolled_back_and_the_live_value_restored(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
     cfg = tmp_path / "config.yaml"
     live = Settings()
     xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
@@ -586,11 +587,15 @@ def test_an_auto_applied_change_that_regresses_is_rolled_back_and_the_live_value
         sessions=1,
         config_path=cfg,
     )
-    assert live.context == {"tool_output_chars": 6000} and xp.get("x1")["auto"] is True
+    # a per-session key: only the treatment arm runs it, the shared config and the live settings are untouched
+    assert live.context == Settings().context and not cfg.exists() and xp.get("x1")["auto"] is True
+    treated = next(f"s{i}" for i in range(100) if optimizer.arm("x1", f"s{i}") == "treatment")
+    assert optimizer.session_settings(live, treated).context == {"tool_output_chars": 6000}
     notes: list[str] = []
-    xp.session_done(lambda since: metrics_for(0.9), notes.append, cfg)
+    xp.session_done(lambda since: ab_window("x1", treatment_esc=0.9, control_esc=0.1), notes.append, cfg)
     assert xp.get("x1")["status"] == "rolled_back" and "rolled back automatically" in notes[0]
-    assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
+    assert optimizer.session_settings(live, treated) is live  # the treatment arm is back on the shared settings
+    assert live.context == Settings().context and not cfg.exists()
 
 
 async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_logged(tmp_path, monkeypatch):
@@ -613,9 +618,12 @@ async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_lo
         assert server.learning.replays.append(rec)
 
     await server.learning.run_optimizer()
-    assert server.config.context == {"tool_output_chars": 6000}  # live, not only the YAML
     (exp,) = server.learning.experiments.all()
-    assert exp["auto"] is True and exp["status"] == "active"
+    assert exp["auto"] is True and exp["status"] == "active" and exp["design"] == "concurrent"
+    # a concurrent A/B: the treatment arm's sessions run the clip, the shared config waits for the verdict
+    assert server.config.context == Settings().context
+    treated = next(f"s{i}" for i in range(100) if optimizer.arm(exp["id"], f"s{i}") == "treatment")
+    assert optimizer.session_settings(server.config, treated).context == {"tool_output_chars": 6000}
     (row,) = server.learning.log.query("auto_apply", since=0, actor=None)  # logged as an automatic decision
     assert row["detail"]["experiment"] == exp["id"] and row["choice"] == "applied"
     await server.learning.run_optimizer()  # already in effect: no second experiment
@@ -675,7 +683,7 @@ async def test_optimizer_run_reports_what_it_applied_automatically(tmp_path, mon
     out = (await call(server, "command.dispatch", {"name": "optimizer", "arg": "run"}))["output"]
 
     (exp,) = server.learning.experiments.all()
-    assert server.config.context == {"tool_output_chars": 6000}
+    assert exp["design"] == "concurrent" and server.config.context == Settings().context  # treatment arm only
     assert "applied automatically" in out.lower() and exp["id"] in out and exp["title"] in out
     assert f"/optimizer rollback {exp['id']}" in out
     await server.close()
@@ -737,3 +745,169 @@ async def test_a_rolled_back_auto_candidate_is_not_applied_again_next_week(tmp_p
 def test_quality_ignores_provider_failovers():
     base = metrics_for(0.2)
     assert optimizer.quality({**base, "failure_rate": 0.05}) == optimizer.quality({**base, "failure_rate": 0.0})
+
+
+def success_window(home, xid, treatment_kept, control_kept, per_arm=12, turns=4):
+    """One period split by ``optimizer.arm``, every session with the same calls and no escalation: only what happened
+    to its turns differs. ``*_kept`` of each session's ``turns`` turns were kept, the rest undone."""
+    log = DecisionLog(home, FakeClock())
+    usage, counts = [], {"treatment": 0, "control": 0}
+    while min(counts.values()) < per_arm:
+        sid = f"w{next(_sids)}"
+        side = optimizer.arm(xid, sid)
+        if counts[side] >= per_arm:
+            continue
+        counts[side] += 1
+        usage += rows(0, 10, 0, session=sid)
+        kept = treatment_kept if side == "treatment" else control_kept
+        for i in range(turns):
+            log.record_turn(f"{sid}-{i}", ts=1, session=sid, status="done", undone=i >= kept)
+        log.settle_turns(sid)
+    return optimizer.collect(usage, log, [], since=0)
+
+
+def test_ab_judges_turn_success_not_turn_completion(tmp_path, monkeypatch):
+    """Issue #140: every turn of both arms finished, so completion saw no difference. The treatment's turns were
+    mostly undone; it is rolled back, and the result says why."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start({"title": "p", "name": "terse", "prompt": "Be terse."}, metrics_for(0.1), sessions=1)
+    m = success_window(tmp_path / "w1", "x1", treatment_kept=1, control_kept=4)
+    assert m["turn_completion_rate"] is None and m["turn_success_rate"] == 0.625  # (12 + 48) / 96
+    notes: list[str] = []
+    xp.session_done(lambda since: m, notes.append)
+    x = xp.get("x1")
+    assert x["status"] == "rolled_back"
+    assert x["result"]["success"] == {"treatment": 0.25, "control": 1.0}
+    assert "turn success 25% vs 100%" in notes[0]
+    # with the turns kept alike, the same overlay is kept
+    xp2 = optimizer.Experiments(tmp_path / "again", FakeClock())
+    xp2.start({"title": "p", "name": "terse", "prompt": "Be terse."}, metrics_for(0.1), sessions=1)
+    xp2.session_done(lambda since: success_window(tmp_path / "w2", "x1", treatment_kept=4, control_kept=4))
+    assert xp2.get("x1")["status"] == "kept"
+
+
+def test_a_control_arm_without_turn_outcomes_is_compared_without_them():
+    """A before/after control stored by an older version has no scored turns: the treatment's failures alone would
+    bias the judgement, so neither arm's success term counts."""
+    base = {"calls": 10, "escalated": 0, "loop_guard": 0, "approvals": 0, "tokens": 0, "turns": 4}
+    treated = [{**base, "scored": 4, "passed": 0}] * 12
+    old_control = [dict(base)] * 12
+    t, c = optimizer.arm_scores(treated, old_control)
+    assert t == c
+
+
+def _session_in(xid, side):
+    return next(f"s{i}" for i in range(200) if optimizer.arm(xid, f"s{i}") == side)
+
+
+def test_a_per_session_config_overlay_gets_a_concurrent_control_arm(tmp_path, monkeypatch):
+    """Issue #140: a config overlay compared the week before with the week after, whatever its key. One whose keys a
+    session's own build reads now splits the sessions by the same hash as a prompt overlay."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("context:\n  memory_chars: 20000\n")
+    live = Settings(context={"memory_chars": 20000})
+    xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
+    patch = {"context": {"memory_chars": 8000}, "autonomy": {"gate_modes": ["auto", "default"]}}
+    x = xp.start({"title": "t", "patch": patch}, metrics_for(0.1, n=0), sessions=1, config_path=cfg)  # no history
+    assert x["design"] == "concurrent" and "applied per session" in x["design_note"] and "control" not in x
+    assert confio.read_yaml(cfg) == {"context": {"memory_chars": 20000}} and live.context == {"memory_chars": 20000}
+    treated, held_back = _session_in("x1", "treatment"), _session_in("x1", "control")
+    own = optimizer.session_settings(live, treated)
+    assert own.context == {"memory_chars": 8000} and own.autonomy == {"gate_modes": ["auto", "default"]}
+    assert optimizer.session_settings(live, held_back) is live and live.context == {"memory_chars": 20000}
+    assert "concurrent A/B" in xp.format_status()
+    # judged like a prompt overlay: the arms of one period
+    xp.session_done(lambda since: ab_window("x1", treatment_esc=0.7, control_esc=0.1), config_path=cfg)
+    assert xp.get("x1")["status"] == "rolled_back" and xp.get("x1")["result"]["n_control"] == 12
+    assert confio.read_yaml(cfg) == {"context": {"memory_chars": 20000}}  # nothing was written, nothing to restore
+    assert optimizer.session_settings(live, treated) is live
+
+
+def test_a_key_shared_by_every_session_keeps_the_before_after_design_and_says_why(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    patch = {"context": {"memory_chars": 8000}, "task_tiers": {"title": "main"}}
+    x = xp.start({"title": "t", "patch": patch}, metrics_for(0.1), sessions=1, config_path=cfg)
+    assert x["design"] == "before_after" and len(x["control"]) == 12
+    assert x["design_note"] == "task_tiers.title cannot be applied per session: compared with the week before"
+    assert confio.read_yaml(cfg) == patch  # the shared config changes at the start
+    assert "before/after: task_tiers.title cannot be applied per session" in xp.format_status()
+
+
+def test_a_kept_concurrent_config_overlay_is_applied_to_every_session_and_can_be_rolled_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("context:\n  tool_output_chars: 10000\n")
+    live = Settings(context={"tool_output_chars": 10000})
+    xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
+    patch = {"context": {"tool_output_chars": 6000}}
+    xp.start({"title": "clip", "patch": patch}, metrics_for(0.1), sessions=1, config_path=cfg)
+    notes: list[str] = []
+    xp.session_done(lambda since: ab_window("x1", treatment_esc=0.1, control_esc=0.1), notes.append, cfg)
+    x = xp.get("x1")
+    assert x["status"] == "kept" and "applied to every session" in notes[-1]
+    assert confio.read_yaml(cfg)["context"]["tool_output_chars"] == 6000 and live.context["tool_output_chars"] == 6000
+    assert x["prev"] == {"context": {"tool_output_chars": 10000}}
+    assert xp.rollback("x1", config_path=cfg)
+    assert confio.read_yaml(cfg)["context"]["tool_output_chars"] == 10000 and live.context["tool_output_chars"] == 10000
+
+
+def test_session_settings_leave_the_shared_config_alone_and_are_off_with_learning(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    live = Settings(context={"tool_output_chars": 10000, "keep_messages": 4})
+    optimizer.Experiments(tmp_path, FakeClock()).start(
+        {"title": "clip", "patch": {"context": {"tool_output_chars": 6000}}}, metrics_for(0.1)
+    )
+    treated = _session_in("x1", "treatment")
+    own = optimizer.session_settings(live, treated)
+    assert own.context == {"tool_output_chars": 6000, "keep_messages": 4}  # merged into the session's own copy
+    assert live.context == {"tool_output_chars": 10000, "keep_messages": 4}
+    assert optimizer.session_settings(live, None) is live
+    off = Settings(context={"tool_output_chars": 10000}, learning={"enabled": False})
+    assert optimizer.session_settings(off, treated) is off
+    # only the per-session settings ever reach a session, whatever experiments.json says
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    items = xp.all()
+    items[0]["patch"] = {
+        "context": {"tool_output_chars": 6000},
+        "autonomy": {"plan_first": False, "gate_modes": ["auto"]},
+        "permissions": {"bash": {"*": "allow"}},
+    }
+    xp._save(items)
+    own = optimizer.session_settings(live, treated)
+    assert own.autonomy == {"gate_modes": ["auto"]} and own.permissions == live.permissions
+
+
+async def test_a_treatment_session_builds_with_the_patch_and_a_control_session_without(tmp_path, monkeypatch):
+    """The session build reads the overlay of the session's arm: its loop's tool-result clip, its system prompt's
+    memory limit and its scope gate's modes."""
+    from k3code.prompting import build_system_prompt
+    from test_permissions_gateway import call, make_server
+
+    (tmp_path / "K3CODE.md").write_text("m" * 3000)  # project memory longer than the treatment's limit
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch, context={"tool_output_chars": 10000})
+    patch = {
+        "context": {"tool_output_chars": 4321, "memory_chars": 500},
+        "autonomy": {"gate_modes": ["auto", "default"]},
+    }
+    msg = server.learning._apply_overlay({"title": "per session", "patch": patch})
+    assert "concurrent A/B" in msg and server.config.context == {"tool_output_chars": 10000}
+    built: dict[str, tuple] = {}
+    for _ in range(60):  # sessions until both arms have one
+        sid = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
+        side = optimizer.arm("x1", sid)
+        if side in built:
+            continue
+        live = server.live[sid]
+        loop = server._build_loop(
+            live, await server._reliability_for(live), server.router, TaskKind.INTERACTIVE_TURN, None
+        )
+        prompt = build_system_prompt("base", cwd=tmp_path, config=server.config, session_id=sid)
+        built[side] = (loop.tool_output_chars, "m" * 1000 in prompt, server.autonomy.gate_applies(live))
+        if len(built) == 2:
+            break
+    # default permission mode: the gate runs there only with the patch's gate_modes
+    assert built == {"treatment": (4321, False, True), "control": (10000, True, False)}
+    await server.close()

@@ -82,6 +82,7 @@ from k3code.gateway.protocol import (
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, TurnEvidence, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
+from k3code.learning import optimizer
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.memory import fenced
@@ -306,6 +307,11 @@ class LiveSession:
         self.current_kind = "interactive_turn"
         #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
         self.turn_id = ""
+        #: The user stopped the turn in flight (/stop, Esc: ``interrupt_turn``); reset when the next turn starts. A
+        #: cancellation without it (daemon stop, deleted session) is not the user's verdict on the work (issue #140).
+        self.user_stopped = False
+        #: Approval prompts of the turn in flight the user answered "deny".
+        self.turn_denials = 0
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
@@ -737,6 +743,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        self.learning.settle_turns(sid)  # the session ended: its last turn can no longer be undone
         await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
@@ -1775,6 +1782,10 @@ class GatewayServer:
         pasted = text.paste_spans if isinstance(text, TypedPrompt) else ()
         prompt = text = str(text)  # the marker only says who wrote it (and which parts were pasted)
         mgr = self.goal_manager(session)
+        # a new prompt moves the session on: an /undo now removes its turn, never an earlier one, so the earlier turns'
+        # outcomes stop waiting for one (issue #140). A goal's continuations are not new prompts: /undo can still
+        # step back through them one by one.
+        self.learning.settle_turns(session.session_id)
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
@@ -1807,6 +1818,7 @@ class GatewayServer:
                     # The provider says the conversation does not fit: drop this attempt's messages, fold the older
                     # history into a summary, and run the prompt once more.
                     session.stored.messages = session.stored.messages[:n_before]
+                    self.learning.discard_turn(session.turn_id)  # this attempt is thrown away; the rerun is the turn
                     if await self._maybe_compact(session, force=True):
                         n_before = len(session.stored.messages)  # the summary replaced the history
                         status, final_text = await self._run_one_turn(session, prompt)
@@ -1844,6 +1856,7 @@ class GatewayServer:
             decision = await mgr.evaluate_after_turn(
                 final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer, evidence=evidence
             )
+            self.learning.turn_judged(session.turn_id, decision.verdict, decision.gate)
             self.emit_goal(session)
             if decision.message:
                 session.emit(
@@ -2053,7 +2066,13 @@ class GatewayServer:
             unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
-            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            # the session's own settings: a concurrent config experiment's treatment arm gets its clip (issue #140)
+            tool_output_chars=int(
+                (getattr(optimizer.session_settings(self.config, session.session_id), "context", None) or {}).get(
+                    "tool_output_chars", 0
+                )
+            )
+            or None,
             context_window=self._router_window(router, session),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
@@ -2164,6 +2183,9 @@ class GatewayServer:
         tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
+        session.user_stopped, session.turn_denials = False, 0
+        # where this turn's messages start in the stored conversation: an /undo that cuts there removes this turn
+        msg_start = len(session.stored.messages)
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -2408,6 +2430,7 @@ class GatewayServer:
             )
             if not prompt_blocked:  # a prompt a hook refused is not a task: nothing to log or learn from
                 self.autonomy.finish(session, gate, scope_outcome, final_text, text)
+                self._record_turn_outcome(session, scope_outcome, tier.value, kind.value, msg_start)
             if self.learning.enabled and not prompt_blocked:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
@@ -2444,6 +2467,30 @@ class GatewayServer:
             self._side_tasks.add(task)
             task.add_done_callback(self._side_tasks.discard)
         return status, final_text
+
+    def _record_turn_outcome(self, session: LiveSession, status: str, tier: str, kind: str, msg_start: int) -> None:
+        """The turn's outcome signals for the improvement engine (issue #140): how it ended (``outage`` kept apart
+        from ``error``), whether the user stopped it, its last test/check (``goals.turn_evidence``), the approvals
+        denied, and its slice of the stored conversation (what an /undo of it removes). The goal judge's verdict and
+        an /undo are added later; until then the outcome is pending. Never raises: it runs in ``finally``."""
+        try:
+            messages = session.stored.messages
+            test = turn_evidence(messages[msg_start:]).last_status() if len(messages) > msg_start else None
+        except Exception:  # noqa: BLE001 - the evidence is best effort; the outcome is still recorded
+            logger.warning("turn evidence for the outcome failed", exc_info=True)
+            messages, test = session.stored.messages, None
+        self.learning.record_turn_outcome(
+            session,
+            session.turn_id,
+            status=status,
+            tier=tier,
+            kind=kind,
+            interrupted=session.user_stopped,
+            test=test,
+            denials=session.turn_denials,
+            msg_start=msg_start,
+            msg_end=len(messages),
+        )
 
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
@@ -2562,7 +2609,8 @@ class GatewayServer:
         """
         if self.halted:  # the compaction call is a model call too
             return 0
-        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
+        own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
+        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
         messages = session.stored.messages
         if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0
@@ -2579,6 +2627,9 @@ class GatewayServer:
             return 0
         if folded:
             session.stored.messages = new
+            # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
+            # be matched to its turn, so their outcomes stop waiting for one
+            self.learning.settle_turns(session.session_id)
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
             session.emit(
@@ -2708,6 +2759,8 @@ class GatewayServer:
             choice = str(result.get("choice", "deny")).lower()
             if choice not in ("once", "session", "always"):
                 choice = "deny"
+            if choice == "deny":
+                session.turn_denials += 1
             reason = str(result.get("reason") or result.get("text") or "").strip()
             if choice in ("session", "always"):
                 session.perms.session_rules.extend(rules)
@@ -3296,6 +3349,7 @@ class GatewayServer:
             return False
         session.pending_prompts.clear()  # /stop means stop: what was queued behind the turn does not run either
         session.steer_queue.clear()
+        session.user_stopped = True  # the turn's outcome: stopped by the user (issue #140)
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
         self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
@@ -3636,6 +3690,7 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
     sid = _require(params, "session_id")
     deleted = server.store.delete(str(sid))
     live = server.live.pop(str(sid), None)
+    server.learning.settle_turns(str(sid))
     await tool_jobs.reap(str(sid))  # background bash jobs end with their session
     if live is not None:
         if live.turn_task is not None and not live.turn_task.done():
@@ -4296,6 +4351,8 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
             break
     if last_user is None:
         return {"removed": 0}
+    # the turn these messages came from was rejected: its outcome is a failure, not "finished" (issue #140)
+    server.learning.turn_undone(session, last_user)
     session.messages = messages[:last_user]
     server.store.save(session.stored)
     return {"removed": len(messages) - last_user}
