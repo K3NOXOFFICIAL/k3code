@@ -1,12 +1,20 @@
-"""When the TUI process dies without running its own exit handler (OOM kill, SIGKILL, crash), the launcher puts the
-terminal back (#153): alternate screen, mouse tracking, bracketed paste and the cursor are the TUI's to restore, and a
-killed TUI cannot. The launcher also reports a signal death as 128 + signo, not as ``sys.exit(-9)`` (= 247)."""
+"""When the TUI process dies without running its own exit handler (OOM kill, SIGKILL, crash), the terminal is put back
+(#153): alternate screen, mouse tracking, bracketed paste and the cursor are the TUI's to restore, and a killed TUI
+cannot. A signal death is reported as 128 + signo, not as ``sys.exit(-9)`` (= 247).
+
+The launcher does not wait for the TUI itself (#164): it imports most of the gateway before it starts the TUI, and
+that Python process stayed resident (about 47 MB) for the whole session doing nothing but waiting. It now execs into
+a small ``sh`` waiter (:data:`cli._TUI_WAITER`) that runs the TUI, writes the reset after an abnormal exit when
+stdout is a terminal, and exits with the TUI's status. These tests run that waiter for real, on a pty."""
 
 from __future__ import annotations
 
 import codecs
+import os
+import pty
 import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,100 +22,125 @@ import pytest
 
 from k3code import cli as cli_mod
 
-
-class _Tty:
-    """A stdout that says it is a terminal and keeps what the launcher writes to it."""
-
-    def __init__(self, *, tty: bool = True) -> None:
-        self.tty = tty
-        self.written: list[str] = []
-        self.flushes = 0
-
-    def isatty(self) -> bool:
-        return self.tty
-
-    def write(self, text: str) -> int:
-        self.written.append(text)
-        return len(text)
-
-    def flush(self) -> None:
-        self.flushes += 1
-
-    @property
-    def text(self) -> str:
-        return "".join(self.written)
+# What a TUI leaves armed in the terminal when it is killed mid-session.
+_KILL_SELF = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
 
 
-def _fake_tui(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str) -> None:
-    """Run ``script`` (Python) in place of ``node tui/dist/entry.js``: a real child process, a real exit status."""
+class _Exec(Exception):
+    """Raised by the stand-in for os.execve: the launcher handed its process over."""
+
+    def __init__(self, path: str, argv: list[str], env: dict[str, str]) -> None:
+        super().__init__(path)
+        self.path, self.argv, self.env = path, argv, env
+
+
+def _launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str) -> _Exec:
+    """Run ``_launch_tui`` with ``script`` (Python) as ``tui/dist/entry.js`` and capture the exec it ends in."""
     entry = tmp_path / "tui" / "dist" / "entry.js"
-    entry.parent.mkdir(parents=True)
+    entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text(script)
     import k3code.paths as paths_mod
 
     monkeypatch.setattr(paths_mod, "find_node", lambda: sys.executable)
     monkeypatch.setattr(cli_mod, "_find_repo_root", lambda: tmp_path)
 
+    def fake_execve(path, argv, env):
+        raise _Exec(path, list(argv), dict(env))
 
-def _launch(tty: _Tty, monkeypatch: pytest.MonkeyPatch) -> int:
-    monkeypatch.setattr(sys, "stdout", tty)
-    with pytest.raises(SystemExit) as exit_info:
-        cli_mod._launch_tui()
-    code = exit_info.value.code
-    assert isinstance(code, int)
-    return code
+    def waited(*_a, **_k):
+        pytest.fail("the launcher ran the TUI and waited on it instead of handing its process over")
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "execve", fake_execve)
+        m.setattr(subprocess, "run", waited)
+        with pytest.raises(_Exec) as handed:
+            cli_mod._launch_tui()
+    return handed.value
 
 
-# What a TUI leaves armed in the terminal when it is killed mid-session.
-_KILL_SELF = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+def _run_waiter(handed: _Exec, *, tty: bool = True) -> tuple[int, str]:
+    """Run the waiter the launcher exec'd into, with stdout on a pty (a terminal) or a pipe; its status and output."""
+    if not tty:
+        proc = subprocess.run(handed.argv, executable=handed.path, env=handed.env, stdout=subprocess.PIPE, check=False)
+        return proc.returncode, proc.stdout.decode()
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(handed.argv, executable=handed.path, env=handed.env, stdout=slave)
+        os.close(slave)
+        out = b""
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:  # EIO: the waiter closed its end
+                break
+            if not chunk:
+                break
+            out += chunk
+        return proc.wait(timeout=60), out.decode()
+    finally:
+        os.close(master)
+
+
+def test_the_launcher_hands_its_process_to_the_tui_waiter(tmp_path, monkeypatch):
+    """#164: no Python launcher stays resident while the TUI runs; the TUI's command line and environment go to the
+    waiter unchanged."""
+    handed = _launch(monkeypatch, tmp_path, "")
+    assert Path(handed.path).name == "sh" and handed.argv[1] == "-c" and handed.argv[2] == cli_mod._TUI_WAITER
+    assert handed.argv[-2:] == [sys.executable, str(tmp_path / "tui" / "dist" / "entry.js")]
+    assert handed.env["K3CODE_GATEWAY_CMD"].endswith("-m k3code.cli gateway --stdio")
 
 
 def test_killed_tui_gets_the_terminal_put_back(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, _KILL_SELF)
-    tty = _Tty()
-    _launch(tty, monkeypatch)
-    out = tty.text
+    rc, out = _run_waiter(_launch(monkeypatch, tmp_path, _KILL_SELF))
     for mode in (1000, 1002, 1003, 1004, 1006, 2004):
         assert f"\x1b[?{mode}l" in out, f"mode {mode} not disabled"
     assert "\x1b[?1049l" in out  # leaves the alternate screen
     assert out.endswith("\x1b[?25h")  # cursor visible, last so nothing hides it again
-    assert tty.flushes
 
 
 def test_killed_tui_exits_128_plus_the_signal(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, _KILL_SELF)
-    assert _launch(_Tty(), monkeypatch) == 128 + signal.SIGKILL
+    rc, _ = _run_waiter(_launch(monkeypatch, tmp_path, _KILL_SELF))
+    assert rc == 128 + signal.SIGKILL
 
 
 def test_crashed_tui_gets_the_terminal_put_back_and_keeps_its_status(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, "raise SystemExit(3)\n")
-    tty = _Tty()
-    assert _launch(tty, monkeypatch) == 3
-    assert "\x1b[?1049l" in tty.text and tty.text.endswith("\x1b[?25h")
+    rc, out = _run_waiter(_launch(monkeypatch, tmp_path, "raise SystemExit(3)\n"))
+    assert rc == 3
+    assert "\x1b[?1049l" in out and out.endswith("\x1b[?25h")
 
 
 def test_clean_exit_leaves_the_terminal_alone(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, "")
-    tty = _Tty()
-    assert _launch(tty, monkeypatch) == 0
-    assert tty.text == ""
+    rc, out = _run_waiter(_launch(monkeypatch, tmp_path, "print('bye', end='')\n"))
+    assert rc == 0
+    assert out == "bye"
 
 
 def test_nothing_is_written_when_stdout_is_not_a_terminal(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, _KILL_SELF)
-    tty = _Tty(tty=False)
-    assert _launch(tty, monkeypatch) == 128 + signal.SIGKILL
-    assert tty.text == ""
+    rc, out = _run_waiter(_launch(monkeypatch, tmp_path, _KILL_SELF), tty=False)
+    assert rc == 128 + signal.SIGKILL
+    assert out == ""
 
 
 def test_a_closed_stdout_does_not_hide_the_exit_status(tmp_path, monkeypatch):
-    _fake_tui(monkeypatch, tmp_path, "raise SystemExit(3)\n")
+    handed = _launch(monkeypatch, tmp_path, "raise SystemExit(3)\n")
+    proc = subprocess.run(handed.argv, executable=handed.path, env=handed.env, stdout=subprocess.DEVNULL, check=False)
+    assert proc.returncode == 3
 
-    class _Closed(_Tty):
-        def write(self, text: str) -> int:
-            raise ValueError("I/O operation on closed file")
 
-    assert _launch(_Closed(), monkeypatch) == 3
+def test_an_interrupt_waits_for_the_tui(tmp_path, monkeypatch):
+    """Ctrl+C before the TUI has its terminal in raw mode reaches the whole process group: the waiter outlives it, so
+    the TUI's own exit (and the reset after an abnormal one) still comes from the waiter."""
+    script = (
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGINT, lambda *_: sys.exit(5))\n"
+        "os.killpg(0, signal.SIGINT)\n"
+        "time.sleep(5)\n"
+    )
+    handed = _launch(monkeypatch, tmp_path, script)
+    proc = subprocess.run(
+        handed.argv, executable=handed.path, env=handed.env, start_new_session=True, check=False, timeout=60
+    )
+    assert proc.returncode == 5
 
 
 def test_reset_block_matches_the_tui(monkeypatch):

@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from k3code.gateway.server import _HANDLERS
 from test_autonomy_gateway import call, make, run_turn, start
 
@@ -125,6 +127,29 @@ async def test_the_live_tail_and_the_caps_have_the_shape_the_tui_reads(tmp_path,
     assert (await call(server, "subagent.tail", {"subagent_id": "nope"}))["available"] is False
     caps = await call(server, "delegation.status", {})
     assert caps["max_concurrent_children"] == 3 and caps["max_spawn_depth"] == 2
+
+
+async def test_a_finished_child_row_says_how_long_it_ran(tmp_path, monkeypatch):
+    """#170 idle repaint: the TUI times a finished child's linger in the agent strip from ``started_at`` plus
+    ``duration_seconds``. Without the duration a child of an earlier turn (known only from this list once the turn's
+    events are cleared) never left the strip, and its clock repainted the idle TUI every second for good."""
+    from test_subagents import final, task_call
+
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "PARENT: delegate it")
+    (row,) = (await call(server, "subagent.list", {"session_id": server.session.session_id}))["subagents"]
+    handle = server.subagents.handles[row["subagent_id"]]
+    assert row["status"] == "completed"
+    assert row["duration_seconds"] == pytest.approx(handle.finished_at - handle.started_at)
+    handle.status, handle.finished_at = "running", 0.0  # a running child has no duration yet
+    (row,) = (await call(server, "subagent.list", {"session_id": server.session.session_id}))["subagents"]
+    assert row["duration_seconds"] is None
 
 
 async def test_the_command_catalog_lists_the_gateways_commands_for_help_and_alias_resolution(tmp_path, monkeypatch):

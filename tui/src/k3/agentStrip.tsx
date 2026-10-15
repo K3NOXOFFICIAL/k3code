@@ -125,9 +125,11 @@ export function buildStripRows(
         a.notes.at(-1) ||
         a.tools.at(-1) ||
         (state === "working" ? "starting…" : a.status),
+      // Only a working agent is timed from its start. A finished one whose run time is unknown shows no time: its
+      // clock counted on from the start for good and repainted the idle TUI every second (#170).
       elapsedSeconds:
         a.durationSeconds ??
-        (a.startedAt != null
+        (state === "working" && a.startedAt != null
           ? Math.max(0, (nowMs - a.startedAt) / 1000)
           : null),
       id: a.id,
@@ -221,9 +223,12 @@ export function AgentStrip({ cols }: { cols: number }) {
     () => buildStripRows(subagents, sessions, now, sid),
     [subagents, sessions, now, sid],
   );
-  // tick while something runs, and while a finished agent row still has to expire (FINISHED_LINGER_MS)
+  // tick while something runs, and while a finished agent row still has to expire (FINISHED_LINGER_MS); a finished
+  // row without a run time (elapsedSeconds null) never expires, so it must not keep the clock going (#170)
   const live = rows.some(
-    (r) => r.state === "working" || (r.kind === "agent" && r.state !== "input"),
+    (r) =>
+      r.state === "working" ||
+      (r.kind === "agent" && r.state !== "input" && r.elapsedSeconds != null),
   );
 
   useEffect(() => {

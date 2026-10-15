@@ -666,6 +666,37 @@ def test_always_rules_are_exact_for_wildcard_unsafe_commands(tmp_path: Path, cmd
     assert [r.pattern for r in suggest_rules("bash", d)] == expected
 
 
+#: (command, the rule an "always" approval proposes) for commands whose flags come before their arity prefix: the
+#: prefix drops the flags and keeps their values (`git -C sub commit` -> `git sub`), so `<prefix> *` never matched the
+#: command that was approved (asked again every time) or named another one (#170). They are kept exact.
+FLAG_FIRST: list[tuple[str, str]] = [
+    ("git --no-pager log -5", "git --no-pager log -5"),
+    ("git -C sub commit -m x", "git -C sub commit -m x"),
+    ("kubectl -n prod get pods", "kubectl -n prod get pods"),
+    ("docker compose -f x.yml up", "docker compose -f x.yml up"),
+    ("npm --prefix tui run build", "npm --prefix tui run build"),
+    # flags after the prefix keep the wildcard
+    ("git commit -m 'fix it'", "git commit *"),
+    ("npm run build -- --watch", "npm run build *"),
+    ("rm -rf build", "rm *"),
+    ("cargo +nightly build", "cargo +nightly *"),
+    ("API_KEY=sk-live-1 git --no-pager log", "git --no-pager log"),
+]
+
+
+@pytest.mark.parametrize(("cmd", "expected"), FLAG_FIRST)
+def test_an_always_rule_matches_the_command_it_was_approved_for(tmp_path: Path, cmd: str, expected: str) -> None:
+    from k3code.permissions.engine import suggest_rules
+
+    d = _decide(cmd, "default", tmp_path)
+    assert d.action == "ask", cmd
+    rules = suggest_rules("bash", d)
+    assert [r.pattern for r in rules] == [expected]
+    if "=" not in cmd.split()[0]:  # a leading VAR=value is dropped from the rule (secrets), so that one still asks
+        again = decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, session_rules=rules)
+        assert again.action == "allow", f"{cmd}: approved 'always', asked again"
+
+
 #: (learned pattern, rejected)
 LEARNED: list[tuple[str, bool]] = [
     ("uv *", True),

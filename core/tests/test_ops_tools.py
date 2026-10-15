@@ -777,6 +777,57 @@ async def test_goal_gate_and_fanout_children_never_get_provider_keys(tmp_path, m
         assert "K3CODE_API_KEY" not in text and "OMNIROUTE_API_KEY" not in text
 
 
+async def test_a_background_bash_the_sandbox_refuses_is_refused_before_anyone_is_asked(tmp_path, monkeypatch):
+    """#170: a /bg session's bash that asks (default mode) went to the TUI as an approval, the user approved it, and
+    the sandbox then refused it anyway (no usable bwrap, or a root it will not bind). The refusal now comes first: no
+    prompt for a command that cannot run, and nothing is spawned."""
+    from k3code.agent.loop import AgentLoop, ApprovalResult
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    asked: list[str] = []
+
+    async def approve(tool, args, decision):
+        asked.append(str(args.get("command")))
+        return ApprovalResult("once")
+
+    async def refuse_spawn(*argv, **kwargs):
+        raise AssertionError("a refused command must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", refuse_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_spawn)
+
+    def run(cwd: Path):
+        loop = AgentLoop(
+            _R(),  # type: ignore[arg-type]
+            system_prompt="x",
+            cwd=cwd,
+            permission_mode="default",
+            headless=False,
+            background=True,
+            approval_callback=approve,
+        )
+        return loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+
+    # no usable bwrap: unattended bash is refused
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    result = await run(tmp_path)
+    assert "bash refused" in result["error"] and "bubblewrap is unusable" in result["error"]
+    assert asked == []
+
+    # bwrap works, but the session is rooted at the home directory, which the sandbox never binds writable
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    result = await run(home)
+    assert "bash refused" in result["error"] and "project directory" in result["error"]
+    assert asked == []
+    assert not (tmp_path / "made.txt").exists() and not (home / "made.txt").exists()
+
+
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
 async def test_unattended_gate_and_fanout_argv_start_with_bwrap(tmp_path, monkeypatch):
     from k3code.autonomy.fanout import run_tests
