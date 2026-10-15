@@ -211,6 +211,34 @@ class DecisionLog:
             outcomes = self._db.execute("DELETE FROM turn_outcomes WHERE ts < ?", (cutoff,))
         return cur.rowcount + outcomes.rowcount
 
+    def delete_project(self, cwd: str | Path) -> int:
+        """Delete the rows of the project ``cwd`` is in (``/learned purge``); returns how many.
+
+        A row is filed under ``project_id`` of the directory it was recorded in: the git remote when there is one,
+        else a hash of that directory. So the project's rows are those filed under its id plus those recorded
+        anywhere in the same repository (``identity_root``): without a remote, a subdirectory or a fan-out worktree
+        has an id of its own. A repository nested inside this one is a project of its own and keeps its rows, and so
+        do the rows that name no directory (the optimizer's, which belong to no project).
+        """
+        from k3code.memory import identity_root
+
+        here = identity_root(cwd)
+        recorded = [str(r[0]) for r in self._db.execute("SELECT DISTINCT cwd FROM decisions WHERE cwd != ''")]
+        cwds = [c for c in recorded if identity_root(c) == here]  # resolved: a symlinked path is the same project
+        n = 0
+        with self._db:
+            n += self._db.execute("DELETE FROM decisions WHERE project = ?", (project_id(cwd),)).rowcount
+            for c in cwds:
+                n += self._db.execute("DELETE FROM decisions WHERE cwd = ?", (c,)).rowcount
+        return n
+
+    def delete_all(self) -> int:
+        """Delete every row of every project (``/learned purge --all``); returns how many. The ``decisions.jsonl``
+        an old version left behind (``.migrated``, read by nothing) holds decisions too and goes with them."""
+        (self.home / "decisions.jsonl.migrated").unlink(missing_ok=True)
+        with self._db:
+            return self._db.execute("DELETE FROM decisions").rowcount
+
     def close(self) -> None:
         self._db.close()
 

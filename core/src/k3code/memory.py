@@ -1,6 +1,9 @@
 """Memory files: the user's (``$K3CODE_HOME/memory/USER.md``), the project's rules (``.k3code/rules/*.md`` at the
 repository root) and its instruction files (K3CODE.md, AGENTS.md, CLAUDE.md) in every directory from the repository
-root down to the session's directory, nearest last. A line ``@path`` imports another file in its place."""
+root down to the session's directory, nearest last. A line ``@path`` imports another file in its place.
+
+``scan_memory`` is the one list of those files (``load_memory`` reads it, ``/memory`` shows it) and ``plan_memory``
+the one place the caps are applied (``memory_prompt`` writes it, ``/memory`` reports it)."""
 
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from k3code.paths import ensure_private_dir, home, main_checkout, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
@@ -59,6 +63,13 @@ def identity_root(cwd: str | Path) -> Path:
 
 def user_memory_path() -> Path:
     return home() / "memory" / "USER.md"
+
+
+def memory_limit(config: Any) -> int:
+    """The per-file cap the prompt applies: ``context.memory_chars`` (a knob the optimizer may tune), else
+    MAX_MEMORY_CHARS. One place, so ``/memory`` reports the cap the prompt build really uses."""
+    ctx = getattr(config, "context", None) or {}
+    return int(ctx.get("memory_chars", MAX_MEMORY_CHARS))
 
 
 def project_memory_path(cwd: str | Path, *, for_write: bool = False) -> Path:
@@ -143,6 +154,7 @@ class MemoryFile:
     path: Path
     text: str  # with its @imports expanded; cut where the caps cut it (see load_memory)
     truncated: bool = False  # the file goes on past ``text``
+    imports: tuple[Path, ...] = ()  # the files its @imports pulled into ``text`` (nested ones too), in reading order
 
 
 def _within(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -199,21 +211,32 @@ def _import_refusal(target: Path) -> str:
         return "not a text file" if b"\0" in f.read(_SNIFF_BYTES) else ""
 
 
-def _expand(path: Path, roots: tuple[Path, ...], stack: tuple[Path, ...], want: int, lead: bool) -> tuple[str, bool]:
+def _expand(
+    path: Path,
+    roots: tuple[Path, ...],
+    stack: tuple[Path, ...],
+    want: int,
+    lead: bool,
+    found: list[Path] | None = None,
+) -> tuple[str, bool]:
     """``expand_imports`` cut to ``want`` characters: the text, and whether anything but whitespace was left out.
 
     The text is exactly the start of the full expansion (``lead``: with its leading whitespace dropped) and holds
-    ``want`` characters when something was left out, fewer when the file ended first.
+    ``want`` characters when something was left out, fewer when the file ended first. ``found`` gets the files the
+    text's @imports came from, in reading order (an import past the cut is not read and not listed).
     """
     while True:
-        text, more, short = _expand_once(path, roots, stack, want, lead)
+        imported: list[Path] = []  # this pass's; a pass that reads on is redone, and its imports with it
+        text, more, short = _expand_once(path, roots, stack, want, lead, imported)
         if not short:
+            if found is not None:
+                found += imported
             return text, more
         want += short  # the expansion came out shorter than what was read (CRLF, an import that vanished): read on
 
 
 def _expand_once(
-    path: Path, roots: tuple[Path, ...], stack: tuple[Path, ...], want: int, lead: bool
+    path: Path, roots: tuple[Path, ...], stack: tuple[Path, ...], want: int, lead: bool, found: list[Path]
 ) -> tuple[str, bool, int]:
     """One pass of ``_expand`` over the first ``want`` characters; the last value is how many are still missing
     when the file goes on past what was read (0 when the pass is final)."""
@@ -281,7 +304,8 @@ def _expand_once(
             if room <= 0:
                 more = True
                 break
-            text, cut = _expand(target, roots, stack, room, not started)
+            found.append(target)
+            text, cut = _expand(target, roots, stack, room, not started, found)
             add(text if cut else text.rstrip("\n"))
             if cut:
                 more = True
@@ -328,37 +352,85 @@ def _chain(root: Path, cwd: Path) -> list[Path]:
     return [*reversed([d for d in (cwd, *cwd.parents) if d == root or root in d.parents])]
 
 
+#: What ``scan_memory`` found at a source. Only READ ones reach the prompt.
+READ = "read"
+MISSING = "missing"  # no such file (for the rules: no ``.k3code/rules/*.md``)
+EMPTY = "empty"  # nothing but whitespace
+SAME = "same"  # the same text as an earlier file, which the prompt already holds
+REFUSED = "refused"  # a symlink leaving the allowed directories, or a credential location: never read
+UNREADABLE = "unreadable"  # reading it failed
+OFF = "off"  # the learned notes with ``learning.enabled: false``
+
+
+@dataclass
+class MemorySource:
+    """A file the memory loader looks at for a directory, and what it found there (see ``scan_memory``)."""
+
+    scope: str  # "user" | "rules" | "project" | "learned"
+    path: Path
+    status: str  # READ, MISSING, EMPTY, SAME, REFUSED, UNREADABLE or OFF
+    file: MemoryFile | None = None  # its text, when READ
+    same_as: Path | None = None  # SAME: the earlier file that gave this text
+    #: What the prompt shows of it after the caps (set by ``plan_memory``); None when it is left out.
+    body: str | None = None
+    #: Set by ``plan_memory``: "" (whole), "file" (cut at the per-file limit), "total" (cut short where the total
+    #: cap ran out) or "dropped" (left out, no room was left in the total).
+    cut: str = ""
+
+
+def _source(scope: str, path: Path, roots: tuple[Path, ...], seen: dict[str, Path], max_chars: int) -> MemorySource:
+    """What the loader finds at one candidate file; ``seen`` maps each text read so far to the file it came from."""
+    if not path.is_file():
+        return MemorySource(scope, path, MISSING)
+    if not _readable(path, roots):
+        return MemorySource(scope, path, REFUSED)
+    imports: list[Path] = []
+    try:
+        text, cut = _expand(path, roots, (), max(max_chars, 0) + 1, True, imports)
+    except OSError:
+        return MemorySource(scope, path, UNREADABLE)
+    text = text if cut else text.strip()  # a cut text ends where the cap fell, whitespace or not
+    if not text:
+        return MemorySource(scope, path, EMPTY)
+    if text in seen:
+        return MemorySource(scope, path, SAME, same_as=seen[text])
+    seen[text] = path
+    return MemorySource(scope, path, READ, MemoryFile(scope, path, text, cut, tuple(imports)))
+
+
+def scan_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[MemorySource]:
+    """Every file the memory loader considers for ``cwd``, in prompt order, with what it found there: the user's
+    memory, the project's rules (one MISSING entry for ``.k3code/rules/*.md`` when there are none), then the
+    instruction files from the repository root down to ``cwd``. ``load_memory`` is the READ ones; ``/memory`` lists
+    them all, so the listing and the prompt cannot disagree about which files count.
+
+    A file is never read whole: see ``load_memory`` for how its text is cut.
+    """
+    root = project_root(cwd)
+    seen: dict[str, Path] = {}
+    out = [_source("user", user_memory_path(), (Path.home().resolve(), home().resolve()), seen, max_chars)]
+    rules = root.joinpath(*RULES_DIR)
+    if rules.is_dir() and not _readable(rules, (root,)):
+        out.append(MemorySource("rules", rules, REFUSED))  # a symlinked rules directory leading out: not read
+    elif rules.is_dir() and (rule_files := sorted(rules.glob("*.md"))):
+        out += [_source("rules", p, (root,), seen, max_chars) for p in rule_files]
+    else:
+        out.append(MemorySource("rules", rules / "*.md", MISSING))
+    for d in _chain(root, Path(cwd).resolve()):
+        out += [_source("project", d / name, (root,), seen, max_chars) for name in PROJECT_FILES]
+    return out
+
+
 def load_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[MemoryFile]:
     """Existing memory files in prompt order: the user's, the project's rules, then the instruction files from the
     repository root down to ``cwd`` (more specific, later). A file whose text another one already gave is skipped.
+    The READ entries of ``scan_memory``.
 
     A file is never read whole: its text, imports included, is cut at ``max_chars`` + 1 characters, so a caller
     that shows ``max_chars`` of it can tell the file went on. The text is what the full expansion stripped of
     whitespace would start with; ``truncated`` says whether more than whitespace was left out.
     """
-    root = project_root(cwd)
-    candidates: list[tuple[str, Path, tuple[Path, ...]]] = []
-    user = user_memory_path()
-    candidates.append(("user", user, (Path.home().resolve(), home().resolve())))
-    rules = root.joinpath(*RULES_DIR)
-    if rules.is_dir() and _readable(rules, (root,)):
-        candidates += [("rules", p, (root,)) for p in sorted(rules.glob("*.md"))]
-    for d in _chain(root, Path(cwd).resolve()):
-        candidates += [("project", d / name, (root,)) for name in PROJECT_FILES]
-    out: list[MemoryFile] = []
-    seen: set[str] = set()
-    for scope, path, roots in candidates:
-        if not path.is_file() or not _readable(path, roots):
-            continue
-        try:
-            text, cut = _expand(path, roots, (), max(max_chars, 0) + 1, True)
-        except OSError:
-            continue
-        text = text if cut else text.strip()  # a cut text ends where the cap fell, whitespace or not
-        if text and text not in seen:
-            seen.add(text)
-            out.append(MemoryFile(scope, path, text, cut))
-    return out
+    return [s.file for s in scan_memory(cwd, max_chars) if s.file is not None]
 
 
 def fenced(label: str, body: str) -> str:
@@ -384,35 +456,64 @@ def _claim_order(files: list[MemoryFile], root: Path) -> list[int]:
     return sorted(range(len(files)), key=key)
 
 
+def plan_memory(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> list[MemorySource]:
+    """``scan_memory`` with what the prompt shows of each READ file: its ``body`` after the caps and how it was
+    ``cut``. Each file is capped at ``limit`` characters and all of them together at ``total``. The budget goes to the
+    user's memory first, then to the files nearest ``cwd`` and outward (``_claim_order``), so what runs out is the
+    repository root's text, not the rules of the directory being worked in. ``memory_prompt`` writes the prompt from
+    this and ``/memory`` lists it, so both say the same."""
+    root = project_root(cwd)
+    sources = scan_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
+    read = [(s, s.file) for s in sources if s.file is not None]
+    left = total
+    for i in _claim_order([m for _, m in read], root):
+        s, m = read[i]
+        cut = m.truncated or len(m.text) > limit
+        body = m.text[:limit] + "\n…(truncated)" if cut else m.text
+        if left <= 0:
+            s.cut = "dropped"
+            continue
+        s.cut = "file" if cut else ""
+        if len(body) > left:
+            body = body[:left] + "\n…(truncated)"
+            s.cut = "total"
+        left -= len(body)
+        s.body = body
+    return sources
+
+
+def learned_source(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, *, enabled: bool = True) -> MemorySource:
+    """The learned notes (``learned.md``) as the prompt shows them: the current notes, at most ``limit`` characters.
+    ``enabled=False`` (``learning.enabled: false``) is OFF: the notes stay out of the prompt."""
+    path = learned_notes_path(cwd)
+    if not enabled:
+        return MemorySource("learned", path, OFF)
+    if not path.is_file():
+        return MemorySource("learned", path, MISSING)
+    notes = read_learned(cwd)
+    if not notes:
+        return MemorySource("learned", path, EMPTY)
+    text = "\n".join(f"- {f}" for f in notes)
+    return MemorySource("learned", path, READ, body=text[:limit], cut="file" if len(text) > limit else "")
+
+
 def memory_prompt(
     cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL, *, learned: bool = True
 ) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
-    Each file is capped at ``limit`` characters and all of them together at ``total``. The budget goes to the user's
-    memory first, then to the files nearest ``cwd`` and outward, so what runs out is the repository root's text, not
-    the rules of the directory being worked in; the files that fit keep the prompt order (nearest last) and one marker
-    line says how many were left out. ``learned=False`` (``learning.enabled: false``) leaves the learned notes out.
+    The caps are ``plan_memory``'s; the files that fit keep the prompt order (nearest last) and one marker line says
+    how many were left out. ``learned=False`` (``learning.enabled: false``) leaves the learned notes out.
     """
     parts = []
     root = project_root(cwd)
-    files = load_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
-    bodies: dict[int, str] = {}
-    left = total
-    for i in _claim_order(files, root):
-        m = files[i]
-        cut = m.truncated or len(m.text) > limit
-        body = m.text[:limit] + "\n…(truncated)" if cut else m.text
-        if left <= 0:
+    files = [s for s in plan_memory(cwd, limit, total) if s.file is not None]
+    shown = 0
+    for s in files:
+        m, body = s.file, s.body
+        if m is None or body is None:
             continue
-        if len(body) > left:
-            body = body[:left] + "\n…(truncated)"
-        left -= len(body)
-        bodies[i] = body
-    for i, m in enumerate(files):
-        if i not in bodies:
-            continue
-        body = bodies[i]
+        shown += 1
         if m.scope == "user":
             parts.append(f"## User memory\n\n{body}")
             continue
@@ -422,11 +523,10 @@ def memory_prompt(
             name = m.path.name
         title = "Project rules" if m.scope == "rules" else "Project memory"
         parts.append(f"## {title} ({name})\n\n" + fenced("project instructions (from the repository):", body))
-    if len(bodies) < len(files):
-        parts.append(TOTAL_MARKER.format(n=len(files) - len(bodies), cap=total))
-    if learned and (notes := read_learned(cwd)):
-        body = "\n".join(f"- {f}" for f in notes)[:limit]
-        parts.append("## Learned project notes\n\n" + fenced(LEARNED_LABEL, body))
+    if shown < len(files):
+        parts.append(TOTAL_MARKER.format(n=len(files) - shown, cap=total))
+    if learned and (notes := learned_source(cwd, limit)).body:
+        parts.append("## Learned project notes\n\n" + fenced(LEARNED_LABEL, notes.body))
     return "\n\n".join(parts)
 
 

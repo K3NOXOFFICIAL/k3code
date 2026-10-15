@@ -9,7 +9,7 @@ from typing import Any
 
 from k3code import outputstyle
 from k3code.extratools import mcp_prompt
-from k3code.memory import MAX_MEMORY_CHARS, memory_prompt
+from k3code.memory import memory_limit, memory_prompt
 from k3code.skills import PROMPT_LIMIT, skills_prompt
 
 _BASE_PATH = Path(__file__).parent / "prompts" / "system.md"
@@ -132,7 +132,7 @@ def prompt_sections(
     # learning.enabled: false keeps what learning wrote on its own (learned notes, optimizer overlays) out of the
     # prompt too, not only stops new learning; lines a person accepted (gotcha cards, USER.md) stay
     learned = bool(learning_cfg(config)["enabled"])
-    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS)), learned=learned):
+    if mem := memory_prompt(cwd, limit=memory_limit(config), learned=learned):  # /memory reports the same cap
         parts.append(("memory", mem))
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt
