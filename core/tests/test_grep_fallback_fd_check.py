@@ -174,3 +174,28 @@ def test_the_fallback_opens_without_becoming_the_controlling_terminal(tmp_path, 
     (tmp_path / "a.txt").write_text("TOKEN\n")
     list(tools._grep_file(tmp_path / "a.txt", re.compile("TOKEN"), 1e18, expect=os.path.realpath(tmp_path / "a.txt")))
     assert seen and all(f & os.O_NOCTTY and f & os.O_NONBLOCK for f in seen)
+
+
+def test_without_proc_the_walk_reads_the_opened_path_off_the_descriptor(tmp_path, fallback_only, monkeypatch) -> None:
+    """macOS has no /proc: the walk still confirms each open file (F_GETPATH there) instead of skipping them all."""
+    import fcntl
+
+    real_readlink, real_fcntl, getpath = os.readlink, fcntl.fcntl, 50  # 50: F_GETPATH on macOS
+
+    def no_proc(path, *a, **k):
+        if str(path).startswith("/proc/self/fd/"):
+            raise FileNotFoundError(path)
+        return real_readlink(path, *a, **k)
+
+    def fake_fcntl(fd, op, *a):
+        if op == getpath:
+            return real_readlink(f"/proc/self/fd/{fd}").encode() + b"\0"
+        return real_fcntl(fd, op, *a)
+
+    monkeypatch.setattr(os, "readlink", no_proc)
+    monkeypatch.setattr(fcntl, "F_GETPATH", getpath, raising=False)
+    monkeypatch.setattr(fcntl, "fcntl", fake_fcntl)
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "proj" / "a.txt").write_text("TOKEN here\n")
+    res = tools._grep_fallback("TOKEN", tmp_path / "proj", None, None)
+    assert "a.txt:1:TOKEN here" in res["matches"]

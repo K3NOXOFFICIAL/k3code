@@ -25,6 +25,7 @@ from k3code.tools.fuzzy_match import (
     fuzzy_find_and_replace,
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
+from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
 
@@ -1068,7 +1069,8 @@ def _open_regular(fp: Path, expect: str | None) -> Any:
     """``fp`` opened for reading, or None when it is not a regular file or, with ``expect`` (the real path a walked
     entry must have), is not that file. The decision is made on the open descriptor: a check by name followed by an
     open by name loses to a process that swaps a directory for a link in between. ``O_NOFOLLOW`` refuses a link as the
-    last component and ``/proc/self/fd`` names the file actually opened, whatever a directory above it became;
+    last component and the descriptor names the file actually opened (``/proc/self/fd`` on Linux, ``F_GETPATH`` on
+    macOS), whatever a directory above it became;
     ``O_NONBLOCK`` keeps the open of a FIFO without a writer from blocking and ``O_NOCTTY`` keeps a terminal device
     from becoming the daemon's controlling terminal."""
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | (os.O_NOFOLLOW if expect is not None else 0)
@@ -1076,7 +1078,7 @@ def _open_regular(fp: Path, expect: str | None) -> Any:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        if expect is not None and os.readlink(f"/proc/self/fd/{fd}") != expect:
+        if expect is not None and str(_opened_path(fd)) != expect:
             raise OSError(errno.ELOOP, "not the file the walk listed")
         return os.fdopen(fd, "rb")
     except BaseException:
@@ -1158,10 +1160,13 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
-        if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
-            continue  # a link met before the open is never opened; the fd check in _open_regular catches a later swap
-        if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
-            skipped += 1
+        try:
+            if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
+                continue  # a link met before the open is never opened; the fd check in _open_regular catches a swap
+            if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
+                skipped += 1
+                continue
+        except OSError:  # realpath raises when a link is swapped for a directory mid-resolve: the file stays unread
             continue
         try:
             # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots, so the
