@@ -23,6 +23,18 @@ func Install(state *KeyState, bindings map[Mode]map[string]string) {
 			return false, nil, nil
 		}
 
+		// An open overlay owns the keyboard, as it does in tuios itself. A
+		// mode's action can open one (ctrl+g ? opens the help, a locked
+		// mode's rename opens an editor) and leave the keymap in that mode,
+		// which took every key first: esc only switched back to typing and
+		// left the overlay up, and the overlay's own keys ran mode actions
+		// (#170). The mode's work is done once the overlay is up, so the
+		// keymap goes back to typing and the key goes to the overlay.
+		if state.Mode != ModeTyping && overlayOwnsKeys(o) {
+			state.Mode, state.Locked = ModeTyping, false
+			return false, nil, nil
+		}
+
 		// Convert key to string (e.g., "ctrl+g", "alt+left", "p")
 		key := keyMsg.String()
 
@@ -66,4 +78,13 @@ func Install(state *KeyState, bindings map[Mode]map[string]string) {
 		}
 		return hints
 	}
+}
+
+// overlayOwnsKeys reports whether tuios routes keys to an overlay, an editor
+// or a full-screen gesture rather than to the panes and the window bindings
+// (see routeKey and HandleKeyPress in internal/input/handler.go).
+func overlayOwnsKeys(o *app.OS) bool {
+	return o.AnyOverlayOpen() || o.Renaming() || o.ContextMenuActive() || o.ReviewOpen() ||
+		o.HintsOpen() || o.PaneLabelsOpen() || o.CaptureActive() || o.ScreenshotPreviewOpen() ||
+		o.ShowScrollbackBrowser || o.ShowTapeReview || o.ShowTapeManager
 }
