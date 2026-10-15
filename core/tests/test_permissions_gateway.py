@@ -6,9 +6,13 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from k3code.config import ProviderEntry, Settings
 from k3code.gateway.server import GatewayServer
 from k3code.gateway.sessions import SessionStore
+from k3code.permissions import Rule
+from k3code.permissions.state import PermissionState
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.router import Router, build_chain
 
@@ -136,6 +140,57 @@ async def test_always_persists_project_rule_and_new_session_skips(tmp_path, monk
 
     rows = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query("approval")
     assert rows[0]["choice"] == "always" and rows[0]["detail"]["tool"] == "bash" and rows[0]["cwd"] == str(tmp_path)
+
+
+def listed(rules: list[Rule], scope: str) -> list[str]:
+    """Rules as /permissions lists them: ``allow bash touch * [project]``."""
+    return [f"{r.action} {r.tool} {r.pattern} [{scope}]" for r in rules]
+
+
+@pytest.mark.parametrize(
+    ("call_", "expected"),
+    [
+        # the audit's case: the prompt showed `touch .../pa1.txt`, "Always allow" stored the whole family
+        (lambda d: bash(f"touch {d}/pa1.txt"), ["allow bash touch *"]),
+        (lambda d: bash("mkdir -p sub && touch sub/x.txt"), ["allow bash mkdir *", "allow bash touch *"]),
+        (lambda d: bash("make -n nothing"), ["allow bash make -n nothing"]),  # wildcard-unsafe: the exact command
+        (lambda d: ToolCall(id="c1", name="write", arguments={"path": "w.txt", "content": "x"}), None),
+    ],
+    ids=["touch", "compound", "wildcard-unsafe", "write"],
+)
+async def test_always_prompt_shows_the_rule_it_stores(tmp_path, monkeypatch, call_, expected):
+    server, _ = make_server(tmp_path, [call_(tmp_path), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "always"}])
+    shown = seen[0]["params"]["rules"]
+    stored = PermissionState(cwd=tmp_path)
+    stored.reload()
+    assert shown["always"] == listed(stored.project_rules, "project")
+    assert shown["session"] == listed(server.session.perms.session_rules, "session")
+    assert shown["always"], "an always approval that stores a rule must name it"
+    if expected is not None:
+        assert shown["always"] == [f"{e} [project]" for e in expected]
+
+
+async def test_session_prompt_shows_the_rule_it_adds(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, [bash(f"touch {tmp_path}/pa1.txt"), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "session"}])
+    shown = seen[0]["params"]["rules"]
+    assert shown["session"] == listed(server.session.perms.session_rules, "session") == ["allow bash touch * [session]"]
+    assert not (tmp_path / ".k3code" / "config.yaml").exists()
+
+
+async def test_always_prompt_says_when_no_rule_can_be_stored(tmp_path, monkeypatch):
+    # a launcher never gets a rule (hardline.is_launcher): "always" allows this call only, and the prompt says so
+    server, _ = make_server(tmp_path, [bash("sh -c 'true'"), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "always"}])
+    assert seen[0]["params"]["rules"] == {"session": [], "always": []}
+    assert server.session.perms.session_rules == []
+    stored = PermissionState(cwd=tmp_path)
+    stored.reload()
+    assert stored.project_rules == []
 
 
 async def test_deny_is_visible_to_model(tmp_path, monkeypatch):

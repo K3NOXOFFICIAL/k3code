@@ -88,7 +88,7 @@ from k3code.mcpclient import McpManager
 from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
-from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
+from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, Rule, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
@@ -2771,6 +2771,12 @@ class GatewayServer:
                         "allow_session": True,
                         "tool_name": tool_name,
                         "pattern": pattern,
+                        # the rules each choice adds, as /permissions lists them: "always" on `touch a.txt` stores
+                        # `allow bash touch * [project]`, and the prompt must say so before it is stored
+                        "rules": {
+                            "session": _listed_rules(rules, "session"),
+                            "always": _listed_rules(rules, "project"),
+                        },
                     },
                     session.session_id,
                 )
@@ -3461,6 +3467,11 @@ def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     if tc.raw_arguments is not None:
         stored["raw_arguments"] = tc.raw_arguments
     return stored
+
+
+def _listed_rules(rules: list[Rule], scope: str) -> list[str]:
+    """``allow bash touch * [project]``: rules as /permissions lists them, for the approval prompt."""
+    return [f"{r.action} {r.tool} {r.pattern} [{scope}]" for r in rules]
 
 
 async def _change_preview(tool_name: str, arguments: dict[str, Any], cwd: Path) -> str | None:

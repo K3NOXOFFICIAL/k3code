@@ -112,6 +112,8 @@ export interface ApprovalReq {
   preview?: string;
   /** Server→client request id; the answer is the response frame for it. */
   requestId: string;
+  /** The rules "session"/"always" add, as /permissions lists them (`allow bash touch * [project]`); [] = none. */
+  rules?: Partial<Record<"always" | "session", string[]>>;
   smartDenied?: boolean;
 }
 
