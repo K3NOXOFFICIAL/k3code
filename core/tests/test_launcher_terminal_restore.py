@@ -90,6 +90,37 @@ def test_the_launcher_hands_its_process_to_the_tui_waiter(tmp_path, monkeypatch)
     assert handed.env["K3CODE_GATEWAY_CMD"].endswith("-m k3code.cli gateway --stdio")
 
 
+def _planted_sh(where: Path) -> Path:
+    """An executable ``sh`` in ``where`` (a project directory a relative PATH entry would find)."""
+    where.mkdir(parents=True, exist_ok=True)
+    sh = where / "sh"
+    sh.write_text("#!/bin/sh\necho planted\n")
+    sh.chmod(0o755)
+    return sh
+
+
+@pytest.mark.parametrize("path", [":/usr/bin:/bin", ".:/usr/bin:/bin", "/nonexistent::/usr/bin"])
+def test_the_waiter_shell_is_never_found_through_a_relative_path_entry(tmp_path, monkeypatch, path):
+    """An empty or ``.`` entry in PATH is the current directory (the project): ``shutil.which("sh")`` picked a planted
+    ``./sh`` there, which then got the TUI's environment. The waiter is ``/bin/sh``."""
+    project = tmp_path / "proj"
+    _planted_sh(project)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", path)
+    handed = _launch(monkeypatch, tmp_path, "")
+    assert handed.path == "/bin/sh" and handed.argv[0] == "/bin/sh"
+
+
+def test_without_bin_sh_the_waiter_comes_from_an_absolute_path_entry_only(tmp_path, monkeypatch):
+    project, bindir = tmp_path / "proj", tmp_path / "bin"
+    _planted_sh(project)
+    real = _planted_sh(bindir)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(cli_mod, "_WAITER_SH", str(tmp_path / "no" / "sh"))
+    assert cli_mod._waiter_shell(f".::{bindir}") == str(real)
+    assert cli_mod._waiter_shell(".:") == str(tmp_path / "no" / "sh")  # nothing absolute: never ./sh
+
+
 def test_killed_tui_gets_the_terminal_put_back(tmp_path, monkeypatch):
     rc, out = _run_waiter(_launch(monkeypatch, tmp_path, _KILL_SELF))
     for mode in (1000, 1002, 1003, 1004, 1006, 2004):
