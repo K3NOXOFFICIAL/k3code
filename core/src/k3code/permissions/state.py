@@ -178,6 +178,8 @@ class PermissionState:
     #: The project whose config and accepted rules apply (None = cwd): the CLI's --config-dir, a worktree child's
     #: parent project (its cwd is a fresh path under the one the user trusted).
     project_dir: Path | None = None
+    #: In plan mode: the mode of the session the plan is made for (the plan-first planning turn, see engine.decide).
+    plan_for: PermissionMode | None = None
     #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
     #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
     loaded: bool = field(default=False, init=False, repr=False)
@@ -215,6 +217,7 @@ class PermissionState:
             session_rules=self.session_rules,
             hardline_extra=self.hardline_extra,
             headless=headless,
+            plan_for=self.plan_for,
         )
 
     def cycle_mode(self) -> PermissionMode:

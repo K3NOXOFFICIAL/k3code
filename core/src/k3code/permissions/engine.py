@@ -478,6 +478,7 @@ def decide(
     session_rules: list[Rule] | None = None,
     hardline_extra: list[str] | None = None,
     headless: bool = False,
+    plan_for: PermissionMode | str | None = None,
 ) -> Decision:
     """Decide allow/ask/deny for one tool call.
 
@@ -485,8 +486,19 @@ def decide(
     ``add_dirs`` extend the readable/writable roots. Order: hardline deny,
     then mode (plan/yolo), then rules (builtin < user < project < session),
     then auto-mode conversion of ask, then headless conversion of ask.
+
+    ``plan_for``: in plan mode, the mode of the session the plan is made for (the plan-first planning turn). For an
+    auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
     mode = PermissionMode(mode)
+    # The planning turn of an auto session reads outside the roots what the session's own turns read there: toolchain
+    # and system dirs without a prompt, anything else refused with a hint. Plan mode asked a person for both, in a
+    # session whose user chose not to be asked (and the turn after the plan refuses the second kind anyway).
+    outside_reads = (
+        PermissionMode.AUTO
+        if mode == PermissionMode.PLAN and plan_for is not None and PermissionMode(plan_for) == PermissionMode.AUTO
+        else mode
+    )
     args = args or {}
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
@@ -501,12 +513,12 @@ def decide(
         path = _abs(raw, cwd_s)
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
-        dec = _decide_path(mode, tool, path, roots, ruleset)
+        dec = _decide_path(mode, tool, path, roots, ruleset, outside_reads)
         # The tools and the kernel follow a symlink before they apply a `..` (`link/../x` is `<target of link>/../x`),
         # `_abs` applied it first: decide the file that is really reached as well, and take the stricter answer.
         reached = os.path.realpath(os.path.join(cwd_s, raw))
         if tool != "glob" and reached != os.path.realpath(path):
-            dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset))
+            dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset, outside_reads))
         if tool in EDIT_TOOLS and dec.action != "deny" and (protected_path(path) or protected_path(reached)):
             # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
@@ -556,15 +568,34 @@ _SENSITIVE_TARGET = re.compile(
 )
 
 
+#: The one place outside the project roots an auto-mode bash redirect may write: auto-mode bash runs in the bwrap
+#: sandbox, whose ``/tmp`` is a fresh tmpfs of its own (``--tmpfs /tmp``, see sandbox.build_argv) that nothing on the
+#: host sees and that is gone when the command ends; without a usable bwrap the loop asks a person before it runs a
+#: command only auto mode allowed (no rule allow covers a redirect outside the roots: _voids_allow), and an unattended
+#: run refuses bash. Refusing ``pytest > /tmp/out.txt 2>&1; tail /tmp/out.txt`` protected nothing.
+_SANDBOX_TMP = "/tmp"
+
+
+def _sandbox_scratch(path: str) -> bool:
+    """``path`` (absolute, normalised) is in the sandbox's private ``/tmp``: under ``/tmp`` as written and after the
+    host's symlinks (``/tmp/x -> ~/.bashrc`` stays refused, though the sandbox would not even show that link; ``..``
+    was resolved, so ``/tmp/../home/u/x`` is not under it), and not under ``$HOME``: a home below ``/tmp`` has its
+    ``~/.cache`` bound back writable from the host after the tmpfs."""
+    if not (path.startswith(_SANDBOX_TMP + "/") and _inside(path, [_SANDBOX_TMP])):
+        return False
+    return not _inside(path, [os.path.expanduser("~")])
+
+
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
-    """A redirect in ``sub`` writes a file outside the project roots. Targets that are variables or globs are left to
-    the sandbox; the ``/dev`` sinks are not files."""
+    """A redirect in ``sub`` writes a file outside the project roots (and outside the sandbox's private ``/tmp``, see
+    _SANDBOX_TMP). Targets that are variables or globs are left to the sandbox; the ``/dev`` sinks are not files."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     for target in _WRITE_REDIRECT.findall(plain):
         target = target.strip("'\"")
         if not target or target.startswith("/dev/") or any(ch in target for ch in "$`*?[{"):
             continue
-        if not _inside(_abs(target, cwd), roots):
+        path = _abs(target, cwd)
+        if not _inside(path, roots) and not _sandbox_scratch(path):
             return True
     return False
 
@@ -1273,8 +1304,18 @@ def _decide_bash(
     )
 
 
-def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], ruleset: list[Rule]) -> Decision:
+def _decide_path(
+    mode: PermissionMode,
+    tool: str,
+    path: str,
+    roots: list[str],
+    ruleset: list[Rule],
+    outside_reads: PermissionMode | None = None,
+) -> Decision:
+    """``outside_reads``: the mode whose policy decides a read outside the roots that no user/project/session rule
+    decides (default ``mode``; auto for the planning turn of an auto session, see decide)."""
     is_edit = tool in EDIT_TOOLS
+    outside_reads = outside_reads or mode
     if is_edit and mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=[path], message=PLAN_MSG)
     if not is_edit and sensitive_path(path):
@@ -1305,11 +1346,13 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
             # a read of the toolchain dirs (/usr, site-packages, node_modules ...) is never worth a prompt: every
             # mode allows it (auto logs it as an auto allow, see _finish, and alone takes /etc too). A
             # user/project/session rule still wins; credential paths were refused above.
-            if mode != PermissionMode.AUTO and not _inside(path, ["/etc"]):
+            if outside_reads != PermissionMode.AUTO and not _inside(path, ["/etc"]):
                 dec.action = "allow"
-            elif mode != PermissionMode.AUTO:
+            elif outside_reads != PermissionMode.AUTO:
                 dec.needs_human = True  # /etc outside auto: a person approves it, as before
-        elif not is_edit and rule.action == "ask" and mode == PermissionMode.AUTO and rule.layer == 0:
+            elif mode != PermissionMode.AUTO:
+                dec.action, dec.auto_allowed = "allow", True  # what _finish does for auto itself
+        elif not is_edit and rule.action == "ask" and outside_reads == PermissionMode.AUTO and rule.layer == 0:
             # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
             dec.action = "deny"
             dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"

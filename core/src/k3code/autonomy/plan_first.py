@@ -25,6 +25,24 @@ logger = logging.getLogger(__name__)
 
 PLAN_SECTIONS = ("Goal", "Steps", "Files", "Risks", "Verification", "Estimate")
 
+
+def planner_permissions(perms: PermissionState) -> PermissionState:
+    """The permissions of a planning turn for the session whose permissions are ``perms``: plan mode (read-only: no
+    bash, no edits, no other side-effect tool, whatever a rule says), the session's roots and project, its session
+    approvals (the same list, so a read approved for the session is not asked again while planning, and one approved
+    while planning holds for the turn after it), and for reads outside the roots the session's own policy
+    (``plan_for``): in an auto session a toolchain read runs and any other is refused with a hint, as in the turn that
+    carries out the plan, instead of asking a person (engine.decide)."""
+    return PermissionState(
+        mode=PermissionMode.PLAN,
+        cwd=perms.cwd,
+        add_dirs=list(perms.add_dirs),
+        session_rules=perms.session_rules,
+        project_dir=perms.project_dir,
+        plan_for=perms.mode,
+    )
+
+
 PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
     "plan in markdown with exactly these sections: "
@@ -258,7 +276,7 @@ class PlanFirst:
                 return cap.mode
             return None
 
-        perms = PermissionState(mode=PermissionMode.PLAN, cwd=session.perms.cwd, add_dirs=list(session.perms.add_dirs))
+        perms = planner_permissions(session.perms)
         # The same composed prompt as the session's normal loop (project memory, facts, gotchas, style, overlay), so
         # the plan follows the rules the execution turn runs under. No skills index, MCP names or advisor note: this
         # loop has none of those tools.

@@ -1033,6 +1033,9 @@ class Parsed:
     unterminated: bool = False
     #: a comment that contains a quote character (an old trick to hide the next line inside a "quote")
     comment_quote: bool = False
+    #: a comment with a quote character that ends the text (``npm test  # don't watch``): nothing follows it to hide,
+    #: so it does not count as comment_quote at the top level (see _scan; a nested payload's still counts, see parse)
+    tail_comment_quote: bool = False
     pipelines: list[list[str]] = field(default_factory=list)  # the subs grouped by | and |&
     clean: str = ""  # the line without comments, line continuations and heredoc bodies (what the regexes see)
     #: $(...)/`...`/<(...) payloads per sub, those of its unquoted heredoc bodies included
@@ -1268,7 +1271,15 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             eol = text.find("\n", i)
             eol = n if eol < 0 else eol
             if any(q in text[i:eol] for q in "'\"`"):
-                out.comment_quote = True
+                # A quote only hides something when text follows the comment: a shell that did not take the `#` as
+                # a comment would read the quote as opening a string that swallows the next lines. In a comment that
+                # ends the text (no open bracket either) it would only open a string that never closes: a syntax
+                # error, and the shell runs nothing of that line. Such a comment is recorded apart, and parse()
+                # counts it only where the text goes on after it (a $(...) payload, a `bash -c` string).
+                if text[eol:].strip() or ctx:
+                    out.comment_quote = True
+                else:
+                    out.tail_comment_quote = True
             i = eol
         elif text.startswith(("$(", "<(", ">("), i):
             i, s = subst(i, 2)
@@ -1495,7 +1506,8 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         parsed.children.append(inner)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
-        parsed.comment_quote = parsed.comment_quote or inner.comment_quote
+        # the outer text goes on after a payload ($(...), `bash -c '...'`): a quote in its last comment still counts
+        parsed.comment_quote = parsed.comment_quote or inner.comment_quote or inner.tail_comment_quote
         parsed.too_deep = parsed.too_deep or inner.too_deep
     # a heredoc a shell runs is its script (`bash <<'EOF'`, `cat <<EOF | sh`): checked like `bash -c "..."`, except for
     # its quotes (a stray one in a comment of a long script is not worth a prompt). The program of another
