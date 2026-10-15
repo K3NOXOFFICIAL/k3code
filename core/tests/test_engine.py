@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from k3code.permissions import PermissionMode, Rule, decide
@@ -281,6 +284,45 @@ def test_auto_mode_denies_writes_outside_the_project_roots() -> None:
     assert decide(mode="auto", tool="edit", args={"path": "/home/user/notes.md"}, cwd=CWD).action == "deny"
     d = decide(mode="auto", tool="bash", args={"command": "echo x > /home/user/x.txt"}, cwd=CWD)
     assert d.action == "deny" and "project roots" in (d.message or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest > /tmp/test-output.txt 2>&1; tail -n 30 /tmp/test-output.txt",
+        "go test ./... &> /tmp/go-test.log",
+        "cargo build 2> /tmp/build-errors.txt",
+        "echo done >> /tmp/k3/marker",
+    ],
+)
+def test_auto_mode_bash_writes_scratch_output_to_the_sandbox_tmp(command: str) -> None:
+    # auto-mode bash runs in the sandbox, whose /tmp is a private tmpfs: a redirect there reaches nothing on the host
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=CWD)
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human, (command, d)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > /tmp/../home/user/.bashrc",  # `..` leaves /tmp
+        "echo x > /var/tmp/x",  # not the sandbox's tmpfs
+        "echo x > /tmpfoo/x",
+        "echo x > ~/.cache/planted",  # ~/.cache is bound writable into the sandbox
+    ],
+)
+def test_auto_mode_bash_still_writes_nowhere_else_outside_the_roots(command: str) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=CWD)
+    assert d.action == "deny" and "project roots" in (d.message or ""), (command, d)
+
+
+def test_auto_mode_bash_tmp_redirect_through_a_host_symlink_stays_refused() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
+        link = Path(scratch) / "link"
+        link.symlink_to("/home/user/.bashrc")  # need not exist: realpath follows the link anyway
+        d = decide(mode="auto", tool="bash", args={"command": f"echo x > {link}"}, cwd=CWD)
+    assert d.action == "deny", d
+    # the write tool runs in the daemon, on the host's /tmp: still outside the roots
+    assert decide(mode="auto", tool="write", args={"path": "/tmp/scratch.py"}, cwd=CWD).action == "deny"
 
 
 def test_auto_mode_still_allows_project_writes_and_sandboxed_reads_outside() -> None:

@@ -554,15 +554,34 @@ _SENSITIVE_TARGET = re.compile(
 )
 
 
+#: The one place outside the project roots an auto-mode bash redirect may write: auto-mode bash runs in the bwrap
+#: sandbox, whose ``/tmp`` is a fresh tmpfs of its own (``--tmpfs /tmp``, see sandbox.build_argv) that nothing on the
+#: host sees and that is gone when the command ends; without a usable bwrap the loop asks a person before it runs a
+#: command only auto mode allowed (no rule allow covers a redirect outside the roots: _voids_allow), and an unattended
+#: run refuses bash. Refusing ``pytest > /tmp/out.txt 2>&1; tail /tmp/out.txt`` protected nothing.
+_SANDBOX_TMP = "/tmp"
+
+
+def _sandbox_scratch(path: str) -> bool:
+    """``path`` (absolute, normalised) is in the sandbox's private ``/tmp``: under ``/tmp`` as written and after the
+    host's symlinks (``/tmp/x -> ~/.bashrc`` stays refused, though the sandbox would not even show that link; ``..``
+    was resolved, so ``/tmp/../home/u/x`` is not under it), and not under ``$HOME``: a home below ``/tmp`` has its
+    ``~/.cache`` bound back writable from the host after the tmpfs."""
+    if not (path.startswith(_SANDBOX_TMP + "/") and _inside(path, [_SANDBOX_TMP])):
+        return False
+    return not _inside(path, [os.path.expanduser("~")])
+
+
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
-    """A redirect in ``sub`` writes a file outside the project roots. Targets that are variables or globs are left to
-    the sandbox; the ``/dev`` sinks are not files."""
+    """A redirect in ``sub`` writes a file outside the project roots (and outside the sandbox's private ``/tmp``, see
+    _SANDBOX_TMP). Targets that are variables or globs are left to the sandbox; the ``/dev`` sinks are not files."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     for target in _WRITE_REDIRECT.findall(plain):
         target = target.strip("'\"")
         if not target or target.startswith("/dev/") or any(ch in target for ch in "$`*?[{"):
             continue
-        if not _inside(_abs(target, cwd), roots):
+        path = _abs(target, cwd)
+        if not _inside(path, roots) and not _sandbox_scratch(path):
             return True
     return False
 
