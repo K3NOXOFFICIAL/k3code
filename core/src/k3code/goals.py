@@ -666,6 +666,56 @@ class TurnEvidence:
         self.edited.pop(path, None)
         self.edited[path] = pos
 
+    def _positions(self) -> list[float]:
+        return [c[0] for c in self.checks] + list(self.edited.values()) + [e[0] for e in self.errors.values()]
+
+    def next_position(self) -> float:
+        """A position after everything recorded so far."""
+        return max(self._positions(), default=-1.0) + 1
+
+    def add_check(self, command: str, code: int | None, own: bool = True) -> None:
+        """A test/check that ran after everything recorded so far (one the harness ran itself: fan-out's merge test)."""
+        self.checks.append((self.next_position(), command, code, own))
+
+    def add_edits(self, paths: list[str]) -> None:
+        """Files changed after everything recorded so far."""
+        pos = self.next_position()
+        for path in paths:
+            self.note_edit(path, pos)
+
+    def extend(self, later: TurnEvidence, *, errors: bool = True) -> None:
+        """Append what ``later`` recorded after everything recorded here, in ``later``'s own order. ``errors=False``
+        leaves ``later``'s tool errors out (a sub-agent's: the reviewer and the merge judged its work)."""
+        positions = later._positions()
+        if not positions:
+            return
+        shift = self.next_position() - min(positions)
+        self.checks += [(pos + shift, command, code, own) for pos, command, code, own in later.checks]
+        for path, pos in later.edited.items():
+            self.note_edit(path, pos + shift)
+        if errors:
+            for key, (pos, line) in later.errors.items():
+                self.errors[key] = (pos + shift, line)
+
+    def followed_by(self, later: TurnEvidence) -> TurnEvidence:
+        """A copy of this evidence with ``later``'s appended (see ``extend``)."""
+        out = TurnEvidence(list(self.checks), dict(self.edited), dict(self.errors))
+        out.extend(later)
+        return out
+
+    def relative_to(self, root: str | Path) -> TurnEvidence:
+        """A copy whose paths under ``root`` (a sub-agent's worktree) are relative to it, as in the project."""
+        base = str(root).rstrip("/") + "/"
+
+        def rel(path: str) -> str:
+            return path[len(base) :] if path.startswith(base) else path
+
+        out = TurnEvidence(list(self.checks))
+        for path, pos in self.edited.items():
+            out.note_edit(rel(path), pos)
+        out.errors = {(tool, rel(path)): v for (tool, path), v in self.errors.items()}
+        return out
+
     def carry(self, turn: int) -> dict[str, Any] | None:
         """This turn's last check as ``GoalState.last_check``; None when the turn ran none."""
         if not self.checks:
@@ -766,6 +816,23 @@ def turn_evidence(messages: list[dict[str, Any]]) -> TurnEvidence:
                 code = None if failed else int(match.group(1)) if match else 0
                 ev.checks.append((pos + (line.check or 0) / n, command, code, own))
     return ev
+
+
+def loop_evidence(messages: list[Any]) -> TurnEvidence:
+    """``turn_evidence`` of an agent loop's own messages (``providers.types.Message``: a sub-agent's, whose turn is
+    never stored as dicts)."""
+    return turn_evidence(
+        [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "name": m.name,
+                "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls],
+            }
+            for m in messages
+        ]
+    )
 
 
 def turn_evidence_digest(messages: list[dict[str, Any]], *, limit: int = EVIDENCE_DIGEST_CHARS) -> str:

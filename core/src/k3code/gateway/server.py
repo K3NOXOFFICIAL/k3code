@@ -80,7 +80,7 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge, turn_evidence
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, TurnEvidence, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -283,6 +283,9 @@ class LiveSession:
         #: what the scope gate made of the latest prompt (None: no gate ran), so an implicit goal whose prompt it rates
         #: trivial, or whose plan was refused or fanned out, ends after its first turn, unjudged (see _run_turn_locked)
         self.turn_gate: GateResult | None = None
+        #: what this turn's fan-out did (its workers' tests and edits, the merges and the merge tests), for the goal
+        #: judge: the turn's stored messages hold only the task and the fan-out's summary (see _run_one_turn)
+        self.fanout_evidence: TurnEvidence | None = None
         self.reliability: Reliability | None = None
         #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
         self.offline_protection_error = ""
@@ -1833,12 +1836,11 @@ class GatewayServer:
             judge = self.goal_judge or make_judge(self._goal_completer(session))
             # no strong-tier advisor veto on an implicit goal: it would review every answered question
             reviewer = None if implicit else self._goal_reviewer(session)
+            evidence = turn_evidence(session.stored.messages[n_before:])
+            if session.fanout_evidence is not None:  # the children's work comes first, the parent's (if any) after
+                evidence = session.fanout_evidence.followed_by(evidence)
             decision = await mgr.evaluate_after_turn(
-                final_text,
-                judge,
-                cwd=session.stored.cwd or None,
-                reviewer=reviewer,
-                evidence=turn_evidence(session.stored.messages[n_before:]),
+                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer, evidence=evidence
             )
             self.emit_goal(session)
             if decision.message:
@@ -2164,6 +2166,7 @@ class GatewayServer:
         session.needs_input = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
+        session.fanout_evidence = None  # set below when this turn fans out
         reliability = await self._reliability_for(session)
         reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
         await self.mcp.ensure_started()
@@ -2274,6 +2277,8 @@ class GatewayServer:
                 fan = await self.fanout.run(
                     session, text, gate.plan, subtasks, budget=self.fanout.budget(len(subtasks))
                 )
+                if fan is not None:  # what the children did, for the goal judge (the summary shows no tool call)
+                    session.fanout_evidence = fan.evidence
                 if fan is not None and fan.ok:
                     gate.proceed, gate.message = False, fan.summary()
                     session.stored.messages = [

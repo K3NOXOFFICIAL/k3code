@@ -323,3 +323,24 @@ async def test_a_judge_failure_reason_stays_out_of_the_continuation():
     mgr.set("ship")
     decision = await mgr.evaluate_after_turn("x", judge)
     assert decision.prompt and "judge's reason" not in decision.prompt
+
+
+# ── a fan-out turn: the children's evidence (the parent stores only the task and the fan-out's summary) ──
+
+
+def test_evidence_appended_after_another_keeps_its_own_order():
+    children = turn_evidence(Turn().edit("f1.txt").bash("pytest -q", "3 passed").messages)
+    parent = turn_evidence(Turn().edit("README.md").messages)
+    merged = children.followed_by(parent)
+    digest = merged.render()
+    assert "$ pytest -q -> exit 0" in digest
+    assert "Files written/edited: 2: f1.txt, README.md" in digest
+    assert "Last test/check: passed, BEFORE the last edit" in digest  # README.md came after the children's test
+    assert children.render().count("Files written/edited: 1") == 1  # followed_by copies, it does not modify
+    errors = TurnEvidence()
+    errors.extend(turn_evidence(Turn().tool("grep", "Error: bad regex", pattern="(").messages), errors=False)
+    assert "Unresolved tool errors: none." in errors.render()
+    late = TurnEvidence()
+    late.add_edits(["a.py"])
+    late.add_check("pytest -q  # fan-out", 1)
+    assert "Last test/check: FAILED, after the last edit." in late.render()
