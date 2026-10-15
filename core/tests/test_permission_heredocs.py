@@ -8,6 +8,7 @@ quoted delimiter (``<<'EOF'``) keeps the body data.
 
 from __future__ import annotations
 
+import re
 import shlex
 import time
 from pathlib import Path
@@ -445,6 +446,137 @@ def test_nesting_the_parser_follows_is_still_checked(tmp_path: Path) -> None:
         assert check(cmd, cwd=str(tmp_path)) is None, cmd
 
 
+# K3NOX-586: bash ends a backtick payload at the first backtick that is not escaped and drops the backslash of `\``,
+# `\\` and `\$` (in double quotes also of `\"`) before it runs the payload. The parser ended the payload at an escaped
+# backtick and never unescaped it, so a command in backticks nested in backticks reached no check (yolo ran it), and
+# backticks never counted as nesting for scan-depth.
+def _backticks(depth: int, inner: str) -> str:
+    """``inner`` nested in ``depth`` pairs of backticks, escaped at every level as bash unescapes it."""
+    for _ in range(depth):
+        inner = "echo `" + re.sub(r"([\\`$])", r"\\\1", inner) + "`"
+    return inner
+
+
+NESTED_BACKTICKS = [
+    r"echo `echo \`rm -rf ~\``",
+    r"x=`echo \`rm -rf ~\``",
+    r'echo "`echo \`rm -rf ~\``"',
+    "cat <<EOF\n" + r"`echo \`rm -rf ~\``" + "\nEOF",
+    r"bash -c 'echo `echo \`rm -rf ~\``'",
+    r"echo $(echo `echo \`rm -rf ~\``)",
+    # `\$` in backticks is a `$`: the $(...) runs
+    r"echo `echo \$(rm -rf ~)`",
+    "cat <<EOF\n" + r"`echo \$(rm -rf ~)`" + "\nEOF",
+    r'echo `echo "\$(rm -rf ~)"`',
+    # in double quotes `\"` in backticks is a `"`, so the payload is not single-quoted
+    r'''echo "`echo \"'\"\`rm -rf ~\`\"'\"`"''',
+    # in a heredoc body dash drops the backslash of `\"` in backticks too (bash keeps it): sh runs the rm
+    "sh <<'EOF'\ncat <<X\n" + r"""`echo \"'\"\`rm -rf ~\`\"'\"`""" + "\nX\nEOF",
+    "cat <<'EOF' | sh\ncat <<X\n" + r"""`echo \"'\"\`rm -rf ~\`\"'\"`""" + "\nX\nEOF",
+    # in a double-quoted `bash -c`/`eval` argument the shell drops the backslash of `\``, `\$` and `\"`
+    r'bash -c "echo \`rm -rf ~\`"',
+    r'sh -c "echo \`rm -rf ~\`"',
+    r'timeout 5 bash -c "echo \`rm -rf ~\`"',
+    r'echo x | xargs sh -c "echo \`rm -rf ~\`"',
+    r'eval "echo \`rm -rf ~\`"',
+    r'bash -c "echo \"\`rm -rf ~\`\""',
+    r'echo $(bash -c "echo \`rm -rf ~\`")',
+    r'bash -c "echo \"\$(rm -rf ~)\""',
+    # a $(...), backtick or ${...} in the argument is one unit: its quotes do not end or start the argument's quotes
+    r'''bash -c "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''sh -c "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''eval "$(: "'")\`rm -rf ~\`$(: "'")"''',
+    r'''bash -c "$(: "'")\`rm -rf ~\`"''',
+    r"""bash -c $(: "'")"\`rm -rf ~\`"$(: "'")""",
+    r'''bash -c "${x:+"'"}\`rm -rf ~\`${x:+"'"}"''',
+    r'''bash -c "`: "'"`\`rm -rf ~\``: "'"`"''',
+]
+
+
+@pytest.mark.parametrize("cmd", NESTED_BACKTICKS)
+def test_a_command_in_nested_backticks_is_checked(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    for mode in MODES:
+        dec = _bash(cmd, mode, tmp_path)
+        assert dec.action == "deny" and dec.hardline == "rm-rf-home", (mode, dec)
+
+
+# K3NOX-620: the shell removes the quotes and backslashes of the word of an unquoted ${...} before the inner shell or
+# eval reads it. Reading the unit only as written made these text; Main (shlex) denied them.
+UNQUOTED_BRACE_WORDS = [
+    r"x=1; bash -c ${x:+'`rm -rf ~`'}",
+    r"bash -c ${x:-'`rm -rf ~`'}",
+    r"x=1; sh -c ${x:+'`rm -rf ~`'}",
+    r"x=1; bash -c ${x:+'$(rm -rf ~)'}",
+    r"x=1; eval ${x:+\`rm -rf ~\`}",
+    r"eval ${x:-\`rm -rf ~\`}",
+    r"x=1; eval ${x:+'`rm -rf ~`'}",
+    r"x=1; sudo bash -c ${x:+'`rm -rf ~`'}",
+]
+
+
+@pytest.mark.parametrize("cmd", UNQUOTED_BRACE_WORDS)
+def test_the_word_of_an_unquoted_brace_is_checked_unquoted(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    for mode in MODES:
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+
+
+#: bash runs no `rm` in these: the backtick is escaped, in single quotes, or its backslash is itself escaped
+BACKTICK_TEXT = [
+    r"echo $(echo \`rm -rf ~\`)",
+    r"echo '`echo \`rm -rf ~\``'",
+    r"echo `echo \\\`rm -rf ~\\\``",
+    r"echo `echo '\`rm -rf ~\`'`",
+    r"echo `echo \"'\"\`rm -rf ~\`\"'\"`",  # out of double quotes `\"` stays: the payload is single-quoted
+    "cat <<EOF\n" + r"`echo \\\`rm -rf ~\\\``" + "\nEOF",
+]
+
+
+@pytest.mark.parametrize("cmd", BACKTICK_TEXT)
+def test_an_escaped_backtick_in_backticks_stays_text(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd, cwd=str(tmp_path)) is None
+    assert _bash(cmd, "yolo", tmp_path).action == "allow"
+
+
+def test_a_backtick_payload_is_unescaped_as_bash_runs_it() -> None:
+    # next to the unescaped payload come the readings of Main: the text up to the next backtick, escaped or not, and
+    # (the scan goes on from there) what the backtick that closes the command then opens
+    assert parse(r"echo `a \`b\` \\ \$c \x \"d\"`").sub_payloads == [[r"a `b` \ $c \x \"d\"", "a \\", ""]]
+    assert parse(r'echo "`a \`b\` \"d\"`"').sub_payloads == [['a `b` "d"', "a \\", '"']]
+    # in a heredoc body bash keeps the backslash of `\"`, dash drops it: both are checked and no rule vouches for it
+    body = parse("cat <<EOF\n" + r"`a \`b\` \"d\"`" + "\nEOF")
+    # and the raw text of the payload, as Main read it
+    assert body.heredocs[0][0].payloads == [r"a \`b\` \"d\"", r"a `b` \"d\"", 'a `b` "d"'] and body.unterminated
+    assert not parse("cat <<EOF\n" + r"`a \`b\``" + "\nEOF").unterminated
+
+
+@pytest.mark.parametrize("depth", [1, 32, 33, 40, 200])
+def test_a_launcher_argument_is_read_past_any_brackets_depth(tmp_path: Path, depth: int) -> None:
+    # K3NOX-614: past a cap on ${...} nesting the argument was split by shlex again and the escaped backtick was text
+    cmd = 'bash -c "' + "${x:+" * depth + "y" + "}" * depth + r' \`rm -rf ~\`"'
+    assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    assert _bash(cmd, "yolo", tmp_path).action == "deny"
+
+
+def test_a_launcher_argument_nested_in_brackets_is_decided_quickly(tmp_path: Path) -> None:
+    # reading a ${...} as one unit must not recurse once per level (RecursionError) or rescan the text per level
+    for cmd in ('bash -c "' + "${" * 5000 + 'x"', 'bash -c "' + "${x:+" * 5000 + "x" + "}" * 5000 + '"'):
+        start = time.perf_counter()
+        for mode in MODES:
+            _bash(cmd, mode, tmp_path)
+        assert time.perf_counter() - start < 5.0
+
+
+def test_backticks_count_as_nesting(tmp_path: Path) -> None:
+    for depth in range(2, 7):
+        assert check(_backticks(depth, HIDDEN), cwd=str(tmp_path)) == "rm-rf-home", depth
+        assert check(_backticks(depth, "date"), cwd=str(tmp_path)) is None, depth
+    for depth in (7, 8):
+        assert check(_backticks(depth, HIDDEN), cwd=str(tmp_path)) == "scan-depth", depth
+        assert _bash(_backticks(depth, HIDDEN), "yolo", tmp_path).action == "deny", depth
+
+
 # a command the parser gives up on (past the budget or the nesting) was still tokenised at every nesting level by the
 # per-command checks, which cannot lift the deny: `$(` x 50,000 took 49 s in decide() and nesting raised RecursionError
 GIVES_UP = ["$(" * 50_000, "<(" * 50_000, "$(((" * 30_000, "$((" * 800, "`$(" * 30_000]
@@ -692,3 +824,77 @@ def test_the_parser_marks_what_ssh_runs_from_its_stdin() -> None:
     for cmd, expected in marks.items():
         assert parse(cmd).code_heredoc == expected, cmd
     assert parse("cat <<'EOF' | ssh -p 22 h | ssh g ls\nx\nEOF").remote_heredoc[0] == ["ssh -p 22 h"]
+
+
+#: commands the test file on Main already pinned as denied: the extraction of nested commands only ever adds to what
+#: Main read (the unescaped backtick, body and launcher readings are checked next to Main's raw ones)
+STILL_DENIED = [
+    *(f"cat <<EOF\n{payload}\nEOF" for payload, _ in HARDLINE_PAYLOADS),
+    'echo "$(cat <<EOF\n$(rm -rf ~)\nEOF\n)"',
+    *SHELL_SCRIPTS,
+    "cat <<EOF\n`\\\nrm -rf ~`\nEOF",
+    "`\\``rm -rf ~",  # Main ends the first payload at the escaped backtick and reads on from there
+    "echo `\\``rm -rf ~",
+]
+
+
+@pytest.mark.parametrize("cmd", STILL_DENIED)
+def test_what_main_denied_is_still_denied(tmp_path: Path, cmd: str) -> None:
+    assert check(cmd) is not None, cmd
+    for mode in ("auto", "yolo"):
+        assert _bash(cmd, mode, tmp_path).action == "deny", (mode, cmd)
+
+
+# ── a unit read in more than one way is not read twice over at every level of nesting ──
+
+
+def _escape_backticks(text: str) -> str:
+    return re.sub(r"([\\`$])", r"\\\1", text)
+
+
+def _nested_bodies(depth: int, filler: str) -> str:
+    """Each level: a heredoc-body backtick holding `\\"` (bash and dash read it differently) and `\\\\` (the raw text
+    differs), so every level has three readings that all differ."""
+    cmd = "echo " + filler
+    for _ in range(depth):
+        cmd = "cat <<X\n`" + _escape_backticks(cmd) + ' \\" \\\\`\nX'
+    return cmd
+
+
+def _nested_backticks(depth: int, filler: str) -> str:
+    cmd = "echo " + filler
+    for _ in range(depth):
+        cmd = "echo `" + _escape_backticks(cmd) + "`"
+    return cmd
+
+
+#: (builder, filler size, hard limit in seconds). Measured on kokadock: 0.02 to 0.3 s; Main took 0.00 s and 3.1 s. The
+#: readings multiplied before the budget was charged: 3.9 s at 5.4 KB and 210 s at 100 KB.
+NESTED_READINGS = [
+    (_nested_bodies, 5_000, 1.0),
+    (_nested_bodies, 100_000, 3.0),
+    (_nested_backticks, 5_000, 1.0),
+    (_nested_backticks, 100_000, 3.0),
+]
+
+
+@pytest.mark.parametrize(
+    ("build", "size", "limit"), NESTED_READINGS, ids=["bodies-5k", "bodies-100k", "backticks-5k", "backticks-100k"]
+)
+def test_nested_readings_of_a_unit_are_decided_in_bounded_time(tmp_path: Path, build, size: int, limit: float) -> None:
+    cmd = build(6, "a" * size)
+    for mode in ("auto", "yolo"):
+        start = time.perf_counter()
+        dec = _bash(cmd, mode, tmp_path)
+        assert time.perf_counter() - start < limit, (build.__name__, size, mode)
+        assert dec.action != "allow", (build.__name__, size, mode)
+
+
+def test_a_command_too_expensive_to_read_twice_is_denied_not_allowed(tmp_path: Path) -> None:
+    cmd = _nested_bodies(6, "a" * 20_000)
+    assert check(cmd, cwd=str(tmp_path)) == "scan-budget"
+    for mode in MODES:
+        assert _bash(cmd, mode, tmp_path).action == "deny", mode
+    # the same shape with little text is still read, and its hidden command found
+    assert check(_nested_bodies(3, f"x; {HIDDEN}"), cwd=str(tmp_path)) == "rm-rf-home"
+    assert check(_nested_bodies(3, "date"), cwd=str(tmp_path)) is None
