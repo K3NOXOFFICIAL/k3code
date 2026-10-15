@@ -195,6 +195,80 @@ def test_an_operator_inside_quotes_a_comment_or_a_heredoc_splits_nothing():
     assert "Last test/check: exit status not the test's (piped or masked)" in digest
 
 
+def test_bash_commands_that_write_files_count_as_edits():
+    """Only the write and edit tools counted: a fix made with ``sed -i``, a redirect or ``git apply`` read as "Files
+    written/edited: none", and a test before it read as passing after the last edit."""
+    patch = "git apply <<'EOF'\n--- a/src/m.py\n+++ b/src/m.py\n@@ -1 +1 @@\n-x\n+y\nEOF"
+    for command, files in (
+        ("sed -i 's/a/b/' src/app.py", "src/app.py"),
+        ("sed -i.bak -e 's/a/b/' -e 's/c/d/' a.py b.py", "a.py, b.py"),
+        ("perl -pi -e 's/a/b/' x.pl", "x.pl"),
+        ("echo 'VERSION = 2' > src/version.py", "src/version.py"),
+        ("printf 'x\\n' >> 'docs/my notes.md'", "docs/my notes.md"),
+        ("printf 'x' | tee -a CHANGELOG.md", "CHANGELOG.md"),
+        ("cat > src/new.py <<'EOF'\nprint(1 > 2)\nEOF", "src/new.py"),
+        ("bash -c 'echo x > gen.txt'", "gen.txt"),
+        ("patch -p1 src/a.py < fix.diff", "src/a.py"),
+        ("patch -p1 < fix.diff", "(via patch)"),
+        ("git apply fix.patch", "(via git apply)"),
+        (patch, "src/m.py"),
+        ("grep -l foo -r src | xargs sed -i 's/foo/bar/'", "(via sed -i)"),
+    ):
+        turn = Turn().bash("pytest -q", "3 passed").bash(command, "")
+        digest = turn_evidence_digest(turn.messages)
+        assert f"Files written/edited: {len(files.split(', '))}: {files}" in digest, command
+        assert "Last test/check: passed, BEFORE the last edit (later edits are unverified)." in digest, command
+
+
+def test_read_only_bash_and_a_tests_own_output_are_no_edits():
+    for command in (
+        "cat src/app.py",
+        "sed 's/a/b/' src/app.py",
+        "perl -ne 'print if /x/' x.pl",
+        'grep -n ">" index.html',
+        "echo a\\>b",
+        "git commit -m 'x > y'",
+        "python -c 'print(1 > 2)'",
+        "awk '{print > \"o.txt\"}' f",
+        "(( a > b )) && echo bigger",
+        "[[ $a > $b ]] && echo later",
+        "ls > /dev/null 2>&1",
+        "make > /tmp/build.log",
+        "patch --dry-run -p1 < fix.diff",
+        "git apply --check fix.patch",
+        "pytest -q > test-log.txt",
+        "pytest -q 2>&1 | tee test-log.txt",
+    ):
+        digest = turn_evidence_digest(Turn().bash(command, "").messages)
+        assert "Files written/edited: none." in digest, command
+
+
+def test_an_edit_and_a_test_in_one_bash_call_are_ordered():
+    after = turn_evidence_digest(Turn().bash("sed -i 's/a/b/' x.py && pytest -q", "3 passed").messages)
+    assert "Last test/check: passed, after the last edit." in after
+    assert "Files written/edited: 1: x.py" in after
+    before = turn_evidence_digest(Turn().bash("pytest -q && sed -i 's/a/b/' x.py", "3 passed").messages)
+    assert "Last test/check: passed, BEFORE the last edit" in before
+
+
+def test_patch_and_mcp_write_tools_count_as_edits_and_read_tools_do_not():
+    apply_patch = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-x\n+y\n*** End Patch"
+    turn = (
+        Turn()
+        .tool("apply_patch", "Done", input=apply_patch)
+        .tool("mcp__filesystem__write_file", "ok", path="docs/x.md", content="x")
+        .tool("mcp__fs__edit_file", "ok", path="b.py", edits=[])
+        .tool("mcp__fs__create_file", "ok", path="new.py")
+        .tool("mcp__fs__read_file", "x = 1", path="c.py")
+        .tool("mcp__x__list_edits", "[]")
+        .tool("mcp__github__create_issue", "#12", title="bug")
+        .tool("mcp__fs__write_file", "Error: permission denied", path="d.py")
+    )
+    digest = turn_evidence_digest(turn.messages)
+    assert "Files written/edited: 4: src/a.py, docs/x.md, b.py, new.py" in digest
+    assert "- mcp__fs__write_file d.py: Error: permission denied" in digest  # a failed write changed nothing
+
+
 def test_a_tool_name_in_a_later_command_does_not_hide_the_failed_test():
     turn = Turn().bash("pytest -q", "1 failed\n[exit code 1]").edit("src/app.py").bash("cat pytest.ini", "[pytest]")
     digest = turn_evidence_digest(turn.messages)
