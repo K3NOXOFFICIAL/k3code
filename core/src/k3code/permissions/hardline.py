@@ -50,12 +50,34 @@ _SSH_RESTART_PATTERNS = [
 ]
 
 #: A Windows drive target whose recursive deletion wipes the host (issue #169): a drive root (``C:``, ``C:\``, ``C:/``),
-#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``) or the Windows directory (``C:\Windows``), with ``/`` or ``\``
-#: separators. The trailing boundary (``(?=[\s"']|$)``) stops it at the end of the word, so a *deeper* path such as
-#: ``C:\Users\<name>\project`` -- an ordinary project folder -- is NOT one of these. A string fragment (no flags), used
-#: inside the case-insensitive launcher patterns below; backslashes survive here because these run on the raw simple
-#: command, before the posix tokenizer (which would eat them) ever sees it.
-_WIN_DRIVE = r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows)?)?[\\/]?(?=[\s\"']|$)"
+#: its ``Users`` tree (``C:\Users``, ``C:\Users\<name>``), the Windows directory (``C:\Windows``) or the installed
+#: programs (``C:\Program Files``, ``C:\Program Files (x86)``, ``C:\ProgramData``), with ``/`` or ``\`` separators. A
+#: string fragment (no flags), used inside the case-insensitive launcher patterns below; backslashes survive here
+#: because these run on the raw simple command, before the posix tokenizer (which would eat them) ever sees it.
+#: ``Program Files`` has a space in it, so it counts only where the quoted word (or the command) ends after it:
+#: ``"C:\Program Files Custom"`` is another folder.
+_WIN_DRIVE_DIR = (
+    r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows|programdata"
+    r"|program files(?: \(x86\))?(?=[\\/]?(?:\*(?:\.\*)?)?(?:[\"']|$))))?"
+)
+#: The user's profile (or the system drive or Windows directory) named through a variable: cmd's ``%USERPROFILE%``
+#: (``%HOMEDRIVE%%HOMEPATH%``, ``%SystemDrive%``, ``%SystemRoot%``, ``%windir%``), PowerShell's ``$env:USERPROFILE``
+#: (``${env:...}``) and ``$HOME``, and ``~``. It must start a word, so ``backup~`` is a file name, not the profile.
+_WIN_VARS = r"(?:userprofile|homedrive|homepath|systemdrive|systemroot|windir)"
+_WIN_PROFILE_VAR = (
+    r"(?:(?<=[\s\"'=(,:])|^)"
+    r"(?:(?:%" + _WIN_VARS + r"%)+|(?:\$\{?env:" + _WIN_VARS + r"\}?)+|\$\{?home\}?|~)"
+)
+#: A whole-tree target: one of the two above, then an optional separator and the ``*`` / ``*.*`` wildcard of everything
+#: in it (``C:\*``, ``C:\*.*``, ``%USERPROFILE%\*``), then the end of the word (``(?=[\s"']|$)``). That end stops it at
+#: the word's end, so a *deeper* path such as ``C:\Users\<name>\project`` or ``$env:USERPROFILE\proj\build`` -- an
+#: ordinary project folder -- is NOT one of these.
+_WIN_DRIVE = r"(?:" + _WIN_DRIVE_DIR + "|" + _WIN_PROFILE_VAR + r")[\\/]?(?:\*(?:\.\*)?)?(?=[\s\"']|$)"
+#: PowerShell's ``-Recurse``: any unambiguous prefix of it (``-r``, ``-rec``, ``-Recurse``; Remove-Item has no other
+#: parameter starting with r), starting a word, after a hyphen or the en/em dash PowerShell also accepts.
+_PS_RECURSE = r"(?<![\w-])[-\u2013\u2014]r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b"
+#: Remove-Item and the PowerShell aliases for it.
+_PS_REMOVE = r"\b(?:remove-item|rm|ri|del|erase|rd|rmdir)\b"
 
 #: A verb that is the command being run: at the start of the simple command, right after a launcher token
 #: (``powershell Format-Volume``), or after a launcher's opening quote (``cmd /c "diskpart"``). Keeps the format/
@@ -63,21 +85,22 @@ _WIN_DRIVE = r"[A-Za-z]:(?:[\\/](?:users(?:[\\/][^\\/\s\"']+)?|windows)?)?[\\/]?
 _WIN_CMD_POS = r"(?:^\s*|\b(?:cmd(?:\.exe)?|powershell|pwsh(?:\.exe)?)\b[^\"'\n]*[\s\"'])"
 
 #: Windows / WSL destroyers, matched on each simple command (``cmd /c "..."`` and ``powershell -Command "..."`` keep
-#: their quoted script in the sub, so the verb and target are visible). The recursive-delete launchers fire only with a
-#: launcher AND a recursive flag AND a drive target from :data:`_WIN_DRIVE`; a bare ``rmdir /s /q build`` or
-#: ``Remove-Item -Recurse .\build`` has no launcher and no drive target, so a project subfolder delete is never caught.
+#: their quoted script in the sub, so the verb and target are visible). The recursive-delete rules fire only with a
+#: launcher (or the verb starting the command) AND a recursive flag AND a whole-tree target from :data:`_WIN_DRIVE`,
+#: in any order; ``rmdir /s /q build`` or ``Remove-Item -Recurse .\build`` has no such target, so a project subfolder
+#: delete is never caught.
 _WINDOWS_PATTERNS: list[tuple[str, str]] = [
-    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows
+    # cmd.exe /c|/k  del|erase .../s  or  rd|rmdir /s  on a drive root / \Users[\<name>] / \Windows / the programs
     (
         "win-cmd-recursive-delete",
-        r"(?i)\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
+        r"(?i)(?:\bcmd(?:\.exe)?\b(?=.*\s/[ck]\b)(?=.*\b(?:del|erase|rd|rmdir)\b)|^\s*(?:del|erase|rd|rmdir)\b)"
+        r"(?=.*/s\b)(?=.*" + _WIN_DRIVE + ")",
     ),
-    # powershell|pwsh (with -Command/-c or bare)  Remove-Item|rm|ri|del ... -Recurse  on those targets
+    # powershell|pwsh (with -Command/-c or bare)  Remove-Item or an alias of it ... -Recurse  on those targets
     (
         "win-powershell-recursive-delete",
-        r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*\b(?:remove-item|rm|ri|del)\b)(?=.*-recurse\b)(?=.*"
-        + _WIN_DRIVE
-        + ")",
+        r"(?i)(?:\b(?:powershell|pwsh)(?:\.exe)?\b(?=.*" + _PS_REMOVE + r")|^\s*remove-item\b)"
+        r"(?=.*" + _PS_RECURSE + r")(?=.*" + _WIN_DRIVE + ")",
     ),
     # Format-Volume (PowerShell cmdlet), diskpart (partition tool) and the legacy `format X:` command only count as the
     # command being run, not as a word in prose or a filename (`cat notes-about-diskpart.md`, `echo "run diskpart"`):
@@ -231,11 +254,14 @@ _DANGEROUS_RM_TARGETS = frozenset(
     }
 )
 
-#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, or the Windows
-#: directory: ``rm -rf`` on any of these wipes the Windows host from inside WSL (issue #169). Matched against the
-#: expanded rm target (optionally a trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such
-#: as ``/mnt/c/Users/nils/project`` is a project folder, not one of these, and is not matched.
-_MNT_DRIVE_RM = re.compile(r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows))?(?:/\*)?", re.IGNORECASE)
+#: A WSL mount of a Windows drive (``/mnt/c``), its ``Users`` tree, a single user profile under it, the Windows
+#: directory or the installed programs (``Program Files``, ``Program Files (x86)``, ``ProgramData``): ``rm -rf`` on any
+#: of these wipes the Windows host from inside WSL (issue #169). Matched against the expanded rm target (optionally a
+#: trailing ``/*``), case-insensitively, as the mount is on drvfs. A deeper path such as ``/mnt/c/Users/nils/project``
+#: is a project folder, not one of these, and is not matched.
+_MNT_DRIVE_RM = re.compile(
+    r"/mnt/[a-z](?:/(?:users(?:/[^/]+)?|windows|program files(?: \(x86\))?|programdata))?(?:/\*)?", re.IGNORECASE
+)
 
 
 def check(
