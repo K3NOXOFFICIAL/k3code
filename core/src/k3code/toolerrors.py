@@ -16,7 +16,9 @@ from k3code.redact import scrub_text
 SIGNATURE_CHARS = 160
 
 _UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-_PATH = re.compile(r"(?:[A-Za-z0-9_.~\-]*/)+[A-Za-z0-9_.\-]*")
+#: From the start of a run of path characters only: from every character of a long run without `/`, scanning to its
+#: end was quadratic (K3NOX-356). A later start in the same run reaches no `/` the first did not.
+_PATH = re.compile(r"(?<![A-Za-z0-9_.~\-])(?:[A-Za-z0-9_.~\-]*/)+[A-Za-z0-9_.\-]*")
 _HEX = re.compile(r"\b(?:0x)?(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}\b")
 _NUMBER = re.compile(r"(?<![A-Za-z_<])\d+(?:\.\d+)?")
 _EXCEPTION = re.compile(r"^Tool execution failed: ([A-Za-z_][\w.]*):")

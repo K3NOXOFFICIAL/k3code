@@ -20,10 +20,14 @@ _KEY_RE = re.compile(r"token|secret|passw|pwd|credential|authoriz|cookie|(?<![a-
 _KEY_WORD_RE = re.compile(r"(?:key|Key)s?(?![a-z])|KEYS?(?![A-Z])")
 #: Config sections whose every value is a secret by default (MCP server environments and request headers).
 _SECRET_SECTIONS = frozenset({"env", "environment", "headers"})
+#: A JWT that stands free is matched from its start. One glued to a word (`x<jwt>`) is matched from the last `eyJ` of
+#: the run with 8 or more characters after it: trying every `eyJ` of a long run to its end was quadratic (K3NOX-356).
 _PREFIXED = re.compile(
     r"(?:sk-[A-Za-z0-9_\-]{12,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|glpat-[A-Za-z0-9_\-]{16,}"
-    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}|Bearer\s+[A-Za-z0-9._\-~+/]{16,}"
+    r"|(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"
+    r"|eyJ(?=[A-Za-z0-9_\-]{8})(?:(?!eyJ[A-Za-z0-9_\-]{8})[A-Za-z0-9_\-])*+\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"
+    r"|Bearer\s+[A-Za-z0-9._\-~+/]{16,}"
     r"|Bearer\s+(?=[A-Za-z0-9._\-~+/]*[0-9._\-~+/])[A-Za-z0-9._\-~+/]{6,}"
     r"|://[^/\s:@]+:(?![*?]+@)[^/\s@]+@)"
 )
@@ -48,9 +52,11 @@ def looks_like_secret(value: str) -> bool:
 
 _PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
 #: `DB_PASSWORD=hunter2`, `export API_KEY: "abc123"`, `client_secret = xyz` (the value stays hidden, the name stays).
+#: The name is the whole run of name characters, tried once from its start (atomic): starting again at every word
+#: start inside a long run (`a-a-a-...`) or at every keyword in it (`tokentoken...`) was quadratic (K3NOX-356).
 _ASSIGNMENT = re.compile(
-    r"(?i)\b([A-Z0-9_.\-]*(?:password|passwd|secret|token|api[_-]?key|apikey|private[_-]?key|credential|"
-    r"access[_-]?key|auth)[A-Z0-9_.\-]*)(\s*[=:]\s*)(['\"]?)([^\s'\"<>,;]{6,})\3"
+    r"(?i)(?<![A-Z0-9_.\-])((?>[A-Z0-9_.\-]*?(?:password|passwd|secret|token|api[_-]?key|apikey|private[_-]?key|"
+    r"credential|access[_-]?key|auth)[A-Z0-9_.\-]*))(\s*[=:]\s*)(['\"]?)([^\s'\"<>,;]{6,})\3"
 )
 _AUTH_HEADER = re.compile(
     r"(?i)\b((?:proxy-)?authorization|set-cookie|cookie|x-api-key|x-auth-token)(\s*[:=]\s*)"
@@ -101,7 +107,9 @@ def _opaque_run(m: re.Match[str]) -> str:
 #: A bare `--key` hides its value only when that is token-shaped (`sort --key=2,2`, `--key docs/a.txt` stay).
 _KEY_FLAG = re.compile(r"(?i)--?key")
 _KEY_FLAG_VALUE = re.compile(r"(?i)((?:^|\s)--?key(?:=|\s+))([^\s'\"-][^\s'\"]*)")
-_URL = re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s'\"<>]+", re.I)
+#: The scheme starts at the last word start before `://` (an earlier one leaves the same text: only what follows `://`
+#: is scrubbed); scanning from every word start of a long run to its end was quadratic (K3NOX-356).
+_URL = re.compile(r"\b[a-z](?:[a-z0-9]|[+.\-](?![a-z]))*+://[^\s'\"<>]+", re.I)
 _TOKEN_CHARS = re.compile(r"[A-Za-z0-9_\-+=~]+")
 _BASE64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
