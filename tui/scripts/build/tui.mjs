@@ -57,7 +57,13 @@ export async function buildTui(options) {
       platform: "node",
       format: "esm",
       target: "node20",
-      outfile: out,
+      // Code that only a dynamic import() reaches goes into its own file under dist/chunks/ and is read only
+      // when that import runs. Bundled into entry.js it was parsed on every start: undici (the WebSocket for
+      // Node 20, ~30% of the bundle, never loaded on Node 22+) raised the startup peak by about 9 MB (#164).
+      outdir: join(product, "dist"),
+      entryNames: "[name]",
+      chunkNames: "chunks/[name]-[hash]",
+      splitting: true,
       jsx: "automatic",
       jsxImportSource: "react",
       // Skip the prebuilt @hermes/ink bundle and inline the source instead:
