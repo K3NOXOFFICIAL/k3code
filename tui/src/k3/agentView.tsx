@@ -16,6 +16,7 @@ import type { Theme } from "../theme.js";
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
 import { $stripSessions } from "./agentStripStore.js";
 import {
+  buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
   type PastSessionRow,
@@ -30,7 +31,7 @@ import {
 } from "./agentViewStore.js";
 
 export const AGENT_VIEW_HINT =
-  "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back";
+  "↑↓ select · →/⏎ attach · x stop · n new · c collapse · ←/esc back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
@@ -78,21 +79,11 @@ export function AgentViewView({
   t,
 }: AgentViewViewProps) {
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
-  const lines: Line[] = [];
+  const lines = buildLines(rows, nav.collapsedGroups);
 
-  for (const group of VIEW_GROUPS) {
-    const inGroup = rows.filter((r) => r.group === group);
-
-    if (inGroup.length) {
-      lines.push({ group, type: "header" });
-
-      for (const row of inGroup) {
-        lines.push({ index: rows.indexOf(row), row, type: "row" });
-      }
-    }
-  }
-
-  const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
+  const selLine = lines.findIndex(
+    (l) => l.type === "row" && l.index === index,
+  );
   // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
   const overflow = !compact && lines.length > height;
   const inner = overflow ? Math.max(1, height - 2) : Math.max(1, height);
@@ -136,7 +127,7 @@ export function AgentViewView({
     const title = compactPreview(row.title, Math.max(1, titleW - tag.length));
     // Earlier sessions are dimmed unless selected, so the live rows above them stand out.
     const ink = selected
-      ? (style.color ?? t.color.text)
+      ? style.color ?? t.color.text
       : row.kind === "past"
         ? t.color.muted
         : t.color.text;
@@ -160,18 +151,47 @@ export function AgentViewView({
         <Text color={t.color.muted}>
           {tag.padEnd(Math.max(0, titleW - title.length))}
         </Text>
-        <Text
-          color={t.color.muted}
-        >{`  ${stateText(row).padEnd(stateW)}`}</Text>
+        <Text color={t.color.muted}>
+          {"  "}
+          {stateText(row).padEnd(stateW)}
+        </Text>
         {modelW ? (
           <Text color={t.color.muted}>
-            {`  ${compactPreview(row.model ?? "", modelW).padEnd(modelW)}`}
+            {"  "}
+            {compactPreview(row.model ?? "", modelW).padEnd(modelW)}
           </Text>
         ) : null}
         {confirm ? <Text color={t.color.warn}>{CONFIRM_TAG}</Text> : null}
       </Text>
     );
   };
+
+  const renderHeader = (group: ViewGroup) => {
+    const isCollapsed = nav.collapsedGroups.includes(group);
+    const count = rows.filter((r) => r.group === group).length;
+    const arrow = isCollapsed ? "▸ " : "▾ ";
+
+    return (
+      <Text
+        bold
+        color={t.color.text}
+        key={`group:${group}`}
+        wrap="truncate-end"
+      >
+        <Text color={t.color.accent}>{arrow}</Text>
+        {VIEW_GROUP_LABEL[group]}
+        {count ? <Text color={t.color.muted}>{`  ${count}`}</Text> : null}
+      </Text>
+    );
+  };
+
+  // New session prompt line
+  const renderNewPrompt = () =>
+    nav.newSessionPrompt ? (
+      <Text color={t.color.accent} wrap="truncate-end">
+        {`new session: ${nav.newSessionText}█`}
+      </Text>
+    ) : null;
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -198,30 +218,25 @@ export function AgentViewView({
         <Box flexDirection="column">
           {above > 0 ? (
             <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↑ ${above} more`}
+              {"  ↑ "}
+              {above}
+              {" more"}
             </Text>
           ) : null}
           {lines.slice(win.start, win.end).map((l) =>
-            l.type === "header" ? (
-              <Text
-                bold
-                color={t.color.text}
-                key={`group:${l.group}`}
-                wrap="truncate-end"
-              >
-                {VIEW_GROUP_LABEL[l.group]}
-              </Text>
-            ) : (
-              renderRow(l.row, l.index)
-            ),
+            l.type === "header" ? renderHeader(l.group) : renderRow(l.row, l.index),
           )}
           {below > 0 ? (
             <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↓ ${below} more`}
+              {"  ↓ "}
+              {below}
+              {" more"}
             </Text>
           ) : null}
         </Box>
       )}
+      {compact ? null : <Text> </Text>}
+      {renderNewPrompt()}
       {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
         {AGENT_VIEW_HINT}
@@ -234,7 +249,7 @@ export interface AgentViewPaneProps {
   gw: GatewayClient;
   onActivate: (row: ViewRow) => void;
   onClose: () => void;
-  onNew: () => void;
+  onNew: (text?: string) => void;
   onStop: (row: ViewRow) => void;
 }
 
@@ -371,8 +386,21 @@ export function AgentViewPane({
         return onStop(r.effect.row);
       case "new":
         return onNew();
+      case "new-prompt":
+        return onNew(r.effect.text);
       case "close":
         return onClose();
+      case "toggle-group": {
+        const group = r.effect.group;
+        const isCollapsed = nav.collapsedGroups.includes(group);
+        const nextCollapsed = isCollapsed
+          ? nav.collapsedGroups.filter((g) => g !== group)
+          : [...nav.collapsedGroups, group];
+        setNav((prev) => ({ ...prev, collapsedGroups: nextCollapsed }));
+        break;
+      }
+      case "cancel-new":
+        break;
     }
   });
 
