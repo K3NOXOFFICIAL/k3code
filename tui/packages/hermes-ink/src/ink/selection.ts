@@ -1241,3 +1241,31 @@ export function applySelectionOverlay(
     }
   }
 }
+
+/**
+ * Rows the PAINTED viewport moves when a drag-to-scroll step takes the
+ * ScrollBox from `painted` (what the last frame drew, see
+ * DOMElement.scrollTopPainted) to `next`. The renderer clamps the paint to
+ * the mounted virtual range (`clampMin`/`clampMax`), so scrollTop can run
+ * ahead of the screen while React mounts more rows; capturing a row per
+ * tick in that state re-reads the same unchanged screen row every tick and
+ * the copied text repeats it dozens of times. Positive = content moved up.
+ */
+export function paintedScrollDelta(
+  painted: number,
+  next: number,
+  clampMin?: number,
+  clampMax?: number,
+): number {
+  let target = next;
+
+  if (clampMin !== undefined && Number.isFinite(clampMin)) {
+    target = Math.max(clampMin, target);
+  }
+
+  if (clampMax !== undefined && Number.isFinite(clampMax)) {
+    target = Math.min(clampMax, target);
+  }
+
+  return target - painted;
+}

@@ -1127,6 +1127,7 @@ function renderNodeToOutput(
           : scrollTop;
 
         node.scrollTop = scrollTop;
+        node.scrollTopPainted = clamped;
 
         // Clamp hitting top/bottom consumes any remainder. Set drainPending
         // only after clamp so a wasted no-op frame isn't scheduled.

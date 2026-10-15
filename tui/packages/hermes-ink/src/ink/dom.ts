@@ -73,6 +73,11 @@ export type DOMElement = {
   // the clamp releases). Undefined = no clamp (sticky-scroll, cold start).
   scrollClampMin?: number;
   scrollClampMax?: number;
+  // The scrollTop the last paint actually used: scrollTop after the clamp
+  // above. While the clamp holds, scrollTop can run ahead of what is on
+  // screen; selection drag-to-scroll reads this to capture only rows that
+  // really scrolled out (see Ink.stepSelectionAutoScroll).
+  scrollTopPainted?: number;
   scrollHeight?: number;
   scrollViewportHeight?: number;
   scrollViewportTop?: number;

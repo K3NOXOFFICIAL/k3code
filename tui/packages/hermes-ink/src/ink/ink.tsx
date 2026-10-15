@@ -83,6 +83,7 @@ import {
   getSelectedText,
   hasSelection,
   moveFocus,
+  paintedScrollDelta,
   selectionBounds,
   selectionSignature,
   type SelectionState,
@@ -2406,21 +2407,33 @@ export default class Ink {
     const top = box.scrollViewportTop ?? 0;
     const bottom = top + viewport - 1;
     const before = selectionBounds(this.selection);
+    // Capture and shift by what the screen will actually move, not by the
+    // step: with the virtual-scroll clamp holding the paint at the mounted
+    // edge the screen stays put for a few ticks (and then catches up by
+    // several rows at once). A row captured while the paint stands still
+    // is the same row again — that is how one wrapped tool line ended up
+    // thirty times in a copied transcript.
+    const moved = paintedScrollDelta(
+      box.scrollTopPainted ?? current,
+      next,
+      box.scrollClampMin,
+      box.scrollClampMax,
+    );
 
-    if (before) {
-      if (this.selectionAutoScrollDir > 0) {
+    if (before && moved !== 0) {
+      if (moved > 0) {
         captureScrolledRows(
           this.selection,
           this.frontFrame.screen,
           top,
-          top,
+          Math.min(bottom, top + moved - 1),
           "above",
         );
       } else {
         captureScrolledRows(
           this.selection,
           this.frontFrame.screen,
-          bottom,
+          Math.max(top, bottom + moved + 1),
           bottom,
           "below",
         );
@@ -2432,7 +2445,10 @@ export default class Ink {
     box.scrollAnchor = undefined;
     box.scrollTop = next;
     markDirty(box);
-    shiftAnchor(this.selection, -this.selectionAutoScrollDir, top, bottom);
+
+    if (moved !== 0) {
+      shiftAnchor(this.selection, -moved, top, bottom);
+    }
 
     if (this.selectionDragCell) {
       this.selectionDragCell = {
