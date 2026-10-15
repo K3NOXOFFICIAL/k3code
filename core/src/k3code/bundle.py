@@ -16,7 +16,7 @@ from typing import Any
 import yaml
 
 from k3code import __version__ as k3_version
-from k3code import confio, trust
+from k3code import confio, mcpjson, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
 from k3code.redact import _SECRET_SECTIONS, REDACTED, drop_values, is_secret_key, redact, redact_session_json
@@ -44,9 +44,12 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[str, Any]:
-    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind."""
-    return redact_session_json(drop_values(asdict(s), secrets or []))
+def session_to_dict(
+    s: StoredSession, secrets: list[str] | None = None, untrusted: list[str] | None = None
+) -> dict[str, Any]:
+    """Known secret values first: the shape pass can cut one at a `,` or a quote and leave its tail behind. The
+    ``untrusted`` ones, known only from a file the user may never have trusted, after it (``redact_session_json``)."""
+    return redact_session_json(asdict(s), secrets, untrusted)
 
 
 def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
@@ -131,6 +134,15 @@ def _unparsed(path: Path) -> str:
     return f"{path} does not parse: fix it first, or the export cannot tell which of its values to hide"
 
 
+def _mcp_json(project: Path) -> dict[str, Any]:
+    """The project's ``.mcp.json`` as written, trusted or not (``mcpjson.as_config``): a session can quote one of its
+    values whatever its trust state (K3NOX-581). One that does not parse is refused like a config file (``_read``)."""
+    data = mcpjson.as_config(project)
+    if data is None:
+        raise BundleError(_unparsed(project / mcpjson.FILE))
+    return data
+
+
 def _known_secrets(*configs: Any) -> tuple[list[str], list[str]]:
     """Every secret value the ``configs`` and this process know (provider keys, secret-named env vars, MCP values),
     longest first; and the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
@@ -213,15 +225,21 @@ def write_bundle(
                 secrets_here, certain = _known_secrets(*configs, raw)
                 data = redact(_drop_known(_secret_scalars_as_text(raw, secrets_here), secrets_here, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
-    # the project config as written, trusted or not, hides its values in the sessions: the certain ones only, so a file
-    # the user never trusted cannot blank out a region or path their transcripts name (a guess, see secret_values)
-    secrets = sorted({*secrets, *_known_secrets(written)[1]}, key=len, reverse=True)
-    exported: list[str] = []
+    sessions: list[tuple[str, StoredSession]] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = session_to_dict(stored, secrets)
+        sessions.append((sid, stored))
+    # the project config, and the .mcp.json of this project and of each exported session's own, as written, trusted or
+    # not, hide their values in the sessions: the certain ones only, so a file the user never trusted cannot blank out
+    # a region or path their transcripts name (a guess, see secret_values), and after the shape pass (session_to_dict)
+    projects = {cwd, *(Path(stored.cwd) for _, stored in sessions if stored.cwd)} if sessions else set()
+    mcp = [_mcp_json(project) for project in sorted(projects)]
+    untrusted = sorted(set(_known_secrets(written, *mcp)[1]) - set(secrets), key=len, reverse=True)
+    exported: list[str] = []
+    for sid, stored in sessions:
+        session = session_to_dict(stored, secrets, untrusted)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
