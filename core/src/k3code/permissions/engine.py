@@ -21,6 +21,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
+from k3code import paths
+
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
 
@@ -420,7 +422,8 @@ def _inside(path: str, roots: list[str]) -> bool:
 #: ``.git`` FILE of a linked worktree naming its git directory), direnv runs ``.envrc`` on the next ``cd``, husky its
 #: hooks on the next commit, and ``.k3code/config*`` sets permission rules and hooks. ``write`` and ``edit`` run in the
 #: daemon, outside the sandbox, and the harness's own git runs there too (scope classification, worktrees).
-#: Matched at any depth and case-insensitively; ``.git`` stands for everything under it.
+#: Matched at any depth and case-insensitively; ``.git`` stands for everything under it. The state directory
+#: ``$K3CODE_HOME`` is protected whole, under whatever name, see :func:`k3code_state`.
 _PROTECTED = re.compile(
     r"(?:^|/)(?:\.git|\.gitattributes|\.gitmodules|\.envrc|\.husky|\.k3code/config[^/]*)(?:/|$)", re.IGNORECASE
 )
@@ -447,10 +450,28 @@ _HOME_PROTECTED = (
 )
 
 
+def k3code_state(path: str) -> bool:
+    """``path`` (absolute) is ``$K3CODE_HOME`` (resolved, whatever its name) or lies inside it: the trust store, the
+    memory files, user skills, output styles and overlays that the next session loads as its own instructions.
+    Compared on the path as written and on its realpath against the directory as set and as resolved, case-insensitively
+    as the other guarded paths are. k3code's own writers do not go through ``decide``."""
+    state = paths.home()
+    guarded = [os.path.normpath(state), os.path.realpath(state)]
+    guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
+
+
 def protected_path(path: str) -> bool:
     """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
-    file or git config in the home directory, or under a credential directory (``~/.ssh``, ``~/.config/k3code``).
-    Checked on the path as written and on its realpath, so a symlink does not hide the target."""
+    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``) or
+    under k3code's own state directory (see :func:`k3code_state`). Checked on the path as written and on its
+    realpath, so a symlink does not hide the target."""
+    if k3code_state(path):
+        return True
     home = os.path.expanduser("~")
     homes = (os.path.normpath(home), os.path.realpath(home))
     guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
@@ -528,6 +549,8 @@ def decide(
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
             dec.action, dec.needs_human, dec.always_ask = "ask", True, True
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
+            if k3code_state(path) or k3code_state(reached):
+                dec.message = f"Edits k3code's own state (trust store, memory, skills); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
