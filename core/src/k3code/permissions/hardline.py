@@ -253,6 +253,7 @@ LAUNCHERS = frozenset(
         "trap",
         "ssh",
         "xargs",
+        "parallel",
         "su",
         "watch",
         "find",
@@ -788,6 +789,14 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
         frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file", "--eof", "--max-chars"}),
         0,
     ),
+    "parallel": (
+        "aCdEIjLlNnS",
+        frozenset(
+            {"--arg-file", "--colsep", "--delimiter", "--eof", "--replace", "--jobs", "--max-lines", "--max-args"}
+            | {"--max-replace-args", "--sshlogin", "--results", "--joblog", "--workdir", "--timeout", "--retries"}
+        ),
+        0,
+    ),
     "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"}), 0),
     "ionice": ("cnpPu", frozenset({"--class", "--classdata", "--pid", "--pgid", "--uid"}), 0),
     "nohup": ("", frozenset(), 0),
@@ -949,7 +958,8 @@ def _skip_wrapper_options(
                 reads.append(value)
             if key in chdir_long and value and chdirs is not None:
                 chdirs.append(value)
-            if name == "xargs" and replaces is not None and len(key) >= 5 and "--replace".startswith(key):
+            # getopt takes any unambiguous prefix: ``--r`` is enough
+            if name == "xargs" and replaces is not None and len(key) >= 3 and "--replace".startswith(key):
                 replaces.append(value or _XARGS_REPLACE)
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):

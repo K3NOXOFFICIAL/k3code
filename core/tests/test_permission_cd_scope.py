@@ -336,9 +336,192 @@ def test_a_tilde_credential_path_stays_denied_when_home_is_reassigned(scoped_pro
     assert dec.action == "deny", dec
 
 
-@pytest.mark.parametrize(
-    "cmd", ["HOME=/tmp/x; head ~/README.md", "HOME=/tmp/x; head $HOME/notes.txt", "head ~/README.md"]
-)
+@pytest.mark.parametrize("cmd", ["head ~/README.md", "head $HOME/notes.txt", "HOME_DIR=/tmp/x; head ~/README.md"])
 def test_a_tilde_name_that_is_no_credential_is_not_asked_about(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
+
+
+# K3NOX-750 / K3NOX-767: the next spellings of the same four ideas (a placeholder, a link, a directory option, a HOME)
+
+ASKED = [
+    # an xargs placeholder or find's ``{}`` in a reader argument, or a cd inside a nested shell
+    "echo .ssh/id_rsa | xargs -I{} head ~/{}",
+    "echo id_rsa | xargs -I@ head $HOME/.ssh/@",
+    "echo .ssh | xargs --r=@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | xargs --re=@ sh -c 'cd ~/@ && head id_rsa'",
+    "find ~ -maxdepth 1 -name .ssh -execdir sh -c 'cd {} && head id_rsa' ;",
+    "find ~ -maxdepth 1 -name .ssh -exec sh -c 'cd {} && head id_rsa' ;",
+    "find ~ -name .ssh -okdir sh -c 'pushd {} && head id_rsa' ;",
+    "find ~ -maxdepth 1 -name .ssh -execdir head {}/id_rsa ;",
+    "echo .ssh | parallel sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | parallel sh -c 'cd ~/{.} && head id_rsa'",
+    "parallel sh -c 'cd ~/{} && head id_rsa' ::: .ssh",
+    # a link made on the line, crossed without any cd
+    "ln -s ~ h && head h/.ssh/id_rsa",
+    "ln -sf ~/.ssh k; head k/id_rsa",
+    "ln -s ~ sub/h && head sub/h/.ssh/id_rsa",
+    "ln -s ~ h && head ./h/.aws/credentials",
+    "ln -s ~ h && head $PWD/h/.ssh/id_rsa",
+    "ln -s ~ -t sub && head sub/alice/.ssh/id_rsa",
+    "ln -s ~ && head alice/.ssh/id_rsa",
+    "cp -s ~/README.md h && head h/.ssh/id_rsa",
+    "busybox ln -s ~ h && head h/.ssh/id_rsa",
+    "busybox ln -s ~ h && cd h && head .ssh/id_rsa",
+    # links made by extraction or checkout, then a cd
+    "tar xf a.tar && cd link && head .ssh/id_rsa",
+    "tar -xf a.tar; cd link; head .ssh/id_rsa",
+    "tar --extract -f a.tar && pushd link && head .ssh/id_rsa",
+    "tar xzf a.tgz && (cd link && head .ssh/id_rsa)",
+    "bsdtar -xf a.tar && cd link && head .ssh/id_rsa",
+    "unzip a.zip && cd link && head .ssh/id_rsa",
+    "git checkout topic && cd link && head .ssh/id_rsa",
+    "git clone https://example.invalid/r.git r && cd r/link && head .ssh/id_rsa",
+    "git -C sub pull && cd sub/link && head .ssh/id_rsa",
+    # HOME moved by something other than ``HOME=``
+    "printf -v HOME %s ~/.ssh; head ~/id_rsa",
+    "printf -vHOME %s ~/.ssh; head ~/id_rsa",
+    "read HOME <<< ~/.ssh; head ~/id_rsa",
+    "read -r HOME < sub/file.txt; head ~/id_rsa",
+    "for HOME in ~/.ssh; do head ~/id_rsa; done",
+    "select HOME in ~/.ssh; do head ~/id_rsa; break; done",
+    "mapfile HOME < sub/file.txt; head ~/id_rsa",
+    "declare HOME=~/.ssh; head ~/id_rsa",
+    "typeset -x HOME=~/.ssh; head ~/id_rsa",
+    "HOME[0]=~/.aws; head ~/credentials",
+    "HOME+=/.aws; head ~/credentials",
+    "declare -n h=HOME; h=~/.aws; head ~/credentials",
+    "declare -n h=HOME; printf -v h %s ~/.aws; head ~/credentials",
+    # a moved HOME: bare ``~``, globs, parameter expansions
+    "HOME=~/.ssh; tar -cf - ~",
+    "HOME=~/.ssh; cp -r ~ sub",
+    "HOME=~/.ssh; cp -r $HOME sub",
+    "HOME=~/.ssh; cp -r ${HOME} sub",
+    "HOME=~/.aws; head ~/cred*",
+    "HOME=~/.aws; head ~/c?edentials",
+    "HOME=~/.aws; head ~/[c]redentials",
+    "HOME=~/.aws; head ${HOME:-x}/credentials",
+    "HOME=~/.aws; head ${HOME}/credentials",
+    "HOME=~/.ssh; head ~/deploy_key",  # a key may carry any name
+    "HOME=/tmp/x; head ~/README.md",  # the line moved HOME, so nothing below it is known
+    "HOME=/tmp/x; head $HOME/notes.txt",
+    # a directory option with no value: xargs appends the input as the value
+    "printf '%s\\n' ~ .aws/credentials | xargs tar -cf - -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs tar -cf - --directory",
+    "printf '%s\\n' ~ .aws/credentials | xargs tar -cC",
+    "printf '%s\\n' ~ .aws/credentials | xargs make -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs git -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs env -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs -n2 tar -cf - -C",
+    # TAR_OPTIONS carries a -C
+    "TAR_OPTIONS='-C /' tar -cf - id_rsa",
+    "export TAR_OPTIONS='-C /'; tar -cf - id_rsa",
+    "env TAR_OPTIONS=-C/ tar -cf - id_rsa",
+    "TAR_OPTIONS=--directory=$HOME; export TAR_OPTIONS; tar -cf - .ssh/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", ASKED)
+def test_a_line_that_may_reach_a_credential_another_way_asks_a_person(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action in ("ask", "deny") and (dec.action == "deny" or dec.needs_human), (cmd, mode, dec)
+
+
+DIR_OPTION_MORE_DENIED = [
+    # tar: an old-style bundle gives its words to the letters that take a value, in order
+    "tar cfC - ~ .ssh/id_rsa",
+    "tar cCf ~ - .ssh/id_rsa",
+    "tar cvCf ~ - .ssh/id_rsa",
+    "tar cCvf ~ - .ssh/id_rsa",
+    "tar Cc ~ -f - .ssh/id_rsa",
+    "tar cfCb - ~ 20 .ssh/id_rsa",
+    "tar cbCf 20 ~ - .ssh/id_rsa",
+    # bsdtar has its own options: --cd, and -H/-L are flags, -s takes a value
+    "bsdtar --cd ~ -cf - .ssh/id_rsa",
+    "bsdtar --cd=~ -cf - .ssh/id_rsa",
+    "bsdtar -H -C ~ -cf - .ssh/id_rsa",
+    "bsdtar -L -C ~ -cf - .ssh/id_rsa",
+    "bsdtar -cHLf - -C ~ .ssh/id_rsa",
+    "bsdtar -s /a/b/ -C ~ -cf - .ssh/id_rsa",
+    # busybox applets
+    "busybox tar -C ~ -cf - .ssh/id_rsa",
+    "busybox make -C ~/.ssh -f id_rsa",
+    # make: -L is a flag, --di is --directory
+    "make -L -C ~ -f .config/k3code/env -p",
+    "make -C ~ -L -f .config/k3code/env -p",
+    "make --di ~ -f .config/k3code/env -p",
+    "make --dir=~ -f .config/k3code/env -p",
+    # other programs that run in a directory they are given
+    "echo .aws/credentials | cpio -o -D ~",
+    "echo .aws/credentials | cpio -o --directory=~",
+    "echo .aws/credentials | cpio -oD ~",
+    "cmake -E chdir ~ head .ssh/id_rsa",
+    "uv --directory ~ run head .ssh/id_rsa",
+    "uv run --directory ~ head .ssh/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", DIR_OPTION_MORE_DENIED)
+def test_more_directory_options_move_the_directory_a_member_is_read_from(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "deny", (cmd, mode, dec)
+    assert dec.hardline == "sensitive-path"
+
+
+STILL_ALLOWED = [
+    "echo file.txt | xargs -I{} cat {}",
+    "echo file.txt | xargs -I{} head sub/{}",
+    "echo file.txt | xargs -I{} head ./{}",
+    "ls sub | xargs -I{} head sub/{}",
+    "find . -name '*.txt' -exec head {} ;",
+    "find sub -name '*.txt' -exec cat {} +",
+    "parallel head ::: sub/file.txt",
+    "ln -s file.txt l && cat l",
+    "ln -s sub l && cat l/file.txt",
+    "ln -s ~/README.md l && head l",
+    "tar -xf a.tar && cat README.md",
+    "tar -xf a.tar",
+    "tar -xf a.tar -C sub",
+    "unzip a.zip && cat README.md",
+    "git checkout topic && cd sub && cat file.txt",
+    "git clone https://example.invalid/r.git r && cd r && ls",
+    "tar cf out.tar sub",
+    "tar cf out.tar -C sub file.txt",
+    "tar cfC out.tar sub file.txt",
+    "tar cvf out.tar sub",
+    "bsdtar -cf out.tar sub",
+    "bsdtar -L -cf out.tar sub",
+    "busybox tar -tf out.tar",
+    "busybox ls",
+    "make -C build",
+    "make -L -n test",
+    "make --directory=sub -n test",
+    "make --dry-run test",
+    "cpio -idv < out.cpio",
+    "cmake -E echo hi",
+    "cmake --build sub",
+    "uv run pytest",
+    "printf '%s\\n' a | xargs tar -cf out.tar -C sub",
+    "printf '%s\\n' a | xargs git status",
+    "printf '%s\\n' a | xargs env true",
+    "TAR_OPTIONS=--warning=none tar -tf out.tar",
+    "TAR_OPTIONS= true",
+    "read x < sub/file.txt; cat sub/file.txt",
+    "HOME_DIR=$HOME; head ~/README.md",
+    "declare -n h=PATH; head ~/README.md",
+    "declare -a list; head ~/README.md",
+    "head ~/README.md",
+    "head $HOME/README.md",
+]
+
+
+@pytest.mark.parametrize("cmd", STILL_ALLOWED)
+def test_the_ordinary_neighbours_of_those_lines_keep_their_decision(scoped_project: Path, cmd: str) -> None:
     dec = _decide(cmd, "auto", scoped_project)
     assert dec.action == "allow", (cmd, dec)
