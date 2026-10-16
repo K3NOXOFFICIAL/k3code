@@ -14,6 +14,7 @@ import functools
 import os
 import re
 import shlex
+import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -429,15 +430,6 @@ def _abs(raw: str, cwd: str) -> str:
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
 
 
-def _real(path: str) -> str:
-    """``os.path.realpath`` that never raises: a path the OS cannot look up (a NUL byte, which no real shell argument
-    holds) keeps its normalised spelling, so the checks that read it still get a string to match against."""
-    try:
-        return os.path.realpath(path)
-    except (ValueError, OSError):
-        return os.path.normpath(path)
-
-
 def _inside(path: str, roots: list[str]) -> bool:
     """``path`` lies under one of ``roots``, after resolving symlinks on both sides: a lexical check let
     ``proj/docs -> ../outside`` turn a write to ``docs/x`` into a write outside the project. A path that does not
@@ -498,12 +490,63 @@ def k3code_state(path: str) -> bool:
     return False
 
 
+def _install_roots() -> list[str]:
+    """What the next start of k3code runs, as paths: the install root (``K3CODE_DATA``, and the one the running
+    process's own virtualenv sits in: ``<data>/current/venv`` or ``<data>/versions/<ver>/venv``, so a process that
+    lacks the setting the install was made with still finds it); the ``k3code``, ``k3``, ``uv`` and ``uvx`` links and
+    programs in ``<prefix>/bin`` (``<data>`` is ``<prefix>/share/k3code``; also ``~/.local/bin`` and ``K3_BIN_DIR``),
+    of which the updater runs ``uv`` without the sandbox; and what shapes the systemd user unit and the environment
+    it starts in. systemd applies a drop-in from any of its unit directories and reads ``user.conf``, ``environment.d``
+    and the ``*.wants`` links next to the units, so the whole ``systemd`` and ``environment.d`` folders are guarded, in
+    the default place and under ``XDG_CONFIG_HOME`` / ``XDG_DATA_HOME`` (the daemon and the user manager may not agree
+    on those), and ``$XDG_RUNTIME_DIR/systemd``."""
+    datas = [paths.data_dir()]
+    for venv in dict.fromkeys((Path(sys.prefix), Path(os.path.realpath(sys.prefix)))):
+        if venv.name != "venv":
+            continue  # a dev checkout's own environment is a project file, not an install
+        if venv.parent.name == "current":
+            datas.append(venv.parent.parent)
+        elif venv.parent.parent.name == "versions":
+            datas.append(venv.parent.parent.parent)
+    bins = [Path.home() / ".local" / "bin"]
+    bins += [d.parent.parent / "bin" for d in datas if d.parent.name == "share"]
+    if explicit := os.environ.get("K3_BIN_DIR"):
+        bins.append(Path(explicit).expanduser())
+    config = [Path.home() / ".config", *_xdg("XDG_CONFIG_HOME")]
+    share = [Path.home() / ".local" / "share", *_xdg("XDG_DATA_HOME")]
+    out = [*datas, *(b / n for b in bins for n in ("k3code", "k3", "uv", "uvx"))]
+    out += [c / n for c in config for n in ("systemd", "environment.d")]
+    out += [d / "systemd" for d in (*share, *_xdg("XDG_RUNTIME_DIR"))]
+    return [str(x) for x in out]
+
+
+def _xdg(name: str) -> list[Path]:
+    value = os.environ.get(name)
+    return [Path(value).expanduser()] if value else []
+
+
+def k3code_install(path: str) -> bool:
+    """``path`` (absolute) is k3code's own installed code, one of its launcher links or programs, or what shapes the
+    systemd user unit (see :func:`_install_roots`): what the next start runs, with no sandbox and no permission
+    engine. Other files in ``~/.local/bin`` are not covered. Compared as written and resolved, against the locations as
+    set and as resolved, case-insensitively."""
+    guarded = [g for root in _install_roots() for g in (os.path.normpath(root), _real(root))]
+    guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
+    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
+
+
 def protected_path(path: str) -> bool:
     """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
-    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``) or
-    under k3code's own state directory (see :func:`k3code_state`). Checked on the path as written and on its
-    realpath, so a symlink does not hide the target."""
+    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``),
+    under k3code's own state directory (see :func:`k3code_state`) or k3code's own install (see :func:`k3code_install`).
+    Checked on the path as written and on its realpath, so a symlink does not hide the target."""
     if k3code_state(path):
+        return True
+    if k3code_install(path):
         return True
     home = os.path.expanduser("~")
     homes = (os.path.normpath(home), _real(home))
@@ -605,6 +648,8 @@ def decide(
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
             if k3code_state(path) or k3code_state(reached):
                 dec.message = f"Edits k3code's own state (trust store, memory, skills); confirm it yourself: {path}"
+            if k3code_install(path) or k3code_install(reached):
+                dec.message = f"Edits k3code's own install (code, launcher, service unit); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
@@ -2055,9 +2100,15 @@ def _home_stores() -> list[str]:
     return list(dict.fromkeys([*stores, *map(_real, stores)]))
 
 
+def _flat(path: str) -> str:
+    """``path`` (absolute) normalised, with a leading ``//`` made ``/``: normpath keeps two slashes (POSIX leaves them
+    implementation-defined) and the kernel does not: ``//home/u/.npmrc`` is ``/home/u/.npmrc`` and must compare so."""
+    return "/" + os.path.normpath(path).lstrip("/")
+
+
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((os.path.normpath(path), _real(path))))
+    return list(dict.fromkeys((_flat(path), _real(path))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -2120,7 +2171,7 @@ def _link_hops(path: str) -> list[str]:
     cur = path
     try:
         for _ in range(_MAX_LINK_HOPS):
-            hops.append(os.path.normpath(cur))
+            hops.append(_flat(cur))
             done: list[str] = []
             rest = cur.split("/")
             for i, comp in enumerate(rest):
@@ -2132,7 +2183,7 @@ def _link_hops(path: str) -> list[str]:
                     continue
                 probe = "/" + "/".join([*done, comp])
                 if os.path.islink(probe):
-                    cur = "/".join([os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :]])
+                    cur = os.path.join(os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :])
                     break
                 done.append(comp)
             else:
@@ -2145,14 +2196,36 @@ def _link_hops(path: str) -> list[str]:
 _MAX_LINK_HOPS = 40  # as the kernel's symlink limit
 
 
-def _without_mirror(path: str, mirror: str) -> str:
-    """``path`` with the first ``/<mirror>`` cut out: ``~/dotfiles/k3code/.k3code/memory/USER.md`` is
-    ``~/dotfiles/k3code/USER.md`` for the mirror ``.k3code/memory``."""
-    at = path.find("/" + mirror + "/") if mirror else -1
-    return path if at < 0 else path[:at] + path[at + len(mirror) + 1 :]
+def _under(path: str, base: str, fold: bool = False) -> bool:
+    """``path`` is ``base`` or lies below it, by name (not resolved again). ``fold`` compares case-insensitively, as
+    secret_store does: only the test that a path lies in a credential store wants that (on drvfs and macOS
+    ``~/.NPMRC`` is ``~/.npmrc``). A root that covers a path, or lies in a store, does so by its exact spelling."""
+    low, root = (path.casefold(), base.casefold().rstrip("/")) if fold else (path, base.rstrip("/"))
+    return low == root or low.startswith(root + "/")
 
 
-def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = "") -> bool:
+def _mirrored(path: str, homes: list[str], projects: list[str]) -> bool:
+    """``path`` lies in a copy of a project root that keeps the root's place below ``$HOME``, in a folder of its own
+    without a dot: a GNU stow package (``~/dotfiles/k3code/.k3code/memory/USER.md`` for the root ``~/.k3code/memory``).
+    Only a root whose own place has a dot component needs this: the copy is the same files, so its dot folders are as
+    ordinary as the root's; any other dot folder of the package (``.config/gh``) is not."""
+    for home in homes:
+        if not path.startswith(home):
+            continue
+        parts = path[len(home) :].split("/")
+        for root in projects:
+            rel = next((root[len(h) :].split("/") for h in homes if root.startswith(h)), [])
+            if not any(c.startswith(".") for c in rel):
+                continue
+            for i in range(1, len(parts) - len(rel) + 1):
+                if any(c.startswith(".") for c in parts[:i]):
+                    break
+                if parts[i : i + len(rel)] == rel:
+                    return True
+    return False
+
+
+def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
     """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
     has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
     (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
@@ -2162,29 +2235,29 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
     a store, with the whole path inside that root, makes its own files ordinary (a session started in
     ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
-    makes its dot folders ordinary (``.github`` of a repository). Callers have already checked the target lies in the
-    ``mirror`` is the memory folder relative to ``$HOME`` (``.k3code/memory``), given for the user's memory: GNU stow
-    without folding links the file, not the folder, so its real place is
-    ``<dotfiles>/<package>/.k3code/memory/USER.md``. That spelling is judged by the dot rule with the mirror cut out
-    of it, so the dotfiles folder and anything below the mirror still count (``~/.dotfiles/...`` and a ``.hidden``
-    below it stay refused). Every other spelling, the realpath of a link in the mirror among them, is judged on its
-    own."""
+    makes its dot folders ordinary (``.github`` of a repository). A root counts as written and by its realpath, and a
+    spelling lies in it by name: a spelling is never resolved a second time, or a memory folder kept in a dotfiles
+    repository (``~/.k3code/memory -> ~/dotfiles/k3code/memory``) would stop being its own. Callers have already
+    checked the target lies in the roots, so a store outside every root needs no test here."""
     spellings = _link_hops(path)
     if any(sensitive_path(p) for p in spellings):
         return True
-    home_roots = [str(r) for r in roots]
+    forms = {r: _spellings(r) for r in map(str, roots)}  # each root as written and by realpath
+
+    def covers(root: str, paths: list[str]) -> bool:
+        return all(any(_under(p, f) for f in forms[root]) for p in paths)
+
     for store in [*_home_stores(), *extra_stores]:
-        low = store.casefold().rstrip("/")
-        held = [p for p in spellings if p.casefold() == low or p.casefold().startswith(low + "/")]
-        if held and not any(_inside(r, [store]) and all(_inside(p, [r]) for p in held) for r in home_roots):
+        held = [p for p in spellings if _under(p, store, fold=True)]
+        if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
             return True
-    homes = _home_prefixes()
     home = os.path.normpath(os.path.expanduser("~"))
-    if not _inside(home, home_roots):
+    if not _inside(home, list(forms)):
         return False
-    projects = [r for r in home_roots if not _inside(home, [r])]
+    projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
+    homes = _home_prefixes()
     return any(
-        _below_home_dot(_without_mirror(p, mirror), homes) and not (projects and _inside(p, projects))
+        _below_home_dot(p, homes) and not (any(_under(p, f) for f in projects) or _mirrored(p, homes, projects))
         for p in spellings
     )
 

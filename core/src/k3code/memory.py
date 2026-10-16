@@ -184,22 +184,9 @@ def _withheld(written: Path, roots: tuple[Path, ...]) -> bool:
     stores = (
         [] if state in (user_home, *user_home.parents) else [str(state), os.path.abspath(home())]
     )  # not $HOME or above
-    mirror = ""
     if roots == _user_roots():
         check = [roots[0], home() / "memory"]  # all of $HOME and the memory folder; the rest of the state is not theirs
-        mirror = _memory_mirror()
-    return memory_import_withheld(str(written), [str(r) for r in check], stores, mirror)
-
-
-def _memory_mirror() -> str:
-    """The memory folder relative to ``$HOME`` (``.k3code/memory``), or '' when it is not below it: where a dotfiles
-    package keeps the files that GNU stow links into the folder one by one."""
-    folder = home() / "memory"
-    for base in (Path.home(), Path.home().resolve()):
-        for form in (Path(os.path.abspath(folder)), folder.resolve()):
-            if base in form.parents:
-                return form.relative_to(base).as_posix()
-    return ""
+    return memory_import_withheld(str(written), [str(r) for r in check], stores)
 
 
 def _import_target(spec: str, base: Path) -> Path:
@@ -332,8 +319,17 @@ def _expand_once(
             add(line)
             continue
         written = _import_spelling(m.group(1), resolved.parent)
-        target = written.resolve()
-        if not target.is_file():
+        try:
+            target = written.resolve()
+        except (OSError, RuntimeError):
+            add(line)
+            continue
+        try:
+            is_file = target.is_file()
+        except (OSError, RuntimeError):
+            add(line)
+            continue
+        if not is_file:
             add(line)
         elif target in stack:
             add(f"({line.strip()} not imported: it imports itself)")
