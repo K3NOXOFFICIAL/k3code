@@ -418,3 +418,74 @@ async def test_projectprep_does_not_propose_k3code_md_over_claude_md(tmp_path: P
     _write(root / "Makefile", "test:\n\ttrue\n")
     props = await projectprep.prepare(root, store=ProposalStore(tmp_path / "store"))
     assert not [p for p in props if p.payload.get("op") == "draft_memory"]
+
+
+# A session whose project root is $HOME reads ~/AGENTS.md, which the model can write (an in-roots edit): an @import
+# there must not pull a home credential store into the prompt. Fake HOME (the conftest fixture) and fake values.
+_FAKE_TOKEN = "fake-" + "token-for-test"
+
+
+def _home_credentials() -> dict[str, Path]:
+    home = Path.home()
+    return {
+        "@.npmrc": _write(home / ".npmrc", "//registry/:_authToken=" + _FAKE_TOKEN),
+        "@.config/gh/hosts.yml": _write(home / ".config/gh/hosts.yml", "oauth_token: " + _FAKE_TOKEN),
+        "@.local/share/uv/credentials/credentials.toml": _write(
+            home / ".local/share/uv/credentials/credentials.toml", "password = '" + _FAKE_TOKEN + "'"
+        ),
+        "@.config/git/credentials": _write(home / ".config/git/credentials", "https://u:" + _FAKE_TOKEN + "@h"),
+    }
+
+
+def test_home_rooted_project_memory_cannot_import_a_home_credential_store(monkeypatch) -> None:
+    home = Path.home()
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+    imports = _home_credentials()
+    _write(home / "notes.md", "ORDINARY-NOTES")
+    _write(home / "AGENTS.md", "head\n" + "\n".join(imports) + "\n@notes.md")
+    text = " ".join(m.text for m in load_memory(home))
+    assert _FAKE_TOKEN not in text and "ORDINARY-NOTES" in text
+    assert text.count("not imported: outside the allowed directories") == len(imports)
+    assert _FAKE_TOKEN not in memory.memory_prompt(home)
+
+
+def test_home_rooted_project_memory_file_symlinked_to_a_credential_store_is_refused(monkeypatch) -> None:
+    home = Path.home()
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+    creds = _home_credentials()
+    (home / "AGENTS.md").symlink_to(creds["@.npmrc"])
+    (home / "K3CODE.md").symlink_to(creds["@.config/git/credentials"])
+    (home / "CLAUDE.md").symlink_to(creds["@.config/gh/hosts.yml"])
+    assert load_memory(home) == []
+    assert _FAKE_TOKEN not in memory.memory_prompt(home)
+
+
+def test_an_import_through_a_symlink_into_a_credential_store_is_refused(monkeypatch) -> None:
+    home = Path.home()
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+    _home_credentials()
+    (home / "innocent.txt").symlink_to(home / ".npmrc")
+    _write(home / "AGENTS.md", "@innocent.txt")
+    assert _FAKE_TOKEN not in " ".join(m.text for m in load_memory(home))
+
+
+def test_user_memory_cannot_import_a_home_credential_store(monkeypatch) -> None:
+    home = Path.home()
+    k3home = home / ".k3code"
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    _home_credentials()
+    _write(home / "prefs.md", "MY-PREFS")
+    _write(k3home / "memory" / "other.md", "OWN-STATE")
+    _write(k3home / "memory" / "USER.md", "@~/.npmrc\n@~/.config/gh/hosts.yml\n@~/prefs.md\n@other.md")
+    text = load_memory(home / "nowhere")[0].text
+    assert _FAKE_TOKEN not in text and "MY-PREFS" in text and "OWN-STATE" in text
+
+
+def test_a_repository_below_home_keeps_its_dot_folders_importable(tmp_path: Path, monkeypatch) -> None:
+    home = Path.home()
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+    root = home / "src" / "proj"
+    (root / ".git").mkdir(parents=True)
+    _write(root / ".github" / "contributing.md", "CI-RULES")
+    _write(root / "AGENTS.md", "@.github/contributing.md")
+    assert "CI-RULES" in load_memory(root)[0].text
