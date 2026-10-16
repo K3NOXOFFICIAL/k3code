@@ -161,6 +161,23 @@ def _within(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(path == r or r in path.parents for r in roots)
 
 
+def _withheld(target: Path, roots: tuple[Path, ...]) -> bool:
+    """``target`` (resolved) is a credential location a memory file must not pull into the prompt: a key or dotenv
+    file (sensitive_path), a credential store of ``$HOME`` (the ones the read-only home sandbox hides) and, for a
+    project whose root is ``$HOME`` or above it, anything below a home dot folder. Memory files are model-writable
+    (``~/AGENTS.md`` is an in-roots edit) and the import path has no ``decide()``. The user's memory keeps its
+    ordinary home files and everything in ``$K3CODE_HOME`` (its own state, wherever that sits)."""
+    from k3code.permissions.engine import home_dot_path, home_store_path, sensitive_path
+
+    path = str(target)
+    if sensitive_path(path):
+        return True
+    user = home().resolve() in roots
+    if user and _within(target, (home().resolve(),)):
+        return False
+    return home_store_path(path) or (not user and home_dot_path(path, [str(r) for r in roots]))
+
+
 def _import_target(spec: str, base: Path) -> Path:
     p = Path(spec).expanduser() if spec.startswith("~/") else base / spec
     return p.resolve()
@@ -240,8 +257,6 @@ def _expand_once(
 ) -> tuple[str, bool, int]:
     """One pass of ``_expand`` over the first ``want`` characters; the last value is how many are still missing
     when the file goes on past what was read (0 when the pass is final)."""
-    from k3code.permissions.engine import sensitive_path
-
     resolved = path.resolve()
     stack = (*stack, resolved)
     head, end, eof = _read_head(path, want, lead)
@@ -293,7 +308,7 @@ def _expand_once(
             add(line)
         elif target in stack:
             add(f"({line.strip()} not imported: it imports itself)")
-        elif not _within(target, roots) or sensitive_path(str(target)):
+        elif not _within(target, roots) or _withheld(target, roots):
             add(f"({line.strip()} not imported: outside the allowed directories)")
         elif len(stack) > MAX_IMPORT_DEPTH:
             add(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
@@ -323,10 +338,10 @@ def expand_imports(
     """``path``'s text with each line ``@relative/or/~/path`` replaced by that file's text (recursively).
 
     An import is resolved against the importing file's directory and must stay inside ``roots`` (the repository for
-    project files, the home directory for the user's memory); a key or credential location is never read. Imports
-    nest at most MAX_IMPORT_DEPTH deep and a cycle is cut. A line naming no file stays as written (``@property`` in
-    prose), and lines inside a code fence are never imports. An import larger than MAX_IMPORT_BYTES or not text is
-    replaced by a marker line.
+    project files, the home directory for the user's memory); a key or credential location (see ``_withheld``) is never
+    read. Imports nest at most MAX_IMPORT_DEPTH deep and a cycle is cut. A line naming no file stays as written
+    (``@property`` in prose), and lines inside a code fence are never imports. An import larger than MAX_IMPORT_BYTES
+    or not text is replaced by a marker line.
 
     The text is cut at ``max_chars`` characters in all, however large the files are, and the files are read only that
     far (see ``_expand`` for the cut).
@@ -336,13 +351,11 @@ def expand_imports(
 
 def _readable(path: Path, roots: tuple[Path, ...]) -> bool:
     """Whether ``path``, with symlinks followed, stays inside ``roots`` and is not a credential location."""
-    from k3code.permissions.engine import sensitive_path
-
     try:
         target = path.resolve()
     except OSError:
         return False
-    return _within(target, roots) and not sensitive_path(str(target))
+    return _within(target, roots) and not _withheld(target, roots)
 
 
 def _chain(root: Path, cwd: Path) -> list[Path]:
