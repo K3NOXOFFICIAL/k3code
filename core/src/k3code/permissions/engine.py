@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import fnmatch
 import functools
-import glob
 import os
 import re
 import shlex
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -470,26 +470,21 @@ def _stricter(a: Decision, b: Decision) -> Decision:
     return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human, d.always_ask))
 
 
-#: The arguments that name a command, a path or a directory; a file body or an edit string may hold any character.
-_NAMING_ARGS = ("command", "path", "file", "pattern", "cwd")
-
-
 def _unusable_argument(args: dict[str, object]) -> str | None:
     """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no shell
-    argument and no file open (both fail), and a lone surrogate cannot be encoded for the OS; a ``~`` before either
-    raised in the user-name lookup, and inside a protected path or a hardline command it broke the matching, so the
-    spelling got a weaker decision than the plain one. A surrogate escape (``\\udc80``, a name the OS could not decode)
-    encodes and is not refused. Checked before any path handling, so no later expansion can raise."""
-    for key in _NAMING_ARGS:
-        value = args.get(key)
-        if not isinstance(value, str):
+    or exec (it lives in the C string terminator, so a name ending there is two names and the rest vanishes); an argument
+    that the locale cannot decode is not reproducible by a human at a shell. ``command`` and ``cwd`` are checked, too."""
+    for key in ("command", "cwd", "path"):
+        val = args.get(key)
+        if val is None:
             continue
-        if "\0" in value:
+        if isinstance(val, str):
+            try:
+                val.encode("utf-8")  # rejects lone surrogates
+            except UnicodeEncodeError:
+                return f"Argument {key} is not text ({val!r})."
+        if isinstance(val, str) and "\0" in val:
             return f"A NUL byte cannot be passed to a command or a path ({key})."
-        try:
-            os.fsencode(value)
-        except UnicodeError:
-            return f"The {key} argument cannot be encoded for the operating system."
     return None
 
 
@@ -518,9 +513,6 @@ def decide(
     auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
     mode = PermissionMode(mode)
-    args = args or {}
-    if (bad := _unusable_argument(args)) is not None:
-        return _finish(Decision(action="deny", patterns=["*"], message=bad), mode, headless)
     # The planning turn of an auto session reads outside the roots what the session's own turns read there: toolchain
     # and system dirs without a prompt, anything else refused with a hint. Plan mode asked a person for both, in a
     # session whose user chose not to be asked (and the turn after the plan refuses the second kind anyway).
@@ -529,6 +521,9 @@ def decide(
         if mode == PermissionMode.PLAN and plan_for is not None and PermissionMode(plan_for) == PermissionMode.AUTO
         else mode
     )
+    args = args or {}
+    if (bad := _unusable_argument(args)) is not None:
+        return Decision(action="deny", reason=bad)
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
     ruleset = merge(builtin_defaults(mode), user_rules or [], project_rules or [], session_rules or [])
@@ -1130,8 +1125,9 @@ _REMOVERS = frozenset({"rm", "unlink", "shred"})
 _COPIERS = frozenset({"cp", "mv", "ln", "install"})
 _KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
 #: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
-#: container one. Both are an ask that a person answers.
-_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "deny": 3}
+#: container one. Both are an ask that a person answers. ``unchecked``: a glob was too large to check for credential
+#: files; a person is asked, and yolo (where nobody can be) refuses.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "unchecked": 3, "deny": 4}
 
 
 def _worse(a: str | None, b: str | None) -> str | None:
@@ -1183,14 +1179,71 @@ def _canonical_secrets(pattern: str, home: str) -> list[str]:
     return out
 
 
-def _glob_reads_secret(pattern: str, home: str) -> bool:
+#: Bounds of the on-disk walk of a glob, shared by every glob word of one bash decision: directory entries read and
+#: seconds spent. A pattern that matches nothing never yields a hit, so a cap on hits would not stop it; the walk runs
+#: on the daemon's event loop. ``_GLOB_MAX_WILD`` caps the wildcard components of one pattern (the walk recurses once
+#: for each); a pattern with more is not walked.
+_GLOB_MAX_ENTRIES = 20_000
+_GLOB_BUDGET_S = 0.5
+_GLOB_MAX_WILD = 32
+
+
+class _GlobBudget:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.deadline = time.monotonic() + _GLOB_BUDGET_S
+        self.spent = False
+
+    def charge(self) -> bool:
+        """Count one directory entry; False once the entry cap or the time budget is used up."""
+        self.entries += 1
+        if self.entries > _GLOB_MAX_ENTRIES or (self.entries % 64 == 0 and time.monotonic() > self.deadline):
+            self.spent = True
+        return not self.spent
+
+
+def _glob_walk(base: str, parts: list[str], budget: _GlobBudget) -> Iterator[str]:
+    """The paths ``glob.glob`` would find for ``base`` + ``parts`` (no ``**``, a wildcard skips dot names), stopping
+    when ``budget`` runs out. Literal components are joined in a loop; only a wildcard component recurses."""
+    if budget.spent:
+        return
+    k = 0
+    while k < len(parts) and not _GLOB_CHARS & set(parts[k]):
+        base = os.path.join(base, parts[k])
+        k += 1
+    if k == len(parts):
+        if os.path.lexists(base):
+            yield base
+        return
+    comp, rest = parts[k], parts[k + 1 :]
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                if not budget.charge():
+                    return
+                name = entry.name
+                if (name.startswith(".") and not comp.startswith(".")) or not fnmatch.fnmatchcase(name, comp):
+                    continue
+                try:
+                    if rest and not entry.is_dir():
+                        continue
+                except OSError:  # a symlink that cannot be followed: glob skips it too
+                    continue
+                yield from _glob_walk(os.path.join(base, name), rest, budget)
+    except OSError:
+        return
+
+
+def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | None:
     """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
-    against the canonical secret names."""
-    for k, hit in enumerate(glob.iglob(pattern)):
+    against the canonical secret names. None when none of these says so and the on-disk walk did not finish within
+    ``budget`` (or was not tried: the budget was spent already, or the pattern is too deep): the answer is unknown."""
+    parts = pattern.split("/")[1:]
+    if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
+        budget.spent = True
+    for hit in _glob_walk("/", parts, budget):
         if sensitive_path(hit):
             return True
-        if k >= 1000:
-            break
     literal: list[str] = []
     for seg in pattern.split("/"):
         if _GLOB_CHARS & set(seg):
@@ -1199,7 +1252,9 @@ def _glob_reads_secret(pattern: str, home: str) -> bool:
     base = "/".join(literal) or "/"
     if base != "/" and sensitive_path(base):
         return True
-    return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
+    if any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home)):
+        return True
+    return None if budget.spent else False
 
 
 _BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
@@ -1224,16 +1279,18 @@ def _brace_expand(word: str, limit: int = 64) -> list[str]:
     return out
 
 
-def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
+def _classify_arg(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
-    front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
+    front of a credential name (``$DIR/.env``), ``unchecked`` when a glob could not be checked within ``budget``, else
+    None. ``{a,b}`` alternatives are classified one by one."""
+    budget = budget or _GlobBudget()
     worst: str | None = None
     for word in _brace_expand(arg):
-        worst = _worse(worst, _classify_word(word, cwd, home))
+        worst = _worse(worst, _classify_word(word, cwd, home, budget))
     return worst
 
 
-def _classify_word(arg: str, cwd: str, home: str) -> str | None:
+def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -1242,7 +1299,8 @@ def _classify_word(arg: str, cwd: str, home: str) -> str | None:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        return "deny" if _glob_reads_secret(path, home) else None
+        reads = _glob_reads_secret(path, home, budget or _GlobBudget())
+        return "unchecked" if reads is None else "deny" if reads else None
     return "deny" if sensitive_path(path) else None
 
 
@@ -1394,44 +1452,47 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     return words, [], []
 
 
-def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str, budget: _GlobBudget) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
-        worst = _worse(worst, _classify_arg(source, cwd, home))
+        worst = _worse(worst, _classify_arg(source, cwd, home, budget))
     wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
     argv = _argv(sub, wrapper_reads)
     for arg in wrapper_reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
+        worst = _worse(worst, _classify_arg(arg, cwd, home, budget))
     if not argv:
         return worst
     for command in hardline.ssh_option_commands(argv[0], argv[1:]):
         # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
-        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
+        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True, budget=budget))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
-    if any(_classify_arg(arg, cwd, home) for arg in writes):
+        worst = _worse(worst, _classify_arg(arg, cwd, home, budget))
+    if any(_classify_arg(arg, cwd, home, budget) for arg in writes):
         worst = _worse(worst, "ask")
-    if any(_classify_arg(arg, cwd, home) for arg in confirm):
+    if any(_classify_arg(arg, cwd, home, budget) for arg in confirm):
         worst = _worse(worst, "confirm")
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
+def _secret_access(
+    parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False, budget: _GlobBudget | None = None
+) -> str | None:
     """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
-    point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
-    None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
-    tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
-    expanded, globs are matched."""
+    point at one), ``unchecked`` (a glob was too large to check), ``confirm`` (deletes, sources, stages one or hands
+    it to a container), ``ask`` (overwrites one), None. Every argument of every simple command and of everything
+    nested in it counts unless the command only prints, tests or authenticates with it (see _credential_roles), and
+    so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
+    budget = budget or _GlobBudget()  # one for the whole command line, nested commands included
     worst: str | None = None
     for sub in parsed.subs:
         piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
-        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home, budget))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
-        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
+        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst, budget))
     return worst
 
 
@@ -1449,6 +1510,9 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
         if norm and norm != nested:
             forms.append(norm)
     return list(dict.fromkeys(forms))
+
+
+_UNCHECKED_MSG = "The glob is too large to check for credential files; narrow it"
 
 
 def _decide_bash(
@@ -1470,6 +1534,8 @@ def _decide_bash(
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
+        if secret == "unchecked":
+            return Decision(action="deny", patterns=prefixes, message=f"{_UNCHECKED_MSG}: {command[:120]}")
         return Decision(action="allow", patterns=prefixes)
     if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
         # auto mode writes only inside the project roots; no allow rule overrides this
@@ -1515,12 +1581,12 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
-    if secret in ("human", "confirm") and worst.action != "deny":
-        why = (
-            "A variable may point at a credential file"
-            if secret == "human"
-            else "Deletes, sources, stages or hands a container a credential file"
-        )
+    if secret in ("human", "confirm", "unchecked") and worst.action != "deny":
+        why = {
+            "human": "A variable may point at a credential file",
+            "confirm": "Deletes, sources, stages or hands a container a credential file",
+            "unchecked": _UNCHECKED_MSG,
+        }[secret]
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
@@ -1663,16 +1729,9 @@ def _home_stores() -> list[str]:
     return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
 
 
-def _norm(path: str) -> str:
-    """``os.path.normpath`` with a leading ``//`` collapsed: POSIX keeps exactly two slashes, and ``//home/u/.npmrc``
-    is ``/home/u/.npmrc`` on Linux but matches no prefix written with one."""
-    out = os.path.normpath(path)
-    return "/" + out.lstrip("/") if out.startswith("//") else out
-
-
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((_norm(path), _norm(os.path.realpath(path)))))
+    return list(dict.fromkeys((os.path.normpath(path), os.path.realpath(path))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -1720,100 +1779,6 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
     return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
-
-
-def _link_hops(path: str) -> list[str]:
-    """``path`` (absolute) as written and, for each symlink met on the way to its realpath, what the path becomes
-    after following it: ``~/.config/gh/hosts.yml -> ~/dotfiles/gh/hosts.yml`` is both. A reader that opens the final
-    target would otherwise never see that the path it was given names a credential store."""
-    hops: list[str] = []
-    cur = path
-    try:
-        for _ in range(_MAX_LINK_HOPS):
-            hops.append(_norm(cur))
-            done: list[str] = []
-            rest = cur.split("/")
-            for i, comp in enumerate(rest):
-                if comp in ("", "."):
-                    continue
-                if comp == "..":
-                    if done:
-                        done.pop()
-                    continue
-                probe = "/" + "/".join([*done, comp])
-                if os.path.islink(probe):
-                    cur = os.path.join("/" + "/".join(done), os.readlink(probe), *(c for c in rest[i + 1 :] if c))
-                    break
-                done.append(comp)
-            else:
-                break
-    except (OSError, ValueError):
-        pass
-    return list(dict.fromkeys([*hops, _norm(os.path.realpath(path))]))
-
-
-_MAX_LINK_HOPS = 40  # as the kernel's symlink limit
-
-
-def _under(path: str, base: str, fold: bool = False) -> bool:
-    """``path`` is ``base`` or lies below it, by name (not resolved again). ``fold``: compared case-insensitively, as
-    for a credential store; a root covers a path by its exact name (on a case-sensitive file system ``MEMORY`` is not
-    ``memory``)."""
-    if fold:
-        path, base = path.casefold(), base.casefold()
-    root = base.rstrip("/")
-    return path == root or path.startswith(root + "/")
-
-
-def _without_mirror(path: str, mirror: str) -> str:
-    """``path`` with the first ``/<mirror>`` cut out: ``~/dotfiles/k3code/.k3code/memory/USER.md`` is
-    ``~/dotfiles/k3code/USER.md`` for the mirror ``.k3code/memory``."""
-    at = path.find("/" + mirror + "/") if mirror else -1
-    return path if at < 0 else path[:at] + path[at + len(mirror) + 1 :]
-
-
-def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = "") -> bool:
-    """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
-    has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
-    (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
-    folder of ``$HOME``. Every spelling is checked: the path as written, each hop of a symlink chain and the realpath
-    (see _link_hops), so a store file that links out and a plain file that links in are both caught.
-
-    The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
-    a store, with the whole path inside that root, makes its own files ordinary (a session started in
-    ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
-    makes its dot folders ordinary (``.github`` of a repository). A root counts as written and by its realpath, and a
-    spelling lies in it by name: a spelling is never resolved a second time, or a memory folder kept in a dotfiles
-    repository (``~/.k3code/memory -> ~/dotfiles/k3code/memory``) would stop being its own. Callers have already
-    checked the target lies in the roots, so a store outside every root needs no test here.
-
-    ``mirror`` is the memory folder relative to ``$HOME`` (``.k3code/memory``), given for the user's memory: GNU stow
-    without folding links the file, not the folder, so its real place is
-    ``<dotfiles>/<package>/.k3code/memory/USER.md``. That spelling is judged by the dot rule with the mirror cut out
-    of it, so the dotfiles folder and anything below the mirror still count (``~/.dotfiles/...`` and a ``.hidden``
-    below it stay refused). Every other spelling, the realpath of a link in the mirror among them, is judged on its
-    own."""
-    spellings = _link_hops(path)
-    if any(sensitive_path(p) for p in spellings):
-        return True
-    forms = {r: _spellings(r) for r in map(str, roots)}  # each root as written and by realpath
-
-    def covers(root: str, paths: list[str]) -> bool:
-        return all(any(_under(p, f) for f in forms[root]) for p in paths)
-
-    for store in [*_home_stores(), *extra_stores]:
-        held = [p for p in spellings if _under(p, store, fold=True)]
-        if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
-            return True
-    home = os.path.normpath(os.path.expanduser("~"))
-    if not _inside(home, list(forms)):
-        return False
-    projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
-    homes = _home_prefixes()
-    return any(
-        _below_home_dot(_without_mirror(p, mirror), homes) and not any(_under(p, f) for f in projects)
-        for p in spellings
-    )
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:
