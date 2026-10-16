@@ -29,6 +29,7 @@ from k3code.tools import (
     clip_tool_results,
     format_tool_result,
 )
+from k3code.tools.safe_open import Guard, file_guard
 from k3code.tools.validate import invalid_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
@@ -665,7 +666,8 @@ class AgentLoop:
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
-                result = await handler(args, cwd=self.cwd)
+                with file_guard(self._file_guard(tool_call.name, args, decision)):
+                    result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": self._bash_refusal(exc)}
         except Exception as e:
@@ -685,6 +687,21 @@ class AgentLoop:
         if feedback:  # the tool already ran: the hook's word joins its result for the model
             result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
         return result
+
+    def _file_guard(self, tool: str, args: dict[str, Any], decision: Decision) -> Guard | None:
+        """What ``read`` and a named ``grep`` check on the file they open (see tools.safe_open): the engine's decision
+        for the path actually reached, so a directory swapped for a link after this call was decided cannot lead the
+        tool to a file the engine did not allow (K3NOX-719). A call that was allowed needs an allow for that path
+        too; one a person approved only needs it not to be refused (a deny rule, a hardline or credential path)."""
+        if tool not in ("read", "grep"):
+            return None
+        approved = decision.action == "ask"
+
+        def guard(real: str) -> bool:
+            now = self.permissions.decide(tool, {**args, "path": real}, headless=self.headless).action
+            return now != "deny" if approved else now == "allow"
+
+        return guard
 
     async def _run_hooks(self, event: str, tool: str, payload: dict[str, Any]) -> HookOutcome:
         if not self.hooks:
