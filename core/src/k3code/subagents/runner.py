@@ -24,7 +24,7 @@ from k3code.autonomy import autonomy_cfg
 from k3code.goals import loop_evidence
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.prompting import build_system_prompt, subagent_system_prompt
+from k3code.prompting import subagent_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
@@ -423,15 +423,6 @@ class SubagentManager:
             # the parent's session denies outrank a config allow there: the child may not run what the parent refuses
             session_rules=[r for r in parent.perms.session_rules if r.action == "deny"],
         )
-        base = build_system_prompt(
-            parent.system_prompt,
-            cwd=cwd,
-            config=server.config,
-            session_meta=parent.stored.meta,
-            mcp=server.mcp,
-            attended=False,  # a child's output goes to its parent, not to a person who could fill in a TODO(human)
-            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
-        )
         note = ""
         if h.isolation == "worktree":
             note = (
@@ -439,12 +430,11 @@ class SubagentManager:
                 "your changes are committed and merged back by the harness. Do not run git commands that "
                 "change branches."
             )
-        system = subagent_system_prompt(base, name=atype.name, description=h.description, body=atype.prompt, note=note)
         # the parent's key (#130) and its /provider pick
         router = server._ensure_router(parent.stored.model or None, parent.stored.provider).get(Tier(h.tier))
         loop = AgentLoop(
             router,
-            system_prompt=system,
+            system_prompt="",  # composed below, from the tools the child ends up with
             max_turns=_child_max_turns(server.config),
             max_tool_errors=int(autonomy_cfg(server.config)["max_tool_errors"]),
             headless=False,
@@ -485,6 +475,18 @@ class SubagentManager:
             for name in list(loop.tools.names()):
                 if name not in allowed and name != "exit_plan":
                     loop.tools._tools.pop(name, None)  # noqa: SLF001
+        loop.system_prompt = subagent_system_prompt(
+            parent.system_prompt,
+            name=atype.name,
+            description=h.description,
+            body=atype.prompt,
+            note=note,
+            tools=set(loop.tools.names()),
+            cwd=cwd,
+            config=server.config,
+            session_meta=parent.stored.meta,
+            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
+        )
 
         def take_steer() -> list[str]:
             taken = h.steer_queue[:]
