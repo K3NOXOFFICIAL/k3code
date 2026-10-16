@@ -429,6 +429,15 @@ def _abs(raw: str, cwd: str) -> str:
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
 
 
+def _real(path: str) -> str:
+    """``os.path.realpath`` that never raises: a path the OS cannot look up (a NUL byte, which no real shell argument
+    holds) keeps its normalised spelling, so the checks that read it still get a string to match against."""
+    try:
+        return os.path.realpath(path)
+    except (ValueError, OSError):
+        return os.path.normpath(path)
+
+
 def _inside(path: str, roots: list[str]) -> bool:
     """``path`` lies under one of ``roots``, after resolving symlinks on both sides: a lexical check let
     ``proj/docs -> ../outside`` turn a write to ``docs/x`` into a write outside the project. A path that does not
@@ -500,7 +509,7 @@ def protected_path(path: str) -> bool:
     homes = (os.path.normpath(home), _real(home))
     guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
     secrets = _secret_dirs()
-    guarded += [*map(os.path.normpath, secrets), *map(os.path.realpath, secrets)]
+    guarded += [*map(os.path.normpath, secrets), *map(_real, secrets)]
     guarded = [g.casefold().rstrip(os.sep) for g in guarded]
     for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         if _PROTECTED.search(p.replace("\\", "/")):
@@ -2042,7 +2051,7 @@ def _home_stores() -> list[str]:
         for h in dict.fromkeys((os.path.normpath(home), _real(home)))
         for rel in (*HOME_RO_HIDDEN, _UV_CREDENTIALS)
     ]
-    return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
+    return list(dict.fromkeys([*stores, *map(_real, stores)]))
 
 
 def _spellings(path: str) -> list[str]:

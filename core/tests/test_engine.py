@@ -785,3 +785,45 @@ def test_the_stricter_of_the_written_and_the_reached_path_keeps_always_ask(fake_
     (fake_home / ".config" / "gh" / "sub").mkdir()
     d = decide(mode="yolo", tool="read", args={"path": f"{outside}/link/../hosts.yml"}, cwd=str(fake_home))
     assert d.action == "ask" and d.always_ask, d
+
+
+# --- a NUL byte in a path: decide() always returns a decision ------------------
+
+_NUL = chr(0)  # built at run time: it cannot sit in a shell argument, and a literal one would not survive an editor
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"echo hi > a{_NUL}b",
+        f"echo hi >> {{tmp}}/a{_NUL}b",
+        f"cat < a{_NUL}b",
+        f"echo hi | tee a{_NUL}b",
+        f"cat a{_NUL}b",
+        f"rm a{_NUL}b",
+        f"echo '<p>a{_NUL}b</p>'",
+        f"echo '<p>a{_NUL}b</p>' > out.html",
+    ],
+)
+def test_bash_with_a_nul_byte_still_gets_a_decision(mode, command, tmp_path) -> None:
+    d = decide(mode=mode, tool="bash", args={"command": command.replace("{tmp}", str(tmp_path))}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}
+
+
+@pytest.mark.parametrize("command", [f"echo hi > a{_NUL}b", f"echo hi > {{tmp}}/a{_NUL}b"])
+def test_auto_mode_refuses_a_redirect_target_it_cannot_resolve(command, tmp_path) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": command.replace("{tmp}", str(tmp_path))}, cwd=tmp_path)
+    assert d.action == "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize("tool", ["read", "write", "edit", "glob", "grep"])
+def test_a_path_tool_with_a_nul_byte_still_gets_a_decision(mode, tool, tmp_path) -> None:
+    d = decide(mode=mode, tool=tool, args={"path": f"a{_NUL}b", "pattern": "*"}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}
+
+
+def test_a_nul_byte_in_the_cwd_args_still_gets_a_decision(tmp_path) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": "echo hi > out", "cwd": f"x{_NUL}y"}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}
