@@ -391,23 +391,34 @@ class DecisionLog:
         self._db.commit()
         return cur.rowcount
 
-    def mark_undone(self, session: str, index: int) -> str | None:
-        """An /undo or /retry removed the session's stored messages from ``index`` on: mark the pending turn whose
-        messages that cut reaches into as undone. Returns its turn id, or None when the cut hit no pending turn (an
-        earlier turn the user had already moved on from, or one recorded before outcomes were)."""
+    def mark_undone(self, session: str, index: int) -> list[str]:
+        """An /undo or /retry removed the session's stored messages from ``index`` on: mark every pending turn whose
+        messages that cut removes as undone. Returns their turn ids, newest first; empty when the cut hit no pending
+        turn (an earlier turn the user had already moved on from, or one recorded before outcomes were).
+
+        An auto-continued (or /goal) run is one turn row per continuation, and /undo drops the whole run back to the
+        prompt the user sent (``_session_undo``): the rows from the turn the cut reaches into on are all removed. Only
+        that first one used to be marked, so the optimizer still scored the run's continuations as passed. The walk
+        stops at the turn the cut reaches into (an older row's slice can be from before a compaction renumbered the
+        messages), and marks nothing when it finds none: the cut then reached into a turn already kept."""
         rows = self._db.execute(
             "SELECT turn, msg_start, msg_end FROM turn_outcomes WHERE session=? AND settled IS NULL AND ts>=?"
             " ORDER BY ts DESC, rowid DESC",
             (session, self.clock() - OUTCOME_SETTLE_S),
         ).fetchall()
+        after: list[str] = []  # newer turns wholly past the cut: a run's continuations
         for row in rows:
-            if int(row["msg_start"]) <= index < int(row["msg_end"]):
-                self._db.execute(
-                    "UPDATE turn_outcomes SET undone=1, settled=? WHERE turn=?", (self.clock(), row["turn"])
+            start, end = int(row["msg_start"]), int(row["msg_end"])
+            if start <= index < end:
+                undone = [*after, str(row["turn"])]
+                self._db.executemany(
+                    "UPDATE turn_outcomes SET undone=1, settled=? WHERE turn=?", [(self.clock(), t) for t in undone]
                 )
                 self._db.commit()
-                return str(row["turn"])
-        return None
+                return undone
+            if start >= index:
+                after.append(str(row["turn"]))
+        return []
 
     def turn_outcomes(
         self, *, since: float = 0.0, until: float | None = None, actor: str | None = None
