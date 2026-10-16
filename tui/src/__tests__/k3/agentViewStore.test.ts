@@ -555,7 +555,11 @@ describe("reduceViewKey", () => {
   });
 
   it("drops a confirmation whose row has gone", () => {
-    const stale: ViewNav = { ...IDLE_VIEW_NAV, confirmKey: "session:gone", index: 1 };
+    const stale: ViewNav = {
+      ...IDLE_VIEW_NAV,
+      confirmKey: "session:gone",
+      index: 1,
+    };
 
     const y = press(stale, { ch: "y" });
 

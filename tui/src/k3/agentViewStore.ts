@@ -176,7 +176,10 @@ export function selectedIndex(
 export function buildLines(
   rows: readonly ViewRow[],
   collapsedGroups: readonly ViewGroup[] = [],
-): ({ group: ViewGroup; type: "header" } | { index: number; row: ViewRow; type: "row" })[] {
+): (
+  | { group: ViewGroup; type: "header" }
+  | { index: number; row: ViewRow; type: "row" }
+)[] {
   const lines: (
     | { group: ViewGroup; type: "header" }
     | { index: number; row: ViewRow; type: "row" }
@@ -228,10 +231,10 @@ export function reduceViewKey(
     }
     if (key.return) {
       const text = nav.newSessionText.trim();
-      return done(
-        text ? { type: "new-prompt", text } : null,
-        { newSessionPrompt: false, newSessionText: "" },
-      );
+      return done(text ? { type: "new-prompt", text } : null, {
+        newSessionPrompt: false,
+        newSessionText: "",
+      });
     }
     if (ch && ch.length === 1) {
       return done(null, { newSessionText: nav.newSessionText + ch });

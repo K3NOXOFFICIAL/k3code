@@ -19,7 +19,6 @@ import {
   type ViewNav,
   type ViewRow,
 } from "../../k3/agentViewStore.js";
-import type { ViewGroup } from "../../k3/agentViewStore.js";
 import { DEFAULT_THEME } from "../../theme.js";
 import { waitFor } from "../waitFor.js";
 
@@ -166,7 +165,11 @@ describe("AgentViewView", () => {
 
   it("shows the stop confirmation on its row", () => {
     const rows = [row(1), row(2)];
-    const out = dump(rows, {}, { ...IDLE_VIEW_NAV, confirmKey: rows[1]!.key, index: 1 });
+    const out = dump(
+      rows,
+      {},
+      { ...IDLE_VIEW_NAV, confirmKey: rows[1]!.key, index: 1 },
+    );
 
     expect(out).toMatch(/task 2.*stop\? y\/n/);
     expect(out.match(/stop\? y\/n/g)).toHaveLength(1);
