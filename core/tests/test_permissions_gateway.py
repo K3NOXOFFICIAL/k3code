@@ -12,7 +12,7 @@ from k3code.config import ProviderEntry, Settings
 from k3code.gateway.server import GatewayServer
 from k3code.gateway.sessions import SessionStore
 from k3code.permissions import Rule
-from k3code.permissions.state import PermissionState
+from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.router import Router, build_chain
 
@@ -248,6 +248,49 @@ async def test_relative_paths_use_session_cwd(tmp_path, monkeypatch):
     await run_turn(server, "go", [])
     assert (proj / "rel.txt").read_text() == "hi"
     assert not (other / "rel.txt").exists()
+
+
+async def _move(server: GatewayServer, path: Path) -> dict:
+    n = len(server._frames)  # type: ignore[attr-defined]
+    await server._handle_line(
+        json.dumps({"jsonrpc": "2.0", "id": 9, "method": "session.workspace.move", "params": {"path": str(path)}})
+    )
+    return next(f for f in map(json.loads, server._frames[n:]) if f.get("id") == 9)  # type: ignore[attr-defined]
+
+
+async def test_a_workspace_move_puts_the_live_session_in_the_new_directory(tmp_path, monkeypatch):
+    from k3code.routing.tiers import TaskKind
+
+    a, b = tmp_path / "proj-a", tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    server, _ = make_server(tmp_path, [], monkeypatch)
+    persist_rules(project_config_path(b), [Rule("bash", "make test", "allow")])  # B's own, trusted project rule
+    await call(server, "session.create", {"cwd": str(a)})
+    live = server.session
+    assert (await _move(server, b))["result"]["cwd"] == str(b)
+
+    assert live.perms.cwd == b
+    assert any(r.pattern == "make test" for r in live.perms.project_rules)  # B's rules, not A's
+    loop = server._build_loop(live, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert loop.cwd == b
+    assert str(b) in loop.system_prompt and str(a) not in loop.system_prompt
+    assert live.live_info()["cwd"] == str(b)
+    # an "always" answer stores its rule in the project the session now works in
+    assert project_config_path(live.perms.cwd) == project_config_path(b)
+
+
+async def test_a_workspace_move_is_refused_while_a_turn_runs(tmp_path, monkeypatch):
+    a, b = tmp_path / "proj-a", tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    server, _ = make_server(tmp_path, [], monkeypatch)
+    await call(server, "session.create", {"cwd": str(a)})
+    live = server.session
+    live.streaming = True  # a turn owns the session: its loop, tools and approvals work in A
+    reply = await _move(server, b)
+    assert "error" in reply and "turn is running" in reply["error"]["message"]
+    assert live.stored.cwd == str(a) and live.perms.cwd == a
 
 
 async def test_add_dir_persists_and_allows_writes(tmp_path, monkeypatch):
