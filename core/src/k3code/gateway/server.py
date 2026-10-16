@@ -331,6 +331,15 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
+        #: The prompt's learned tail (memory files, learned notes, facts, gotchas, overlay) as the session's first
+        #: prompt read it (``prompting.frozen_learned_sections``): the background review and distill rewrite those
+        #: files mid-session, and the prompt must stay the cached prefix until the conversation is rewritten anyway.
+        self.prompt_frozen: dict[str, Any] = {}
+
+    def refresh_prompt_inputs(self) -> None:
+        """Read the learned tail of the prompt afresh at the next loop: the conversation was rewritten (compaction,
+        /clear), the session moved to another project, or the user changed its memory on purpose (/memory add)."""
+        self.prompt_frozen.clear()
 
     @property
     def turn_in_flight(self) -> bool:
@@ -2064,6 +2073,7 @@ class GatewayServer:
                 mcp=self.mcp,
                 attended=not (session.background or session.goal_continuation),
                 session_id=session.session_id,
+                frozen=session.prompt_frozen,
             ),
             max_turns=self.config.max_turns,
             headless=False,
@@ -2650,6 +2660,7 @@ class GatewayServer:
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
             # be matched to its turn, so their outcomes stop waiting for one
             self.learning.settle_turns(session.session_id)
+            session.refresh_prompt_inputs()  # the old prefix is no longer cached anyway: show what was learned
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
             session.emit(
@@ -2674,6 +2685,7 @@ class GatewayServer:
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
                 session_id=session.session_id,
+                frozen=session.prompt_frozen,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
@@ -3792,6 +3804,7 @@ async def _session_workspace_move(server: GatewayServer, params: dict[str, Any])
     if session is None:
         raise _InvalidParams("no active session")
     session.stored.cwd = str(path)
+    session.refresh_prompt_inputs()  # the new project's memory and notes, not the old one's
     server.store.save(session.stored)
     return {"ok": True, "cwd": str(path)}
 

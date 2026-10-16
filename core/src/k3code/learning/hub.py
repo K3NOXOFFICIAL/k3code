@@ -36,6 +36,11 @@ DAY = 86400.0
 WEEK = 7 * DAY
 
 
+#: Proposal kinds whose handler writes into the prompt's learned tail (``prompting.learned_sections``): the stack
+#: facts, a gotcha, a USER.md line, an optimizer overlay.
+PROMPT_KINDS = frozenset({"project_setup", "project_gotcha", "preference", "optimizer"})
+
+
 class LearningHub:
     def __init__(self, server: Any, store: ProposalStore, clock: Callable[[], float] = time.time) -> None:
         self.server = server
@@ -293,6 +298,13 @@ class LearningHub:
 
     async def apply(self, p: Proposal, session: Any = None) -> str:
         """Run the handler of an accepted learned proposal; returns a human message."""
+        msg = await self._apply(p, session)
+        if p.kind in PROMPT_KINDS and hasattr(session, "refresh_prompt_inputs"):
+            # what the user accepted applies to this conversation now; background writers wait for a compaction
+            session.refresh_prompt_inputs()
+        return msg
+
+    async def _apply(self, p: Proposal, session: Any = None) -> str:
         payload = p.payload
         cwd = str(session.perms.cwd) if session is not None else ""
         if payload.get("op") == "recipe":  # before the kind switch: a recipe "skill" is not a curator skill
