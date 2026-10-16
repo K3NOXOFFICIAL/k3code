@@ -94,9 +94,11 @@ async def repo_root(path: str | Path) -> Path | None:
 
 async def worktrees_dir_problem(path: str | Path) -> str | None:
     """Why git must not add or prune worktrees in the repository ``path`` is in, or None when it may: its common dir's
-    ``worktrees`` folder is a symlink (or resolves outside the common dir). A sandboxed command with
-    ``sandbox.git_writable`` can plant such a link; ``git worktree prune`` deletes what it finds in the folder that
-    is not a worktree admin dir, ``git worktree add`` writes into it, and both would do so in the link's target."""
+    ``worktrees`` folder is a symlink (or resolves outside the common dir), or an entry in it is a symlink. A sandboxed
+    command with ``sandbox.git_writable`` can plant such a link (a killed turn can leave one behind, before the scrub
+    ran); ``git worktree prune`` deletes what it finds in the folder that is not a worktree admin dir, ``git worktree
+    add`` writes into it, and both would do so in the link's target. Git itself only makes real folders there, so a
+    link entry is refused rather than removed: rewriting the repository is not this check's job."""
     rc, out = await git(path, "rev-parse", "--git-common-dir")
     if rc != 0 or not out.strip():
         return None  # not a repository: the git call that follows reports it
@@ -105,6 +107,10 @@ async def worktrees_dir_problem(path: str | Path) -> str | None:
     try:
         if folder.is_symlink() or (folder.exists() and not folder.resolve().is_relative_to(common.resolve())):
             return f"{folder} is a symlink or leads outside {common}"
+        if folder.is_dir():
+            for entry in folder.iterdir():
+                if entry.is_symlink():
+                    return f"{entry} is a symlink"
     except (OSError, RuntimeError):
         return f"{folder} cannot be resolved"
     return None

@@ -533,7 +533,12 @@ class AgentLoop:
         # before the permission prompt: a call the handler cannot run is not worth an approval
         if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
             return {"error": invalid}
-        decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
+        if tool_call.name == "bash":
+            # parsing a long command line takes a while (linear, about a second per 200 KB of simple commands): off the
+            # event loop, so the daemon's other sessions, its socket and heartbeats keep running meanwhile (K3NOX-691)
+            decision = await asyncio.to_thread(self.permissions.decide, tool_call.name, args, headless=self.headless)
+        else:
+            decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
@@ -557,7 +562,7 @@ class AgentLoop:
             and decision.rule is not None
             and decision.rule.action == "allow"
             and decision.rule.layer == 0
-            and home_read_only(str(args.get("command", "")))
+            and await asyncio.to_thread(home_read_only, str(args.get("command", "")))  # parses it again: off the loop
             and sandbox.readonly_home_ok(self.cwd, self.permissions.add_dirs)
         )
         # A test/build/lint command the builtin rules allow only inside the sandbox (accept-edits and auto): it runs

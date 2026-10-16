@@ -9,6 +9,7 @@ import errno
 import json
 import os
 import shutil
+import stat
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -25,6 +26,7 @@ from k3code.tools.fuzzy_match import (
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
 from k3code.tools.safe_open import NotAllowed, open_regular
+from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
 
@@ -1070,14 +1072,41 @@ _GREP_PIECE_BYTES = 1 << 20
 _GREP_CLOCK_BYTES = 64 * 1024
 
 
-def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> Iterator[str | None]:
+def _open_regular(fp: Path, expect: str | None) -> Any:
+    """``fp`` opened for reading, or None when it is not a regular file or, with ``expect`` (the real path a walked
+    entry must have), is not that file. The decision is made on the open descriptor: a check by name followed by an
+    open by name loses to a process that swaps a directory for a link in between. ``O_NOFOLLOW`` refuses a link as the
+    last component and the descriptor names the file actually opened (``/proc/self/fd`` on Linux, ``F_GETPATH`` on
+    macOS), whatever a directory above it became;
+    ``O_NONBLOCK`` keeps the open of a FIFO without a writer from blocking and ``O_NOCTTY`` keeps a terminal device
+    from becoming the daemon's controlling terminal."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | (os.O_NOFOLLOW if expect is not None else 0)
+    fd = os.open(fp, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        if expect is not None and str(_opened_path(fd)) != expect:
+            raise OSError(errno.ELOOP, "not the file the walk listed")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _grep_file(
+    fp: Path, rx: Any, deadline: float, *, named: bool = False, expect: str | None = None
+) -> Iterator[str | None]:
     """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
     preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
-    matches`` line, as rg says. Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
+    matches`` line, as rg says. A walked entry passes the real path it must be (``expect``); one that is a link, a
+    FIFO or any other non-regular file, or that is not that path when opened, raises OSError unread. A named file is
+    opened as the permission check decided on it (see open_regular); a walked one by its descriptor (see
+    _open_regular). Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
     _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
     anchor at one, is approximate."""
-    # a named file is opened as the permission check decided on it (see open_regular); a walked one by its name
-    with open_regular(fp) if named else fp.open("rb") as f:
+    # a named file is opened as the permission check decided on it (see open_regular); a walked one must still be
+    # the walked path when opened (see _open_regular)
+    with open_regular(fp) if named else _open_regular(fp, expect) as f:
         binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
         if binary and not named:
             return
@@ -1143,13 +1172,19 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
-        if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
-            continue  # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots
-        if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
-            skipped += 1
+        try:
+            if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
+                continue  # a link met before the open is never opened; the fd check in _open_regular catches a swap
+            if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
+                skipped += 1
+                continue
+        except OSError:  # realpath raises when a link is swapped for a directory mid-resolve: the file stays unread
             continue
         try:
-            for hit in _grep_file(fp, rx, deadline, named=named):
+            # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots, so the
+            # opened file must be the walked path (see _open_regular)
+            expect = None if named else os.path.join(real_base, rel)
+            for hit in _grep_file(fp, rx, deadline, named=named, expect=expect):
                 if hit is None:
                     timed_out = True
                     break
@@ -1159,7 +1194,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         except NotAllowed:  # a named file whose path changed under the permission check: nothing of it was read
             changed = True
             continue
-        except OSError:  # unreadable, not a regular file, or an index entry deleted from the work tree (see _git_files)
+        except OSError:  # unreadable, not a regular file, a link, or an index entry deleted from the work tree
             continue
         if timed_out or len(matches) > MAX_SEARCH_RESULTS:
             break

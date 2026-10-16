@@ -350,7 +350,7 @@ const ROWS: ViewRow[] = [
 
 const press = (nav: ViewNav, key: ViewKey, rows = ROWS, page = 2) =>
   reduceViewKey(nav, rows, key, page);
-const at = (index: number): ViewNav => ({ confirmKey: null, index });
+const at = (index: number): ViewNav => ({ ...IDLE_VIEW_NAV, index });
 
 describe("reduceViewKey", () => {
   it("moves with ↑/↓ and clamps at both ends without wrapping", () => {
@@ -424,7 +424,11 @@ describe("reduceViewKey", () => {
     const ask = press(at(1), { ch: "x" });
 
     expect(ask.effect).toBeNull();
-    expect(ask.nav).toEqual({ confirmKey: "session:s1", index: 1 });
+    expect(ask.nav).toEqual({
+      ...IDLE_VIEW_NAV,
+      confirmKey: "session:s1",
+      index: 1,
+    });
 
     for (const key of [{ ch: "y" }, { ch: "Y" }, { return: true }]) {
       const r = press(ask.nav, key);
@@ -449,7 +453,7 @@ describe("reduceViewKey", () => {
       const r = press(ask, key);
 
       expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(at(1));
+      expect(r.nav).toEqual({ ...IDLE_VIEW_NAV, index: 1 });
     }
   });
 
@@ -458,12 +462,19 @@ describe("reduceViewKey", () => {
       const r = press(at(i), { ch: "x" });
 
       expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(at(i));
+      expect(r.nav).toEqual({ ...IDLE_VIEW_NAV, index: i });
     }
   });
 
   it("n starts a new session; esc and ← close", () => {
-    expect(press(at(2), { ch: "n" }).effect).toEqual({ type: "new" });
+    const result = press(at(2), { ch: "n" });
+    expect(result.nav).toEqual({
+      ...IDLE_VIEW_NAV,
+      index: 2,
+      newSessionPrompt: true,
+      newSessionText: "",
+    });
+    expect(result.effect).toBeNull();
     expect(press(at(2), { escape: true }).effect).toEqual({ type: "close" });
     expect(press(at(2), { left: true }).effect).toEqual({ type: "close" });
   });
@@ -519,8 +530,10 @@ describe("reduceViewKey", () => {
       expect(r.nav).toEqual(at(0));
     }
 
-    expect(press(IDLE_VIEW_NAV, { ch: "n" }, none).effect).toEqual({
-      type: "new",
+    expect(press(IDLE_VIEW_NAV, { ch: "n" }, none).nav).toEqual({
+      ...IDLE_VIEW_NAV,
+      newSessionPrompt: true,
+      newSessionText: "",
     });
     expect(press(IDLE_VIEW_NAV, { escape: true }, none).effect).toEqual({
       type: "close",
@@ -542,7 +555,11 @@ describe("reduceViewKey", () => {
   });
 
   it("drops a confirmation whose row has gone", () => {
-    const stale: ViewNav = { confirmKey: "session:gone", index: 1 };
+    const stale: ViewNav = {
+      ...IDLE_VIEW_NAV,
+      confirmKey: "session:gone",
+      index: 1,
+    };
 
     const y = press(stale, { ch: "y" });
 
@@ -551,7 +568,7 @@ describe("reduceViewKey", () => {
 
     const empty = press(stale, { ch: "q" }, []);
 
-    expect(empty.nav).toEqual(at(0));
+    expect(empty.nav).toEqual({ ...IDLE_VIEW_NAV, index: 0 });
     // Like a live confirmation, a stale one eats Esc: the next Esc closes.
     expect(press(stale, { escape: true }, []).effect).toBeNull();
     expect(press(at(0), { escape: true }, []).effect).toEqual({

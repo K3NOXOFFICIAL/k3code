@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -166,12 +167,13 @@ def versions() -> dict[str, str]:
     return {"k3code": k3, "python": sys.version.split()[0], "platform": platform.platform(), "node": node_v}
 
 
-def _mcp_json_values(server: Any, events: list[dict[str, Any]]) -> set[str]:
-    """The certain secret values (``guesses=False``) of the ``.mcp.json`` of the gateway's project and of each
-    session the ``events`` name, as written, trusted or not: an event can quote one (K3NOX-581, as
-    ``bundle.write_bundle``). One that does not parse refuses the dump with its path only."""
+def _project_values(server: Any, events: list[dict[str, Any]]) -> set[str]:
+    """The certain secret values (``guesses=False``) of the ``.mcp.json`` and the ``.k3code/config.yaml`` of the
+    gateway's project and of each session the ``events`` name, as written, trusted or not: an event can quote one
+    (K3NOX-581, K3NOX-594, as ``bundle.write_bundle``). One that does not parse refuses the dump with its path only."""
     from k3code import mcpjson
     from k3code.config import default_project_dir
+    from k3code.paths import project_config_path
 
     projects = {default_project_dir()}
     for sid in {e.get("session") for e in events} - {None}:
@@ -180,12 +182,22 @@ def _mcp_json_values(server: Any, events: list[dict[str, Any]]) -> set[str]:
             projects.add(Path(stored.cwd))
     values: set[str] = set()
     for project in sorted(projects):
-        data = mcpjson.as_config(project)
-        if data is None:
-            path = project / mcpjson.FILE
-            raise ValueError(f"{path} does not parse: fix it first, or the dump cannot tell which values to hide")
-        values.update(secret_values(data, guesses=False))
+        files = ((project / mcpjson.FILE, mcpjson.as_config(project)), (project_config_path(project), _config(project)))
+        for path, data in files:
+            if data is None:
+                raise ValueError(f"{path} does not parse: fix it first, or the dump cannot tell which values to hide")
+            values.update(secret_values(data, guesses=False))
     return values
+
+
+def _config(project: Path) -> Any:
+    """``project``'s config.yaml as the export reads it (``bundle.read_project_config``); None when it does not parse
+    (the caller raises the dump's own error, outside this one: nothing chained)."""
+    from k3code import bundle
+
+    with contextlib.suppress(bundle.BundleError):
+        return bundle.read_project_config(project)
+    return None
 
 
 async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, probe: bool = True) -> Path:
@@ -199,8 +211,8 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
     secrets = secret_values(server.config)
     # known from a file the user may never have trusted: dropped after the shape passes (drop_after_shapes), in the
     # JSON text of each part, where a string that holds JSON (`cat .mcp.json`) escapes such a value once more
-    mcp = _mcp_json_values(server, events) - set(secrets)
-    escaped = {e for v in mcp for e in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1])}
+    known = _project_values(server, events) - set(secrets)
+    escaped = {e for v in known for e in (v, json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1])}
     untrusted = sorted(escaped, key=len, reverse=True)
     checks = await doctor.run_checks(server.config, probe=probe, home=home)
     parts = {

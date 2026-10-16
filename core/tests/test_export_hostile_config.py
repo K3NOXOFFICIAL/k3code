@@ -301,3 +301,44 @@ def test_without_proc_or_f_getpath_the_read_is_refused(tmp_path: Path, monkeypat
     with pytest.raises(OSError):
         trust.read_bounded(proj / ".k3code" / "config.yaml", within=proj)
     assert trust.read_bounded(proj / ".k3code" / "config.yaml") == b"note: x\n"  # no place to check: read
+
+
+# K3NOX-594: the config.yaml of an exported session's own project is read the same way, wherever the export runs
+
+
+def _export_session_of(tmp_path: Path, proj: Path) -> Path:
+    """Export, from another directory, one session that ran in ``proj``."""
+    here = tmp_path / "here"
+    here.mkdir()
+    store = SessionStore(tmp_path / "s.db")
+    sid = store.create(title="t", cwd=str(proj)).session_id
+    out = tmp_path / "x.k3bundle"
+    with _within():
+        write_bundle(out, store=store, cwd=here, session_ids=[sid], settings=False)
+    return out
+
+
+@pytest.mark.parametrize("kind", HOSTILE)
+def test_export_refuses_a_hostile_config_of_an_exported_sessions_project(tmp_path: Path, kind: str) -> None:
+    proj = _project(tmp_path)
+    (proj / ".k3code" / "config.yaml").write_text(HOSTILE[kind]())
+    with pytest.raises(BundleError, match="does not parse") as e:
+        _export_session_of(tmp_path, proj)
+    assert "lol" not in str(e.value)
+
+
+def test_export_refuses_a_config_symlinked_out_of_an_exported_sessions_project(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text(f"note: {MARK}\n")
+    (proj / ".k3code" / "config.yaml").symlink_to(outside)
+    with pytest.raises(BundleError, match="does not parse") as e:
+        _export_session_of(tmp_path, proj)
+    assert MARK not in str(e.value)
+    assert not (tmp_path / "x.k3bundle").exists()
+
+
+def test_export_does_not_block_on_a_fifo_config_of_an_exported_sessions_project(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    os.mkfifo(proj / ".k3code" / "config.yaml")
+    assert _export_session_of(tmp_path, proj).exists()

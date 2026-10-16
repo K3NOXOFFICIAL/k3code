@@ -113,6 +113,13 @@ class SessionStore:
         with contextlib.suppress(sqlite3.OperationalError):
             self._db.execute("ALTER TABLE sessions ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
+        # Matches worked_in()'s WHERE clause verbatim so the planner can use it instead of walking every
+        # automation-origin row (the agent view's session loader was stalling on this: a fleet of background
+        # jobs means automation rows now vastly outnumber human ones in the recent window).
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS sessions_worked_in ON sessions (updated_at)"
+            " WHERE messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+        )
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
         )
@@ -220,16 +227,21 @@ class SessionStore:
         return [self._summary(row) for row in rows]
 
     def summaries(self, ids: list[str]) -> list[SessionSummary]:
-        """Summaries of ``ids`` in that order; an id with no row is skipped."""
-        out: list[SessionSummary] = []
-        for sid in ids:
-            row = self._db.execute(
-                f"SELECT {self._SUMMARY_COLUMNS} FROM sessions WHERE session_id = ?",  # noqa: S608
-                (sid,),
-            ).fetchone()
-            if row is not None:
-                out.append(self._summary(row))
-        return out
+        """Summaries of ``ids`` in that order; an id with no row is skipped.
+
+        One batched ``IN (...)`` query instead of one round trip per id: with the agent view asking for
+        up to 50 summaries on every open, N sequential round trips on the event-loop thread was the
+        dominant cost of a slow-feeling session loader.
+        """
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        rows = self._db.execute(
+            f"SELECT {self._SUMMARY_COLUMNS} FROM sessions WHERE session_id IN ({marks})",  # noqa: S608
+            ids,
+        ).fetchall()
+        by_id = {row[0]: row for row in rows}
+        return [self._summary(by_id[sid]) for sid in ids if sid in by_id]
 
     def _summary(self, row: tuple[Any, ...]) -> SessionSummary:
         count, preview = row[7], row[8] or ""

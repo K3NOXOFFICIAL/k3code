@@ -249,3 +249,46 @@ async def test_a_worktrees_folder_that_is_a_real_directory_is_reaped_as_before(t
     reaped = await wt.reap(repo)
 
     assert reaped is not None and [w.id for w in reaped.worktrees] == ["w2"]
+
+
+async def test_reap_does_not_prune_through_a_link_entry_inside_a_real_worktrees_folder(tmp_path):
+    """The folder is a real one, but an entry in it is a link (a killed turn can leave one a sandboxed command with
+    ``git_writable`` planted before the scrub ran): ``git worktree prune`` follows the entry and empties its target.
+    The reap leaves the repository alone and says so."""
+    repo = git_repo(tmp_path / "repo")
+    crash_worker(repo, "w2")
+    victim = victim_tree(tmp_path)
+    (repo / ".git" / "worktrees" / "evil").symlink_to(victim, target_is_directory=True)
+
+    reaped = await wt.reap(repo)
+
+    assert reaped is None
+    assert (victim / "sub" / "marker.txt").read_text() == "keep\n" and (victim / "marker.txt").exists()
+    assert (repo / ".git" / "worktrees" / "evil").is_symlink()  # the repository is not rewritten either
+    assert (repo / ".k3code" / "worktrees" / "w2").is_dir()  # and no worker checkout was touched
+
+
+async def test_create_refuses_to_add_a_worktree_while_a_link_entry_sits_in_the_worktrees_folder(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    crash_worker(repo, "w2")
+    victim = victim_tree(tmp_path)
+    (repo / ".git" / "worktrees" / "evil").symlink_to(victim, target_is_directory=True)
+    before = sorted(p.relative_to(victim) for p in victim.rglob("*"))
+
+    with pytest.raises(RuntimeError, match="worktrees"):
+        await wt.create(repo, "child1")
+
+    assert sorted(p.relative_to(victim) for p in victim.rglob("*")) == before
+    assert not (repo / ".k3code" / "worktrees" / "child1").exists()
+    assert not wt.owner_file(repo / ".k3code" / "worktrees" / "child1").exists()
+
+
+async def test_a_link_entry_to_a_file_in_the_worktrees_folder_also_stops_the_reap(tmp_path):
+    """Not only a link to a folder: any link under ``worktrees`` is not something git made, so nothing runs on it."""
+    repo = git_repo(tmp_path / "repo")
+    victim = victim_tree(tmp_path)
+    (repo / ".git" / "worktrees").mkdir(exist_ok=True)
+    (repo / ".git" / "worktrees" / "evil").symlink_to(victim / "marker.txt")
+
+    assert await wt.reap(repo) is None
+    assert (victim / "marker.txt").exists()
