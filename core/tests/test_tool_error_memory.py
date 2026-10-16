@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -567,6 +570,20 @@ async def test_an_auto_line_alone_never_reaches_the_machine_file(tmp_path, monke
 ROOTS_MSG = "Auto mode writes only inside the project roots"
 
 
+@pytest.fixture
+def outside_roots():
+    """A directory auto mode may not write to: not under the project, $HOME or /tmp (bash may redirect into the
+    sandbox's private /tmp, and pytest's base temp dir lives there)."""
+    try:
+        path = tempfile.mkdtemp(dir="/var/tmp", prefix="k3-outside-")
+    except OSError:
+        pytest.skip("/var/tmp is not writable")
+    try:
+        yield Path(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     ("mode", "tool", "args", "hooks", "message"),
     [
@@ -585,14 +602,15 @@ ROOTS_MSG = "Auto mode writes only inside the project roots"
     ],
     ids=["hardline-bash", "hardline-sensitive-read", "auto-roots-bash", "auto-roots-write", "plan-mode", "hook-block"],
 )
-async def test_a_policy_denial_is_not_a_project_tool_error(tmp_path, monkeypatch, mode, tool, args, hooks, message):
+async def test_a_policy_denial_is_not_a_project_tool_error(
+    tmp_path, monkeypatch, outside_roots, mode, tool, args, hooks, message
+):
     """The permission engine's and a PreToolUse hook's refusals say what the policy is, not what the project is like:
     the real result of each goes through the loop's observer into the hub and nothing is recorded or proposed."""
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     hub = server.learning
-    proj, outside = tmp_path / "proj", tmp_path / "elsewhere"
+    proj, outside = tmp_path / "proj", outside_roots
     proj.mkdir()
-    outside.mkdir()
     loop = _loop(proj, hooks, mode=mode)
     sess = _session(server, proj)
     loop.on_tool_outcome = lambda tc, result, failure, **kw: hub.tool_outcome(sess, tc, result, failure, **kw)

@@ -1800,8 +1800,8 @@ class GatewayServer:
         prompt = text = str(text)  # the marker only says who wrote it (and which parts were pasted)
         mgr = self.goal_manager(session)
         # a new prompt moves the session on: an /undo now removes its turn, never an earlier one, so the earlier turns'
-        # outcomes stop waiting for one (issue #140). A goal's continuations are not new prompts: /undo can still
-        # step back through them one by one.
+        # outcomes stop waiting for one (issue #140). A goal's continuations are not new prompts: an /undo after the
+        # run removes all of its turns, and marks every one of them undone.
         self.learning.settle_turns(session.session_id)
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
@@ -4513,7 +4513,8 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
             break
     if last_user is None:
         return {"removed": 0}
-    # the turn these messages came from was rejected: its outcome is a failure, not "finished" (issue #140)
+    # the turns these messages came from (each turn of an auto-continued run) were rejected: their outcomes are
+    # failures, not "finished" (issue #140)
     server.learning.turn_undone(session, last_user)
     session.messages = messages[:last_user]
     server.store.save(session.stored)
