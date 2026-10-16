@@ -985,11 +985,12 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
     return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
-def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
+def _argv(sub: str, reads: list[str] | None = None, chdirs: list[str] | None = None) -> list[str]:
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
-    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``)."""
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
+    runs the command in (``env -C DIR``, ``git -C DIR``)."""
     words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words), reads)
+    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -1199,13 +1200,59 @@ def _brace_expand(word: str, limit: int = 64) -> list[str]:
     return out
 
 
-def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
+@dataclass(frozen=True)
+class _Where:
+    """The directories a relative path on a command line may be relative to: the session directory and every directory
+    a ``cd``/``pushd`` on the line can have moved to (see _where). ``unknown``: one of them could not be worked out
+    (``cd $DIR``, ``cd -``, a glob), so a relative path could be read from anywhere."""
+
+    dirs: tuple[str, ...]
+    unknown: bool = False
+
+
+def _classify_arg(arg: str, where: _Where, home: str) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
-    front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
+    front of a credential name (``$DIR/.env``) or an unknown directory may hold it, else None. ``{a,b}`` alternatives
+    are classified one by one, each against every directory in ``where``."""
     worst: str | None = None
     for word in _brace_expand(arg):
-        worst = _worse(worst, _classify_word(word, cwd, home))
+        for cwd in where.dirs:
+            worst = _worse(worst, _classify_word(word, cwd, home))
+        if where.unknown and _relative_word(word) and _may_be_credential(word, home):
+            worst = _worse(worst, "human")
     return worst
+
+
+def _relative_word(word: str) -> bool:
+    word = word.strip("'\"")
+    return bool(word) and "://" not in word and not word.startswith(("/", "~", "$"))
+
+
+#: What a file in a credential folder is called: reading a bare one of these after a ``cd`` to somewhere unknown may be
+#: reading the credential (the other names in those folders are not worth a question: every ``cat README.md`` after a
+#: ``cd "$(mktemp -d)"`` would ask).
+_CREDENTIAL_LEAVES = frozenset(
+    {
+        "credentials",
+        "config",
+        "env",
+        "authorized_keys",
+        "known_hosts",
+        "private-keys-v1.d",
+        "pubring.kbx",
+        "trustdb.gpg",
+    }
+)
+
+
+def _may_be_credential(word: str, home: str) -> bool:
+    """A relative ``word`` that names a credential from some directory a ``cd`` to somewhere unknown can reach: a
+    credential leaf name, or a path that is one from the home directory, the root, a process directory or the parent
+    of a credential folder (``.ssh/id_rsa``, ``k3code/env``, ``proc/self/environ``)."""
+    if _sensitive_name(word) or os.path.basename(word.strip("'\"")).lower() in _CREDENTIAL_LEAVES:
+        return True
+    parents = (os.path.dirname(d) for d in _secret_dirs())
+    return any(_classify_word(word, probe, home) for probe in dict.fromkeys([home, "/", "/proc/self", *parents]))
 
 
 def _classify_word(arg: str, cwd: str, home: str) -> str | None:
@@ -1369,44 +1416,192 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     return words, [], []
 
 
-def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+#: ``cd`` and ``pushd`` change the directory the rest of the line reads from; ``popd`` and ``pushd`` with no
+#: directory only go back to one the line was already in.
+_CD_BUILTINS = frozenset({"cd", "pushd"})
+#: the most directories one command line is followed into; past it the directory counts as unknown
+_CD_MAX_DIRS = 32
+#: how many times the ``cd``s of a line with a loop or a function are replayed on the directories found so far (a loop
+#: starts its second turn in the directory its first one ended in); one still moving after that has an unknown directory
+_CD_PASSES = 3
+_LOOP = re.compile(r"(?:^|[\s;&|(])(?:for|while|until|select|function)\b|\(\)\s*\{")
+
+
+def _loops(parsed: hardline.Parsed) -> bool:
+    return bool(_LOOP.search(parsed.clean)) or any(_loops(child) for child in parsed.children)
+
+
+#: Words that open a compound command in front of the command it runs: ``if cd ~; then ...``, ``{ cd ~; }``,
+#: ``! cd ~``, ``do cd ~``.
+_SHELL_KEYWORDS = frozenset({"!", "{", "(", "if", "then", "elif", "else", "do", "while", "until"})
+#: Commands that run text this check never reads: a sourced file, an alias, a trap.
+_RUNS_UNREAD_TEXT = frozenset({"source", ".", "alias", "trap"})
+#: Shell settings that move the directory in ways the check does not follow: a rewritten ``DIRSTACK`` that ``popd``
+#: returns to, ``cdable_vars`` (``cd x`` goes to the directory ``$x`` names).
+_CD_SETTINGS = ("DIRSTACK", "cdable_vars")
+_HOME_ASSIGNMENT = re.compile(r"^HOME\+?=")
+
+
+@dataclass
+class _CdScan:
+    """The directory changes on a command line: each ``cd``/``pushd`` as (name, arguments), and what makes the
+    directories reachable unclear: ``CDPATH`` set (a relative ``cd`` may go elsewhere), or ``unknown`` (a command the
+    check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS)."""
+
+    found: list[tuple[str, list[str]]] = field(default_factory=list)
+    cdpath: bool = False
+    unknown: bool = False
+
+
+def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
+    """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
+    included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
+    ``sudo -D`` or ``git -C`` runs its command in."""
+    scan = scan or _CdScan()
+    for sub in parsed.subs:
+        scan.cdpath = scan.cdpath or "CDPATH" in sub
+        scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
+        raw = hardline.tokens(sub)
+        scan.unknown = scan.unknown or any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        chdirs: list[str] = []
+        argv = _argv(sub, None, chdirs)
+        scan.found += [("cd", [d]) for d in chdirs]
+        while argv and (argv[0] in _SHELL_KEYWORDS or argv[0] == "function" or argv[0] in ("builtin", "command")):
+            argv = argv[2:] if argv[0] == "function" else argv[1:]  # ``function NAME {``: the name is no command
+        if not argv:
+            continue
+        if "$" in argv[0] or "`" in argv[0] or argv[0] in _RUNS_UNREAD_TEXT:
+            scan.unknown = True  # ``$c ~``, ``$(echo cd) ~``, ``. ./x.sh``, ``alias c='cd ~'``
+        if argv[0] in _CD_BUILTINS:
+            scan.found.append((argv[0], argv[1:]))
+    for child in parsed.children:
+        _cd_commands(child, scan)
+    return scan
+
+
+def _cd_operand(name: str, args: list[str]) -> str | None:
+    """The directory ``cd``/``pushd`` is given: ``~`` for a bare ``cd``; None when the command stays in the
+    directories it has (``pushd`` alone swaps, ``pushd +1`` rotates). ``pushd -n DIR`` does not change directory
+    itself, but ``popd`` or a bare ``pushd`` comes back to DIR, so it counts as reached."""
+    operands: list[str] = []
+    options_over = False
+    for a in args:
+        if not options_over and a == "--":
+            options_over = True
+        elif not options_over and a.startswith(("-", "+")) and a != "-":
+            if name == "pushd" and a[1:].isdigit():
+                return None
+        else:
+            operands.append(a)
+    if operands:
+        return operands[0]
+    return "~" if name == "cd" else None
+
+
+def _cd_targets(operand: str, bases: tuple[str, ...], home: str, cdpath: bool) -> list[str] | None:
+    """The directories ``cd OPERAND`` can land in from any of ``bases``, or None when that cannot be worked out: ``cd
+    -`` (the directory before), an unresolved ``$VAR``/substitution, an unknown ``~user``, a glob, or a relative name
+    while ``CDPATH`` may redirect it."""
+    operand = operand.strip("'\"")
+    if not operand:
+        return list(bases)  # ``cd ""`` stays where it is
+    if operand == "-":
+        return None
+    out: list[str] = []
+    for word in _brace_expand(operand):
+        if _GLOB_CHARS & set(word):
+            return None
+        if word.startswith("~") and word != "~" and not word.startswith("~/"):
+            expanded = os.path.expanduser(word)
+            if expanded == word:
+                return None  # a user this machine does not know, ``~+``, ``~-``
+            word = expanded
+        if cdpath and word not in (".", "..") and not word.startswith(("/", "~", "./", "../", "$")):
+            return None
+        for base in bases:
+            path = hardline.expand_vars(word, base, home)
+            if "$" in path or "`" in path:
+                return None
+            out.append(os.path.normpath(path if os.path.isabs(path) else os.path.join(base, path)))
+    return out
+
+
+def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
+    """The directories the relative paths on ``parsed`` may be relative to. A ``cd`` anywhere on the line counts for
+    every command on it, whatever their order or nesting (``(cd ~; cat .ssh/id_rsa)``, ``bash -c 'cd ~ && ...'``, a
+    loop that comes back round): the line is judged against its starting directory and each directory its ``cd``s can
+    reach, each ``cd`` applied to every directory found before it (``cd ~ && cd .ssh``). One that cannot be resolved
+    makes the directory unknown (``unknown``), which the credential check treats like an unknown variable."""
+    start = base if isinstance(base, _Where) else _Where((base,))
+    scan = _cd_commands(parsed)
+    cds, cdpath = scan.found, scan.cdpath
+    dirs = list(start.dirs)
+    unknown = start.unknown or scan.unknown
+    passes_allowed = _CD_PASSES if _loops(parsed) else 1
+    for passes in range(passes_allowed):
+        grew = False
+        for name, args in cds:
+            operand = _cd_operand(name, args)
+            if operand is None:
+                continue
+            targets = _cd_targets(operand, tuple(dirs), home, cdpath)
+            if targets is None:
+                unknown = True
+                continue
+            for d in targets:
+                if d not in dirs:
+                    dirs.append(d)
+                    grew = True
+            if len(dirs) > _CD_MAX_DIRS:
+                return _Where(tuple(dirs[:_CD_MAX_DIRS]), True)
+        if not grew:
+            break
+        if passes_allowed > 1 and passes == passes_allowed - 1:
+            unknown = True  # still reaching new directories after the last replay
+    return _Where(tuple(dirs), unknown)
+
+
+def _sub_secret_access(sub: str, piped: bool, where: _Where, home: str) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
-        worst = _worse(worst, _classify_arg(source, cwd, home))
+        worst = _worse(worst, _classify_arg(source, where, home))
     wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
     argv = _argv(sub, wrapper_reads)
     for arg in wrapper_reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
+        worst = _worse(worst, _classify_arg(arg, where, home))
     if not argv:
         return worst
     for command in hardline.ssh_option_commands(argv[0], argv[1:]):
         # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
-        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
+        inner = hardline.parse(command)
+        worst = _worse(worst, _secret_access(inner, _where(inner, where, home), home, consumed=True))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
-    if any(_classify_arg(arg, cwd, home) for arg in writes):
+        worst = _worse(worst, _classify_arg(arg, where, home))
+    if any(_classify_arg(arg, where, home) for arg in writes):
         worst = _worse(worst, "ask")
-    if any(_classify_arg(arg, cwd, home) for arg in confirm):
+    if any(_classify_arg(arg, where, home) for arg in confirm):
         worst = _worse(worst, "confirm")
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
+def _secret_access(parsed: hardline.Parsed, where: _Where, home: str, consumed: bool = False) -> str | None:
     """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
     point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
     None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
     tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
     expanded, globs are matched."""
     worst: str | None = None
+    # once per line, not per sub: a line of thousands of simple commands made this subs x pipelines (K3NOX-691)
+    in_pipes = {sub for p in parsed.pipelines if len(p) > 1 for sub in p}
     for sub in parsed.subs:
-        piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
-        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+        piped = consumed or sub in in_pipes
+        worst = _worse(worst, _sub_secret_access(sub, piped, where, home))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
-        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
+        worst = _worse(worst, _secret_access(child, where, home, consumed or k < n_subst))
     return worst
 
 
@@ -1430,14 +1625,13 @@ def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
-    hit = hardline.check(command, extra, cwd=cwd, home=home)
+    hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    parsed = hardline.parse(command)
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
-    secret = _secret_access(parsed, cwd, home)
+    secret = _secret_access(parsed, _where(parsed, cwd, home), home)
     if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
