@@ -185,3 +185,160 @@ def test_a_cd_up_out_of_a_project_inside_the_home_is_followed(
     cmd = cmd.replace("cd .. &&", "cd ../.. &&")
     dec = _decide(cmd, mode, project)
     assert dec.action == "deny", (cmd, mode, dec)
+
+
+# K3NOX-732: the four spellings K3NOX-320 left open
+
+DIR_OPTION_DENIED = [
+    # tar and make run in the directory -C names; naming the parent and then a relative member slipped past
+    "tar -C ~ -cf - .ssh/id_rsa",
+    "tar -cf - -C ~ .ssh/id_rsa",
+    "tar -cC ~ -f - .ssh/id_rsa",
+    "tar -C~ -cf - .ssh/id_rsa",
+    "tar --directory=~ -cf - .ssh/id_rsa",
+    "tar --directory ~/.config -cf - k3code/env",
+    "tar --dir ~/.config -cf - k3code/env",
+    "gtar -C ~ -cf - .aws/credentials",
+    "bsdtar -C ~ -cf - .ssh/id_ed25519",
+    "make -C ~ -f .ssh/id_rsa",
+    "make --directory=~/.ssh -f id_rsa",
+    "make -C ~/.config -f k3code/env",
+    "sudo tar -C ~ -cf - .ssh/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", DIR_OPTION_DENIED)
+def test_a_tar_or_make_directory_option_moves_the_directory_a_member_is_read_from(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "deny", (cmd, mode, dec)
+    assert dec.hardline == "sensitive-path"
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "tar -C $DIR -cf - .ssh/id_rsa",
+        'tar -C "$(mktemp -d)" -cf - id_rsa',
+        "tar --directory=$DIR -cf - k3code/env",
+        "make -C $DIR -f id_rsa",
+    ],
+)
+def test_a_tar_or_make_directory_that_cannot_be_worked_out_asks_a_person(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec)
+
+
+@pytest.mark.parametrize("cmd", ["tar -C sub -cf out.tar file.txt", "tar -tf out.tar", "make -C sub -n test"])
+def test_an_ordinary_tar_or_make_directory_option_is_not_judged_harder(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action != "deny" and not dec.needs_human, (cmd, dec)
+
+
+LINK_THEN_CD = [
+    "ln -s ~ h && cd h && head .ssh/id_rsa",
+    "ln -sf ~ h; cd h; head .ssh/id_rsa",
+    "ln --symbolic ~ h && pushd h && head .aws/credentials",
+    "ln -s ~ h; (cd h; head .ssh/id_rsa)",
+    "bash -c 'ln -s ~ h && cd h && head .ssh/id_rsa'",
+    "cp -s ~/README.md h && cd h && head .ssh/id_rsa",
+    "cp --symbolic-link ~/README.md h && cd h && head .ssh/id_rsa",
+    "ln -s ~ h && env -C h head .ssh/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", LINK_THEN_CD)
+def test_a_cd_after_a_symlink_made_on_the_same_line_asks_a_person(scoped_project: Path, cmd: str, mode: str) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ln -s file.txt l && cat l",  # no cd
+        "cd sub && cat file.txt",
+        "ln -s file.txt sub/l && cd sub && cat file.txt",  # nothing there that could name a credential
+        "cd sub && ln -s file.txt l && cat l",
+    ],
+)
+def test_a_symlink_alone_or_a_cd_alone_is_judged_as_before(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
+
+
+XARGS_PLACEHOLDER = [
+    "printf .ssh | xargs -I{} sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | xargs -I{} sh -c 'cd ~/{}; head id_rsa'",
+    "echo .ssh | xargs -I {} bash -c 'cd ~/{}; head id_rsa'",
+    "echo .ssh | xargs -I@@ sh -c 'pushd ~/@@ && head id_rsa'",
+    "echo .ssh | xargs -i sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | xargs -i@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | xargs --replace sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | xargs --replace=@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | sudo xargs -I{} sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | xargs -n1 -I{} sh -c 'cd \"~/{}\" && head id_rsa'",
+    "echo .ssh | xargs -I{} sh -c 'cd {}' ; head id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", XARGS_PLACEHOLDER)
+def test_a_cd_operand_holding_the_xargs_placeholder_asks_a_person(scoped_project: Path, cmd: str, mode: str) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ls | xargs -I{} sh -c 'cd sub && cat file.txt'",  # the placeholder is not in the cd operand
+        "echo sub | xargs -I{} sh -c 'cd sub && cat file.txt {}'",
+        "echo x | xargs sh -c 'cd sub && cat file.txt'",
+        "echo file.txt | xargs -I{} cat {}",
+    ],
+)
+def test_an_xargs_that_does_not_feed_a_cd_keeps_its_decision(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
+
+
+HOME_THEN_TILDE = [
+    "HOME=~/.ssh; head ~/id_rsa",
+    "HOME=~/.ssh; head $HOME/id_rsa",
+    "HOME=~/.ssh; head ${HOME}/id_rsa",
+    'HOME=~/.ssh; base64 "$HOME/id_rsa"',
+    "export HOME=~/.aws; head ~/credentials",
+    "export HOME=~/.config; head ~/k3code/env",
+    "HOME=~ ; HOME=$HOME/.ssh; head ~/id_ed25519",
+    "HOME=~/.ssh bash -c 'head ~/id_rsa'",
+    "HOME=~/.ssh sh -c 'head $HOME/id_rsa'",
+    "HOME=~/.ssh; echo go | xargs -a ~/id_rsa head",
+    "HOME=~/.ssh; head < ~/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", HOME_THEN_TILDE)
+def test_a_tilde_after_home_was_reassigned_on_the_line_asks_a_person(scoped_project: Path, cmd: str, mode: str) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec)
+
+
+def test_a_tilde_credential_path_stays_denied_when_home_is_reassigned(scoped_project: Path) -> None:
+    dec = _decide("HOME=/nowhere; head ~/.ssh/id_rsa", "auto", scoped_project)
+    assert dec.action == "deny", dec
+
+
+@pytest.mark.parametrize(
+    "cmd", ["HOME=/tmp/x; head ~/README.md", "HOME=/tmp/x; head $HOME/notes.txt", "head ~/README.md"]
+)
+def test_a_tilde_name_that_is_no_credential_is_not_asked_about(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
