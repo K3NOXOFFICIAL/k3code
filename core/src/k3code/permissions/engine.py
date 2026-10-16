@@ -15,7 +15,7 @@ import os
 import re
 import shlex
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -519,15 +519,15 @@ def _unusable_argument(args: dict[str, object]) -> str | None:
     """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no shell
     or exec (it lives in the C string terminator, so a name ending there is two names and the rest vanishes); an argument
     that the locale cannot decode is not reproducible by a human at a shell. ``command`` and ``cwd`` are checked, too."""
-    for key in ("command", "cwd", "path"):
+    for key in ("command", "cwd", "path", "file", "pattern"):
         val = args.get(key)
         if val is None:
             continue
         if isinstance(val, str):
             try:
-                val.encode("utf-8")  # rejects lone surrogates
+                val.encode("utf-8", "surrogateescape")  # rejects lone surrogates outside the escape range
             except UnicodeEncodeError:
-                return f"Argument {key} is not text ({val!r})."
+                return f"Argument {key} is not text that can be encoded ({val!r})."
         if isinstance(val, str) and "\0" in val:
             return f"A NUL byte cannot be passed to a command or a path ({key})."
     return None
@@ -568,7 +568,7 @@ def decide(
     )
     args = args or {}
     if (bad := _unusable_argument(args)) is not None:
-        return Decision(action="deny", reason=bad)
+        return Decision(action="deny", message=bad)
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
     ruleset = merge(builtin_defaults(mode), user_rules or [], project_rules or [], session_rules or [])
@@ -1641,8 +1641,15 @@ def _makes_symlink(name: str, args: list[str]) -> bool:
 def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
     """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
     included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
-    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in."""
+    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in. A ``trap``
+    action runs later (at exit, on a signal), not now, so its ``cd`` does not move the rest of the line: its
+    payload is still checked for secrets in _secret_access, but skipped here."""
     scan = scan or _CdScan()
+    trap_payloads: set[str] = set()
+    for sub in parsed.subs:
+        argv0 = _argv(sub)
+        if argv0 and argv0[0] == "trap":
+            trap_payloads.update(hardline._trap_actions(argv0[1:]))
     for sub in parsed.subs:
         scan.cdpath = scan.cdpath or "CDPATH" in sub
         scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
@@ -1665,6 +1672,8 @@ def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdSca
             scan.found += [("cd", [d]) for d in _dir_option_values(argv[0], argv[1:])]
         scan.links = scan.links or _makes_symlink(argv[0], argv[1:])
     for child in parsed.children:
+        if child.clean in trap_payloads or any(s in trap_payloads for s in child.subs):
+            continue  # a trap action runs later: its cd does not move the current line
         _cd_commands(child, scan)
     return scan
 
@@ -2080,12 +2089,96 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     of ``$HOME`` (or is a dotfile there), a root at or above ``$HOME`` covers it and no project root below ``$HOME``
     does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
     (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
+    return _home_dot_spelled(_spellings(path), roots)
+
+
+def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
+    """_home_dot_read for a path given as its spellings."""
     home = os.path.normpath(os.path.expanduser("~"))
     if not _inside(home, roots):
         return False
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in spellings)
+
+
+def _link_hops(path: str) -> list[str]:
+    """``path`` (absolute) as written and, for each symlink met on the way to its realpath, what the path becomes
+    after following it: ``~/.config/gh/hosts.yml -> ~/dotfiles/gh/hosts.yml`` is both. A reader that opens the final
+    target would otherwise never see that the path it was given names a credential store."""
+    hops: list[str] = []
+    cur = path
+    try:
+        for _ in range(_MAX_LINK_HOPS):
+            hops.append(os.path.normpath(cur))
+            done: list[str] = []
+            rest = cur.split("/")
+            for i, comp in enumerate(rest):
+                if comp in ("", "."):
+                    continue
+                if comp == "..":
+                    if done:
+                        done.pop()
+                    continue
+                probe = "/" + "/".join([*done, comp])
+                if os.path.islink(probe):
+                    cur = "/".join([os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :]])
+                    break
+                done.append(comp)
+            else:
+                break
+    except (OSError, ValueError):
+        pass
+    return list(dict.fromkeys([*hops, _real(path)]))
+
+
+_MAX_LINK_HOPS = 40  # as the kernel's symlink limit
+
+
+def _without_mirror(path: str, mirror: str) -> str:
+    """``path`` with the first ``/<mirror>`` cut out: ``~/dotfiles/k3code/.k3code/memory/USER.md`` is
+    ``~/dotfiles/k3code/USER.md`` for the mirror ``.k3code/memory``."""
+    at = path.find("/" + mirror + "/") if mirror else -1
+    return path if at < 0 else path[:at] + path[at + len(mirror) + 1 :]
+
+
+def memory_import_withheld(
+    path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = ""
+) -> bool:
+    """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
+    has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
+    (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
+    folder of ``$HOME``. Every spelling is checked: the path as written, each hop of a symlink chain and the realpath
+    (see _link_hops), so a store file that links out and a plain file that links in are both caught.
+
+    The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
+    a store, with the whole path inside that root, makes its own files ordinary (a session started in
+    ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
+    makes its dot folders ordinary (``.github`` of a repository). Callers have already checked the target lies in the
+    ``mirror`` is the memory folder relative to ``$HOME`` (``.k3code/memory``), given for the user's memory: GNU stow
+    without folding links the file, not the folder, so its real place is
+    ``<dotfiles>/<package>/.k3code/memory/USER.md``. That spelling is judged by the dot rule with the mirror cut out
+    of it, so the dotfiles folder and anything below the mirror still count (``~/.dotfiles/...`` and a ``.hidden``
+    below it stay refused). Every other spelling, the realpath of a link in the mirror among them, is judged on its
+    own."""
+    spellings = _link_hops(path)
+    if any(sensitive_path(p) for p in spellings):
+        return True
+    home_roots = [str(r) for r in roots]
+    for store in [*_home_stores(), *extra_stores]:
+        low = store.casefold().rstrip("/")
+        held = [p for p in spellings if p.casefold() == low or p.casefold().startswith(low + "/")]
+        if held and not any(_inside(r, [store]) and all(_inside(p, [r]) for p in held) for r in home_roots):
+            return True
+    homes = _home_prefixes()
+    home = os.path.normpath(os.path.expanduser("~"))
+    if not _inside(home, home_roots):
+        return False
+    projects = [r for r in home_roots if not _inside(home, [r])]
+    return any(
+        _below_home_dot(_without_mirror(p, mirror), homes) and not (projects and _inside(p, projects))
+        for p in spellings
+    )
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:
