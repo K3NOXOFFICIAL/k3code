@@ -525,3 +525,197 @@ STILL_ALLOWED = [
 def test_the_ordinary_neighbours_of_those_lines_keep_their_decision(scoped_project: Path, cmd: str) -> None:
     dec = _decide(cmd, "auto", scoped_project)
     assert dec.action == "allow", (cmd, dec)
+
+
+# K3NOX-767: more ways a program changes its directory, or fills a name in later, than K3NOX-732 followed
+
+MORE_DIR_OPTION_DENIED = [
+    # an old-style tar bundle: each letter that takes a value takes the next word, in order
+    "tar cfC - ~ .ssh/id_rsa",
+    "tar cCf ~ - .ssh/id_rsa",
+    "gtar cfC - ~ .aws/credentials",
+    "tar cfC - ~/.config k3code/env",
+    # bsdtar: its own option table (--cd; -H and -L are plain flags there)
+    "bsdtar --cd ~ -cf - .ssh/id_rsa",
+    "bsdtar --cd=~ -cf - .ssh/id_rsa",
+    "bsdtar -H -C ~ -cf - .ssh/id_rsa",
+    "bsdtar -L -C ~ -cf - .ssh/id_rsa",
+    # any prefix of --directory
+    "tar --dire ~ -cf - .ssh/id_rsa",
+    "make --di ~ -f .config/k3code/env -p",
+    "make --dir=~/.config -f k3code/env -p",
+    # make -L is a flag
+    "make -L -C ~ -f .config/k3code/env -p",
+    # busybox applets
+    "busybox tar -C ~ -cf - .ssh/id_rsa",
+    "busybox tar cfC - ~ .ssh/id_rsa",
+    # other commands with a directory option
+    "echo .aws/credentials | cpio -o -D ~",
+    "echo .aws/credentials | cpio -o --directory=~",
+    "echo .aws/credentials | cpio -o --dir ~",
+    "cmake -E chdir ~ cat .aws/credentials",
+    "uv --directory ~ run cat .aws/credentials",
+    "uv run --directory ~ cat .aws/credentials",
+    "uv run --directory=~ cat .aws/credentials",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", MORE_DIR_OPTION_DENIED)
+def test_more_directory_options_move_the_directory_a_name_is_read_from(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "deny", (cmd, mode, dec)
+
+
+ASKS_ABOUT_DIRECTORY = [
+    # GNU tar reads options from this variable, so a directory set there is unseen
+    "TAR_OPTIONS='-C ~' tar -cf - .ssh/id_rsa",
+    "export TAR_OPTIONS='-C ~'; tar -cf - .ssh/id_rsa",
+    "env TAR_OPTIONS='-C ~' tar -cf - .ssh/id_rsa",
+    "TAR_OPTIONS+=' -C ~' ; tar -cf - .ssh/id_rsa",
+    # xargs appends its input to the command: a directory option with no value takes the first word
+    "printf '%s\\n' ~ .aws/credentials | xargs tar -cf - -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs tar -cf - --directory",
+    "printf '%s\\n' ~ .aws/credentials | xargs make -f .aws/credentials -p -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs git -C",
+    "printf '%s\\n' ~ .aws/credentials | xargs -n1 tar -cf - -C",
+    # short abbreviations of --replace
+    "echo .ssh | xargs --r=@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | xargs --re=@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | xargs --rep=@ sh -c 'cd ~/@ && head id_rsa'",
+    "echo .ssh | xargs --r sh -c 'cd ~/{} && head id_rsa'",
+    # GNU parallel fills {} the way xargs -I does
+    "echo .ssh | parallel sh -c 'cd ~/{} && head id_rsa'",
+    "echo .ssh | parallel sh -c 'cd ~/{.}; head id_rsa'",
+    "echo .ssh | parallel sh -c 'cd ~/{/}; head id_rsa'",
+    "echo .ssh | parallel sh -c 'cd ~/{1}; head id_rsa'",
+    "echo .ssh | parallel -I@@ sh -c 'cd ~/@@; head id_rsa'",
+    "echo .ssh | parallel --replace @@ sh -c 'cd ~/@@; head id_rsa'",
+    "echo .ssh | parallel --replace=@@ sh -c 'cd ~/@@; head id_rsa'",
+    "echo .ssh | parallel -j2 sh -c 'pushd ~/{}; head id_rsa'",
+    # busybox ln
+    "busybox ln -s ~ h && cd h && head .ssh/id_rsa",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", ASKS_ABOUT_DIRECTORY)
+def test_a_directory_that_cannot_be_worked_out_asks_a_person_k3nox_767(
+    scoped_project: Path, cmd: str, mode: str
+) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec)
+
+
+def test_xargs_env_chdir_with_no_value_is_not_allowed(scoped_project: Path) -> None:
+    dec = _decide("printf '%s\\n' ~ .aws/credentials | xargs env -C", "auto", scoped_project)
+    assert dec.action != "allow", dec
+
+
+MORE_KEPT = [
+    "tar cf out.tar file.txt",
+    "tar xf out.tar",
+    "tar cfC out.tar sub file.txt",
+    "tar cCf sub out.tar file.txt",
+    "bsdtar -H -L -C sub -cf out.tar file.txt",
+    "bsdtar --cd sub -cf out.tar file.txt",
+    "make -L -n test",
+    "make --directory sub -n test",
+    "make --di sub -n test",
+    "busybox tar -C sub -cf out.tar file.txt",
+    "busybox ls sub",
+    "echo file.txt | cpio -o -D sub",
+    "cmake -E chdir sub cat file.txt",
+    "cmake -E echo hi",
+    "uv --directory sub run pytest -q",
+    "uv run --directory sub pytest -q",
+    "ls | xargs --re={} cat {}",
+    "ls | xargs tar -cf out.tar",
+    "ls | parallel cat {}",
+    "ls | parallel -j4 wc -l {}",
+    "ls | parallel sh -c 'cd sub && cat file.txt'",
+    "echo sub | parallel sh -c 'cd sub && cat file.txt {}'",
+    "TAR_OPTIONS=--xz tar -cf out.tar file.txt",
+    "printf '%s\\n' file.txt | xargs tar -cf out.tar -C sub",
+]
+
+
+@pytest.mark.parametrize("cmd", MORE_KEPT)
+def test_an_ordinary_line_is_not_judged_harder_k3nox_767(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
+
+
+HOME_ASSIGNED_ELSEWHERE = [
+    "printf -v HOME %s ~/.ssh; head ~/id_rsa",
+    "printf -vHOME %s ~/.ssh; head ~/id_rsa",
+    "read HOME < list; head ~/id_rsa",
+    "read -r HOME < list; head ~/id_rsa",
+    "read -p x HOME < list; head ~/id_rsa",
+    "for HOME in a b; do head ~/id_rsa; done",
+    "select HOME in a b; do head ~/id_rsa; done",
+    "mapfile HOME < list; head ~/id_rsa",
+    "readarray -t HOME < list; head ~/id_rsa",
+    "getopts x HOME; head ~/id_rsa",
+    "HOME[0]=~/.aws; cat ~/credentials",
+    "HOME[0]=~/.aws; cat $HOME/credentials",
+    "declare -n h=HOME; h=~/.aws; cat ~/credentials",
+    "local -n h=HOME; h=~/.aws; cat ~/credentials",
+    "typeset -n h=HOME; h=~/.aws; cat ~/credentials",
+    "declare HOME=~/.aws; cat ~/credentials",
+    "let HOME=1; cat ~/credentials",
+    # a name that is not a literal credential file once HOME has moved
+    "HOME=~/.aws; cat ~/cred*",
+    "HOME=~/.aws; cat ~/c?edentials",
+    "HOME=~/.aws; cat ${HOME:-x}/credentials",
+    "HOME=~/.aws; cat ${HOME}/cred*",
+    "HOME=~/.aws; cat $HOME/c?edentials",
+    # a bare ~ or $HOME is the moved home
+    "HOME=~/.ssh; tar -cf - ~",
+    "HOME=~/.ssh; cp -r ~ out",
+    "HOME=~/.ssh; cp -r $HOME out",
+    "HOME=~/.ssh; cp -r ${HOME} out",
+    'HOME=~/.ssh; cp -r "$HOME" out',
+    "printf -v HOME %s ~/.ssh; tar -cf - ~",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", HOME_ASSIGNED_ELSEWHERE)
+def test_a_home_assigned_without_a_home_word_asks_a_person(scoped_project: Path, cmd: str, mode: str) -> None:
+    dec = _decide(cmd, mode, scoped_project)
+    assert dec.action in ("ask", "deny") and (dec.action == "deny" or dec.needs_human), (cmd, mode, dec)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "HOME=/tmp/x; head ~/README.md",  # a moved home: the name is no longer worth a look, the home is
+        "HOME=/tmp/x; head $HOME/notes.txt",
+        "HOME=/tmp/x; head ~",
+    ],
+)
+def test_any_reader_argument_in_a_moved_home_asks_a_person(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "ask" and dec.needs_human, (cmd, dec)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "head ~/README.md",
+        "ls ~",
+        "HOME=/tmp/x; head README.md",
+        "HOME=/tmp/x; echo ~alice",
+        "read x < list; head ~/README.md",
+        "printf -v x %s hi; head ~/README.md",
+        "for i in a b; do head ~/README.md; done",
+        "HOMEDIR=/tmp/x; head $HOMEDIR/README.md ~/README.md",
+        "declare -n h=PATH; head ~/README.md",
+    ],
+)
+def test_a_line_that_leaves_home_alone_is_judged_as_before(scoped_project: Path, cmd: str) -> None:
+    dec = _decide(cmd, "auto", scoped_project)
+    assert dec.action == "allow", (cmd, dec)
