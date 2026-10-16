@@ -525,9 +525,10 @@ def _stricter(a: Decision, b: Decision) -> Decision:
 
 
 def _unusable_argument(args: dict[str, object]) -> str | None:
-    """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no shell
-    or exec (it lives in the C string terminator, so a name ending there is two names and the rest vanishes); an argument
-    that the locale cannot decode is not reproducible by a human at a shell. ``command`` and ``cwd`` are checked, too."""
+    """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no
+    shell or exec (it lives in the C string terminator, so a name ending there is two names and the rest vanishes);
+    an argument that the locale cannot decode is not reproducible by a human at a shell. ``command`` and ``cwd``
+    are checked, too."""
     for key in ("command", "cwd", "path", "file", "pattern"):
         val = args.get(key)
         if val is None:
@@ -1349,9 +1350,7 @@ class _Where:
     home_moved: bool = False  # ``HOME`` is assigned on the line: ``~`` and ``$HOME`` may not mean the daemon's home
 
 
-def _classify_arg(
-    arg: str, where: _Where, home: str, budget: _GlobBudget | None = None
-) -> str | None:
+def _classify_arg(arg: str, where: _Where, home: str, budget: _GlobBudget | None = None) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
     front of a credential name (``$DIR/.env``) or an unknown directory may hold it, ``unchecked`` when a glob could
     not be checked within ``budget``, else None. ``{a,b}`` alternatives are classified one by one, each against every
@@ -1775,7 +1774,9 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
     return _Where(tuple(dirs), unknown, home_moved)
 
 
-def _sub_secret_access(sub: str, piped: bool, where: _Where, home: str, budget: _GlobBudget | None = None) -> str | None:
+def _sub_secret_access(
+    sub: str, piped: bool, where: _Where, home: str, budget: _GlobBudget | None = None
+) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
@@ -2151,9 +2152,7 @@ def _without_mirror(path: str, mirror: str) -> str:
     return path if at < 0 else path[:at] + path[at + len(mirror) + 1 :]
 
 
-def memory_import_withheld(
-    path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = ""
-) -> bool:
+def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = (), mirror: str = "") -> bool:
     """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
     has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
     (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
