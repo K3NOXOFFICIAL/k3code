@@ -403,6 +403,27 @@ def _norm(path: str | Path) -> str:
     return os.path.normpath(os.path.expanduser(str(path)))
 
 
+def _real(path: str) -> str:
+    """``os.path.realpath(path)``, but a NUL byte (or other OS-rejected path) in attacker-controlled input must
+    reach a decision, not a crash: fall back to the normalized path so callers still get a comparable string.
+    Containment checks (:func:`_inside`) must not treat this fallback as a resolved path; use :func:`_real_strict`
+    there instead."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return os.path.normpath(path)
+
+
+def _real_strict(path: str) -> str | None:
+    """Like :func:`_real`, but a path the OS refuses (a NUL byte, say) resolves to ``None`` instead of a lexical
+    guess: a containment check that cannot resolve a path must fail closed (not inside), never fail open by
+    comparing an un-resolved string that happens to share a prefix with a root."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+
+
 def _abs(raw: str, cwd: str) -> str:
     p = os.path.expanduser(raw or ".")
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
@@ -411,9 +432,12 @@ def _abs(raw: str, cwd: str) -> str:
 def _inside(path: str, roots: list[str]) -> bool:
     """``path`` lies under one of ``roots``, after resolving symlinks on both sides: a lexical check let
     ``proj/docs -> ../outside`` turn a write to ``docs/x`` into a write outside the project. A path that does not
-    exist yet resolves through its nearest existing parent (realpath keeps the missing remainder as is)."""
-    real = os.path.realpath(path)
-    real_roots = [os.path.realpath(r) for r in roots]
+    exist yet resolves through its nearest existing parent (realpath keeps the missing remainder as is). A path (or
+    root) the OS refuses to resolve is never "inside": see :func:`_real_strict`."""
+    real = _real_strict(path)
+    if real is None:
+        return False
+    real_roots = [r for r in (_real_strict(root) for root in roots) if r is not None]
     return any(real == r or real.startswith(r.rstrip("/") + "/") for r in real_roots)
 
 
@@ -456,9 +480,9 @@ def k3code_state(path: str) -> bool:
     Compared on the path as written and on its realpath against the directory as set and as resolved, case-insensitively
     as the other guarded paths are. k3code's own writers do not go through ``decide``."""
     state = paths.home()
-    guarded = [os.path.normpath(state), os.path.realpath(state)]
+    guarded = [os.path.normpath(state), _real(state)]
     guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
-    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         low = p.casefold()
         if any(low == g or low.startswith(g + os.sep) for g in guarded):
             return True
@@ -473,12 +497,12 @@ def protected_path(path: str) -> bool:
     if k3code_state(path):
         return True
     home = os.path.expanduser("~")
-    homes = (os.path.normpath(home), os.path.realpath(home))
+    homes = (os.path.normpath(home), _real(home))
     guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
     secrets = _secret_dirs()
     guarded += [*map(os.path.normpath, secrets), *map(os.path.realpath, secrets)]
     guarded = [g.casefold().rstrip(os.sep) for g in guarded]
-    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         if _PROTECTED.search(p.replace("\\", "/")):
             return True
         low = p.casefold()
@@ -541,8 +565,8 @@ def decide(
         dec = _decide_path(mode, tool, path, roots, ruleset, outside_reads)
         # The tools and the kernel follow a symlink before they apply a `..` (`link/../x` is `<target of link>/../x`),
         # `_abs` applied it first: decide the file that is really reached as well, and take the stricter answer.
-        reached = os.path.realpath(os.path.join(cwd_s, raw))
-        if tool != "glob" and reached != os.path.realpath(path):
+        reached = _real(os.path.join(cwd_s, raw))
+        if tool != "glob" and reached != _real(path):
             dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset, outside_reads))
         if tool in EDIT_TOOLS and dec.action != "deny" and (protected_path(path) or protected_path(reached)):
             # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
@@ -634,7 +658,7 @@ def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
         if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
             return False  # a variable or glob: unknown target
         path = _abs(target, cwd)
-        if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, os.path.realpath(path))):
+        if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, _real(path))):
             return False
     return True
 
@@ -1050,7 +1074,7 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
     the builtin read-only allowlist does not cover these reads. Checked on the path as written and on its realpath (a
     symlink in ``$HOME`` into a dot folder); a short option with a dot (``-f.config/x``) may attach such a path."""
     home = os.path.normpath(os.path.expanduser("~"))
-    homes = list(dict.fromkeys((home, os.path.realpath(home))))
+    homes = list(dict.fromkeys((home, _real(home))))
     if not _inside(home, roots):
         return False  # no root covers $HOME: a path there is outside the roots, which voids a builtin allow already
     projects = [r for r in roots if not _inside(home, [r])]
@@ -1065,7 +1089,7 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
         if not t or t.startswith("$"):
             continue
         lexical = _abs(t, cwd)
-        for p in dict.fromkeys((lexical, os.path.realpath(os.path.join(cwd, os.path.expanduser(t))))):
+        for p in dict.fromkeys((lexical, _real(os.path.join(cwd, os.path.expanduser(t))))):
             if projects and _inside(p, projects):
                 continue
             for h in homes:
@@ -1899,7 +1923,7 @@ def _toolchain_read(path: str) -> bool:
     home = os.path.expanduser("~")
     if _inside(path, [*_TOOLCHAIN_SYSTEM, *(os.path.join(home, rel) for rel in _TOOLCHAIN_HOME)]):
         return True
-    return any(seg in _TOOLCHAIN_SEGMENTS for seg in os.path.realpath(path).split(os.sep))
+    return any(seg in _TOOLCHAIN_SEGMENTS for seg in _real(path).split(os.sep))
 
 
 def _home_stores() -> list[str]:
@@ -1911,7 +1935,7 @@ def _home_stores() -> list[str]:
     home = os.path.expanduser("~")
     stores = [
         os.path.join(h, rel)
-        for h in dict.fromkeys((os.path.normpath(home), os.path.realpath(home)))
+        for h in dict.fromkeys((os.path.normpath(home), _real(home)))
         for rel in (*HOME_RO_HIDDEN, _UV_CREDENTIALS)
     ]
     return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
@@ -1919,7 +1943,7 @@ def _home_stores() -> list[str]:
 
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((os.path.normpath(path), os.path.realpath(path))))
+    return list(dict.fromkeys((os.path.normpath(path), _real(path))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -1947,7 +1971,7 @@ def _home_store_read(path: str, roots: list[str]) -> bool:
 def _home_prefixes() -> list[str]:
     """``$HOME/`` as written and by its realpath."""
     home = os.path.normpath(os.path.expanduser("~"))
-    return [h.rstrip("/") + "/" for h in dict.fromkeys((home, os.path.realpath(home)))]
+    return [h.rstrip("/") + "/" for h in dict.fromkeys((home, _real(home)))]
 
 
 def _below_home_dot(path: str, homes: list[str]) -> bool:
@@ -2069,10 +2093,7 @@ def sensitive_path(path: str) -> bool:
     case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files."""
     if secret_store(path):
         return True
-    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
-        if _dotenv_name(os.path.basename(p)):
-            return True
-    return False
+    return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), _real(path))))
 
 
 def secret_store(path: str) -> bool:
@@ -2080,8 +2101,8 @@ def secret_store(path: str) -> bool:
     dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
     compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
     dirs = [os.path.normpath(d) for d in _secret_dirs()]
-    dirs = [d.lower() for d in dict.fromkeys(dirs + [os.path.realpath(d) for d in dirs])]
-    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+    dirs = [d.lower() for d in dict.fromkeys(dirs + [_real(d) for d in dirs])]
+    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         folded = p.lower()
         if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in dirs):
             return True
