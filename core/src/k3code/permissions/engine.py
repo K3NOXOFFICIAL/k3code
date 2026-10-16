@@ -1231,8 +1231,9 @@ _COPIERS = frozenset({"cp", "mv", "ln", "install"})
 _KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
 #: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
 #: container one. Both are an ask that a person answers. ``unchecked``: a glob was too large to check for credential
-#: files; a person is asked, and yolo (where nobody can be) refuses.
-_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "unchecked": 3, "deny": 4}
+#: files; a person is asked, and yolo (where nobody can be) refuses. ``unchecked_w``: the same for a glob a command
+#: deletes or overwrites, which yolo has always let through.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "unchecked_w": 2, "unchecked": 3, "deny": 4}
 
 
 def _worse(a: str | None, b: str | None) -> str | None:
@@ -1298,6 +1299,14 @@ class _GlobBudget:
         self.entries = 0
         self.deadline = time.monotonic() + _GLOB_BUDGET_S
         self.spent = False
+        self._dirs: list[str] | None = None
+
+    @property
+    def secret_dirs(self) -> list[str]:
+        """The secret dirs, resolved once for the decision instead of once for every hit."""
+        if self._dirs is None:
+            self._dirs = _folded_secret_dirs()
+        return self._dirs
 
     def charge(self) -> bool:
         """Count one directory entry; False once the entry cap or the time budget is used up."""
@@ -1347,7 +1356,7 @@ def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | N
     if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
         budget.spent = True
     for hit in _glob_walk("/", parts, budget):
-        if sensitive_path(hit):
+        if sensitive_path(hit, budget.secret_dirs):
             return True
     literal: list[str] = []
     for seg in pattern.split("/"):
@@ -1355,7 +1364,7 @@ def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | N
             break
         literal.append(seg)
     base = "/".join(literal) or "/"
-    if base != "/" and sensitive_path(base):
+    if base != "/" and sensitive_path(base, budget.secret_dirs):
         return True
     if any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home)):
         return True
@@ -1705,7 +1714,17 @@ _TAR_COMMANDS = frozenset({"tar", "gtar", "bsdtar"})
 _FEEDERS = frozenset({"xargs", "parallel"})
 #: ``find -exec`` and friends fill ``{}`` with a file name; GNU ``parallel`` fills these.
 _FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
-_PARALLEL_REPLACES = ("{}", "{.}", "{/}", "{//}", "{/.}", *(f"{{{n}}}" for n in range(1, 10)))
+_PARALLEL_REPLACES = (
+    "{}",
+    "{.}",
+    "{/}",
+    "{//}",
+    "{/.}",
+    "{#}",
+    "{%}",
+    "{=",
+    *(f"{{{n}}}" for n in range(1, 10)),
+)
 #: ``git`` subcommands that write files into the work tree, links included.
 _GIT_WRITES_TREE = frozenset(
     {"checkout", "switch", "restore", "reset", "merge", "pull", "clone", "rebase", "apply", "am", "cherry-pick"}
@@ -1764,6 +1783,22 @@ def _dangling_dir_option(argv: list[str], last: str) -> bool:
     if last.startswith("--"):
         return "=" not in last and len(last) >= 4 and ("--directory".startswith(last) or "--chdir".startswith(last))
     return last.startswith("-") and last[-1] in "CD"
+
+
+def _parallel_replaces(raw: list[str]) -> list[str]:
+    """The strings GNU parallel swaps for its input in the command it runs: ``{}`` and its relatives, and what
+    ``-I``/``--replace`` name."""
+    if "parallel" not in {os.path.basename(t) for t in raw}:
+        return []
+    out = list(_PARALLEL_REPLACES)
+    for k, t in enumerate(raw):
+        if t in ("-I", "--replace") and k + 1 < len(raw):
+            out.append(raw[k + 1])
+        elif t.startswith("--replace="):
+            out.append(t.partition("=")[2])
+        elif t.startswith("-I") and len(t) > 2:
+            out.append(t[2:])
+    return out
 
 
 def _makes_symlink(name: str, args: list[str]) -> bool:
@@ -1872,8 +1907,7 @@ def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdSca
         scan.tar = scan.tar or argv[0] in _TAR_COMMANDS
         if argv[0] == "find" and _FIND_EXEC.intersection(argv):
             scan.replaces.append("{}")
-        if "parallel" in {os.path.basename(t) for t in raw}:
-            scan.replaces += _PARALLEL_REPLACES
+        scan.replaces += _parallel_replaces(raw)
         if _makes_symlink(argv[0], argv[1:]):
             scan.links = True
             scan.link_names += _link_names(argv[1:])
@@ -1995,10 +2029,12 @@ def _sub_secret_access(
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
         worst = _worse(worst, _classify_arg(arg, where, home, budget))
-    if any(_classify_arg(arg, where, home, budget) for arg in writes):
-        worst = _worse(worst, "ask")
-    if any(_classify_arg(arg, where, home, budget) for arg in confirm):
-        worst = _worse(worst, "confirm")
+    for args, verdict in ((writes, "ask"), (confirm, "confirm")):
+        found = [_classify_arg(arg, where, home, budget) for arg in args]
+        if "unchecked" in found:
+            worst = _worse(worst, "unchecked_w")
+        elif any(found):
+            worst = _worse(worst, verdict)
     return worst
 
 
@@ -2108,11 +2144,12 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
-    if secret in ("human", "confirm", "unchecked") and worst.action != "deny":
+    if secret in ("human", "confirm", "unchecked", "unchecked_w") and worst.action != "deny":
         why = {
             "human": "A variable may point at a credential file",
             "confirm": "Deletes, sources, stages or hands a container a credential file",
             "unchecked": _UNCHECKED_MSG,
+            "unchecked_w": _UNCHECKED_MSG,
         }[secret]
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
@@ -2498,30 +2535,36 @@ def windows_profile_secret(path: str, drives: list[str] | None = None) -> bool:
     return False
 
 
-def sensitive_path(path: str) -> bool:
+def sensitive_path(path: str, dirs: list[str] | None = None) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
     (``/proc/*/environ``), a dotenv file, or the keys and credential stores of a Windows profile WSL mounts (see
     :func:`windows_profile_secret`). Checked on the path as written and on its realpath (symlinks), and
-    case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files."""
-    if secret_store(path):
+    case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files. ``dirs``
+    is :func:`_folded_secret_dirs`, for a caller that checks many paths."""
+    if secret_store(path, dirs):
         return True
     return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), _real(path))))
 
 
-def secret_store(path: str) -> bool:
+def secret_store(path: str, dirs: list[str] | None = None) -> bool:
     """``path`` (absolute) is in a key or credential store (``sensitive_path`` without the dotenv files): the secret
     dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
     compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
-    dirs = [os.path.normpath(d) for d in _secret_dirs()]
-    dirs = [d.lower() for d in dict.fromkeys(dirs + [_real(d) for d in dirs])]
+    folded_dirs = dirs if dirs is not None else _folded_secret_dirs()
     for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         folded = p.lower()
-        if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in dirs):
+        if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in folded_dirs):
             return True
         if windows_profile_secret(p):
             return True
     return False
+
+
+def _folded_secret_dirs() -> list[str]:
+    """The secret dirs as written and as realpaths, lower case."""
+    dirs = [os.path.normpath(d) for d in _secret_dirs()]
+    return [d.lower() for d in dict.fromkeys(dirs + [_real(d) for d in dirs])]
 
 
 def _glob_base(path: str, pattern: str) -> str:

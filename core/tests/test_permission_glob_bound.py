@@ -142,3 +142,51 @@ def test_very_deep_patterns_decide_without_an_exception(tmp_path: Path) -> None:
     assert engine._classify_word(literal, str(tmp_path), "/home/user") is None
     wild = "/" + "*/" * 1500 + "x"
     assert engine._classify_word(wild, str(tmp_path), "/home/user") == "unchecked"
+
+
+def test_ordinary_glob_of_three_thousand_files_decides_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proj = tmp_path / "proj"
+    (proj / "images").mkdir(parents=True)
+    (proj / "out").mkdir()
+    for n in range(3000):
+        (proj / "images" / f"img{n:04d}.png").write_text("x")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for mode in ("yolo", "auto", "default"):
+        d = decide(mode=mode, tool="bash", args={"command": "cp images/*.png out/"}, cwd=proj)
+        assert "too large" not in (d.message or ""), mode
+        assert d.action != "deny", mode
+    assert engine._classify_word(f"{proj}/images/*.png", str(proj), str(tmp_path / "home")) is None
+
+
+def test_secret_dirs_are_resolved_once_per_decision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "images").mkdir()
+    for n in range(300):
+        (tmp_path / "images" / f"img{n:04d}.png").write_text("x")
+    real, calls = os.path.realpath, [0]
+
+    def counting(p: str, **kw: object) -> str:
+        calls[0] += 1
+        return real(p, **kw)
+
+    monkeypatch.setattr(os.path, "realpath", counting)
+    engine._classify_word(f"{tmp_path}/images/*.png", str(tmp_path), "/home/user")
+    assert calls[0] < 300 * 3 + 20  # a hit costs its own realpath, not one per secret directory
+
+
+def test_unchecked_glob_in_a_write_or_delete_position_asks_with_the_right_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scandir_entries: list[int]
+) -> None:
+    proj = tmp_path / "proj"
+    (proj / "a").mkdir(parents=True)
+    for n in range(300):
+        (proj / "a" / f"f{n:03d}").write_text("x")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(engine, "_GLOB_MAX_ENTRIES", 100, raising=False)
+    for cmd in ("rm a/*", "cp x a/*"):
+        d = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=proj)
+        assert d.needs_human, cmd
+        assert "too large to check" in (d.message or ""), cmd
+    # a credential delete or overwrite is allowed in yolo as it always was; an unchecked one is not refused either
+    assert decide(mode="yolo", tool="bash", args={"command": "rm a/*"}, cwd=proj).action == "allow"
