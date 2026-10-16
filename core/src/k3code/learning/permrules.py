@@ -51,6 +51,7 @@ UNSAFE_ROOTS = frozenset(
         "bash",
         "zsh",
         "eval",
+        "trap",
         "exec",
         "curl",
         "wget",
