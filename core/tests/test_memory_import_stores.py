@@ -295,3 +295,139 @@ def test_a_link_from_the_memory_folder_to_a_credential_file_is_still_refused(mon
     (k3 / "memory" / "ghdir").symlink_to(home / ".config" / "gh")
     _w(k3 / "memory" / "USER.md", "@a.md\n@b.md\n@ghdir/hosts.yml")
     assert TOKEN not in _text(home / "nowhere")
+
+
+# K3NOX-773: GNU stow without folding. ``k3code setup`` has already made ``~/.k3code/memory``, so stow links the file,
+# not the folder, and the file's real place is a package folder that mirrors the home layout.
+
+
+def test_user_memory_file_linked_from_a_stow_package_without_folding_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "USER.md", "MY-PREFS")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "USER.md").symlink_to(real)
+    assert "MY-PREFS" in _text(home / "nowhere")
+    assert next(s for s in scan_memory(home / "nowhere") if s.scope == "user").status == "read"
+
+
+def test_an_import_linked_from_a_stow_package_without_folding_is_read(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / "style.md", "MY-STYLE")
+    _w(k3 / "memory" / "USER.md", "@style.md")
+    (k3 / "memory" / "style.md").symlink_to(real)
+    assert "MY-STYLE" in _text(home / "nowhere")
+
+
+def test_a_stow_package_below_a_dot_folder_of_home_stays_refused(monkeypatch) -> None:
+    """The documented limit: a dotfiles repository that itself sits in a dot folder is judged by the dot rule."""
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / ".dotfiles" / "k3code" / ".k3code" / "memory" / "USER.md", "MY-PREFS")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "USER.md").symlink_to(real)
+    assert "MY-PREFS" not in _text(home / "nowhere")
+
+
+def test_a_stow_shaped_folder_that_links_to_a_credential_folder_is_still_refused(monkeypatch) -> None:
+    """The mirror is exempt for what sits in it, not for where a link in it leads: the real file is judged too."""
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(home / ".config" / "git" / "credentials", "https://u:" + TOKEN + "@h")
+    pkg = home / "dotfiles" / "k3code" / ".k3code"
+    pkg.mkdir(parents=True)
+    (pkg / "memory").symlink_to(home / ".config" / "git")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "credentials").symlink_to(pkg / "memory" / "credentials")
+    _w(k3 / "memory" / "USER.md", "@credentials")
+    assert TOKEN not in _text(home / "nowhere")
+
+
+def test_a_stow_shaped_file_that_links_to_a_credential_file_is_still_refused(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(home / ".config" / "git" / "credentials", "https://u:" + TOKEN + "@h")
+    mirror = home / "dotfiles" / "k3code" / ".k3code" / "memory"
+    mirror.mkdir(parents=True)
+    (mirror / "USER.md").symlink_to(home / ".config" / "git" / "credentials")
+    (k3 / "memory").mkdir(parents=True)
+    (k3 / "memory" / "USER.md").symlink_to(mirror / "USER.md")
+    assert TOKEN not in _text(home / "nowhere")
+
+
+def test_a_stow_shaped_name_does_not_open_a_dot_folder_below_it(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "k3code" / ".k3code" / "memory" / ".hidden" / "x.md", "HIDDEN")
+    _w(k3 / "memory" / "USER.md", "@x.md")
+    (k3 / "memory" / "x.md").symlink_to(real)
+    assert "HIDDEN" not in _text(home / "nowhere")
+
+
+# K3NOX-751: a leading ``//`` (POSIX keeps it through normpath) and a link to ``/`` must not hide a store file that
+# links out of its store from the credential check.
+
+
+def _linked_out_store(home: Path) -> Path:
+    real = _w(home / "dotfiles" / "gh" / "hosts.yml", "oauth_token: " + TOKEN)
+    (home / ".config" / "gh").mkdir(parents=True)
+    (home / ".config" / "gh" / "hosts.yml").symlink_to(real)
+    return home / ".config" / "gh" / "hosts.yml"
+
+
+def test_a_leading_double_slash_does_not_hide_a_store_file_that_links_out(monkeypatch) -> None:
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out_store(home)
+    _w(home / "AGENTS.md", f"@/{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home)
+
+
+def test_a_leading_double_slash_does_not_hide_a_store_file_from_user_memory(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _linked_out_store(home)
+    _w(k3 / "memory" / "USER.md", f"@/{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home / "nowhere")
+
+
+def test_a_leading_double_slash_does_not_hide_a_dot_folder_credential_that_links_out(monkeypatch) -> None:
+    home = Path.home()
+    _k3home(monkeypatch)
+    real = _w(home / "dotfiles" / "git" / "credentials", "https://u:" + TOKEN + "@h")
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").symlink_to(real)
+    _w(home / "AGENTS.md", f"@/{home}/.config/git/credentials")
+    assert TOKEN not in _text(home)
+
+
+def test_a_proc_root_spelling_of_a_store_file_that_links_out_is_refused(monkeypatch) -> None:
+    """``/proc/self/root`` links to ``/``: joining the rest onto it must not leave a leading ``//``."""
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out_store(home)
+    _w(home / "AGENTS.md", f"@/proc/self/root{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home)
+
+
+def test_a_link_to_the_root_folder_does_not_hide_a_store_file_that_links_out(monkeypatch) -> None:
+    home = Path.home()
+    _k3home(monkeypatch)
+    _linked_out_store(home)
+    (home / "r").symlink_to("/")
+    _w(home / "AGENTS.md", f"@r{home}/.config/gh/hosts.yml")
+    assert TOKEN not in _text(home)
+
+
+# K3NOX-773, last point: only the "held by a store" test folds case. A root covers a path by exact name.
+
+
+def test_a_differently_cased_memory_folder_is_not_the_memory_folder(monkeypatch) -> None:
+    home = Path.home()
+    k3 = _k3home(monkeypatch)
+    _w(k3 / "MEMORY" / "x.md", "OTHER-FOLDER")
+    if (k3 / "memory").exists():  # a case-insensitive file system: there is no other folder
+        pytest.skip("case-insensitive file system")
+    _w(k3 / "memory" / "USER.md", "@../MEMORY/x.md")
+    assert "OTHER-FOLDER" not in _text(home / "nowhere")
