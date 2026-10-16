@@ -612,7 +612,7 @@ describe("AppLayout agent view: leaving the startup session", () => {
 
   // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
   it.each([
-    ["n", "newLiveSession", ["s1"]],
+    ["n", "newLiveSession", ["test session", undefined, "s1"]],
     ["\r", "activateLiveSession", ["s2", "s1"]],
   ] as const)(
     "%j closes the empty session forged after the view opened",
@@ -648,6 +648,17 @@ describe("AppLayout agent view: leaving the startup session", () => {
 
       layout.press(key);
 
+      // For "n", we need to type the session name and press Enter
+      if (key === "n") {
+        await waitFor(() => expect(layout.output()).toContain("new session:"));
+        for (const ch of "test session") {
+          layout.press(ch);
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        layout.press("\n");
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
       await waitFor(() => expect(spy).toHaveBeenCalled());
       expect(spy).toHaveBeenCalledWith(...args);
     },
@@ -680,16 +691,41 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
               }
             : method === "session.close"
               ? { closed: true }
-              : null,
+              : method === "session.create"
+                ? {
+                    session_id: "s-new",
+                    stored_session_id: "stored-s-new",
+                    info: { version: "1.0" },
+                  }
+                : method === "setup.status"
+                  ? { provider_configured: true }
+                  : null,
       ),
     );
-    const rpc = vi.fn((method: string) =>
+    const rpc = vi.fn((method: string, params?: Record<string, unknown>) =>
       Promise.resolve<unknown>(
         method === "setup.status"
           ? { provider_configured: true }
           : method === "session.create"
-            ? { session_id: "s-new" }
-            : null,
+            ? {
+                session_id: "s-new",
+                stored_session_id: "stored-s-new",
+                info: { version: "1.0" },
+              }
+            : method === "session.activate" && params?.session_id
+              ? {
+                  session_id: params.session_id,
+                  stored_session_id: `stored-${params.session_id}`,
+                  info: { version: "1.0" },
+                  messages: [],
+                  running: false,
+                  status: "idle",
+                }
+              : method === "session.list"
+                ? { sessions: past }
+                : method === "session.close"
+                  ? { closed: true }
+                  : null,
       ),
     );
     const gateway = {
@@ -720,8 +756,8 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
           actions={{
             ...layoutProps.actions,
             activateLiveSession: session.activateLiveSession,
-            newLiveSession: (dropSid?: string) =>
-              void session.newLiveSession(undefined, undefined, dropSid),
+            newLiveSession: (msg?: string, title?: string, dropSid?: string) =>
+              void session.newLiveSession(msg, title, dropSid),
             resumeById: (id: string, dropSid?: string) =>
               void session.resumeById(id, { dropSid }),
           }}
@@ -763,8 +799,17 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() => expect(layout.output()).toContain("new session:"));
+    for (const ch of "test session") {
+      layout.press(ch);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    layout.press("\n");
+    await new Promise((r) => setTimeout(r, 500));
 
-    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1), {
+      timeout: 10000,
+    });
     expect(getUiState().sid).toBe("s-new");
     expect(closeCalls(request)).toHaveLength(1);
   });
@@ -817,9 +862,18 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() => expect(layout.output()).toContain("new session:"));
+    for (const ch of "test session") {
+      layout.press(ch);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    layout.press("\n");
+    await new Promise((r) => setTimeout(r, 500));
 
     // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
-    await waitFor(() => expect(getUiState().sid).toBe("s-new"));
+    await waitFor(() => expect(getUiState().sid).toBe("s-new"), {
+      timeout: 10000,
+    });
     expect(rpc).toHaveBeenCalledWith("session.create", expect.anything());
     await flush();
 

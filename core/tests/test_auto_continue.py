@@ -431,6 +431,45 @@ async def test_undo_after_an_auto_continued_run_drops_the_whole_run_back_to_the_
     await server.close()
 
 
+def _outcomes(server) -> dict[str, int]:
+    """Each recorded turn's ``undone`` flag, oldest first."""
+    return [r["undone"] for r in server.learning.log.turn_outcomes(since=0)]
+
+
+async def test_undo_after_an_auto_continued_run_marks_every_turn_of_the_run_undone(tmp_path, monkeypatch):
+    """K3NOX-696: /undo removed the whole run, but only its first turn row was marked undone; the continuation turns
+    kept ``passed`` and the optimizer's success rate still counted them."""
+    server, _, live, _ = await _setup(
+        tmp_path, monkeypatch, replies=["hello back", "step 1", "step 2", "all built"], autonomy={**AUTO}
+    )
+    server.goal_judge = scripted_judge(["continue", "continue", "done"])
+    server.config.autonomy["auto_continue"] = False
+    await server._run_turn(live, "first question")
+    server.config.autonomy["auto_continue"] = True
+    await server._run_turn(live, "build the parser")
+    assert _outcomes(server) == [0, 0, 0, 0]  # the normal turn, the run's turn and its two continuations
+    assert await _undo(server, live) == {"removed": 6}
+    assert _outcomes(server) == [0, 1, 1, 1]
+    undo = server.learning.log.query("undo")[0]
+    assert undo["subject"] == server.learning.log.turn_outcomes(since=0)[1]["turn"]  # logged under the run's prompt
+    assert await _undo(server, live) == {"removed": 2}
+    assert _outcomes(server) == [0, 1, 1, 1]  # the run's prompt settled the normal turn: it was kept, as before
+    await server.close()
+
+
+async def test_retry_after_an_auto_continued_run_marks_every_turn_of_the_run_undone(tmp_path, monkeypatch):
+    """/retry is an /undo (``session.undo``) followed by sending the prompt again: the retried run's turns are all
+    undone, the new attempt's turn is not."""
+    server, _, live, _ = await _setup(tmp_path, monkeypatch, replies=["step 1", "step 2", "all built", "built again"])
+    server.goal_judge = scripted_judge(["continue", "continue", "done", "done"])
+    await server._run_turn(live, "build the parser")
+    assert _outcomes(server) == [0, 0, 0]
+    assert await _undo(server, live) == {"removed": 6}
+    await server._run_turn(live, "build the parser")
+    assert _outcomes(server) == [1, 1, 1, 0]
+    await server.close()
+
+
 async def test_undo_after_a_goal_run_drops_its_continuations_too(tmp_path, monkeypatch):
     server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "all built"])
     server.goal_judge = scripted_judge(["continue", "done"])

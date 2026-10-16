@@ -92,6 +92,24 @@ async def repo_root(path: str | Path) -> Path | None:
     return Path(out.strip()) if rc == 0 and out.strip() else None
 
 
+async def worktrees_dir_problem(path: str | Path) -> str | None:
+    """Why git must not add or prune worktrees in the repository ``path`` is in, or None when it may: its common dir's
+    ``worktrees`` folder is a symlink (or resolves outside the common dir). A sandboxed command with
+    ``sandbox.git_writable`` can plant such a link; ``git worktree prune`` deletes what it finds in the folder that
+    is not a worktree admin dir, ``git worktree add`` writes into it, and both would do so in the link's target."""
+    rc, out = await git(path, "rev-parse", "--git-common-dir")
+    if rc != 0 or not out.strip():
+        return None  # not a repository: the git call that follows reports it
+    common = Path(path) / out.strip()  # absolute for a linked worktree, relative to ``path`` otherwise
+    folder = common / "worktrees"
+    try:
+        if folder.is_symlink() or (folder.exists() and not folder.resolve().is_relative_to(common.resolve())):
+            return f"{folder} is a symlink or leads outside {common}"
+    except (OSError, RuntimeError):
+        return f"{folder} cannot be resolved"
+    return None
+
+
 @dataclass
 class Worktree:
     id: str
@@ -151,6 +169,8 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
     path = root / ".k3code" / "worktrees" / child_id
     branch = f"k3/{child_id}"
     async with worktree_lock(root):  # parallel adds on one repo race on .git/worktrees (see worktree_lock)
+        if problem := await worktrees_dir_problem(root):
+            raise RuntimeError(f"refusing git worktree add: {problem}")
         k3 = root / ".k3code"
         k3.mkdir(exist_ok=True)
         gi = k3 / ".gitignore"
@@ -375,13 +395,17 @@ async def scan(path: str | Path, *, expire_days: float = BRANCH_EXPIRY_DAYS) -> 
 
 
 async def reap(path: str | Path, *, expire_days: float = BRANCH_EXPIRY_DAYS) -> Leftovers | None:
-    """Remove what :func:`scan` finds in the repository ``path`` is in; returns what was removed (None outside a repo).
+    """Remove what :func:`scan` finds in the repository ``path`` is in; returns what was removed (None outside a repo,
+    and when its ``worktrees`` folder is a link: see :func:`worktrees_dir_problem`).
 
     A worker's process dying (a crash, a kill, a reboot) skips the cleanup that follows its turn, so its checkout
     and branch stayed forever. The checkout goes, but what it held is committed to its branch first, and a branch
     with work on it is kept until it is ``expire_days`` old; the tip of an expired one is returned (and logged) so
     ``git branch <name> <sha>`` brings it back. A branch already merged into HEAD has nothing to lose.
     """
+    if problem := await worktrees_dir_problem(path):
+        logger.warning("not reaping in %s: %s", path, problem)
+        return None
     found = await scan(path, expire_days=expire_days)
     if found is None:
         return None

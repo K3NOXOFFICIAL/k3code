@@ -287,6 +287,106 @@ def test_a_repo_with_no_git_writable_planting_is_left_untouched(tmp_path):
     assert admin_commondir.exists()  # the worktree's real commondir is kept
 
 
+def _outside_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """A directory outside the repository holding a harmless marker subtree (what a planted link would point at)."""
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    marker = outside / "sub" / "marker.txt"
+    marker.write_text("keep\n")
+    return outside, marker
+
+
+def test_the_scrub_unlinks_a_symlinked_worktrees_dir_a_command_planted_and_keeps_its_target(tmp_path):
+    """A command can swap ``.git/worktrees`` for a link to a directory outside the project; the scrub runs on the
+    host and must neither list nor remove anything through it. The link itself goes, so no later git run (the start-up
+    reap's prune, a worktree add) follows it either."""
+    repo = _repo(tmp_path / "repo")
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert marker.read_text() == "keep\n" and (outside / "sub").is_dir()
+    assert not (repo / ".git" / "worktrees").exists() and not (repo / ".git" / "worktrees").is_symlink()
+    assert len([n for n in notes if "worktrees" in n and "symlink" in n]) == 1, notes
+
+
+@needs_bwrap
+async def test_a_worktrees_link_planted_from_the_sandbox_is_unlinked_and_its_target_survives(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    outside, marker = _outside_tree(tmp_path)  # not visible in the sandbox: the link may dangle there
+    scrub = _snapshot_scrub(repo)
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", git_writable=True)
+    planted = await tool_bash({"command": f"ln -s {outside} .git/worktrees"}, cwd=repo, sandbox=argv)
+    assert planted["exit_code"] == 0, planted
+    assert (repo / ".git" / "worktrees").is_symlink()
+    notes = scrub()
+    assert not (repo / ".git" / "worktrees").is_symlink() and marker.read_text() == "keep\n"
+    assert any("worktrees" in n for n in notes), notes
+
+
+def test_the_snapshot_does_not_list_through_a_symlinked_worktrees_dir(tmp_path):
+    """Names listed through a link would make the scrub think the link target's children are the repository's own."""
+    repo = _repo(tmp_path / "repo")
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    snap = sandbox.snapshot_git_writable(repo)
+    assert all(not s.worktrees for s in snap["gitdirs"])
+    assert sandbox.scrub_git_writable_changes(snap)
+    assert marker.read_text() == "keep\n"
+    assert (repo / ".git" / "worktrees").is_symlink()  # the user's own link (it was there before) stays
+
+
+def test_a_symlinked_worktrees_dir_makes_the_git_dir_fully_read_only_and_makes_no_stand_ins(tmp_path):
+    """The host side of the bind setup also lists ``worktrees`` to make stand-ins; through a link that would create
+    files in the link's target. The git dir stays whole read-only instead."""
+    repo = _repo(tmp_path / "repo")
+    outside, _ = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(outside, target_is_directory=True)
+    before = sorted(p.relative_to(outside) for p in outside.rglob("*"))
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", bwrap=BWRAP, git_writable=True)
+    assert str(repo / ".git") in _ro_binds(argv)
+    assert sorted(p.relative_to(outside) for p in outside.rglob("*")) == before
+
+
+def test_a_worktree_admin_dir_swapped_for_a_symlink_is_not_scrubbed_through(tmp_path):
+    """A surviving ``worktrees/<name>`` replaced by a link: its ``config.worktree`` is the link target's file, which the
+    scrub must not rewrite."""
+    repo = _repo(tmp_path / "repo")
+    _git(repo, "worktree", "add", "-q", str(tmp_path / "wt"), "-b", "work")
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, _ = _outside_tree(tmp_path)
+    target_cfg = outside / "config.worktree"
+    text = "[core]\n\thooksPath = /tmp/mine\n"
+    target_cfg.write_text(text)
+    admin = repo / ".git" / "worktrees" / "wt"
+    shutil.rmtree(admin)
+    admin.symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert target_cfg.read_text() == text
+    assert any("symlink" in n and "wt" in n for n in notes), notes
+
+
+def test_a_symlinked_entry_in_a_real_worktrees_dir_is_unlinked_and_its_target_kept(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / ".git" / "worktrees").mkdir()
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, marker = _outside_tree(tmp_path)
+    (repo / ".git" / "worktrees" / "evil").symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert not (repo / ".git" / "worktrees" / "evil").is_symlink()
+    assert marker.read_text() == "keep\n"
+    assert any("evil" in n for n in notes), notes
+
+
+def test_remove_planted_refuses_a_path_that_resolves_outside_the_git_dir(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    outside, marker = _outside_tree(tmp_path)
+    gitdir = (repo / ".git").resolve()
+    notes = sandbox._remove_planted(outside / "sub", "worktrees/sub admin dir", kind="tree", gitdir=gitdir)
+    assert marker.exists()
+    assert len(notes) == 1 and "refus" in notes[0]
+
+
 def test_harness_git_disables_hooks_and_fsmonitor(tmp_path):
     """The next git run outside the sandbox is harness git; it must not run a hook or fsmonitor program even if one is
     configured (the second line of defence behind the scrub)."""
@@ -407,3 +507,89 @@ async def test_a_background_job_cannot_plant_a_commondir_after_its_call_returned
         assert not (repo / ".git" / "commondir").exists()
     finally:
         await jobs.REGISTRY.reap(loop.session_id)
+
+
+# ── K3NOX-667: renaming the parent of a read-only bind replaced what the bind protects ──
+
+
+def _rename_then_recreate(name: str) -> str:
+    return f"mv {name} {name}-moved && mkdir {name} && echo planted > {name}/config.yaml"
+
+
+@needs_bwrap
+@pytest.mark.parametrize("git_writable", [True, False])
+@pytest.mark.parametrize("name", [".git", ".k3code"])
+async def test_the_parent_of_a_read_only_entry_cannot_be_renamed_away(tmp_path, git_writable, name):
+    """A read-only bind makes only the bound path a mount point; its parent, an ordinary directory in the writable
+    project bind, could be renamed with the protected entries inside and recreated with a command's own content. The
+    ``.git`` of the default (read-only) setting and ``.husky``/``.envrc`` are mount points themselves."""
+    repo = _repo(tmp_path / "repo")
+    (repo / ".k3code").mkdir()
+    (repo / ".k3code" / "config.yaml").write_text("mine: true\n")
+    hooks = repo / ".git" / "hooks"
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", git_writable=git_writable)
+    res = await tool_bash({"command": _rename_then_recreate(name)}, cwd=repo, sandbox=argv)
+    assert res["exit_code"] != 0, res
+    assert (repo / name).is_dir() and not (repo / f"{name}-moved").exists()
+    assert (repo / ".k3code" / "config.yaml").read_text() == "mine: true\n"
+    assert hooks.is_dir() and not (hooks / "pre-commit").exists()
+
+
+@needs_bwrap
+async def test_git_still_works_with_the_git_dir_and_project_config_pinned(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / ".k3code").mkdir()
+    (repo / ".k3code" / "config.yaml").write_text("mine: true\n")
+    argv = sandbox.build_argv(repo, home=tmp_path / "home", git_writable=True)
+    res = await tool_bash({"command": _COMMIT}, cwd=repo, sandbox=argv)
+    assert res["exit_code"] == 0, res
+    assert _git(repo, "log", "-1", "--format=%s", "topic").stdout.strip() == "second"
+    planted = await tool_bash({"command": _PLANT}, cwd=repo, sandbox=argv)
+    assert planted["stderr"].count("Read-only file system") >= 3, planted
+
+
+@needs_bwrap
+async def test_a_linked_worktree_cannot_rename_the_common_dirs_worktrees_folder(tmp_path):
+    """A fan-out child's sandbox: the common dir and its own admin dir are mount points, the ``worktrees`` folder
+    between them is not. Renamed, it would redirect what the parent's snapshot and scrub (and git) find there."""
+    repo = _repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", str(wt), "-b", "work")
+    wt = wt.resolve()
+    common = repo / ".git"
+    argv = sandbox.build_argv(wt, home=tmp_path / "home", git_writable=True)
+    res = await tool_bash({"command": f"mv {common}/worktrees {common}/worktrees-moved"}, cwd=wt, sandbox=argv)
+    assert res["exit_code"] != 0, res
+    assert (common / "worktrees" / "wt").is_dir()
+    committed = await tool_bash({"command": _COMMIT}, cwd=wt, sandbox=argv)
+    assert committed["exit_code"] == 0, committed
+
+
+def test_a_git_dir_swapped_for_a_link_after_the_snapshot_is_not_scrubbed_through(tmp_path):
+    """Defence in depth for the host side: whatever replaced ``.git`` (the sandbox no longer lets a command), the scrub
+    must not work through it. It acts on the git dir the snapshot recorded, and only while that is still it."""
+    repo = _repo(tmp_path / "repo")
+    snap = sandbox.snapshot_git_writable(repo)
+    outside, marker = _outside_tree(tmp_path)
+    (outside / "worktrees" / "x").mkdir(parents=True)
+    (outside / "worktrees" / "x" / "marker.txt").write_text("keep\n")
+    cfg = outside / "config.worktree"
+    cfg.write_text("[core]\n\thooksPath = /tmp/mine\n")
+    (outside / "commondir").write_text("keep\n")
+    (repo / ".git").rename(repo / ".git-moved")
+    (repo / ".git").symlink_to(outside, target_is_directory=True)
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert (outside / "worktrees" / "x" / "marker.txt").read_text() == "keep\n" and marker.exists()
+    assert cfg.read_text() == "[core]\n\thooksPath = /tmp/mine\n" and (outside / "commondir").exists()
+    assert len([n for n in notes if "skipped" in n and ".git" in n]) == 1, notes
+
+
+def test_a_git_dir_replaced_by_another_directory_after_the_snapshot_is_not_scrubbed(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    snap = sandbox.snapshot_git_writable(repo)
+    (repo / ".git").rename(repo / ".git-moved")
+    (repo / ".git").mkdir()
+    (repo / ".git" / "commondir").write_text("not planted by a command; a different directory\n")
+    notes = sandbox.scrub_git_writable_changes(snap)
+    assert (repo / ".git" / "commondir").exists()
+    assert len([n for n in notes if "skipped" in n]) == 1, notes
