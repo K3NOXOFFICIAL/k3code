@@ -743,8 +743,13 @@ export const coreCommands: SlashCommand[] = [
           .rpc<SystemBatteryResponse>("system.battery", {})
           .then((r) => {
             if (r?.available && typeof r.percent === "number") {
+              const temp =
+                typeof r.temp_c === "number"
+                  ? ` ${Math.round(r.temp_c)}°C`
+                  : "";
+              const profile = r.power_profile ? `${r.power_profile} ` : "";
               ctx.transcript.sys(
-                `battery indicator ${state} — currently ${r.plugged ? "⚡" : "🔋"} ${r.percent}%`,
+                `battery indicator ${state} — currently ${profile}${r.plugged ? "⚡" : "🔋"} ${r.percent}%${temp}`,
               );
             } else {
               ctx.transcript.sys(

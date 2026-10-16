@@ -82,7 +82,7 @@ describe("/tune, /model and /effort", () => {
     patchUiState({ sid: "sid-abc" });
   });
 
-  it.each(["/tune", "/model", "/effort", "/tune  ", "/model  "])(
+  it.each(["/tune", "/model", "/effort", "/provider", "/tune  ", "/model  "])(
     "bare %j opens the one popup, and nothing else",
     (line) => {
       const ctx = buildCtx();
@@ -138,7 +138,7 @@ describe("/tune, /model and /effort", () => {
     );
   });
 
-  it("/provider is listed with its usage and goes to the gateway, bare too", async () => {
+  it("/provider with args goes to the gateway; bare opens the tune popup (#415)", async () => {
     expect(findSlashCommand("provider")?.usage).toBe(
       "/provider [<name> [--save]]",
     );
@@ -148,18 +148,31 @@ describe("/tune, /model and /effort", () => {
 
     run(ctx, "/provider");
 
-    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
-      command: "provider",
-      session_id: "sid-abc",
-    });
-    await vi.waitFor(() =>
-      expect(ctx.transcript.sys).toHaveBeenCalledWith(
-        "Providers (* = active):\n* a\n  b",
-      ),
-    );
+    expect(getOverlayState().tunePicker).toBe(true);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    resetOverlayState();
+
     run(ctx, "/provider b --save");
     expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
       command: "provider b --save",
+      session_id: "sid-abc",
+    });
+  });
+
+  it("/permissions bare opens the settings panel; with args goes to gateway (#415)", async () => {
+    expect(findSlashCommand("permissions")).toBeDefined();
+    const ctx = buildCtx(() => Promise.resolve({ output: "ok" }));
+
+    run(ctx, "/permissions");
+
+    expect(getOverlayState().settingsPanel).toBe(true);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    resetOverlayState();
+    patchUiState({ sid: "sid-abc" });
+
+    run(ctx, "/permissions mode plan");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "permissions mode plan",
       session_id: "sid-abc",
     });
   });
@@ -267,11 +280,11 @@ describe("/tune, /model and /effort", () => {
 
   describe("while a prompt is open", () => {
     it.each(LOCKS)(
-      "bare /tune, /model and /effort refuse to open over a %s prompt",
+      "bare /tune, /model, /effort and /provider refuse to open over a %s prompt",
       (_name, overlay) => {
         patchOverlayState(overlay as never);
 
-        for (const line of ["/tune", "/model", "/effort"]) {
+        for (const line of ["/tune", "/model", "/effort", "/provider"]) {
           const ctx = buildCtx();
 
           expect(run(ctx, line)).toBe(true);
@@ -280,6 +293,13 @@ describe("/tune, /model and /effort", () => {
             expect.stringContaining("answer the open prompt first"),
           );
         }
+
+        const pctx = buildCtx();
+        expect(run(pctx, "/permissions")).toBe(true);
+        expect(getOverlayState().settingsPanel).toBe(false);
+        expect(pctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringContaining("finish the pending prompt"),
+        );
       },
     );
 

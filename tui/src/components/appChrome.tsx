@@ -302,8 +302,14 @@ function batteryColor(info: BatteryInfo, t: Theme): string {
 
 // Compact battery label: a bolt while charging, else a battery glyph.
 // Renders `--` for an unknown percent so a null can never surface as "null%".
+// Appends power profile + temperature when the gateway reports them
+// (`balanced ⚡ 100% 51°C`, #413).
 function batteryLabel(info: BatteryInfo): string {
-  return `${info.plugged ? "⚡" : "🔋"} ${info.percent ?? "--"}%`;
+  const base = `${info.plugged ? "⚡" : "🔋"} ${info.percent ?? "--"}%`;
+  const temp =
+    typeof info.temp_c === "number" ? ` ${Math.round(info.temp_c)}°C` : "";
+  const profile = info.power_profile ? `${info.power_profile} ` : "";
+  return `${profile}${base}${temp}`;
 }
 
 // Colour a credits notice by its level. The notice TEXT already carries its

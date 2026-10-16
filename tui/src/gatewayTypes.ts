@@ -172,6 +172,8 @@ export interface SystemBatteryResponse {
   category?: string;
   percent?: null | number;
   plugged?: null | boolean;
+  temp_c?: null | number;
+  power_profile?: null | string;
 }
 
 // ── /tune: model + effort + ultracode ────────────────────────────────

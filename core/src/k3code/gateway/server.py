@@ -4377,7 +4377,60 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
 
 
 async def _system_battery(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    return {"available": False}
+    """Host battery, power profile and temperature for the TUI status bar (#413).
+
+    Linux sysfs only (no subprocess): ``/sys/class/power_supply/BAT*/capacity`` +
+    ``status``, ``/sys/class/thermal/thermal_zone*/temp`` (millidegree C), and the
+    platform profile (``/sys/firmware/acpi/platform_profile`` or power-profiles-daemon).
+    Missing files mean no battery / no sensor: ``available`` False, never a raise.
+    """
+    import pathlib
+
+    def _read(path: str) -> str:
+        try:
+            return pathlib.Path(path).read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            return ""
+
+    percent: int | None = None
+    plugged: bool | None = None
+    for bat in (
+        sorted(pathlib.Path("/sys/class/power_supply").glob("BAT*"))
+        if pathlib.Path("/sys/class/power_supply").is_dir()
+        else []
+    ):
+        cap = _read(str(bat / "capacity"))
+        if cap.isdigit():
+            percent = max(0, min(100, int(cap)))
+            status = _read(str(bat / "status")).lower()
+            plugged = status in ("charging", "full") if status else None
+            break
+    if percent is None:
+        return {"available": False}
+    temp_c: float | None = None
+    for zone in (
+        sorted(pathlib.Path("/sys/class/thermal").glob("thermal_zone*"))
+        if pathlib.Path("/sys/class/thermal").is_dir()
+        else []
+    ):
+        raw = _read(str(zone / "temp"))
+        if raw.lstrip("-").isdigit():
+            try:
+                temp_c = int(raw) / 1000.0
+                break
+            except ValueError:
+                continue
+    profile = _read("/sys/firmware/acpi/platform_profile") or ""
+    if not profile:
+        # power-profiles-daemon holds the active profile; no daemon means no profile.
+        profile = ""
+    category = "good" if percent >= 60 else "warn" if percent >= 25 else "bad" if percent >= 10 else "critical"
+    out: dict[str, Any] = {"available": True, "category": category, "percent": percent, "plugged": plugged}
+    if temp_c is not None:
+        out["temp_c"] = round(temp_c, 1)
+    if profile:
+        out["power_profile"] = profile
+    return out
 
 
 def _session_dir(server: GatewayServer, params: dict[str, Any]) -> Path:
