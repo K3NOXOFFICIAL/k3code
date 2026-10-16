@@ -61,7 +61,8 @@ def style_text(name: str, cwd: str | Path, *, attended: bool = True) -> str | No
     """
     custom = custom_styles(cwd)
     if name in custom:
-        return custom[name].read_text(encoding="utf-8").strip()
+        # A non-UTF-8 style/overlay file must not break every turn (#171): replace, don't raise.
+        return custom[name].read_text(encoding="utf-8", errors="replace").strip()
     if name in PRESETS:
         return PRESETS[name] if attended else UNATTENDED_PRESETS.get(name, PRESETS[name])
     return None

@@ -268,7 +268,11 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
     assert f'wsl.exe -d Ubuntu --exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
     assert "--cd" not in shim  # wsl.exe starts in the current directory by itself; Windows 10's WSL has no --cd
+    # #142/#112: without a compiler the installer writes a .ps1 launcher (exact args, UNC-safe) next to the .cmd
+    ps_shim = (appdata / "k3code" / "bin" / "k3code.ps1").read_text()
+    assert "wsl.exe" in ps_shim and "@args" in ps_shim
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
+    assert not (appdata / "k3code" / "bin" / "k3.ps1").exists()
 
     r = ps("uninstall.ps1")
     assert r.returncode == 0, r.stderr

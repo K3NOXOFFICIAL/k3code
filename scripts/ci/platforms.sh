@@ -173,6 +173,8 @@ EOF
     shim=$(cat "$RUN/appdata/k3code/bin/k3code.cmd")
     printf 'k3code.cmd:\n%s\n' "$shim"
     case $shim in *'wsl.exe -d Ubuntu --exec sh -lc "exec /home/u/.local/bin/k3code \"$@\"" k3code %*'*) ;; *) fail "unexpected shim" ;; esac
+    [ -f "$RUN/appdata/k3code/bin/k3code.ps1" ] || fail "missing k3code.ps1 fallback shim (#142/#112)"
+    grep -q "@args" "$RUN/appdata/k3code/bin/k3code.ps1" || fail "k3code.ps1 does not forward args"
     # what k3code.cmd runs, from the checkout's folder
     k3() { (cd "$WORK" && "$w" -d Ubuntu --exec sh -lc 'exec /home/u/.local/bin/k3code "$@"' k3code "$@"); }
     k3 --version || fail "k3code does not start through the shim command"

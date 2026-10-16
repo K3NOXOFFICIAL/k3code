@@ -260,6 +260,8 @@ def _read_range(f: Any, start: int, end: int) -> dict[str, Any]:
         raw = f.readline(MAX_READ_BYTES + 1)  # bounded: one endless line must not be loaded whole either
         if not raw:
             break
+        if b"\x00" in raw:  # binary range read (#171): same refusal as the whole-file path, without U+FFFD noise
+            return {"error": "that range looks like a binary file (NUL byte): not shown. Use bash (file/xxd/strings)."}
         if len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n"):
             if number >= start:
                 return too_big
@@ -331,7 +333,16 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
         explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
         first, count = _read_window(arguments)
         size = os.fstat(f.fileno()).st_size
-        if size > MAX_READ_BYTES:
+        # A binary or image file would inject ~60k chars of U+FFFD noise into context (#171): refuse it with a hint,
+        # like ripgrep does, when a NUL is in the first 8 KB (also checked on the range path below).
+        head = f.read(_BINARY_SNIFF_BYTES)
+        if b"\x00" in head:
+            return {
+                "error": f"{path} looks like a binary file ({size} bytes): not shown. "
+                "Use bash (file/xxd/strings) to inspect it."
+            }
+        f.seek(0)
+        if size > MAX_READ_BYTES:  # large: stream the range below (the head read was only the binary sniff)
             # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
             if not explicit:
                 return {

@@ -77,7 +77,7 @@ if (-not $WindowsOnly) {
   }
 }
 
-foreach ($n in @('k3code.exe', 'k3.exe', 'k3code.cmd', 'k3.cmd', 'k3code.exe.old-*', 'k3.exe.old-*')) {
+foreach ($n in @('k3code.exe', 'k3.exe', 'k3code.ps1', 'k3.ps1', 'k3code.cmd', 'k3.cmd', 'k3code.exe.old-*', 'k3.exe.old-*')) {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir $n)
 }
 if (Test-Path (Join-Path $shimDir '*.exe')) { Say "k3code.exe is still running: delete $shimDir once it has exited" }

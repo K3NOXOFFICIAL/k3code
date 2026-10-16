@@ -289,6 +289,17 @@ async def test_model_global_saves_the_default_through_the_command_too(server, tm
     assert server.config.default_model == "cheap" and server._session_for(sid).stored.model == "cheap"
 
 
+async def test_tune_global_persists_the_provider_pin(server, tmp_path):
+    """`/tune --provider x --global` saves default_provider for new sessions (#365)."""
+    path, _ = _write_config()
+    sid = await _session(server, tmp_path)
+    res = await m1.cmd(server, "/tune cheap --provider b --global", sid)
+    assert "Provider set to: b (saved to " in res["message"]
+    assert yaml.safe_load(path.read_text()).get("default_provider") == "b"
+    assert server.config.default_provider == "b"
+    assert server._session_for(sid).stored.provider == "b"
+
+
 # ── the default model is saved to the user config ───────────────────────────────────────────────────────────────
 
 
@@ -674,7 +685,7 @@ async def test_config_set_model_honours_reasoning_and_global(server, tmp_path):
             {"key": "model", "session_id": sid, "value": "cheap --provider a --reasoning high --tui-session"},
         )
     )["result"]
-    assert res == {"ok": True, "key": "model", "value": "cheap"}
+    assert res == {"ok": True, "key": "model", "value": "gpt-4o-mini"}  # resolved id, not the key (#365)
     live = server._session_for(sid)
     assert live.stored.model == "cheap" and live.reasoning_effort == "high"
     assert live.stored.provider == "a"  # the picker's provider step pins the session (#90)
@@ -698,13 +709,15 @@ async def test_config_set_model_honours_reasoning_and_global(server, tmp_path):
     assert yaml.safe_load(path.read_text())["default_model"] == "default"  # unchanged value: not rewritten
     await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "cheap --provider a --global"})
     assert yaml.safe_load(path.read_text())["default_model"] == "cheap" and server.config.default_model == "cheap"
-    assert live.stored.model == "cheap" and len(_backups(path)) == 1
+    assert yaml.safe_load(path.read_text()).get("default_provider") == "a"  # --global persists the pin (#365)
+    assert server.config.default_provider == "a"
+    assert live.stored.model == "cheap" and len(_backups(path)) >= 1
 
 
 async def test_config_set_model_global_without_a_session_and_bad_values(server, tmp_path):
     path, text = _write_config()
     res = (await m1.rpc(server, "config.set", {"key": "model", "value": "cheap --reasoning high --global"}))["result"]
-    assert res["value"] == "cheap"  # --reasoning has no session to go to: ignored, as before
+    assert res["value"] == "gpt-4o-mini"  # resolved id, not the key (#365); --reasoning ignored without session
     assert server.config.default_model == "cheap" and yaml.safe_load(path.read_text())["default_model"] == "cheap"
     sid = await _session(server, tmp_path)
     live = server._session_for(sid)
