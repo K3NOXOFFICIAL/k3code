@@ -69,7 +69,7 @@ def _configs(config: Any, cwd: Path) -> tuple[list[Any], Any]:
         except Exception:  # noqa: BLE001 - the files as written below still name their secrets
             config = None
     user = _read(user_config_path())
-    written = _read(project_config_path(cwd), project=cwd)
+    written = read_project_config(cwd)
     trusted = trust.trusted_text(cwd)
     project = None if trusted is None else _read(project_config_path(cwd), trusted, project=cwd)
     return [config, user, project], written
@@ -128,6 +128,13 @@ def _read(path: Path, text: str | None = None, *, project: Path | None = None) -
             return _read_project(path, project, text)
         return confio.read_yaml(path) if text is None else yaml.safe_load(text)
     raise BundleError(_unparsed(path))
+
+
+def read_project_config(project: Path) -> Any:
+    """``project``'s config.yaml as written, trusted or not (``_read``: bounded, inside the project, no aliases);
+    ``{}`` without one. A session that ran there can quote its values wherever it is exported or dumped (K3NOX-594):
+    one that does not parse raises BundleError."""
+    return _read(project_config_path(project), project=project)
 
 
 def _unparsed(path: Path) -> str:
@@ -231,12 +238,14 @@ def write_bundle(
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
         sessions.append((sid, stored))
-    # the project config, and the .mcp.json of this project and of each exported session's own, as written, trusted or
-    # not, hide their values in the sessions: the certain ones only, so a file the user never trusted cannot blank out
-    # a region or path their transcripts name (a guess, see secret_values), and after the shape pass (session_to_dict)
+    # the config.yaml and the .mcp.json of this project and of each exported session's own (K3NOX-581, K3NOX-594), as
+    # written, trusted or not, hide their values in the sessions: the certain ones only, so a file the user never
+    # trusted cannot blank out a region or path their transcripts name (a guess, see secret_values), and after the
+    # shape pass (session_to_dict). This project's config.yaml is `written`.
     projects = {cwd, *(Path(stored.cwd) for _, stored in sessions if stored.cwd)} if sessions else set()
+    elsewhere = [read_project_config(project) for project in sorted(projects - {cwd})]
     mcp = [_mcp_json(project) for project in sorted(projects)]
-    untrusted = sorted(set(_known_secrets(written, *mcp)[1]) - set(secrets), key=len, reverse=True)
+    untrusted = sorted(set(_known_secrets(written, *elsewhere, *mcp)[1]) - set(secrets), key=len, reverse=True)
     exported: list[str] = []
     for sid, stored in sessions:
         session = session_to_dict(stored, secrets, untrusted)
