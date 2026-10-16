@@ -369,7 +369,12 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
   const activeRow =
     seeds.activeRow ??
     (seeds.surface ? mix(surface, seeds.accent, 0.22) : tones.activeRow);
-  const muted = seeds.muted ?? tones.muted;
+  // #414: secondary text must stay readable in a session, not just on the
+  // welcome screen. Enforce WCAG AA (4.5:1) for normal text against the
+  // terminal background; large/status text keeps 3:1 via statusFg.
+  const bg = seeds.bg;
+  const muted = ensureContrast(seeds.muted ?? tones.muted, bg, 4.5);
+  const label = ensureContrast(tones.label, bg, 4.5);
 
   return {
     primary: seeds.primary,
@@ -382,7 +387,7 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
     completionMetaBg: surface,
     completionMetaCurrentBg: activeRow,
 
-    label: tones.label,
+    label,
     ok: seeds.ok,
     error: seeds.error,
     warn: seeds.warn,
@@ -396,14 +401,14 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
     // but are independently skinnable.
     syntaxString: seeds.accent,
     syntaxNumber: seeds.text,
-    syntaxKeyword: seeds.border ?? tones.border,
+    syntaxKeyword: ensureContrast(seeds.border ?? tones.border, bg, 3),
     syntaxComment: muted,
 
-    prompt: seeds.prompt ?? seeds.text,
+    prompt: ensureContrast(seeds.prompt ?? seeds.text, bg, 4.5),
     // sessionLabel/sessionBorder track the muted tone — "same role, same
     // colour" by design (#11300).
     sessionLabel: muted,
-    sessionBorder: muted,
+    sessionBorder: ensureContrast(muted, bg, 3),
 
     statusBg: surface,
     statusFg: tones.statusFg,

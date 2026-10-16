@@ -80,6 +80,24 @@ export const tuneCommands: SlashCommand[] = [
     help: "list the providers, or switch this session's (--save: also the default in config.yaml)",
     name: "provider",
     usage: "/provider [<name> [--save]]",
-    run: (arg, ctx) => runOnGateway("provider", arg.trim(), ctx),
+    run: (arg, ctx) =>
+      arg.trim()
+        ? runOnGateway("provider", arg.trim(), ctx)
+        : openTunePopup(ctx),
+  },
+
+  {
+    help: "permissions (popup, or /permissions ... passthrough to gateway)",
+    name: "permissions",
+    usage: "/permissions [...]",
+    run: (arg, ctx) => {
+      if (!arg.trim()) {
+        if (!openSettingsPanel()) {
+          ctx.transcript.sys("finish the pending prompt first");
+        }
+        return;
+      }
+      return runOnGateway("permissions", arg.trim(), ctx);
+    },
   },
 ];

@@ -34,7 +34,9 @@ export const sameBatteryInfo = (
     a.available === b.available &&
     a.category === b.category &&
     a.percent === b.percent &&
-    a.plugged === b.plugged);
+    a.plugged === b.plugged &&
+    (a.temp_c ?? null) === (b.temp_c ?? null) &&
+    (a.power_profile ?? null) === (b.power_profile ?? null));
 
 /** Coerce a `system.battery` RPC payload into the UI's BatteryInfo shape. */
 export const toBatteryInfo = (
@@ -49,11 +51,20 @@ export const toBatteryInfo = (
       ? Math.max(0, Math.min(100, Math.round(r.percent)))
       : null;
 
+  const temp_c =
+    typeof r.temp_c === "number" && Number.isFinite(r.temp_c) ? r.temp_c : null;
+  const power_profile =
+    typeof r.power_profile === "string" && r.power_profile
+      ? r.power_profile
+      : null;
+
   return {
     available: !!r.available,
     category: normalizeCategory(r.category),
     percent,
     plugged: typeof r.plugged === "boolean" ? r.plugged : null,
+    temp_c,
+    power_profile,
   };
 };
 

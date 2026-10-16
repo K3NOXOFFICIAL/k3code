@@ -43,6 +43,8 @@ export interface BatteryInfo {
   category: BatteryCategory;
   percent: null | number;
   plugged: null | boolean;
+  temp_c?: null | number;
+  power_profile?: null | string;
 }
 
 export type BusyInputMode = "interrupt" | "queue" | "steer";
