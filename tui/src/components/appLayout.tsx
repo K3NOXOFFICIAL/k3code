@@ -651,8 +651,8 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
       gw={gw}
       onActivate={activate}
       onClose={close}
-      onNew={() => {
-        actions.newLiveSession(dropSid());
+      onNew={(text) => {
+        actions.newLiveSession(text, undefined, dropSid());
         close();
       }}
       onStop={({ kind, ...row }) => {
