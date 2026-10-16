@@ -43,10 +43,6 @@ const CURRENT_TAG = " (this session)";
 const CONFIRM_TAG = "  stop? y/n";
 const MODEL_MAX = 24;
 
-type Line =
-  | { group: ViewGroup; type: "header" }
-  | { index: number; row: ViewRow; type: "row" };
-
 const stateText = (row: ViewRow) =>
   row.kind === "past"
     ? relativeSessionAge(row.lastActive ?? undefined) || "earlier"
@@ -81,9 +77,7 @@ export function AgentViewView({
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
   const lines = buildLines(rows, nav.collapsedGroups);
 
-  const selLine = lines.findIndex(
-    (l) => l.type === "row" && l.index === index,
-  );
+  const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
   // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
   const overflow = !compact && lines.length > height;
   const inner = overflow ? Math.max(1, height - 2) : Math.max(1, height);
@@ -127,7 +121,7 @@ export function AgentViewView({
     const title = compactPreview(row.title, Math.max(1, titleW - tag.length));
     // Earlier sessions are dimmed unless selected, so the live rows above them stand out.
     const ink = selected
-      ? style.color ?? t.color.text
+      ? (style.color ?? t.color.text)
       : row.kind === "past"
         ? t.color.muted
         : t.color.text;
@@ -223,9 +217,13 @@ export function AgentViewView({
               {" more"}
             </Text>
           ) : null}
-          {lines.slice(win.start, win.end).map((l) =>
-            l.type === "header" ? renderHeader(l.group) : renderRow(l.row, l.index),
-          )}
+          {lines
+            .slice(win.start, win.end)
+            .map((l) =>
+              l.type === "header"
+                ? renderHeader(l.group)
+                : renderRow(l.row, l.index),
+            )}
           {below > 0 ? (
             <Text color={t.color.muted} wrap="truncate-end">
               {"  ↓ "}

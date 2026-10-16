@@ -692,10 +692,14 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
             : method === "session.close"
               ? { closed: true }
               : method === "session.create"
-              ? { session_id: "s-new", stored_session_id: "stored-s-new", info: { version: "1.0" } }
-              : method === "setup.status"
-              ? { provider_configured: true }
-              : null,
+                ? {
+                    session_id: "s-new",
+                    stored_session_id: "stored-s-new",
+                    info: { version: "1.0" },
+                  }
+                : method === "setup.status"
+                  ? { provider_configured: true }
+                  : null,
       ),
     );
     const rpc = vi.fn((method: string, params?: Record<string, unknown>) =>
@@ -703,14 +707,25 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
         method === "setup.status"
           ? { provider_configured: true }
           : method === "session.create"
-            ? { session_id: "s-new", stored_session_id: "stored-s-new", info: { version: "1.0" } }
+            ? {
+                session_id: "s-new",
+                stored_session_id: "stored-s-new",
+                info: { version: "1.0" },
+              }
             : method === "session.activate" && params?.session_id
-            ? { session_id: params.session_id, stored_session_id: `stored-${params.session_id}`, info: { version: "1.0" }, messages: [], running: false, status: "idle" }
-            : method === "session.list"
-            ? { sessions: past }
-            : method === "session.close"
-            ? { closed: true }
-            : null,
+              ? {
+                  session_id: params.session_id,
+                  stored_session_id: `stored-${params.session_id}`,
+                  info: { version: "1.0" },
+                  messages: [],
+                  running: false,
+                  status: "idle",
+                }
+              : method === "session.list"
+                ? { sessions: past }
+                : method === "session.close"
+                  ? { closed: true }
+                  : null,
       ),
     );
     const gateway = {
@@ -792,7 +807,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     layout.press("\n");
     await new Promise((r) => setTimeout(r, 500));
 
-    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1), { timeout: 10000 });
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1), {
+      timeout: 10000,
+    });
     expect(getUiState().sid).toBe("s-new");
     expect(closeCalls(request)).toHaveLength(1);
   });
@@ -854,7 +871,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     await new Promise((r) => setTimeout(r, 500));
 
     // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
-    await waitFor(() => expect(getUiState().sid).toBe("s-new"), { timeout: 10000 });
+    await waitFor(() => expect(getUiState().sid).toBe("s-new"), {
+      timeout: 10000,
+    });
     expect(rpc).toHaveBeenCalledWith("session.create", expect.anything());
     await flush();
 
