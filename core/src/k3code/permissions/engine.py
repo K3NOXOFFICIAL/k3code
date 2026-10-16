@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import fnmatch
 import functools
-import glob
 import os
 import re
 import shlex
-from collections.abc import Callable, Sequence
+import sys
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -489,18 +490,69 @@ def k3code_state(path: str) -> bool:
     return False
 
 
+def _install_roots() -> list[str]:
+    """What the next start of k3code runs, as paths: the install root (``K3CODE_DATA``, and the one the running
+    process's own virtualenv sits in: ``<data>/current/venv`` or ``<data>/versions/<ver>/venv``, so a process that
+    lacks the setting the install was made with still finds it); the ``k3code``, ``k3``, ``uv`` and ``uvx`` links and
+    programs in ``<prefix>/bin`` (``<data>`` is ``<prefix>/share/k3code``; also ``~/.local/bin`` and ``K3_BIN_DIR``),
+    of which the updater runs ``uv`` without the sandbox; and what shapes the systemd user unit and the environment
+    it starts in. systemd applies a drop-in from any of its unit directories and reads ``user.conf``, ``environment.d``
+    and the ``*.wants`` links next to the units, so the whole ``systemd`` and ``environment.d`` folders are guarded, in
+    the default place and under ``XDG_CONFIG_HOME`` / ``XDG_DATA_HOME`` (the daemon and the user manager may not agree
+    on those), and ``$XDG_RUNTIME_DIR/systemd``."""
+    datas = [paths.data_dir()]
+    for venv in dict.fromkeys((Path(sys.prefix), Path(os.path.realpath(sys.prefix)))):
+        if venv.name != "venv":
+            continue  # a dev checkout's own environment is a project file, not an install
+        if venv.parent.name == "current":
+            datas.append(venv.parent.parent)
+        elif venv.parent.parent.name == "versions":
+            datas.append(venv.parent.parent.parent)
+    bins = [Path.home() / ".local" / "bin"]
+    bins += [d.parent.parent / "bin" for d in datas if d.parent.name == "share"]
+    if explicit := os.environ.get("K3_BIN_DIR"):
+        bins.append(Path(explicit).expanduser())
+    config = [Path.home() / ".config", *_xdg("XDG_CONFIG_HOME")]
+    share = [Path.home() / ".local" / "share", *_xdg("XDG_DATA_HOME")]
+    out = [*datas, *(b / n for b in bins for n in ("k3code", "k3", "uv", "uvx"))]
+    out += [c / n for c in config for n in ("systemd", "environment.d")]
+    out += [d / "systemd" for d in (*share, *_xdg("XDG_RUNTIME_DIR"))]
+    return [str(x) for x in out]
+
+
+def _xdg(name: str) -> list[Path]:
+    value = os.environ.get(name)
+    return [Path(value).expanduser()] if value else []
+
+
+def k3code_install(path: str) -> bool:
+    """``path`` (absolute) is k3code's own installed code, one of its launcher links or programs, or what shapes the
+    systemd user unit (see :func:`_install_roots`): what the next start runs, with no sandbox and no permission
+    engine. Other files in ``~/.local/bin`` are not covered. Compared as written and resolved, against the locations as
+    set and as resolved, case-insensitively."""
+    guarded = [g for root in _install_roots() for g in (os.path.normpath(root), _real(root))]
+    guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
+    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
+
+
 def protected_path(path: str) -> bool:
     """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
-    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``) or
-    under k3code's own state directory (see :func:`k3code_state`). Checked on the path as written and on its
-    realpath, so a symlink does not hide the target."""
+    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``),
+    under k3code's own state directory (see :func:`k3code_state`) or k3code's own install (see :func:`k3code_install`).
+    Checked on the path as written and on its realpath, so a symlink does not hide the target."""
     if k3code_state(path):
+        return True
+    if k3code_install(path):
         return True
     home = os.path.expanduser("~")
     homes = (os.path.normpath(home), _real(home))
     guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
     secrets = _secret_dirs()
-    guarded += [*map(os.path.normpath, secrets), *map(os.path.realpath, secrets)]
+    guarded += [*map(os.path.normpath, secrets), *map(_real, secrets)]
     guarded = [g.casefold().rstrip(os.sep) for g in guarded]
     for p in dict.fromkeys((os.path.normpath(path), _real(path))):
         if _PROTECTED.search(p.replace("\\", "/")):
@@ -513,6 +565,25 @@ def protected_path(path: str) -> bool:
 
 def _stricter(a: Decision, b: Decision) -> Decision:
     return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human, d.always_ask))
+
+
+def _unusable_argument(args: dict[str, object]) -> str | None:
+    """Why the OS cannot take one of the arguments that name a command or a path, or None. A NUL byte reaches no
+    shell or exec (it lives in the C string terminator, so a name ending there is two names and the rest vanishes);
+    an argument that the locale cannot decode is not reproducible by a human at a shell. ``command`` and ``cwd``
+    are checked, too."""
+    for key in ("command", "cwd", "path", "file", "pattern"):
+        val = args.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            try:
+                val.encode("utf-8", "surrogateescape")  # rejects lone surrogates outside the escape range
+            except UnicodeEncodeError:
+                return f"Argument {key} is not text that can be encoded ({val!r})."
+        if isinstance(val, str) and "\0" in val:
+            return f"A NUL byte cannot be passed to a command or a path ({key})."
+    return None
 
 
 def decide(
@@ -549,6 +620,8 @@ def decide(
         else mode
     )
     args = args or {}
+    if (bad := _unusable_argument(args)) is not None:
+        return Decision(action="deny", message=bad)
     cwd_s = _norm(cwd)
     roots = [cwd_s, *[_norm(d) for d in (add_dirs or [])]]
     ruleset = merge(builtin_defaults(mode), user_rules or [], project_rules or [], session_rules or [])
@@ -575,6 +648,8 @@ def decide(
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
             if k3code_state(path) or k3code_state(reached):
                 dec.message = f"Edits k3code's own state (trust store, memory, skills); confirm it yourself: {path}"
+            if k3code_install(path) or k3code_install(reached):
+                dec.message = f"Edits k3code's own install (code, launcher, service unit); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
@@ -1155,8 +1230,9 @@ _REMOVERS = frozenset({"rm", "unlink", "shred"})
 _COPIERS = frozenset({"cp", "mv", "ln", "install"})
 _KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
 #: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
-#: container one. Both are an ask that a person answers.
-_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "deny": 3}
+#: container one. Both are an ask that a person answers. ``unchecked``: a glob was too large to check for credential
+#: files; a person is asked, and yolo (where nobody can be) refuses.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "unchecked": 3, "deny": 4}
 
 
 def _worse(a: str | None, b: str | None) -> str | None:
@@ -1208,14 +1284,71 @@ def _canonical_secrets(pattern: str, home: str) -> list[str]:
     return out
 
 
-def _glob_reads_secret(pattern: str, home: str) -> bool:
+#: Bounds of the on-disk walk of a glob, shared by every glob word of one bash decision: directory entries read and
+#: seconds spent. A pattern that matches nothing never yields a hit, so a cap on hits would not stop it; the walk runs
+#: on the daemon's event loop. ``_GLOB_MAX_WILD`` caps the wildcard components of one pattern (the walk recurses once
+#: for each); a pattern with more is not walked.
+_GLOB_MAX_ENTRIES = 20_000
+_GLOB_BUDGET_S = 0.5
+_GLOB_MAX_WILD = 32
+
+
+class _GlobBudget:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.deadline = time.monotonic() + _GLOB_BUDGET_S
+        self.spent = False
+
+    def charge(self) -> bool:
+        """Count one directory entry; False once the entry cap or the time budget is used up."""
+        self.entries += 1
+        if self.entries > _GLOB_MAX_ENTRIES or (self.entries % 64 == 0 and time.monotonic() > self.deadline):
+            self.spent = True
+        return not self.spent
+
+
+def _glob_walk(base: str, parts: list[str], budget: _GlobBudget) -> Iterator[str]:
+    """The paths ``glob.glob`` would find for ``base`` + ``parts`` (no ``**``, a wildcard skips dot names), stopping
+    when ``budget`` runs out. Literal components are joined in a loop; only a wildcard component recurses."""
+    if budget.spent:
+        return
+    k = 0
+    while k < len(parts) and not _GLOB_CHARS & set(parts[k]):
+        base = os.path.join(base, parts[k])
+        k += 1
+    if k == len(parts):
+        if os.path.lexists(base):
+            yield base
+        return
+    comp, rest = parts[k], parts[k + 1 :]
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                if not budget.charge():
+                    return
+                name = entry.name
+                if (name.startswith(".") and not comp.startswith(".")) or not fnmatch.fnmatchcase(name, comp):
+                    continue
+                try:
+                    if rest and not entry.is_dir():
+                        continue
+                except OSError:  # a symlink that cannot be followed: glob skips it too
+                    continue
+                yield from _glob_walk(os.path.join(base, name), rest, budget)
+    except OSError:
+        return
+
+
+def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | None:
     """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
-    against the canonical secret names."""
-    for k, hit in enumerate(glob.iglob(pattern)):
+    against the canonical secret names. None when none of these says so and the on-disk walk did not finish within
+    ``budget`` (or was not tried: the budget was spent already, or the pattern is too deep): the answer is unknown."""
+    parts = pattern.split("/")[1:]
+    if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
+        budget.spent = True
+    for hit in _glob_walk("/", parts, budget):
         if sensitive_path(hit):
             return True
-        if k >= 1000:
-            break
     literal: list[str] = []
     for seg in pattern.split("/"):
         if _GLOB_CHARS & set(seg):
@@ -1224,7 +1357,9 @@ def _glob_reads_secret(pattern: str, home: str) -> bool:
     base = "/".join(literal) or "/"
     if base != "/" and sensitive_path(base):
         return True
-    return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
+    if any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home)):
+        return True
+    return None if budget.spent else False
 
 
 _BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
@@ -1258,25 +1393,72 @@ class _Where:
     dirs: tuple[str, ...]
     unknown: bool = False
     home_moved: bool = False  # ``HOME`` is assigned on the line: ``~`` and ``$HOME`` may not mean the daemon's home
+    replaces: tuple[str, ...] = ()  # strings a program on the line fills with its input (see _CdScan.replaces)
+    links: tuple[str, ...] = ()  # names of symbolic links the line makes (see _CdScan.link_names)
 
 
-def _classify_arg(arg: str, where: _Where, home: str) -> str | None:
+#: ``~``, ``$HOME`` and ``${HOME...}`` at the start of a word: the home directory as the shell will spell it.
+_HOME_WORD = re.compile(r"~(?=/|$)|\$HOME(?![A-Za-z0-9_])|\$\{HOME\b")
+
+
+def _placeholder_credential(word: str, where: _Where, home: str) -> bool:
+    """``word`` holds a string the line fills with its input (``~/{}`` under ``xargs -I{}``, ``{}/id_rsa`` under ``find
+    -exec``) in a place that could make it a credential: below the home directory, a credential folder or one that holds
+    one (the same folders ``_may_be_credential`` tries), or in front of a credential name. A bare placeholder
+    (``cat {}``) is left alone, as is one below a folder that holds no credential (``sub/{}``)."""
+    word = word.strip("'\"")
+    secret = _secret_dirs()
+    parents = {home, "/", "/proc/self", *(os.path.dirname(d) for d in secret)}
+    for r in where.replaces:
+        before, found, after = word.partition(r)
+        if not found:
+            continue
+        if after.startswith("/") and _may_be_credential(after.lstrip("/"), home):
+            return True
+        if not before:
+            continue
+        for cwd in where.dirs:
+            expanded = hardline.expand_vars(before, cwd, home)
+            if "$" in expanded or "`" in expanded:
+                continue
+            folder = _abs(expanded if expanded.endswith("/") else os.path.dirname(expanded) or ".", cwd)
+            if folder in parents or any(folder == d or folder.startswith(d + "/") for d in secret):
+                return True
+    return False
+
+
+def _crosses_link(word: str, cwd: str, home: str, links: tuple[str, ...]) -> bool:
+    """``word`` goes through a symbolic link the line makes and goes on to a name that may be a credential."""
+    word = hardline.expand_vars(word.strip("'\""), cwd, home)
+    if not word or "$" in word or "`" in word:
+        return False
+    path = _abs(word, cwd)
+    for link in links:
+        base = _abs(hardline.expand_vars(link, cwd, home), cwd)
+        if path.startswith(base.rstrip("/") + "/") and _may_be_credential(path[len(base) :].lstrip("/"), home):
+            return True
+    return False
+
+
+def _classify_arg(arg: str, where: _Where, home: str, budget: _GlobBudget | None = None) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
-    front of a credential name (``$DIR/.env``) or an unknown directory may hold it, else None. ``{a,b}`` alternatives
-    are classified one by one, each against every directory in ``where``."""
+    front of a credential name (``$DIR/.env``) or an unknown directory may hold it, ``unchecked`` when a glob could
+    not be checked within ``budget``, else None. ``{a,b}`` alternatives are classified one by one, each against every
+    directory in ``where``."""
+    budget = budget or _GlobBudget()
     worst: str | None = None
     for word in _brace_expand(arg):
         for cwd in where.dirs:
-            worst = _worse(worst, _classify_word(word, cwd, home))
+            worst = _worse(worst, _classify_word(word, cwd, home, budget))
+            if where.links and _crosses_link(word, cwd, home, where.links):
+                worst = _worse(worst, "human")  # ``ln -s ~ h && head h/.ssh/id_rsa``: the link is not on disk yet
         if where.unknown and _relative_word(word) and _may_be_credential(word, home):
             worst = _worse(worst, "human")
-        if where.home_moved and (m := _HOME_PREFIX.match(word.strip("'\""))) and _may_be_credential(m.group(1), home):
-            worst = _worse(worst, "human")  # ``HOME=~/.ssh; cat ~/id_rsa``: a name in a home that is not the daemon's
+        if where.home_moved and _HOME_WORD.match(word.strip("'\"")):
+            worst = _worse(worst, "human")  # ``HOME=~/.ssh; cat ~/key``: any name in a home that is not the daemon's
+        if where.replaces and _placeholder_credential(word, where, home):
+            worst = _worse(worst, "human")
     return worst
-
-
-#: ``~/NAME``, ``$HOME/NAME`` and ``${HOME}/NAME``: a path below the home directory.
-_HOME_PREFIX = re.compile(r"(?:~|\$HOME|\$\{HOME\})/+(.+)")
 
 
 def _relative_word(word: str) -> bool:
@@ -1301,17 +1483,19 @@ _CREDENTIAL_LEAVES = frozenset(
 )
 
 
-def _may_be_credential(word: str, home: str) -> bool:
+def _may_be_credential(word: str, home: str, budget: _GlobBudget | None = None) -> bool:
     """A relative ``word`` that names a credential from some directory a ``cd`` to somewhere unknown can reach: a
     credential leaf name, or a path that is one from the home directory, the root, a process directory or the parent
     of a credential folder (``.ssh/id_rsa``, ``k3code/env``, ``proc/self/environ``)."""
     if _sensitive_name(word) or os.path.basename(word.strip("'\"")).lower() in _CREDENTIAL_LEAVES:
         return True
     parents = (os.path.dirname(d) for d in _secret_dirs())
-    return any(_classify_word(word, probe, home) for probe in dict.fromkeys([home, "/", "/proc/self", *parents]))
+    return any(
+        _classify_word(word, probe, home, budget) for probe in dict.fromkeys([home, "/", "/proc/self", *parents])
+    )
 
 
-def _classify_word(arg: str, cwd: str, home: str) -> str | None:
+def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -1320,7 +1504,8 @@ def _classify_word(arg: str, cwd: str, home: str) -> str | None:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        return "deny" if _glob_reads_secret(path, home) else None
+        reads = _glob_reads_secret(path, home, budget or _GlobBudget())
+        return "unchecked" if reads is None else "deny" if reads else None
     return "deny" if sensitive_path(path) else None
 
 
@@ -1495,15 +1680,36 @@ _RUNS_UNREAD_TEXT = frozenset({"source", ".", "alias", "trap"})
 #: Shell settings that move the directory in ways the check does not follow: a rewritten ``DIRSTACK`` that ``popd``
 #: returns to, ``cdable_vars`` (``cd x`` goes to the directory ``$x`` names).
 _CD_SETTINGS = ("DIRSTACK", "cdable_vars")
-_HOME_ASSIGNMENT = re.compile(r"^HOME\+?=")
-#: Commands whose ``-C DIR``/``--directory DIR`` runs them in DIR, and the short options of each that take a value.
+_HOME_NAME = re.compile(r"HOME(?:\[[^\]]*\])?")
+_HOME_ASSIGNMENT = re.compile(_HOME_NAME.pattern + r"\+?=")
+_HOME_NAMEREF = re.compile(r"[A-Za-z_]\w*=" + _HOME_NAME.pattern)
+#: Commands that set the variables named among their arguments (``read HOME``), apart from ``printf -v NAME``.
+_SETS_NAMED = frozenset({"read", "mapfile", "readarray", "getopts"})
+#: Commands whose ``-C DIR``/``--directory DIR`` runs them in DIR: the short options of each that take a value, the
+#: short option that names the directory, and the long options that do. getopt takes any unambiguous prefix of a long
+#: option (``make --di DIR``), so a prefix of four characters or more counts, and so does an ambiguous one: it only
+#: makes the check look at a directory the program refuses. bsdtar has its own table (``-H`` and ``-L`` are flags,
+#: ``-s`` and ``-W`` take a value, ``--cd`` names the directory); in make ``-L`` is a flag.
 _DIR_OPTION_COMMANDS = {
-    "tar": "fCTXbHIgFVLNK",
-    "gtar": "fCTXbHIgFVLNK",
-    "bsdtar": "fCTXbHIgFVLNK",
-    "make": "CfIoWEL",
-    "gmake": "CfIoWEL",
+    "tar": ("fCTXbHIgFVLNK", "C", ("--directory",)),
+    "gtar": ("fCTXbHIgFVLNK", "C", ("--directory",)),
+    "bsdtar": ("bCfIsTWX", "C", ("--directory", "--cd")),
+    "make": ("CfIoWE", "C", ("--directory",)),
+    "gmake": ("CfIoWE", "C", ("--directory",)),
+    "cpio": ("CDEFHIMOR", "D", ("--directory",)),
+    "uv": ("", "", ("--directory",)),
+    "cmake": ("", "", ()),  # ``-E chdir DIR CMD...``
 }
+_TAR_COMMANDS = frozenset({"tar", "gtar", "bsdtar"})
+#: Programs that put their input after the arguments they are given, which can hand a directory option its value.
+_FEEDERS = frozenset({"xargs", "parallel"})
+#: ``find -exec`` and friends fill ``{}`` with a file name; GNU ``parallel`` fills these.
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_PARALLEL_REPLACES = ("{}", "{.}", "{/}", "{//}", "{/.}", *(f"{{{n}}}" for n in range(1, 10)))
+#: ``git`` subcommands that write files into the work tree, links included.
+_GIT_WRITES_TREE = frozenset(
+    {"checkout", "switch", "restore", "reset", "merge", "pull", "clone", "rebase", "apply", "am", "cherry-pick"}
+)
 
 
 @dataclass
@@ -1511,29 +1717,53 @@ class _CdScan:
     """The directory changes on a command line: each ``cd``/``pushd`` as (name, arguments), and what makes the
     directories reachable unclear: ``CDPATH`` set (a relative ``cd`` may go elsewhere), or ``unknown`` (a command the
     check cannot read as a command word, ``HOME`` rewritten, a setting from _CD_SETTINGS). ``home``: ``HOME`` is
-    assigned. ``links``: the line makes a symbolic link, which a later ``cd`` can pass through. ``replaces``: the
-    strings ``xargs -I`` fills with its input, which a ``cd`` operand must not hold."""
+    assigned. ``links``: the line makes a symbolic link or unpacks files (an archive, a checkout), which a later
+    ``cd`` can pass through; ``link_names`` are the names of the links it makes by ``ln -s``/``cp -s``. ``replaces``:
+    the strings a program on the line fills with its input (``xargs -I``, ``find -exec``'s ``{}``, ``parallel``'s
+    ``{}``), which a ``cd`` operand must not hold. ``tar_options``, ``tar``: ``TAR_OPTIONS`` is mentioned, tar runs."""
 
     found: list[tuple[str, list[str]]] = field(default_factory=list)
     cdpath: bool = False
     unknown: bool = False
     home: bool = False
     links: bool = False
+    link_names: list[str] = field(default_factory=list)
     replaces: list[str] = field(default_factory=list)
+    tar_options: bool = False
+    tar: bool = False
 
 
 def _dir_option_values(name: str, args: list[str]) -> list[str]:
-    """The directories ``tar -C DIR``, ``--directory DIR`` and ``make -C DIR`` run in (an old-style ``tar cf x -C DIR``
-    bundle and an abbreviated ``--dir`` included)."""
-    if name.endswith("tar") and args and not args[0].startswith("-"):
-        args = [f"-{args[0]}", *args[1:]]
+    """The directories ``tar -C DIR``, ``--directory DIR``, ``make -C DIR``, ``cpio -D DIR``, ``uv --directory DIR`` and
+    ``cmake -E chdir DIR`` run in (an old-style ``tar cfC x DIR`` bundle and an abbreviated ``--dir`` included)."""
+    short_val, short_dir, long_dirs = _DIR_OPTION_COMMANDS[name]
+    if name == "cmake":
+        return [args[2]] if len(args) > 2 and args[0] == "-E" and args[1] == "chdir" else []
+    values: list[str] = []
+    if name in _TAR_COMMANDS and args and not args[0].startswith("-"):
+        rest = args[1:]  # an old-style bundle: each letter that takes a value takes the next word, in order
+        for ch in args[0]:
+            if ch in short_val and rest:
+                if ch == short_dir:
+                    values.append(rest[0])
+                rest = rest[1:]
+        args = rest
     spelled: list[str] = []
     for a in args:
         key, eq, value = a.partition("=")
-        long = a.startswith("--") and len(key) >= 5 and "--directory".startswith(key)  # getopt takes any prefix
-        spelled.append("--directory" + eq + value if long else a)
-    opts, _ = _options(spelled, _DIR_OPTION_COMMANDS[name], frozenset({"--directory"}))
-    return [value for opt, value in opts if opt in ("-C", "--directory") and value]
+        full = next((o for o in long_dirs if a.startswith("--") and len(key) >= 4 and o.startswith(key)), None)
+        spelled.append(full + eq + value if full else a)
+    opts, _ = _options(spelled, short_val, frozenset(long_dirs))
+    return values + [value for opt, value in opts if value and (opt == "-" + short_dir or opt in long_dirs)]
+
+
+def _dangling_dir_option(argv: list[str], last: str) -> bool:
+    """A directory option ends the command (``xargs tar -cf - -C``): the program that feeds it hands it its value."""
+    if argv[0] not in _DIR_OPTION_COMMANDS and argv[0] not in ("git", "env"):
+        return False
+    if last.startswith("--"):
+        return "=" not in last and len(last) >= 4 and ("--directory".startswith(last) or "--chdir".startswith(last))
+    return last.startswith("-") and last[-1] in "CD"
 
 
 def _makes_symlink(name: str, args: list[str]) -> bool:
@@ -1551,16 +1781,75 @@ def _makes_symlink(name: str, args: list[str]) -> bool:
     return False
 
 
+def _link_names(args: list[str]) -> list[str]:
+    """Where an ``ln -s``/``cp -s`` may put its links: the last operand (and below it, when that is a folder), or the
+    ``-t`` folder."""
+    opts, positional = _options(args, "St", frozenset({"--suffix", "--target-directory"}))
+    positional = [os.path.expanduser(p.replace("${HOME}", "~").replace("$HOME", "~")) for p in positional]
+    folder = next((v for o, v in opts if o in ("-t", "--target-directory") and v), None)
+    if folder is not None:
+        return [os.path.join(folder, os.path.basename(p)) for p in positional]
+    if len(positional) == 1:
+        return [os.path.basename(positional[0].rstrip("/")) or "."]
+    names = positional[-1:]
+    return names + [os.path.join(positional[-1], os.path.basename(p.rstrip("/"))) for p in positional[:-1]]
+
+
+def _unpacks(name: str, args: list[str]) -> bool:
+    """The command may write symbolic links into the tree: unpacking an archive (``tar x``, ``unzip``) or a git command
+    that writes the work tree."""
+    if name in _TAR_COMMANDS:
+        if args and not args[0].startswith("-"):
+            return "x" in args[0]
+        for a in args:
+            if a.startswith("--"):
+                if len(a) >= 4 and any(o.startswith(a.partition("=")[0]) for o in ("--extract", "--get")):
+                    return True
+            elif a.startswith("-") and "x" in a[1:]:
+                return True
+        return False
+    if name == "git":
+        return bool(args) and args[0] in _GIT_WRITES_TREE
+    return name == "unzip"
+
+
+def _assigns_home(raw: list[str]) -> bool:
+    """``HOME`` is set by this simple command: ``HOME=x`` (``HOME[0]=x``, ``HOME+=x``, behind ``export``/``declare``),
+    ``printf -v HOME``, ``read HOME`` and its kin, ``for``/``select HOME in``, or a name reference to it
+    (``declare -n h=HOME``, after which ``h=x`` sets it)."""
+    if any(_HOME_ASSIGNMENT.match(t) for t in raw):
+        return True
+    named = [t for t in raw if _HOME_NAME.fullmatch(t)]
+    if "printf" in raw and any(t == "-v" and i + 1 < len(raw) and raw[i + 1] in named for i, t in enumerate(raw)):
+        return True
+    if "printf" in raw and any(t.startswith("-v") and _HOME_NAME.fullmatch(t[2:]) for t in raw):
+        return True
+    if named and any(t in _SETS_NAMED for t in raw):
+        return True
+    if named and any(a in ("for", "select") and b in named for a, b in zip(raw, raw[1:], strict=False)):
+        return True
+    ref = any(t in ("declare", "typeset", "local") for t in raw) and any(re.fullmatch(r"-\w*n\w*", t) for t in raw)
+    return ref and any(_HOME_NAMEREF.fullmatch(t) for t in raw)
+
+
 def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdScan:
     """Every directory change on the line, nested commands (``bash -c``, ``$(...)``, a subshell, a function body)
     included: ``cd``, ``pushd`` (``pushd -n DIR`` too: ``popd`` comes back to it) and the directory an ``env -C``,
-    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in."""
+    ``sudo -D`` or ``git -C`` runs its command in, and the one ``tar -C`` and ``make -C`` work in. A ``trap``
+    action runs later (at exit, on a signal), not now, so its ``cd`` does not move the rest of the line: its
+    payload is still checked for secrets in _secret_access, but skipped here."""
     scan = scan or _CdScan()
+    trap_payloads: set[str] = set()
+    for sub in parsed.subs:
+        argv0 = _argv(sub)
+        if argv0 and argv0[0] == "trap":
+            trap_payloads.update(hardline._trap_actions(argv0[1:]))
     for sub in parsed.subs:
         scan.cdpath = scan.cdpath or "CDPATH" in sub
         scan.unknown = scan.unknown or any(name in sub for name in _CD_SETTINGS)
+        scan.tar_options = scan.tar_options or "TAR_OPTIONS" in sub
         raw = hardline.tokens(sub)
-        homed = any(_HOME_ASSIGNMENT.match(t) for t in raw)
+        homed = _assigns_home(raw)
         scan.home = scan.home or homed
         scan.unknown = scan.unknown or homed
         chdirs: list[str] = []
@@ -1568,6 +1857,8 @@ def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdSca
         scan.found += [("cd", [d]) for d in chdirs]
         while argv and (argv[0] in _SHELL_KEYWORDS or argv[0] == "function" or argv[0] in ("builtin", "command")):
             argv = argv[2:] if argv[0] == "function" else argv[1:]  # ``function NAME {``: the name is no command
+        while len(argv) > 1 and argv[0] == "busybox":
+            argv = argv[1:]  # ``busybox tar -C DIR``: the applet is the command
         if not argv:
             continue
         if "$" in argv[0] or "`" in argv[0] or argv[0] in _RUNS_UNREAD_TEXT:
@@ -1576,8 +1867,20 @@ def _cd_commands(parsed: hardline.Parsed, scan: _CdScan | None = None) -> _CdSca
             scan.found.append((argv[0], argv[1:]))
         if argv[0] in _DIR_OPTION_COMMANDS:
             scan.found += [("cd", [d]) for d in _dir_option_values(argv[0], argv[1:])]
-        scan.links = scan.links or _makes_symlink(argv[0], argv[1:])
+        if raw and _dangling_dir_option(argv, raw[-1]) and any(os.path.basename(t) in _FEEDERS for t in raw):
+            scan.unknown = True  # ``xargs tar -cf - -C``: the input is the directory
+        scan.tar = scan.tar or argv[0] in _TAR_COMMANDS
+        if argv[0] == "find" and _FIND_EXEC.intersection(argv):
+            scan.replaces.append("{}")
+        if "parallel" in {os.path.basename(t) for t in raw}:
+            scan.replaces += _PARALLEL_REPLACES
+        if _makes_symlink(argv[0], argv[1:]):
+            scan.links = True
+            scan.link_names += _link_names(argv[1:])
+        scan.links = scan.links or _unpacks(argv[0], argv[1:])
     for child in parsed.children:
+        if child.clean in trap_payloads or any(s in trap_payloads for s in child.subs):
+            continue  # a trap action runs later: its cd does not move the current line
         _cd_commands(child, scan)
     return scan
 
@@ -1637,10 +1940,12 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
     makes the directory unknown (``unknown``), which the credential check treats like an unknown variable."""
     start = base if isinstance(base, _Where) else _Where((base,))
     scan = _cd_commands(parsed)
+    replaces = tuple(dict.fromkeys([*start.replaces, *scan.replaces]))
+    links = tuple(dict.fromkeys([*start.links, *scan.link_names]))
     cds, cdpath = scan.found, scan.cdpath
     dirs = list(start.dirs)
     home_moved = start.home_moved or scan.home
-    unknown = start.unknown or scan.unknown
+    unknown = start.unknown or scan.unknown or (scan.tar_options and scan.tar)  # ``TAR_OPTIONS`` may hold a ``-C``
     # a link made on the line is not on disk yet when the line is judged, so a ``cd`` may go through it anywhere
     unknown = unknown or (scan.links and any(_cd_operand(name, args) is not None for name, args in cds))
     passes_allowed = _CD_PASSES if _loops(parsed) else 1
@@ -1662,55 +1967,60 @@ def _where(parsed: hardline.Parsed, base: str | _Where, home: str) -> _Where:
                     dirs.append(d)
                     grew = True
             if len(dirs) > _CD_MAX_DIRS:
-                return _Where(tuple(dirs[:_CD_MAX_DIRS]), True, home_moved)
+                return _Where(tuple(dirs[:_CD_MAX_DIRS]), True, home_moved, replaces, links)
         if not grew:
             break
         if passes_allowed > 1 and passes == passes_allowed - 1:
             unknown = True  # still reaching new directories after the last replay
-    return _Where(tuple(dirs), unknown, home_moved)
+    return _Where(tuple(dirs), unknown, home_moved, replaces, links)
 
 
-def _sub_secret_access(sub: str, piped: bool, where: _Where, home: str) -> str | None:
+def _sub_secret_access(
+    sub: str, piped: bool, where: _Where, home: str, budget: _GlobBudget | None = None
+) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
-        worst = _worse(worst, _classify_arg(source, where, home))
+        worst = _worse(worst, _classify_arg(source, where, home, budget))
     wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
     argv = _argv(sub, wrapper_reads)
     for arg in wrapper_reads:
-        worst = _worse(worst, _classify_arg(arg, where, home))
+        worst = _worse(worst, _classify_arg(arg, where, home, budget))
     if not argv:
         return worst
     for command in hardline.ssh_option_commands(argv[0], argv[1:]):
         # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
         inner = hardline.parse(command)
-        worst = _worse(worst, _secret_access(inner, _where(inner, where, home), home, consumed=True))
+        worst = _worse(worst, _secret_access(inner, _where(inner, where, home), home, consumed=True, budget=budget))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
-        worst = _worse(worst, _classify_arg(arg, where, home))
-    if any(_classify_arg(arg, where, home) for arg in writes):
+        worst = _worse(worst, _classify_arg(arg, where, home, budget))
+    if any(_classify_arg(arg, where, home, budget) for arg in writes):
         worst = _worse(worst, "ask")
-    if any(_classify_arg(arg, where, home) for arg in confirm):
+    if any(_classify_arg(arg, where, home, budget) for arg in confirm):
         worst = _worse(worst, "confirm")
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, where: _Where, home: str, consumed: bool = False) -> str | None:
+def _secret_access(
+    parsed: hardline.Parsed, where: _Where, home: str, consumed: bool = False, budget: _GlobBudget | None = None
+) -> str | None:
     """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
-    point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
-    None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
-    tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
-    expanded, globs are matched."""
+    point at one), ``unchecked`` (a glob was too large to check), ``confirm`` (deletes, sources, stages one or hands
+    it to a container), ``ask`` (overwrites one), None. Every argument of every simple command and of everything
+    nested in it counts unless the command only prints, tests or authenticates with it (see _credential_roles), and
+    so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
+    budget = budget or _GlobBudget()  # one for the whole command line, nested commands included
     worst: str | None = None
     # once per line, not per sub: a line of thousands of simple commands made this subs x pipelines (K3NOX-691)
     in_pipes = {sub for p in parsed.pipelines if len(p) > 1 for sub in p}
     for sub in parsed.subs:
         piped = consumed or sub in in_pipes
-        worst = _worse(worst, _sub_secret_access(sub, piped, where, home))
+        worst = _worse(worst, _sub_secret_access(sub, piped, where, home, budget))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
-        worst = _worse(worst, _secret_access(child, where, home, consumed or k < n_subst))
+        worst = _worse(worst, _secret_access(child, where, home, consumed or k < n_subst, budget))
     return worst
 
 
@@ -1728,6 +2038,9 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
         if norm and norm != nested:
             forms.append(norm)
     return list(dict.fromkeys(forms))
+
+
+_UNCHECKED_MSG = "The glob is too large to check for credential files; narrow it"
 
 
 def _decide_bash(
@@ -1748,6 +2061,8 @@ def _decide_bash(
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
+        if secret == "unchecked":
+            return Decision(action="deny", patterns=prefixes, message=f"{_UNCHECKED_MSG}: {command[:120]}")
         return Decision(action="allow", patterns=prefixes)
     if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
         # auto mode writes only inside the project roots; no allow rule overrides this
@@ -1793,12 +2108,12 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
-    if secret in ("human", "confirm") and worst.action != "deny":
-        why = (
-            "A variable may point at a credential file"
-            if secret == "human"
-            else "Deletes, sources, stages or hands a container a credential file"
-        )
+    if secret in ("human", "confirm", "unchecked") and worst.action != "deny":
+        why = {
+            "human": "A variable may point at a credential file",
+            "confirm": "Deletes, sources, stages or hands a container a credential file",
+            "unchecked": _UNCHECKED_MSG,
+        }[secret]
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
@@ -1938,12 +2253,18 @@ def _home_stores() -> list[str]:
         for h in dict.fromkeys((os.path.normpath(home), _real(home)))
         for rel in (*HOME_RO_HIDDEN, _UV_CREDENTIALS)
     ]
-    return list(dict.fromkeys([*stores, *map(os.path.realpath, stores)]))
+    return list(dict.fromkeys([*stores, *map(_real, stores)]))
+
+
+def _flat(path: str) -> str:
+    """``path`` (absolute) normalised, with a leading ``//`` made ``/``: normpath keeps two slashes (POSIX leaves them
+    implementation-defined) and the kernel does not: ``//home/u/.npmrc`` is ``/home/u/.npmrc`` and must compare so."""
+    return "/" + os.path.normpath(path).lstrip("/")
 
 
 def _spellings(path: str) -> list[str]:
     """``path`` (absolute) as written, normalised, and its realpath."""
-    return list(dict.fromkeys((os.path.normpath(path), _real(path))))
+    return list(dict.fromkeys((_flat(path), _real(path))))
 
 
 def _stores_holding(spellings: list[str], stores: list[str]) -> list[str]:
@@ -1985,24 +2306,116 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     of ``$HOME`` (or is a dotfile there), a root at or above ``$HOME`` covers it and no project root below ``$HOME``
     does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
     (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
+    return _home_dot_spelled(_spellings(path), roots)
+
+
+def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
+    """_home_dot_read for a path given as its spellings."""
     home = os.path.normpath(os.path.expanduser("~"))
     if not _inside(home, roots):
         return False
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
-    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+    return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in spellings)
 
 
-def home_store_path(path: str) -> bool:
-    """``path`` (absolute) lies in a credential store of ``$HOME`` (see _home_stores), whatever the roots: the check
-    for a reader that has no ``decide()`` of its own (the memory loader's @imports)."""
-    return bool(_stores_holding(_spellings(path), _home_stores()))
+def _link_hops(path: str) -> list[str]:
+    """``path`` (absolute) as written and, for each symlink met on the way to its realpath, what the path becomes
+    after following it: ``~/.config/gh/hosts.yml -> ~/dotfiles/gh/hosts.yml`` is both. A reader that opens the final
+    target would otherwise never see that the path it was given names a credential store."""
+    hops: list[str] = []
+    cur = path
+    try:
+        for _ in range(_MAX_LINK_HOPS):
+            hops.append(_flat(cur))
+            done: list[str] = []
+            rest = cur.split("/")
+            for i, comp in enumerate(rest):
+                if comp in ("", "."):
+                    continue
+                if comp == "..":
+                    if done:
+                        done.pop()
+                    continue
+                probe = "/" + "/".join([*done, comp])
+                if os.path.islink(probe):
+                    cur = os.path.join(os.path.join("/" + "/".join(done), os.readlink(probe)), *rest[i + 1 :])
+                    break
+                done.append(comp)
+            else:
+                break
+    except (OSError, ValueError):
+        pass
+    return list(dict.fromkeys([*hops, _real(path)]))
 
 
-def home_dot_path(path: str, roots: Sequence[str]) -> bool:
-    """``path`` (absolute) lies below a dot folder of ``$HOME`` that ``roots`` cover only because a root is at or
-    above ``$HOME`` (see _home_dot_read): a project root below ``$HOME`` makes its own ``.github`` ordinary."""
-    return _home_dot_read(path, list(roots))
+_MAX_LINK_HOPS = 40  # as the kernel's symlink limit
+
+
+def _under(path: str, base: str, fold: bool = False) -> bool:
+    """``path`` is ``base`` or lies below it, by name (not resolved again). ``fold`` compares case-insensitively, as
+    secret_store does: only the test that a path lies in a credential store wants that (on drvfs and macOS
+    ``~/.NPMRC`` is ``~/.npmrc``). A root that covers a path, or lies in a store, does so by its exact spelling."""
+    low, root = (path.casefold(), base.casefold().rstrip("/")) if fold else (path, base.rstrip("/"))
+    return low == root or low.startswith(root + "/")
+
+
+def _mirrored(path: str, homes: list[str], projects: list[str]) -> bool:
+    """``path`` lies in a copy of a project root that keeps the root's place below ``$HOME``, in a folder of its own
+    without a dot: a GNU stow package (``~/dotfiles/k3code/.k3code/memory/USER.md`` for the root ``~/.k3code/memory``).
+    Only a root whose own place has a dot component needs this: the copy is the same files, so its dot folders are as
+    ordinary as the root's; any other dot folder of the package (``.config/gh``) is not."""
+    for home in homes:
+        if not path.startswith(home):
+            continue
+        parts = path[len(home) :].split("/")
+        for root in projects:
+            rel = next((root[len(h) :].split("/") for h in homes if root.startswith(h)), [])
+            if not any(c.startswith(".") for c in rel):
+                continue
+            for i in range(1, len(parts) - len(rel) + 1):
+                if any(c.startswith(".") for c in parts[:i]):
+                    break
+                if parts[i : i + len(rel)] == rel:
+                    return True
+    return False
+
+
+def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequence[str] = ()) -> bool:
+    """``path`` (absolute, as written: not resolved) must not be pulled into the prompt by the memory loader, which
+    has no ``decide()`` of its own: a key or dotenv file (sensitive_path); a file in a credential store of ``$HOME``
+    (see _home_stores) or in one of ``extra_stores``; or, with a root at or above ``$HOME``, anything below a dot
+    folder of ``$HOME``. Every spelling is checked: the path as written, each hop of a symlink chain and the realpath
+    (see _link_hops), so a store file that links out and a plain file that links in are both caught.
+
+    The roots decide what is ordinary, as for the in-process readers (_home_store_read, _home_dot_read): a root inside
+    a store, with the whole path inside that root, makes its own files ordinary (a session started in
+    ``~/.claude/skills/x`` reads that skill's ``CLAUDE.md``), and a root below ``$HOME`` that does not contain it
+    makes its dot folders ordinary (``.github`` of a repository). A root counts as written and by its realpath, and a
+    spelling lies in it by name: a spelling is never resolved a second time, or a memory folder kept in a dotfiles
+    repository (``~/.k3code/memory -> ~/dotfiles/k3code/memory``) would stop being its own. Callers have already
+    checked the target lies in the roots, so a store outside every root needs no test here."""
+    spellings = _link_hops(path)
+    if any(sensitive_path(p) for p in spellings):
+        return True
+    forms = {r: _spellings(r) for r in map(str, roots)}  # each root as written and by realpath
+
+    def covers(root: str, paths: list[str]) -> bool:
+        return all(any(_under(p, f) for f in forms[root]) for p in paths)
+
+    for store in [*_home_stores(), *extra_stores]:
+        held = [p for p in spellings if _under(p, store, fold=True)]
+        if held and not any(any(_under(f, store) for f in forms[r]) and covers(r, held) for r in forms):
+            return True
+    home = os.path.normpath(os.path.expanduser("~"))
+    if not _inside(home, list(forms)):
+        return False
+    projects = [f for r in forms if not _inside(home, [r]) for f in forms[r]]
+    homes = _home_prefixes()
+    return any(
+        _below_home_dot(p, homes) and not (any(_under(p, f) for f in projects) or _mirrored(p, homes, projects))
+        for p in spellings
+    )
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:

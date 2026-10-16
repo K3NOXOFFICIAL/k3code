@@ -250,8 +250,10 @@ LAUNCHERS = frozenset(
         "ksh",
         "fish",
         "eval",
+        "trap",
         "ssh",
         "xargs",
+        "parallel",
         "su",
         "watch",
         "find",
@@ -787,6 +789,14 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
         frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file", "--eof", "--max-chars"}),
         0,
     ),
+    "parallel": (
+        "aCdEIjLlNnS",
+        frozenset(
+            {"--arg-file", "--colsep", "--delimiter", "--eof", "--replace", "--jobs", "--max-lines", "--max-args"}
+            | {"--max-replace-args", "--sshlogin", "--results", "--joblog", "--workdir", "--timeout", "--retries"}
+        ),
+        0,
+    ),
     "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"}), 0),
     "ionice": ("cnpPu", frozenset({"--class", "--classdata", "--pid", "--pgid", "--uid"}), 0),
     "nohup": ("", frozenset(), 0),
@@ -948,7 +958,8 @@ def _skip_wrapper_options(
                 reads.append(value)
             if key in chdir_long and value and chdirs is not None:
                 chdirs.append(value)
-            if name == "xargs" and replaces is not None and len(key) >= 5 and "--replace".startswith(key):
+            # getopt takes any unambiguous prefix: ``--r`` is enough
+            if name == "xargs" and replaces is not None and len(key) >= 3 and "--replace".startswith(key):
                 replaces.append(value or _XARGS_REPLACE)
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
@@ -1707,14 +1718,36 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
     return out, remote
 
 
+def _trap_actions(args: list[str]) -> list[str]:
+    """The action strings of ``trap`` with arguments ``args``: shell that runs later (at exit, on a signal, on
+    ERR/DEBUG), so each is read like a ``bash -c`` payload. The shells disagree on what an option is: bash takes
+    ``-l``/``-p``/``-P`` and fails on any other ``-x``, dash and ash fail on any ``-x``, and a ``+x`` word is the action
+    in all three; zsh reads every first word but ``--`` as the action. Both readings are returned (reading one too
+    many is safe). Nothing for ``trap -l``/``-p`` in bash, a lone ``-`` (resets the traps) or an empty action."""
+    out: list[str] = []
+    i = 0
+    while i < len(args) and len(args[i]) > 1 and args[i].startswith("-") and args[i] != "--":
+        i += 1
+    letters = "".join(a[1:] for a in args[:i])
+    if i < len(args) and args[i] == "--":
+        i += 1
+    if not set(letters) & set("lp") and i < len(args):
+        out.append(args[i])
+    first = args[1:] if args[:1] == ["--"] else args
+    if first:
+        out.append(first[0])
+    return [a for a in dict.fromkeys(out) if a not in ("", "-")]
+
+
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
-    values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and the command line of ``wsl.exe``, ``cmd.exe /c``
-    and ``powershell.exe -Command`` (see _windows_command_line): strings run as commands, unquoted as the shell
-    unquotes them (see _shell_words). An unquoted ``${...}`` is read both as written and as the text its word gives
-    (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double quotes both as written and with the backslashes
-    the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs `` `a` ``), every combination of the two, and
-    shlex's reading is checked as well. Identical readings are one reading."""
+    action string of ``trap`` (see _trap_action), the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and
+    the command line of ``wsl.exe``, ``cmd.exe /c`` and ``powershell.exe -Command`` (see _windows_command_line):
+    strings run as commands, unquoted as the shell unquotes them (see _shell_words). An unquoted ``${...}`` is read
+    both as written and as the text its word gives (``bash -c ${x:+'`a`'}`` runs `` `a` ``), a ``${...}`` in double
+    quotes both as written and with the backslashes the shell drops there removed (``bash -c "${x:+\\`a\\`}"`` runs
+    `` `a` ``), every combination of the two, and shlex's reading is checked as well. Identical readings are one
+    reading."""
     out: list[str] = []
     # the readings differ only in a ${...} unit: without one they are all the first, read once (a line of thousands of
     # simple commands is read once per command, see engine._secret_access)
@@ -1727,6 +1760,8 @@ def _launcher_payloads(sub: str) -> list[str]:
         real = normalize_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real and real[0] == "trap":
+            out += _trap_actions(real[1:])
         if real:
             out += ssh_option_commands(real[0], real[1:])
             out += _windows_command_line(real[0], real[1:])

@@ -25,6 +25,7 @@ from k3code.tools.fuzzy_match import (
     fuzzy_find_and_replace,
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
+from k3code.tools.safe_open import NotAllowed, open_regular
 from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
@@ -249,32 +250,31 @@ def _too_big_to_read(path: Path) -> dict[str, Any] | None:
     return {"error": f"{_file_size_note(size)}: edit cannot load it; change it with bash (sed, python) instead"}
 
 
-def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
-    """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them."""
+def _read_range(f: Any, start: int, end: int) -> dict[str, Any]:
+    """Lines ``start..end`` of the large file ``f`` (open, binary), streamed, at most MAX_READ_BYTES of them."""
     selected: list[str] = []
     total = used = 0
     too_big = {"error": f"Lines {start}-{end} exceed {MAX_READ_BYTES // (1024 * 1024)} MB: request a smaller range"}
-    with path.open("rb") as f:
-        number = 1  # only \n ends a line here; a huge file is not re-split on \r
-        while number <= end:
-            raw = f.readline(MAX_READ_BYTES + 1)  # bounded: one endless line must not be loaded whole either
-            if not raw:
-                break
-            if len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n"):
-                if number >= start:
-                    return too_big
-                while raw and not raw.endswith(b"\n"):  # skip the rest of a huge line before the range
-                    raw = f.readline(1 << 20)
-            elif number >= start:
-                total += len(raw)
-                if total > MAX_READ_BYTES:
-                    return too_big
-                line = _cap_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
-                used += len(line) + _NUMBER_WIDTH + 2
-                if selected and used > READ_MAX_CHARS:
-                    break  # the char budget is spent: the model continues with offset
-                selected.append(line)
-            number += 1
+    number = 1  # only \n ends a line here; a huge file is not re-split on \r
+    while number <= end:
+        raw = f.readline(MAX_READ_BYTES + 1)  # bounded: one endless line must not be loaded whole either
+        if not raw:
+            break
+        if len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n"):
+            if number >= start:
+                return too_big
+            while raw and not raw.endswith(b"\n"):  # skip the rest of a huge line before the range
+                raw = f.readline(1 << 20)
+        elif number >= start:
+            total += len(raw)
+            if total > MAX_READ_BYTES:
+                return too_big
+            line = _cap_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+            used += len(line) + _NUMBER_WIDTH + 2
+            if selected and used > READ_MAX_CHARS:
+                break  # the char budget is spent: the model continues with offset
+            selected.append(line)
+        number += 1
     if not selected:
         return {"content": "", "lines": f"{start}-{start} (past the end of the file)"}
     last = start + len(selected) - 1
@@ -319,20 +319,27 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
 def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
-    if not path.is_file():
+    try:
+        # one open decides everything below: the permission check, the type and the size are those of this file, not
+        # of whatever the name means by the time each of them looks again (a directory swapped for a link, K3NOX-719)
+        f = open_regular(path)
+    except NotAllowed:
+        return {"error": f"Permission denied: {path} leads to a file the permission check did not allow (a link)"}
+    except (OSError, ValueError):  # missing, a directory or other non-regular file, not readable
         return {"error": f"File not found: {path}"}
-    explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
-    first, count = _read_window(arguments)
-    size = path.stat().st_size
-    if size > MAX_READ_BYTES:
-        # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
-        if not explicit:
-            return {
-                "error": f"{_file_size_note(size)}: "
-                "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
-            }
-        return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
-    text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
+    with f:
+        explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
+        first, count = _read_window(arguments)
+        size = os.fstat(f.fileno()).st_size
+        if size > MAX_READ_BYTES:
+            # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
+            if not explicit:
+                return {
+                    "error": f"{_file_size_note(size)}: "
+                    "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
+                }
+            return _read_range(f, first, first + (count or READ_DEFAULT_LIMIT) - 1)
+        text = f.read().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
     total = len(lines)
     first = min(first, total + 1)
@@ -1092,10 +1099,14 @@ def _grep_file(
     """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
     preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
     matches`` line, as rg says. A walked entry passes the real path it must be (``expect``); one that is a link, a
-    FIFO or any other non-regular file, or that is not that path when opened, raises OSError unread. Past ``deadline``
-    (``time.monotonic``) it yields None once and stops. A line longer than _GREP_PIECE_BYTES is searched piece by
-    piece under its own line number, so a match across a piece edge, or an anchor at one, is approximate."""
-    with _open_regular(fp, expect) as f:
+    FIFO or any other non-regular file, or that is not that path when opened, raises OSError unread. A named file is
+    opened as the permission check decided on it (see open_regular); a walked one by its descriptor (see
+    _open_regular). Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
+    _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
+    anchor at one, is approximate."""
+    # a named file is opened as the permission check decided on it (see open_regular); a walked one must still be
+    # the walked path when opened (see _open_regular)
+    with open_regular(fp) if named else _open_regular(fp, expect) as f:
         binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
         if binary and not named:
             return
@@ -1147,6 +1158,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     real_base = os.path.realpath(base)  # base itself may be a link the engine decided on
     matches: list[str] = []
     skipped = 0
+    changed = False
     timed_out = False
     secret_file = sensitive_path if named else search_withheld(str(path))  # a named file: tool_grep decided on it
     for rel, is_dir in candidates:
@@ -1179,6 +1191,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
                 matches.append(hit)
                 if len(matches) > MAX_SEARCH_RESULTS:
                     break
+        except NotAllowed:  # a named file whose path changed under the permission check: nothing of it was read
+            changed = True
+            continue
         except OSError:  # unreadable, not a regular file, a link, or an index entry deleted from the work tree
             continue
         if timed_out or len(matches) > MAX_SEARCH_RESULTS:
@@ -1189,6 +1204,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     result = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
     if skipped:
         _note_withheld(result, f"{skipped} credential file(s) (.env, keys, home dot folders) not searched")
+    if changed:
+        gone = f"{path} leads to a file the permission check did not allow (a link on the path): not searched"
+        result["warnings"] = f"{result['warnings']}; {gone}" if result.get("warnings") else gone
     return result
 
 

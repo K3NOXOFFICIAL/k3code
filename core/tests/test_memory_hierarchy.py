@@ -489,3 +489,13 @@ def test_a_repository_below_home_keeps_its_dot_folders_importable(tmp_path: Path
     _write(root / ".github" / "contributing.md", "CI-RULES")
     _write(root / "AGENTS.md", "@.github/contributing.md")
     assert "CI-RULES" in load_memory(root)[0].text
+
+
+def test_an_import_line_with_a_nul_byte_stays_as_written(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "alice"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "alice" / ".k3code"))
+    root = _repo(tmp_path)
+    _write(root / "AGENTS.md", "before\n@a\x00b\nafter\n")
+    loaded = load_memory(root)
+    assert [m.text for m in loaded] == ["before\n@a\x00b\nafter"]
+    assert "@a\x00b" in memory_prompt(root)

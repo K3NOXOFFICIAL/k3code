@@ -2759,12 +2759,17 @@ class GatewayServer:
                 session.announced_tools.clear()
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
-        async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
-            decision = decision or session.perms.decide(tool_name, arguments)
+        async def approve(
+            tool_name: str, arguments: dict[str, Any], decision: Any = None, *, perms: Any = None
+        ) -> ApprovalResult:
+            # a background sub-agent asks through its parent's callback while the parent may have moved on to another
+            # project: ``perms`` is the asking loop's own state, so the preview and an "always" rule use its project
+            where = perms if perms is not None else session.perms
+            decision = decision or where.decide(tool_name, arguments)
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
-            preview = await _change_preview(tool_name, arguments, session.perms.cwd)
+            preview = await _change_preview(tool_name, arguments, where.cwd)
             try:
                 result = await self._ask_client(
                     "approval",
@@ -2803,7 +2808,7 @@ class GatewayServer:
             if choice in ("session", "always"):
                 session.perms.session_rules.extend(rules)
             if choice == "always" and rules:
-                persist_rules(project_config_path(session.perms.cwd), rules)
+                persist_rules(project_config_path(where.project_dir or where.cwd), rules)
             self.learning.approval(
                 session, tool_name, pattern, choice, reason=reason, command=_command_for_tool(tool_name, arguments)
             )
