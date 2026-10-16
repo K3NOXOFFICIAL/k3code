@@ -530,7 +530,7 @@ async def test_config_set_model_switches_session_model():
     }
     await server._handle_line(json.dumps(line))
     ok = next(f for f in frames_of(server)[n:] if f.get("id") == 2)
-    assert ok["result"]["value"] == "cheap"
+    assert ok["result"]["value"] == "b"  # resolved model id, not the key (#365: status bar shows the id)
     assert server._session_for(sid).stored.model == "cheap"
     bad = await rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "nope"}, req_id=3)
     assert "error" in bad

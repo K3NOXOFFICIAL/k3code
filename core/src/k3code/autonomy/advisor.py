@@ -28,7 +28,10 @@ TOOL_SYSTEM = (
     "directly: give a concrete plan or diagnosis, name wrong assumptions and risks, and say what to check next. "
     "Under 400 words."
 )
-SUMMARY_SYSTEM = "Summarize this coding conversation: the goal, decisions, work done, open problems. Max 300 words."
+SUMMARY_SYSTEM = (
+    "Summarize this coding conversation for the agent that continues it: the goal, decisions, files read and "
+    "changed (exact paths), commands run and their results, open problems, and the next step. Max 400 words."
+)
 
 
 #: ``/advisor on`` without a model key: the strong tier of the configured routing.
@@ -71,13 +74,29 @@ def session_advisor(meta: dict[str, Any] | None, default: str = "") -> str:
 
 
 def transcript_text(messages: list[Message] | list[dict[str, Any]], *, per_message: int = 1500) -> str:
+    """Conversation as text for the compaction summarizer (#171): assistant tool calls are included, so files
+    edited and commands run are not lost (before, only message text was seen)."""
     lines: list[str] = []
     for m in messages:
-        role = m["role"] if isinstance(m, dict) else m.role
-        content = (m.get("content") if isinstance(m, dict) else m.content) or ""
-        if role == "system" or not content:
+        if isinstance(m, dict):
+            role, content, calls = m.get("role"), m.get("content") or "", m.get("tool_calls") or []
+            call_items = [
+                (c.get("name", "?"), json.dumps(c.get("arguments", {}))[:200]) for c in calls if isinstance(c, dict)
+            ]
+        else:
+            role, content = m.role, m.content or ""
+            call_items = [(c.name, json.dumps(c.arguments)[:200]) for c in (m.tool_calls or [])]
+        if role == "system" and not call_items:
             continue
-        lines.append(f"{role}: {str(content)[:per_message]}")
+        if content:
+            lines.append(f"{role}: {str(content)[:per_message]}")
+        for name, args in call_items:
+            lines.append(f"assistant called: {name}({args})")
+        if role == "tool" and not content and not call_items:
+            continue
+        if role == "tool" and content:
+            tool_name = getattr(m, "name", None) or (m.get("name") if isinstance(m, dict) else "")
+            lines[-1] = f"tool {tool_name}: {lines[-1]}"
     return "\n".join(lines)
 
 

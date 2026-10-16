@@ -195,6 +195,29 @@ class InteractivePrompter(Prompter):
     interactive = True
 
     def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        # Long menus (model lists, #122) get a type-ahead filter so a 300-model endpoint does not need 400 DOWN
+        # keys: a FuzzyCompleter over the choices, free text accepted (a model id can be typed directly).
+        if len(choices) > 8:
+            try:
+                from prompt_toolkit import prompt as _prompt
+                from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
+            except ImportError:
+                return self._numbered(message, choices, default)
+            shown = "\n".join(f"  {i}) {c}" for i, c in enumerate(choices, 1))
+            print(f"{message}\n{shown}")
+            completer = FuzzyCompleter(WordCompleter(choices, ignore_case=True))
+            raw = _prompt(f"{message} [{default or choices[0]}] (number, name or filter text): ",
+                          completer=completer, complete_while_typing=True).strip()
+            if not raw:
+                return default or choices[0]
+            if raw.isdigit() and 1 <= int(raw) <= len(choices):
+                return choices[int(raw) - 1]
+            if raw in choices:
+                return raw
+            # a filter substring: first choice containing it, else the raw text (a custom model id)
+            lowered = raw.lower()
+            hit = next((c for c in choices if lowered in c.lower()), None)
+            return hit if hit is not None else raw
         try:
             from prompt_toolkit.shortcuts import choice
         except ImportError:  # old prompt_toolkit: numbered fallback

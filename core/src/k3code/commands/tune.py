@@ -215,6 +215,7 @@ def apply_tune(ctx: Any, live: Any, req: TuneRequest) -> TuneOutcome:
 
     saved = ""
     wrote = False
+    saved_provider = ""
     if req.model is not None and req.scope == "default":
         try:
             wrote, backup = chain_config.set_default_model(req.model)
@@ -222,6 +223,16 @@ def apply_tune(ctx: Any, live: Any, req: TuneRequest) -> TuneOutcome:
             raise TuneError(f"Could not save the default model: {e}") from e
         where = str(chain_config.config_path())
         saved = f" (saved to {where}" + (f", backup: {backup})" if backup else ")")
+    if provider is not None and req.scope == "default":
+        # `/tune --provider x --global` persists the provider pin for new sessions (#365); without --global it
+        # stays a session (or daemon) default like /provider.
+        try:
+            wrote_p, backup_p = chain_config.set_default_provider(provider)
+        except chain_config.ChainEditError as e:
+            raise TuneError(f"Could not save the default provider: {e}") from e
+        if wrote_p:
+            where = str(chain_config.config_path())
+            saved_provider = f" (saved to {where}" + (f", backup: {backup_p})" if backup_p else ")")
 
     changed: list[str] = []
     lines: list[str] = []
@@ -251,18 +262,24 @@ def apply_tune(ctx: Any, live: Any, req: TuneRequest) -> TuneOutcome:
         if req.scope == "default":
             lines.append(f"Default model for new sessions: {key}{saved}")
     if provider is not None:
-        # Like /provider: the session's turns try that block first from the next turn on; without a session it is the
-        # default of this daemon (not saved, also with --global).
+        # Like /provider: the session's turns try that block first from the next turn on; with --global the pin is
+        # also saved as default_provider for new sessions (#365), otherwise it stays a session (or daemon) default.
         if live is not None:
             if live.stored.provider != provider:
                 changed.append("provider")
             live.stored.provider = provider
             session_changed = True
-        else:
-            if config.default_provider != provider:
+        if req.scope == "default":
+            if config.default_provider != provider or saved_provider:
                 changed.append("default_provider")
             config.default_provider = provider
-        lines.append(f"Provider set to: {provider}")
+            lines.append(f"Provider set to: {provider}{saved_provider}")
+        else:
+            if live is None:
+                if config.default_provider != provider:
+                    changed.append("default_provider")
+                config.default_provider = provider
+            lines.append(f"Provider set to: {provider}")
     if req.effort is not None:
         # Sent from the next turn on: as output_config.effort to Claude models that take it, and as
         # reasoning_effort to OpenAI reasoning models. Other models ignore it.

@@ -550,8 +550,12 @@ def _first_model_id(spec: str | list[str]) -> str:
 
 def _model_label(config: Any, key: str, provider: str = "") -> str:
     """The model id the active provider block (``provider``, the session's /provider pick, else ``default_provider``,
-    else the first block) uses for ``key`` (what the user recognises), else the key itself."""
-    specs = _resolve_model_specs(config, key) if config.providers else []
+    else the first block) uses for ``key`` (what the user recognises), else the key itself.
+
+    Uses the same ``tier_model_specs(Tier.MAIN)`` lookup as ``_active_model`` so the label always names the model a
+    turn goes to (issue #365): the old ``_resolve_model_specs`` ignored ``tiers.main``.
+    """
+    specs = tier_model_specs(config, Tier.MAIN, key=key) if config.providers else []
     name = active_provider(config, provider)
     first = next((s for p, s in zip(config.providers, specs, strict=False) if p.name == name), "")
     return str(_first_model_id(first) or key)
@@ -4334,9 +4338,10 @@ async def _config_set_reasoning(server: GatewayServer, params: dict[str, Any]) -
 async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``config.set model``: value is ``<model-key> [--provider p] [--reasoning <level>] [--session|--global]``.
 
-    ``--global`` also makes the key the saved default of new sessions; ``--reasoning`` sets the session's effort
-    (ignored without a session); ``--provider`` pins the session to that provider block like /provider (without a
-    session: the daemon's default provider, not saved); the other picker flags are ignored."""
+    ``--global`` also makes the key (and a ``--provider`` pin) the saved default of new sessions (#365);
+    ``--reasoning`` sets the session's effort (ignored without a session); ``--provider`` pins the session to that
+    provider block like /provider; the other picker flags are ignored. Returns the resolved model id as ``value``
+    (not just the key) so the TUI status bar shows the id, not the alias."""
     parts = iter(str(params.get("value") or "").split())
     keys: list[str] = []
     reasoning: str | None = None
@@ -4364,7 +4369,8 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
         tune_cmd.apply_tune(server, session, req)
     except tune_cmd.TuneError as e:
         raise _InvalidParams(str(e)) from None
-    return {"ok": True, "key": "model", "value": key}
+    pinned = session.stored.provider if session is not None else (provider or "")
+    return {"ok": True, "key": "model", "value": _model_label(server.config, key, pinned)}
 
 
 async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

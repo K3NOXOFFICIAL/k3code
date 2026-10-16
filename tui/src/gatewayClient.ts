@@ -554,9 +554,11 @@ export class GatewayClient extends EventEmitter {
     const cmdOverride = resolveGatewayCmd();
     const python = resolvePython();
     // k3: the k3code gateway works in the user's directory, not the TUI source root.
+    // K3CODE_TUI_CWD first, HERMES_CWD as a legacy fallback (#170: env rename reads K3CODE_* first).
     const cwd =
       process.env.K3CODE_CWD ||
-      (cmdOverride ? process.cwd() : process.env.HERMES_CWD || root);
+      process.env.K3CODE_TUI_CWD ||
+      (cmdOverride ? process.cwd() : process.env.HERMES_CWD || process.env.HERMES_TUI_CWD || root);
     const env = { ...process.env };
     const pyPath = env.PYTHONPATH?.trim();
 

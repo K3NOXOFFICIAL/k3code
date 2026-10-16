@@ -1047,6 +1047,10 @@ export function useMainApp(gw: GatewayClient) {
         request_id: clarify.requestId,
       }).then((r) => {
         if (!r) {
+          // No `clarify.lock` on this backend (#170: the gateway answers single-question clarifies via the
+          // server request itself). Answer the pending request directly so the turn continues instead of hanging.
+          respondToServerRequest(clarify.requestId, { answer });
+          patchOverlayState({ clarify: null });
           return;
         }
 

@@ -46,6 +46,46 @@ def test_every_method_the_tui_calls_on_its_own_or_from_a_kept_command_exists():
         assert method in _HANDLERS, method
 
 
+#: Client→server RPCs the TUI is allowed to call without a gateway handler: each has a local fallback.
+#: `clarify.lock` (batch clarify) falls back to answering the pending server clarify request directly (#170).
+_TUI_RPC_ALLOWLIST = frozenset({"clarify.lock"})
+
+
+def test_every_rpc_method_the_tui_source_calls_exists_or_has_a_fallback():
+    """#170: fail when the TUI calls an RPC the gateway does not implement (dead overlay / missing handler).
+
+    Scans ``tui/src`` for client→server calls (``rpc("method"`` / ``.request("method"``) and asserts each is in
+    ``_HANDLERS``, unless allowlisted with a local fallback. Event/case labels and server→client methods are not
+    matched: only the two call-site shapes above.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent.parent / "tui" / "src"
+    if not root.is_dir():
+        pytest.skip("tui/src not checked out next to core/")
+    pat = re.compile(
+        r"""(?:\brpc\s*(?:<[^>]*>)?\s*\(\s*|\.request\s*(?:<[^>]*>)?\s*\(\s*)["']([a-z][a-z0-9_.-]+)["']"""
+    )
+    missing: dict[str, list[str]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in (".ts", ".tsx"):
+            continue
+        if "__tests__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in pat.finditer(text):
+            method = m.group(1)
+            if method not in _HANDLERS and method not in _TUI_RPC_ALLOWLIST:
+                missing.setdefault(method, []).append(str(path.relative_to(root)))
+                if len(missing[method]) > 3:
+                    missing[method].append("...")
+                    break
+    assert not missing, f"TUI calls RPCs the gateway does not implement: {missing}"
+
+
 async def test_shell_exec_runs_in_the_session_directory_and_keeps_the_hardline(tmp_path, monkeypatch):
     server = await _server(tmp_path, monkeypatch)
     res = await call(server, "shell.exec", {"command": "pwd; echo out; echo err >&2; exit 3"})

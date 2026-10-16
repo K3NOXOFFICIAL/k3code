@@ -94,12 +94,16 @@ class OpenAICompatProvider(Provider):
         wire = messages_to_openai(messages)
         if self._marks(model):
             _add_cache_breakpoints(wire)
+        # Reasoning models (gpt-5, o-series) on api.openai.com reject max_tokens (#171): send
+        # max_completion_tokens instead, matching takes_effort (relay-prefixed ids like openai/gpt-5 covered).
+        from k3code.providers.effort import takes_effort as _takes_effort
+
         payload: dict[str, Any] = {
             "model": model,
             "messages": wire,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": max_tokens,
+            ("max_completion_tokens" if _takes_effort(model, "openai") else "max_tokens"): max_tokens,
         }
         if temperature is not None:
             payload["temperature"] = temperature
@@ -183,11 +187,20 @@ class OpenAICompatProvider(Provider):
                             yield StreamEvent(type="text_delta", text=text)
                         for tc in delta.get("tool_calls") or []:
                             idx = tc.get("index", 0)
-                            slot = tool_calls.setdefault(idx, {"id": "", "name": "", "args": []})
-                            if tc_id := tc.get("id"):
+                            # Some relays number every parallel call 0 (#171): a different non-empty id on the
+                            # same wire index opens a new slot instead of merging into the first call. Repeated
+                            # whole names (a retried name chunk) still de-duplicate into the open slot.
+                            slot = tool_calls.get(idx)
+                            tc_id = tc.get("id") or ""
+                            if slot is None:
+                                slot = tool_calls[idx] = {"id": "", "name": "", "args": []}
+                            elif tc_id and slot["id"] and tc_id != slot["id"]:
+                                idx = max(tool_calls) + 1 if tool_calls else 0
+                                slot = tool_calls[idx] = {"id": "", "name": "", "args": []}
+                            if tc_id and not slot["id"]:
                                 slot["id"] = tc_id
                             fn = tc.get("function") or {}
-                            if fn_name := fn.get("name"):
+                            if (fn_name := fn.get("name")) and fn_name not in slot["name"]:
                                 slot["name"] += fn_name
                             if args := fn.get("arguments"):
                                 slot["args"].append(args)
