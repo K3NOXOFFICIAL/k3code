@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from k3code import doctor
 from k3code.config import Settings
 from k3code.gateway.server import GatewayServer
@@ -199,3 +201,51 @@ async def test_a_gateway_start_reaps_the_repos_its_sessions_worked_in(tmp_path, 
 
     assert not (repo / ".k3code" / "worktrees" / "w3").exists()
     assert sh(repo, "show", "k3/w3:half.txt") == "work in progress\n"
+
+
+def victim_tree(tmp_path: Path) -> Path:
+    """A harmless folder outside the repository, with entries ``git worktree prune`` would drop from a worktrees folder
+    (it keeps only the admin dirs that hold a ``gitdir`` file): a plain file and a subfolder."""
+    victim = tmp_path / "victim"
+    (victim / "sub").mkdir(parents=True)
+    (victim / "sub" / "marker.txt").write_text("keep\n")
+    (victim / "marker.txt").write_text("keep\n")
+    return victim
+
+
+async def test_reap_does_not_prune_through_a_worktrees_link_into_another_folder(tmp_path):
+    """``<common dir>/worktrees`` replaced by a link (a sandboxed command with ``git_writable`` can do that): the
+    start-up prune would empty the link's target. The reap leaves the repository alone and says so."""
+    repo = git_repo(tmp_path / "repo")
+    victim = victim_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(victim, target_is_directory=True)
+
+    reaped = await wt.reap(repo)
+
+    assert reaped is None
+    assert (victim / "sub" / "marker.txt").read_text() == "keep\n" and (victim / "marker.txt").exists()
+    assert (repo / ".git" / "worktrees").is_symlink()  # the user's repository is not rewritten either
+
+
+async def test_create_refuses_to_add_a_worktree_through_a_worktrees_link(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    victim = victim_tree(tmp_path)
+    (repo / ".git" / "worktrees").symlink_to(victim, target_is_directory=True)
+    before = sorted(p.relative_to(victim) for p in victim.rglob("*"))
+
+    with pytest.raises(RuntimeError, match="worktrees"):
+        await wt.create(repo, "child1")
+
+    assert sorted(p.relative_to(victim) for p in victim.rglob("*")) == before  # nothing was written into the target
+    assert not (repo / ".k3code" / "worktrees" / "child1").exists()
+    assert not wt.owner_file(repo / ".k3code" / "worktrees" / "child1").exists()
+
+
+async def test_a_worktrees_folder_that_is_a_real_directory_is_reaped_as_before(tmp_path):
+    repo = git_repo(tmp_path / "repo")
+    crash_worker(repo, "w2")
+    assert (repo / ".git" / "worktrees").is_dir()
+
+    reaped = await wt.reap(repo)
+
+    assert reaped is not None and [w.id for w in reaped.worktrees] == ["w2"]
