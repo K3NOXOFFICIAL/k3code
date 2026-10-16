@@ -15,11 +15,13 @@ import glob
 import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+from k3code import paths
 
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
@@ -420,7 +422,8 @@ def _inside(path: str, roots: list[str]) -> bool:
 #: ``.git`` FILE of a linked worktree naming its git directory), direnv runs ``.envrc`` on the next ``cd``, husky its
 #: hooks on the next commit, and ``.k3code/config*`` sets permission rules and hooks. ``write`` and ``edit`` run in the
 #: daemon, outside the sandbox, and the harness's own git runs there too (scope classification, worktrees).
-#: Matched at any depth and case-insensitively; ``.git`` stands for everything under it.
+#: Matched at any depth and case-insensitively; ``.git`` stands for everything under it. The state directory
+#: ``$K3CODE_HOME`` is protected whole, under whatever name, see :func:`k3code_state`.
 _PROTECTED = re.compile(
     r"(?:^|/)(?:\.git|\.gitattributes|\.gitmodules|\.envrc|\.husky|\.k3code/config[^/]*)(?:/|$)", re.IGNORECASE
 )
@@ -447,10 +450,28 @@ _HOME_PROTECTED = (
 )
 
 
+def k3code_state(path: str) -> bool:
+    """``path`` (absolute) is ``$K3CODE_HOME`` (resolved, whatever its name) or lies inside it: the trust store, the
+    memory files, user skills, output styles and overlays that the next session loads as its own instructions.
+    Compared on the path as written and on its realpath against the directory as set and as resolved, case-insensitively
+    as the other guarded paths are. k3code's own writers do not go through ``decide``."""
+    state = paths.home()
+    guarded = [os.path.normpath(state), os.path.realpath(state)]
+    guarded = [g.casefold().rstrip(os.sep) for g in dict.fromkeys(guarded)]
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
+
+
 def protected_path(path: str) -> bool:
     """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
-    file or git config in the home directory, or under a credential directory (``~/.ssh``, ``~/.config/k3code``).
-    Checked on the path as written and on its realpath, so a symlink does not hide the target."""
+    file or git config in the home directory, under a credential directory (``~/.ssh``, ``~/.config/k3code``) or
+    under k3code's own state directory (see :func:`k3code_state`). Checked on the path as written and on its
+    realpath, so a symlink does not hide the target."""
+    if k3code_state(path):
+        return True
     home = os.path.expanduser("~")
     homes = (os.path.normpath(home), os.path.realpath(home))
     guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
@@ -528,6 +549,8 @@ def decide(
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
             dec.action, dec.needs_human, dec.always_ask = "ask", True, True
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
+            if k3code_state(path) or k3code_state(reached):
+                dec.message = f"Edits k3code's own state (trust store, memory, skills); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
@@ -1655,8 +1678,10 @@ def _secret_access(parsed: hardline.Parsed, where: _Where, home: str, consumed: 
     tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
     expanded, globs are matched."""
     worst: str | None = None
+    # once per line, not per sub: a line of thousands of simple commands made this subs x pipelines (K3NOX-691)
+    in_pipes = {sub for p in parsed.pipelines if len(p) > 1 for sub in p}
     for sub in parsed.subs:
-        piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
+        piped = consumed or sub in in_pipes
         worst = _worse(worst, _sub_secret_access(sub, piped, where, home))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
@@ -1685,10 +1710,9 @@ def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
-    hit = hardline.check(command, extra, cwd=cwd, home=home)
+    hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    parsed = hardline.parse(command)
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
@@ -1943,6 +1967,18 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
     return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+
+
+def home_store_path(path: str) -> bool:
+    """``path`` (absolute) lies in a credential store of ``$HOME`` (see _home_stores), whatever the roots: the check
+    for a reader that has no ``decide()`` of its own (the memory loader's @imports)."""
+    return bool(_stores_holding(_spellings(path), _home_stores()))
+
+
+def home_dot_path(path: str, roots: Sequence[str]) -> bool:
+    """``path`` (absolute) lies below a dot folder of ``$HOME`` that ``roots`` cover only because a root is at or
+    above ``$HOME`` (see _home_dot_read): a project root below ``$HOME`` makes its own ``.github`` ordinary."""
+    return _home_dot_read(path, list(roots))
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:

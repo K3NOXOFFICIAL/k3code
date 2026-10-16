@@ -40,7 +40,7 @@ const DAY = 86_400;
 const dump = (
   rows: ViewRow[],
   extra: Partial<React.ComponentProps<typeof AgentViewView>> = {},
-  nav: ViewNav = IDLE_VIEW_NAV,
+  nav: ViewNav = { ...IDLE_VIEW_NAV, collapsedGroups: [] },
 ) => {
   const stdout = Object.assign(new PassThrough(), { columns: 90, rows: 40 });
   const frames: string[] = [];
@@ -89,7 +89,7 @@ const mixed = (): ViewRow[] => [
 
 describe("AgentViewView", () => {
   it("groups rows under the three headers with the strip's glyphs and counts, past rows last", () => {
-    const out = dump(mixed(), {}, { confirmKey: null, index: 1 });
+    const out = dump(mixed(), {}, { ...IDLE_VIEW_NAV, index: 1 });
 
     console.log(`\n--- agent view dump ---\n${out}\n-----------------------`);
 
@@ -97,7 +97,7 @@ describe("AgentViewView", () => {
 
     expect(lines[0]).toContain("Agents");
     expect(lines[0]).toContain("1 need input · 2 working · 3 completed");
-    expect(lines.filter((l) => l === "Completed")).toHaveLength(1);
+    expect(lines.filter((l) => l.includes("Completed"))).toHaveLength(1);
     expect(out).not.toContain("Earlier sessions");
     expect(out).not.toContain("Idle");
 
@@ -121,7 +121,7 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back",
+      "↑↓ select · →/⏎ attach · x stop · n new · c collapse · ←/esc back",
     );
   });
 
@@ -165,7 +165,11 @@ describe("AgentViewView", () => {
 
   it("shows the stop confirmation on its row", () => {
     const rows = [row(1), row(2)];
-    const out = dump(rows, {}, { confirmKey: rows[1]!.key, index: 1 });
+    const out = dump(
+      rows,
+      {},
+      { ...IDLE_VIEW_NAV, confirmKey: rows[1]!.key, index: 1 },
+    );
 
     expect(out).toMatch(/task 2.*stop\? y\/n/);
     expect(out.match(/stop\? y\/n/g)).toHaveLength(1);
@@ -465,7 +469,7 @@ describe("AgentViewPane", () => {
       // header, four list lines, footer: no spacers, no ↑/↓ indicators
       expect(lines).toHaveLength(6);
       expect(lines[0]).toContain("Agents");
-      expect(lines[1]).toBe("Needs input");
+      expect(lines[1]).toMatch(/▾ Needs input/);
       expect(lines[2]).toContain("bravo");
       expect(out).not.toMatch(/more/);
       expect(lines.at(-1)).toContain("↑↓ select");
@@ -568,8 +572,20 @@ describe("AgentViewPane", () => {
       await waitFor(() => expect(onStop).toHaveBeenCalled());
       expect(onStop.mock.calls[0]![0]).toMatchObject({ id: "a" });
 
+      // "n" opens the new-session prompt; type text and press Enter to submit.
       stdin.write("n");
-      await waitFor(() => expect(onNew).toHaveBeenCalled());
+      await waitFor(() => expect(output).toContain("new session:"));
+      for (const ch of "test session") {
+        stdin.write(ch);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      stdin.write("\n");
+      // Give it time to process
+      await new Promise((r) => setTimeout(r, 500));
+      console.error("DEBUG: onNew calls:", onNew.mock.calls);
+      console.error("DEBUG: output:", JSON.stringify(output.slice(-300)));
+      await waitFor(() => expect(onNew).toHaveBeenCalled(), { timeout: 10000 });
+      expect(onNew).toHaveBeenCalledWith("test session");
     } finally {
       view.unmount();
       view.cleanup();

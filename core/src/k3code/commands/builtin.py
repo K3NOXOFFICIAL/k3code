@@ -202,6 +202,8 @@ class _ClearCommand(CommandDef):
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
         _settle_turns(ctx, live)
+        if hasattr(live, "refresh_prompt_inputs"):  # a new conversation: its prompt shows what was learned since
+            live.refresh_prompt_inputs()
         from k3code.gateway.sessions import StoredSession
 
         stored: StoredSession | None = ctx.store.get(session_id or "")
@@ -230,6 +232,8 @@ class _CompactCommand(CommandDef):
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
         live.messages = messages
         _settle_turns(ctx, live)
+        if hasattr(live, "refresh_prompt_inputs"):  # the rewritten conversation is a new cache prefix anyway
+            live.refresh_prompt_inputs()
         ctx.store.save(live.stored)
         note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
         return {"type": "message", "message": note}
