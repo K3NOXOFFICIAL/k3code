@@ -36,6 +36,11 @@ DAY = 86400.0
 WEEK = 7 * DAY
 
 
+#: Proposal kinds whose handler writes into the prompt's learned tail (``prompting.learned_sections``): the stack
+#: facts, a gotcha, a USER.md line, an optimizer overlay.
+PROMPT_KINDS = frozenset({"project_setup", "project_gotcha", "preference", "optimizer"})
+
+
 class LearningHub:
     def __init__(self, server: Any, store: ProposalStore, clock: Callable[[], float] = time.time) -> None:
         self.server = server
@@ -293,6 +298,13 @@ class LearningHub:
 
     async def apply(self, p: Proposal, session: Any = None) -> str:
         """Run the handler of an accepted learned proposal; returns a human message."""
+        msg = await self._apply(p, session)
+        if p.kind in PROMPT_KINDS and hasattr(session, "refresh_prompt_inputs"):
+            # what the user accepted applies to this conversation now; background writers wait for a compaction
+            session.refresh_prompt_inputs()
+        return msg
+
+    async def _apply(self, p: Proposal, session: Any = None) -> str:
         payload = p.payload
         cwd = str(session.perms.cwd) if session is not None else ""
         if payload.get("op") == "recipe":  # before the kind switch: a recipe "skill" is not a curator skill
@@ -499,18 +511,20 @@ class LearningHub:
         except Exception:  # noqa: BLE001
             logger.warning("turn verdict write failed", exc_info=True)
 
-    def turn_undone(self, session: Any, index: int) -> str | None:
-        """/undo or /retry is about to drop the session's stored messages from ``index`` on: the pending turn those
-        messages belong to is marked undone, and the undo is logged. Returns the turn id, or None."""
+    def turn_undone(self, session: Any, index: int) -> list[str]:
+        """/undo or /retry is about to drop the session's stored messages from ``index`` on: the pending turns those
+        messages belong to (every turn of an auto-continued run) are marked undone, and the undo is logged under the
+        turn the cut reaches into (the run's first). Returns the turn ids, newest first."""
         if not self.enabled:
-            return None
+            return []
         try:
-            turn = self.log.mark_undone(session.session_id, index)
+            turns = self.log.mark_undone(session.session_id, index)
         except Exception:  # noqa: BLE001
             logger.warning("turn undo write failed", exc_info=True)
-            turn = None
-        self.record("undo", session, subject=turn or "", choice="turn-undo")
-        return turn
+            turns = []
+        detail = {"turns": len(turns)} if len(turns) > 1 else None
+        self.record("undo", session, subject=turns[-1] if turns else "", choice="turn-undo", detail=detail)
+        return turns
 
     def settle_turns(self, session_id: str) -> None:
         """The session moved on (its next prompt began, or it closed): its pending outcomes are final."""

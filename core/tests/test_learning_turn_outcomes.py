@@ -68,10 +68,39 @@ def test_an_undo_marks_the_pending_turn_whose_messages_it_removes(tmp_path):
     outcome(log, "t1", start=0, end=4)
     log.settle_turns("s1")  # the user moved on: t1 can no longer be undone by a later cut
     outcome(log, "t2", start=4, end=9)
-    assert log.mark_undone("s1", 2) is None  # a cut into the settled turn marks nothing
-    assert log.mark_undone("s1", 4) == "t2"
+    assert log.mark_undone("s1", 2) == []  # a cut into the settled turn marks nothing
+    assert log.mark_undone("s1", 4) == ["t2"]
     rows = {r["turn"]: r for r in log.turn_outcomes()}
     assert rows["t2"]["undone"] == 1 and rows["t2"]["passed"] is False and rows["t1"]["passed"] is True
+
+
+def test_an_undo_of_an_auto_continued_run_marks_every_turn_of_the_run(tmp_path):
+    """K3NOX-696: /undo drops the whole run back to the user's prompt, but only the turn the cut reached into was
+    marked; the continuations kept ``passed`` and the success rate still counted them."""
+    log = DecisionLog(tmp_path, FakeClock())
+    outcome(log, "kept", start=0, end=4)
+    log.settle_turns("s1")
+    outcome(log, "run", start=4, end=6)  # the user's prompt and its reply
+    outcome(log, "cont1", start=6, end=8)  # a continuation prompt and its reply
+    outcome(log, "cont2", start=8, end=10)
+    assert log.mark_undone("s1", 4) == ["cont2", "cont1", "run"]
+    rows = {r["turn"]: r for r in log.turn_outcomes()}
+    assert [rows[t]["undone"] for t in ("kept", "run", "cont1", "cont2")] == [0, 1, 1, 1]
+    m = optimizer.collect(NO_USAGE, log, [], since=0)
+    assert m["turns_scored"] == 4 and m["turns_pending"] == 0 and m["turn_failures"]["undone"] == 3
+    assert m["turn_success_rate"] == 0.25  # only the kept turn passed
+
+
+def test_an_undo_stops_at_the_turn_it_cuts_into(tmp_path):
+    """A row older than the turn the cut reaches into is not removed by it, whatever its slice says: a compaction
+    renumbers the stored messages, so a slice from before it can lie past the cut (the undo then drops only the last
+    turn, see ``_session_undo``)."""
+    log = DecisionLog(tmp_path, FakeClock())
+    outcome(log, "before", start=20, end=24)  # recorded before a compaction shortened the conversation
+    outcome(log, "last", start=5, end=8)
+    assert log.mark_undone("s1", 5) == ["last"]
+    rows = {r["turn"]: r for r in log.turn_outcomes()}
+    assert rows["before"]["undone"] == 0 and rows["last"]["undone"] == 1
 
 
 def test_an_existing_decisions_db_gets_the_outcome_table_and_missing_columns(tmp_path):

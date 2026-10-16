@@ -124,6 +124,11 @@ class MemoryCommand(CommandDef):
             if not text:
                 return reply("Usage: /memory add <text> [--user]")
             append_memory(target, text)
+            # the user's own line applies now, not at the next compaction (the session's prompt keeps its memory as
+            # first read, against the background writers: LiveSession.prompt_frozen)
+            live = ctx.sessions.get(session_id) if session_id and hasattr(ctx, "sessions") else None
+            if live is not None and hasattr(live, "refresh_prompt_inputs"):
+                live.refresh_prompt_inputs()
             return reply(f"Added to {target}", path=str(target))
         if sub == "edit":
             return reply(f"Edit {target} (the CLI opens $EDITOR; here, open it yourself).", path=str(target))
