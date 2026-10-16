@@ -15,7 +15,7 @@ import glob
 import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1688,6 +1688,18 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     projects = [r for r in roots if not _inside(home, [r])]
     homes = _home_prefixes()
     return any(_below_home_dot(p, homes) and not (projects and _inside(p, projects)) for p in _spellings(path))
+
+
+def home_store_path(path: str) -> bool:
+    """``path`` (absolute) lies in a credential store of ``$HOME`` (see _home_stores), whatever the roots: the check
+    for a reader that has no ``decide()`` of its own (the memory loader's @imports)."""
+    return bool(_stores_holding(_spellings(path), _home_stores()))
+
+
+def home_dot_path(path: str, roots: Sequence[str]) -> bool:
+    """``path`` (absolute) lies below a dot folder of ``$HOME`` that ``roots`` cover only because a root is at or
+    above ``$HOME`` (see _home_dot_read): a project root below ``$HOME`` makes its own ``.github`` ordinary."""
+    return _home_dot_read(path, list(roots))
 
 
 def search_withheld(searched: str) -> Callable[[str], bool]:
