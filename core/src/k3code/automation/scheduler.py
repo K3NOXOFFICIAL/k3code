@@ -262,10 +262,7 @@ class JobScheduler:
                 nxt, status, quiet = plan["at"], "retrying", True
                 if self._retry_forever_on():
                     wait_s = int(plan["at"] - now)
-                    note = (
-                        f"network unreachable (0 API calls): retry {plan['attempt']} "
-                        f"in {wait_s}s (retry-forever)"
-                    )
+                    note = f"network unreachable (0 API calls): retry {plan['attempt']} in {wait_s}s (retry-forever)"
                 else:
                     note = f"network unreachable (0 API calls): retry {plan['attempt']}/3 in {int(plan['at'] - now)}s"
             else:

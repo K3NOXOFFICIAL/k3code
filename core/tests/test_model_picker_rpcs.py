@@ -221,6 +221,7 @@ def test_unset_env_var_keeps_other_lines_and_the_mode(tmp_path):
     assert unset_env_var("A", path) is False
     assert unset_env_var("B", path) is True and path.read_text() == ""
 
+
 # ── permissions.get ───────────────────────────────────────────────────────────────────────────────────────────────
 async def test_permissions_get_returns_mode_modes_and_effective_rules(server):
     res = await _ok(server, "permissions.get", {})

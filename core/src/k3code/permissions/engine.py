@@ -631,9 +631,7 @@ def decide(
     except ValueError:
         return Decision(action="deny", message=f"Unknown permission mode: {plan_for}")
     outside_reads = (
-        PermissionMode.AUTO
-        if mode == PermissionMode.PLAN and plan_for_mode == PermissionMode.AUTO
-        else mode
+        PermissionMode.AUTO if mode == PermissionMode.PLAN and plan_for_mode == PermissionMode.AUTO else mode
     )
     args = args or {}
     if (bad := _unusable_argument(args)) is not None:

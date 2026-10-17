@@ -651,9 +651,7 @@ def _numbered_read(result: dict[str, Any]) -> str:
     body = "\n".join(f"{n:>{_NUMBER_WIDTH}}\t{line}" for n, line in enumerate(lines, first))
     wanted = result.get("wanted_last")
     elided = (
-        f"; lines {last + 1}-{wanted} elided by READ_MAX_CHARS"
-        if isinstance(wanted, int) and last < wanted
-        else ""
+        f"; lines {last + 1}-{wanted} elided by READ_MAX_CHARS" if isinstance(wanted, int) and last < wanted else ""
     )
     continued = f"showed {first}-{last}{elided}; continue with offset={last + 1}"
     if total is None:  # a huge file, streamed: its length is not known

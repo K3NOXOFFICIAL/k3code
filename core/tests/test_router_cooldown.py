@@ -490,6 +490,8 @@ def test_accounts_survive_a_restart_separately(tmp_path):
     reborn = CooldownStore(path=path)
     assert reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="aaa")
     assert not reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="bbb")
+
+
 def err500() -> ProviderError:
     return ProviderError(message="internal server error", status_code=500, body={"error": {"message": "boom"}})
 
@@ -549,6 +551,8 @@ async def test_last_good_entry_is_preferred_failover_target():
     # a still fails (stale script head) but b — the last entry that answered — is tried before pristine c.
     assert (await router.complete(MSGS, [])).content == "from b"
     assert c.calls == 0
+
+
 async def test_quota_with_short_retry_after_sleeps_inline():
     """Quota declaring a reset within max_inline_wait: same-entry retry after an inline sleep, no cooldown."""
     body = {"error": {"message": "usage limit exceeded", "type": "usage_limit_exceeded"}}
