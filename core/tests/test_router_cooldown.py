@@ -14,11 +14,13 @@ from k3code.reliability.events import PARKED, UNPARKED, EventEmitter
 from k3code.reliability.persistent_retry import PersistentRetry, RetryConfig
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.router.classifier import FailoverReason
+from k3code.router.cooldown import key_fingerprint
 
 QUOTA_BODY = {
     "error": {"message": "usage limit exceeded", "type": "usage_limit_exceeded", "code": "usage_limit_exceeded"}
 }
 MSGS = [Message(role="user", content="hi")]
+ACCOUNT_A = key_fingerprint("key-a")  # what the router keys provider "a" (Scripted) by
 
 
 class Scripted:
@@ -70,8 +72,8 @@ async def test_long_retry_after_fails_over_without_sleeping():
     msg = await router.complete(MSGS, [])
     assert msg.content == "from b"
     assert sleeps == [] and a.calls == 1  # no inline wait, no retry on the exhausted entry
-    assert store.in_cooldown(provider="a", model="m", base_url="http://a")
-    assert 59000 < store.remaining_seconds(provider="a", model="m", base_url="http://a") <= 59826
+    assert store.in_cooldown(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)
+    assert 59000 < store.remaining_seconds(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) <= 59826
     assert any(e.kind == "router.cooldown" and e.extra["seconds"] == 59826 for e in events)
 
 
@@ -80,7 +82,7 @@ async def test_short_retry_after_still_sleeps_inline():
     router, store, sleeps, _ = make([a], max_retries=1)
     assert (await router.complete(MSGS, [])).content == "ok after wait"
     assert sleeps == [5.0]
-    assert not store.in_cooldown(provider="a", model="m", base_url="http://a")
+    assert not store.in_cooldown(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)
 
 
 async def test_max_inline_wait_is_configurable():
@@ -90,7 +92,7 @@ async def test_max_inline_wait_is_configurable():
     await router.complete(MSGS, [])  # 30 <= 60: retries disabled → fails over by exhaustion, no cooldown ladder
     router2, store2, sleeps2, _ = make([Scripted("a", [err429(30)]), Scripted("b", ["b"])], max_inline_wait=10.0)
     await router2.complete(MSGS, [])
-    assert sleeps2 == [] and store2.in_cooldown(provider="a", model="m", base_url="http://a")
+    assert sleeps2 == [] and store2.in_cooldown(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)
 
 
 async def test_quota_without_retry_after_cools_down_for_an_hour():
@@ -98,7 +100,7 @@ async def test_quota_without_retry_after_cools_down_for_an_hour():
     b = Scripted("b", ["b"])
     router, store, sleeps, _ = make([a, b])
     await router.complete(MSGS, [])
-    remaining = store.remaining_seconds(provider="a", model="m", base_url="http://a")
+    remaining = store.remaining_seconds(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)
     assert sleeps == [] and 3500 < remaining <= 3600
     entry = next(iter(store.entries.values()))
     assert entry.reason is FailoverReason.quota
@@ -108,7 +110,7 @@ async def test_quota_cooldown_default_is_configurable():
     a = Scripted("a", [err429(None, QUOTA_BODY)])
     router, store, _, _ = make([a, Scripted("b", ["b"])], quota_cooldown=120.0)
     await router.complete(MSGS, [])
-    assert store.remaining_seconds(provider="a", model="m", base_url="http://a") <= 120
+    assert store.remaining_seconds(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) <= 120
 
 
 async def test_cooled_entry_is_skipped_on_next_call():
@@ -206,12 +208,12 @@ async def test_rate_limit_cooldown_ladder_climbs_and_resets_on_success():
     arm = [store.arm(FailoverReason.rate_limit, provider="a", model="m", base_url="http://a") for _ in range(3)]
     assert arm == [60, 120, 240]
     store.arm(FailoverReason.rate_limit, provider="b", model="m", base_url="http://b")  # per entry
-    assert store.strikes[("b", "m", "http://b")] == 1
+    assert store.strikes[("b", "m", "http://b", "")] == 1
     a = Scripted("a", ["ok"])
     router, _, _, _ = make([a], store=store)
     store.entries.clear()
     assert (await router.complete(MSGS, [])).content == "ok"
-    assert store.arm(FailoverReason.rate_limit, provider="a", model="m", base_url="http://a") == 60
+    assert store.arm(FailoverReason.rate_limit, provider="a", model="m", base_url="http://a", account=ACCOUNT_A) == 60
 
 
 def test_expired_cooldowns_are_dropped_on_load(tmp_path):
@@ -221,6 +223,65 @@ def test_expired_cooldowns_are_dropped_on_load(tmp_path):
     store.arm(FailoverReason.quota, provider="a", model="m", retry_after=100)
     wall["t"] += 101
     assert not CooldownStore(path=path, wall=lambda: wall["t"]).in_cooldown(provider="a", model="m")
+
+
+# ── a host that sleeps: the monotonic clock stops, the wall clock does not ──
+
+
+def test_cooldown_ends_at_its_wall_clock_reset_when_the_monotonic_clock_stood_still():
+    """CLOCK_MONOTONIC excludes host suspend (laptop lid, WSL2 host sleep): a 1 h park armed in the evening was still
+    counting awake-time seconds the next morning, after the provider's window had long reset."""
+    wall = {"t": 1_000_000.0}
+    store = CooldownStore(wall=lambda: wall["t"])
+    store.arm(FailoverReason.quota, provider="a", model="m", retry_after=3600, now=500.0)
+    kw = {"provider": "a", "model": "m", "now": 500.0}  # the monotonic clock does not move
+    wall["t"] += 100
+    assert store.in_cooldown(**kw)
+    assert 3400 < store.remaining_seconds(**kw) <= 3500
+    wall["t"] += 3600  # the host slept past the reset
+    assert not store.in_cooldown(**kw)
+    assert store.remaining_seconds(**kw) == 0.0
+    assert store.entries == {}  # and the expired window is dropped
+
+
+def test_network_cooldown_is_not_active_once_its_wall_clock_window_passed():
+    wall = {"t": 1_000_000.0}
+    store = CooldownStore(wall=lambda: wall["t"])
+    store.arm(FailoverReason.network, provider="n", model="m", network_cooldown=60)
+    assert store.only_network_cooling()
+    wall["t"] += 61  # the real monotonic clock has moved by microseconds
+    assert not store.only_network_cooling()
+
+
+async def test_a_park_ends_when_the_host_slept_through_the_reset():
+    """End to end: the chain parks for 1 h, the host sleeps (wall +1 h 1 min, monotonic +the poll chunk), the park
+    ends at the next poll and the next attempt reaches the provider instead of being skipped as still cooling."""
+    wall = {"t": 1_700_000_000.0}
+    a = Scripted("a", [err429(3600), "recovered"])
+    router, store, _, _ = make([a], store=CooldownStore(wall=lambda: wall["t"]))
+    clock = {"now": 1000.0}
+    slept: list[float] = []
+
+    async def sleep(d: float) -> None:
+        slept.append(d)
+        clock["now"] += d
+        if len(slept) == 1:
+            wall["t"] += 3660  # suspend: only the wall clock noticed
+        assert len(slept) < 50, "still parked long after the wall-clock reset"
+
+    pr = PersistentRetry(
+        router,
+        None,
+        config=RetryConfig(poll_interval=0.5),
+        events=EventEmitter(),
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
+        wall=lambda: wall["t"],
+    )
+    texts = [ev.message.content async for ev in pr.stream(MSGS, []) if ev.type == "done" and ev.message]
+    assert texts == ["recovered"]
+    assert clock["now"] - 1000.0 < 5.0, "must not count out the awake-time seconds of a window that already reset"
+    assert a.calls == 2
 
 
 def test_corrupt_cooldown_file_is_ignored(tmp_path):
@@ -257,7 +318,7 @@ async def test_a_cooldown_armed_under_a_model_override_is_honoured_on_the_next_c
     router, store, _, _ = make([a])
     with pytest.raises(ChainExhausted):
         await router.complete(MSGS, [], model="override")
-    assert store.in_cooldown(provider="a", model="override", base_url="http://a")
+    assert store.in_cooldown(provider="a", model="override", base_url="http://a", account=ACCOUNT_A)
     with pytest.raises(ChainExhausted) as exc:
         await router.complete(MSGS, [], model="override")
     assert a.calls == 1  # skipped inside its window, not called again
@@ -278,8 +339,8 @@ async def test_auth_failure_cools_the_entry_down_and_later_calls_skip_it():
     assert (await router.complete(MSGS, [])).content == "from b"
     assert (await router.complete(MSGS, [])).content == "from b"  # the second rejection in a row arms it
     assert a.calls == 2
-    assert store.reason_of(provider="a", model="m", base_url="http://a") is FailoverReason.auth
-    assert 290 < store.remaining_seconds(provider="a", model="m", base_url="http://a") <= 300
+    assert store.reason_of(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) is FailoverReason.auth
+    assert 290 < store.remaining_seconds(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) <= 300
     assert (await router.complete(MSGS, [])).content == "from b"
     assert a.calls == 2  # no POST (and so no reachability probe) to the dead entry on the third call
 
@@ -294,7 +355,7 @@ async def test_replaced_key_is_tried_at_once():
     a.api_key = "fresh-key"
     assert (await router.complete(MSGS, [])).content == "a works now"
     assert a.calls == 3
-    assert store.reason_of(provider="a", model="m", base_url="http://a") is None
+    assert store.reason_of(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) is None
 
 
 def test_auth_cooldown_never_stores_the_key(tmp_path):
@@ -347,7 +408,7 @@ async def test_all_entries_in_auth_cooldown_says_authentication_not_rate_limit()
 async def test_one_transient_rejection_arms_no_cooldown_two_in_a_row_do():
     a = Scripted("a", [err401(), "a works", err401(), err401(), "unreachable"])
     router, store, _, _ = make([a])
-    ident = {"provider": "a", "model": "m", "base_url": "http://a"}
+    ident = {"provider": "a", "model": "m", "base_url": "http://a", "account": ACCOUNT_A}
     with pytest.raises(ChainExhausted):
         await router.complete(MSGS, [])
     assert store.reason_of(**ident) is None  # one 401 from a restarting relay: the next prompt is tried
@@ -368,7 +429,7 @@ async def test_a_keyless_entry_never_arms_an_auth_cooldown():
         with pytest.raises(ChainExhausted):
             await router.complete(MSGS, [])
     assert a.calls == 3  # tried every time, never skipped
-    assert store.reason_of(provider="a", model="m", base_url="http://a") is None
+    assert store.reason_of(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) is None
 
 
 async def test_mixed_rate_limit_and_auth_chain_waits_for_the_reset_instead_of_calling_it_auth():
@@ -387,3 +448,112 @@ async def test_a_chain_where_every_failure_is_auth_still_says_authentication_fai
     with pytest.raises(ChainExhausted) as exc:
         await router.complete(MSGS, [])
     assert "authentication failed" in str(exc.value) and exc.value.retry_after is None
+
+
+# ── two accounts of one provider (same name, model, base_url, different keys) ──
+
+
+def _account(name: str, key: str, script: list[ProviderError | str]) -> Scripted:
+    p = Scripted(name, script)
+    p.base_url = "http://shared"
+    p.api_key = key
+    return p
+
+
+async def test_accounts_with_the_same_name_model_and_url_cool_down_independently():
+    main = _account("relay", "key-main", [err429(600)])
+    backup = _account("relay", "key-backup", ["from backup"])
+    router, store, _, _ = make([main, backup])
+    assert (await router.complete(MSGS, [])).content == "from backup"
+    # main's 429 parks main only: the backup account is not cooling down
+    assert router._skip_in_cooldown(router.chain[0], "m") is not None
+    assert router._skip_in_cooldown(router.chain[1], "m") is None
+    assert len(store.entries) == 1
+
+
+async def test_rate_limit_strikes_are_counted_per_account():
+    main = _account("relay", "key-main", [err429(None), err429(None)])
+    backup = _account("relay", "key-backup", ["ok"])
+    router, store, _, _ = make([main, backup])
+    await router.complete(MSGS, [])
+    # a success on the backup must not reset main's ladder, and main's strike must not climb backup's
+    assert sorted(store.strikes.values()) == [1]
+    assert router.chain[0].key != router.chain[1].key
+
+
+def test_accounts_survive_a_restart_separately(tmp_path):
+    path = tmp_path / "cooldowns.json"
+    store = CooldownStore(path=path)
+    store.arm(
+        FailoverReason.rate_limit, provider="relay", model="m", base_url="http://shared", retry_after=600, account="aaa"
+    )
+    reborn = CooldownStore(path=path)
+    assert reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="aaa")
+    assert not reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="bbb")
+def err500() -> ProviderError:
+    return ProviderError(message="internal server error", status_code=500, body={"error": {"message": "boom"}})
+
+
+async def test_failover_skips_cooling_entries():
+    """Next-best failover: a cooling entry is skipped even when it is next in chain order."""
+    a = Scripted("a", [err500()])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, events = make([a, b, c], max_retries=0)
+    store.arm(
+        FailoverReason.rate_limit,
+        provider="b",
+        model="m",
+        base_url="http://b",
+        account=key_fingerprint("key-b"),
+        retry_after=600,
+    )
+    assert (await router.complete(MSGS, [])).content == "from c"
+    assert b.calls == 0  # cooling entry never tried
+    failovers = [e for e in events if e.kind == "router.failover"]
+    assert len(failovers) == 1 and failovers[0].reason == "server"
+
+
+async def test_failover_prefers_healthy_entry():
+    """Failover prefers the entry with the fewest consecutive failures over chain order."""
+    a = Scripted("a", [err500()])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, _ = make([a, b, c], max_retries=0)
+    # b flaked twice before (kept working afterwards: no cooldown), c is pristine.
+    store.record_failure(provider="b", model="m", base_url="http://b", account=key_fingerprint("key-b"))
+    store.record_failure(provider="b", model="m", base_url="http://b", account=key_fingerprint("key-b"))
+    assert (await router.complete(MSGS, [])).content == "from c"
+    assert b.calls == 0 and c.calls == 1
+
+
+async def test_quota_triggers_cooldown_and_failover():
+    """Quota (no Retry-After): no same-entry retry, 1h cooldown armed, immediate failover with reason."""
+    a = Scripted("a", [err429(None, QUOTA_BODY)])
+    b = Scripted("b", ["from b"])
+    router, store, sleeps, events = make([a, b])
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert a.calls == 1 and sleeps == []  # immediate failover, nothing slept inline
+    assert store.reason_of(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) is FailoverReason.quota
+    failovers = [e for e in events if e.kind == "router.failover"]
+    assert len(failovers) == 1 and failovers[0].reason == "quota"
+
+
+async def test_last_good_entry_is_preferred_failover_target():
+    """After recovery the chain prefers the last working entry as the failover target."""
+    a = Scripted("a", [err500(), "a recovered"])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, _ = make([a, b, c], max_retries=0)
+    assert (await router.complete(MSGS, [])).content == "from b"  # a fails over to b; b is last-good
+    # a still fails (stale script head) but b — the last entry that answered — is tried before pristine c.
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert c.calls == 0
+async def test_quota_with_short_retry_after_sleeps_inline():
+    """Quota declaring a reset within max_inline_wait: same-entry retry after an inline sleep, no cooldown."""
+    body = {"error": {"message": "usage limit exceeded", "type": "usage_limit_exceeded"}}
+    a = Scripted("a", [err429(5, body), "ok after wait"])
+    router, store, sleeps, _ = make([a, Scripted("b", ["from b"])], max_retries=1)
+    assert (await router.complete(MSGS, [])).content == "ok after wait"
+    assert sleeps == [5.0]
+    assert not store.in_cooldown(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)

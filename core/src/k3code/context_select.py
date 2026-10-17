@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 SELECT_SYSTEM = (
     "You manage the context of a coding agent. Below are earlier tool results the agent is about to lose from its "
     "context to save tokens. For each one decide: keep it whole only if the agent's next steps still need its exact "
-    "text; otherwise it is dropped (the agent can re-run the tool), and you may leave a note of at most 300 "
+    "text; otherwise it is dropped and the agent must NOT re-run the tool just to recover the text (re-run only "
+    "with new arguments for new information), and you may leave a note of at most 300 "
     "characters with the specific facts still worth knowing (file paths, line numbers, names, values, errors). "
     "Leave no note for results that no longer matter. Keep as little as possible.\n"
     'Reply with JSON only: {"keep": [<numbers>], "notes": {"<number>": "<note>"}}'
@@ -53,8 +54,9 @@ class DecisionSettings:
     model: str = ""
     #: elide (with the decision model) once the request passes this share of the context window
     at_ratio: float = ELIDE_AT_RATIO
-    #: characters of tool results one decision reads at most
-    max_input_chars: int = 40_000
+    #: characters of tool results one decision reads at most (40k of excerpts cost more than they save: the
+    #: decision itself is a judgement call over short excerpts, and anything it drops still gets plain elision)
+    max_input_chars: int = 10_000
     timeout: float = 15.0
 
 

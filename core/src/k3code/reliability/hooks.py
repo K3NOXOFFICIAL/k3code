@@ -12,6 +12,7 @@ has, using the ``reliability.*`` / ``net.state`` kinds from
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ class ReliabilitySettings:
     flags: ReliabilityFlags = field(default_factory=ReliabilityFlags)
     max_wait: float | None = None  # persistent-retry total wait bound; None = forever
     max_park_seconds: float = 600.0  # park ladder cap (RetryConfig.park_max)
+    retry_forever: bool = False  # never abort a run on transient/infra errors (park + retry forever)
     # Optional session budget caps, enforced from router usage reports.
     session_tokens: int | None = None
     session_usd: float | None = None
@@ -80,15 +82,24 @@ class Reliability:
         cancel_token: CancelToken | None = None,
         max_wait: float | None = None,
         max_park_seconds: float | None = None,
+        retry_forever: bool = False,
         netwatch_config: dict[str, Any] | None = None,
+        netwatch: NetWatch | None = None,
     ) -> None:
         self.flags = flags or ReliabilityFlags()
         self.session = session
         self.home = home
         self.events = EventEmitter()
         self.cancel_token = cancel_token or CancelToken()
-        self.netwatch = NetWatch(NetWatchConfig(**(netwatch_config or {}))) if self.flags.netwatch else None
-        self.retry_config = RetryConfig(max_wait=max_wait)
+        # #109: one NetWatch per gateway process, shared by every session's bundle (passed in as ``netwatch``), so
+        # there is one monitor loop and one nmcli poll for the whole daemon instead of a pair per session. Without a
+        # shared one (headless, tests, an automation bundle) the bundle owns its own; either way it is refcounted
+        # (acquire/release) so the loops run only while at least one bundle has it started.
+        if not self.flags.netwatch:
+            self.netwatch = None
+        else:
+            self.netwatch = netwatch if netwatch is not None else NetWatch(NetWatchConfig(**(netwatch_config or {})))
+        self.retry_config = RetryConfig(max_wait=None if retry_forever else max_wait, retry_forever=retry_forever)
         if max_park_seconds is not None:  # reliability.max_park_seconds used to be read and then dropped
             self.retry_config.park_max = float(max_park_seconds)
         self.governor = (
@@ -99,7 +110,9 @@ class Reliability:
         self.retry: PersistentRetry | None = None  # built in attach_router
         self.unattended = False  # see set_unattended
         self._started = False
-        self._net_forwarded = False
+        # what the transcript file holds: these messages (by identity, in order) in this many bytes; see save_transcript
+        self._saved: list[Message] = []
+        self._saved_bytes = -1
 
     # ── construction ──
 
@@ -115,8 +128,10 @@ class Reliability:
         *,
         session: str = "default",
         home: Path | None = None,
+        netwatch: NetWatch | None = None,
     ) -> Reliability:
-        """Build from config; settings=None means "reliability on, all defaults"."""
+        """Build from config; settings=None means "reliability on, all defaults". ``netwatch`` shares one instance
+        across the process (the gateway passes its own; headless/tests/automation leave it None and own one)."""
         if settings is not None and not settings.enabled:
             return cls.disabled()
         r = cls(
@@ -125,7 +140,9 @@ class Reliability:
             home=home,
             max_wait=settings.max_wait if settings else None,
             max_park_seconds=settings.max_park_seconds if settings else None,
+            retry_forever=settings.retry_forever if settings else False,
             netwatch_config=settings.netwatch if settings else None,
+            netwatch=netwatch,
         )
         if settings and r.governor is not None:
             if settings.session_tokens is not None or settings.session_usd is not None:
@@ -158,15 +175,18 @@ class Reliability:
             self.retry.unattended = self.unattended
 
     async def start(self) -> None:
-        """Begin NetWatch polling (providers should already be registered)."""
+        """Begin NetWatch polling (providers should already be registered). With a shared NetWatch this adds a
+        reference (the first one starts the loops) and subscribes this bundle's forwarder; later bundles reuse the
+        running loops."""
         if self.netwatch is not None and not self._started:
             self._forward_net_states()
-            await self.netwatch.start()
+            await self.netwatch.acquire()
             self._started = True
 
     async def stop(self) -> None:
         if self.netwatch is not None and self._started:
-            await self.netwatch.stop()
+            self.netwatch.unsubscribe(self._on_net_change)  # leave the shared instance; another bundle may hold it
+            await self.netwatch.release()
             self._started = False
         if self.journal is not None:
             self.journal.close()
@@ -267,39 +287,68 @@ class Reliability:
         return self.home / "journal" / f"{self.session}.messages.json"
 
     def save_transcript(self, messages: list[Message]) -> None:
-        """M2: atomically persist the conversation so a crashed run can resume."""
+        """M2: persist the conversation so a crashed run can resume.
+
+        One JSON line per message. The loop saves after every step and tool result, so a save appends only the
+        messages added since the last one: rewriting the whole conversation each time cost O(steps × transcript)
+        on the event loop (#72). The file is rewritten (tmp + replace) only when it no longer holds a prefix of
+        ``messages``: another list (a resume, another loop on this session) or a file changed or gone underneath."""
         path = self._transcript_path()
         if path is None or not self.flags.journal:
             return
-        data = [
-            {
-                "role": m.role,
-                "content": m.content,
-                "tool_call_id": m.tool_call_id,
-                "name": m.name,
-                "tool_calls": [
-                    {"id": c.id, "name": c.name, "arguments": c.arguments, "raw_arguments": c.raw_arguments}
-                    for c in m.tool_calls
-                ],
-            }
-            for m in messages
-        ]
+        saved, size = self._saved, self._saved_bytes
+        self._saved, self._saved_bytes = [], -1  # what the file holds is unknown until this save succeeds
         try:
             # the whole conversation, tool output included: 0700/0600 whatever the umask (saved before any tool
             # call opens the journal, so it cannot rely on ToolJournal for the directory's mode)
             ensure_private_dir(path.parent)
-            tmp = path.with_suffix(".tmp")
-            private_file(tmp).write_text(json.dumps(data))  # write_text truncates and keeps the 0600 mode
-            os.replace(tmp, path)
+            if (
+                len(saved) <= len(messages)
+                and all(a is b for a, b in zip(saved, messages, strict=False))
+                and path.exists()
+                and path.stat().st_size == size
+            ):
+                with path.open("ab") as fh:
+                    fh.write(_transcript_lines(messages[len(saved) :]))
+                    size = fh.tell()
+            else:
+                data = _transcript_lines(messages)
+                tmp = path.with_suffix(".tmp")
+                private_file(tmp).write_bytes(data)  # write_bytes truncates and keeps the 0600 mode
+                os.replace(tmp, path)
+                size = len(data)
+            self._saved, self._saved_bytes = list(messages), size
         except OSError as e:
             logger.debug("transcript not saved (%s)", e)
+
+    def clear_transcript(self) -> None:
+        """A turn that ended cleanly has nothing left to resume: the session store holds the conversation."""
+        path = self._transcript_path()
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
 
     def load_transcript(self) -> list[Message] | None:
         path = self._transcript_path()
         if path is None or not path.exists():
             return None
         try:
-            raw = json.loads(path.read_text())
+            raw: list[Any] = []
+            lines = path.read_text().split("\n")
+            for i, line in enumerate(lines):
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    if i == len(lines) - 1:
+                        break  # a crash cut the last append short: resume from the messages before it
+                    raise
+                if isinstance(rec, list):  # the whole transcript as one JSON array, as saved before it was appended to
+                    raw.extend(rec)
+                else:
+                    raw.append(rec)
             return [
                 Message(
                     role=d["role"],
@@ -392,15 +441,15 @@ class Reliability:
     # ── internals ──
 
     def _forward_net_states(self) -> None:
+        """Subscribe this bundle's forwarder to the (shared) NetWatch, exactly once per started interval. stop()
+        unsubscribes it again, so an idle-sweep re-arm re-subscribes and a connectivity change still reaches this
+        session's clients once, never N times (the subscriber used to stack on every re-arm)."""
         assert self.netwatch is not None
-        if self._net_forwarded:  # start() runs again after every idle stop(): subscribe once, not once per re-arm
-            return
-        self._net_forwarded = True
+        self.netwatch.unsubscribe(self._on_net_change)  # drop a stale copy before re-adding: deliver once, not twice
+        self.netwatch.subscribe(self._on_net_change)
 
-        def on_change(old: NetState, new: NetState) -> None:
-            self.events.emit(ev.NET_STATE, detail=f"{old.value} -> {new.value}", old=old.value, new=new.value)
-
-        self.netwatch.subscribe(on_change)
+    def _on_net_change(self, old: NetState, new: NetState) -> None:
+        self.events.emit(ev.NET_STATE, detail=f"{old.value} -> {new.value}", old=old.value, new=new.value)
 
     def cancel(self) -> None:
         """Abort any paused/parked wait (wired to /stop)."""
@@ -412,8 +461,8 @@ class Reliability:
         return self.loop_guard is not None and self.loop_guard.needs_input
 
 
-def build_reliability(config: Any, session: str, home: Path | None = None) -> Reliability:
-    """Build the reliability bundle from ``config.reliability`` (a dict shaped like ReliabilitySettings)."""
+def reliability_settings(config: Any) -> ReliabilitySettings:
+    """Parse ``config.reliability`` (a dict shaped like ReliabilitySettings) into a settings object."""
     raw = dict(getattr(config, "reliability", None) or {})
     flags_raw = raw.pop("flags", None)
     flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
@@ -421,6 +470,7 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
         "enabled",
         "max_wait",
         "max_park_seconds",
+        "retry_forever",
         "session_tokens",
         "session_usd",
         "day_tokens",
@@ -430,4 +480,41 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
     settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
     for key in known & set(raw):
         setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=session, home=home)
+    return settings
+
+
+def build_reliability(
+    config: Any, session: str, home: Path | None = None, *, netwatch: NetWatch | None = None
+) -> Reliability:
+    """Build the reliability bundle from ``config.reliability``; ``netwatch`` shares one instance across the process
+    (see :meth:`Reliability.from_settings`)."""
+    return Reliability.from_settings(reliability_settings(config), session=session, home=home, netwatch=netwatch)
+
+
+def shared_netwatch(config: Any) -> NetWatch | None:
+    """A NetWatch built from ``config.reliability`` for the whole process to share, or None when netwatch is off. Its
+    probe knobs come from ``reliability.netwatch``; sessions subscribe/unsubscribe and it is refcounted."""
+    settings = reliability_settings(config)
+    if not settings.enabled or not settings.flags.netwatch:
+        return None
+    return NetWatch(NetWatchConfig(**(settings.netwatch or {})))
+
+
+def _transcript_lines(messages: list[Message]) -> bytes:
+    """``messages`` as transcript lines: one JSON object per message (see :meth:`Reliability.save_transcript`)."""
+    return "".join(
+        json.dumps(
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "name": m.name,
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments, "raw_arguments": c.raw_arguments}
+                    for c in m.tool_calls
+                ],
+            }
+        )
+        + "\n"
+        for m in messages
+    ).encode()

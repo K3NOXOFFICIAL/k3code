@@ -6,17 +6,24 @@
 #        scripts/release/release.sh --list-assets VERSION
 #
 # A release needs: the Main branch checked out, a clean tree, HEAD == origin/Main (after git fetch), VERSION ==
-# the VERSION file, a "## [VERSION]" heading in CHANGELOG.md, and no tag vVERSION yet. Then:
+# the VERSION file, a "## [VERSION]" heading in CHANGELOG.md with nothing left under "## Unreleased" (the notes are
+# the "## [VERSION]" section only), and no tag vVERSION yet. Then:
 #   1. scripts/ci/check.sh --post: the full local check, and the local-ci status on the commit
 #   2. the personal-data scan of the source export (scripts/release/build_release.sh; the export is not published)
 #   3. the assets, in .k3dev/release/VERSION/assets/:
-#        k3code-<pep440 version>-py3-none-any.whl   uv build --wheel
+#        k3code-<pep440 version>-py3-none-any.whl   uv build --wheel, with LICENSE, NOTICE and LICENSES/ in k3code/
+#                                                   (checked: a wheel without them stops the release)
 #        k3code-VERSION-requirements.txt            uv export --locked: the hashed runtime dependencies
-#        k3code-tui-VERSION.tar.gz                  the built TUI (tui/dist)
+#        k3code-tui-VERSION.tar.gz                  the built TUI (tui/dist), LICENSE, NOTICE, LICENSES/ and
+#                                                   THIRD_PARTY_NOTICES.txt (the npm packages bundled into dist)
 #        k3-{linux,darwin}-{amd64,arm64}            the k3 pane binary, CGO_ENABLED=0 cross builds
+#        THIRD_PARTY_NOTICES.txt                    the notices of everything above: NOTICE and LICENSES/, the TUI's
+#                                                   npm packages, and the Go modules and runtime linked into k3
 #        SHA256SUMS                                 a sha256 line for every other asset
 #   4. the release notes: the CHANGELOG.md section of VERSION
-#   5. git tag -a vVERSION, git push origin vVERSION, gh release create (--prerelease when VERSION contains "-")
+#   5. gh release create --draft with every asset (--prerelease when VERSION contains "-"), a check that the draft holds
+#      them all, then gh release edit --draft=false. GitHub creates the tag vVERSION at the checked commit only when it
+#      publishes, so a run that fails earlier leaves no tag: rerun the same command (it replaces a leftover draft).
 #
 # --dry-run checks the preconditions without stopping on them (each one that fails is printed), runs the full check
 # without --post, builds everything into .k3dev/release/VERSION/ and prints what it would publish. --no-check (only
@@ -48,6 +55,7 @@ asset_names() {
       echo "k3-$os-$arch"
     done
   done
+  echo "THIRD_PARTY_NOTICES.txt"
   echo "SHA256SUMS"
 }
 
@@ -103,10 +111,19 @@ file_ver=$(tr -d ' \t\r\n' <VERSION)
 [ "$file_ver" = "$VER" ] || problem "the VERSION file says $file_ver, not $VER (core/pyproject.toml reads its version from VERSION)"
 grep -Eq "^## \[?$(printf '%s' "$VER" | sed 's/[.]/\\./g')\]?([[:space:]]|$)" CHANGELOG.md ||
   problem "CHANGELOG.md has no '## [$VER]' heading"
+# The release notes are the '## [VER]' section alone (step 4), so whatever '## Unreleased' still holds would be left out
+# of them. Blank lines and '###' subheadings do not count as content.
+unreleased=$(awk '
+  /^## / { h = tolower($2); gsub(/[][]/, "", h); if (h == "unreleased") { in_u = 1; next } if (in_u) exit }
+  in_u && NF && !/^###/ { n++ }
+  END { print n + 0 }
+' CHANGELOG.md)
+[ "$unreleased" = 0 ] ||
+  problem "CHANGELOG.md '## Unreleased' still holds $unreleased line(s) the release notes would leave out; rename it to '## [$VER] - <date>' and start a fresh, empty '## Unreleased'"
 if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null || [ -n "$(git ls-remote --tags origin "refs/tags/$TAG" 2>/dev/null)" ]; then
   problem "tag $TAG already exists"
 fi
-for t in uv npm go gh; do
+for t in uv npm go gh python3; do
   have "$t" || problem "$(install_hint "$t")"
 done
 if [ "$problems" -gt 0 ] && [ "$DRY" = 0 ]; then
@@ -134,8 +151,16 @@ echo "release: personal-data scan of the export of ${SHA:0:12}"
 sh "$HERE/build_release.sh" -o "$OUT/export" HEAD
 
 # --- 3. assets ---------------------------------------------------------------------------------------------------
+# The third-party notices (issue #165): k3code's own license files go into every asset that ships code, and
+# THIRD_PARTY_NOTICES files name what the TUI bundle and the k3 binaries link in. third_party_notices.py fails on a
+# package or module whose license it cannot find, which stops the release.
+NOTICES="$HERE/third_party_notices.py"
+
 echo "release: core wheel"
 (cd core && uv build --quiet --wheel --out-dir "$OUT/build/wheel")
+# core/hatch_build.py copies LICENSE, NOTICE and LICENSES/ into the wheel; a wheel without them is not published
+python3 "$NOTICES" check-wheel --repo "$ROOT" "$OUT"/build/wheel/*.whl ||
+  die "the wheel does not ship LICENSE, NOTICE and LICENSES/ (core/hatch_build.py); nothing was published"
 cp "$OUT"/build/wheel/*.whl "$ASSETS/"
 
 echo "release: locked requirements"
@@ -145,20 +170,35 @@ echo "release: locked requirements"
   -o "$ASSETS/k3code-$VER-requirements.txt")
 
 echo "release: TUI tarball"
+# dist/ is the bundle; beside it, the license files and the notices of the npm packages bundled into it (the
+# production dependencies in package-lock.json, with their license texts from node_modules after npm ci).
+mkdir -p "$OUT/build/tui"
 (
   cd tui
   npm ci --no-audit --no-fund
   npm run build:ink
   npm run build
-  tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist
+  python3 "$NOTICES" generate --npm-lock package-lock.json -o "$OUT/build/tui/THIRD_PARTY_NOTICES.txt"
+  tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist -C "$ROOT" LICENSE NOTICE LICENSES \
+    -C "$OUT/build/tui" THIRD_PARTY_NOTICES.txt
 ) >"$OUT/build/tui.log" 2>&1 || die "the TUI build failed; see $OUT/build/tui.log"
 
 echo "release: k3 binaries"
+# go list -deps names every module each build links in (per platform: some are linux- or darwin-only), from the
+# module cache the build just used; it compiles and runs nothing (never `go test`).
+: >"$OUT/build/go-modules.json"
 for os in linux darwin; do
   for arch in amd64 arm64; do
     (cd panes && GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$ASSETS/k3-$os-$arch" ./cmd/k3)
+    (cd panes && GOOS=$os GOARCH=$arch CGO_ENABLED=0 go list -deps -json=Module ./cmd/k3) >>"$OUT/build/go-modules.json" ||
+      die "go list could not name the modules of k3-$os-$arch"
   done
 done
+
+echo "release: THIRD_PARTY_NOTICES.txt"
+goroot=$(cd panes && go env GOROOT) || die "go env GOROOT failed"
+python3 "$NOTICES" generate --own "$ROOT" --npm-lock tui/package-lock.json --go-modules "$OUT/build/go-modules.json" \
+  --goroot "$goroot" -o "$ASSETS/THIRD_PARTY_NOTICES.txt" || die "the third-party notices could not be generated"
 
 echo "release: SHA256SUMS"
 (
@@ -202,16 +242,26 @@ echo "release: assets of $TAG (from ${SHA:0:12}) in ${ASSETS#"$ROOT"/}:"
 if [ "$DRY" = 1 ]; then
   echo
   echo "release: --dry-run, would now run:"
-  echo "  git tag -a $TAG -m 'k3code $VER' ${SHA:0:12}"
-  echo "  git push origin refs/tags/$TAG"
-  echo "  gh release create $TAG <the assets above> --title $TAG --notes-file ${NOTES#"$ROOT"/} --verify-tag ${flags[*]-}"
+  echo "  gh release create $TAG <the assets above> --draft --target ${SHA:0:12} --title $TAG --notes-file ${NOTES#"$ROOT"/} ${flags[*]-}"
+  echo "  gh release edit $TAG --draft=false   (GitHub then creates the tag $TAG at ${SHA:0:12})"
   [ "$problems" = 0 ] || echo "release: $problems precondition(s) failed (above): a real release would have refused"
   exit 0
 fi
 
 # --- 5. publish --------------------------------------------------------------------------------------------------
-git tag -a "$TAG" -m "k3code $VER" "$SHA"
-# The full check passed on this exact commit a moment ago (step 1); the pre-push hook would run it again.
-K3CODE_SKIP_HOOKS=1 git push origin "refs/tags/$TAG"
-gh release create "$TAG" "$ASSETS"/* --title "$TAG" --notes-file "$NOTES" --verify-tag ${flags[@]+"${flags[@]}"}
+# The tag must not exist before the release does: install.sh takes the newest v* tag at once, and release.sh refuses a
+# tag that exists, so a tag left behind by a failed upload would be installed and block the rerun. The release is made
+# as a draft (no tag) with every asset, checked, and only then published; GitHub creates the tag at $SHA when it does.
+stale=$(gh release list --limit 100 --json tagName,isDraft \
+  --jq ".[] | select(.isDraft and .tagName == \"$TAG\") | .tagName") || die "gh release list failed; is gh signed in (gh auth status)?"
+if [ -n "$stale" ]; then
+  note "replacing the draft release $TAG that an earlier run left behind"
+  gh release delete "$TAG" --yes
+fi
+gh release create "$TAG" "$ASSETS"/* --draft --target "$SHA" --title "$TAG" --notes-file "$NOTES" ${flags[@]+"${flags[@]}"}
+uploaded=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort) || die "gh release view $TAG failed"
+local_assets=$(cd "$ASSETS" && printf '%s\n' * | sort)
+[ "$uploaded" = "$local_assets" ] ||
+  die "the draft release $TAG holds [$(tr '\n' ' ' <<<"$uploaded")], not [$(tr '\n' ' ' <<<"$local_assets")]; it stays a draft, no tag exists: rerun"
+gh release edit "$TAG" --draft=false
 echo "release: $TAG published"

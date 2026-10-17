@@ -25,6 +25,7 @@ k3code = "k3code.cli:cli"
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.5",
     "respx>=0.21",
     "ruff>=0.6",
     "pexpect>=4.9",
@@ -41,13 +42,25 @@ pattern = "(?P<version>[0-9][^\\s]*)"
 [tool.hatch.build.targets.wheel]
 packages = ["src/k3code"]
 
+# hatch_build.py copies LICENSE, NOTICE and LICENSES/ from the repository root into the wheel's k3code/ (issue #165)
+[tool.hatch.build.targets.wheel.hooks.custom]
+
+# the sdist carries them at its root, so a wheel built from the sdist gets them as well
+[tool.hatch.build.targets.sdist.force-include]
+"../LICENSE" = "LICENSE"
+"../NOTICE" = "NOTICE"
+"../LICENSES" = "LICENSES"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
 # A test (or its teardown) stuck for 5 min dumps every thread's stack to the log: where a stalled run sits (issue #42).
 faulthandler_timeout = 300
-markers = ["real_systemd: run with the host's systemctl/loginctl/journalctl instead of the conftest stubs"]
+markers = [
+    "real_systemd: run with the host's systemctl/loginctl/journalctl instead of the conftest stubs (also runs serial)",
+    "serial: not safe next to other tests; scripts/ci/check.sh runs these alone, after the parallel xdist lane",
+]
 
 [tool.ruff]
 line-length = 120

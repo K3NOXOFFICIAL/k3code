@@ -73,7 +73,7 @@ const snapshot = (over: Record<string, unknown> = {}) => ({
     { description: "", effort: false, key: "tiny", resolved: ["tiny"] },
   ],
   ultra_mode: "off",
-  wake_words: ["ultracode", "ultraplan", "ultraresearch"],
+  wake_words: ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"],
   wake_words_enabled: true,
   ...over,
 });
@@ -359,7 +359,9 @@ describe("TunePicker", () => {
     expect(frame).toMatch(/default\s+low\s+medium\s+high\s+xhigh\s+max/);
     // 80 columns: the key line is the shortened one, Esc still named
     expect(frame).toMatch(/Tab ultracode · Enter default · s session · Esc\s/);
-    expect(frame).toContain("ultraresearch");
+    // sixteen models crowd the wake footer off the 24 rows entirely (six
+    // words fit nowhere at 80 columns once the list takes its floor).
+    expect(frame).not.toContain("Wake words");
     // box + margin + the status rule under it must leave the 24 rows enough room
     expect(lines.length + 3).toBeLessThanOrEqual(24);
   });

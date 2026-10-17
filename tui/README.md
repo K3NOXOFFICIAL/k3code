@@ -16,7 +16,7 @@ The client entrypoint is `src/entry.tsx`. It exits early if `stdin` is not a TTY
 python -m tui_gateway.entry
 ```
 
-Interpreter resolution uses `HERMES_PYTHON`, supplied by the CLI launcher or
+Interpreter resolution uses `K3CODE_PYTHON`, supplied by the CLI launcher or
 Nix wrapper. Direct development runs without that value use `python3` on PATH,
 or `python` on Windows. The TUI does not search `PYTHON`, `VIRTUAL_ENV`, or
 checkout venv directories for a different interpreter.
@@ -149,6 +149,8 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 
 ### Main chat input
 
+`Alt+Enter` is the portable newline key: it works in every terminal. `Shift+Enter` and `Ctrl+J` insert a newline only where the terminal reports them (Windows Terminal, SSH sessions, Ghostty, WSL); elsewhere `Ctrl+J` submits.
+
 | Key                         | Behavior                                                                                                                                                |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Enter`                     | Submit the current draft                                                                                                                                |
@@ -158,7 +160,7 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 | `Ctrl+C`                    | Interrupt active run, or clear the current draft, or exit if nothing is pending                                                                         |
 | `Ctrl+D`                    | Exit                                                                                                                                                    |
 | `Cmd/Ctrl+G` / `Alt+G`      | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
-| `Ctrl+L`                    | New session (same as `/clear`)                                                                                                                          |
+| `Ctrl+L`                    | Force a full repaint (same as `/redraw`)                                                                                                                |
 | `Ctrl+O`                    | Open the Tune popup (same as `/tune`): model, reasoning effort and ultracode in one place                                                               |
 | `Ctrl+V` / `Alt+V`          | Paste text first, then fall back to image/path attachment when applicable                                                                               |
 | `Tab`                       | Apply the active completion                                                                                                                             |
@@ -182,7 +184,7 @@ Notes:
 
 - `Tab` only applies completions when completions are present and you are not in multiline mode.
 - Queue/history navigation only applies when you are not in multiline mode.
-- `PgUp` / `PgDn` are left to the terminal emulator; the TUI does not handle them.
+- `PgUp` / `PgDn` scroll the transcript by half a viewport; `Shift+Up` / `Shift+Down` scroll it one row. `Home` / `End` edit the input line and do not scroll the transcript (there is no jump-to-bottom key).
 - A wake word (`ultracode`, `ultraplan`, ...) is painted in the accent colour when the gateway would act on it: the
   composer judges every line of a multi-line draft as one prompt, skips text inside a paste, and never paints a mode
   that `wake_words` in `config.yaml` switched off.
@@ -192,7 +194,8 @@ Notes:
 | Context                     | Keys                | Behavior                                          |
 | --------------------------- | ------------------- | ------------------------------------------------- |
 | approval prompt             | `Up/Down`, `Enter`  | Move and confirm the selected approval choice     |
-| approval prompt             | `o`, `s`, `a`, `d`  | Quick-pick `once`, `session`, `always`, `deny`    |
+| approval prompt             | `1`-`4`             | Quick-pick the matching numbered choice           |
+| approval prompt             | other typed text    | Ignored; only deny works until `Up/Down`          |
 | approval prompt             | `Esc`, `Ctrl+C`     | Deny                                              |
 | clarify prompt with choices | `Up/Down`, `Enter`  | Move and confirm the selected choice              |
 | clarify prompt with choices | single-digit number | Quick-pick the matching numbered choice           |
@@ -226,7 +229,7 @@ Notes:
 - Completion requests are debounced by 60 ms. Input starting with `/` uses `complete.slash`. A trailing token that starts with `./`, `../`, `~/`, `/`, or `@` uses `complete.path`.
 - Text pastes are inserted inline directly into the draft. Nothing is newline-flattened.
 - `Cmd/Ctrl+G` (or `Alt+G` in VSCode/Cursor, which intercept the primary keystroke for Find Next) writes the current draft, including any multiline buffer, to a temp file, suspends Ink, launches `$EDITOR`, then restores the TUI and submits the saved text if the editor exits cleanly.
-- Input history is stored in `~/.hermes/.hermes_history` or under `HERMES_HOME`.
+- Input history is stored per project in `~/.k3code/projects/<project>/.input_history`, or under `K3CODE_HOME`.
 
 ## Rendering
 
@@ -274,9 +277,11 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 ### Session (`session.ts`)
 
 `/model`, `/sessions` (aliases `/switch`, `/session`, `/resume`),
-`/bg`, `/btw`, `/image`, `/personality`,
-`/compress`, `/branch` (alias `/fork`), `/voice`, `/skin`,
-`/indicator`, `/yolo`, `/reasoning`, `/fast`, `/busy`, `/verbose`, `/usage`
+`/image`, `/theme`, `/pet`, `/indicator`, `/yolo`, `/reasoning`, `/busy`,
+`/usage`
+
+`/bg`, `/branch`, `/fork` and `/compact` (alias `/compress`) are not TUI
+commands: they run in the Python gateway through `slash.exec`.
 
 ### Tune (`tune.ts`)
 
@@ -366,6 +371,8 @@ Current color overrides:
 
 - banner title, accent, border, body, dim
 - label, ok, error, warn
+
+`NO_COLOR` (non-empty, see no-color.org) turns off all foreground and background colour at the one place colour is applied (`colorize()` in `packages/hermes-ink/src/ink/colorize.ts`); bold, dim and inverse stay.
 
 `branding.tsx` uses those values for the logo, session panel, and update notice.
 

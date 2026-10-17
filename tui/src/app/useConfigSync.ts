@@ -308,6 +308,7 @@ export const applyDisplay = (
   }
 
   patchUiState({
+    agentsView: !!d.tui_start_agents_view,
     battery: !!d.battery,
     busyInputMode: normalizeBusyInputMode(d.busy_input_mode),
     compact: !!d.tui_compact,

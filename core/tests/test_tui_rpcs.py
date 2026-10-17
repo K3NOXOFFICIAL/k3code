@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from k3code.gateway.server import _HANDLERS
 from test_autonomy_gateway import call, make, run_turn, start
 
@@ -42,6 +44,46 @@ def test_every_method_the_tui_calls_on_its_own_or_from_a_kept_command_exists():
         "subagent.steer",
     ):
         assert method in _HANDLERS, method
+
+
+#: Client→server RPCs the TUI is allowed to call without a gateway handler: each has a local fallback.
+#: `clarify.lock` (batch clarify) falls back to answering the pending server clarify request directly (#170).
+_TUI_RPC_ALLOWLIST = frozenset({"clarify.lock"})
+
+
+def test_every_rpc_method_the_tui_source_calls_exists_or_has_a_fallback():
+    """#170: fail when the TUI calls an RPC the gateway does not implement (dead overlay / missing handler).
+
+    Scans ``tui/src`` for client→server calls (``rpc("method"`` / ``.request("method"``) and asserts each is in
+    ``_HANDLERS``, unless allowlisted with a local fallback. Event/case labels and server→client methods are not
+    matched: only the two call-site shapes above.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent.parent / "tui" / "src"
+    if not root.is_dir():
+        pytest.skip("tui/src not checked out next to core/")
+    pat = re.compile(
+        r"""(?:\brpc\s*(?:<[^>]*>)?\s*\(\s*|\.request\s*(?:<[^>]*>)?\s*\(\s*)["']([a-z][a-z0-9_.-]+)["']"""
+    )
+    missing: dict[str, list[str]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix not in (".ts", ".tsx"):
+            continue
+        if "__tests__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in pat.finditer(text):
+            method = m.group(1)
+            if method not in _HANDLERS and method not in _TUI_RPC_ALLOWLIST:
+                missing.setdefault(method, []).append(str(path.relative_to(root)))
+                if len(missing[method]) > 3:
+                    missing[method].append("...")
+                    break
+    assert not missing, f"TUI calls RPCs the gateway does not implement: {missing}"
 
 
 async def test_shell_exec_runs_in_the_session_directory_and_keeps_the_hardline(tmp_path, monkeypatch):
@@ -125,6 +167,29 @@ async def test_the_live_tail_and_the_caps_have_the_shape_the_tui_reads(tmp_path,
     assert (await call(server, "subagent.tail", {"subagent_id": "nope"}))["available"] is False
     caps = await call(server, "delegation.status", {})
     assert caps["max_concurrent_children"] == 3 and caps["max_spawn_depth"] == 2
+
+
+async def test_a_finished_child_row_says_how_long_it_ran(tmp_path, monkeypatch):
+    """#170 idle repaint: the TUI times a finished child's linger in the agent strip from ``started_at`` plus
+    ``duration_seconds``. Without the duration a child of an earlier turn (known only from this list once the turn's
+    events are cleared) never left the strip, and its clock repainted the idle TUI every second for good."""
+    from test_subagents import final, task_call
+
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "PARENT: delegate it")
+    (row,) = (await call(server, "subagent.list", {"session_id": server.session.session_id}))["subagents"]
+    handle = server.subagents.handles[row["subagent_id"]]
+    assert row["status"] == "completed"
+    assert row["duration_seconds"] == pytest.approx(handle.finished_at - handle.started_at)
+    handle.status, handle.finished_at = "running", 0.0  # a running child has no duration yet
+    (row,) = (await call(server, "subagent.list", {"session_id": server.session.session_id}))["subagents"]
+    assert row["duration_seconds"] is None
 
 
 async def test_the_command_catalog_lists_the_gateways_commands_for_help_and_alias_resolution(tmp_path, monkeypatch):

@@ -101,3 +101,25 @@ async def test_no_makefile_write_into_the_repo_and_scratch_dirs_are_skipped(tmp_
     empty.mkdir()
     assert await projectprep.prepare(empty, store=store) == []
     assert not (empty / ".k3code").exists() and not projectstate.state_path(empty).exists()
+
+
+async def test_a_bare_git_init_directory_is_scratch_too(tmp_path):
+    bare = tmp_path / "bare"
+    (bare / ".git").mkdir(parents=True)
+    store = ProposalStore(tmp_path / "home")
+    assert await projectprep.prepare(bare, store=store) == []
+    assert not projectstate.state_path(bare).exists() and store.all() == []
+
+
+@pytest.mark.parametrize("where", ["home", "above"])
+async def test_a_session_in_home_scans_nothing(tmp_path, monkeypatch, where):
+    # a session started in $HOME scanned the whole home on every start and proposed recipes for what it met there
+    home = tmp_path / "users" / "me"
+    make(home, {"package.json": json.dumps({"scripts": {"test": "jest"}}), "proj/go.mod": "module x"})
+    monkeypatch.setenv("HOME", str(home))
+    store = ProposalStore(tmp_path / "k3")
+    root = home if where == "home" else home.parent
+    assert await projectprep.prepare(root, store=store) == []
+    assert not projectstate.state_path(root).exists() and store.all() == []
+    # a project below home is still prepared
+    assert await projectprep.prepare(home / "proj", store=store)

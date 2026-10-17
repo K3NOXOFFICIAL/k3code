@@ -15,14 +15,30 @@ export const appendTranscriptMessage = (prev: Msg[], msg: Msg): Msg[] =>
       : msg,
   );
 
+// Keeps the transcript at MAX_HISTORY rows. Trimmed rows leave a dim "N earlier
+// rows not shown" event row (right after the intro) so the cut is never silent;
+// it counts as one of the MAX_HISTORY rows and its `hiddenRows` accumulates
+// across later trims instead of stacking markers (#150).
 export const capTranscriptHistory = (items: Msg[]): Msg[] => {
   if (items.length <= MAX_HISTORY) {
     return items;
   }
 
-  return items[0]?.kind === "intro"
-    ? [items[0], ...items.slice(-(MAX_HISTORY - 1))]
-    : items.slice(-MAX_HISTORY);
+  const intro = items[0]?.kind === "intro" ? items[0] : undefined;
+  const rest = items.slice(intro ? 1 : 0);
+  const prior = rest[0]?.hiddenRows;
+  const rows = prior === undefined ? rest : rest.slice(1);
+  const kept = rows.slice(-(MAX_HISTORY - (intro ? 2 : 1)));
+  const hiddenRows = (prior ?? 0) + rows.length - kept.length;
+
+  const marker: Msg = {
+    hiddenRows,
+    kind: "event",
+    role: "system",
+    text: `${hiddenRows} earlier rows not shown`,
+  };
+
+  return intro ? [intro, marker, ...kept] : [marker, ...kept];
 };
 
 export const upsert = (prev: Msg[], role: Role, text: string): Msg[] =>

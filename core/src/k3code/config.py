@@ -14,6 +14,22 @@ from k3code import trust
 
 logger = logging.getLogger(__name__)
 
+#: Model ids the relay catalog no longer lists, and what they became. Keys match
+#: the whole id only (``claude-sonnet-5`` -> ``claude-sonnet-5-5``), so dated ids
+#: and gateway aliases (``auto/...``) pass through untouched.
+RETIRED_MODEL_IDS: dict[str, str] = {
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-opus-5": "claude-opus-5-5",
+    "claude-haiku-4-5": "claude-haiku-5-5",
+}
+
+
+def _normalize_retired_model_id(spec: str | list[str]) -> str | list[str]:
+    if isinstance(spec, list):
+        return [RETIRED_MODEL_IDS.get(s, s) for s in spec]
+    return RETIRED_MODEL_IDS.get(spec, spec)
+
+
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
 
@@ -23,8 +39,10 @@ class ProviderEntry(BaseModel):
     name: str
     kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
     base_url: str = ""  # required for "openai" / "anthropic"
-    api_key_env: str = ""  # required for "openai" / "anthropic"
-    api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
+    api_key_env: str = ""  # required for "openai" / "anthropic"; "" = the endpoint takes no key (Ollama)
+    #: populated by load_config() from the api_key_env var; never set this directly. Not in repr: a logged or
+    #: printed config must not carry the key.
+    api_key: str = Field(default="", repr=False)
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: Optional one-line text per model key ({default: "Everyday coding", cheap: "Fast and cheap"}), shown by /tune.
     descriptions: dict[str, str] = Field(default_factory=dict)
@@ -45,9 +63,16 @@ class ProviderEntry(BaseModel):
     persistent: bool = True
     max_sessions: int = 4
     idle_seconds: float = 600.0
+    #: claude-cli only: seconds one model step (one call, or one turn of a live process) may take in all before it is
+    #: killed and counts as a timeout. The router then fails over to the next entry without retrying this one.
+    timeout_seconds: float = Field(default=300.0, gt=0)
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
-    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    #: marks messages Anthropic-style when the model id looks like Claude (a relay to Anthropic passes it on); ``on``
+    #: marks every model id, which a gateway alias in front of Claude needs.
     prompt_cache: str = "auto"
+    #: openai kind, ``prompt_cache: auto``: globs (case-insensitive, whole id, e.g. ``auto/*``) of further model ids
+    #: that get the breakpoints.
+    cache_models: list[str] = Field(default_factory=list)
 
     @field_validator("prompt_cache")
     @classmethod
@@ -81,6 +106,22 @@ class ProviderEntry(BaseModel):
                 if key not in data:
                     raise ValueError(f"{key} is required for provider kind {data.get('kind')!r}")
         return data
+
+    @field_validator("models", "tiers")
+    @classmethod
+    def _normalize_retired_model_ids(
+        cls, v: dict[str, str | list[str]]
+    ) -> dict[str, str | list[str]]:
+        """Rewrite model ids the endpoint no longer lists to their replacement.
+
+        Older configs (and /model-era docs) wrote the bare ``claude-sonnet-5`` /
+        ``claude-opus-5`` / ``claude-haiku-4-5`` ids; the relay catalog now only
+        carries the dated ones (``claude-sonnet-5-5``, ...). Without this, the
+        cheap tier sends a dead id and the goal_judge dies with "unknown
+        provider for model" on every tick. Vendor-prefixed ids (``claude/...``)
+        are left alone: the prefix is the relay's routing, not the model.
+        """
+        return {k: _normalize_retired_model_id(s) for k, s in v.items()}
 
 
 class McpServerConfig(BaseModel):
@@ -121,6 +162,10 @@ class Mem0Config(BaseModel):
     user_id: str = ""
     agent_id: str = "k3code"
 
+    def identifiers(self) -> dict[str, str]:
+        """Whose memories these are: sent on every write and every search, so a search finds what was written."""
+        return {"agent_id": self.agent_id, **({"user_id": self.user_id} if self.user_id else {})}
+
 
 class DisplayConfig(BaseModel):
     # TUI-only settings (tui_theme, tui_status_indicator, tui_statusbar, battery, pet, ...) are kept as extra
@@ -129,6 +174,8 @@ class DisplayConfig(BaseModel):
 
     theme: str = ""
     focus_mode: bool = False
+    #: the TUI opens its full-screen agent view on startup instead of a session composer (setting from /settings)
+    tui_start_agents_view: bool = False
 
 
 class GoalConfig(BaseModel):
@@ -164,15 +211,19 @@ class Settings(BaseModel):
 
     providers: list[ProviderEntry] = Field(default_factory=list)
     default_model: str = "default"  # key into provider.models
+    #: provider block a session's turns try first (/provider <name> --save); "" or an unknown name = the first block
+    default_provider: str = ""
     max_turns: int = 0  # model calls per prompt; 0 = no cap (a reached cap stops the turn as needs_input)
     max_tokens: int = 8192
     temperature: float | None = None
     permission_mode: str = "ask"  # ask | auto-edit | plan | auto | yolo
     headless_permission: str | None = None  # overrides permission_mode in -p mode
     # M2 reliability layer; keys mirror reliability.ReliabilitySettings, e.g.
-    #   reliability: {enabled: true, max_wait: 3600,
+    #   reliability: {enabled: true, max_wait: 3600, retry_forever: false,
     #                 flags: {netwatch: true, journal: true, ...},
     #                 session_tokens: 2000000, session_usd: 5.0}
+    # retry_forever: never abort on transient/infra errors; park with capped
+    # backoff and retry forever (forces max_wait=None).
     reliability: dict[str, Any] = Field(default_factory=dict)
     # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex]}
     permissions: dict[str, Any] = Field(default_factory=dict)
@@ -197,13 +248,22 @@ class Settings(BaseModel):
     # min_scope: with the ultracode mode on (/ultracode on), a prompt rated at least this runs the pipeline.
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
-    # Wake words (ultracode, ultraplan, ultraresearch typed in a prompt run that mode once): {enabled: true,
-    # ultracode: true, ultraplan: true, ultraresearch: true}; see k3code.wakewords
+    # Wake words (ultracode, ultraplan, ultraresearch, fanout, ultrasketch, ultrareview typed in a prompt
+    # run that mode once): {enabled: true, <word>: true, ...}; see k3code.wakewords
     wake_words: dict[str, Any] = Field(
-        default_factory=lambda: {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
+        default_factory=lambda: {
+            "enabled": True,
+            "ultracode": True,
+            "ultraplan": True,
+            "ultraresearch": True,
+            "fanout": True,
+            "ultrasketch": True,
+            "ultrareview": True,
+        }
     )
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
-    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
+    # the exact origin of research.searxng_url is always allowed. While the guard is on, web_fetch connects directly
+    # and ignores HTTP(S)_PROXY/ALL_PROXY (a proxy would resolve names again). See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
     # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",
@@ -222,6 +282,19 @@ class Settings(BaseModel):
     # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
     # see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("providers")
+    @classmethod
+    def _unique_provider_names(cls, v: list[ProviderEntry]) -> list[ProviderEntry]:
+        """The name is how /model, doctor, NetWatch and the cooldown store find an entry: two blocks sharing one would
+        be edited, cleared and parked together. A second account of a provider gets its own name."""
+        seen: set[str] = set()
+        for p in v:
+            name = p.name.strip().lower()
+            if name in seen:
+                raise ValueError(f"duplicate provider name {p.name.strip()!r}: give each provider block its own name")
+            seen.add(name)
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -261,9 +334,15 @@ class Settings(BaseModel):
         return {**dict.fromkeys(CONFIG_KEYS, True), **v}
 
 
-#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
-#: learning decisions (days).
-RETENTION_DEFAULTS: dict[str, int] = {"usage_days": 180, "journal_days": 30, "debug_bundles": 10, "decisions_days": 365}
+#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), the journal directory's size
+#: cap (MB; the oldest closed files go first), debug bundles kept (count), learning decisions (days).
+RETENTION_DEFAULTS: dict[str, int] = {
+    "usage_days": 180,
+    "journal_days": 30,
+    "journal_mb": 512,
+    "debug_bundles": 10,
+    "decisions_days": 365,
+}
 
 
 def retention(config: Any) -> dict[str, int]:
@@ -374,19 +453,29 @@ def load_config(
 
     _warn_unknown_escalate_keys(merged)
     _warn_unknown_mode_keys(merged)
+    merged["autonomy"] = _checked_auto_continue(merged.get("autonomy"))
 
-    # Expand provider api_key_env -> api_key (api_key_env is a required field on
-    # ProviderEntry, so look it up without popping it out of the dict).
+    # Validate first, then expand api_key_env -> api_key on the validated entries. A validation error echoes its input
+    # (pydantic's input_value=<the provider block>), so a key in that block would show up in the error text (its tail
+    # survives the truncation) and in every log it reaches. An api_key written in config.yaml was always replaced
+    # here; it is dropped before validation for the same reason. A providers value or entry of the wrong type is left
+    # to pydantic, which reports it like any other config error.
+    providers = merged.get("providers")
+    if isinstance(providers, list):
+        merged["providers"] = [
+            {k: v for k, v in p.items() if k != "api_key"} if isinstance(p, dict) else p for p in providers
+        ]
+    settings = Settings(**merged)
+
     # The process environment wins; otherwise fall back to the env file the setup wizard
     # writes (~/.config/k3code/env), so a key stored there also works outside systemd.
     from k3code.setup.state import read_env_file
 
     file_env = read_env_file()
-    for p in merged.get("providers", []):
-        name = p.get("api_key_env", "")
-        p["api_key"] = os.environ.get(name) or file_env.get(name, "")
+    for entry in settings.providers:
+        entry.api_key = os.environ.get(entry.api_key_env) or file_env.get(entry.api_key_env, "")
 
-    return Settings(**merged)
+    return settings
 
 
 def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
@@ -409,6 +498,30 @@ def _warn_unknown_mode_keys(merged: dict[str, Any]) -> None:
         section = merged.get(name)
         for key in sorted(set(section) - known if isinstance(section, dict) else (), key=str):
             logger.warning("%s.%s is not used and is ignored (known keys: %s)", name, key, ", ".join(sorted(known)))
+
+
+def _checked_auto_continue(section: Any) -> Any:
+    """``autonomy.auto_continue`` (true, false or "auto") and ``auto_continue_max_turns`` (a non-negative whole
+    number; ``"8"`` reads as 8) checked at load: a bad value is warned about and dropped, so the default applies
+    ("auto", 8). Before, ``auto_continue_max_turns: eight`` passed the load and raised at the first auto-continued
+    prompt, and ``-1`` silently meant no cap."""
+    from k3code.autonomy import DEFAULTS, auto_continue_max_turns, auto_continue_setting
+
+    if not isinstance(section, dict):
+        return section  # not a mapping: pydantic reports it
+    out = dict(section)
+    for key, coerce in (("auto_continue", auto_continue_setting), ("auto_continue_max_turns", auto_continue_max_turns)):
+        if key not in out:
+            continue
+        value = coerce(out[key])
+        if value is None:
+            want = 'true, false or "auto"' if key == "auto_continue" else "a whole number, 0 or more (0 = no cap)"
+            logger.warning(
+                "autonomy.%s=%r is not valid (%s); using the default %r", key, out.pop(key), want, DEFAULTS[key]
+            )
+        else:
+            out[key] = value
+    return out
 
 
 def _is_scalar(default: Any) -> bool:

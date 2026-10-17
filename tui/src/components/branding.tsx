@@ -245,21 +245,24 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   const [mcpOpen, setMcpOpen] = useState(false);
 
   const truncLine = (pfx: string, items: string[]) => {
-    let line = "";
-    let shown = 0;
+    const sorted = [...items].sort();
+    const room = lineBudget - pfx.length;
 
-    for (const item of [...items].sort()) {
-      const next = line ? `${line}, ${item}` : item;
-
-      if (pfx.length + next.length > lineBudget) {
-        return line ? `${line}, …+${items.length - shown}` : `${item}, …`;
-      }
-
-      line = next;
-      shown++;
+    if (sorted.join(", ").length <= room) {
+      return sorted.join(", ");
     }
 
-    return line;
+    // Keep the longest prefix whose "…+N" suffix still fits the cell, so the
+    // Text's own truncation never clips it into a second ellipsis.
+    for (let shown = sorted.length - 1; shown > 0; shown--) {
+      const line = `${sorted.slice(0, shown).join(", ")}, …+${sorted.length - shown}`;
+
+      if (line.length <= room) {
+        return line;
+      }
+    }
+
+    return `…+${sorted.length}`;
   };
 
   // ── Collapsible skills section ──
@@ -384,12 +387,14 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
       <ArtLines lines={heroLines} />
       <Text />
 
-      <Text color={t.color.accent}>
+      {/* Cut at the end like the narrow layout: the default wrap broke a long
+          model name mid-word onto a second line (#170). */}
+      <Text color={t.color.accent} wrap="truncate-end">
         {(info.model ?? "").split("/").pop()}
         <Text color={t.color.muted}> · k3code</Text>
       </Text>
 
-      <Text color={t.color.muted} wrap="truncate-end">
+      <Text color={t.color.muted} wrap="truncate-start">
         {info.cwd || process.cwd()}
       </Text>
 
@@ -420,7 +425,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
             {(info.model ?? "").split("/").pop()}
             <Text color={t.color.muted}> · k3code</Text>
           </Text>
-          <Text color={t.color.muted} wrap="truncate-end">
+          <Text color={t.color.muted} wrap="truncate-start">
             {info.cwd || process.cwd()}
           </Text>
           {sid && (

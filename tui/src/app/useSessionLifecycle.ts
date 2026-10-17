@@ -403,8 +403,19 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   );
 
   const newLiveSession = useCallback(
-    (msg = "new live session started", title?: string, dropSid?: string) => {
-      patchOverlayState({ agentView: false, sessions: false });
+    (
+      msg = "new live session started",
+      title?: string,
+      dropSid?: string,
+      // The agent view's composer starts sessions and stays open, so the full-screen
+      // list keeps watching the new one; every other entry point folds both overlays.
+      keepAgentView = false,
+    ) => {
+      if (keepAgentView) {
+        patchOverlayState({ sessions: false });
+      } else {
+        patchOverlayState({ agentView: false, sessions: false });
+      }
 
       return startNewSession(msg, title, true).then((sid) => {
         dropAfterSwitch(dropSid, sid);

@@ -189,6 +189,35 @@ const countNewlines = (text: string, end: number) => {
   return count;
 };
 
+// C0 controls except \n and \t, DEL, C1 controls and bidi overrides/isolates.
+const UNSAFE_DISPLAY_RE =
+  // eslint-disable-next-line no-control-regex
+  /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * Model-controlled text made safe to paint: every control byte (ESC, BEL, CR,
+ * DEL, ...) becomes a visible symbol (ESC → ␛) and every C1 control or bidi
+ * override a `\xNN` / `\uNNNN` escape, so it cannot move the cursor, erase
+ * the prompt, set the title or reorder what the user reads. `\n` and `\t`
+ * stay; a missing field (the gateway payload is untyped JSON) is empty.
+ */
+export const visibleControls = (s: string | null | undefined) =>
+  (s ?? "").replace(UNSAFE_DISPLAY_RE, (c) => {
+    const code = c.charCodeAt(0);
+
+    if (code < 0x20) {
+      return String.fromCharCode(0x2400 + code);
+    }
+
+    if (code === 0x7f) {
+      return "\u2421";
+    }
+
+    return code < 0x100
+      ? `\\x${code.toString(16).padStart(2, "0")}`
+      : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
+
 export const stripTrailingPasteNewlines = (text: string) =>
   /[^\n]/.test(text) ? text.replace(/\n+$/, "") : text;
 

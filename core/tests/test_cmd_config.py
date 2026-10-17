@@ -208,6 +208,103 @@ async def test_memory_command(tmp_path, monkeypatch):
     await server.close()
 
 
+def _memory_tree(root):
+    """A repository whose memory spans every kind of source the loader reads, with one of each listing state."""
+    (root / ".git").mkdir(parents=True)
+    (root / "pkg" / "sub").mkdir(parents=True)
+    (root / ".k3code" / "rules").mkdir(parents=True)
+    (root / ".k3code" / "rules" / "style.md").write_text("RULE-STYLE")
+    (root / "docs").mkdir()
+    (root / "docs" / "build.md").write_text("IMPORTED-BUILD")
+    (root / "AGENTS.md").write_text("ROOT-AGENTS\n@docs/build.md\n")
+    (root / "CLAUDE.md").write_text("ROOT-AGENTS\n@docs/build.md\n")  # the usual copy: same text, read once
+    (root / "pkg" / "K3CODE.md").write_text("  \n")  # empty
+    (root / "pkg" / "sub" / "CLAUDE.md").write_text("s" * 25_000)  # past the 20,000-character per-file cap
+    memmod.write_learned(root, ["build with make all"])
+
+
+async def test_memory_lists_exactly_the_files_the_prompt_reads(tmp_path, monkeypatch):
+    """/memory listed only USER.md and the root K3CODE.md (or AGENTS.md); the prompt also reads CLAUDE.md, every
+    directory from the root down to the session's, .k3code/rules/*.md, learned.md and @imports. The listing is now
+    the loader's own scan: same files, same order, with what the caps cut."""
+    server, _ = make_server(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    _memory_tree(repo)
+    cwd = repo / "pkg" / "sub"
+    sid = await new_session(server, cwd)
+    res = await cmd(server, "/memory", sid)
+    rows, out = res["files"], res["output"]
+
+    # every file the loader reads is listed, in the prompt's order, and the listing names no file it does not read
+    read = [r["path"] for r in rows if r["status"] == memmod.READ and r["scope"] != "learned"]
+    assert read == [str(m.path) for m in memmod.load_memory(cwd)]
+    assert read == [
+        str(repo / ".k3code" / "rules" / "style.md"),
+        str(repo / "AGENTS.md"),
+        str(repo / "pkg" / "sub" / "CLAUDE.md"),
+    ]
+    by_path = {r["path"]: r for r in rows}
+    # every place the loader looks: root to cwd, the three names in each, the user's memory and learned.md
+    for d in (repo, repo / "pkg", cwd):
+        for name in memmod.PROJECT_FILES:
+            assert str(d / name) in by_path
+    assert [r["scope"] for r in rows][:2] == ["user", "rules"] and rows[-1]["scope"] == "learned"
+    assert by_path[str(memmod.user_memory_path())]["status"] == memmod.MISSING
+    assert by_path[str(repo / "K3CODE.md")]["status"] == memmod.MISSING
+    assert by_path[str(repo / "CLAUDE.md")]["status"] == memmod.SAME
+    assert by_path[str(repo / "pkg" / "K3CODE.md")]["status"] == memmod.EMPTY
+    assert by_path[str(repo / "AGENTS.md")]["imports"] == [str(repo / "docs" / "build.md")]
+    assert f"@import {repo / 'docs' / 'build.md'}" in out
+    assert by_path[str(memmod.learned_notes_path(repo))]["status"] == memmod.READ
+    # the cap the prompt applies is reported on the file it cut
+    assert by_path[str(cwd / "CLAUDE.md")]["cut"] == "file"
+    assert f"{cwd / 'CLAUDE.md'}  25000 bytes, cut at the 20000-character per-file limit" in out
+    assert by_path[str(repo / "AGENTS.md")]["cut"] == ""
+    # the file /memory add and edit write to
+    assert by_path[str(repo / "AGENTS.md")]["edit_target"] == "project"
+    assert f"/memory add and /memory edit write to {repo / 'AGENTS.md'}" in out
+    await server.close()
+
+
+def test_memory_listing_reports_what_the_total_cap_dropped(tmp_path, monkeypatch):
+    """The 40,000-character total goes to the nearest files first: the root file it cuts short and the one it leaves
+    out are listed as such, and the prompt agrees."""
+    from k3code.commands.memory_cmd import memory_listing
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "K3CODE.md").write_text("p" * 15_000)
+    for name, fill in (("K3CODE.md", "k"), ("AGENTS.md", "a"), ("CLAUDE.md", "c")):
+        (repo / name).write_text(fill * 20_000)
+    out, rows = memory_listing(repo / "pkg", make_cfg())
+    cuts = {r["path"].removeprefix(str(repo) + "/"): r["cut"] for r in rows if r["status"] == memmod.READ}
+    assert cuts == {"K3CODE.md": "", "AGENTS.md": "total", "CLAUDE.md": "dropped", "pkg/K3CODE.md": ""}
+    assert f"{repo / 'AGENTS.md'}  20000 bytes, cut short: the 40000-character total ran out" in out
+    assert f"{repo / 'CLAUDE.md'}  20000 bytes, left out: the 40000-character total ran out" in out
+    prompt = memmod.memory_prompt(repo / "pkg")
+    assert "a" * 4_000 in prompt and "a" * 6_000 not in prompt and "c" * 100 not in prompt
+    assert memmod.TOTAL_MARKER.format(n=1, cap=memmod.MAX_MEMORY_TOTAL) in prompt
+
+
+def test_memory_listing_uses_the_prompts_per_file_cap_and_learning_switch(tmp_path, monkeypatch):
+    """``context.memory_chars`` (the optimizer's knob) is the cap the prompt uses, so it is the one reported; with
+    ``learning.enabled: false`` the learned notes are listed as not in the prompt."""
+    from k3code.commands.memory_cmd import memory_listing
+    from k3code.config import Settings
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "K3CODE.md").write_text("x" * 600)
+    memmod.write_learned(repo, ["build with make all"])
+    out, rows = memory_listing(repo, Settings(context={"memory_chars": 500}, learning={"enabled": False}))
+    assert "cut at the 500-character per-file limit" in out
+    assert rows[-1]["scope"] == "learned" and rows[-1]["status"] == memmod.OFF
+    assert "x" * 501 not in build_system_prompt("BASE", cwd=repo, config=Settings(context={"memory_chars": 500}))
+
+
 async def test_skills_command_and_tool(tmp_path, monkeypatch):
     server, provider = make_server(tmp_path, monkeypatch)
     write_skill(home() / "skills", "alpha", "Does alpha things", body="ALPHA-SECRET-BODY")

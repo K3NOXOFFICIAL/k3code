@@ -69,7 +69,7 @@ export type Props = BaseProps & WeightProps;
 export function shouldUseAnsiDim(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const override = (env.HERMES_TUI_DIM ?? "").trim();
+  const override = (env.K3CODE_TUI_DIM ?? env.HERMES_TUI_DIM ?? "").trim();
 
   if (ENV_ON_RE.test(override)) {
     return true;
@@ -102,7 +102,7 @@ export function setDimFallbackColor(color: Color | undefined): void {
 export function dimColorFallback(
   env: NodeJS.ProcessEnv = process.env,
 ): Color | undefined {
-  const override = (env.HERMES_TUI_DIM ?? "").trim();
+  const override = (env.K3CODE_TUI_DIM ?? env.HERMES_TUI_DIM ?? "").trim();
 
   if (ENV_ON_RE.test(override) || ENV_OFF_RE.test(override)) {
     return undefined;

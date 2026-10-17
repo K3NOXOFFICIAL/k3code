@@ -106,6 +106,8 @@ export interface ConfigDisplayConfig {
    * nothing — just advertises the command.  Default true.
    */
   tui_agents_nudge?: boolean;
+  /** Open the full-screen agent view on launch (/settings "Start in agent view"). */
+  tui_start_agents_view?: boolean;
   tui_auto_resume_recent?: boolean;
   tui_compact?: boolean;
   /** Legacy alias for display.mouse_tracking. */
@@ -172,6 +174,8 @@ export interface SystemBatteryResponse {
   category?: string;
   percent?: null | number;
   plugged?: null | boolean;
+  temp_c?: null | number;
+  power_profile?: null | string;
 }
 
 // ── /tune: model + effort + ultracode ────────────────────────────────
@@ -532,6 +536,8 @@ export interface SubagentListResponse {
     goal?: string | null;
     model?: string | null;
     started_at?: number | null;
+    /** How long a finished child ran (s); null while it runs. */
+    duration_seconds?: number | null;
     status?: string | null;
     tool_count?: number | null;
     last_tool?: string | null;

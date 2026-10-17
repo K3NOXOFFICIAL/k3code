@@ -315,6 +315,51 @@ def test_a_genuine_context_overflow_is_still_context_overflow():
     assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 529])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "upstream error: failed to count input token usage",
+        "internal error: token limit bookkeeping failed",
+        "backend crashed: too many tokens in flight, exceeds the limit of workers",
+        "upstream error: could not read prompt length from cache, context size unknown",
+    ],
+)
+def test_server_error_with_generic_token_wording_is_server_not_context_overflow(status, message):
+    """A 5xx body that merely mentions tokens used to be context_overflow, which stops the fallback walk and
+    forces compaction instead of failing over to the next entry."""
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError(message, status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.server
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 529])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "the request exceeds the available context size, try increasing it",
+        "slot context shift failed: n_ctx_slot = 4096",
+        "truncating input prompt: limit exceeded",
+        "This model's max_model_len is 8192; the prompt exceeds the max_model_len",
+        "prompt is too long for the maximum model length",
+    ],
+)
+def test_llamacpp_and_vllm_overflow_wording_on_5xx_is_still_context_overflow(status, message):
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError(message, status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
+
+
+@pytest.mark.parametrize("status", [413, 422])
+def test_payload_too_large_wording_on_413_422_keeps_the_broad_overflow_phrases(status):
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError("request failed: too many tokens, token limit exceeded", status_code=status)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
+
+
 # ── TLS certificate failures: permanent, hinted, never parked ─────────
 
 CERT_ERROR = (
@@ -355,6 +400,29 @@ def test_transient_tls_alert_is_still_network():
     assert result.hint == ""
 
 
+def test_unknown_provider_for_model_400_carries_the_model_id_hint():
+    """A relay that routes by the id's vendor prefix rejects `claude/<model>` (catalog only carries `cc/<model>`)
+    with "unknown provider for model <model>": failover happens as for any bad_request, plus a fix-it hint."""
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import UNKNOWN_MODEL_ID_HINT
+
+    err = ProviderError(
+        "claude/claude-sonnet-5: model — [400]: unknown provider for model claude-sonnet-5", status_code=400
+    )
+    result = classify_api_error(err, provider="claude", model="claude/claude-sonnet-5")
+    assert result.reason is FailoverReason.bad_request
+    assert result.immediate_failover
+    assert result.hint == UNKNOWN_MODEL_ID_HINT
+    assert "/models" in result.hint and "vendor prefix" in result.hint
+
+
+def test_other_400s_get_no_hint():
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError("request failed: max_tokens is too large", status_code=400)
+    assert classify_api_error(err, provider="p", model="m").hint == ""
+
+
 async def test_certificate_failure_fails_the_turn_instead_of_parking(provider_factory, sample_messages, sample_tools):
     """An unattended run parks on network failures and waits for connectivity; a certificate that does not verify
     must end the turn at once, with the hint, and without inline retries."""
@@ -380,3 +448,39 @@ async def test_certificate_failure_fails_the_turn_instead_of_parking(provider_fa
     assert client.send.await_count == 1
     assert slept == []
     assert not [e for e in seen if e.kind == PARKED]
+
+
+# ── summarize: long enough to keep the provider's explanation, never a credential (issue #163) ──
+
+
+@pytest.mark.parametrize(
+    "secret, message",
+    [
+        ("sk-proj-Ab3dEf6hIj9kLm2nOp5qRs8t", "Incorrect API key provided: {s}. You can find your key at platform"),
+        ("Zq7Vb2Xn9Lm4Kp8Rt3Wy6Hs1Df5Gj0Ac", "upstream rejected key {s} for this model"),
+        ("hunter2hunter2", "proxy said: Authorization: Bearer {s} is not valid"),
+        ("Q9w8E7r6T5y4U3i2O1p0", "GET https://api.example.com/v1/models?key={s} returned 403"),
+    ],
+)
+def test_summary_never_carries_a_key_like_token(secret, message):
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import summarize
+
+    summary = summarize(ProviderError(message.format(s=secret), status_code=401))
+    assert secret not in summary
+    assert secret[:12] not in summary  # not even the start of it
+    assert "<redacted>" in summary
+
+
+def test_summary_keeps_a_400_character_provider_error_whole():
+    """160 characters cut a provider's explanation off after the preamble; a 400-character error is now kept."""
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import summarize
+
+    message = "400 Bad Request from https://api.example.com/v1/chat/completions (request id req_0f1e): " + (
+        "the tool schema for 'search' is invalid because property 'query' has no type; " * 5
+    )
+    message = message[:400]
+    summary = summarize(ProviderError(message, status_code=400))
+    assert summary == f"ProviderError: {message.strip()}"
+    assert len(summarize(ProviderError("x" * 2000))) == 500  # the default still caps a runaway body

@@ -10,6 +10,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
@@ -30,7 +31,10 @@ import {
 } from "../config/env.js";
 import { PLACEHOLDER } from "../content/placeholders.js";
 import { prevRenderedMsg } from "../domain/blockLayout.js";
-import { composerLineHighlights } from "../domain/composerHighlights.js";
+import {
+  composerLineHighlights,
+  hasWakeWordHit,
+} from "../domain/composerHighlights.js";
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -65,7 +69,6 @@ import { Banner, Panel, SessionPanel } from "./branding.js";
 import { FpsOverlay } from "./fpsOverlay.js";
 import { GoalBar } from "./goalBar.js";
 import { HelpHint } from "./helpHint.js";
-import { Journey } from "./journey.js";
 import { MessageLine } from "./messageLine.js";
 import { QueuedMessages } from "./queuedMessages.js";
 import { SectionRule } from "./sectionRule.js";
@@ -297,6 +300,16 @@ const TranscriptPane = memo(function TranscriptPane({
   );
 });
 
+/** Rainbow hues cycled by the composer border while an ultramode is on. */
+const RAINBOW: readonly string[] = [
+  "#ff0000",
+  "#ff7f00",
+  "#ffff00",
+  "#00ff00",
+  "#0000ff",
+  "#4b0082",
+  "#9400d3",
+];
 const ComposerPane = memo(function ComposerPane({
   actions,
   composer,
@@ -329,6 +342,24 @@ const ComposerPane = memo(function ComposerPane({
         : [],
     [composer.inputBuf, composer.input, wake],
   );
+  // Animated rainbow border while an ultramode is on: either the session's
+  // ultra_mode, or the current prompt naming an enabled wake word (the same
+  // hit the composer accent paints). Cheap: one 500ms ticker, 7 hues.
+  const ultraModeOn = ui.info?.ultra_mode === "ultracode";
+  const ultraWakeHit = useMemo(
+    () => hasWakeWordHit([...composer.inputBuf, composer.input], wake),
+    [composer.inputBuf, composer.input, wake],
+  );
+  const ultraActive = ultraModeOn || ultraWakeHit;
+  const [rainbowTick, setRainbowTick] = useState(0);
+  useEffect(() => {
+    if (!ultraActive) {
+      return;
+    }
+    const timer = setInterval(() => setRainbowTick((t) => t + 1), 500);
+    return () => clearInterval(timer);
+  }, [ultraActive]);
+  const rainbow = RAINBOW[rainbowTick % RAINBOW.length];
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -394,7 +425,10 @@ const ComposerPane = memo(function ComposerPane({
     onModelSelect: actions.onModelSelect,
     onNewLiveSession: actions.newLiveSession,
     onNewPromptSession: actions.newPromptSession,
+    onPermissionsApply: actions.onPermissionsApply,
+    onProviderSelect: actions.onProviderSelect,
     onResumeSelect: actions.resumeById,
+    onSettingsApply: actions.onSettingsApply,
     onTuneApply: actions.onTuneApply,
     pagerPageSize: composer.pagerPageSize,
   };
@@ -530,6 +564,8 @@ const ComposerPane = memo(function ComposerPane({
               </Box>
 
               <Box
+                borderColor={ultraActive ? rainbow : undefined}
+                borderStyle={ultraActive ? "round" : undefined}
                 flexGrow={0}
                 flexShrink={0}
                 height={inputHeight}
@@ -618,19 +654,6 @@ const AgentsOverlayPane = memo(function AgentsOverlayPane() {
   );
 });
 
-const JourneyPane = memo(function JourneyPane() {
-  const { gw } = useGateway();
-  const ui = useStore($uiState);
-
-  return (
-    <Journey
-      gw={gw}
-      onClose={() => patchOverlayState({ journey: false })}
-      t={ui.theme}
-    />
-  );
-});
-
 const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
   actions,
 }: Pick<AppLayoutProps, "actions">) {
@@ -664,9 +687,19 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
       gw={gw}
       onActivate={activate}
       onClose={close}
-      onNew={() => {
-        actions.newLiveSession(dropSid());
+      // A /command needs the transcript to be visible: the view folds away first.
+      onCommand={(command) => {
         close();
+        actions.onSettingsApply(command);
+      }}
+      // A plain prompt starts a session for it and the view STAYS up — watching
+      // it work is why this view exists. An empty session left behind (the one
+      // this client just departed) is dropped; the gateway judges disposability.
+      onNewPrompt={(text) => {
+        actions.newPromptSession(text, undefined, {
+          dropSid: dropSid(),
+          keepAgentView: true,
+        });
       }}
       onStop={({ kind, ...row }) => {
         if (kind !== "past") {
@@ -747,7 +780,7 @@ export const AppLayout = memo(function AppLayout({
   const overlay = useStore($overlayState);
   const ui = useStore($uiState);
   // These replace the transcript, rails, pet, prompt zone and composer with one full-screen pane.
-  const fullScreen = overlay.agents || overlay.journey || overlay.agentView;
+  const fullScreen = overlay.agents || overlay.agentView;
 
   const cursorSnapshotRef = useRef<InputCursorSnapshot | null>(null);
   useEffect(() => {
@@ -772,10 +805,6 @@ export const AppLayout = memo(function AppLayout({
           {overlay.agents ? (
             <PerfPane id="agents">
               <AgentsOverlayPane />
-            </PerfPane>
-          ) : overlay.journey ? (
-            <PerfPane id="journey">
-              <JourneyPane />
             </PerfPane>
           ) : overlay.agentView ? (
             <PerfPane id="agentView">

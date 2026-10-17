@@ -13,6 +13,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,10 @@ from typing import Any
 from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
+from k3code.goals import loop_evidence
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.prompting import build_system_prompt
+from k3code.prompting import subagent_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
@@ -79,6 +81,13 @@ class Handle:
     tail: list[str] = field(default_factory=list)
     index: int = 0
     count: int = 1
+    #: what the child's tool calls showed (``goals.TurnEvidence``: its tests with exit codes, the files it edited),
+    #: kept when its loop is dropped: a fan-out hands its workers' evidence to the parent's goal judge
+    evidence: Any = field(default=None, repr=False)
+    #: called as ``on_usage(handle, final)`` right after each model call adds to ``tokens_in``/``tokens_out``, from
+    #: the child's own task; ``final`` = the reply has no tool calls, so the child makes no further call. A fan-out
+    #: with a token cap stops its running children there once the cap is crossed
+    on_usage: Callable[[Handle, bool], None] | None = field(default=None, repr=False)
 
     @property
     def done(self) -> bool:
@@ -405,13 +414,14 @@ class SubagentManager:
 
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
-        perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
-        base = build_system_prompt(
-            parent.system_prompt,
+        perms = PermissionState(
+            mode=PermissionMode(parent.perms.mode),
             cwd=cwd,
-            config=server.config,
-            session_meta=parent.stored.meta,
-            mcp=server.mcp,
+            add_dirs=list(parent.perms.add_dirs),
+            # a worktree child's cwd is a fresh path under the project: its config rules are the parent project's
+            project_dir=parent.perms.project_dir or parent.perms.cwd,
+            # the parent's session denies outrank a config allow there: the child may not run what the parent refuses
+            session_rules=[r for r in parent.perms.session_rules if r.action == "deny"],
         )
         note = ""
         if h.isolation == "worktree":
@@ -420,11 +430,11 @@ class SubagentManager:
                 "your changes are committed and merged back by the harness. Do not run git commands that "
                 "change branches."
             )
-        system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
-        router = server.tier_routers().get(Tier(h.tier))
+        # the parent's key (#130) and its /provider pick
+        router = server._ensure_router(parent.stored.model or None, parent.stored.provider).get(Tier(h.tier))
         loop = AgentLoop(
             router,
-            system_prompt=system,
+            system_prompt="",  # composed below, from the tools the child ends up with
             max_turns=_child_max_turns(server.config),
             max_tool_errors=int(autonomy_cfg(server.config)["max_tool_errors"]),
             headless=False,
@@ -441,6 +451,14 @@ class SubagentManager:
         )
         from k3code.extratools import register_skill_tool
 
+        parent_approval = getattr(parent, "_approval_cb", None)
+        if parent_approval is not None:
+            # the parent's callback reads the parent's live project, which a workspace move changes under a running
+            # child: the child's prompts name its own state, so "always" lands in the project the child works in
+            async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> Any:
+                return await parent_approval(tool_name, arguments, decision, perms=perms)
+
+            loop.approval_callback = approve
         # trust is keyed on the project the user trusted (a worktree child's cwd is a fresh path under it);
         # the hook commands run where the child works
         loop.hooks = userhooks.load(parent.perms.cwd, h.id)
@@ -457,6 +475,18 @@ class SubagentManager:
             for name in list(loop.tools.names()):
                 if name not in allowed and name != "exit_plan":
                     loop.tools._tools.pop(name, None)  # noqa: SLF001
+        loop.system_prompt = subagent_system_prompt(
+            parent.system_prompt,
+            name=atype.name,
+            description=h.description,
+            body=atype.prompt,
+            note=note,
+            tools=set(loop.tools.names()),
+            cwd=cwd,
+            config=server.config,
+            session_meta=parent.stored.meta,
+            session_id=parent.session_id,  # its usage rows count for the parent, so it shares the parent's A/B arm
+        )
 
         def take_steer() -> list[str]:
             taken = h.steer_queue[:]
@@ -468,7 +498,7 @@ class SubagentManager:
 
     async def _drive(self, parent: Any, h: Handle, atype: AgentType, prompt: str, cwd: Path) -> None:
         server = self.server
-        server._ensure_router(parent.stored.model or None)
+        server._ensure_router(parent.stored.model or None, parent.stored.provider)
         reliability = child_reliability(server.config, h.id, server._home())
         parent_approval = await server._approval_callback_for(parent)
         parent._approval_cb = parent_approval  # noqa: SLF001 - shared with every child of this session
@@ -504,6 +534,11 @@ class SubagentManager:
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens
+                        if h.on_usage is not None:
+                            try:
+                                h.on_usage(h, not msg.tool_calls)
+                            except Exception:  # noqa: BLE001 - a budget watcher must not take the child down
+                                logger.exception("sub-agent %s: usage callback failed", h.id)
                     if msg.content:
                         final = msg.content
                         if msg.tool_calls:
@@ -511,6 +546,8 @@ class SubagentManager:
                     h.model = server.last_attempt[1] or h.model
         finally:
             h.result = final.strip()
+            with contextlib.suppress(Exception):  # evidence for a goal judge: never the child's outcome
+                h.evidence = loop_evidence(loop.turn_messages).relative_to(cwd)
             # the child's background bash jobs are filed under its own id: no session close ever reaps them
             with contextlib.suppress(Exception):
                 await tool_jobs.reap(h.id)

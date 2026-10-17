@@ -19,7 +19,7 @@ import { useTurnSelector } from "../app/turnStore.js";
 import { DEV_CREDITS_MODE } from "../config/env.js";
 import { FACES } from "../content/faces.js";
 import { VERBS } from "../content/verbs.js";
-import { fmtDuration } from "../domain/messages.js";
+import { fmtDuration, fmtDurationMinutes } from "../domain/messages.js";
 import { stickyPromptFromViewport } from "../domain/viewport.js";
 import { isReducedMotion } from "../lib/animation.js";
 import {
@@ -302,8 +302,14 @@ function batteryColor(info: BatteryInfo, t: Theme): string {
 
 // Compact battery label: a bolt while charging, else a battery glyph.
 // Renders `--` for an unknown percent so a null can never surface as "null%".
+// Appends power profile + temperature when the gateway reports them
+// (`balanced ⚡ 100% 51°C`, #413).
 function batteryLabel(info: BatteryInfo): string {
-  return `${info.plugged ? "⚡" : "🔋"} ${info.percent ?? "--"}%`;
+  const base = `${info.plugged ? "⚡" : "🔋"} ${info.percent ?? "--"}%`;
+  const temp =
+    typeof info.temp_c === "number" ? ` ${Math.round(info.temp_c)}°C` : "";
+  const profile = info.power_profile ? `${info.power_profile} ` : "";
+  return `${profile}${base}${temp}`;
 }
 
 // Colour a credits notice by its level. The notice TEXT already carries its
@@ -472,48 +478,45 @@ function SpawnHud({ t }: { t: Theme }) {
   );
 }
 
-function SessionDuration({ startedAt }: { startedAt: number }) {
+// Idle read-outs show whole minutes, so they re-render once a minute, at the
+// minute boundary of `since`, instead of every second: a TUI with nothing
+// running must not repaint the status rule on a timer (#170).
+function useMinuteClock(since: number) {
   const [now, setNow] = useState(() => Date.now());
   const isOccluded = useStore($isStatusRuleOccluded);
 
   useEffect(() => {
     // Paused only while an overlay actually covers the status rule — see
-    // FaceTicker.  The `setNow` below already re-seeds from the wall clock
-    // on every re-arm, so it doubles as the reveal catch-up.
+    // FaceTicker.  The `setNow` below re-seeds from the wall clock on every
+    // re-arm, so it doubles as the reveal catch-up.
     if (isOccluded) {
       return;
     }
 
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 1000);
+    let timer: ReturnType<typeof setTimeout>;
 
-    return () => clearInterval(id);
-  }, [isOccluded, startedAt]);
+    const arm = () => {
+      const t = Date.now();
 
-  return fmtDuration(now - startedAt);
+      setNow(t);
+      timer = setTimeout(arm, 60_000 - (Math.max(0, t - since) % 60_000));
+    };
+
+    arm();
+
+    return () => clearTimeout(timer);
+  }, [isOccluded, since]);
+
+  return now;
+}
+
+function SessionDuration({ startedAt }: { startedAt: number }) {
+  return fmtDurationMinutes(useMinuteClock(startedAt) - startedAt);
 }
 
 function IdleSince({ endedAt }: { endedAt: number }) {
-  // Time since the last final agent response. Re-ticks every second like
-  // SessionDuration so the read-out stays live while the session idles.
-  const [now, setNow] = useState(() => Date.now());
-  const isOccluded = useStore($isStatusRuleOccluded);
-
-  useEffect(() => {
-    // Paused only while an overlay actually covers the status rule — see
-    // FaceTicker.  The `setNow` below re-seeds from the wall clock on reveal
-    // so the idle read-out is not frozen when the overlay closes.
-    if (isOccluded) {
-      return;
-    }
-
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 1000);
-
-    return () => clearInterval(id);
-  }, [endedAt, isOccluded]);
-
-  return `✓ ${fmtDuration(now - endedAt)}`;
+  // Time since the last final agent response.
+  return `✓ ${fmtDurationMinutes(useMinuteClock(endedAt) - endedAt)}`;
 }
 
 // `wire` is the level the route actually sends (session.info.reasoning_effort_wire):

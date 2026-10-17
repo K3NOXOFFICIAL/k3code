@@ -4,7 +4,7 @@
 #   core     ruff check + ruff format --check (core/ and scripts/), pytest
 #   tui      npm ci, build:ink, build, typecheck, eslint, prettier --check, vitest (minus tui/.ci-test-excludes)
 #   panes    go build ./cmd/k3, go vet and go test on the packages k3 depends on (never `go test ./...`)
-#   vendor   scripts/vendor_check.py (license bookkeeping)
+#   vendor   scripts/vendor_check.py (license bookkeeping); full: the core wheel ships LICENSE, NOTICE, LICENSES/
 #   secrets  gitleaks on the commits this branch adds over origin/Main, plus uncommitted and staged changes
 #   shell    shellcheck and a syntax check (sh -n / bash -n) of install/*.sh, scripts/**/*.sh and .githooks/*
 #
@@ -37,7 +37,7 @@ K3CI_NAME=check.sh
 strip_git_env
 cd "$ROOT"
 
-ALL_AREAS="shell vendor secrets core panes tui"
+ALL_AREAS=$K3CI_AREAS
 QUICK=0
 CHANGED=0
 POST=0
@@ -87,8 +87,8 @@ if [ "$POST" = 1 ]; then
     die "--post needs the full check: drop --quick, --only, --changed and --plan"
 fi
 
-# changed_areas: the areas the files changed vs BASE (committed, staged, unstaged, untracked) belong to. secrets
-# always runs.
+# changed_areas: the areas the files changed vs BASE (committed, staged, unstaged, untracked) belong to
+# (areas_for_files in lib.sh). secrets always runs.
 changed_files() {
   git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null ||
     die "no $BASE to compare with: run git fetch origin (or pass --base REF)"
@@ -100,29 +100,14 @@ changed_files() {
 }
 
 changed_areas() {
-  local f areas=" secrets "
-  add() { case $areas in *" $1 "*) ;; *) areas="$areas$1 " ;; esac; }
-  while IFS= read -r f; do
-    case $f in
-      core/* | install/*) add core ;;
-      scripts/ci/* | .githooks/*) add core && add shell ;;
-      tui/*) add tui && add vendor ;;
-      panes/*) add panes && add vendor ;;
-      VENDOR.toml | NOTICE | LICENSES/* | scripts/vendor_check.py) add vendor ;;
-    esac
-    case $f in
-      scripts/*.py) add core ;;
-      *.sh | install/*) add shell ;;
-    esac
-  done < <(changed_files)
-  echo "$areas"
+  changed_files | areas_for_files
 }
 
 # Select the areas, in the fixed order of ALL_AREAS.
 selected=""
 want=" ${ONLY:-$ALL_AREAS} "
 changed=" $ALL_AREAS "
-if [ "$CHANGED" = 1 ]; then changed=$(changed_areas) || exit 2; fi
+if [ "$CHANGED" = 1 ]; then changed=" $(changed_areas) " || exit 2; fi
 for a in $ALL_AREAS; do
   case "$want" in *" $a "*) ;; *) continue ;; esac
   case "$changed" in *" $a "*) selected="$selected $a" ;; esac
@@ -197,7 +182,17 @@ area_core() {
     # A stalled run must fail instead of hanging the whole check (issue #42). 45 min is far above a normal run;
     # faulthandler_timeout (core/pyproject.toml) prints the stacks of a test stuck for 5 min, so the log says where.
     need timeout
-    step "pytest" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" uv run pytest -q
+    # The bulk of the suite runs in parallel (pytest-xdist); tests marked `serial` (real systemd, a pty) run alone
+    # afterwards. --basetemp keeps the temp paths short: a worker adds popen-gwN/, and a Unix socket path caps at 108
+    # bytes, so the dir sits directly under /tmp even when TMPDIR is long (the Multica runtime sets
+    # /tmp/multica-task-<id>). K3CODE_CI_PYTEST_WORKERS=0 runs the first lane in one process.
+    local workers="${K3CODE_CI_PYTEST_WORKERS:-$(n=$(nproc 2>/dev/null || echo 1); echo $((n < 8 ? n : 8)))}" base
+    base=$(mktemp -d /tmp/k3ci-XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/k3ci-XXXXXX")
+    step "pytest (parallel, $workers workers)" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" \
+      uv run pytest -q -n "$workers" -m "not serial" --basetemp "$base/par"
+    step "pytest (serial lane)" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" \
+      uv run pytest -q -m serial --basetemp "$base/ser"
+    rm -rf "$base"
   fi
 }
 
@@ -247,6 +242,7 @@ area_panes() {
   fi
   step "go vet" panes go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
   if full; then
+    step "go test cmd/k3" panes go test ./cmd/k3/
     step "go test -race" panes go test -race ./internal/k3keys/... ./internal/harness/...
     # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default
     # 10 min package timeout then kills it mid-test (issue #52)
@@ -257,6 +253,12 @@ area_panes() {
 area_vendor() {
   need python3
   step "vendor_check" . python3 scripts/vendor_check.py
+  if full; then
+    # The wheel release.sh publishes must carry k3code's license files (core/hatch_build.py, issue #165): build it as
+    # release.sh does, into a temporary directory, and compare them with the repository's.
+    need uv
+    step "wheel license files" . python3 scripts/release/third_party_notices.py check-wheel --repo . --build
+  fi
 }
 
 area_secrets() {

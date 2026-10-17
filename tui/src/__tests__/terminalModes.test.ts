@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearNativeTuiFrame,
+  clearStartupScreen,
   isPaintableHex,
   resetTerminalModes,
   setTerminalBackground,
@@ -135,5 +136,17 @@ describe("isPaintableHex", () => {
     for (const junk of ["", "teal", "#fff", "#12345", "#1234567"]) {
       expect(isPaintableHex(junk)).toBe(false);
     }
+  });
+});
+
+describe("startup screen clear", () => {
+  it("wipes the visible screen only, never the scrollback (ESC[3J)", () => {
+    const write = vi.fn();
+
+    clearStartupScreen({ write } as unknown as NodeJS.WriteStream);
+
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("\x1b[2J\x1b[H");
+    expect(String(write.mock.calls[0]![0])).not.toContain("\x1b[3J");
   });
 });

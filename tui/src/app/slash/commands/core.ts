@@ -331,6 +331,39 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: "start k3code in the agent view on launch",
+    name: "agents-view",
+    run: (arg, ctx) => {
+      if (arg.trim()) {
+        ctx.gateway
+          .rpc<ConfigSetResponse>("config.set", {
+            key: "agents_view",
+            value: arg.trim(),
+          })
+          .then(
+            ctx.guarded<ConfigSetResponse>((r) =>
+              ctx.transcript.sys(`agent view at startup: ${r?.value ?? "off"}`),
+            ),
+          )
+          .catch(ctx.guardedErr);
+
+        return;
+      }
+
+      ctx.gateway
+        .rpc<ConfigGetValueResponse>("config.get", { key: "agents_view" })
+        .then(
+          ctx.guarded<ConfigGetValueResponse>((r) =>
+            ctx.transcript.sys(
+              `agent view at startup: ${r?.value === "on" ? "on" : "off"}`,
+            ),
+          ),
+        )
+        .catch(ctx.guardedErr);
+    },
+  },
+
+  {
     aliases: ["detail"],
     help: "control agent detail visibility (global or per-section)",
     name: "details",
@@ -743,8 +776,13 @@ export const coreCommands: SlashCommand[] = [
           .rpc<SystemBatteryResponse>("system.battery", {})
           .then((r) => {
             if (r?.available && typeof r.percent === "number") {
+              const temp =
+                typeof r.temp_c === "number"
+                  ? ` ${Math.round(r.temp_c)}°C`
+                  : "";
+              const profile = r.power_profile ? `${r.power_profile} ` : "";
               ctx.transcript.sys(
-                `battery indicator ${state} — currently ${r.plugged ? "⚡" : "🔋"} ${r.percent}%`,
+                `battery indicator ${state} — currently ${profile}${r.plugged ? "⚡" : "🔋"} ${r.percent}%${temp}`,
               );
             } else {
               ctx.transcript.sys(

@@ -1,4 +1,5 @@
 import { Box, Text, useInput, useStdout } from "@k3code/ink";
+import { TextInput } from "../components/textInput.js";
 import type { SessionListResult } from "@k3code/shared/gateway-events";
 import { useStore } from "@nanostores/react";
 import { useEffect, useMemo, useState } from "react";
@@ -16,6 +17,7 @@ import type { Theme } from "../theme.js";
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
 import { $stripSessions } from "./agentStripStore.js";
 import {
+  buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
   type PastSessionRow,
@@ -30,7 +32,10 @@ import {
 } from "./agentViewStore.js";
 
 export const AGENT_VIEW_HINT =
-  "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back";
+  "↑↓ select · tab/→/⏎ attach · x stop · c collapse · ←/esc back";
+/** Shown while the bottom composer owns the keyboard. */
+export const AGENT_VIEW_INPUT_HINT =
+  "⏎ start · /command run · tab list · esc clear/back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
@@ -41,10 +46,6 @@ const COUNT_LABEL: Record<ViewGroup, string> = {
 const CURRENT_TAG = " (this session)";
 const CONFIRM_TAG = "  stop? y/n";
 const MODEL_MAX = 24;
-
-type Line =
-  | { group: ViewGroup; type: "header" }
-  | { index: number; row: ViewRow; type: "row" };
 
 const stateText = (row: ViewRow) =>
   row.kind === "past"
@@ -62,6 +63,8 @@ export interface AgentViewViewProps {
   height: number;
   loading?: boolean;
   nav: ViewNav;
+  onNewSessionTextChange: (text: string) => void;
+  onNewSessionSubmit: (text: string) => void;
   rows: readonly ViewRow[];
   t: Theme;
 }
@@ -74,23 +77,13 @@ export function AgentViewView({
   height,
   loading = false,
   nav,
+  onNewSessionTextChange = () => {},
+  onNewSessionSubmit = () => {},
   rows,
   t,
 }: AgentViewViewProps) {
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
-  const lines: Line[] = [];
-
-  for (const group of VIEW_GROUPS) {
-    const inGroup = rows.filter((r) => r.group === group);
-
-    if (inGroup.length) {
-      lines.push({ group, type: "header" });
-
-      for (const row of inGroup) {
-        lines.push({ index: rows.indexOf(row), row, type: "row" });
-      }
-    }
-  }
+  const lines = buildLines(rows, nav.collapsedGroups);
 
   const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
   // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
@@ -160,18 +153,68 @@ export function AgentViewView({
         <Text color={t.color.muted}>
           {tag.padEnd(Math.max(0, titleW - title.length))}
         </Text>
-        <Text
-          color={t.color.muted}
-        >{`  ${stateText(row).padEnd(stateW)}`}</Text>
+        <Text color={t.color.muted}>
+          {"  "}
+          {stateText(row).padEnd(stateW)}
+        </Text>
         {modelW ? (
           <Text color={t.color.muted}>
-            {`  ${compactPreview(row.model ?? "", modelW).padEnd(modelW)}`}
+            {"  "}
+            {compactPreview(row.model ?? "", modelW).padEnd(modelW)}
           </Text>
         ) : null}
         {confirm ? <Text color={t.color.warn}>{CONFIRM_TAG}</Text> : null}
       </Text>
     );
   };
+
+  const renderHeader = (group: ViewGroup) => {
+    const isCollapsed = nav.collapsedGroups.includes(group);
+    const count = rows.filter((r) => r.group === group).length;
+    const arrow = isCollapsed ? "▸ " : "▾ ";
+
+    return (
+      <Text
+        bold
+        color={t.color.text}
+        key={`group:${group}`}
+        wrap="truncate-end"
+      >
+        <Text color={t.color.accent}>{arrow}</Text>
+        {VIEW_GROUP_LABEL[group]}
+        {count ? <Text color={t.color.muted}>{`  ${count}`}</Text> : null}
+      </Text>
+    );
+  };
+
+  // The bottom composer, like the one in the main view: starts a session, runs a
+  // /command. Focus state lives in `nav.focus` (tab toggles), not in the input.
+  // The long placeholder wraps on narrow panes, so small descriptors shrink it.
+  const placeholder =
+    cols - 2 >= "start a new session, or type a /command".length
+      ? "start a new session, or type a /command"
+      : cols - 2 >= "new session or /command".length
+        ? "new session or /command"
+        : "new…";
+  const renderNewPrompt = () => (
+    <Box flexDirection="row" width={cols}>
+      <Text color={nav.focus === "input" ? t.color.accent : t.color.muted}>
+        {"❯ "}
+      </Text>
+      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+        <TextInput
+          color={t.color.text}
+          columns={Math.max(1, cols - 2)}
+          focus={nav.focus === "input"}
+          onChange={onNewSessionTextChange}
+          onSubmit={onNewSessionSubmit}
+          placeholder={placeholder}
+          placeholderColor={t.color.muted}
+          value={nav.draft ?? ""}
+        />
+      </Box>
+    </Box>
+  );
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -198,43 +241,45 @@ export function AgentViewView({
         <Box flexDirection="column">
           {above > 0 ? (
             <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↑ ${above} more`}
+              {"  ↑ "}
+              {above}
+              {" more"}
             </Text>
           ) : null}
-          {lines.slice(win.start, win.end).map((l) =>
-            l.type === "header" ? (
-              <Text
-                bold
-                color={t.color.text}
-                key={`group:${l.group}`}
-                wrap="truncate-end"
-              >
-                {VIEW_GROUP_LABEL[l.group]}
-              </Text>
-            ) : (
-              renderRow(l.row, l.index)
-            ),
-          )}
+          {lines
+            .slice(win.start, win.end)
+            .map((l) =>
+              l.type === "header"
+                ? renderHeader(l.group)
+                : renderRow(l.row, l.index),
+            )}
           {below > 0 ? (
             <Text color={t.color.muted} wrap="truncate-end">
-              {`  ↓ ${below} more`}
+              {"  ↓ "}
+              {below}
+              {" more"}
             </Text>
           ) : null}
         </Box>
       )}
       {compact ? null : <Text> </Text>}
+      {renderNewPrompt()}
+      {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
-        {AGENT_VIEW_HINT}
+        {nav.focus === "input" ? AGENT_VIEW_INPUT_HINT : AGENT_VIEW_HINT}
       </Text>
     </Box>
   );
 }
 
 export interface AgentViewPaneProps {
+  /** A `/command` typed in the composer: closes the view (output needs a transcript) and runs it. */
+  onCommand: (command: string) => void;
   gw: GatewayClient;
   onActivate: (row: ViewRow) => void;
   onClose: () => void;
-  onNew: () => void;
+  /** A plain prompt typed in the composer: starts a session for it; the view stays open. */
+  onNewPrompt: (text: string) => void;
   onStop: (row: ViewRow) => void;
 }
 
@@ -243,7 +288,8 @@ export function AgentViewPane({
   gw,
   onActivate,
   onClose,
-  onNew,
+  onNewPrompt,
+  onCommand,
   onStop,
 }: AgentViewPaneProps) {
   const { stdout } = useStdout();
@@ -266,8 +312,37 @@ export function AgentViewPane({
   const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
   // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
   const compact = termRows < 8;
-  // header, spacer, spacer, footer (+ the error line); compact: header and footer only
-  const height = Math.max(1, termRows - (compact ? 2 : 4) - (error ? 1 : 0));
+  // header, composer, spacer, spacer, hint (+ the error line); compact: header, composer and hint only.
+  // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
+  const height = Math.max(
+    1,
+    termRows - (compact ? 3 : 5) - (error ? 1 : 0),
+  );
+
+  const handleNewSessionTextChange = (draft: string) => {
+    setNav({ ...navState, draft });
+  };
+
+  // Enter on the composer: a /command runs through the app's slash handler with the
+  // view closed so its output lands in the transcript; a plain prompt starts a
+  // session for it with the view open — that is the orchestrator's purpose.
+  const handleNewSessionSubmit = (text: string) => {
+    const trimmed = text.trim();
+
+    if (!trimmed) {
+      return;
+    }
+
+    setNav({ ...navState, draft: "", focus: "input" });
+
+    if (trimmed.startsWith("/")) {
+      onCommand(trimmed);
+
+      return;
+    }
+
+    onNewPrompt(trimmed);
+  };
 
   useEffect(() => {
     let stopped = false;
@@ -355,6 +430,7 @@ export function AgentViewPane({
         pageUp: key.pageUp,
         return: key.return,
         right: key.rightArrow,
+        tab: key.tab,
         up: key.upArrow,
       },
       Math.max(1, height - 2),
@@ -369,10 +445,17 @@ export function AgentViewPane({
         return onActivate(r.effect.row);
       case "stop":
         return onStop(r.effect.row);
-      case "new":
-        return onNew();
       case "close":
         return onClose();
+      case "toggle-group": {
+        const group = r.effect.group;
+        const isCollapsed = nav.collapsedGroups.includes(group);
+        const nextCollapsed = isCollapsed
+          ? nav.collapsedGroups.filter((g) => g !== group)
+          : [...nav.collapsedGroups, group];
+        setNav((prev) => ({ ...prev, collapsedGroups: nextCollapsed }));
+        break;
+      }
     }
   });
 
@@ -384,6 +467,8 @@ export function AgentViewPane({
       height={height}
       loading={loading}
       nav={nav}
+      onNewSessionTextChange={handleNewSessionTextChange}
+      onNewSessionSubmit={handleNewSessionSubmit}
       rows={rows}
       t={theme}
     />

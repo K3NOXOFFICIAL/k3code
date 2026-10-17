@@ -67,6 +67,21 @@ SSL_CERT_HINT = (
     "certificate, or check the proxy (it may be re-signing HTTPS traffic)"
 )
 
+#: Relays that route by the model id's vendor prefix ("vendor/model") reject one that is not in their catalog with
+#: wording like "unknown provider for model <rest>" — e.g. configured `claude/<model>` where the catalog only carries
+#: `cc/<model>` (or `claude/cc/<model>` combos). Failover is right; the hint tells the user what to reconfigure.
+_UNKNOWN_MODEL_VENDOR_PATTERNS = (
+    "unknown provider for model",
+    "unknown provider for the model",
+    "no provider configured for model",
+)
+
+#: What the user can do about a model id the endpoint does not know; carried on :attr:`ClassifiedError.hint`.
+UNKNOWN_MODEL_ID_HINT = (
+    "the endpoint has no model under this id — use exactly an id it lists (GET {base}/models or a /model "
+    "chain listing; relays often require their own vendor prefix, e.g. cc/<model> instead of claude/<model>)"
+)
+
 #: Reasons that abort the whole walk instead of trying the next entry:
 #: a context overflow will recur on every entry until the loop compacts.
 TERMINAL_REASONS = frozenset({FailoverReason.context_overflow})
@@ -418,6 +433,7 @@ _NETWORK_ERROR_TYPES = frozenset(
 _TIMEOUT_ERROR_TYPES = frozenset(
     {
         "ReadTimeout",
+        "StreamStalled",
         "ConnectTimeout",
         "PoolTimeout",
         "WriteTimeout",
@@ -459,7 +475,28 @@ _MESSAGE_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
     (_CONNECTION_MESSAGE_PATTERNS, _R.network),
 )
 
+# A 5xx body is matched against server-specific overflow wording only. The broad list ("input token", "token limit",
+# "too many tokens", "exceeds the limit", ...) also appears in ordinary server errors, and a false overflow stops the
+# fallback walk and forces compaction instead of failing over.
+_5XX_OVERFLOW_PATTERNS = (
+    # llama.cpp
+    "exceeds the available context size",
+    "slot context",
+    "n_ctx_slot",
+    "truncating input",
+    # vLLM
+    "max_model_len",
+    "maximum model length",
+    "prompt is too long",
+)
+
 _5XX_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
+    (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _R.server),
+    (_5XX_OVERFLOW_PATTERNS, _R.context_overflow),
+)
+
+# 413/422 are payload rejections, where the broad overflow phrases are the right reading.
+_PAYLOAD_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
     (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _R.server),
     (_CONTEXT_OVERFLOW_PATTERNS, _R.context_overflow),
 )
@@ -474,6 +511,7 @@ _ERROR_CODE_REASONS: dict[str, FailoverReason] = {
     **dict.fromkeys(_QUOTA_ERROR_CODES, _R.quota),
     **dict.fromkeys(_MODEL_NOT_FOUND_ERROR_CODES, _R.bad_request),
     **dict.fromkeys(_CONTEXT_OVERFLOW_ERROR_CODES, _R.context_overflow),
+    **dict.fromkeys(("invalid_api_key", "incorrect_api_key", "authentication_error", "permission_error"), _R.auth),
     "server_error": _R.server,
     "api_error": _R.server,
     "rate_limit_error": _R.rate_limit,
@@ -533,7 +571,7 @@ def _by_status(c: _Ctx) -> FailoverReason | None:
     if status == 408:
         return _R.timeout
     if status in (413, 422):
-        return _first_match(c.msg, _5XX_RULES) or (_R.context_overflow if status == 413 else _R.bad_request)
+        return _first_match(c.msg, _PAYLOAD_RULES) or (_R.context_overflow if status == 413 else _R.bad_request)
     if status == 429:
         return _status_429(c)
     if status in (500, 502):
@@ -681,6 +719,15 @@ def _cause_chain(error: BaseException, limit: int = 8) -> list[BaseException]:
 _STAGES = (_by_status, _by_error_code, _by_tls_cert, _by_message, _by_transport)
 
 
+def _hint_for(reason: FailoverReason, c: _Ctx) -> str:
+    """A fix-it note for the failure kinds the user must repair in their setup (empty = none)."""
+    if reason is _R.ssl_cert:
+        return SSL_CERT_HINT
+    if reason is _R.bad_request and any(p in c.msg for p in _UNKNOWN_MODEL_VENDOR_PATTERNS):
+        return UNKNOWN_MODEL_ID_HINT
+    return ""
+
+
 def classify_api_error(
     error: BaseException,
     *,
@@ -714,7 +761,7 @@ def classify_api_error(
         model=model,
         message=_extract_message(error, body),
         retry_after=retry_after,
-        hint=SSL_CERT_HINT if reason is _R.ssl_cert else "",
+        hint=_hint_for(reason, c),
     )
 
 
@@ -885,7 +932,16 @@ def _extract_message(error: BaseException, body: dict[str, Any]) -> str:
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def summarize(error: BaseException, limit: int = 160) -> str:
-    """One-line error summary for event logs. Never includes credentials."""
-    text = _WHITESPACE_RE.sub(" ", f"{type(error).__name__}: {error}").strip()
+def summarize(error: BaseException, limit: int = 500) -> str:
+    """One-line error summary for event logs. Never includes credentials.
+
+    The text goes through the secret scrubber before it is cut: a provider can echo the key, an ``Authorization``
+    header or a ``?key=`` URL back in its error body, and a credential cut in half no longer matches the patterns.
+    ``opaque=True`` also hides a bare 32+ character token (a key with no known prefix); a provider error has no git
+    SHA to keep. The default of 500 characters keeps the provider's explanation, which usually follows a long
+    preamble (status line, URL, request id): 160 cut most of them off (issue #163)."""
+    from k3code.redact import scrub_text, scrub_urls  # here: the vendored module stays free of k3code imports
+
+    text = scrub_text(scrub_urls(f"{type(error).__name__}: {error}"), opaque=True)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"

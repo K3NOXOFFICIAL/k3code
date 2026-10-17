@@ -50,27 +50,53 @@ def expand(pattern: str) -> str:
     return pattern
 
 
-def from_config(permissions: dict[str, Any]) -> list[Rule]:
+def from_config(permissions: dict[str, Any], problems: list[str] | None = None) -> list[Rule]:
     """Parse a ``permissions:`` config mapping into a ruleset.
 
     ``{bash: "ask"}`` -> rule with pattern ``*``; ``{bash: {"git *": "allow"}}``
     -> one rule per entry, in insertion order (later overrides earlier).
+
+    An invalid entry raises ``ValueError``. Given ``problems`` it fails closed instead: the entry becomes a ``deny``
+    over everything it could have meant (its pattern; the whole tool when the pattern or the tool's value cannot be
+    read), one line naming it (never its pattern, which may hold a secret) goes to ``problems``, and the other entries
+    are kept (dropping them dropped the user's deny rules, and auto/yolo then allowed what they denied).
     """
     ruleset: list[Rule] = []
-    for tool, value in permissions.items():
-        if isinstance(value, str):
-            ruleset.append(Rule(tool=tool, pattern="*", action=value))
+
+    def invalid(tool: str, pattern: str, where: str, why: str) -> None:
+        if problems is None:
+            raise ValueError(f"permissions.{where}: {why}")
+        problems.append(f"permissions.{where}: {why}; enforced as deny")
+        ruleset.append(Rule(tool=tool, pattern=pattern, action="deny"))
+
+    for key, value in permissions.items():
+        tool = str(key)
+        entries = {"*": value} if isinstance(value, str) else value
+        if not isinstance(entries, dict):
+            invalid(tool, "*", tool, "must be an action or a pattern→action mapping")
             continue
-        for pattern, action in value.items():
-            ruleset.append(Rule(tool=tool, pattern=expand(pattern), action=action))
+        for n, (pattern, action) in enumerate(entries.items(), 1):
+            where = tool if entries is not value else f"{tool} entry {n}"
+            if not isinstance(pattern, str):
+                invalid(tool, "*", where, "the pattern is not text (quote it)")
+            elif action not in ("allow", "ask", "deny"):
+                invalid(tool, expand(pattern), where, "the action is not allow, ask or deny")
+            else:
+                ruleset.append(Rule(tool=tool, pattern=expand(pattern), action=action))
     return ruleset
 
 
 def merge(*rulesets: list[Rule]) -> list[Rule]:
-    """Concatenate rulesets (builtin < user < project < session)."""
+    """Concatenate rulesets (builtin < user < project < session).
+
+    Rules already stamped with their layer skip the rebuild: builtin rules come
+    from a cached tuple at layer 0, so a hot-path decide() avoids re-creating
+    ~150 Rule objects per call.
+    """
     merged: list[Rule] = []
     for layer, ruleset in enumerate(rulesets):
-        merged.extend(replace(r, layer=layer) for r in ruleset)
+        for r in ruleset:
+            merged.append(r if r.layer == layer else replace(r, layer=layer))
     return merged
 
 
@@ -81,6 +107,8 @@ def evaluate(tool: str, pattern: str, ruleset: list[Rule], *, default: Action = 
     user > builtin), then deny > ask > allow. Falls back to ``{"tool": tool, "pattern": "*", action: default}``.
     User config wins over a project's: a project allow never overrides a matching user (or session) deny, however
     specific it is (a cloned repo's ``git push origin *: allow`` beat the user's ``git push *: deny``).
+    Session outranks user by design (pinned by test): the session is the user's live intent for this run,
+    while project repos are untrusted third parties.
     """
     best: Rule | None = None
     best_key: tuple[int, ...] = (-1, -1, -1, -1)

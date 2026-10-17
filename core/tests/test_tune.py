@@ -31,7 +31,7 @@ def _providers() -> list[ProviderEntry]:
             kind="anthropic",
             base_url="http://b",
             api_key_env="NOPE_B",
-            models={"default": "claude-sonnet-5", "cheap": "claude-haiku-4-5", "deep": "claude-opus-5"},
+            models={"default": "claude-sonnet-5-5", "cheap": "claude-haiku-5-5", "deep": "claude-opus-5-5"},
             descriptions={"default": "Everyday coding", "deep": "Hardest problems"},
         ),
         ProviderEntry(name="c", kind="claude-cli", models={"local": "sonnet"}),
@@ -115,7 +115,8 @@ _CFG_KEY_HIGH = Settings(
         ("effort none", {"effort": "default"}),
         ("cheap --global", {"model": "cheap", "scope": "default"}),
         ("cheap --session", {"model": "cheap"}),
-        ("cheap --provider b --tui-session --reasoning high", {"model": "cheap", "effort": "high"}),
+        ("cheap --provider b --tui-session --reasoning high", {"model": "cheap", "effort": "high", "provider": "b"}),
+        ("--provider B", {"provider": "b"}),  # names match regardless of case, as in /provider
         ("ultracode off high cheap", {"model": "cheap", "effort": "high", "ultra_mode": "off"}),
         ("effort high high", {"effort": "high"}),  # the same value twice is not a conflict
         ("--session", {}),
@@ -141,6 +142,8 @@ def test_a_model_key_beats_an_effort_word_but_effort_names_the_level():
         ("effort", "effort needs a value"),
         ("--reasoning", "--reasoning needs a value"),
         ("--provider", "--provider needs a value"),
+        ("cheap --provider z", "Unknown provider: z (valid: a, b, c)"),
+        ("--provider a --provider b", "provider given twice (a, b)"),
         ("effort turbo", "Unknown effort: turbo"),
         ("--reasoning loud", "Unknown effort: loud"),
         ("--global", "--global needs a model"),
@@ -237,6 +240,40 @@ async def test_apply_is_all_or_nothing(server, tmp_path):
     with pytest.raises(tune.TuneError, match="No active session"):
         tune.apply_tune(server, None, tune.TuneRequest(model="cheap", effort="high"))
     assert server.config.default_model == "default"
+    with pytest.raises(tune.TuneError, match="Unknown provider: z"):
+        tune.apply_tune(server, live, tune.TuneRequest(model="cheap", provider="z"))
+    assert live.stored.model == "default" and live.stored.provider == ""
+
+
+# ── --provider (#90) ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+async def test_tune_provider_pins_the_session_and_the_labels_follow_it(server, tmp_path):
+    sid = await _session(server, tmp_path)
+    live = server._session_for(sid)
+    res = await m1.cmd(server, "/tune cheap --provider b", sid)
+    assert res["message"].splitlines() == ["Model key set to: cheap", "Provider set to: b"]
+    assert (live.stored.model, live.stored.provider) == ("cheap", "b")
+    assert server.store.get(sid).provider == "b"
+    # the model ids are provider b's, the block a turn now tries first
+    assert _infos(server, sid)[-1]["model"] == "claude-haiku-5-5" == server._active_model(live)
+    assert tune.state_line(server.config, live).startswith("Model: cheap (claude-haiku-5-5) · ")
+    row = next(r for r in tune.snapshot(server, live)["models"] if r["key"] == "cheap")
+    assert row["providers"][0] == "b" and row["resolved"][0] == "claude-haiku-5-5"
+    assert (await m1.cmd(server, "/tune --provider a", sid))["message"] == "Provider set to: a"
+    assert _infos(server, sid)[-1]["model"] == "gpt-4o-mini"
+
+
+async def test_tune_set_takes_a_provider_and_without_a_session_sets_the_default_provider(server, tmp_path):
+    sid = await _session(server, tmp_path)
+    res = (await m1.rpc(server, "tune.set", {"session_id": sid, "provider": "c"}))["result"]
+    assert res["changed"] == ["provider"] and server._session_for(sid).stored.provider == "c"
+    err = (await m1.rpc(server, "tune.set", {"session_id": sid, "model": "cheap", "provider": "zz"}))["error"]
+    assert err["code"] == -32602 and "Unknown provider: zz" in err["message"]
+    assert server._session_for(sid).stored.model == "default"  # all or nothing
+    outcome = tune.apply_tune(server, None, tune.TuneRequest(provider="b"))
+    assert outcome.lines == ["Provider set to: b"] and outcome.changed == ["default_provider"]
+    assert server.config.default_provider == "b" and not chain_config.config_path().exists()
 
 
 async def test_model_global_saves_the_default_through_the_command_too(server, tmp_path):
@@ -250,6 +287,17 @@ async def test_model_global_saves_the_default_through_the_command_too(server, tm
     (backup,) = _backups(path)
     assert backup.read_text() == text and "backup: " in lines[1]
     assert server.config.default_model == "cheap" and server._session_for(sid).stored.model == "cheap"
+
+
+async def test_tune_global_persists_the_provider_pin(server, tmp_path):
+    """`/tune --provider x --global` saves default_provider for new sessions (#365)."""
+    path, _ = _write_config()
+    sid = await _session(server, tmp_path)
+    res = await m1.cmd(server, "/tune cheap --provider b --global", sid)
+    assert "Provider set to: b (saved to " in res["message"]
+    assert yaml.safe_load(path.read_text()).get("default_provider") == "b"
+    assert server.config.default_provider == "b"
+    assert server._session_for(sid).stored.provider == "b"
 
 
 # ── the default model is saved to the user config ───────────────────────────────────────────────────────────────
@@ -293,29 +341,30 @@ async def test_tune_get_lists_one_row_per_model_key(server, tmp_path):
     assert res["model"] == "cheap" and res["default_model"] == "default" and res["has_session"] is True
     assert res["efforts"] == ["low", "medium", "high", "xhigh", "max"] and res["effort"] == "high"
     assert res["ultra_modes"] == ["off", "ultracode"] and res["ultra_mode"] == "off"
-    assert res["wake_words"] == ["ultracode", "ultraplan", "ultraresearch"] and res["wake_words_enabled"] is True
+    assert res["wake_words"] == ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]
+    assert res["wake_words_enabled"] is True
     rows = {r["key"]: r for r in res["models"]}
     assert [r["key"] for r in res["models"]] == ["default", "cheap", "plain", "deep", "local"]  # default first
     assert rows["default"] == {
         "key": "default",
         "providers": ["a", "b", "c"],  # c has no 'default' either and falls back to its first model
-        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],
+        "resolved": ["gpt-5.1", "claude-sonnet-5-5", "sonnet"],
         "description": "Everyday coding",  # a's is empty: the first non-empty one wins
         "current": False,
         "default": True,
         "effort": True,
     }
-    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-4-5", "sonnet"]
+    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-5-5", "sonnet"]
     assert rows["cheap"]["description"] == "Fast and cheap" and rows["cheap"]["current"] is True
     assert rows["cheap"]["effort"] is True  # o3-mini takes one
     # a key that only some providers define still routes through all of them, in chain order: the others fall back
-    assert rows["plain"]["resolved"] == ["llama3", "claude-sonnet-5", "sonnet"] and rows["plain"]["effort"] is True
+    assert rows["plain"]["resolved"] == ["llama3", "claude-sonnet-5-5", "sonnet"] and rows["plain"]["effort"] is True
     assert rows["deep"]["providers"] == ["a", "b", "c"] and rows["deep"]["effort"] is True
-    assert rows["deep"]["resolved"] == ["gpt-5.1", "claude-opus-5", "sonnet"] and rows["deep"]["description"]
+    assert rows["deep"]["resolved"] == ["gpt-5.1", "claude-opus-5-5", "sonnet"] and rows["deep"]["description"]
     assert rows["local"] == {
         **rows["local"],
         "providers": ["a", "b", "c"],
-        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],  # a turn on 'local' goes to a's default first
+        "resolved": ["gpt-5.1", "claude-sonnet-5-5", "sonnet"],  # a turn on 'local' goes to a's default first
         "effort": True,
     }
     assert [r["key"] for r in res["models"] if r["current"]] == ["cheap"]
@@ -353,6 +402,20 @@ async def test_tune_get_effort_is_unknown_when_nothing_resolves():
     assert row["key"] == "blank" and row["resolved"] == [] and row["effort"] is None
 
 
+async def test_settings_get_returns_the_view_with_its_option_lists_and_text(server, tmp_path):
+    """settings.get feeds the interactive /settings panel: the view, its option lists and the plain text."""
+    sid = await _session(server, tmp_path)
+    await m1.cmd(server, "/tune cheap effort high", sid)
+    res = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
+    view = res["settings"]
+    assert view["model_key"] == "cheap" and view["effort"] == "high"
+    assert {"cheap", "default"} <= set(view["model_keys"])
+    assert "plan" in view["permission_modes"] and view["permission_mode"] in view["permission_modes"]
+    assert res["output"].startswith("model:        cheap")
+    bare = (await m1.rpc(server, "settings.get", {}))["result"]
+    assert bare["settings"]["model_keys"] == view["model_keys"] and "output" in bare
+
+
 async def test_tune_get_without_a_session_and_with_an_unknown_one(server):
     res = (await m1.rpc(server, "tune.get", {}))["result"]
     assert res["has_session"] is False and res["effort"] is None and res["ultra_mode"] == "off"
@@ -374,7 +437,8 @@ async def test_tune_get_reports_a_session_model_that_left_the_config(server, tmp
 async def test_tune_get_reports_the_wake_word_settings(server):
     server.config.wake_words = {"enabled": True, "ultraplan": False}
     res = (await m1.rpc(server, "tune.get", {}))["result"]
-    assert res["wake_words"] == ["ultracode", "ultraresearch"] and res["wake_words_enabled"] is True
+    assert res["wake_words"] == ["ultracode", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]
+    assert res["wake_words_enabled"] is True
     server.config.wake_words = {"enabled": False}
     assert (await m1.rpc(server, "tune.get", {}))["result"]["wake_words_enabled"] is False
 
@@ -623,9 +687,17 @@ async def test_config_set_model_honours_reasoning_and_global(server, tmp_path):
             {"key": "model", "session_id": sid, "value": "cheap --provider a --reasoning high --tui-session"},
         )
     )["result"]
-    assert res == {"ok": True, "key": "model", "value": "cheap"}
+    assert res == {"ok": True, "key": "model", "value": "gpt-4o-mini"}  # resolved id, not the key (#365)
     live = server._session_for(sid)
     assert live.stored.model == "cheap" and live.reasoning_effort == "high"
+    assert live.stored.provider == "a"  # the picker's provider step pins the session (#90)
+    await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "cheap --provider b"})
+    assert live.stored.provider == "b" and _infos(server, sid)[-1]["model"] == "claude-haiku-5-5"
+    err = (await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "deep --provider zz"}))[
+        "error"
+    ]
+    assert err["code"] == -32602 and "Unknown provider: zz" in err["message"]
+    assert (live.stored.model, live.stored.provider) == ("cheap", "b")
     assert server.config.default_model == "default" and path.read_text() == text  # session only
 
     # the old picker's vocabulary
@@ -639,13 +711,15 @@ async def test_config_set_model_honours_reasoning_and_global(server, tmp_path):
     assert yaml.safe_load(path.read_text())["default_model"] == "default"  # unchanged value: not rewritten
     await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "cheap --provider a --global"})
     assert yaml.safe_load(path.read_text())["default_model"] == "cheap" and server.config.default_model == "cheap"
-    assert live.stored.model == "cheap" and len(_backups(path)) == 1
+    assert yaml.safe_load(path.read_text()).get("default_provider") == "a"  # --global persists the pin (#365)
+    assert server.config.default_provider == "a"
+    assert live.stored.model == "cheap" and len(_backups(path)) >= 1
 
 
 async def test_config_set_model_global_without_a_session_and_bad_values(server, tmp_path):
     path, text = _write_config()
     res = (await m1.rpc(server, "config.set", {"key": "model", "value": "cheap --reasoning high --global"}))["result"]
-    assert res["value"] == "cheap"  # --reasoning has no session to go to: ignored, as before
+    assert res["value"] == "gpt-4o-mini"  # resolved id, not the key (#365); --reasoning ignored without session
     assert server.config.default_model == "cheap" and yaml.safe_load(path.read_text())["default_model"] == "cheap"
     sid = await _session(server, tmp_path)
     live = server._session_for(sid)
@@ -670,6 +744,19 @@ async def test_model_options_reports_the_sessions_model(server, tmp_path):
     res = (await m1.rpc(server, "model.options", {"session_id": sid}))["result"]
     assert res["model"] == "deep" and {p["slug"] for p in res["providers"]} == {"a", "b", "c"}
     assert server.session.session_id == other
+
+
+async def test_model_options_marks_the_pinned_provider_and_maps_keys_to_model_ids(server, tmp_path):
+    sid = await _session(server, tmp_path)
+    res = (await m1.rpc(server, "model.options", {"session_id": sid}))["result"]
+    assert res["provider"] == "a" and [p["is_current"] for p in res["providers"]] == [True, False, False]
+    await m1.cmd(server, "/provider b", sid)
+    res = (await m1.rpc(server, "model.options", {"session_id": sid}))["result"]
+    assert res["provider"] == "b" and [p["slug"] for p in res["providers"] if p["is_current"]] == ["b"]
+    a, b = res["providers"][0], res["providers"][1]
+    assert a["models"] == ["cheap", "default", "plain"]  # still the keys --provider and /model take
+    assert a["model_ids"] == {"default": "gpt-5.1", "cheap": "gpt-4o-mini", "plain": "llama3"}  # a list: its first
+    assert b["model_ids"]["deep"] == "claude-opus-5-5"
 
 
 # ── /model and /effort keep working ─────────────────────────────────────────────────────────────────────────────
@@ -771,7 +858,7 @@ async def test_tune_is_a_command_in_the_model_and_settings_help_group(server):
         ("gpt-5.1", "openai", True),
         ("openai/o3-mini", "openai", True),
         ("gpt-4o-mini", "openai", False),
-        ("claude-opus-5", "openai", False),  # an OpenAI-style route only ever sends reasoning_effort
+        ("claude-opus-5-5", "openai", False),  # an OpenAI-style route only ever sends reasoning_effort
         ("sonnet", "claude-cli", False),
         ("", "openai", None),
         ("gpt-5.1", "somethingelse", None),

@@ -1,5 +1,10 @@
 import type { SlashExecResponse } from "../../../gatewayTypes.js";
-import { openTunePicker } from "../../overlayStore.js";
+import {
+  openPermissionsPicker,
+  openProviderPicker,
+  openSettingsPanel,
+  openTunePicker,
+} from "../../overlayStore.js";
 import type { SlashCommand, SlashRunCtx } from "../types.js";
 
 /**
@@ -14,11 +19,35 @@ export function openTunePopup(ctx: SlashRunCtx): void {
   }
 }
 
+/**
+ * Bare `/provider` opens its own popup (the provider-block switcher, #421),
+ * not the /tune popup. Typed `/provider <name> [--save]` goes to the gateway.
+ */
+export function openProviderPopup(ctx: SlashRunCtx): void {
+  if (!openProviderPicker()) {
+    ctx.transcript.sys(
+      "answer the open prompt first, then run the command again",
+    );
+  }
+}
+
+/**
+ * Bare `/permissions` opens the permissions popup (mode + effective rules),
+ * not the settings panel. Typed `/permissions ...` goes to the gateway.
+ */
+export function openPermissionsPopup(ctx: SlashRunCtx): void {
+  if (!openPermissionsPicker()) {
+    ctx.transcript.sys(
+      "answer the open prompt first, then run the command again",
+    );
+  }
+}
+
 /** `/<name> <arg>` on the gateway, which owns the /tune grammar; its message is what the user sees. */
 function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
   return ctx.gateway.gw
     .request<SlashExecResponse>("slash.exec", {
-      command: `${name} ${arg}`,
+      command: arg ? `${name} ${arg}` : name,
       session_id: ctx.sid,
     })
     .then((r) => {
@@ -33,6 +62,34 @@ function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
 // and the generic slash path sends them there untouched.
 export const tuneCommands: SlashCommand[] = [
   {
+    help: "interactive settings panel (arrows to move/change, / to search, Tab for status)",
+    name: "settings",
+    usage: "/settings [status]",
+    run: (arg, ctx) => {
+      if (arg.trim() === "status" || arg.trim() === "text") {
+        return ctx.gateway.gw
+          .request<SlashExecResponse>("slash.exec", {
+            command: "settings",
+            session_id: ctx.sid,
+          })
+          .then((r) => {
+            if (!ctx.stale()) {
+              ctx.transcript.page(
+                r?.output || "/settings: no output",
+                "Settings",
+              );
+            }
+          })
+          .catch(ctx.guardedErr);
+      }
+
+      if (!openSettingsPanel()) {
+        ctx.transcript.sys("finish the pending prompt first");
+      }
+    },
+  },
+
+  {
     help: "set model, effort and ultracode together (popup, or /tune [model] [effort] [ultracode [on|off]] [--global])",
     name: "tune",
     usage: "/tune [model] [effort] [ultracode [on|off]] [--global]",
@@ -46,5 +103,30 @@ export const tuneCommands: SlashCommand[] = [
     usage: "/effort [low|medium|high|xhigh|max|default]",
     run: (arg, ctx) =>
       arg.trim() ? runOnGateway("effort", arg.trim(), ctx) : openTunePopup(ctx),
+  },
+
+  {
+    help: "list the providers, or switch this session's (--save: also the default in config.yaml)",
+    name: "provider",
+    usage: "/provider [<name> [--save]]",
+    run: (arg, ctx) =>
+      arg.trim()
+        ? runOnGateway("provider", arg.trim(), ctx)
+        : openProviderPopup(ctx),
+  },
+
+  {
+    help: "permissions (mode + rules popup, or /permissions ... passthrough to gateway)",
+    name: "permissions",
+    usage: "/permissions [...]",
+    run: (arg, ctx) => {
+      if (arg.trim()) {
+        return runOnGateway("permissions", arg.trim(), ctx);
+      }
+
+      if (!openPermissionsPicker()) {
+        ctx.transcript.sys("finish the pending prompt first");
+      }
+    },
   },
 ];

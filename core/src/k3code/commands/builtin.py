@@ -1,4 +1,4 @@
-"""Built-in slash commands: /tune /model /effort /clear /compact /rename /resume /stop /exit /help."""
+"""Built-in slash commands: /tune /model /provider /effort /clear /compact /rename /resume /stop /exit /help."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from k3code.commands.tune import TuneCommand
 from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
+from k3code.routing.tiers import active_provider
 from k3code.session_ai import compact_messages
 
 _MODEL_USAGE = (
@@ -112,6 +113,55 @@ class _ModelCommand(CommandDef):
         }
 
 
+class _ProviderCommand(CommandDef):
+    _USAGE = "/provider [<name> [--save]]"
+
+    def __init__(self) -> None:
+        super().__init__(name="provider", help=f"List or switch the provider: {self._USAGE}")
+
+    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        """Bare: the provider blocks, the active one marked. ``<name>``: the session's turns try that block first from
+        the next turn on (``stored.provider``; the transcript is untouched). ``--save``: also ``default_provider``."""
+        config = ctx.config
+        live = ctx.sessions.get(session_id) if session_id else None
+        names = [p.name for p in config.providers]
+        words = arg.split()
+        if not words:
+            if not names:
+                return {"type": "message", "message": "No providers configured."}
+            active = active_provider(config, live.stored.provider if live is not None else "")
+            rows = [f"{'*' if n == active else ' '} {n}" for n in names]
+            return {"type": "message", "message": "Providers (* = active):\n" + "\n".join(rows)}
+        save = "--save" in words
+        rest = [w for w in words if w != "--save"]
+        if len(rest) != 1 or rest[0].startswith("--"):
+            return {"type": "message", "message": f"Usage: {self._USAGE}"}
+        # names are unique regardless of case (Settings checks it), so a case-insensitive match is unambiguous
+        name = next((n for n in names if n.lower() == rest[0].lower()), None)
+        if name is None:
+            valid = ", ".join(names) or "none configured"
+            return {"type": "message", "message": f"Unknown provider: {rest[0]} (valid: {valid})"}
+        lines = []
+        if live is not None:
+            lines.append(f"Provider set to: {name} (from the next turn)")
+        if save:
+            try:
+                _, backup = chain_config.set_default_provider(name)
+            except chain_config.ChainEditError as e:
+                return {"type": "message", "message": f"Could not save the default provider: {e}"}
+            where = str(chain_config.config_path()) + (f", backup: {backup}" if backup else "")
+            lines.append(f"Default provider: {name} (saved to {where})")
+        elif live is None:  # like /model without a session: the default of this daemon, not saved
+            lines.append(f"Default provider set to: {name}")
+        if save or live is None:
+            config.default_provider = name
+        if live is not None:
+            live.stored.provider = name
+            ctx.store.save(live.stored)
+            live.emit("session.info", live.live_info())
+        return {"type": "message", "message": "\n".join(lines)}
+
+
 class _EffortCommand(CommandDef):
     _USAGE = "/effort [low|medium|high|xhigh|max|default]"
 
@@ -132,6 +182,14 @@ class _EffortCommand(CommandDef):
         return {"type": "message", "message": "\n".join(outcome.lines)}
 
 
+def _settle_turns(ctx: Any, live: Any) -> None:
+    """The stored conversation was rewritten: the pending turns' message ranges no longer point at their messages, so
+    an /undo could not be matched to its turn. Their outcomes stop waiting for one (issue #140)."""
+    hub = getattr(ctx, "learning", None)
+    if hub is not None:
+        hub.settle_turns(live.session_id)
+
+
 class _ClearCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="clear", help="Clear the current session transcript", aliases=["c"])
@@ -143,6 +201,9 @@ class _ClearCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
+        _settle_turns(ctx, live)
+        if hasattr(live, "refresh_prompt_inputs"):  # a new conversation: its prompt shows what was learned since
+            live.refresh_prompt_inputs()
         from k3code.gateway.sessions import StoredSession
 
         stored: StoredSession | None = ctx.store.get(session_id or "")
@@ -170,6 +231,9 @@ class _CompactCommand(CommandDef):
         if not folded:
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
         live.messages = messages
+        _settle_turns(ctx, live)
+        if hasattr(live, "refresh_prompt_inputs"):  # the rewritten conversation is a new cache prefix anyway
+            live.refresh_prompt_inputs()
         ctx.store.save(live.stored)
         note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
         return {"type": "message", "message": note}
@@ -274,6 +338,7 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
     from k3code.commands.import_ import ImportCommand
+    from k3code.commands.learned_cmd import LearnedCommand
     from k3code.commands.learning_cmd import (
         LearnCommand,
         OptimizerCommand,
@@ -322,11 +387,13 @@ def build_registry() -> CommandRegistry:
         OptimizerCommand(),
         SelfImproveCommand(),
         LearnCommand(),
+        LearnedCommand(),
     ):
         reg.register(extra)
     for cmd in (
         TuneCommand(),
         _ModelCommand(),
+        _ProviderCommand(),
         _EffortCommand(),
         _ClearCommand(),
         _CompactCommand(),

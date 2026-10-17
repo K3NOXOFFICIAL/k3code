@@ -27,6 +27,7 @@ import { turnController } from "../app/turnController.js";
 import { patchTurnState, resetTurnState } from "../app/turnStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import { useInputHandlers } from "../app/useInputHandlers.js";
+import { startPromptLiveSession } from "../app/useMainApp.js";
 import { useSessionLifecycle } from "../app/useSessionLifecycle.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
@@ -43,6 +44,8 @@ type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
 type IntervalSpy = ReturnType<
   typeof vi.spyOn<typeof globalThis, "setInterval">
 >;
+
+type TimeoutSpy = ReturnType<typeof vi.spyOn<typeof globalThis, "setTimeout">>;
 
 // Fixed wall clock so the rendered elapsed read-outs are exact strings rather
 // than whatever the machine's clock happens to produce mid-test.
@@ -148,10 +151,21 @@ const armedDelays = (spy: IntervalSpy) => spy.mock.calls.map((call) => call[1]);
 const oneSecondTimers = (spy: IntervalSpy) =>
   armedDelays(spy).filter((delay) => delay === 1000).length;
 
-/** The handlers of every 1s clock armed so far — `() => setNow(Date.now())`. */
-const oneSecondTicks = (spy: IntervalSpy) =>
+// The idle SessionDuration + IdleSince read-outs are minute-granular: each arms
+// one setTimeout for the next minute boundary of its start time (<= 60 s away),
+// not a 1 s interval.  Everything else the tree arms with setTimeout is far
+// shorter, so the 30–60 s window isolates the clocks.
+const isClockDelay = (delay: unknown) =>
+  typeof delay === "number" && delay >= 30_000 && delay <= 60_000;
+
+/** Number of idle-clock timeouts armed so far. */
+const clockTimers = (spy: TimeoutSpy) =>
+  spy.mock.calls.filter((call) => isClockDelay(call[1])).length;
+
+/** The handlers of every idle-clock timeout armed so far. */
+const clockTicks = (spy: TimeoutSpy) =>
   spy.mock.calls
-    .filter((call) => call[1] === 1000)
+    .filter((call) => isClockDelay(call[1]))
     .map((call) => call[0] as () => void);
 
 // ── AppLayout harness ────────────────────────────────────────────────
@@ -175,6 +189,7 @@ const layoutProps: AppLayoutProps = {
     activateLiveSession: () => {},
     answerApproval: () => {},
     answerClarify: () => {},
+    answerClarifyQuestion: () => {},
     answerSecret: () => {},
     answerSudo: () => {},
     clearSelection: () => {},
@@ -182,6 +197,9 @@ const layoutProps: AppLayoutProps = {
     newLiveSession: () => {},
     newPromptSession: () => {},
     onModelSelect: () => {},
+    onProviderSelect: () => {},
+    onSettingsApply: () => {},
+    onTuneApply: () => {},
     resumeById: () => {},
     setStickyPrompt: () => {},
   },
@@ -265,6 +283,7 @@ const mountLayout = (
 const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
 
 let intervalSpy: IntervalSpy;
+let timeoutSpy: TimeoutSpy;
 let nowSpy: ReturnType<typeof vi.spyOn<typeof Date, "now">>;
 
 beforeEach(() => {
@@ -272,6 +291,7 @@ beforeEach(() => {
   resetUiState();
   nowSpy = vi.spyOn(Date, "now").mockReturnValue(T0);
   intervalSpy = vi.spyOn(globalThis, "setInterval");
+  timeoutSpy = vi.spyOn(globalThis, "setTimeout");
 });
 
 afterEach(() => {
@@ -280,16 +300,17 @@ afterEach(() => {
   }
 
   intervalSpy.mockRestore();
+  timeoutSpy.mockRestore();
   nowSpy.mockRestore();
   resetOverlayState();
   resetUiState();
 });
 
 describe("status-chrome timers under an occluding overlay", () => {
-  it("arms the one-second SessionDuration + IdleSince clocks when nothing covers the rule", () => {
+  it("arms the minute-granular SessionDuration + IdleSince clocks when nothing covers the rule", () => {
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("arms no timer at all when an occluding overlay is already open", () => {
@@ -297,7 +318,7 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 
   it("arms the FaceTicker glyph/verb/clock trio mid-turn when nothing covers the rule", () => {
@@ -348,7 +369,7 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("re-syncs the elapsed read-outs from the wall clock on reveal instead of resuming stale", async () => {
@@ -359,8 +380,8 @@ describe("status-chrome timers under an occluding overlay", () => {
 
     const rule = mount(idleProps);
 
-    expect(rule.output()).toContain("1m 0s");
-    expect(rule.output()).toContain("✓ 5s");
+    expect(rule.output()).toContain("│ 1m │");
+    expect(rule.output()).toContain("✓ <1m");
 
     // Five minutes of wall clock elapse while the overlay covers the rule.
     nowSpy.mockReturnValue(T0 + 300_000);
@@ -368,7 +389,7 @@ describe("status-chrome timers under an occluding overlay", () => {
     resetOverlayState();
     // Poll for the reveal frame instead of a fixed tick: under CI load the
     // store-driven re-render can land well after one 20ms scheduler turn.
-    await waitFor(() => expect(rule.output()).toContain("6m 0s"), {
+    await waitFor(() => expect(rule.output()).toContain("│ 6m │"), {
       interval: 10,
       timeout: 5_000,
     });
@@ -376,27 +397,27 @@ describe("status-chrome timers under an occluding overlay", () => {
     const resumed = rule.output();
 
     // Caught up to real elapsed time, not stuck on the pre-overlay values.
-    expect(resumed).toContain("6m 0s");
-    expect(resumed).toContain("✓ 5m 5s");
-    expect(resumed).not.toContain("1m 0s");
+    expect(resumed).toContain("│ 6m │");
+    expect(resumed).toContain("✓ 5m");
+    expect(resumed).not.toContain("│ 1m │");
 
     // …and the clocks are running again.
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("tears the clocks down when an overlay opens over an already-running status rule", async () => {
     mount(idleProps);
 
-    // Handles of the two live 1-second clocks (SessionDuration + IdleSince).
-    const clocks = intervalSpy.mock.results
-      .filter((_result, i) => intervalSpy.mock.calls[i]?.[1] === 1000)
-      .map((result) => result.value as ReturnType<typeof setInterval>);
+    // Handles of the two live minute clocks (SessionDuration + IdleSince).
+    const clocks = timeoutSpy.mock.results
+      .filter((_result, i) => isClockDelay(timeoutSpy.mock.calls[i]?.[1]))
+      .map((result) => result.value as ReturnType<typeof setTimeout>);
 
     expect(clocks).toHaveLength(2);
 
-    const clearSpy = vi.spyOn(globalThis, "clearInterval");
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
 
-    patchOverlayState({ pluginsHub: true });
+    patchOverlayState({ sessions: true });
     await flush();
 
     // Each running clock is cleared as the overlay goes up …
@@ -405,9 +426,35 @@ describe("status-chrome timers under an occluding overlay", () => {
     }
 
     // … and the occluded re-run arms no replacement (still just the original two).
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
 
     clearSpy.mockRestore();
+  });
+});
+
+describe("idle status rule repaints (#170)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("writes no frame for 30 s while idle, then one minute-granular repaint at the next minute", async () => {
+    nowSpy.mockRestore();
+    vi.useFakeTimers({ now: T0 });
+
+    // Session started 60 s ago, last turn ended 5 s ago: the next minute
+    // boundary is 55 s away, so nothing may be written before then.
+    const rule = mount(idleProps);
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(rule.output()).toContain("1m");
+    rule.clear();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rule.output()).toBe("");
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(rule.output()).toContain("2m");
+    expect(rule.output()).toContain("✓ 1m");
   });
 });
 
@@ -420,13 +467,11 @@ describe("status-chrome timers track the current overlay model", () => {
   const occluding: Array<[string, Partial<OverlayState>]> = [
     ["modelPicker", { modelPicker: true }],
     ["pager", { pager: { lines: ["a"], offset: 0 } }],
-    ["pluginsHub", { pluginsHub: true }],
     ["sessions", { sessions: true }],
-    ["skillsHub", { skillsHub: true }],
     ["widget", { widget: { appId: "demo", state: null } }],
   ];
 
-  // In `$isBlocked` but NOT occluding.  `agents` / `agentView` / `journey`
+  // In `$isBlocked` but NOT occluding.  `agents` / `agentView`
   // unmount the whole ComposerPane subtree, so React's effect cleanup already
   // stops the clocks and gating on them would be dead code; the rest are
   // PromptZone states that render in normal flow and push the rule down
@@ -461,7 +506,6 @@ describe("status-chrome timers track the current overlay model", () => {
         } as OverlayState["confirm"],
       },
     ],
-    ["journey", { journey: true }],
     [
       "secret",
       {
@@ -478,7 +522,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
       mount(idleProps);
 
-      expect(oneSecondTimers(intervalSpy)).toBe(0);
+      expect(clockTimers(timeoutSpy)).toBe(0);
     },
   );
 
@@ -489,7 +533,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
       mount(idleProps);
 
-      expect(oneSecondTimers(intervalSpy)).toBe(2);
+      expect(clockTimers(timeoutSpy)).toBe(2);
     },
   );
 
@@ -500,7 +544,7 @@ describe("status-chrome timers track the current overlay model", () => {
 
     mount(idleProps);
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 });
 
@@ -522,20 +566,20 @@ describe("AppLayout status-rule visibility", () => {
     // The rule is genuinely rendered — the approval prompt pushed it, it did
     // not cover it — so freezing its clock would freeze something visible.
     expect(layout.output()).toContain("~/repo");
-    expect(layout.output()).toContain("1m 0s");
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(layout.output()).toContain("1m");
+    expect(clockTimers(timeoutSpy)).toBe(2);
 
-    // …and it really advances: drive the armed 1s handlers forward.
-    nowSpy.mockReturnValue(T0 + 30_000);
+    // …and it really advances: drive the armed minute handlers forward.
+    nowSpy.mockReturnValue(T0 + 120_000);
 
-    for (const tick of oneSecondTicks(intervalSpy)) {
+    for (const tick of clockTicks(timeoutSpy)) {
       tick();
     }
 
     await flush();
     await flush();
 
-    expect(layout.output()).toContain("1m 30s");
+    expect(layout.output()).toContain("3m");
   });
 
   it("arms no clock under a floating model picker while the rule is at the top", async () => {
@@ -543,7 +587,7 @@ describe("AppLayout status-rule visibility", () => {
 
     await flush();
 
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 
   it("keeps the clocks armed under a floating model picker while the rule is at the bottom", async () => {
@@ -551,7 +595,7 @@ describe("AppLayout status-rule visibility", () => {
 
     await flush();
 
-    expect(oneSecondTimers(intervalSpy)).toBe(2);
+    expect(clockTimers(timeoutSpy)).toBe(2);
   });
 
   it("swaps the transcript and composer for the full-screen agent view", async () => {
@@ -562,7 +606,7 @@ describe("AppLayout status-rule visibility", () => {
     expect(layout.output()).toContain(AGENT_VIEW_HINT);
     // the composer (and the status rule inside it) unmounts with the view up
     expect(layout.output()).not.toContain("~/repo");
-    expect(oneSecondTimers(intervalSpy)).toBe(0);
+    expect(clockTimers(timeoutSpy)).toBe(0);
   });
 });
 
@@ -572,11 +616,18 @@ describe("AppLayout agent view: leaving the startup session", () => {
   });
 
   // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
+  // Typing "test session" and pressing Enter now starts the session from the
+  // view's own composer (the view stays open) and leaves the empty startup
+  // session behind for the gateway to drop if it is disposable.
   it.each([
-    ["n", "newLiveSession", ["s1"]],
+    [
+      "n",
+      "newPromptSession",
+      ["test session", undefined, { dropSid: "s1", keepAgentView: true }],
+    ],
     ["\r", "activateLiveSession", ["s2", "s1"]],
   ] as const)(
-    "%j closes the empty session forged after the view opened",
+    "%j leaves the empty session forged after the view opened",
     async (key, method, args) => {
       const spy = vi.fn();
       const layout = mountLayout(
@@ -608,6 +659,21 @@ describe("AppLayout agent view: leaving the startup session", () => {
       }
 
       layout.press(key);
+
+      // For "n": it focuses the composer; type the session name and press Enter.
+      if (key === "n") {
+        await waitFor(() =>
+          expect(layout.output()).toContain("start a new session"),
+        );
+        // let React (re)subscribe the focused TextInput before typing
+        await new Promise((r) => setTimeout(r, 30));
+        for (const ch of "test session") {
+          layout.press(ch);
+          await new Promise((r) => setTimeout(r, 10));
+        }
+            layout.press("\n");
+        await new Promise((r) => setTimeout(r, 200));
+      }
 
       await waitFor(() => expect(spy).toHaveBeenCalled());
       expect(spy).toHaveBeenCalledWith(...args);
@@ -641,16 +707,41 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
               }
             : method === "session.close"
               ? { closed: true }
-              : null,
+              : method === "session.create"
+                ? {
+                    session_id: "s-new",
+                    stored_session_id: "stored-s-new",
+                    info: { version: "1.0" },
+                  }
+                : method === "setup.status"
+                  ? { provider_configured: true }
+                  : null,
       ),
     );
-    const rpc = vi.fn((method: string) =>
+    const rpc = vi.fn((method: string, params?: Record<string, unknown>) =>
       Promise.resolve<unknown>(
         method === "setup.status"
           ? { provider_configured: true }
           : method === "session.create"
-            ? { session_id: "s-new" }
-            : null,
+            ? {
+                session_id: "s-new",
+                stored_session_id: "stored-s-new",
+                info: { version: "1.0" },
+              }
+            : method === "session.activate" && params?.session_id
+              ? {
+                  session_id: params.session_id,
+                  stored_session_id: `stored-${params.session_id}`,
+                  info: { version: "1.0" },
+                  messages: [],
+                  running: false,
+                  status: "idle",
+                }
+              : method === "session.list"
+                ? { sessions: past }
+                : method === "session.close"
+                  ? { closed: true }
+                  : null,
       ),
     );
     const gateway = {
@@ -681,8 +772,26 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
           actions={{
             ...layoutProps.actions,
             activateLiveSession: session.activateLiveSession,
-            newLiveSession: (dropSid?: string) =>
-              void session.newLiveSession(undefined, undefined, dropSid),
+            newLiveSession: (msg?: string, title?: string, dropSid?: string) =>
+              void session.newLiveSession(msg, title, dropSid),
+            newPromptSession: (
+              prompt: string,
+              modelArg?: string,
+              opts?: { dropSid?: string; keepAgentView?: boolean },
+            ) =>
+              void startPromptLiveSession({
+                // the storyboard-level prompt dispatch is out of scope here
+                dispatchSubmission: () => {},
+                dropSid: opts?.dropSid,
+                keepAgentView: opts?.keepAgentView,
+                maybeWarn: () => {},
+                modelArg,
+                newLiveSession: (msg?: string, title?: string, sid?: string) =>
+                  session.newLiveSession(msg, title, sid),
+                prompt,
+                rpc: gateway.rpc,
+                sys: () => {},
+              }),
             resumeById: (id: string, dropSid?: string) =>
               void session.resumeById(id, { dropSid }),
           }}
@@ -724,8 +833,19 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    // let React (re)subscribe the focused TextInput before typing
+    await new Promise((r) => setTimeout(r, 60));
+    for (const ch of "test session") {
+      layout.press(ch);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    layout.press("\n");
+    await new Promise((r) => setTimeout(r, 500));
 
-    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1), {
+      timeout: 10000,
+    });
     expect(getUiState().sid).toBe("s-new");
     expect(closeCalls(request)).toHaveLength(1);
   });
@@ -778,9 +898,20 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
+    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    // let React (re)subscribe the focused TextInput before typing
+    await new Promise((r) => setTimeout(r, 60));
+    for (const ch of "test session") {
+      layout.press(ch);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    layout.press("\n");
+    await new Promise((r) => setTimeout(r, 500));
 
     // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
-    await waitFor(() => expect(getUiState().sid).toBe("s-new"));
+    await waitFor(() => expect(getUiState().sid).toBe("s-new"), {
+      timeout: 10000,
+    });
     expect(rpc).toHaveBeenCalledWith("session.create", expect.anything());
     await flush();
 

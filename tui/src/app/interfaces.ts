@@ -43,6 +43,8 @@ export interface BatteryInfo {
   category: BatteryCategory;
   percent: null | number;
   plugged: null | boolean;
+  temp_c?: null | number;
+  power_profile?: null | string;
 }
 
 export type BusyInputMode = "interrupt" | "queue" | "steer";
@@ -137,15 +139,17 @@ export interface OverlayState {
   ambient: ActiveWidget[];
   /** Modal widget app — owns input, blocks the composer. */
   widget: ActiveWidget | null;
-  journey: boolean;
   modelPicker: boolean | { refresh?: boolean };
   pager: null | PagerState;
-  pluginsHub: boolean;
   secret: null | SecretReq;
   sessions: boolean;
-  skillsHub: boolean;
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
+  settingsPanel: boolean;
+  /** /provider popup: provider-block switcher (bare /provider). */
+  providerPicker: boolean;
+  /** /permissions popup: mode + effective rules (bare /permissions). */
+  permissionsPicker: boolean;
   tunePicker: boolean;
 }
 
@@ -174,6 +178,8 @@ export interface UiState {
   destructiveSlashConfirm: boolean;
   detailsMode: DetailsMode;
   detailsModeCommandOverride: boolean;
+  /** "Start k3code in agent view" (display.tui_start_agents_view). */
+  agentsView: boolean;
   // Focus view (/focus) — display-only reduced-output mode. Drives the
   // persistent `◉ focus` status-bar badge; never affects request payloads.
   focusView: boolean;
@@ -438,10 +444,25 @@ export interface AppLayoutActions {
   /** `dropSid`: an empty session to close once attached elsewhere (agent view). */
   activateLiveSession: (id: string, dropSid?: string) => void;
   closeLiveSession: (id: string) => Promise<null | SessionCloseResponse>;
-  newLiveSession: (dropSid?: string) => void;
-  newPromptSession: (prompt: string, modelArg?: string) => void;
+  newLiveSession: (msg?: string, title?: string, dropSid?: string) => void;
+  /**
+   * Start a session and run `prompt` in it. The agent view's composer passes
+   * `keepAgentView` so the full-screen list stays up while the new session works;
+   * `dropSid` closes the session departed from once the new one is attached (the
+   * gateway keeps non-disposable sessions).
+   */
+  newPromptSession: (
+    prompt: string,
+    modelArg?: string,
+    opts?: { dropSid?: string; keepAgentView?: boolean },
+  ) => void;
   onModelSelect: (value: string) => void;
+  /** The /provider popup's Enter: closes it and switches the session's provider. */
+  onProviderSelect: (slug: string, saveDefault: boolean) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
+  onSettingsApply: (command: string) => void;
+  /** The /permissions popup: closes it and dispatches the slash string. */
+  onPermissionsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
   resumeById: (id: string, dropSid?: string) => void;
@@ -511,9 +532,12 @@ export interface AppOverlaysProps {
   onModelSelect: (value: string) => void;
   onNewLiveSession: () => void;
   onNewPromptSession: (prompt: string, modelArg?: string) => void;
+  onPermissionsApply: (command: string) => void;
+  onProviderSelect: (slug: string, saveDefault: boolean) => void;
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;
+  onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   pagerPageSize: number;
 }

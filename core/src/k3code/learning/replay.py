@@ -1,15 +1,24 @@
 """Replay harness (M1 P6-1): recorded turns replayed through candidate settings on the fake provider.
 
 Every finished turn is recorded with its inputs (the size of each message before each model request, and the size of
-the injected memory and skills) and its outcome (status, recorded tokens, whether the verifier passed it).
+the injected memory and skills), how it ended (status) and its recorded tokens. Whether it succeeded is not known at
+turn end (an /undo may still remove it): the decision log keeps each turn's outcome signals (``turn_outcomes``) and
+:meth:`ReplayStore.load` joins them onto the records as ``passed`` (:func:`attach_outcomes`). A record used to say
+``passed: status == "done"``, which counted a turn the user undid right away as a success (issue #140).
 A candidate setting (a smaller tool-output clip, a memory or skill limit) is replayed: each request is rebuilt with the
 candidate applied and sent through :class:`FakeProvider`, whose usage step is the estimated size (characters / 4).
 The same records always give the same token totals. A record holds the size of each message (and the tool name of a
 tool result, which decides its clip), never its text.
 
-The replay cannot re-run the model, so the verifier pass rate is bounded rather than measured: a passing turn whose
-inputs the candidate changed counts as a possible failure. That bound is conservative, and it is what the auto-apply
-gate reads.
+A record holds the sizes of the turn's own messages only. The history before the turn is a constant-size summary: its
+total characters and the ``HISTORY_BIG_KEEP`` largest tool results (the only entries a clip candidate can change).
+A turn's record therefore does not grow with the length of the session. Records written before this kept a size entry
+for every message of the history (no ``history`` key); they still replay, with the history inside ``entries``.
+
+The replay cannot re-run the model, so the pass rate is bounded rather than measured: a turn whose inputs the candidate
+changed counts as a possible failure unless it is known to have failed already (a turn still waiting for its outcome,
+or one recorded before outcomes were, may have succeeded, so it counts as at risk). That bound is conservative, and it
+is what the auto-apply gate reads.
 """
 
 from __future__ import annotations
@@ -19,17 +28,24 @@ import dataclasses
 import functools
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.learning.decisions import turn_passed
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
+from k3code.skills import PROMPT_LIMIT
 from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
 
 RECORD_PARTS = ("learning", "replay", "turns.jsonl")
 #: A turn record larger than this is not kept (records hold sizes only, so this is a guard, not a norm).
 MAX_RECORD_CHARS = 200_000
+#: The history before a turn is summarised: this many of its largest tool results are kept one by one, so the clip
+#: candidates see them; the rest of the history is only counted (a result past these is replayed unclipped, which
+#: understates a reduction and never overstates one).
+HISTORY_BIG_KEEP = 16
 #: The file is cut back to its newest half past this size.
 MAX_FILE_BYTES = 40_000_000
 
@@ -51,18 +67,25 @@ def est_tokens(chars: int) -> int:
 # ── recording ──────────────────────────────────────────────────────────────
 
 
-class ReplayStore:
-    """Append-only JSONL of turn records under ``$K3CODE_HOME/learning/replay/turns.jsonl``."""
+#: Reads the decision log's turn outcomes from a time on (``DecisionLog.turn_outcomes``).
+OutcomeSource = Callable[..., list[dict[str, Any]]]
 
-    def __init__(self, home: Path | str) -> None:
+
+class ReplayStore:
+    """Append-only JSONL of turn records under ``$K3CODE_HOME/learning/replay/turns.jsonl``.
+
+    ``outcomes``: where the turns' outcomes are kept; :meth:`load` then attaches each record's ``passed``."""
+
+    def __init__(self, home: Path | str, outcomes: OutcomeSource | None = None) -> None:
         self.path = Path(home).joinpath(*RECORD_PARTS)
+        self.outcomes = outcomes
 
     def append(self, record: dict[str, Any]) -> bool:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         if len(line) > MAX_RECORD_CHARS:
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        ensure_private_dir(self.path.parent)
+        with private_file(self.path).open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         if self.path.stat().st_size > MAX_FILE_BYTES:
             lines = self.path.read_text(encoding="utf-8").splitlines()
@@ -80,7 +103,40 @@ class ReplayStore:
                 out.append(json.loads(line))
             except ValueError:
                 continue  # a torn line from a crash is skipped, never fatal
+        if self.outcomes is not None and out:
+            since = min(float(t.get("ts") or 0) for t in out)
+            out = attach_outcomes(out, self.outcomes(since=since))
         return out
+
+
+def unjoined_passed(status: str) -> bool | None:
+    """A record with no outcome row (recorded before outcomes were, or with the row lost): a turn that did not finish
+    failed, and one that finished is unknown, since it may have been undone. Never "finished, so it passed"."""
+    return None if status == "done" else turn_passed({"status": status})
+
+
+def attach_outcomes(turns: list[dict[str, Any]], outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each record with its turn's outcome: ``outcome`` (the signals: undone, interrupted, last test, judge, ...; None
+    when the turn has no row) and ``passed`` (``DecisionLog.turn_outcomes``: None while pending or when the turn says
+    nothing either way). Returns new dicts; the records themselves are left alone."""
+    by_turn = {str(o["turn"]): o for o in outcomes}
+    out = []
+    for t in turns:
+        row = by_turn.get(str(t.get("turn") or ""))
+        if row is None:
+            out.append({**t, "outcome": None, "passed": unjoined_passed(str(t.get("status") or ""))})
+            continue
+        signals = {k: row[k] for k in ("undone", "interrupted", "test", "gate", "judge", "denials", "pending")}
+        out.append({**t, "outcome": signals, "passed": row["passed"]})
+    return out
+
+
+def record_passed(turn: dict[str, Any]) -> bool | None:
+    """The replay's view of one record's success: the joined outcome, else :func:`unjoined_passed`. A record's own
+    ``passed`` key, written by older versions as ``status == "done"``, is never read."""
+    if "outcome" in turn:
+        return turn["passed"]
+    return unjoined_passed(str(turn.get("status") or ""))
 
 
 def build_record(
@@ -98,14 +154,17 @@ def build_record(
     skill_lines: list[int],
     ts: float,
 ) -> dict[str, Any]:
-    """One turn as the replay reads it: the size of every message (never its text), the request boundaries and the
-    answer sizes. Request ``k`` of the turn saw ``entries[:boundaries[k]]``; its answer is the assistant message there.
+    """One turn as the replay reads it: the size of each of its own messages (never its text), the request boundaries
+    and the answer sizes. ``status`` is how the turn ended, not whether it succeeded: that is joined on load from the
+    decision log (:func:`attach_outcomes`). Request ``k`` of the turn saw the summarised history and
+    ``entries[:boundaries[k]]``; its answer is the assistant message there.
 
     ``first`` is the index of the turn's own first message (its prompt): the history before it made no request of
-    this turn, so its assistant messages are not boundaries (they are still part of every request's input).
+    this turn, so its assistant messages are not boundaries (they are still part of every request's input). It is
+    kept as ``history`` (see :func:`_summarise_history`), not entry by entry.
     """
-    entries = [_entry(m) for m in messages]
-    boundaries = [i for i, m in enumerate(messages) if m.role == "assistant" and i >= first]
+    entries = [_entry(m) for m in messages[first:]]
+    boundaries = [i for i, e in enumerate(entries) if e["r"] == "assistant"]
     completions = [_entry_chars(entries[i]) for i in boundaries]
     return {
         "turn": turn,
@@ -114,11 +173,11 @@ def build_record(
         "kind": kind,
         "tier": tier,
         "status": status,
-        "passed": status == "done",
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "memory_chars": memory_chars,
         "skill_lines": list(skill_lines),
+        "history": _summarise_history([_entry(m) for m in messages[:first]]),
         "entries": entries,
         "boundaries": boundaries,
         "completions": completions,
@@ -133,6 +192,26 @@ def _entry(m: Message) -> dict[str, Any]:
     if m.tool_calls:
         out["c"] = [len(tc.name) + len(json.dumps(tc.arguments, ensure_ascii=False)) for tc in m.tool_calls]
     return out
+
+
+def _summarise_history(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """The history before a turn in constant size: the message count, the characters of everything but the
+    ``HISTORY_BIG_KEEP`` largest tool results (``rest``), and those results themselves (``big``, in order)."""
+    ranked = sorted((i for i, e in enumerate(entries) if e["r"] == "tool"), key=lambda i: (-int(entries[i]["n"]), i))
+    keep = sorted(ranked[:HISTORY_BIG_KEEP])
+    kept = set(keep)
+    rest = sum(_entry_chars(e) for i, e in enumerate(entries) if i not in kept)
+    return {"messages": len(entries), "rest": rest, "big": [entries[i] for i in keep]}
+
+
+def _history_entries(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    """The earlier history as entries for the replay: the kept tool results and one entry for the rest. A record in
+    the old format has no summary (its history is inside ``entries``)."""
+    history = turn.get("history")
+    if not history:
+        return []
+    rest = int(history["rest"])
+    return [*history["big"], {"r": "user", "n": rest}] if rest else list(history["big"])
 
 
 def _entry_chars(e: dict[str, Any]) -> int:
@@ -190,9 +269,10 @@ def _apply(
 async def _replay_turn(provider: FakeProvider, turn: dict[str, Any], cand: Candidate | None) -> dict[str, Any]:
     tok_in = tok_out = 0
     changed = False
-    entries = turn["entries"]
+    entries = _history_entries(turn) + turn["entries"]
+    prefix = len(entries) - len(turn["entries"])
     for boundary, answer_chars in zip(turn["boundaries"], turn["completions"], strict=True):
-        sent, ch, cut = _apply(cand, entries[:boundary], turn)
+        sent, ch, cut = _apply(cand, entries[: prefix + boundary], turn)
         changed = changed or ch
         chars = sum(_entry_chars(e) for e in sent) - cut
         # the messages carry roles only: the fake provider needs their shape, the sizes come from the usage step
@@ -217,7 +297,10 @@ def _fake() -> FakeProvider:
 
 
 async def evaluate(turns: list[dict[str, Any]], cand: Candidate, *, now_clip: int | None = None) -> dict[str, Any]:
-    """Token totals before and after ``cand`` over the recorded turns, and the verifier pass-rate bound.
+    """Token totals before and after ``cand`` over the recorded turns, and the pass-rate bound.
+
+    ``pass_rate_before`` is the share of scored turns that succeeded (None when no turn has a settled outcome);
+    ``pass_drop_points`` the share of all turns the candidate changed that are not known to have failed.
 
     "Before" is what the model is sent today: tool results clipped at ``now_clip`` (the configured default when None).
     The memory and skill sizes are already the recorded ones, which were the configured sizes.
@@ -229,8 +312,10 @@ async def evaluate(turns: list[dict[str, Any]], cand: Candidate, *, now_clip: in
     tok_before = sum(r["in"] + r["out"] for r in before)
     tok_after = sum(r["in"] + r["out"] for r in after)
     n = len(turns)
-    passed = sum(1 for t in turns if t["passed"])
-    at_risk = sum(1 for t, r in zip(turns, after, strict=True) if t["passed"] and r["changed"])
+    outcomes = [record_passed(t) for t in turns]
+    scored = sum(1 for p in outcomes if p is not None)
+    passed = sum(1 for p in outcomes if p is True)
+    at_risk = sum(1 for p, r in zip(outcomes, after, strict=True) if p is not False and r["changed"])
     return {
         "candidate": cand.name,
         "turns": n,
@@ -239,7 +324,8 @@ async def evaluate(turns: list[dict[str, Any]], cand: Candidate, *, now_clip: in
         "tokens_after": tok_after,
         "token_reduction_pct": round(100.0 * (tok_before - tok_after) / tok_before, 2) if tok_before else 0.0,
         "changed_turns": sum(1 for r in after if r["changed"]),
-        "pass_rate_before": round(passed / n, 4) if n else None,
+        "scored_turns": scored,
+        "pass_rate_before": round(passed / scored, 4) if scored else None,
         "pass_drop_points": round(100.0 * at_risk / n, 2) if n else None,
     }
 
@@ -260,17 +346,17 @@ def auto_ok(result: dict[str, Any]) -> bool:
 
 
 def tier_pass_delta(turns: list[dict[str, Any]], kind: str, to_tier: str) -> dict[str, Any]:
-    """What moving one task kind to ``to_tier`` does to the verifier pass rate, from the turns observed on each tier.
+    """What moving one task kind to ``to_tier`` does to the pass rate, from the scored turns observed on each tier.
 
     Tokens do not depend on the tier, so the token delta is 0; the pass delta is None until both tiers were observed.
     """
-    of_kind = [t for t in turns if t["kind"] == kind]
+    of_kind = [t for t in turns if t["kind"] == kind and record_passed(t) is not None]
     on_to = [t for t in of_kind if t["tier"] == to_tier]
     elsewhere = [t for t in of_kind if t["tier"] != to_tier]
     delta = None
     if on_to and elsewhere:
-        rate_to = sum(t["passed"] for t in on_to) / len(on_to)
-        rate_else = sum(t["passed"] for t in elsewhere) / len(elsewhere)
+        rate_to = sum(record_passed(t) is True for t in on_to) / len(on_to)
+        rate_else = sum(record_passed(t) is True for t in elsewhere) / len(elsewhere)
         delta = round(100.0 * (rate_to - rate_else), 2)
     return {
         "kind": kind,
@@ -287,7 +373,7 @@ async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]])
     ``auto_ok`` (whether the gate allows an automatic change). Candidates that would not reduce anything are dropped."""
     now_clip = int(context.get("tool_output_chars", 10_000))
     now_memory = int(context.get("memory_chars", 20_000))
-    now_skills = int(context.get("skill_prompt_limit", 60))
+    now_skills = int(context.get("skill_prompt_limit", PROMPT_LIMIT))
     specs: list[tuple[Candidate, dict[str, Any], str]] = []
     if now_clip > TOOL_CLIP_CANDIDATE:
         specs.append(

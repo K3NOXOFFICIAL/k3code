@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import urllib.request
 from pathlib import Path
 
@@ -121,6 +122,7 @@ async def test_producers_register_debug_dump_and_preview(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
     await call(server, "slash.exec", {"command": "preview build a thing"})
+    await asyncio.wait_for(server.session.turn_task, 20)
     kinds = {a.kind for a in server.artifacts.list()}
     assert "preview" in kinds
     prev = server.artifacts.list(kind="preview")[0]

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { INITIAL_STATE, parseMultipleKeypresses } from "./parse-keypress.js";
 import { PASTE_END, PASTE_START } from "./termio/csi.js";
@@ -21,6 +21,39 @@ describe("legacy modified return parsing", () => {
       ]);
     },
   );
+});
+
+describe("legacy backspace parsing (0x08)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("parses 0x08 as Ctrl+Backspace under Windows Terminal (WT_SESSION)", () => {
+    vi.stubEnv("WT_SESSION", "00000000-0000-0000-0000-000000000000");
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, "\x08");
+
+    expect(keys).toEqual([
+      expect.objectContaining({ name: "backspace", ctrl: true, meta: false }),
+    ]);
+  });
+
+  it("keeps 0x08 as plain Backspace without WT_SESSION", () => {
+    vi.stubEnv("WT_SESSION", "");
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, "\x08");
+
+    expect(keys).toEqual([
+      expect.objectContaining({ name: "backspace", ctrl: false, meta: false }),
+    ]);
+  });
+
+  it("keeps 0x7f as plain Backspace under Windows Terminal", () => {
+    vi.stubEnv("WT_SESSION", "00000000-0000-0000-0000-000000000000");
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, "\x7f");
+
+    expect(keys).toEqual([
+      expect.objectContaining({ name: "backspace", ctrl: false, meta: false }),
+    ]);
+  });
 });
 
 describe("legacy function-key parsing", () => {

@@ -6,7 +6,7 @@ import asyncio
 
 from k3code.agent.loop import AgentLoop
 from k3code.automation.server_runner import ServerRunner
-from k3code.errors import ChainExhausted
+from k3code.errors import AllProvidersUnreachable, ChainExhausted
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, GoalState
 from k3code.reliability import BudgetExceeded
@@ -19,7 +19,7 @@ NO_ADVISOR = {"advisor_on_goal": False}
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False
@@ -223,3 +223,166 @@ async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_l
     await capped.evaluate_after_turn("done!", judge)
     paused = await capped.evaluate_after_turn("done!", judge)
     assert not paused.should_continue and capped.state.paused_reason == "check exhausted 2 retries: $ exit 1"
+
+
+async def test_the_judge_receives_the_turns_evidence_digest(tmp_path, monkeypatch):
+    """Roadmap #172 §2: the judge sees what the turn's tools did, not only the agent's claim."""
+    from k3code.providers.types import ToolCall
+    from test_permissions_gateway import call, run_turn
+    from test_permissions_gateway import make_server as scripted_server
+
+    write = ToolCall(id="w1", name="write", arguments={"path": "fix.py", "content": "x = 1\n"})
+    server, _ = scripted_server(
+        tmp_path, [write, "all done, tests pass"], monkeypatch, mode="yolo", autonomy=NO_ADVISOR
+    )
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    got: list[tuple[str, str, str]] = []
+
+    async def judge(goal: str, response: str, evidence):
+        got.append((goal, response, evidence.render()))
+        return "continue", "no test ran", False, False
+
+    server.goal_judge = judge
+    server.goal_manager(server.session).set("fix the bug", max_turns=1)
+    await run_turn(server, "fix the bug", [])
+    assert len(got) == 1 and got[0][1] == "all done, tests pass"
+    evidence = got[0][2]
+    assert "No test/check command ran this turn." in evidence
+    assert "Files written/edited: 1: fix.py" in evidence
+    await server.close()
+
+
+async def test_an_unparseable_judge_reply_ends_an_implicit_goal_at_once_but_a_goal_fails_open_three_times():
+    """Auto-continue failed open on a reply that was not a verdict and ran up to 3 more unattended turns; a /goal keeps
+    that behaviour (the user set it), an implicit goal now ends on the first one, with a notice."""
+    from k3code.goals import MAX_CONSECUTIVE_PARSE_FAILURES
+
+    async def garbled(goal, response, evidence=None):
+        return "continue", "judge reply was not JSON: 'sure!'", True, False
+
+    implicit = _mem_manager()
+    implicit.set("fix the parser", implicit=True, max_turns=8)
+    decision = await implicit.evaluate_after_turn("I changed parse()", garbled)
+    assert not decision.should_continue and decision.prompt is None
+    assert implicit.state is None and decision.status == "cleared"
+    assert decision.message.startswith("↻ Auto-continue stopped: the completion judge's reply was not a verdict")
+
+    explicit = _mem_manager()
+    explicit.set("fix the parser")
+    for _ in range(MAX_CONSECUTIVE_PARSE_FAILURES - 1):
+        decision = await explicit.evaluate_after_turn("working", garbled)
+        assert decision.should_continue and explicit.state.status == "active"
+    decision = await explicit.evaluate_after_turn("working", garbled)
+    assert not decision.should_continue and explicit.state.status == "paused"
+    assert (
+        explicit.state.paused_reason
+        == f"judge returned unparseable output {MAX_CONSECUTIVE_PARSE_FAILURES} turns in a row"
+    )
+FOREVER = {"retry_forever": True}
+
+
+def _transport_failing_judge(fails: int):
+    """A judge whose model call fails transport-style ``fails`` times, then verdicts done."""
+    calls: list[tuple[str, str]] = []
+
+    async def judge(goal: str, response: str, evidence: str = ""):
+        calls.append((goal, response))
+        if len(calls) <= fails:
+            return "continue", "judge error: Timeout", False, True
+        return "done", "the work is complete", False, False
+
+    judge.calls = calls  # type: ignore[attr-defined]
+    return judge
+
+
+async def test_retry_forever_parks_on_transient_error_then_resumes_and_completes(tmp_path, monkeypatch):
+    """Mid-goal transient error parks (stays active, never failed) and the next turn completes on judge agree."""
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["the feature is shipped"], autonomy=NO_ADVISOR,
+                            reliability=FOREVER)
+    sid = await new_session(server, repo)
+    _goal(server, sid).set("ship the feature")
+    assert server._retry_forever_on()  # the flag reads without a schema change
+
+    calls = {"n": 0}
+    real_run = AgentLoop.run
+
+    async def flaky(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ChainExhausted("all provider entries failed (last reason: server)", last_reason="server")
+        async for ev in real_run(self, *args, **kwargs):
+            yield ev
+
+    monkeypatch.setattr(AgentLoop, "run", flaky)
+    server.goal_judge = scripted_judge(["done"])
+    result = await ServerRunner(server).run_prompt("go", session_id=sid)
+
+    # The transient turn failed at the provider layer, but the goal parked: still active, never done, never failed.
+    assert result.status == "failed"
+    parked = _goal(server, sid).state
+    assert parked.status == "active" and parked.waiting_on_providers
+    assert _persisted_goal(tmp_path, sid).status == "active"  # the park survives a daemon restart
+
+    # Recovery: the next turn runs, the judge agrees, and only then the goal completes.
+    result = await ServerRunner(server).run_prompt("go", session_id=sid)
+    assert result.status == "completed"
+    done = _goal(server, sid).state
+    assert done.status == "done" and not done.waiting_on_providers
+    await server.close()
+
+
+async def test_retry_forever_never_completes_on_an_error_path(tmp_path, monkeypatch):
+    """Provider errors and judge transport failures never write status done, with or without retry_forever."""
+    from k3code import goals as goals_mod
+
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR, reliability=FOREVER)
+    sid = await new_session(server, repo)
+    mgr = _goal(server, sid)
+    mgr.set("never auto-complete me")
+
+    # Judge transport failures fail open forever instead of pausing after 5.
+    transport = _transport_failing_judge(fails=goals_mod.MAX_CONSECUTIVE_TRANSPORT_FAILURES + 2)
+    for _ in range(goals_mod.MAX_CONSECUTIVE_TRANSPORT_FAILURES + 2):
+        decision = await mgr.evaluate_after_turn("partial work", transport, retry_forever=True)
+        assert decision.status != "done" and decision.verdict == "continue"
+    assert mgr.state.status == "active"  # still running, not paused and certainly not done
+
+    # A provider outage mid-run parks the goal; done is unreachable from any error path.
+    async def down(self, *args, **kwargs):
+        raise AllProvidersUnreachable("down", attempts=3)
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(AgentLoop, "run", down)
+    result = await ServerRunner(server).run_prompt("go", session_id=sid)
+    assert result.status == "failed"
+    state = _goal(server, sid).state
+    assert state.status == "active" and state.waiting_on_providers
+    assert state.status != "done"
+    await server.close()
+
+
+async def test_retry_forever_waiting_goal_resumes_after_restart_without_spending_kick_budget(
+    tmp_path, monkeypatch
+):
+    """A goal parked on a transient error is active on disk: the next boot re-kicks it, free of kick budget."""
+    repo = git_repo(tmp_path / "repo")
+    first, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR, reliability=FOREVER)
+    sid = await new_session(first, repo)
+    mgr = _goal(first, sid)
+    mgr.set("survive the restart")
+    mgr.note_wait("all provider entries failed (last reason: server)")
+    await first.close()  # the daemon dies mid-park: the wait must persist as active
+    assert _persisted_goal(tmp_path, sid).status == "active"
+
+    second, provider = make_server(
+        tmp_path, monkeypatch, replies=["the feature is shipped"], autonomy=NO_ADVISOR, reliability=FOREVER
+    )
+    second.goal_judge = scripted_judge(["done"])
+    assert await second.resume_goals() == 1  # restart-storm safe mode stays intact: halted/storm boots kick 0
+    await asyncio.wait_for(second.live[sid].turn_task, 20)
+    assert _goal(second, sid).state.status == "done"
+    # The recovery re-kick consumed no kick budget: a parked goal can outwait any outage.
+    assert _goal(second, sid).recent_kicks(__import__("time").time()) == []
+    await second.close()

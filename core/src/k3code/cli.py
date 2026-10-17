@@ -6,12 +6,13 @@ import contextlib
 import json
 import logging
 import os
+import selectors
 import shlex
-import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
@@ -25,12 +26,8 @@ if TYPE_CHECKING:  # annotations only: the engine is imported inside the functio
 logging.basicConfig(level=os.environ.get("K3CODE_LOG_LEVEL", "WARNING").upper(), format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-
-def _load_system_prompt() -> str:
-    prompt_path = Path(__file__).parent / "prompts" / "system.md"
-    if prompt_path.is_file():
-        return prompt_path.read_text(encoding="utf-8")
-    return "You are a helpful coding assistant."
+#: the journal/transcript name of a headless run that was given no ``--session``
+HEADLESS_SESSION = "headless"
 
 
 def _resolve_model_specs(config: Any) -> list[str | list[str]]:
@@ -71,6 +68,17 @@ def _cooldown_path() -> Path:
     return _current_home() / "cooldowns.json"
 
 
+#: Reliability waits a ``-p`` or REPL run reports on stderr: the INFO log line was invisible at the default level, so
+#: a run that paused or parked looked hung (#108).
+_WAIT_NOTICES = {
+    "reliability.paused": "paused",
+    "reliability.parked": "parked",
+    "reliability.resumed": "resumed",
+    "reliability.unparked": "unparked",
+    "reliability.gave_up": "gave up",
+}
+
+
 def _print_event(event: RouterEvent) -> None:
     if event.kind == "router.attempt":
         logger.debug("Attempt %d: %s/%s", event.attempt, event.provider, event.model)
@@ -78,9 +86,32 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("Failover: %s/%s (reason: %s) — %s", event.provider, event.model, event.reason, event.detail)
     elif event.kind == "router.exhausted":
         logger.warning("Chain exhausted: %s", event.detail)
+    elif (word := _WAIT_NOTICES.get(event.kind)) is not None:
+        data = getattr(event, "data", None) or {}  # a ReliabilityEvent
+        line = f"[k3code] {word}: {event.detail}"
+        if event.kind == "reliability.parked" and "delay" in data:
+            line += f"; next try in {data['delay']:.0f}s"
+        elif event.kind == "reliability.gave_up":
+            line += " (--max-wait or reliability.max_wait sets the limit)"
+        sys.stderr.write(line + "\n")
     elif event.kind.startswith(("reliability.", "net.state")):
         # M2: reliability events surface as info lines.
         logger.info("%s %s", event.kind, event.detail)
+
+
+def _warn_unsandboxed(mode: str) -> None:
+    """An auto/yolo run whose bash has no sandbox here (bwrap unusable): said once on stderr, not only in the log."""
+    what = (
+        "yolo mode runs every command on this machine"
+        if mode == "yolo"
+        else "auto mode refuses each command it would have run in the sandbox (nobody can approve it here)"
+    )
+    sys.stderr.write(f"[k3code] no sandbox: bubblewrap is unusable here, so {what}; see k3code doctor\n")
+
+
+def _warn_home_started() -> None:
+    """A run whose cwd is $HOME: said once on stderr (see AgentLoop._tell_home_started)."""
+    sys.stderr.write("[k3code] k3code started in your home directory: start it inside a project for full auto mode\n")
 
 
 def _build_reliability(config: Any, session: str) -> Reliability:
@@ -89,6 +120,33 @@ def _build_reliability(config: Any, session: str) -> Reliability:
     from k3code.reliability import build_reliability
 
     return build_reliability(config, session=session, home=k3code_home())
+
+
+#: How long a ``-p`` run waits for a provider (paused offline, or parked with every provider down) before it gives up.
+HEADLESS_MAX_WAIT = 300.0
+
+
+def _headless_max_wait(flag: float | None, config: Any) -> float | None:
+    """The wait bound of a headless run: ``--max-wait``, else ``reliability.max_wait`` when the config sets the key,
+    else 5 minutes; 0 (or a null config value) waits for ever, the ``max_turns: 0`` idiom. Waiting for ever used to
+    be the only behaviour, so a cron job whose provider was down hung until something killed it (#108)."""
+    if flag is None:
+        raw = getattr(config, "reliability", None) or {}
+        flag = raw.get("max_wait", HEADLESS_MAX_WAIT)
+    if flag is None:
+        return None
+    return float(flag) or None
+
+
+def _gave_up_result(exc: Exception, event: dict[str, Any], cause: str) -> dict[str, Any]:
+    """The result of a run that waited its bound out; ``main`` exits 75 (EX_TEMPFAIL) on it, so a scheduler retries."""
+    waited = float(event.get("waited") or 0)
+    return {
+        "error": "gave_up",
+        "message": f"gave up after {waited:.0f}s waiting for a provider: {exc}",
+        "waited": waited,
+        "cause": cause,
+    }
 
 
 async def _reap_jobs(session: str) -> None:
@@ -106,48 +164,72 @@ async def _run_headless(
     permission_mode: PermissionMode,
     config: Any,
     json_output: bool,
-    session: str = "headless",
+    session: str | None = None,
     resume: bool = False,
     project_dir: Path | None = None,
+    max_wait: float | None = None,
 ) -> dict[str, Any] | None:
-    """Run headless mode and return final result dict."""
+    """Run headless mode and return final result dict.
+
+    ``session`` names the journal and transcript (default ``headless``, so ``--resume`` finds the last run). The run's
+    own id, which the prompt overlay's A/B arm and the usage rows use, is that name when given and otherwise unique:
+    all unnamed runs used to be one session, one pooled A/B sample.
+
+    ``max_wait`` is the ``--max-wait`` flag; see :func:`_headless_max_wait` for the default.
+    """
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
-    from k3code.prompting import build_system_prompt
+    from k3code.permissions.state import PermissionState
+    from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
+    from k3code.reliability.events import GAVE_UP
     from k3code.reliability.persistent_retry import TurnCancelled
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
 
     if model and (err := _use_model_key(config, model)):
         return {"error": "unknown_model", "message": err}
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    run_id = session or f"{HEADLESS_SESSION}-{uuid.uuid4().hex[:8]}"
+    session = session or HEADLESS_SESSION
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config, session_id=run_id)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
     cooldowns = CooldownStore(path=_cooldown_path())
-    usage = _HeadlessUsage(session)
+    usage = _HeadlessUsage(run_id)
     router = Router(chain, cooldowns=cooldowns, on_event=usage.on_router_event, **router_options(config))
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
     reliability = _build_reliability(config, session=session)
     reliability.register_providers(chain)
+    # the retry wrapper is built from retry_config when AgentLoop attaches the router: bound the wait before that
+    raw_rel = getattr(config, "reliability", None) or {}
+    if raw_rel.get("retry_forever"):
+        reliability.retry_config.retry_forever = True
+        reliability.retry_config.max_wait = None  # forever ignores --max-wait
+    else:
+        reliability.retry_config.max_wait = _headless_max_wait(max_wait, config)
+    gave_up: dict[str, Any] = {}
+    reliability.events.add(lambda ev: gave_up.update(ev.data) if ev.kind == GAVE_UP else None)
 
     loop = AgentLoop(
         router,
         system_prompt=system_prompt,
         max_turns=config.max_turns,
-        permission_mode=permission_mode.value,
+        # the config of the project the run applies (--config-dir) is the one its rules come from
+        permissions=PermissionState(mode=permission_mode, cwd=Path.cwd(), project_dir=project_dir),
         headless=True,
         on_event=_print_event,
         cwd=Path.cwd(),
         reliability=reliability,
         session=session,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
+    loop.on_home_started = _warn_home_started
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
@@ -201,8 +283,12 @@ async def _run_headless(
             }
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
+        if gave_up:
+            return _gave_up_result(e, gave_up, "all_providers_unreachable")
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
     except ChainExhausted as e:
+        if gave_up:
+            return _gave_up_result(e, gave_up, "chain_exhausted")
         return {"error": "chain_exhausted", "message": str(e), "last_reason": e.last_reason}
     except ContextOverflow as e:
         return {"error": "context_overflow", "message": str(e)}
@@ -245,6 +331,57 @@ def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
     name = parts[0][1:]
     cmd = build_registry().get(name) if name and not name.startswith("/") else None
     return (cmd, name, parts[1] if len(parts) > 1 else "") if cmd is not None else None
+
+
+#: How long ``-p TEXT`` waits for anything on a piped stdin (data or end of file) before it goes on without it.
+_STDIN_WAIT_SECONDS = 3.0
+
+
+def _read_stdin(wait: float | None) -> str:
+    """All the text on stdin. With ``wait``, "" when nothing at all arrives within that many seconds.
+
+    A scheduler or harness that leaves stdin open and idle must not hang ``k3code -p TEXT``; ``-p -`` asked for stdin,
+    so it passes ``wait=None`` and waits for the end of the input.
+    """
+    stream = sys.stdin
+    if stream is None:  # fd 0 was closed
+        return ""
+    if wait is not None:
+        try:
+            # epoll where there is one: select() fails on a descriptor >= FD_SETSIZE (1024), which must not turn into a
+            # blocking read of an idle pipe
+            with selectors.DefaultSelector() as sel:
+                sel.register(stream, selectors.EVENT_READ)
+                ready = bool(sel.select(wait))
+        except (AttributeError, OSError, ValueError, TypeError):
+            # no descriptor to poll (an in-memory stream) or one epoll refuses (a regular file): neither can block
+            ready = True
+        if not ready:
+            click.echo(
+                f"k3code: no input arrived on stdin within {wait:g} s, going on without it "
+                "(`< /dev/null` skips the wait)",
+                err=True,
+            )
+            return ""
+    try:
+        return stream.read()
+    except UnicodeDecodeError:
+        raise click.ClickException("stdin is not UTF-8 text") from None
+
+
+def _headless_prompt(prompt: str | None) -> str | None:
+    """The prompt a headless run sends: ``-p -`` is read from stdin, and a piped stdin follows a ``-p TEXT`` prompt.
+
+    ``echo text | k3code -p summarize`` sends "summarize", a blank line and the text. A terminal is never read for
+    ``-p TEXT``, and neither is stdin for a slash command (``-p /stats``), which involves no model.
+    """
+    if prompt == "-":
+        if not (text := _read_stdin(wait=None)).strip():
+            raise click.UsageError("-p -: no prompt on stdin")
+        return text.rstrip()
+    if not prompt or sys.stdin is None or sys.stdin.isatty() or _headless_slash(prompt) is not None:
+        return prompt
+    return f"{prompt}\n\n{text}" if (text := _read_stdin(wait=_STDIN_WAIT_SECONDS).rstrip()) else prompt
 
 
 class _LightCommandContext:
@@ -386,7 +523,8 @@ async def _run_repl(
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
-    from k3code.prompting import build_system_prompt
+    from k3code.permissions.state import PermissionState
+    from k3code.prompting import base_prompt, build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
     from k3code.reliability.persistent_retry import TurnCancelled
@@ -396,7 +534,7 @@ async def _run_repl(
     if model and (err := _use_model_key(config, model)):
         print(f"[Error] {err}; using {config.default_model}")
         model = None
-    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
+    system_prompt = build_system_prompt(base_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -420,12 +558,15 @@ async def _run_repl(
         router,
         system_prompt=system_prompt,
         max_turns=config.max_turns,
-        permission_mode=permission_mode.value,
+        # the config of the project the run applies (--config-dir) is the one its rules come from
+        permissions=PermissionState(mode=permission_mode, cwd=Path.cwd(), project_dir=project_dir),
         headless=False,
         on_event=_print_event,
         cwd=Path.cwd(),
         reliability=reliability,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
+    loop.on_home_started = _warn_home_started
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
@@ -526,12 +667,14 @@ async def _run_repl(
 
 #: ``--permission`` values. ``auto`` is what an unattended ``-p`` run needs: it allows what would only ask (bash
 #: included, run in the sandbox), while the hardline list and deny rules still refuse, exactly as in an interactive
-#: auto session; ``ask`` and ``auto-edit`` deny every shell command that would ask, since nobody can answer.
-PERMISSION_CHOICES = ["ask", "auto-edit", "auto", "yolo"]
+#: auto session; ``default`` and ``accept-edits`` deny every shell command that would ask, since nobody can answer.
+#: Every name ``permission_mode`` accepts: the modes as the TUI shows them, then the older names ``ask``/``auto-edit``.
+PERMISSION_CHOICES = ["default", "accept-edits", "plan", "auto", "yolo", "ask", "auto-edit"]
 PERMISSION_HELP = (
-    "Permission mode: ask, auto-edit, auto (runs what is not denied, bash in the sandbox; the hardline list and deny "
-    "rules still refuse; the mode for unattended -p runs) or yolo. Default: permission_mode from the config (ask), "
-    "or headless_permission for -p"
+    "Permission mode: default, accept-edits, plan (read-only), auto (runs what is not denied, bash in the sandbox; "
+    "the hardline list and deny rules still refuse; the mode for unattended -p runs) or yolo; ask and auto-edit are "
+    "older names for default and accept-edits. Default: permission_mode from the config, or headless_permission "
+    "for -p"
 )
 
 
@@ -546,7 +689,12 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
 
 
 @click.command()
-@click.option("-p", "--prompt", "prompt", help="Headless prompt; omit for REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    "prompt",
+    help="Headless prompt; omit for REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
@@ -555,8 +703,16 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
     help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
-@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--session", "session", default=None, help="Session id (journal + transcript name; default: headless)")
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
+@click.option(
+    "--max-wait",
+    "max_wait",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Headless: seconds to wait for a provider (offline, or every provider down) before giving up with exit "
+    "code 75; 0 waits for ever. Default: reliability.max_wait from the config, else 300",
+)
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
 @click.option(
@@ -570,8 +726,9 @@ def main(
     model: str | None,
     permission: str | None,
     json_output: bool,
-    session: str,
+    session: str | None,
     resume: bool,
+    max_wait: float | None,
     config_dir: Path | None,
     repl: bool,
     stdio_flag: bool,
@@ -581,6 +738,7 @@ def main(
     Examples:
       k3code -p "create hello.py" --permission auto
       k3code -p "fix the bug" --json
+      git diff | k3code -p "review this"
       k3code  # starts the TUI (or the REPL with --repl / non-tty)
     """
     if stdio_flag:
@@ -594,6 +752,7 @@ def main(
     from k3code.config import load_config
     from k3code.permissions import PermissionMode
 
+    prompt = _headless_prompt(prompt)
     # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
     # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
     project_dir = config_dir or Path.cwd()
@@ -638,6 +797,7 @@ def main(
                 session=session,
                 resume=resume,
                 project_dir=project_dir,
+                max_wait=max_wait,
             )
         )
         if json_output and result:
@@ -647,7 +807,9 @@ def main(
                 sys.stdout.write("\n")  # the streamed answer: end it so the shell prompt starts on its own line
             if "error" in result:
                 click.echo(f"k3code: error: {result.get('message') or result['error']}", err=True)
-        sys.exit(0 if result and "error" not in result else 1)
+        if result and "error" not in result:
+            sys.exit(0)
+        sys.exit(75 if result and result.get("error") == "gave_up" else 1)  # EX_TEMPFAIL: a scheduler tries again
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config, project_dir=project_dir))
@@ -677,16 +839,23 @@ def _offer_project_trust(project_dir: Path) -> None:
     trust.record(project_dir, trusted=answer)
 
 
-def _run_gateway() -> None:
-    """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
-    import asyncio
-
+def _configure_service_logging() -> None:
+    """The gateway and the daemon log at INFO on stderr. httpx logs one INFO line per request, and an idle daemon
+    makes one per probe (#109): its logger stays at WARNING, as ``k3code doctor`` keeps it."""
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,  # the import-time basicConfig above already installed a handler
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _run_gateway() -> None:
+    """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
+    import asyncio
+
+    _configure_service_logging()
     from k3code.gateway.server import GatewayServer
 
     async def _serve() -> None:
@@ -698,6 +867,57 @@ def _run_gateway() -> None:
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_serve())
+
+
+# The TUI's own reset (tui/src/lib/terminalModes.ts TERMINAL_MODE_RESET, kept equal by a test), minus the default
+# colours it only restores when it painted them: mouse and locator reporting, focus events, bracketed paste, the
+# alternate screen, the kitty keyboard and modifyOtherKeys modes, attributes, and last the cursor.
+_TERMINAL_RESET = (
+    "\x1b[0'z\x1b[0'{"
+    "\x1b[?2029l\x1b[?1016l\x1b[?1015l\x1b[?1006l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+    "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[<u\x1b[>4m\x1b[0m\x1b[?25h"
+)
+
+
+#: The process the launcher becomes once the TUI is found (#164). The launcher has imported most of the gateway by
+#: then, and waiting for the TUI kept that Python process resident (about 47 MB) for the whole session. This ``sh``
+#: waiter runs the TUI (``"$@"``), puts the terminal back when the TUI did not exit cleanly (an OOM kill, a crash: the
+#: shell would otherwise stay in the alternate screen with mouse tracking and bracketed paste on and the cursor hidden,
+#: #153) when stdout is a terminal, and exits with the TUI's status (a signal death as 128 + signo, as a shell reports
+#: it). ``$1`` is the reset. The no-op INT/QUIT trap keeps the waiter alive through a Ctrl+C that reaches the whole
+#: process group before the TUI has its terminal in raw mode; the TUI itself gets those signals as usual.
+_TUI_WAITER = (
+    'trap : INT QUIT; reset=$1; shift; "$@"; rc=$?; '
+    'if [ "$rc" -ne 0 ] && [ -t 1 ]; then printf "%s" "$reset" 2>/dev/null; fi; exit "$rc"'
+)
+
+
+#: The shell the waiter runs in, by absolute path (see :func:`_waiter_shell`).
+_WAITER_SH = "/bin/sh"
+
+
+def _waiter_shell(path: str | None) -> str:
+    """The ``sh`` for the TUI's waiter: :data:`_WAITER_SH`, or where it does not exist the first ``sh`` in an absolute
+    entry of ``path`` (the PATH). Never one found through a relative entry: an empty entry or ``.`` in PATH is the
+    current directory, the project, whose ``./sh`` would then run with the TUI's environment and as its parent."""
+    if os.path.isfile(_WAITER_SH) and os.access(_WAITER_SH, os.X_OK):
+        return _WAITER_SH
+    import shutil
+
+    for entry in (path if path is not None else os.defpath).split(os.pathsep):
+        if os.path.isabs(entry) and (found := shutil.which("sh", path=entry)):
+            return found
+    return _WAITER_SH  # nothing better: execve then fails as it would have
+
+
+def _exec_tui(argv: list[str], env: dict[str, str]) -> NoReturn:
+    """Replace this process with the TUI's waiter (:data:`_TUI_WAITER`) running ``argv``."""
+    sh = _waiter_shell(env.get("PATH"))
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(OSError, ValueError):
+            stream.flush()
+    logging.shutdown()  # exec runs no atexit handlers: flush the log file now
+    os.execve(sh, [sh, "-c", _TUI_WAITER, "k3code", _TERMINAL_RESET, *argv], env)
 
 
 def _launch_tui(
@@ -714,16 +934,17 @@ def _launch_tui(
     project config the user was asked to trust) reach the spawned gateway through K3CODE_PERMISSION_MODE and
     K3CODE_PROJECT_DIR.
     """
-    from k3code.paths import find_node
+    from k3code.paths import find_node, node_problem
 
     node = find_node()
     repo_root = _find_repo_root()
     entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
     if node is None or entry is None or not entry.is_file():
+        why = node_problem() if node is None else "need tui/dist/entry.js"
         if require:
-            click.echo("The TUI is not available (need node + tui/dist/entry.js).", err=True)
+            click.echo(f"The TUI is not available ({why}).", err=True)
             sys.exit(1)
-        logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
+        logger.warning("TUI not available (%s); falling back to REPL", why)
         import asyncio
 
         from k3code.config import load_config
@@ -753,8 +974,7 @@ def _launch_tui(
     if project_dir is not None:
         env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
-    result = subprocess.run([node, str(entry)], env=env, check=False)
-    sys.exit(result.returncode)
+    _exec_tui([node, str(entry)], env)
 
 
 def _find_repo_root() -> Path | None:
@@ -787,7 +1007,11 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
     help="Show the version and exit.",
 )
 @click.pass_context
-@click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
+@click.option(
+    "-p",
+    "--prompt",
+    help="Headless prompt; omit for TUI/REPL. '-' reads it from stdin; piped stdin text is added after it",
+)
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
@@ -796,22 +1020,37 @@ def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> 
     help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
-@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--session", "session", default=None, help="Session id (journal + transcript name; default: headless)")
 @click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
+@click.option(
+    "--max-wait",
+    "max_wait",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Headless: seconds to wait for a provider (offline, or every provider down) before giving up with exit "
+    "code 75; 0 waits for ever. Default: reliability.max_wait from the config, else 300",
+)
 def cli(
     ctx: click.Context,
     prompt: str | None,
     model: str | None,
     permission: str | None,
     json_output: bool,
-    session: str,
+    session: str | None,
     resume: bool,
     config_dir: Path | None,
     repl: bool,
+    max_wait: float | None,
 ) -> None:
     """k3code — terminal coding agent."""
+    from k3code.paths import tighten_home
+
+    # Every entry point passes here (the systemd unit runs `k3code daemon`): a $K3CODE_HOME that an older version made
+    # 0755 under the usual umask is made 0700 once, before anything reads or writes in it (issue #163).
+    if tighten_home():
+        logger.info("made %s owner-only (0700)", os.environ.get("K3CODE_HOME") or "~/.k3code")
     if ctx.invoked_subcommand is None:
         if prompt is None and _is_interactive():
             from k3code.setup.onboard import first_run
@@ -830,10 +1069,45 @@ def cli(
             json_output=json_output,
             session=session,
             resume=resume,
+            max_wait=max_wait,
             config_dir=config_dir,
             repl=repl,
             stdio_flag=False,
         )
+
+
+@cli.group("prompt")
+def prompt_group() -> None:
+    """Inspect the system prompt k3code sends."""
+
+
+@prompt_group.command("dump")
+@click.option("--mode", default="interactive", show_default=True, help="interactive|headless|plan|subagent:<type>")
+@click.option("--sections", "sections_only", is_flag=True, help="Print the per-section size table instead of the text")
+@click.option("--tools", "with_tools", is_flag=True, help="Also print the tool schemas and count them in the table")
+@click.option("--hash", "hash_only", is_flag=True, help="Print only the SHA-256 of the prompt")
+@click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
+def prompt_dump(mode: str, sections_only: bool, with_tools: bool, hash_only: bool, config_dir: Path | None) -> None:
+    """Print the assembled system prompt of a mode, as this project would start it (MCP tool names excluded)."""
+    from k3code.config import load_config
+    from k3code.prompting import assemble_mode, prompt_hash, section_table, tool_schemas_json
+
+    project_dir = config_dir or Path.cwd()
+    try:
+        text, sections = assemble_mode(mode, cwd=project_dir, config=load_config(project_dir=project_dir))
+    except ValueError as e:
+        raise click.UsageError(str(e)) from None
+    tools = tool_schemas_json() if with_tools else ""
+    if hash_only:
+        click.echo(prompt_hash(text))
+        return
+    if sections_only:
+        click.echo(section_table(sections, tools))
+        click.echo(f"sha256 {prompt_hash(text)}")
+        return
+    click.echo(text, nl=False)
+    if tools:
+        click.echo(f"\n--- tool schemas ---\n{tools}")
 
 
 @cli.command("gateway")
@@ -910,12 +1184,7 @@ def daemon_cmd() -> None:
 
     from k3code.daemon import DaemonAlreadyRunning, run_daemon
 
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        force=True,  # the import-time basicConfig above already installed a handler
-    )
+    _configure_service_logging()
     try:
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(run_daemon())
@@ -953,6 +1222,18 @@ def service_status() -> None:
     from k3code import service
 
     click.echo("\n".join(service.status()))
+
+
+@service_group.command("restart")
+def service_restart() -> None:
+    """Restart the daemon unit. Also clears the start limit a crash loop hit."""
+    from k3code import service
+
+    try:
+        service.restart()
+    except service.ServiceError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"restarted {service.UNIT_NAME}")
 
 
 @cli.command("doctor")
@@ -1077,6 +1358,16 @@ def _confirm_item(item: Any) -> bool:
     return click.confirm(f"Apply {item.key}?", default=False)
 
 
+def _answers_prompter(path: Path) -> Any:
+    """The prompter for an answers file; a file that is not valid is a usage error naming it, not a traceback."""
+    from k3code.setup.prompter import AnswerPrompter, AnswersError
+
+    try:
+        return AnswerPrompter.from_file(path)
+    except AnswersError as e:
+        raise click.UsageError(f"{path}: {e}") from None
+
+
 @cli.command("setup")
 @click.option("--step", "step", help="Re-run a single step (welcome, about, system, usage, providers, tiers, ...)")
 @click.option("--non-interactive", is_flag=True, help="Take every answer from --answers")
@@ -1085,17 +1376,21 @@ def _confirm_item(item: Any) -> bool:
 @click.option("--no-probe", is_flag=True, help="Skip live provider/integration tests")
 def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, restart: bool, no_probe: bool) -> None:
     """Guided, resumable first-run setup."""
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter
     from k3code.setup.wizard import run_setup
 
     if non_interactive:
         if answers is None:
             raise click.UsageError("--non-interactive needs --answers FILE")
-        p: Any = AnswerPrompter.from_file(answers)
+        p: Any = _answers_prompter(answers)
+    elif answers is None and not _is_interactive():
+        raise click.UsageError("`k3code setup` needs a terminal; pass --answers FILE to run it without prompts")
     else:
-        p = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+        p = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_setup(p, only_step=step, restart=restart, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
@@ -1111,18 +1406,29 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
 def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
     """Guided first-run setup: fast (API endpoint + key) or full. Run it any time."""
     from k3code.setup.onboard import run_onboarding
-    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter, Prompter
+    from k3code.setup.prompter import AnswersError, InteractivePrompter, Prompter
 
     if answers is None and not _is_interactive():
         raise click.UsageError("`k3code onboard` needs a terminal; pass --answers FILE to run it without prompts")
-    p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    p: Prompter = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
         run_onboarding(p, do_probe=not no_probe)
+    except AnswersError as e:
+        raise click.UsageError(f"{answers}: {e}") from None
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
         click.echo("\nInterrupted. Run `k3code onboard` again to finish.")
         raise SystemExit(130) from None
+
+
+def _unusable_source(src: Path) -> str:
+    """Why the recorded source checkout cannot be updated from: the path, and what is wrong with it."""
+    why = "does not exist (moved or deleted?)" if not src.exists() else "is not a git checkout (it has no .git)"
+    return (
+        f"this install is built from {src}, which {why}. Put the checkout back there, or set update.source in "
+        "config.yaml to where it is now"
+    )
 
 
 @cli.command("update")
@@ -1162,16 +1468,16 @@ def update_cmd(
         raise SystemExit(0 if res.ok else 1)
     cfg = upd.update_settings()
     cur = upd.current_version()
+    daemon_behind = upd.stale_daemon_build()
+    block = upd.current_lines(cur, daemon_behind, "daemon:  ")  # `current:`, and the daemon's build if it is behind
     rel = None
     git_ref = None
     if not from_source:
         denied = ""
         try:
             rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token(), cfg["api"])
-        except PermissionError as e:
+        except Exception as e:  # noqa: BLE001  # any API failure: the checkout or the git ref below still works
             denied = str(e)
-        except Exception as e:  # noqa: BLE001
-            raise click.ClickException(str(e)) from e
         if rel is None:
             src = upd.source_checkout()
             if src is not None and (src / ".git").exists():
@@ -1184,12 +1490,14 @@ def update_cmd(
                     f"{denied or 'No release has been published yet'}.\n"
                     f"This install was made from git ({git_ref} of {cfg['url']}): checking it."
                 )
+            elif src is not None:  # recorded, but gone: say where it was expected, not only why no release came
+                raise click.ClickException(f"{_unusable_source(src)}{f' ({denied})' if denied else ''}")
             else:
                 raise click.ClickException(
                     denied
                     or "no releases found on this channel, and this install keeps no checkout or git ref to update "
-                    "from. Reinstall with `sh install.sh --from-git` (it can update itself from then on), or set "
-                    "update.source in config.yaml to a k3code checkout"
+                    f"from. Reinstall with {upd.installer_command('--from-git')} (it can update itself from then on), "
+                    "or set update.source in config.yaml to a k3code checkout"
                 )
     if git_ref is not None:
         try:
@@ -1198,16 +1506,16 @@ def update_cmd(
             raise click.ClickException(str(e)) from e
         if upd.is_commit_sha(git_ref):
             click.echo(
-                f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
-                f"Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
+                f"{block}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
+                f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
             )
             return
-        click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
+        click.echo(f"{block}\nlatest:  {head[:7]} ({git_ref})")
         if check:
             return
         have = upd.installed_sha()
         if have and head.startswith(have):
-            click.echo("Already up to date.")
+            click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
@@ -1222,9 +1530,11 @@ def update_cmd(
             )
     elif from_source:
         src = upd.source_checkout()
-        if src is None or not (src / ".git").exists():
+        if src is None:
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
-        click.echo(f"current: {cur}\nsource: {src}")
+        if not (src / ".git").exists():
+            raise click.ClickException(_unusable_source(src))
+        click.echo(f"{block}\nsource: {src}")
         if check:
             return
         if not yes:
@@ -1234,14 +1544,14 @@ def update_cmd(
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
         if ver == cur:  # the checkout builds the version that is already active
-            click.echo(f"Already up to date ({ver}).")
+            click.echo(upd.up_to_date(daemon_behind, f"Already up to date ({ver})."))
             return
     else:
         assert rel is not None
-        click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
+        click.echo(f"{block}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
         if check or not upd.is_newer(rel.version, cur):
             if not check:
-                click.echo("Already up to date.")
+                click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
@@ -1249,12 +1559,20 @@ def update_cmd(
             upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
         except upd.IntegrityError as e:
             raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
-        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+        except upd.ReleaseBuildError as e:
+            raise click.ClickException(f"update failed: {e}\nNothing was activated.") from e
+        except (OSError, ValueError, httpx.HTTPError) as e:
             raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
+    try:
+        warnings = upd.vet_staged(ver)  # refuses a version that lost the TUI; nothing is switched or pruned then
+    except upd.SourceUpdateError as e:
+        raise click.ClickException(str(e)) from e
     res = upd.activate(ver)
     click.echo(res.message)
     if res.ok:
+        for line in warnings:
+            click.echo(line)
         upd.prune()
     raise SystemExit(0 if res.ok else 1)
 
@@ -1305,15 +1623,16 @@ def config_edit_cmd(project: bool) -> None:
 @click.argument("action", type=click.Choice(["edit", "list"]), default="list")
 @click.option("--user", is_flag=True, help="User memory instead of project memory")
 def memory_cmd(action: str, user: bool) -> None:
-    """List memory files, or open one in $EDITOR."""
+    """List the memory files the prompt reads here (the same listing as /memory), or open one in $EDITOR."""
     from k3code.commands.config_cmd import open_editor
+    from k3code.commands.memory_cmd import memory_listing
+    from k3code.config import load_config
     from k3code.memory import project_memory_path, user_memory_path
 
     target = user_memory_path() if user else project_memory_path(Path.cwd())
     if action == "edit":
         raise SystemExit(open_editor(target))
-    for scope, p in (("user", user_memory_path()), ("project", project_memory_path(Path.cwd()))):
-        click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
+    click.echo(memory_listing(Path.cwd(), load_config(project_dir=Path.cwd()))[0])
 
 
 # ── schedule (cron jobs) ──────────────────────────────────────────────

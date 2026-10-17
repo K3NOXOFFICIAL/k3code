@@ -8,15 +8,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import home, user_config_path
+from k3code.paths import ensure_private_dir, home, user_config_path
+from k3code.redact import scrub_text
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
-from k3code.setup.state import env_file_path, read_env_file
-from k3code.setup.steps import Ctx, _entry_from, offer_project_recipes, write_config
+from k3code.setup.state import env_file_path, read_env_file, set_env_var
+from k3code.setup.steps import (
+    Ctx,
+    _entry_from,
+    key_env_at,
+    key_env_for,
+    offer_project_recipes,
+    project_scan_skip_reason,
+    unique_name,
+    write_config,
+)
 from k3code.setup.wizard import run_setup
 
 QUESTION = "Fast setup (API endpoint + key) or full setup?"
@@ -39,7 +50,7 @@ def question_answered() -> bool:
 
 def record_answer(answer: str) -> None:
     path = marker_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
     path.write_text(json.dumps({"answer": answer}) + "\n", encoding="utf-8")
 
 
@@ -63,11 +74,15 @@ TIER_MODELS: dict[str, dict[str, str]] = {
     },
     "claude-cli": {"main": CLAUDE_CLI_MODEL, "strong": "opus", "cheap": "haiku", "fast": "haiku"},
 }
-MAX_MODEL_CHOICES = 15
+MAX_KEY_TRIES = 3  # keys asked for before a rejected one has to be saved anyway or given up on (#147)
+# `NAME=` counts only with a value after it: "ABCD1234=" and "ABCDEFGH==" are keys (all capitals, padded), not a NAME.
+_PASTED = re.compile(r"^(?:(?i:export)\s+)?(?:[A-Z_][A-Z0-9_]*=(?=[^=\s])|(?i:bearer)\s+)")
 
 
-def detect_providers() -> dict[str, str]:
-    """What is already usable here: provider -> why (a key in the environment, the claude command, Ollama)."""
+def detect_providers(*, do_probe: bool = True) -> dict[str, str]:
+    """What is already usable here: provider -> why (a key in the environment, a Claude Code login, Ollama).
+
+    The claude command alone is not a login: with ``do_probe``, a Claude Code that says it is logged out is left out."""
     found: dict[str, str] = {}
     env_file = read_env_file()
     for name in ("anthropic", "openai", "openrouter"):
@@ -75,11 +90,20 @@ def detect_providers() -> dict[str, str]:
         if os.environ.get(var) or env_file.get(var):
             found[name] = f"{var} is set"
     if shutil.which("claude"):
-        found["claude-cli"] = "the claude command is installed"
+        logged_in = _claude_login() if do_probe else None
+        if logged_in is not False:
+            found["claude-cli"] = "Claude Code is logged in" if logged_in else "the claude command is installed"
     ok, _ms, _detail = probe.probe_url(probe.PRESETS["local"]["base_url"].rsplit("/v1", 1)[0], timeout=0.4)
     if ok:
         found["local"] = "Ollama is running"
     return found
+
+
+def _claude_login() -> bool | None:
+    """Whether Claude Code is logged in (None = cannot tell); see ``claude_cli.login_status``."""
+    from k3code.providers import claude_cli
+
+    return claude_cli.login_status()
 
 
 def _default_provider(found: dict[str, str]) -> str:
@@ -96,15 +120,102 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
         return p.text("onboard.model", "Model id for everyday work (blank = set it later)", "").strip()
     if not p.interactive:
         return str(p.raw("onboard.model", ids[0]))
-    shown = ids[:MAX_MODEL_CHOICES]
-    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", [*shown, "(type one)"])
+    shown = ids[: probe.MAX_MODEL_CHOICES]
+    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", ["(type one)", *shown], ids[0])
     if pick == "(type one)":
         return p.text("onboard.model.custom", "Model id", "").strip()
     return pick
 
 
-def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any], str]:
-    """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown)."""
+def _custom_names(base: str, before: list[Any]) -> tuple[str, str]:
+    """Name and key variable for a custom endpoint, never those of another endpoint already configured (#114, #120).
+
+    The entry being replaced (same endpoint) passes its variable on, the same rule as the wizard (key_env_at)."""
+    others = [e for e in before if isinstance(e, dict) and str(e.get("base_url") or "").rstrip("/") != base]
+    name = unique_name("endpoint", {str(e.get("name")) for e in others})
+    return name, key_env_at(base, name, before)
+
+
+def clean_key(raw: str) -> str:
+    """The key itself from what was pasted: without quotes, whitespace, `NAME=` / `export NAME=` or `Bearer `."""
+    key = raw.strip().strip("\"'").strip()
+    return _PASTED.sub("", key, count=1).strip().strip("\"'").strip()
+
+
+def _describe(key: str) -> str:
+    """The length of a key and, when it is long enough to hide the rest, its last four characters: to spot a typo."""
+    return f"{len(key)} characters" + (f", ends in {key[-4:]}" if len(key) >= 16 else "")
+
+
+def _check_key(p: Prompter, entry: dict[str, Any], key: str, existing: str) -> tuple[str, list[str]]:
+    """List the endpoint's models with the key before the key is stored. Returns (key to store, model ids).
+
+    A key the endpoint rejects is not stored. Unattended that is an error (`--no-probe` skips the check); interactively
+    the key is asked for again, up to MAX_KEY_TRIES keys in all, then it can be saved anyway or given up on. Another
+    failure (offline, wrong URL, a redirect) is reported and the key kept; interactively it can be retried first.
+    No key at all is not a rejected one: the key may be supplied later (#147)."""
+    env_name, base, tries = entry["api_key_env"], scrub_text(entry["base_url"]), 1
+    while True:
+        sent = key or existing
+        ok, _ms, ids, detail = probe.list_models(entry, sent)
+        if ok:
+            return key, ids
+        kind, hint = probe.explain(detail)
+        if kind == "auth" and not sent:
+            hint = "the endpoint wants a key"
+        if kind == "auth" and sent:
+            if not p.interactive:
+                raise ValueError(
+                    f"{env_name} was rejected by {base} ({detail}); nothing was written. "
+                    "Fix the key, or pass --no-probe to skip this check."
+                )
+            who = f"The key you entered ({_describe(key)})" if key else f"The {env_name} that is already set"
+            p.say(f"  {who} was rejected by {base} ({detail}).")
+            if tries < MAX_KEY_TRIES:
+                tries += 1
+                typed = clean_key(
+                    p.text("onboard.retry_key", "API key again (hidden; blank = stop asking)", "", secret=True)
+                )
+                if typed:
+                    key = typed
+                    continue
+            options = ["save anyway", "cancel"]
+        else:
+            p.say(f"  could not list models ({detail}): {hint}")
+            if not p.interactive or kind == "auth":
+                return key, []
+            options = ["retry", "save anyway", "cancel"]
+        answer = p.select(
+            "onboard.probe_failed",
+            "The key could not be checked. What now?",
+            options,
+            options[0] if "retry" in options else "cancel",
+        )
+        if answer == "cancel":
+            p.say("  Nothing was written.")
+            raise KeyboardInterrupt
+        if answer == "save anyway":
+            return key, []
+
+
+def _keep_env_key(p: Prompter, env_name: str, value: str) -> None:
+    """A key that exists only in this shell's environment: the daemon's unit and the Windows `wsl sh -lc` commands
+    never see it, so offer it to the 0600 env file (default yes) or say plainly that they will not."""
+    where = env_file_path()
+    if p.confirm("onboard.save_env_key", f"Copy {env_name} into {where} (0600) so the daemon sees it too?", True):
+        set_env_var(env_name, value)
+        p.say(f"  stored {env_name} in {where} (0600)")
+    else:
+        p.say(
+            f"  NOTE: {env_name} stays in this shell only; the daemon and the Windows commands will not see it."
+            f" Add it to {where} to change that."
+        )
+
+
+def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> tuple[dict[str, Any], str]:
+    """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown).
+
+    ``before`` is the provider chain in the config now."""
     if name == "api":
         base = ""
         while not base:
@@ -117,40 +228,57 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
         preset = name
         base = probe.PRESETS[name]["base_url"]
     known = probe.PRESETS.get(preset, {})
-    spec: dict[str, Any] = {
-        "preset": preset,
-        "name": preset if preset != "custom" else "endpoint",
-        "base_url": base,
-        "kind": known.get("kind", "openai"),
-        "api_key_env": known.get("api_key_env", "K3CODE_API_KEY"),
-    }
+    spec: dict[str, Any] = {"preset": preset, "base_url": base, "kind": known.get("kind", "openai")}
+    if preset == "custom":
+        spec["name"], spec["api_key_env"] = _custom_names(base, before)
+    else:
+        spec["name"], spec["api_key_env"] = preset, known["api_key_env"]
     env_name = spec["api_key_env"]
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
-    key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
-    if existing and not key:
-        p.say(f"  using {env_name} from your environment")
+    in_file = bool(read_env_file().get(env_name))  # the daemon reads the file, so it wins the message when both exist
+    where = f"the env file {env_file_path()}" if in_file else "your environment"
+    key = clean_key(str(p.raw("onboard.key", "") or "")) if not p.interactive else ""
+    question = f"Keep the {env_name} key from {where}?"
+    shared = env_name == "K3CODE_API_KEY"  # every endpoint used to share it, so its key may be another vendor's (#114)
+    if shared:
+        question += " (the old shared variable: it may hold another endpoint's key)"
+    kept = bool(existing and not key and p.confirm("onboard.keep_key", question, not shared))
+    if kept:
+        p.say(f"  using {env_name} from {where}")
+        if not in_file:
+            _keep_env_key(p, env_name, existing)  # only this shell has it: the daemon would not see it (#237)
     elif preset != "local" and not key:
         key = p.text(
             "onboard.key",
             f"API key (hidden; stored 0600 in {env_file_path()}; blank = set {env_name} yourself)",
             "",
             secret=True,
-        ).strip()
-    if key:
-        spec["api_key"] = key
+        )
+        key = clean_key(key)
+    # Declined and nothing typed: the key in that variable is not this endpoint's, so it is not used for it.
+    declined = bool(existing) and not kept and not key
+    if declined:
+        existing = ""
+        if preset == "custom":  # a variable of its own; a vendor preset's variable is fixed and keeps its key
+            taken = {str(e.get("api_key_env") or "") for e in before if isinstance(e, dict)}
+            spec["api_key_env"] = env_name = key_env_for(spec["name"], taken | set(os.environ) | set(read_env_file()))
+    # The key is not in spec yet: it is stored once the endpoint has accepted it (or could not say).
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
     if entry is None:  # only the interactive branch of _entry_from returns None
         raise ValueError("no provider entry was built")
-    if not key and not existing and preset != "local":
+    if preset == "local" and not key and not existing:
+        entry["api_key_env"] = ""  # Ollama takes no key: an empty name declares the entry keyless (#107)
+    if declined and preset != "custom":
+        p.say(f"  NOTE: the {env_name} key is still stored; replace it in {env_file_path()} or export a new one.")
+    elif not key and not existing and preset != "local":
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 
     ids: list[str] = []
+    if do_probe and not declined:  # a declined key is not this endpoint's: nothing to check, and none is sent
+        key, ids = _check_key(p, entry, key, existing)
+    if key:
+        _entry_from(Ctx(p=p, data={}), 0, "primary", {**spec, "api_key": key})  # the same entry, now storing the key
     answered = p.raw("onboard.model", None) if not p.interactive else None
-    if do_probe and not answered:
-        ok, _ms, ids, detail = probe.list_models(entry, key or existing or os.environ.get(env_name, ""))
-        if not ok:
-            p.say(f"  could not list models ({detail}); check the key and URL with `k3code doctor`")
-            ids = []
     model = str(answered).strip() if answered else _pick_model(p, preset, ids)
     if model:
         p.say(f"  model: {model}")
@@ -159,7 +287,7 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
 
 def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     """Fast setup: one provider with defaults for everything else. Picks what is already set up here first."""
-    found = detect_providers() if p.interactive else {}
+    found = detect_providers(do_probe=do_probe) if p.interactive else {}
     for name, why in found.items():
         p.say(f"  found {name}: {why}")
     labels = {n: f"{n:<11} {PROVIDER_HELP[n]}" + ("  (found)" if n in found else "") for n in PROVIDERS}
@@ -169,14 +297,19 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     kind = next((n for n, label in labels.items() if picked in (n, label)), picked.split()[0] if picked else "")
     if kind not in PROVIDERS:
         raise ValueError(f"onboard.provider must be one of: {', '.join(PROVIDERS)} (got {picked!r})")
+    from k3code import confio
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
     tiers: dict[str, str]
     if kind == "claude-cli":
         if shutil.which("claude") is None:
             p.say("  NOTE: the `claude` command is not on PATH yet; install Claude Code before the first turn.")
+        elif do_probe and _claude_login() is False:
+            p.say("  NOTE: Claude Code is not logged in, so the first turn would fail: run `claude`, then /login.")
         entry: dict[str, Any] = {"name": "claude-cli", "kind": "claude-cli"}
         tiers = dict(TIER_MODELS["claude-cli"])
     else:
-        entry, model = _api_entry(p, kind, do_probe=do_probe)
+        entry, model = _api_entry(p, kind, do_probe=do_probe, before=before)
         known = TIER_MODELS.get(kind, {})
         tiers = {**known, "main": model} if model and known.get("main") == model else ({"main": model} if model else {})
     model = tiers.get("main", "")
@@ -184,16 +317,16 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         "providers": {"entries": [entry]},
         "tiers": {"models": {entry["name"]: tiers} if tiers else {}},
     }
-    from k3code import confio
-
-    before = confio.read_yaml(user_config_path()).get("providers") or []
     path = write_config(data, only="providers")  # keeps the rest of an existing config untouched
     p.say(f"Wrote {path}: provider {entry['name']} ({entry['kind']}), default model {model or '(not set yet)'}.")
     if kept := _keep_other_providers(path, before, entry):
         p.say(f"  kept as fallback (after {entry['name']}): {', '.join(kept)}")
     if not model:
         p.say("  No model set yet: add providers[0].models.default with `k3code config-edit`.")
-    offer_project_recipes(p, Path.cwd())
+    if why := project_scan_skip_reason(Path.cwd()):
+        p.say(f"Project recipes not offered ({why}); a session in a project offers them as cards.")
+    else:
+        offer_project_recipes(p, Path.cwd())
     p.say("Ready. `k3code onboard` (choose full) adds more providers, MCP servers and more any time.")
 
 

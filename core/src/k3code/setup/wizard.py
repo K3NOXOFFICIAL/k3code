@@ -21,10 +21,14 @@ def run_setup(
     """Run pending steps in order (or just ``only_step``). State is saved after every step."""
     if restart:
         clear_state()
-    state = load_state()
+    state = load_state(p.say)
     if state.get("done") and not only_step:  # a finished run: start a fresh one
         state = {"completed": [], "data": {}}
-    ctx = Ctx(p=p, data=state["data"], do_probe=do_probe, cwd=cwd or Path.cwd())
+    ctx = Ctx(p=p, data=state["data"], do_probe=do_probe, cwd=cwd or Path.cwd(), only_step=only_step)
+    if only_step and only_step != "providers":
+        # The chain is whatever config.yaml says now (fast onboarding, /config and hand edits never touch the saved
+        # answers); the saved answers are not changed by this.
+        ctx.data = {**state["data"], "providers": {"entries": _chain_in_config()}}
     if only_step == "secrets":  # extra step: not part of the numbered flow
         todo = [Step("secrets", step_secrets, "Missing API keys")]
     elif only_step:
@@ -42,12 +46,22 @@ def run_setup(
         if step.name not in state["completed"] and step.name != "secrets":
             state["completed"].append(step.name)
         if only_step and step.name not in ("summary", "secrets", "project"):  # these own no config keys
-            write_config(state["data"], only=step.name)
+            # the providers step rebuilds its entries: models already configured stay, whatever the saved tiers say
+            data = {k: v for k, v in state["data"].items() if not (step.name == "providers" and k == "tiers")}
+            write_config(data, only=step.name)
             if step.name in ("about", "system", "usage"):
-                write_user_md(state["data"])
+                write_user_md(state["data"], p.say)
         save_state(state)
     if not only_step and all(n in state["completed"] for n in STEP_NAMES):
         state["done"] = True  # keep the data so `--step X` can rewrite config from it
         save_state(state)
         p.say("\nSetup complete.")
     return state
+
+
+def _chain_in_config() -> list[dict[str, Any]]:
+    """The provider entries of ``config.yaml`` as they are now."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    return [p for p in confio.read_yaml(user_config_path()).get("providers") or [] if isinstance(p, dict)]

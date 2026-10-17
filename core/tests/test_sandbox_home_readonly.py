@@ -6,12 +6,14 @@ invisible to a model that checks for it, and the model asked its first-run quest
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 import yaml
 
+from k3code import paths
 from k3code.reliability import sandbox
 from k3code.tools import tool_bash
 
@@ -208,3 +210,204 @@ def test_an_entry_inside_the_project_is_read_only_after_the_project_bind(tmp_pat
     bind = [i for i, a in enumerate(argv) if a == "--bind" and argv[i + 1] == str(proj)][0]
     ro = [i for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == str(proj / ".myapp")][0]
     assert ro > bind  # a later mount wins: the entry is read-only although its parent is writable
+
+
+def test_read_only_home_view_has_no_network(tmp_path):
+    home = _home(tmp_path)
+    assert "--unshare-net" in sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    assert "--unshare-net" not in sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP)
+
+
+def test_read_only_home_view_hides_every_secret_dir_the_engine_refuses():
+    from k3code.permissions import engine
+
+    hidden = {*sandbox.HOME_SECRETS, *sandbox.HOME_READONLY_REFUSED, *sandbox.HOME_RO_HIDDEN}
+    assert set(engine._HOME_SECRETS) <= hidden
+
+
+def test_read_only_home_view_hides_top_level_dotenv_and_symlink_targets(tmp_path, monkeypatch):
+    home = _home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".env.local").write_text("K=V\n")
+    (home / "dot").mkdir()
+    (home / "dot" / "hist").write_text("x\n")
+    (home / ".bash_history").symlink_to("dot/hist")
+    argv = sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    masked = [argv[i + 2] for i, a in enumerate(argv) if a == "--ro-bind" and argv[i + 1] == "/dev/null"]
+    assert str(home / ".env.local") in masked and str(home / "dot" / "hist") in masked
+    assert str(home / ".bash_history") not in masked  # a bind onto the link would follow it anyway
+
+
+def _uv_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    uv = home / ".local" / "share" / "uv"
+    for sub in ("python", "tools", "credentials"):
+        (uv / sub).mkdir(parents=True)
+    (uv / "credentials" / "credentials.toml").write_text('token = "fake-uv-token"\n')
+    return home
+
+
+def test_uv_credentials_are_never_bound_into_the_sandbox(tmp_path):
+    """`uv auth dir` is ~/.local/share/uv/credentials (index tokens): only uv's interpreters and tools are bound."""
+    home = _uv_home(tmp_path)
+    uv = home / ".local" / "share" / "uv"
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    binds = _binds(argv)
+    assert str(uv / "python") in binds and str(uv / "tools") in binds
+    assert str(uv) not in binds and str(uv / "credentials") not in binds
+    assert not any(str(uv / "credentials") in a for a in argv)
+
+
+def test_uv_dirs_are_bound_only_when_they_exist(tmp_path):
+    home = tmp_path / "home"
+    (home / ".local" / "share" / "uv" / "tools").mkdir(parents=True)
+    binds = _binds(sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[]))
+    assert str(home / ".local/share/uv/tools") in binds
+    assert str(home / ".local/share/uv/python") not in binds
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_uv_credentials_are_unreadable_inside_the_real_sandbox(tmp_path):
+    home = _uv_home(tmp_path)
+    proj = _proj(tmp_path)
+    creds = home / ".local" / "share" / "uv" / "credentials" / "credentials.toml"
+    argv = sandbox.build_argv(proj, home=home, home_readonly=[])
+    res = await tool_bash({"command": f"cat {creds}; ls {home}/.local/share/uv/python"}, cwd=proj, sandbox=argv)
+    assert "fake-uv-token" not in res["stdout"]
+    assert "No such file" in res["stderr"]
+    assert res["stderr"].count("No such file") == 1  # python/ is still there
+
+
+def test_uv_credentials_are_hidden_in_the_read_only_home_view(tmp_path, monkeypatch):
+    """The read-only $HOME view shows all of $HOME but its credential stores: uv's (`uv auth dir`) is one of them, as
+    in the project sandbox, which binds only uv's python/ and tools/."""
+    home = _uv_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    argv = sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    tmpfs = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert str(home / ".local/share/uv/credentials") in tmpfs
+    assert str(home / ".local/share/uv/python") not in tmpfs
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_uv_credentials_are_unreadable_in_the_real_read_only_home_view(tmp_path, monkeypatch):
+    home = _uv_home(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    creds = home / ".local" / "share" / "uv" / "credentials" / "credentials.toml"
+    argv = sandbox.build_argv(home, home=home, readonly_home=True)
+    res = await tool_bash({"command": f"cat {creds}; ls {home}/.local/share/uv/python"}, cwd=home, sandbox=argv)
+    assert "fake-uv-token" not in res["stdout"]
+    assert res["stderr"].count("No such file") == 1  # python/ is still there
+
+
+# ── ~/.cache is not shared with processes outside the sandbox (K3NOX-639) ──
+
+
+def _cache_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    (home / ".cache" / "huggingface").mkdir(parents=True)
+    (home / ".cache" / "huggingface" / "token").write_text("fake-hf-token")
+    (home / ".config" / "uv").mkdir(parents=True)
+    (home / ".config" / "uv" / "uv.toml").write_text('index-url = "https://user:fake-index-pass@example.invalid/"\n')
+    return home
+
+
+def test_the_host_cache_is_never_bound_writable(tmp_path):
+    """uv hard-links its cache into environments that run outside the sandbox, so a write in place to a cached file
+    from inside would change code that runs unsandboxed. The sandbox gets a cache of its own at the same path."""
+    home = _cache_home(tmp_path)
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    binds = [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--bind"]
+    mine = [src for src, dst in binds if dst == str(home / ".cache")]
+    assert len(mine) == 1 and mine[0] != str(home / ".cache")
+    assert Path(mine[0]).is_dir() and Path(mine[0]).is_relative_to(paths.home())
+    assert str(home / ".cache") not in [src for src, _ in binds]
+    assert str(home / ".cache") not in _binds(argv)
+
+
+def test_the_sandbox_cache_is_bound_even_when_the_host_has_no_cache_dir(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    assert [a for i, a in enumerate(argv) if a == str(home / ".cache") and argv[i - 2] == "--bind"]
+
+
+def test_the_sandbox_cache_is_private_to_the_user(tmp_path):
+    home = _cache_home(tmp_path)
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    src = next(argv[i + 1] for i, a in enumerate(argv) if a == "--bind" and argv[i + 2] == str(home / ".cache"))
+    assert (Path(src).stat().st_mode & 0o777) == 0o700
+
+
+def test_an_unusable_sandbox_cache_is_skipped_not_raised(tmp_path, monkeypatch):
+    """A sandbox that cannot be built would leave bash running without one: no cache dir means an empty one."""
+    home = _cache_home(tmp_path)
+
+    def boom(path):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(paths, "ensure_private_dir", boom)
+    argv = sandbox.build_argv(_proj(tmp_path), home=home, bwrap=BWRAP, home_readonly=[])
+    assert not [a for i, a in enumerate(argv) if a == str(home / ".cache") and argv[i - 2] == "--bind"]
+    assert not any(a == "--bind" and argv[i + 1] == str(home / ".cache") for i, a in enumerate(argv))
+
+
+def test_read_only_home_view_hides_the_huggingface_token_and_uv_config(tmp_path):
+    home = _cache_home(tmp_path)
+    argv = sandbox.build_argv(home, home=home, bwrap=BWRAP, readonly_home=True)
+    tmpfs = [argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert str(home / ".cache" / "huggingface") in tmpfs and str(home / ".config" / "uv") in tmpfs
+
+
+def _hardlinked_cache(tmp_path: Path) -> tuple[Path, Path]:
+    """A host cache file hard-linked into a 'venv' file, the way uv installs from ~/.cache/uv/archive-v0."""
+    home = _cache_home(tmp_path)
+    cached = home / ".cache" / "uv" / "archive-v0" / "abc" / "k3probe" / "__init__.py"
+    cached.parent.mkdir(parents=True)
+    cached.write_text("VALUE = 'original'\n")
+    venv_file = home / "outside-venv" / "k3probe" / "__init__.py"
+    venv_file.parent.mkdir(parents=True)
+    os.link(cached, venv_file)
+    assert cached.stat().st_nlink == 2
+    return home, cached
+
+
+needs_bwrap = pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+
+
+@needs_bwrap
+async def test_a_hard_linked_cache_file_cannot_be_changed_from_inside_the_sandbox(tmp_path):
+    home, cached = _hardlinked_cache(tmp_path)
+    venv_file = home / "outside-venv" / "k3probe" / "__init__.py"
+    proj = _proj(tmp_path)
+    argv = sandbox.build_argv(proj, home=home, home_readonly=[])
+    cmd = f"printf \"VALUE = 'changed-in-sandbox'\" > {cached}; echo ok > {home}/.cache/mine; ls {home}/.cache"
+    res = await tool_bash({"command": cmd}, cwd=proj, sandbox=argv)
+    assert "mine" in res["stdout"]  # a build can still write a cache
+    assert venv_file.read_text() == "VALUE = 'original'\n"  # the file outside the sandbox did not change
+    assert cached.read_text() == "VALUE = 'original'\n"
+    assert not (home / ".cache" / "mine").exists()
+
+
+@needs_bwrap
+async def test_the_huggingface_token_is_unreadable_inside_the_sandbox(tmp_path):
+    home = _cache_home(tmp_path)
+    proj = _proj(tmp_path)
+    for readonly_home in (False, True):
+        cwd = home if readonly_home else proj
+        argv = sandbox.build_argv(cwd, home=home, home_readonly=[], readonly_home=readonly_home)
+        res = await tool_bash(
+            {"command": f"cat {home}/.cache/huggingface/token {home}/.config/uv/uv.toml"}, cwd=cwd, sandbox=argv
+        )
+        assert "fake-hf-token" not in res["stdout"] and "fake-index-pass" not in res["stdout"]
+        assert "fake-hf-token" not in res["stderr"] and "fake-index-pass" not in res["stderr"]
+
+
+def test_probing_bwrap_creates_nothing_under_the_k3code_home(tmp_path, monkeypatch):
+    """`usable()` runs at import time of a test module (skipif), before any fixture has moved K3CODE_HOME."""
+    k3home = tmp_path / "k3home"
+    monkeypatch.setenv("K3CODE_HOME", str(k3home))
+    monkeypatch.setattr(sandbox, "_probe", None)
+    sandbox.usable()
+    sandbox.hidden_name_lookup_files()
+    assert not k3home.exists()

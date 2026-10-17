@@ -14,17 +14,27 @@ from typing import Any
 
 from k3code.artifacts import write_artifact_file
 from k3code.autonomy import DEFAULT_MIN_SCOPE
-from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_subtasks, run_tests
+from k3code.autonomy.fanout import (
+    REVIEW_ATTEMPTS,
+    FanoutResult,
+    detect_test_command,
+    extract_subtasks,
+    run_tests,
+)
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
 from k3code.memory import with_hook_context
 from k3code.providers.types import Message
+from k3code.reliability.sandbox import HARNESS_GIT_DIFF_FLAGS
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
 from k3code.subagents.runner import Handle
 
 logger = logging.getLogger(__name__)
+
+#: Diff characters the review panel's prompts carry; past it the lenses are told so and read the rest themselves.
+REVIEW_DIFF_CHARS = 60000
 
 
 async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
@@ -99,8 +109,8 @@ def parse_judge(text: str) -> tuple[dict[str, float], str]:
     return scores, body.strip()
 
 
-def parse_findings(text: str) -> list[dict[str, Any]]:
-    """The last JSON array of objects in a reviewer's reply."""
+def findings_list(text: str) -> list[dict[str, Any]] | None:
+    """The last JSON array of objects in a reviewer's reply; None when it has none (no answer is not "no findings")."""
     for m in reversed(list(re.finditer(r"\[\s*(?:\{.*?\}\s*,?\s*)*\]", text or "", re.S))):
         try:
             data = json.loads(m.group(0))
@@ -108,7 +118,12 @@ def parse_findings(text: str) -> list[dict[str, Any]]:
             continue
         if isinstance(data, list):
             return [d for d in data if isinstance(d, dict) and d.get("issue")]
-    return []
+    return None
+
+
+def parse_findings(text: str) -> list[dict[str, Any]]:
+    """The last JSON array of objects in a reviewer's reply."""
+    return findings_list(text) or []
 
 
 def dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -255,10 +270,12 @@ class Ultra:
 
     # ── /ultracode ──
 
-    async def ultracode(self, session: Any, task: str, *, context: str = "") -> str:
+    async def ultracode(self, session: Any, task: str, *, context: str = "", max_agents: int | None = None) -> str:
         cfg = ultra_cfg(self.server.config)
         brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
-        budget = AgentBudget(int(cfg["max_agents"]), int(cfg["max_tokens"]))
+        budget = AgentBudget(
+            int(max_agents) if max_agents is not None else int(cfg["max_agents"]), int(cfg["max_tokens"])
+        )
         report = _Report(task)
         cwd = Path(session.perms.cwd)
         try:
@@ -273,10 +290,10 @@ class Ultra:
             report.fanout = fan
             if fan is not None and fan.stopped:
                 raise BudgetStop(fan.stopped)
-            if fan is None:  # no git repo: one worker, in place
+            if fan is None:  # fan-out skipped (no repo, dirty checkout, no sandbox or test runner): one worker
                 prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
-                report.notes.append(f"implementation (single worker, no git repo): {h.status}")
+                report.notes.append(f"implementation (single worker in place, fan-out skipped): {h.status}")
             elif not fan.ok:
                 report.notes.append("fan-out left unresolved subtasks:\n" + fan.summary())
 
@@ -312,28 +329,56 @@ class Ultra:
         cwd = Path(session.perms.cwd)
         diff = ""
         if base:
-            _, diff = await wt_mod.git(cwd, "diff", f"{base}..HEAD")
+            _, diff = await wt_mod.git(cwd, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{base}..HEAD")
         if not diff.strip():
             report.notes.append("nothing to review: no committed changes")
             return
-        diff = diff[:60000]
+        cut = ""
+        if len(diff) > REVIEW_DIFF_CHARS:
+            cut = (
+                f"\nThe diff above is CUT at {REVIEW_DIFF_CHARS} of {len(diff)} characters: run "
+                f"`git diff {base}..HEAD` or read the changed files for the rest.\n"
+            )
+            report.notes.append(f"the review panel saw the first {REVIEW_DIFF_CHARS} of {len(diff)} diff characters")
+        diff = diff[:REVIEW_DIFF_CHARS]
         self.progress(session, "ultracode", "adversarial review", ", ".join(LENSES), budget)
+        # a lens leaves this only with an answer: one the budget stopped before it answered stays in it
+        unanswered: dict[str, str] = dict.fromkeys(LENSES, "the budget ran out before it answered")
 
         async def lens_review(lens: str, desc: str) -> list[dict[str, Any]]:
             prompt = (
                 f"LENS: {lens}\nAdversarially review this change through one lens only: {desc}.\n\nTask:\n{task}\n\n"
-                f"Diff:\n```diff\n{diff}\n```\nRead the code if you need more context. Reply with a JSON array of "
+                f"Diff:\n```diff\n{diff}\n```\n{cut}Read the code if you need more context. Reply with a JSON array of "
                 'findings: [{"file": "...", "line": 0, "severity": "high|med|low", "issue": "..."}] '
                 "(an empty array if you find nothing). Report only real problems."
             )
-            h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}")
-            return parse_findings(h.result)
+            for _ in range(REVIEW_ATTEMPTS):  # a lens that fails or answers without the array is asked once more
+                h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}")
+                found = findings_list(h.result) if h.status == "completed" else None
+                if found is not None:
+                    unanswered.pop(lens, None)
+                    return found
+                unanswered[lens] = f"{h.status}: {h.error}" if h.status != "completed" else "no findings array"
+            return []
 
-        results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        def note_unanswered() -> None:
+            if unanswered:  # a dead lens is not a lens that found nothing: say the review is incomplete
+                report.notes.append(
+                    "review INCOMPLETE: no answer from the "
+                    + ", ".join(f"{lens} lens ({why})" for lens, why in unanswered.items())
+                )
+
+        try:
+            results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        except BudgetStop:  # the report is cut short here: it still says which lenses never answered
+            note_unanswered()
+            raise
         candidates = dedupe_findings([f for r in results for f in r])
         report.candidates = candidates
+        note_unanswered()
         if not candidates:
-            report.notes.append("review panel found nothing")
+            nothing = "the lenses that answered found nothing" if unanswered else "review panel found nothing"
+            report.notes.append(nothing)
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
         votes: dict[str, dict[str, bool]] = {}

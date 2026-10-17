@@ -7,8 +7,13 @@ backups ``<name>.bak-<ts>`` next to the file before every write.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import secrets
+import threading
 import time
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -18,8 +23,15 @@ from pydantic import ValidationError
 
 from k3code import trust
 from k3code.config import Settings
+from k3code.paths import ensure_state_dir
+
+try:
+    import fcntl
+except ImportError:  # Windows: no flock, so the lock below is a no-op there (the atomic write still holds)
+    fcntl = None  # type: ignore[assignment]
 
 _BAK_RE = re.compile(r"\.bak-\d{8}T\d{12}(?:-\d+)?$")
+_held = threading.local()
 
 
 class ConfigError(ValueError):
@@ -33,6 +45,60 @@ def read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
     return data
+
+
+@contextlib.contextmanager
+def locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``path`` (a ``.<name>.lock`` file beside it) for a read-modify-write.
+
+    Serialises k3code processes and threads that edit the same config file, so two edits do not each read the old
+    file and the second one drop the first one's change. Reentrant within a thread (``write_yaml`` takes it again
+    under an outer ``with locked(path)``). A best effort: where ``fcntl`` is missing (Windows) it does nothing, and a
+    lock file that cannot be opened is skipped rather than failing the edit.
+    """
+    key = str(path.absolute())
+    held: set[str] = _held.__dict__.setdefault("paths", set())
+    if key in held or fcntl is None:
+        yield
+        return
+    try:
+        ensure_state_dir(path.parent)
+        fd = os.open(path.parent / f".{path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except (OSError, RuntimeError):  # RuntimeError: a $K3CODE_HOME another user owns
+        yield
+        return
+    held.add(key)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        held.discard(key)
+        os.close(fd)  # closing the descriptor releases the flock
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text``: temp file in the same directory, fsync, ``os.replace``.
+
+    A plain ``write_text`` truncates first, so a kill or a full disk in the middle left an empty or partial file. An
+    existing file keeps its mode (and is written under 0600 until then, so a 0600 file is never briefly readable); a
+    new file gets 0666 minus the umask. A symlink is written through.
+    """
+    target = path.resolve() if path.is_symlink() else path
+    mode = target.stat().st_mode & 0o7777 if target.exists() else None
+    tmp = target.with_name(f".{target.name}.tmp-{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def backup_path(path: Path) -> Path:
@@ -60,22 +126,31 @@ def latest_backup(path: Path) -> Path | None:
 
 
 def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True, keep_trust: bool = True) -> Path | None:
-    """Write ``data`` as YAML; the previous file is copied to ``.bak-<ts>`` first. Returns the backup.
+    """Write ``data`` as YAML, atomically; the previous file is copied to ``.bak-<ts>`` first. Returns the backup.
+
+    A write that would not change the file's bytes makes no backup (and returns None): rewriting the same config
+    must not pile up identical ``.bak-*`` files.
 
     ``keep_trust=False`` for content someone else wrote (an imported bundle): a project config written that way is
     left untrusted until the user approves it with `k3code trust`.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    bak: Path | None = None
-    if backup and path.is_file():
-        bak = backup_path(path)
-        bak.write_bytes(path.read_bytes())
+    # the user config's directory is $K3CODE_HOME (0700, issue #163: onboarding creates it here); a project's
+    # .k3code/ is part of the repository and keeps the umask's mode
+    ensure_state_dir(path.parent)
     text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-    if keep_trust:
-        with trust.keeping_trust(path):
-            path.write_text(text, encoding="utf-8")
-    else:
-        path.write_text(text, encoding="utf-8")
+    bak: Path | None = None
+    with locked(path):
+        if backup and path.is_file():
+            previous = path.read_bytes()
+            if previous == text.encode("utf-8"):
+                return None
+            bak = backup_path(path)
+            bak.write_bytes(previous)
+        if keep_trust:
+            with trust.keeping_trust(path):
+                atomic_write_text(path, text)
+        else:
+            atomic_write_text(path, text)
     return bak
 
 

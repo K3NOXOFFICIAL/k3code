@@ -89,12 +89,25 @@ describe("/tune, /model and /effort", () => {
 
       expect(run(ctx, line)).toBe(true);
       expect(getOverlayState().tunePicker).toBe(true);
+      expect(getOverlayState().providerPicker).toBe(false);
       expect(getOverlayState().modelPicker).toBe(false);
       expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
       expect(ctx.gateway.rpc).not.toHaveBeenCalled();
       expect(ctx.transcript.sys).not.toHaveBeenCalled();
     },
   );
+
+  it("bare /provider opens its own popup, not the tune popup (#421)", () => {
+    const ctx = buildCtx();
+
+    expect(run(ctx, "/provider")).toBe(true);
+    expect(getOverlayState().providerPicker).toBe(true);
+    expect(getOverlayState().tunePicker).toBe(false);
+    expect(getOverlayState().modelPicker).toBe(false);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled();
+    expect(ctx.transcript.sys).not.toHaveBeenCalled();
+  });
 
   it("opens without a session too (the popup greys effort and ultracode itself)", () => {
     resetUiState();
@@ -136,6 +149,48 @@ describe("/tune, /model and /effort", () => {
     await vi.waitFor(() =>
       expect(ctx.transcript.sys).toHaveBeenCalledWith("effort: high"),
     );
+  });
+
+  it("/provider with args goes to the gateway; bare opens its own popup (#421)", async () => {
+    expect(findSlashCommand("provider")?.usage).toBe(
+      "/provider [<name> [--save]]",
+    );
+    const ctx = buildCtx(() =>
+      Promise.resolve({ output: "Providers (* = active):\n* a\n  b" }),
+    );
+
+    run(ctx, "/provider");
+
+    expect(getOverlayState().providerPicker).toBe(true);
+    expect(getOverlayState().tunePicker).toBe(false);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    resetOverlayState();
+
+    run(ctx, "/provider b --save");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "provider b --save",
+      session_id: "sid-abc",
+    });
+  });
+
+  it("/permissions bare opens its own popup; with args goes to gateway", async () => {
+    expect(findSlashCommand("permissions")).toBeDefined();
+    const ctx = buildCtx(() => Promise.resolve({ output: "ok" }));
+
+    run(ctx, "/permissions");
+
+    expect(getOverlayState().permissionsPicker).toBe(true);
+    expect(getOverlayState().settingsPanel).toBe(false);
+    expect(getOverlayState().tunePicker).toBe(false);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    resetOverlayState();
+    patchUiState({ sid: "sid-abc" });
+
+    run(ctx, "/permissions mode plan");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "permissions mode plan",
+      session_id: "sid-abc",
+    });
   });
 
   it("shows the gateway's error instead of swallowing it", async () => {
@@ -197,8 +252,8 @@ describe("/tune, /model and /effort", () => {
     });
   });
 
-  describe("/ultracode, /ultraplan and /ultraresearch stay gateway pass-throughs", () => {
-    it.each(["ultracode", "ultraplan", "ultraresearch"])(
+  describe("/ultracode, /ultraplan, /ultraresearch, /preview and /review stay gateway pass-throughs", () => {
+    it.each(["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"])(
       "/%s has no local handler",
       (name) => {
         expect(findSlashCommand(name)).toBeUndefined();
@@ -254,6 +309,28 @@ describe("/tune, /model and /effort", () => {
             expect.stringContaining("answer the open prompt first"),
           );
         }
+
+        const pctx = buildCtx();
+        expect(run(pctx, "/permissions")).toBe(true);
+        expect(getOverlayState().settingsPanel).toBe(false);
+        expect(pctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringContaining("finish the pending prompt"),
+        );
+      },
+    );
+
+    it.each(LOCKS)(
+      "bare /provider refuses to open over a %s prompt",
+      (_name, overlay) => {
+        patchOverlayState(overlay as never);
+        const ctx = buildCtx();
+
+        expect(run(ctx, "/provider")).toBe(true);
+        expect(getOverlayState().providerPicker).toBe(false);
+        expect(getOverlayState().tunePicker).toBe(false);
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringContaining("answer the open prompt first"),
+        );
       },
     );
 

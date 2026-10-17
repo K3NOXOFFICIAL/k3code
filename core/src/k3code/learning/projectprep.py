@@ -197,12 +197,14 @@ async def prepare(
     offers the recipes of stacks that were not there before. The scans run in a worker thread. ``caller`` and
     ``preferences`` are unused at scan time (the K3CODE.md draft is written on acceptance)."""
     root = projectstate.project_root(root)
+    if not_a_project(root):
+        return []  # a session started in $HOME (or / above it): no project to scan, and no proposals about it
     scan = await asyncio.to_thread(stacks.scan, root)
     prev = _previous(root)
     if prev.get("fingerprint") == scan.fingerprint:
         return []
-    if not scan.stacks and not (root / ".git").exists():
-        return []  # not a project (empty or scratch directory): nothing to prepare
+    if not scan.stacks:
+        return []  # no stack detected (an empty, scratch or bare `git init` directory): nothing to prepare
     info = stacks.legacy_info(scan, root)
     risks = await asyncio.to_thread(scan_risks, root, info)
     skills = await asyncio.to_thread(_skills, root, skill_roots)
@@ -257,6 +259,13 @@ async def prepare(
 
 
 FACTS_MAX_LINES = 25
+
+
+def not_a_project(root: str | Path) -> bool:
+    """``root`` is the home directory or a directory above it (``/``, ``/home``): what a session started outside any
+    project resolves to. Scanning it walked the whole home on every session start, proposed recipes for whatever
+    stacks it met there and keyed learned state to ``~`` (fast setup already refused it, see setup/steps.py)."""
+    return Path.home().resolve().is_relative_to(Path(root).resolve())
 
 
 def facts_prompt(cwd: str | Path) -> str:

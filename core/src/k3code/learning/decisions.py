@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from k3code import sqlstore
 from k3code.paths import ensure_private_dir
@@ -42,7 +42,75 @@ CREATE TABLE IF NOT EXISTS decisions (
     detail TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS decisions_kind ON decisions(kind, project);
+CREATE INDEX IF NOT EXISTS decisions_kind_project_subject_ts ON decisions(kind, project, subject, ts);
 """
+
+#: Columns of ``turn_outcomes`` after its key ``turn`` (the turn id the usage rows and replay records carry). They are
+#: created with the table and, on a table an older version made without some of them, added one by one
+#: (``_migrate_turn_outcomes``): the schema can grow on an existing database without a rebuild.
+#:
+#: ``status``: how the turn ended (``done``, ``error``, ``outage``, ``needs_input``, ``interrupted``, ``halted``).
+#: ``interrupted``: the user stopped it (/stop, Esc); a daemon stop is not the user's verdict. ``undone``: /undo or
+#: /retry removed it before the session's next turn. ``test``: the last test/check command of the turn
+#: (``passed``, ``failed``, ``unknown`` when a pipe or ``||`` masks its exit status, NULL when none ran). ``gate``:
+#: the goal's ``--check`` run after the turn (``passed``/``failed``/NULL). ``judge``: the goal judge's verdict, ""
+#: when none ran. ``denials``: approval prompts answered "deny". ``msg_start``/``msg_end``: the turn's slice of the
+#: stored conversation, so an /undo is matched to the turn whose messages it removes. ``settled``: when the outcome
+#: stopped waiting for an /undo (NULL = pending; see ``OUTCOME_SETTLE_S``).
+_TURN_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("ts", "REAL NOT NULL DEFAULT 0"),
+    ("session", "TEXT NOT NULL DEFAULT ''"),
+    ("kind", "TEXT NOT NULL DEFAULT ''"),
+    ("tier", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL DEFAULT ''"),
+    ("interrupted", "INTEGER NOT NULL DEFAULT 0"),
+    ("undone", "INTEGER NOT NULL DEFAULT 0"),
+    ("test", "TEXT"),
+    ("gate", "TEXT"),
+    ("judge", "TEXT NOT NULL DEFAULT ''"),
+    ("denials", "INTEGER NOT NULL DEFAULT 0"),
+    ("msg_start", "INTEGER NOT NULL DEFAULT 0"),
+    ("msg_end", "INTEGER NOT NULL DEFAULT 0"),
+    ("settled", "REAL"),
+    ("actor", "TEXT NOT NULL DEFAULT 'user'"),
+)
+_TURN_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS turn_outcomes (turn TEXT PRIMARY KEY, "
+    + ", ".join(f"{name} {decl}" for name, decl in _TURN_COLUMNS)
+    + ")"
+)
+
+#: A turn's outcome waits this long for an /undo or /retry before it counts as kept anyway. The session's next turn
+#: (an /undo then removes that one first) or its end settles it sooner; this covers a session left open, and a daemon
+#: that stopped before either happened.
+OUTCOME_SETTLE_S = 3600.0
+#: Statuses that say nothing about the work: no provider answered, the daemon was paused, or the attempt was thrown
+#: away and run again (``discarded``: the conversation overflowed the context window and was compacted). Such a turn is
+#: never scored, whatever else happened to it.
+UNSCORED_STATUSES = ("outage", "halted", "discarded")
+
+
+def turn_passed(row: dict[str, Any]) -> bool | None:
+    """Whether one turn succeeded, from its recorded signals; None when it says nothing either way.
+
+    Succeeded: it finished (``done``), was not undone and not stopped by the user, its last test/check did not fail
+    (the goal's ``--check`` run after the turn counts as the last one), and the goal judge did not call it blocked.
+    A turn that merely finished used to count as a success, even one the user undid right away. A turn interrupted
+    without the user asking (the daemon stopped) is not scored, like an outage. Pending is not decided here: see
+    :meth:`DecisionLog.turn_outcomes`.
+    """
+    status = str(row.get("status") or "")
+    if status in UNSCORED_STATUSES:
+        return None
+    if row.get("interrupted"):
+        return False
+    if status == "interrupted":  # cancelled, but not by the user's stop: a daemon restart, a deleted session
+        return None
+    if row.get("undone") or status != "done":
+        return False
+    if (row.get("gate") or row.get("test")) == "failed":
+        return False
+    return row.get("judge") != "blocked"
 
 
 def scrub(text: str) -> str:
@@ -88,6 +156,14 @@ def project_id(cwd: str | Path) -> str:
 MAX_AGE_DAYS = 365
 
 
+class ToolErrorSightings(NamedTuple):
+    """What :meth:`DecisionLog.tool_error_sightings` found for one failure signature."""
+
+    count: int  #: sightings in the window, at most the ``cap`` asked for
+    choice: str  #: the error class of the newest one, "" when there is none
+    followup: str  #: the working retry noted on the newest sighting that has one, "" when none has
+
+
 class DecisionLog:
     def __init__(self, home: Path, clock: Callable[[], float] = time.time) -> None:
         self.home = Path(home)
@@ -98,6 +174,7 @@ class DecisionLog:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
         self._migrate_actor()
+        self._migrate_turn_outcomes()
         self._db.commit()
         self._pid_cache: dict[str, str] = {}
         self.migrate_jsonl()
@@ -114,11 +191,53 @@ class DecisionLog:
             )
         self._db.execute("CREATE INDEX IF NOT EXISTS decisions_kind_actor_ts ON decisions(kind, actor, ts)")
 
+    def _migrate_turn_outcomes(self) -> None:
+        """The per-turn outcome table (issue #140): created when missing, and any column a table made by an older
+        version lacks is added (each has a default, so existing rows stay valid)."""
+        self._db.execute(_TURN_SCHEMA)
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(turn_outcomes)")}
+        for name, decl in _TURN_COLUMNS:
+            if name not in cols:
+                self._db.execute(f"ALTER TABLE turn_outcomes ADD COLUMN {name} {decl}")
+        self._db.execute("CREATE INDEX IF NOT EXISTS turn_outcomes_session_ts ON turn_outcomes(session, ts)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS turn_outcomes_ts ON turn_outcomes(ts)")
+
     def prune(self, max_age_days: float = MAX_AGE_DAYS) -> int:
-        """Delete decisions older than ``max_age_days`` (the daemon calls it at start); returns rows deleted."""
+        """Delete decisions and turn outcomes older than ``max_age_days`` (the daemon calls it at start); returns
+        rows deleted."""
+        cutoff = self.clock() - max_age_days * 86400
         with self._db:
-            cur = self._db.execute("DELETE FROM decisions WHERE ts < ?", (self.clock() - max_age_days * 86400,))
-        return cur.rowcount
+            cur = self._db.execute("DELETE FROM decisions WHERE ts < ?", (cutoff,))
+            outcomes = self._db.execute("DELETE FROM turn_outcomes WHERE ts < ?", (cutoff,))
+        return cur.rowcount + outcomes.rowcount
+
+    def delete_project(self, cwd: str | Path) -> int:
+        """Delete the rows of the project ``cwd`` is in (``/learned purge``); returns how many.
+
+        A row is filed under ``project_id`` of the directory it was recorded in: the git remote when there is one,
+        else a hash of that directory. So the project's rows are those filed under its id plus those recorded
+        anywhere in the same repository (``identity_root``): without a remote, a subdirectory or a fan-out worktree
+        has an id of its own. A repository nested inside this one is a project of its own and keeps its rows, and so
+        do the rows that name no directory (the optimizer's, which belong to no project).
+        """
+        from k3code.memory import identity_root
+
+        here = identity_root(cwd)
+        recorded = [str(r[0]) for r in self._db.execute("SELECT DISTINCT cwd FROM decisions WHERE cwd != ''")]
+        cwds = [c for c in recorded if identity_root(c) == here]  # resolved: a symlinked path is the same project
+        n = 0
+        with self._db:
+            n += self._db.execute("DELETE FROM decisions WHERE project = ?", (project_id(cwd),)).rowcount
+            for c in cwds:
+                n += self._db.execute("DELETE FROM decisions WHERE cwd = ?", (c,)).rowcount
+        return n
+
+    def delete_all(self) -> int:
+        """Delete every row of every project (``/learned purge --all``); returns how many. The ``decisions.jsonl``
+        an old version left behind (``.migrated``, read by nothing) holds decisions too and goes with them."""
+        (self.home / "decisions.jsonl.migrated").unlink(missing_ok=True)
+        with self._db:
+            return self._db.execute("DELETE FROM decisions").rowcount
 
     def close(self) -> None:
         self._db.close()
@@ -210,6 +329,117 @@ class DecisionLog:
             d["detail"] = json.loads(d["detail"] or "{}")
             rows.append(d)
         return rows
+
+    def tool_error_sightings(self, project: str, tool: str, subject: str, since: float, cap: int) -> ToolErrorSightings:
+        """The ``tool_error`` rows of ``project`` since ``since`` with this ``tool`` and ``subject`` (any actor),
+        without loading the other rows of the window: three queries through the
+        ``decisions_kind_project_subject_ts`` index. ``count`` stops at ``cap``, so it does not grow with the number
+        of sightings either; only the search for a ``followup`` runs back through them, inside SQLite, until it finds
+        one."""
+        where = (
+            "FROM decisions WHERE kind='tool_error' AND project=? AND subject=? AND ts>=?"
+            " AND json_extract(detail, '$.tool')=?"
+        )
+        args = (project, subject, since, tool)
+        count = int(self._db.execute(f"SELECT COUNT(*) FROM (SELECT 1 {where} LIMIT ?)", (*args, cap)).fetchone()[0])
+        if not count:
+            return ToolErrorSightings(0, "", "")
+        newest = "ORDER BY ts DESC, id DESC LIMIT 1"
+        choice = self._db.execute(f"SELECT choice {where} {newest}", args).fetchone()
+        followup = self._db.execute(
+            f"SELECT json_extract(detail, '$.followup') {where} AND json_extract(detail, '$.followup') != '' {newest}",
+            args,
+        ).fetchone()
+        return ToolErrorSightings(count, str(choice[0]), str(followup[0]) if followup else "")
+
+    # ── turn outcomes (issue #140) ──
+
+    def record_turn(self, turn: str, **fields: Any) -> None:
+        """Insert or update the outcome row of ``turn``; ``fields`` are ``_TURN_COLUMNS`` names. Unknown names are
+        refused (they would reach the SQL)."""
+        known = {name for name, _ in _TURN_COLUMNS}
+        if bad := set(fields) - known:
+            raise ValueError(f"unknown turn outcome field(s): {', '.join(sorted(bad))}")
+        cols = list(fields)
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
+        update = ", ".join(f"{c}=excluded.{c}" for c in cols) or "turn=excluded.turn"
+        self._db.execute(
+            f"INSERT INTO turn_outcomes (turn{''.join(', ' + c for c in cols)}) VALUES (?{', ?' * len(cols)})"
+            f" ON CONFLICT(turn) DO UPDATE SET {update}",
+            (turn, *values),
+        )
+        self._db.commit()
+
+    def update_turn(self, turn: str, **fields: Any) -> None:
+        """Set fields of an existing outcome row; a turn with no row is left alone (never a half row)."""
+        known = {name for name, _ in _TURN_COLUMNS}
+        if bad := set(fields) - known:
+            raise ValueError(f"unknown turn outcome field(s): {', '.join(sorted(bad))}")
+        if not fields:
+            return
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
+        self._db.execute(
+            f"UPDATE turn_outcomes SET {', '.join(f'{c}=?' for c in fields)} WHERE turn=?", (*values, turn)
+        )
+        self._db.commit()
+
+    def settle_turns(self, session: str) -> int:
+        """The session's pending outcomes stop waiting for an /undo (its next user turn began, or it ended)."""
+        cur = self._db.execute(
+            "UPDATE turn_outcomes SET settled=? WHERE session=? AND settled IS NULL", (self.clock(), session)
+        )
+        self._db.commit()
+        return cur.rowcount
+
+    def mark_undone(self, session: str, index: int) -> list[str]:
+        """An /undo or /retry removed the session's stored messages from ``index`` on: mark every pending turn whose
+        messages that cut removes as undone. Returns their turn ids, newest first; empty when the cut hit no pending
+        turn (an earlier turn the user had already moved on from, or one recorded before outcomes were).
+
+        An auto-continued (or /goal) run is one turn row per continuation, and /undo drops the whole run back to the
+        prompt the user sent (``_session_undo``): the rows from the turn the cut reaches into on are all removed. Only
+        that first one used to be marked, so the optimizer still scored the run's continuations as passed. The walk
+        stops at the turn the cut reaches into (an older row's slice can be from before a compaction renumbered the
+        messages), and marks nothing when it finds none: the cut then reached into a turn already kept."""
+        rows = self._db.execute(
+            "SELECT turn, msg_start, msg_end FROM turn_outcomes WHERE session=? AND settled IS NULL AND ts>=?"
+            " ORDER BY ts DESC, rowid DESC",
+            (session, self.clock() - OUTCOME_SETTLE_S),
+        ).fetchall()
+        after: list[str] = []  # newer turns wholly past the cut: a run's continuations
+        for row in rows:
+            start, end = int(row["msg_start"]), int(row["msg_end"])
+            if start <= index < end:
+                undone = [*after, str(row["turn"])]
+                self._db.executemany(
+                    "UPDATE turn_outcomes SET undone=1, settled=? WHERE turn=?", [(self.clock(), t) for t in undone]
+                )
+                self._db.commit()
+                return undone
+            if start >= index:
+                after.append(str(row["turn"]))
+        return []
+
+    def turn_outcomes(
+        self, *, since: float = 0.0, until: float | None = None, actor: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Outcome rows in [since, until), oldest first, each with ``pending`` (still waiting for an /undo: not
+        settled and younger than ``OUTCOME_SETTLE_S``) and ``passed`` (:func:`turn_passed`; None while pending)."""
+        sql, args = "SELECT * FROM turn_outcomes WHERE ts>=?", [since]
+        if until is not None:
+            sql += " AND ts<?"
+            args.append(until)
+        if actor is not None:
+            sql += " AND actor=?"
+            args.append(actor)
+        horizon = self.clock() - OUTCOME_SETTLE_S
+        out = []
+        for r in self._db.execute(sql + " ORDER BY ts, rowid", args):
+            row = dict(r)
+            row["pending"] = row["settled"] is None and float(row["ts"]) > horizon
+            row["passed"] = None if row["pending"] else turn_passed(row)
+            out.append(row)
+        return out
 
     def count(self, kind: str | None = None) -> int:
         if kind:

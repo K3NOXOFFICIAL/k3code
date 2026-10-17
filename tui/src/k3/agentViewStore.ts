@@ -114,13 +114,26 @@ export function buildViewRows({
   ];
 }
 
+export type ViewFocus = "input" | "list";
+
 export interface ViewNav {
-  /** Row key awaiting a y/n stop confirmation. */
+  /** What the composer body holds; edited by the TextInput, never by the reducer. */
+  draft: string;
   confirmKey: null | string;
   index: number;
+  /** Collapsed group names (groups whose rows are hidden). */
+  collapsedGroups: ViewGroup[];
+  /** Which half owns the keyboard: the row list, or the bottom composer. */
+  focus: ViewFocus;
 }
 
-export const IDLE_VIEW_NAV: ViewNav = { confirmKey: null, index: 0 };
+export const IDLE_VIEW_NAV: ViewNav = {
+  collapsedGroups: [],
+  confirmKey: null,
+  draft: "",
+  focus: "list",
+  index: 0,
+};
 
 export type ViewKey = {
   ch?: string;
@@ -135,13 +148,14 @@ export type ViewKey = {
   pageUp?: boolean;
   return?: boolean;
   right?: boolean;
+  tab?: boolean;
   up?: boolean;
 };
 
 export type ViewEffect =
   | { row: ViewRow; type: "activate" | "stop" }
   | { type: "close" }
-  | { type: "new" };
+  | { type: "toggle-group"; group: ViewGroup };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -155,6 +169,37 @@ export function selectedIndex(
   const i = key == null ? -1 : rows.findIndex((r) => r.key === key);
 
   return i >= 0 ? i : Math.max(0, Math.min(fallback, rows.length - 1));
+}
+
+/** Build the visible line list (headers + rows) respecting collapsed groups. */
+export function buildLines(
+  rows: readonly ViewRow[],
+  collapsedGroups: readonly ViewGroup[] = [],
+): (
+  | { group: ViewGroup; type: "header" }
+  | { index: number; row: ViewRow; type: "row" }
+)[] {
+  const lines: (
+    | { group: ViewGroup; type: "header" }
+    | { index: number; row: ViewRow; type: "row" }
+  )[] = [];
+
+  for (const group of VIEW_GROUPS) {
+    const inGroup = rows.filter((r) => r.group === group);
+    const isCollapsed = collapsedGroups.includes(group);
+
+    if (inGroup.length) {
+      lines.push({ group, type: "header" });
+
+      if (!isCollapsed) {
+        for (const row of inGroup) {
+          lines.push({ index: rows.indexOf(row), row, type: "row" });
+        }
+      }
+    }
+  }
+
+  return lines;
 }
 
 /** Live sessions other than this one and in-turn agents can be stopped; past rows and the current session cannot. */
@@ -175,8 +220,22 @@ export function reduceViewKey(
   const done = (effect: null | ViewEffect, next: Partial<ViewNav> = {}) => ({
     consumed: true as const,
     effect,
-    nav: { confirmKey: null, index, ...next },
+    nav: { ...nav, confirmKey: null, index, ...next },
   });
+
+  // The composer owns editing keys through its own useInput; only the two chords
+  // it hands up reach the reducer here. Esc clears the draft first, so leaving
+  // the view takes a second Esc — text is never lost to a stray Esc.
+  if (nav.focus === "input") {
+    if (key.tab) {
+      return done(null, { focus: "list" });
+    }
+    if (key.escape) {
+      return nav.draft ? done(null, { draft: "" }) : done({ type: "close" });
+    }
+    return done(null);
+  }
+
   // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops (→ cancels like any
   // other key); when the row has gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to
   // whatever row moved under it.
@@ -194,8 +253,9 @@ export function reduceViewKey(
     return done({ type: "close" });
   }
 
-  if (ch === "n") {
-    return done({ type: "new" });
+  // n and tab both hand the keyboard to the composer; the draft survives the switch.
+  if (ch === "n" || key.tab) {
+    return done(null, { focus: "input" });
   }
 
   if (!rows.length) {
@@ -238,6 +298,14 @@ export function reduceViewKey(
 
   if (ch === "x" && isStoppable(row)) {
     return done(null, { confirmKey: row.key });
+  }
+
+  // Collapse/expand group headers with 'c' or Enter when on a header line.
+  // We don't know the current line type here (header vs row) — the caller will
+  // convert a header line selection to a toggle-group effect.
+  // For now, 'c' toggles the group of the currently selected row.
+  if (ch === "c") {
+    return done({ type: "toggle-group", group: row.group });
   }
 
   return done(null);

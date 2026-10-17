@@ -3,13 +3,13 @@ import { useStore } from "@nanostores/react";
 import type { ReactNode } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
-import type { AppOverlaysProps } from "../app/interfaces.js";
+import { INDICATOR_STYLES, type AppOverlaysProps } from "../app/interfaces.js";
 import {
   $overlayState,
   hasFloatingPanel,
   patchOverlayState,
 } from "../app/overlayStore.js";
-import { $uiSessionId, $uiTheme } from "../app/uiStore.js";
+import { $uiSessionId, $uiState, $uiTheme } from "../app/uiStore.js";
 
 import { ActiveSessionSwitcher } from "./activeSessionSwitcher.js";
 import { FloatBox } from "./appChrome.js";
@@ -17,9 +17,10 @@ import { MaskedPrompt } from "./maskedPrompt.js";
 import { ModelPicker } from "./modelPicker.js";
 import { OverlayHint } from "./overlayControls.js";
 import { listRowStyle } from "./overlayPrimitives.js";
-import { PluginsHub } from "./pluginsHub.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
-import { SkillsHub } from "./skillsHub.js";
+import { PermissionsPicker } from "./permissionsPicker.js";
+import { ProviderPicker } from "./providerPicker.js";
+import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
 
@@ -176,7 +177,10 @@ export function FloatingOverlays({
   onModelSelect,
   onNewLiveSession,
   onNewPromptSession,
+  onPermissionsApply,
+  onProviderSelect,
   onResumeSelect,
+  onSettingsApply,
   onTuneApply,
   pagerPageSize,
 }: Pick<
@@ -189,13 +193,17 @@ export function FloatingOverlays({
   | "onModelSelect"
   | "onNewLiveSession"
   | "onNewPromptSession"
+  | "onPermissionsApply"
+  | "onProviderSelect"
   | "onResumeSelect"
+  | "onSettingsApply"
   | "onTuneApply"
   | "pagerPageSize"
 > & { nativeMode?: boolean }) {
   const { gw } = useGateway();
   const overlay = useStore($overlayState);
   const sid = useStore($uiSessionId);
+  const ui = useStore($uiState);
   const theme = useStore($uiTheme);
 
   const hasAny = hasFloatingPanel(overlay) || completions.length;
@@ -269,6 +277,36 @@ export function FloatingOverlays({
     });
   }
 
+  if (overlay.settingsPanel) {
+    widgets.push({
+      id: "settings-panel",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <SettingsPanel
+            gw={gw}
+            local={{
+              agentsView: ui.agentsView,
+              busy: ui.busyInputMode,
+              compact: ui.compact,
+              details: ui.detailsMode,
+              indicator: ui.indicatorStyle,
+              indicators: [...INDICATOR_STYLES],
+              mouse: ui.mouseTracking !== "off",
+              retryForever: false,
+              showReasoning: ui.showReasoning,
+              statusBar: ui.statusBar,
+            }}
+            maxWidth={width}
+            onApply={onSettingsApply}
+            onClose={() => patchOverlayState({ settingsPanel: false })}
+            sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
   if (overlay.tunePicker) {
     widgets.push({
       id: "tune-picker",
@@ -287,15 +325,17 @@ export function FloatingOverlays({
     });
   }
 
-  if (overlay.skillsHub) {
+  if (overlay.permissionsPicker) {
     widgets.push({
-      id: "skills-hub",
+      id: "permissions-picker",
       render: (width) => (
         <FloatBox color={theme.color.border}>
-          <SkillsHub
+          <PermissionsPicker
             gw={gw}
             maxWidth={width}
-            onClose={() => patchOverlayState({ skillsHub: false })}
+            onApply={onPermissionsApply}
+            onCancel={() => patchOverlayState({ permissionsPicker: false })}
+            sessionId={sid}
             t={theme}
           />
         </FloatBox>
@@ -303,15 +343,17 @@ export function FloatingOverlays({
     });
   }
 
-  if (overlay.pluginsHub) {
+  if (overlay.providerPicker) {
     widgets.push({
-      id: "plugins-hub",
+      id: "provider-picker",
       render: (width) => (
         <FloatBox color={theme.color.border}>
-          <PluginsHub
+          <ProviderPicker
             gw={gw}
             maxWidth={width}
-            onClose={() => patchOverlayState({ pluginsHub: false })}
+            onCancel={() => patchOverlayState({ providerPicker: false })}
+            onSelect={onProviderSelect}
+            sessionId={sid}
             t={theme}
           />
         </FloatBox>

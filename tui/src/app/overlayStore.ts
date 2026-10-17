@@ -13,14 +13,14 @@ const buildOverlayState = (): OverlayState => ({
   confirm: null,
   ambient: [],
   widget: null,
-  journey: false,
   modelPicker: false,
   pager: null,
-  pluginsHub: false,
+  providerPicker: false,
+  permissionsPicker: false,
   secret: null,
   sessions: false,
-  skillsHub: false,
   sudo: null,
+  settingsPanel: false,
   tunePicker: false,
 });
 
@@ -34,13 +34,13 @@ export const $isBlocked = computed(
     approval,
     clarify,
     confirm,
-    journey,
     modelPicker,
     pager,
-    pluginsHub,
+    permissionsPicker,
+    providerPicker,
     secret,
     sessions,
-    skillsHub,
+    settingsPanel,
     sudo,
     tunePicker,
     widget,
@@ -51,13 +51,13 @@ export const $isBlocked = computed(
       approval ||
       clarify ||
       confirm ||
-      journey ||
       modelPicker ||
       pager ||
-      pluginsHub ||
+      permissionsPicker ||
+      providerPicker ||
       secret ||
       sessions ||
-      skillsHub ||
+      settingsPanel ||
       sudo ||
       tunePicker ||
       widget,
@@ -79,8 +79,8 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `pager`,
- *   `sessions`, `skillsHub`, `pluginsHub` — but ONLY when the rule sits at
+ * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `providerPicker`,
+ *   `pager`, `sessions` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
  *   over the `at="top"` rule and never reaches the `at="bottom"` one.
@@ -92,7 +92,7 @@ export const $isBlocked = computed(
  *   render in NORMAL FLOW above ComposerPane (`appLayout.tsx:553-568`): they
  *   push content down, they do not cover it.  The rule stays on screen and
  *   its clock must keep running.
- * - `agents`, `agentView` and `journey`.  They unmount the entire ComposerPane subtree
+ * - `agents` and `agentView`.  They unmount the entire ComposerPane subtree
  *   (`appLayout.tsx:553`), so `StatusRule` unmounts with it and React's own
  *   effect cleanup clears the intervals.  Gating on them would be dead code.
  * - `ambient` — a glanceable in-flow dock that reserves its own rows.
@@ -119,16 +119,17 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
   Boolean(
     overlay.modelPicker ||
     overlay.pager ||
-    overlay.pluginsHub ||
+    overlay.permissionsPicker ||
+    overlay.providerPicker ||
     overlay.sessions ||
-    overlay.skillsHub ||
+    overlay.settingsPanel ||
     overlay.tunePicker,
   );
 
 /**
  * A question to the user is open (approval, clarify, sudo/secret password,
- * confirm): it owns the keyboard. The /tune popup neither opens over one nor
- * reads a key while one is up.
+ * confirm): it owns the keyboard. The /tune and /provider popups neither open
+ * over one nor read a key while one is up.
  */
 export const tuneLocked = (
   overlay: Pick<
@@ -166,6 +167,17 @@ export const patchOverlayState = (
 /** Full reset — used by session/turn teardown and tests. */
 export const resetOverlayState = () => $overlayState.set(buildOverlayState());
 
+/** Open the /settings panel; false while a prompt is waiting for an answer. */
+export const openSettingsPanel = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ settingsPanel: true });
+
+  return true;
+};
+
 /** Open the /tune popup; false (nothing opened) while a prompt is waiting for an answer. */
 export const openTunePicker = (): boolean => {
   if (tuneLocked($overlayState.get())) {
@@ -173,6 +185,28 @@ export const openTunePicker = (): boolean => {
   }
 
   patchOverlayState({ tunePicker: true });
+
+  return true;
+};
+
+/** Open the /provider popup; false (nothing opened) while a prompt is waiting for an answer. */
+export const openProviderPicker = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ providerPicker: true });
+
+  return true;
+};
+
+/** Open the /permissions popup; false (nothing opened) while a prompt is waiting for an answer. */
+export const openPermissionsPicker = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ permissionsPicker: true });
 
   return true;
 };
@@ -194,10 +228,10 @@ export const resetFlowOverlays = () =>
     agentView: $overlayState.get().agentView,
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
-    journey: $overlayState.get().journey,
     modelPicker: $overlayState.get().modelPicker,
-    pluginsHub: $overlayState.get().pluginsHub,
+    permissionsPicker: $overlayState.get().permissionsPicker,
+    providerPicker: $overlayState.get().providerPicker,
     sessions: $overlayState.get().sessions,
-    skillsHub: $overlayState.get().skillsHub,
+    settingsPanel: $overlayState.get().settingsPanel,
     tunePicker: $overlayState.get().tunePicker,
   });

@@ -353,3 +353,90 @@ async def test_webhook_stop_cancels_running_actions():
     await asyncio.wait_for(started.wait(), 5)
     await srv.stop()
     assert cancelled == [True]
+
+
+async def _post_full(port, path, token, body="{}"):
+    """POST and return (status, headers, JSON body)."""
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(
+        f"POST {path} HTTP/1.1\r\nHost: x\r\nX-K3-Token: {token}\r\nContent-Length: {len(body)}\r\n\r\n{body}".encode()
+    )
+    await w.drain()
+    data = await r.read()
+    w.close()
+    head, _, payload = data.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+    return int(lines[0].split(" ", 2)[1]), headers, json.loads(payload)
+
+
+async def test_webhook_says_when_the_run_was_not_started(tmp_path):
+    """Issue #159: every authenticated POST got `202 {"ok": true}` and the run was then dropped (previous run still
+    going, cooldown, rate limit) with only an INFO log. The sender now hears 409 / 429 with a reason and Retry-After,
+    and 202 only when a run really started."""
+    gate = asyncio.Event()
+
+    class Slow(FakeRunner):
+        async def run_shell(self, command, cwd):
+            self.shells.append((command, cwd))
+            await gate.wait()
+            return 0, "ok"
+
+    c, db, r, m = mgr_for(tmp_path, Slow(), webhook_port=0)
+    await m.start()
+    busy = m.add(name="busy", trigger={"type": "webhook"}, action={"type": "shell", "command": "true"})
+    path, token = f"/hook/{busy['id']}", busy["trigger"]["token"]
+    status, _, body = await _post_full(m.webhook.port, path, token)
+    assert (status, body) == (202, {"ok": True})
+    await until(lambda: len(r.shells) == 1)
+    status, _, body = await _post_full(m.webhook.port, path, token)  # the first run is still going
+    assert status == 409 and body["ok"] is False and body["error"] == "busy" and "still going" in body["reason"]
+    gate.set()
+    await until(lambda: db.runs(busy["id"]) and db.runs(busy["id"])[0]["status"] == "completed")
+    assert len(r.shells) == 1 and db.get("automations", busy["id"])["fire_count"] == 1  # the 409 started nothing
+
+    cool = m.add(
+        name="cool",
+        trigger={"type": "webhook"},
+        action={"type": "notify", "text": "n"},
+        policy={"cooldown_s": 90},
+    )
+    path, token = f"/hook/{cool['id']}", cool["trigger"]["token"]
+    assert (await _post_full(m.webhook.port, path, token))[0] == 202
+    await until(lambda: db.get("automations", cool["id"])["fire_count"] == 1)
+    c._now += 30
+    status, headers, body = await _post_full(m.webhook.port, path, token)
+    assert status == 429 and body["error"] == "cooldown" and headers["retry-after"] == "60" == str(body["retry_after"])
+    c._now += 61
+    assert (await _post_full(m.webhook.port, path, token))[0] == 202
+
+    capped = m.add(
+        name="capped",
+        trigger={"type": "webhook"},
+        action={"type": "notify", "text": "n"},
+        policy={"max_per_hour": 2},
+    )
+    path, token = f"/hook/{capped['id']}", capped["trigger"]["token"]
+    assert (await _post_full(m.webhook.port, path, token))[0] == 202
+    await until(lambda: db.get("automations", capped["id"])["fire_count"] == 1)
+    c._now += 600
+    assert (await _post_full(m.webhook.port, path, token))[0] == 202
+    await until(lambda: db.get("automations", capped["id"])["fire_count"] == 2)
+    c._now += 600
+    status, headers, body = await _post_full(m.webhook.port, path, token)
+    # the oldest of the two runs leaves the hour 3600 - 1200 = 2400 s from now
+    assert status == 429 and body["error"] == "rate_limited" and headers["retry-after"] == "2400"
+    assert db.get("automations", capped["id"])["fire_count"] == 2
+    await m.stop()
+
+
+async def test_webhook_server_answers_a_handler_rejection():
+    from k3code.automation.webhook import Rejected
+
+    srv = WebhookServer(0)
+    port = await srv.start()
+    srv.register("abc", "s3cret", lambda event: Rejected(429, "cooldown", "wait", retry_after=7))
+    status, headers, body = await _post_full(port, "/hook/abc", "s3cret")
+    assert status == 429 and headers["retry-after"] == "7"
+    assert body == {"ok": False, "error": "cooldown", "reason": "wait", "retry_after": 7}
+    await srv.stop()

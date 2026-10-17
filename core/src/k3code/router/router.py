@@ -36,17 +36,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.providers.base import Provider
+from k3code.providers.base import Provider, ProviderDeadline
 from k3code.providers.retry_utils import jittered_backoff
+from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
     FailoverReason,
     classify_api_error,
     summarize,
 )
-from k3code.router.cooldown import CooldownStore, key_fingerprint
+from k3code.router.cooldown import BREAKER_REASONS, CooldownStore, key_fingerprint
 
 logger = logging.getLogger(__name__)
+
+#: retries of the same entry after a stream stalled (see providers/stall.py)
+STALL_RETRIES = 1
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -79,8 +83,8 @@ class ChainEntry:
         return not getattr(self.provider, "api_key", "")
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower())
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.provider_name.lower(), self.model.lower(), self.base_url.lower(), self.key_fingerprint)
 
 
 def build_chain(providers: Sequence[Provider], models: Sequence[str | Sequence[str]]) -> list[ChainEntry]:
@@ -232,12 +236,15 @@ class Router:
         all_network = True  # tracks "every failure so far was a network failure"
         all_auth = True  # tracks "every failure and every cooldown seen so far was an auth rejection"
         auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
-        entry_index = 0
-        while entry_index < len(self.chain):
-            entry = self.chain[entry_index]
-            target_model = model if entry_index == 0 and model else entry.model
+        skipped = False  # an entry was passed over for a cooldown armed before this walk
+        tried: set[int] = set()  # chain indices already attempted this walk (failover never repeats one)
+        chain_index = self._first_entry(model, tried)  # first try stays chain order; health picks failover targets
+        while chain_index is not None:
+            entry = self.chain[chain_index]
+            target_model = model if chain_index == 0 and model else entry.model
             skip_reason = self._skip_in_cooldown(entry, target_model)
             if skip_reason is not None:
+                skipped = True
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
                     entry.provider_name,
@@ -249,14 +256,17 @@ class Router:
                     provider=entry.provider_name,
                     model=target_model,
                     base_url=entry.base_url,
+                    account=entry.key_fingerprint,
                     fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
-                entry_index += 1
+                tried.add(chain_index)
+                chain_index = self._next_target(model, tried)
                 continue
+            tried.add(chain_index)
             attempt = 0
             while True:
                 self._emit("router.attempt", entry, attempt=attempt + 1)
@@ -268,7 +278,10 @@ class Router:
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
                             self.cooldowns.record_success(
-                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                                provider=entry.provider_name,
+                                model=target_model,
+                                base_url=entry.base_url,
+                                account=entry.key_fingerprint,
                             )
                         yield event
                     # The provider yields its "done" event then closes normally.
@@ -277,11 +290,17 @@ class Router:
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)
+                    self.cooldowns.record_failure(
+                        provider=entry.provider_name,
+                        model=target_model,
+                        base_url=entry.base_url,
+                        account=entry.key_fingerprint,
+                    )
                     failure_hint = classified.hint or failure_hint
                     all_network = all_network and classified.reason is FailoverReason.network
                     all_auth = all_auth and classified.reason is FailoverReason.auth
                     if classified.reason is FailoverReason.auth:
-                        auth_failed.add(entry_index)
+                        auth_failed.add(chain_index)
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
                     if streamed:
@@ -290,20 +309,47 @@ class Router:
                         streamed = False
                         yield StreamEvent(type="reset")
                     cooldown = self._cooldown_seconds(classified)
-                    if cooldown is not None or classified.immediate_failover:
+                    if cooldown is not None or (classified.immediate_failover and not self._honor_inline(classified)):
                         self._failover(
                             entry,
                             target_model,
                             classified.reason,
                             attempt,
                             exc,
-                            entry_index=entry_index,
+                            entry_index=chain_index,
                             retry_after=cooldown,
+                            model_override=model,
+                            tried=tried,
                         )
                         break
-                    # retryable: same entry with backoff, max_retries times, then fail over
-                    if attempt >= self.max_retries:
-                        self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
+                    # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
+                    # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
+                    breaker = classified.reason in BREAKER_REASONS
+                    if isinstance(exc, ProviderDeadline):
+                        retries = 0
+                    elif is_stall(exc):
+                        retries = min(self.max_retries, STALL_RETRIES)
+                    elif breaker and self.cooldowns.tripped(
+                        provider=entry.provider_name,
+                        model=target_model,
+                        base_url=entry.base_url,
+                        account=entry.key_fingerprint,
+                    ):
+                        retries = 0  # the half-open probe failed: one request, then the breaker reopens (doubled)
+                    else:
+                        retries = self.max_retries
+                    if attempt >= retries:
+                        self._failover(
+                            entry,
+                            target_model,
+                            classified.reason,
+                            attempt,
+                            exc,
+                            entry_index=chain_index,
+                            retry_after=classified.retry_after if breaker else None,
+                            model_override=model,
+                            tried=tried,
+                        )
                         break
                     attempt += 1
                     delay = self._backoff_for(classified, attempt)
@@ -325,7 +371,7 @@ class Router:
                         extra={"delay": delay},
                     )
                     await self._sleep(delay)
-            entry_index += 1
+            chain_index = self._next_target(model, tried)
         # every entry exhausted
         self._emit_exhausted(last_reason, last_detail)
         if all_network and last_reason is not None:
@@ -334,6 +380,11 @@ class Router:
             )
         reason_name = last_reason.value if last_reason else "unknown"
         wait = self.earliest_reset(model, auth_failed=auth_failed)
+        if wait is not None and last_reason in BREAKER_REASONS and not skipped:
+            # Every entry failed in this very walk: the call reports its failure now, as before the breaker (an
+            # interactive turn fails fast, an unattended run parks on its own ladder). The windows just armed only
+            # change the next calls: they skip the entry, or wait for its window when it is the only one.
+            wait = None
         if last_reason is FailoverReason.auth and all_auth:
             # Not a rate limit: waiting does not help, only a new key does (the entries are cooling down so the next
             # call does not hammer them). No retry_after, so the persistent retry layer fails now instead of parking.
@@ -347,8 +398,9 @@ class Router:
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
+            state = "cooling down after failures" if last_reason in BREAKER_REASONS else "rate-limited"
             raise ChainExhausted(
-                f"all providers rate-limited until {clock} ({reason_name})",
+                f"all providers {state} until {clock} ({reason_name})",
                 last_reason=reason_name,
                 retry_after=wait,
                 until=until,
@@ -361,10 +413,23 @@ class Router:
 
     # ── helpers ──
 
+    def _honor_inline(self, classified) -> bool:
+        """Whether a declared Retry-After is short enough to sleep on instead of cooling down.
+
+        Quota and rate-limit resets within ``max_inline_wait`` are honored inline with a
+        same-entry retry; longer (or missing) windows arm a cooldown and fail over at once.
+        """
+        declared = classified.retry_after
+        return (
+            classified.reason in (FailoverReason.quota, FailoverReason.rate_limit)
+            and declared is not None
+            and 0 < declared <= self.max_inline_wait
+        )
+
     def _cooldown_seconds(self, classified) -> float | None:
         """Cooldown to arm (and fail over immediately) instead of retrying inline; None = retry as usual."""
         declared = classified.retry_after
-        if classified.reason is FailoverReason.quota:
+        if classified.reason is FailoverReason.quota and not self._honor_inline(classified):
             return float(declared) if declared and declared > 0 else self.quota_cooldown
         if classified.reason is FailoverReason.rate_limit and declared and declared > self.max_inline_wait:
             return float(declared)
@@ -383,16 +448,28 @@ class Router:
             target = model if index == 0 and model else entry.model
             fp = entry.key_fingerprint
             if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             ):
                 if index in auth_failed:
                     continue
                 return None
             left = self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             cooled = self.cooldowns.reason_of(
-                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
@@ -410,12 +487,94 @@ class Router:
             return None
         fp = entry.key_fingerprint
         if self.cooldowns.in_cooldown(
-            provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+            provider=entry.provider_name,
+            model=model,
+            base_url=entry.base_url,
+            account=fp,
+            fingerprint=fp,
         ):
             return self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+                provider=entry.provider_name,
+                model=model,
+                base_url=entry.base_url,
+                account=fp,
+                fingerprint=fp,
             )
         return None
+
+    def _target_model(self, index: int, model: str | None) -> str:
+        """Model the walk uses for chain entry ``index`` (an explicit override wins on the first entry)."""
+        entry = self.chain[index]
+        return model if index == 0 and model else entry.model
+
+    def _entry_health(self, index: int, model: str | None) -> tuple[int, int, float, int]:
+        """Failover-target sort key: last-known-good first, then fewest consecutive failures,
+        then most-recent success, then chain order. Cooling entries are filtered before sorting
+        (they are skipped, never tried), so the key only ranks working candidates.
+        """
+        entry = self.chain[index]
+        target = self._target_model(index, model)
+        is_good = (
+            self.cooldowns is not None
+            and self.cooldowns.last_good is not None
+            and (entry.provider_name.lower(), target.lower(), entry.base_url.lower(), entry.key_fingerprint)
+            == self.cooldowns.last_good
+        )
+        failures = (
+            self.cooldowns.failure_count(
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=entry.key_fingerprint,
+            )
+            if self.cooldowns is not None
+            else 0
+        )
+        last_ok = (
+            self.cooldowns.last_success_at(
+                provider=entry.provider_name,
+                model=target,
+                base_url=entry.base_url,
+                account=entry.key_fingerprint,
+            )
+            if self.cooldowns is not None
+            else None
+        )
+        return (0 if is_good else 1, failures, -(last_ok or 0.0), index)
+
+    def _cooling(self, index: int, model: str | None) -> bool:
+        """Whether chain entry ``index`` is in active cooldown (failover skips it)."""
+        if self.cooldowns is None:
+            return False
+        entry = self.chain[index]
+        target = self._target_model(index, model)
+        fp = entry.key_fingerprint
+        return self.cooldowns.in_cooldown(
+            provider=entry.provider_name,
+            model=target,
+            base_url=entry.base_url,
+            account=fp,
+            fingerprint=fp,
+        )
+
+    def _first_entry(self, model: str | None, tried: set[int]) -> int | None:
+        """First entry to try: chain order, skipping cooling entries (existing behavior)."""
+        for i in range(len(self.chain)):
+            if i not in tried and not self._cooling(i, model):
+                return i
+        for i in range(len(self.chain)):
+            if i not in tried:
+                return i
+        return None
+
+    def _next_target(self, model: str | None, tried: set[int]) -> int | None:
+        """Next-best WORKING failover target: untried, not cooling, last-known-good first,
+        then fewest consecutive failures, then most-recent success, then chain order."""
+        candidates = [i for i in range(len(self.chain)) if i not in tried and not self._cooling(i, model)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda i: self._entry_health(i, model))
+        return candidates[0]
 
     def _failover(
         self,
@@ -427,6 +586,8 @@ class Router:
         *,
         entry_index: int,
         retry_after: float | None = None,
+        model_override: str | None = None,
+        tried: Collection[int] | None = None,
     ) -> None:
         # Without a declared long window jittered_backoff already separated the retries; the cooldown
         # then uses its own ladder.
@@ -435,11 +596,12 @@ class Router:
             provider=entry.provider_name,
             model=target_model,
             base_url=entry.base_url,
+            account=entry.key_fingerprint,
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
         )
-        if retry_after is not None and armed:
+        if armed and (retry_after is not None or reason in BREAKER_REASONS):
             self._emit(
                 "router.cooldown",
                 entry,
@@ -448,8 +610,15 @@ class Router:
                 detail=f"cooling down {armed:.0f}s: {summarize(exc)}",
                 extra={"seconds": armed, "until": self.cooldowns.wall() + armed},
             )
-        next_index = entry_index + 1
-        next_entry = self.chain[next_index] if next_index < len(self.chain) else None
+        # The event names the entry the walk will actually try next (health-aware target,
+        # not just the next chain position).
+        next_entry: ChainEntry | None = None
+        if tried is not None:
+            nxt = self._next_target(model_override, set(tried))
+            next_entry = self.chain[nxt] if nxt is not None else None
+        else:
+            nxt = entry_index + 1
+            next_entry = self.chain[nxt] if nxt < len(self.chain) else None
         self._emit(
             "router.failover",
             entry,
@@ -481,17 +650,19 @@ class Router:
     ) -> None:
         if self.on_event is None:
             return
-        self.on_event(
-            RouterEvent(
-                kind=kind,
-                provider=entry.provider_name if entry else "",
-                model=(entry.model if entry else "") or (extra or {}).get("model", ""),
-                attempt=attempt,
-                reason=reason,
-                detail=detail,
-                extra={**(extra or {}), "tier": self.tier},
-            )
+        event = RouterEvent(
+            kind=kind,
+            provider=entry.provider_name if entry else "",
+            model=(entry.model if entry else "") or (extra or {}).get("model", ""),
+            attempt=attempt,
+            reason=reason,
+            detail=detail,
+            extra={**(extra or {}), "tier": self.tier},
         )
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001 - a sink that fails (a client gone mid-turn) must not abort the walk (#148)
+            logger.warning("router event sink failed on %s", kind, exc_info=True)
 
 
 class ProviderStreamError(Exception):

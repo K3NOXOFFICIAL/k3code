@@ -18,11 +18,30 @@ from k3code.autonomy.proposals import ProposalStore, propose
 from k3code.autonomy.scope import ScopeLog, ScopeVerdict
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
+from k3code.prompting import build_system_prompt
 from k3code.routing.tiers import TaskKind, Tier
 
 logger = logging.getLogger(__name__)
 
 PLAN_SECTIONS = ("Goal", "Steps", "Files", "Risks", "Verification", "Estimate")
+
+
+def planner_permissions(perms: PermissionState) -> PermissionState:
+    """The permissions of a planning turn for the session whose permissions are ``perms``: plan mode (read-only: no
+    bash, no edits, no other side-effect tool, whatever a rule says), the session's roots and project, its session
+    approvals (the same list, so a read approved for the session is not asked again while planning, and one approved
+    while planning holds for the turn after it), and for reads outside the roots the session's own policy
+    (``plan_for``): in an auto session a toolchain read runs and any other is refused with a hint, as in the turn that
+    carries out the plan, instead of asking a person (engine.decide)."""
+    return PermissionState(
+        mode=PermissionMode.PLAN,
+        cwd=perms.cwd,
+        add_dirs=list(perms.add_dirs),
+        session_rules=perms.session_rules,
+        project_dir=perms.project_dir,
+        plan_for=perms.mode,
+    )
+
 
 PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
@@ -89,7 +108,10 @@ class PlanFirst:
         return autonomy_cfg(self.server.config)
 
     def gate_applies(self, session: Any) -> bool:
-        cfg = self.cfg
+        # the session's own settings: a concurrent config experiment on gate_modes reaches its treatment arm only
+        from k3code.learning.optimizer import session_settings
+
+        cfg = autonomy_cfg(session_settings(self.server.config, getattr(session, "session_id", None)))
         if session.background and not cfg["gate_unattended"]:
             return False  # unattended runs are pre-approved: nobody is there to approve a plan
         override = getattr(session, "scope_override", None)
@@ -173,6 +195,20 @@ class PlanFirst:
             return GateResult(prompt=text, verdict=verdict, scope_hash=h)
 
         captured = await self._planning_turn(session, text, verdict)
+        if not captured.approved and self._run_unplanned(session, verdict, captured):
+            # The planner spent its turns exploring and never produced a plan (nobody refused one). In auto mode,
+            # below high risk, the task runs directly instead of being dropped with "Plan not approved".
+            logger.warning("planner produced no plan for session %s; running the task directly", sid)
+            session.emit(
+                "notification.show",
+                {
+                    "text": "The planner produced no plan; running the task directly.",
+                    "level": "warning",
+                    "kind": "info",
+                    "key": "plan",
+                },
+            )
+            return GateResult(prompt=text, verdict=verdict, scope_hash=h)
         if not captured.approved:
             return GateResult(
                 prompt=text,
@@ -181,10 +217,15 @@ class PlanFirst:
                 scope_hash=h,
                 message="Plan not approved; nothing was executed. Rephrase the task or send it again.",
             )
+        # no proposer pass on the plan: ``finish`` runs one after the task, when there is a result to propose from
         prompt = f"{text}\n\nApproved plan (follow it):\n{captured.plan}"
-        if self.cfg["proposals"]:
-            self.spawn(self.propose_from(session, f"Task: {text}\n\nPlan:\n{captured.plan}"))
         return GateResult(prompt=prompt, verdict=verdict, plan=captured.plan, scope_hash=h)
+
+    @staticmethod
+    def _run_unplanned(session: Any, verdict: ScopeVerdict, captured: _Captured) -> bool:
+        """No plan came out of the planning turn, and auto mode would have approved one: run the task directly.
+        A plan somebody refused (high risk asks) stays refused."""
+        return not captured.plan and session.perms.mode is PermissionMode.AUTO and verdict.risk != "high"
 
     # ── planning turn ──
 
@@ -235,10 +276,22 @@ class PlanFirst:
                 return cap.mode
             return None
 
-        perms = PermissionState(mode=PermissionMode.PLAN, cwd=session.perms.cwd, add_dirs=list(session.perms.add_dirs))
+        perms = planner_permissions(session.perms)
+        # The same composed prompt as the session's normal loop (project memory, facts, gotchas, style, overlay), so
+        # the plan follows the rules the execution turn runs under. No skills index, MCP names or advisor note: this
+        # loop has none of those tools.
+        base = build_system_prompt(
+            session.system_prompt,
+            cwd=session.perms.cwd,
+            config=server.config,
+            session_meta=session.stored.meta,
+            skills=False,
+            advisor=False,
+            session_id=session.session_id,
+        )
         loop = AgentLoop(
             router,
-            system_prompt=session.system_prompt + PLAN_ADDENDUM,
+            system_prompt=base + PLAN_ADDENDUM,
             max_turns=8,
             headless=False,
             on_event=server._on_router_event,
@@ -258,20 +311,34 @@ class PlanFirst:
         if verdict.suggested_subtasks:
             mark = " (parallelizable)" if verdict.parallelizable else ""
             prompt += f"\nSuggested subtasks{mark}: " + "; ".join(verdict.suggested_subtasks)
+        # The conversation so far goes in as a condensed transcript (long tool results clipped, the old part
+        # summarized on the cheap tier past ``advisor_compact_chars``), not as the full message history: the planner
+        # needs the context, not every byte of it.
+        ctx = await advisor_mod.condensed_context(
+            server.model_caller,
+            session.stored.messages,
+            threshold=int(self.cfg["advisor_compact_chars"]),
+            session_id=sid,
+        )
+        if ctx:
+            prompt += f"\n\nConversation so far:\n{ctx}"
         last_text = ""
-        async for event in loop.run(prompt, max_tokens=server.config.max_tokens, history=session.history):
+        async for event in loop.run(prompt, max_tokens=server.config.max_tokens, history=[]):
             server._on_stream_event(session, event)
             if event.type == "done" and event.message and event.message.role == "assistant" and event.message.content:
                 last_text = event.message.content
-        if not cap.plan and last_text.strip() and not loop.interrupted:
-            await on_plan(last_text.strip())  # the model answered with a plan but skipped exit_plan
+        if not cap.plan and last_text.strip() and not loop.interrupted and not loop.escalation_reason:
+            # the model answered with a plan but skipped exit_plan; a loop-guard or tool-error stop notice is not one
+            await on_plan(last_text.strip())
         if not cap.approved:
             if cap.plan:
                 show("rejected")
             return cap
 
         extra: dict[str, Any] = {"auto_approved": cap.auto}
-        if self.advisor_applies(session, "advisor_on_plan"):
+        # a strong-tier critique is worth its call for a large/huge or high-risk plan; a medium one runs as approved
+        weighty = verdict.scope in ("large", "huge") or verdict.risk == "high"
+        if weighty and self.advisor_applies(session, "advisor_on_plan"):
             try:
                 extra["advisor"] = await advisor_mod.advise(
                     server.model_caller,

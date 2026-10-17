@@ -108,8 +108,12 @@ export interface ApprovalReq {
   description: string;
   /** Per-choice label overrides (e.g. exit_plan: once → "Approve plan"). */
   labels?: Record<string, string>;
+  /** write/edit: what the call would change, as a unified diff (capped by the gateway). */
+  preview?: string;
   /** Server→client request id; the answer is the response frame for it. */
   requestId: string;
+  /** The rules "session"/"always" add, as /permissions lists them (`allow bash touch * [project]`); [] = none. */
+  rules?: Partial<Record<"always" | "session", string[]>>;
   smartDenied?: boolean;
 }
 
@@ -150,6 +154,9 @@ export interface Msg {
   // rehydrate, wall clock at append time for live rows). Rendered as a dim
   // [HH:MM] label when `display.timestamps` is on (#41531).
   createdAt?: number;
+  // Set only on the "N earlier rows not shown" event row that
+  // capTranscriptHistory leaves where it trimmed; carries the running total.
+  hiddenRows?: number;
   thinking?: string;
   // MoA reference-model output stored in `thinking` (see turnController's
   // recordMoaReference): unlike ordinary model reasoning, this is the

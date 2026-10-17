@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 DEFAULTS: dict[str, Any] = {
@@ -13,11 +14,15 @@ DEFAULTS: dict[str, Any] = {
     #: unattended bash (goal continuations, sub-agents, background runs) keeps the network inside the sandbox;
     #: off = no network (bwrap cannot filter by host, so this is all or nothing)
     "unattended_network": False,
-    #: advisor critique after plan approval / before a goal is declared done (auto mode)
+    #: advisor critique after plan approval (large/huge scope or high risk only) / before a goal is declared done
+    #: (auto mode)
     "advisor_on_plan": True,
     "advisor_on_goal": True,
     "advisor_modes": ["auto"],
-    #: proposer pass after a plan and after a task
+    #: session advisor the main model can consult through the ``advisor`` tool: a model key, "strong" (the strong
+    #: tier) or "" (off). ``/advisor <key>`` sets it per session; ``/advisor <key> --default`` writes this key
+    "advisor": "",
+    #: proposer pass after a finished task (none on the plan)
     "proposals": True,
     #: an interactive task the scope gate calls "trivial" starts on the cheap tier and escalates when it stalls
     #: (GOAL B5: route unimportant work to cheaper models, escalating when they struggle)
@@ -33,15 +38,25 @@ DEFAULTS: dict[str, Any] = {
     "escalate_main": True,
     #: an interactive prompt with no /goal of its own runs as an implicit goal: the cheap judge reads each reply and a
     #: continuation prompt drives the next turn until it says done or blocked, so a model that stops early ("next I
-    #: would…") carries on. Costs one judge call per turn; opt-in. Never for background, cron, loop or automation
-    #: turns, sub-agents or ``k3code -p``; an implicit goal ends cleared, never paused (see GoalState.implicit)
-    "auto_continue": False,
+    #: would…") carries on. Costs one judge call per turn. "auto" = on in the auto and yolo permission modes, off in
+    #: the others; true/false force it. Never for background, cron, loop or automation turns, sub-agents or
+    #: ``k3code -p``, nor for a prompt the scope gate rates trivial or a plain question; an implicit goal ends
+    #: cleared, never paused (see GoalState.implicit)
+    "auto_continue": "auto",
+    #: judged turns an implicit goal may run, the prompt's own turn included (0 = no cap); at the cap it ends with a
+    #: notice, and the next prompt ("continue") starts a fresh one
+    "auto_continue_max_turns": 8,
     #: name a new session from its first prompt (one cheap-tier call, background); opt-in
     "auto_title": False,
     "preview_timeout": 30,
     "advisor_compact_chars": 24000,
     #: M4b: parallel sub-agent execution of large/huge plans
     #: ``panes``: inside k3 panes, open one read-only pane per child
+    #: ``max_tokens``/``max_agents``: the budget of one auto fan-out (issue #136; /ultracode passes its own). Children
+    #: are not started once their tokens reach ``max_tokens`` (0 = no token cap) or ``max_agents`` children ran
+    #: (workers, reviewers and reworks each count; a worker only starts while a reviewer slot is left for it and for
+    #: the workers already running; 0 = 4 per subtask, at most 16); a value that is not a non-negative whole number
+    #: counts as unset; what is left goes to the parent
     "fanout": {
         "enabled": True,
         "panes": False,
@@ -49,6 +64,8 @@ DEFAULTS: dict[str, Any] = {
         "require_tests": True,
         "test_command": "",
         "test_timeout": 600,
+        "max_tokens": 1_000_000,
+        "max_agents": 0,
     },
 }
 
@@ -62,6 +79,70 @@ ULTRACODE_KEYS = frozenset({"max_tokens", "max_agents", "min_scope"})
 #: ``ultracode.min_scope`` default: with the ultracode mode on, a prompt at least this big runs the pipeline
 #: (``small`` = everything except ``trivial``: answers and one located edit).
 DEFAULT_MIN_SCOPE = "small"
+
+
+#: Permission modes in which ``autonomy.auto_continue: auto`` turns auto-continue on: nobody approves each step there,
+#: so a turn that stops early ("next I would…") is the model waiting for nothing.
+AUTO_CONTINUE_MODES = frozenset({"auto", "yolo"})
+
+
+def auto_continue_setting(value: Any) -> bool | str | None:
+    """A valid ``autonomy.auto_continue``: True, False or "auto"; None for anything else. YAML gives the booleans;
+    the strings ``true``/``false``/``on``/``off``/``yes``/``no`` (a value set from an environment or a CLI) count as
+    them, in any case."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word == "auto":
+            return "auto"
+        if word in ("true", "on", "yes", "1"):
+            return True
+        if word in ("false", "off", "no", "0"):
+            return False
+    return None
+
+
+def auto_continue_max_turns(value: Any) -> int | None:
+    """A valid ``autonomy.auto_continue_max_turns``: a non-negative whole number (``8``, ``"8"``, ``8.0``); None for
+    anything else (``"eight"``, ``-1``, ``2.5``, ``true``, ``null``)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def auto_continue_on(cfg: dict[str, Any], mode: str) -> bool:
+    """``autonomy.auto_continue`` for a session in permission ``mode``: true/false force it, "auto" follows the mode.
+    An invalid value (config load warned about it) counts as the default, "auto"."""
+    value = auto_continue_setting(cfg.get("auto_continue"))
+    if value is None:
+        value = DEFAULTS["auto_continue"]
+    if value == "auto":
+        return str(mode) in AUTO_CONTINUE_MODES
+    return bool(value)
+
+
+def auto_continue_turns(cfg: dict[str, Any]) -> int:
+    """``autonomy.auto_continue_max_turns`` (0 = no cap); an invalid value (config load warned about it) counts as the
+    default, so a typo never removes the cap."""
+    value = auto_continue_max_turns(cfg.get("auto_continue_max_turns"))
+    return DEFAULTS["auto_continue_max_turns"] if value is None else value
+
+
+_REQUEST_OPENER = re.compile(
+    r"^\s*(please\b|(can|could|would|will|won't|shall)\s+(you|we)\b|why\s+don'?t\s+(you|we)\b)", re.IGNORECASE
+)
+
+
+def is_plain_question(text: str) -> bool:
+    """A one-line prompt ending in ``?`` that is not a request phrased as one ("can you fix…?"): an answer ends it,
+    so auto-continue leaves it alone. Kept narrow on purpose: a task missed here only costs a judge call."""
+    t = text.strip()
+    return bool(t) and "\n" not in t and t.endswith("?") and not _REQUEST_OPENER.match(t)
 
 
 def autonomy_cfg(config: Any) -> dict[str, Any]:

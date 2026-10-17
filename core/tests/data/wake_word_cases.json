@@ -415,5 +415,145 @@
   ],
   "mode": "ultracode",
   "task": "x ``` y z"
+ },
+ {
+  "input": "'/tmp/my ultracode file.txt'",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "\"/tmp/my ultracode file.txt\"",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "@\"/tmp/my ultracode file.txt\"",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "look at @\"/tmp/my ultraplan notes.txt\" please",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "open /tmp/my\\ ultracode\\ file.txt",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "open /tmp/my\\ ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "read 'my ultraresearch notes.txt' and 'b.txt'",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "fix 'a b' and ultracode \"c d\"",
+  "mode": "ultracode",
+  "task": "fix 'a b' and \"c d\""
+ },
+ {
+  "input": "don't stop, ultracode it's fine",
+  "mode": "ultracode",
+  "task": "don't stop, it's fine"
+ },
+ {
+  "input": "the users' ultracode runs again",
+  "mode": "ultracode",
+  "task": "the users' runs again"
+ },
+ {
+  "input": "fix `it's` then ultracode the loop",
+  "mode": "ultracode",
+  "task": "fix `it's` then the loop"
+ },
+ {
+  "input": "ultracode he said 'x",
+  "mode": "ultracode",
+  "task": "he said 'x"
+ },
+ {
+  "input": "ultracode 'a b' c",
+  "mode": "ultracode",
+  "task": "'a b' c"
+ },
+ {
+  "input": "~/my\\ ultraplan\\ notes.txt",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "fanout implement the login form",
+  "mode": "fanout",
+  "task": "implement the login form"
+ },
+ {
+  "input": "Fanout: split this into parallel tasks",
+  "mode": "fanout",
+  "task": "split this into parallel tasks"
+ },
+ {
+  "input": "implement the login form, fanout",
+  "mode": "fanout",
+  "task": "implement the login form"
+ },
+ {
+  "input": "fanout",
+  "mode": "fanout",
+  "task": ""
+ },
+ {
+  "input": "ultrasketch a settings page",
+  "mode": "ultrasketch",
+  "task": "a settings page"
+ },
+ {
+  "input": "Ultrasketch: the new onboarding flow",
+  "mode": "ultrasketch",
+  "task": "the new onboarding flow"
+ },
+ {
+  "input": "ultrasketch",
+  "mode": "ultrasketch",
+  "task": ""
+ },
+ {
+  "input": "ultrareview staged",
+  "mode": "ultrareview",
+  "task": "staged"
+ },
+ {
+  "input": "ultrareview",
+  "mode": "ultrareview",
+  "task": ""
+ },
+ {
+  "input": "what is the difference between fanout and ultraplan?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "fanout this and then ultraplan that",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultrasketch this and then ultrareview that",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does \"fanout\" do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "look at src/fanout.py",
+  "mode": null,
+  "task": null
  }
 ]

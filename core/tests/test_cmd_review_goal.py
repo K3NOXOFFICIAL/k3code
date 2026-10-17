@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 
@@ -23,17 +24,24 @@ FINDINGS = json.dumps(
 )
 
 
+async def _review_output(server, provider, line, sid) -> str:
+    """Run /review (now a job) and return the assistant message it ends with."""
+    before = len(provider.seen)
+    res = await cmd(server, line, sid)
+    await asyncio.wait_for(server.live[sid].turn_task, 20)
+    assert len(provider.seen) == before + 1, res
+    return server.live[sid].stored.messages[-1]["content"]
+
+
 async def test_review_unstaged_diff(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     (repo / "a.py").write_text("x = 99\n")
     server, provider = make_server(tmp_path, monkeypatch, replies=["```json\n" + FINDINGS + "\n```"])
     sid = await new_session(server, repo)
 
-    res = await cmd(server, "/review", sid)
-    out = res["output"]
+    out = await _review_output(server, provider, "/review", sid)
     assert "2 finding(s)" in out and out.index("[P0]") < out.index("[P2]")  # sorted by severity
     assert "a.py:1" in out and "issue: x is wrong" in out and "suggestion: set x = 2" in out
-    assert res["review"]["findings"][0]["severity"] == "P0"
     system, user = provider.seen[0][0].content, provider.seen[0][1].content
     assert "Review guidelines" in system and "Apache-2.0" in system  # vendored rubric + notice
     assert "+x = 99" in user and "-x = 1" in user
@@ -50,8 +58,9 @@ async def test_review_unstaged_diff(tmp_path, monkeypatch):
 
 async def _user_for(server, provider, line, sid) -> str:
     before = len(provider.seen)
-    await cmd(server, line, sid)
-    assert len(provider.seen) == before + 1
+    res = await cmd(server, line, sid)
+    await asyncio.wait_for(server.live[sid].turn_task, 20)
+    assert len(provider.seen) == before + 1, res
     return provider.seen[-1][1].content
 
 
@@ -62,7 +71,8 @@ async def test_review_edge_cases(tmp_path, monkeypatch):
     assert "Nothing to review" in (await cmd(server, "/review", sid))["output"]
     assert "Not a review target" in (await cmd(server, "/review nonsense", sid))["output"]
     (repo / "a.py").write_text("x = 2\n")
-    assert "Review failed" in (await cmd(server, "/review", sid))["output"]  # reviewer returned junk
+    out = await _review_output(server, provider, "/review", sid)
+    assert "Review failed" in out  # reviewer returned junk
     assert provider.n == 1
     plain = tmp_path / "plain"
     plain.mkdir()
@@ -93,7 +103,7 @@ async def test_goal_cleared_or_replaced_during_the_judge_is_not_resurrected():
     for meddle in (mgr.clear, mgr.pause, lambda: mgr.set("another goal")):
         mgr.set("ship it")
 
-        async def judge(goal, response, meddle=meddle):
+        async def judge(goal, response, evidence="", meddle=meddle):
             meddle()
             return "continue", "keep going", False, False
 
@@ -109,7 +119,7 @@ async def test_goal_cleared_or_replaced_during_the_judge_is_not_resurrected():
 def scripted_judge(verdicts):
     calls: list[tuple[str, str]] = []
 
-    async def judge(goal: str, response: str):
+    async def judge(goal: str, response: str, evidence: str = ""):
         calls.append((goal, response))
         v = verdicts[min(len(calls) - 1, len(verdicts) - 1)]
         return v, f"verdict {v}", False, False

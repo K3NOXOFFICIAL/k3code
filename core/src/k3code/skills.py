@@ -12,7 +12,7 @@ from k3code.paths import home
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
 MAX_DEPTH = 4
-PROMPT_LIMIT = 60  # skills named in the system prompt; the rest are reachable via the skill tool
+PROMPT_LIMIT = 30  # skills named in the system prompt; the rest are reachable via the skill tool
 
 
 @dataclass
@@ -21,8 +21,14 @@ class Skill:
     description: str
     path: Path
 
+    #: The most of one SKILL.md the skill tool answers with: an uncapped skill file lands whole in the prompt.
+    MAX_TEXT_CHARS = 8000
+
     def text(self) -> str:
-        return self.path.read_text(encoding="utf-8", errors="replace")
+        text = self.path.read_text(encoding="utf-8", errors="replace")
+        if len(text) <= self.MAX_TEXT_CHARS:
+            return text
+        return text[: self.MAX_TEXT_CHARS] + f"\n…[{len(text) - self.MAX_TEXT_CHARS} more chars in {self.path}]"
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:
@@ -90,6 +96,8 @@ def find_markers(root: Path) -> list[Path]:
 
 #: root → (signature of its SKILL.md files, the skills parsed from them). discover() runs on every prompt build and
 #: at every turn end; with the cache a root is only walked (directory listings and stats), not read and parsed again.
+#: Capped: the gateway is long-lived, so one entry per distinct cwd/session root would grow forever.
+_CACHE_MAX = 256
 _CACHE: dict[Path, tuple[tuple[tuple[str, int, int], ...], list[Skill]]] = {}
 
 
@@ -121,6 +129,8 @@ def _root_skills(root: Path) -> list[Skill]:
         name = fm.get("name") or marker.parent.name
         found.append(Skill(name, " ".join(fm.get("description", "").split()), marker))
     _CACHE[root] = (sig, found)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
     return found
 
 
@@ -194,7 +204,7 @@ def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None, limit: 
     lines = ["## Skills", "", "Load a skill's full instructions with the `skill` tool (`name`, or `query` to search)."]
     chosen = sorted(rank_skills(skills, cwd)[:limit], key=lambda s: s.name) if len(skills) > limit else skills
     for s in chosen:
-        desc = s.description if len(s.description) <= 110 else s.description[:107] + "..."
+        desc = s.description if len(s.description) <= 90 else s.description[:87] + "..."
         lines.append(f"- {s.name}: {desc}")
     if len(skills) > limit:
         lines.append(f"- …and {len(skills) - limit} more; use `skill` with a `query` to find them.")

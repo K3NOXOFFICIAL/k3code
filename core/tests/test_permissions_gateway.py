@@ -6,9 +6,13 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from k3code.config import ProviderEntry, Settings
 from k3code.gateway.server import GatewayServer
 from k3code.gateway.sessions import SessionStore
+from k3code.permissions import Rule
+from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.router import Router, build_chain
 
@@ -47,6 +51,9 @@ def bash(cmd: str, id: str = "c1") -> ToolCall:
 def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str = "default", **cfg):
     monkeypatch.setenv("K3CODE_HOME", str(tmp.parent / f"{tmp.name}-k3home"))  # beside, not inside, the project
     store = SessionStore(tmp / "sessions.db")
+    # these turns are scripted one reply per model call: auto-continue (on by default in auto/yolo) would add judge
+    # calls and continuation turns; tests about it ask for it (test_auto_continue)
+    cfg["autonomy"] = {"auto_continue": False, **(cfg.get("autonomy") or {})}
     config = Settings(
         # a closed localhost port: background calls fail at once (no DNS lookup of a made-up host)
         providers=[ProviderEntry(name="t", kind="openai", base_url="http://127.0.0.1:9", api_key_env="NOPE")],
@@ -135,6 +142,59 @@ async def test_always_persists_project_rule_and_new_session_skips(tmp_path, monk
     assert rows[0]["choice"] == "always" and rows[0]["detail"]["tool"] == "bash" and rows[0]["cwd"] == str(tmp_path)
 
 
+def listed(rules: list[Rule], scope: str) -> list[str]:
+    """Rules as /permissions lists them: ``allow bash touch * [project]``."""
+    return [f"{r.action} {r.tool} {r.pattern} [{scope}]" for r in rules]
+
+
+@pytest.mark.parametrize(
+    ("call_", "expected"),
+    [
+        # the audit's case: the prompt showed `touch .../pa1.txt`, "Always allow" stored the whole family
+        (lambda d: bash(f"touch {d}/pa1.txt"), ["allow bash touch *"]),
+        (lambda d: bash("mkdir -p sub && touch sub/x.txt"), ["allow bash mkdir *", "allow bash touch *"]),
+        (lambda d: bash("make -n nothing"), ["allow bash make -n nothing"]),  # wildcard-unsafe: the exact command
+        # the arity prefix `git status` is not how the command starts: the exact command is stored (#170), and shown
+        (lambda d: bash("git -C sub status"), ["allow bash git -C sub status"]),
+        (lambda d: ToolCall(id="c1", name="write", arguments={"path": "w.txt", "content": "x"}), None),
+    ],
+    ids=["touch", "compound", "wildcard-unsafe", "narrowed", "write"],
+)
+async def test_always_prompt_shows_the_rule_it_stores(tmp_path, monkeypatch, call_, expected):
+    server, _ = make_server(tmp_path, [call_(tmp_path), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "always"}])
+    shown = seen[0]["params"]["rules"]
+    stored = PermissionState(cwd=tmp_path)
+    stored.reload()
+    assert shown["always"] == listed(stored.project_rules, "project")
+    assert shown["session"] == listed(server.session.perms.session_rules, "session")
+    assert shown["always"], "an always approval that stores a rule must name it"
+    if expected is not None:
+        assert shown["always"] == [f"{e} [project]" for e in expected]
+
+
+async def test_session_prompt_shows_the_rule_it_adds(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, [bash(f"touch {tmp_path}/pa1.txt"), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "session"}])
+    shown = seen[0]["params"]["rules"]
+    assert shown["session"] == listed(server.session.perms.session_rules, "session") == ["allow bash touch * [session]"]
+    assert not (tmp_path / ".k3code" / "config.yaml").exists()
+
+
+async def test_always_prompt_says_when_no_rule_can_be_stored(tmp_path, monkeypatch):
+    # a launcher never gets a rule (hardline.is_launcher): "always" allows this call only, and the prompt says so
+    server, _ = make_server(tmp_path, [bash("sh -c 'true'"), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [{"choice": "always"}])
+    assert seen[0]["params"]["rules"] == {"session": [], "always": []}
+    assert server.session.perms.session_rules == []
+    stored = PermissionState(cwd=tmp_path)
+    stored.reload()
+    assert stored.project_rules == []
+
+
 async def test_deny_is_visible_to_model(tmp_path, monkeypatch):
     server, provider = make_server(tmp_path, [bash("echo hi > a.txt"), "ok"], monkeypatch)
     await call(server, "session.create", {"cwd": str(tmp_path)})
@@ -188,6 +248,49 @@ async def test_relative_paths_use_session_cwd(tmp_path, monkeypatch):
     await run_turn(server, "go", [])
     assert (proj / "rel.txt").read_text() == "hi"
     assert not (other / "rel.txt").exists()
+
+
+async def _move(server: GatewayServer, path: Path) -> dict:
+    n = len(server._frames)  # type: ignore[attr-defined]
+    await server._handle_line(
+        json.dumps({"jsonrpc": "2.0", "id": 9, "method": "session.workspace.move", "params": {"path": str(path)}})
+    )
+    return next(f for f in map(json.loads, server._frames[n:]) if f.get("id") == 9)  # type: ignore[attr-defined]
+
+
+async def test_a_workspace_move_puts_the_live_session_in_the_new_directory(tmp_path, monkeypatch):
+    from k3code.routing.tiers import TaskKind
+
+    a, b = tmp_path / "proj-a", tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    server, _ = make_server(tmp_path, [], monkeypatch)
+    persist_rules(project_config_path(b), [Rule("bash", "make test", "allow")])  # B's own, trusted project rule
+    await call(server, "session.create", {"cwd": str(a)})
+    live = server.session
+    assert (await _move(server, b))["result"]["cwd"] == str(b)
+
+    assert live.perms.cwd == b
+    assert any(r.pattern == "make test" for r in live.perms.project_rules)  # B's rules, not A's
+    loop = server._build_loop(live, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert loop.cwd == b
+    assert str(b) in loop.system_prompt and str(a) not in loop.system_prompt
+    assert live.live_info()["cwd"] == str(b)
+    # an "always" answer stores its rule in the project the session now works in
+    assert project_config_path(live.perms.cwd) == project_config_path(b)
+
+
+async def test_a_workspace_move_is_refused_while_a_turn_runs(tmp_path, monkeypatch):
+    a, b = tmp_path / "proj-a", tmp_path / "proj-b"
+    a.mkdir()
+    b.mkdir()
+    server, _ = make_server(tmp_path, [], monkeypatch)
+    await call(server, "session.create", {"cwd": str(a)})
+    live = server.session
+    live.streaming = True  # a turn owns the session: its loop, tools and approvals work in A
+    reply = await _move(server, b)
+    assert "error" in reply and "turn is running" in reply["error"]["message"]
+    assert live.stored.cwd == str(a) and live.perms.cwd == a
 
 
 async def test_add_dir_persists_and_allows_writes(tmp_path, monkeypatch):

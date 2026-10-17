@@ -6,8 +6,8 @@ they cost no CI minutes:
 | Script | Replaces | What it does |
 | --- | --- | --- |
 | `scripts/ci/check.sh` | `ci.yml`, `gitleaks.yml` | the full local check; `--post` sets the commit status `local-ci` |
-| `scripts/ci/merge-pr.sh N` | waiting for the checks, then pressing merge | merges `Main` into the PR, runs the full check, pushes, posts `local-ci`, merges |
-| `scripts/release/release.sh VER` | `release.yml` | checks, builds the assets, tags, publishes the GitHub release |
+| `scripts/ci/merge-pr.sh N` | waiting for the checks, then pressing merge | merges `Main` into the PR, runs the scoped or full check, pushes, posts `local-ci`, merges |
+| `scripts/release/release.sh VER` | `release.yml` | checks, builds the assets, publishes the GitHub release (GitHub creates the tag) |
 
 `installer.yml` (macOS and Windows runners) is replaced, as far as Linux can, by `scripts/ci/platforms.sh`; see
 [macOS and Windows](#macos-and-windows).
@@ -34,9 +34,9 @@ scripts/ci/check.sh --post       # full run, then set local-ci on HEAD (clean tr
 
 Areas: `core` (ruff check, ruff format --check, pytest; needs uv and bubblewrap), `tui` (npm ci, build, typecheck,
 eslint, prettier, vitest minus `tui/.ci-test-excludes`; needs Node 22+), `panes` (go build, go vet and go test on the
-packages k3 uses, never `go test ./...`; needs Go and a C compiler for `-race`), `vendor` (`scripts/vendor_check.py`),
-`secrets` (gitleaks on the commits over `origin/Main` and on uncommitted changes), `shell` (shellcheck, `sh -n` /
-`bash -n`). A missing tool fails its area with an install hint. The run is niced (`nice -n 10`); logs and a summary
+packages k3 uses, never `go test ./...`; needs Go and a C compiler for `-race`), `vendor` (`scripts/vendor_check.py`;
+the full check also builds the wheel and checks that it ships `LICENSE`, `NOTICE` and `LICENSES/`), `secrets`
+(gitleaks on the commits over `origin/Main` and on uncommitted changes), `shell` (shellcheck, `sh -n` / `bash -n`). A missing tool fails its area with an install hint. The run is niced (`nice -n 10`); logs and a summary
 table go to `.k3dev/ci/<time>/`.
 
 `npm ci` runs only when `tui/package-lock.json` changed since the last install (a hash in
@@ -62,11 +62,29 @@ commit everyone can fetch, checked from exactly that tree. A failed run posts `l
 ```sh
 scripts/ci/merge-pr.sh --dry-run 42   # everything except push, status and merge
 scripts/ci/merge-pr.sh 42
+scripts/ci/merge-pr.sh --full 42      # the full check whatever the PR touches
 ```
 
 The PR must be open, based on `Main`, and its branch must be in this repository (a fork's branch cannot be pushed
-to). The script fetches, creates a worktree in `.k3dev/merge-pr/42-<time>/wt` at the PR head, merges `origin/Main` into
-it (`--no-ff`), and runs the full check of the merged tree. When it passes it pushes the merge commit to the PR branch
+to). The script fetches, decides between a scoped and the full check, creates a worktree in
+`.k3dev/merge-pr/42-<time>/wt` at the PR head, merges `origin/Main` into it (`--no-ff`), and runs that check of the
+merged tree.
+
+**Scoped or full.** A scoped check runs only the areas the PR's files touch (`git diff origin/Main...<head>`, mapped to
+areas as `check.sh --changed` does; `secrets` always runs), each area complete with its builds and test suites, never
+`--quick`. The full check runs every area. It is full when any of these holds, and the first output line says which:
+
+- `--full`, or the PR has the label **`full-ci`**
+- the PR title starts with `feat` or contains "feature"
+- more than 40 changed files or more than 1500 changed lines (`K3CODE_CI_FULL_FILES`, `K3CODE_CI_FULL_LINES`)
+- more than one merge commit over `Main` (an integration branch; one merge of `Main` into the branch is normal)
+- a change to `VENDOR.toml`, `install/`, `scripts/ci/` or a lockfile (`uv.lock`, `package-lock.json`, `go.mod`,
+  `go.sum`)
+
+The decision is printed before the check runs (`--dry-run` included), and the `local-ci` description names it:
+`scoped: secrets,core,tui passed on …` or `full: local check passed on …`.
+
+When the check passes it pushes the merge commit to the PR branch
 (a fast-forward; never forced), sets `local-ci=success` on it, marks a draft PR ready and runs
 `gh pr merge 42 --merge --match-head-commit <sha>`, so GitHub merges exactly the commit that was checked. On a
 conflict or a failed check it stops and prints the log folder; nothing is pushed. The worktree is removed in every
@@ -74,28 +92,44 @@ case; the logs stay in `.k3dev/merge-pr/42-<time>/ci/`.
 
 ## Releasing
 
-1. Set the version in `VERSION` (the core wheel reads it from there), add a `## [X.Y.Z] - <date>` section to
-   `CHANGELOG.md`, merge that to `Main`.
+1. Set the version in `VERSION` (the core wheel reads it from there). In `CHANGELOG.md` rename `## Unreleased` to
+   `## [X.Y.Z] - <date>` and put a fresh, empty `## Unreleased` above it, so the release notes (the `## [X.Y.Z]` section
+   alone) hold everything since the last release. Merge that to `Main`.
 2. On an up-to-date, clean `Main`: `scripts/release/release.sh --dry-run X.Y.Z`, then `scripts/release/release.sh X.Y.Z`.
 
 `release.sh` refuses unless `Main` is checked out, the tree is clean, `HEAD` is `origin/Main`, `X.Y.Z` equals `VERSION`,
-`CHANGELOG.md` has the heading and the tag does not exist. Then it runs `check.sh --post`, runs the personal-data scan
+`CHANGELOG.md` has the heading and nothing is left under `## Unreleased` (blank lines and `###` subheadings do not
+count) and the tag does not exist. Then it runs `check.sh --post`, runs the personal-data scan
 of `scripts/release/build_release.sh` on the source export (the export itself is not published; GitHub attaches
-source archives to every release), builds the assets into `.k3dev/release/X.Y.Z/assets/`, creates the annotated tag
-`vX.Y.Z`, pushes it and runs `gh release create` with the CHANGELOG section as notes. A version with a `-`
-(`1.0.0-rc.1`) is published as a prerelease.
+source archives to every release), builds the assets into `.k3dev/release/X.Y.Z/assets/`, creates the release as a
+**draft** (`gh release create --draft --target <sha>`, the CHANGELOG section as notes), checks that the draft holds
+every asset and publishes it (`gh release edit --draft=false`). A version with a `-` (`1.0.0-rc.1`) is published as a
+prerelease.
+
+The script never pushes the tag. A draft has no tag; GitHub creates `vX.Y.Z` (a lightweight tag at the commit that was
+checked) when the draft is published. So `install.sh`, which installs the newest `v*` tag, and `k3code update` see
+nothing of a release until it is complete, and a failed run leaves no tag that blocks the next one.
 
 `--dry-run` reports every failed precondition instead of stopping, still runs the full check (add `--no-check` to skip
 it), builds everything and prints what it would publish. `release.sh --list-assets X.Y.Z` prints the asset names.
+
+### When a release fails
+
+Nothing is published and no tag exists until the last step, so fix the cause (network, `gh auth status`, a failed check)
+and **run the same command again**. A draft release `vX.Y.Z` left behind by the failed run is deleted and created anew
+(the assets are rebuilt as well); a draft never has a tag, so nothing else needs cleaning up. The only case the script
+cannot undo is a publish that GitHub carried out while `gh` reported an error: the rerun then stops at "tag vX.Y.Z
+already exists". Check `gh release view vX.Y.Z`; if it shows the release published with all assets, it is done.
 
 ### Assets and how `k3code update` uses them
 
 | Asset | Built with | Used by the updater |
 | --- | --- | --- |
-| `k3code-<pep440>-py3-none-any.whl` | `uv build --wheel` in `core/` | the one `*.whl`, installed into a fresh venv |
+| `k3code-<pep440>-py3-none-any.whl` | `uv build --wheel` in `core/`; `core/hatch_build.py` adds `LICENSE`, `NOTICE` and `LICENSES/` under `k3code/`, and the release stops if they are missing | the one `*.whl`, installed into a fresh venv |
 | `k3code-X.Y.Z-requirements.txt` | `uv export --locked --no-dev --no-emit-project` (hashed) | `*-requirements.txt`: the locked dependencies, for an updater that installs with `--require-hashes` (an older one downloads and ignores it) |
-| `k3code-tui-X.Y.Z.tar.gz` | `npm ci`, `build:ink`, `build`, `tar` of `tui/dist` | `k3code-tui-*.tar.gz`, unpacked into the version's `tui/` |
+| `k3code-tui-X.Y.Z.tar.gz` | `npm ci`, `build:ink`, `build`, `tar` of `tui/dist` with `LICENSE`, `NOTICE`, `LICENSES/` and `THIRD_PARTY_NOTICES.txt` (the production packages of `tui/package-lock.json`: name, version, license and license file) | `k3code-tui-*.tar.gz`, unpacked into the version's `tui/` |
 | `k3-linux-amd64`, `k3-linux-arm64`, `k3-darwin-amd64`, `k3-darwin-arm64` | `CGO_ENABLED=0 GOOS=… GOARCH=… go build -trimpath -ldflags "-s -w" ./cmd/k3` | `k3-<platform>-<arch>`, copied to the version's `bin/k3` |
+| `THIRD_PARTY_NOTICES.txt` | `scripts/release/third_party_notices.py`: `NOTICE` and `LICENSES/`, the TUI's npm packages, and the Go modules (`go list -deps -json=Module ./cmd/k3` for each platform) and Go runtime linked into the `k3` binaries, each with its license text | verified and downloaded, not installed: it is the notice for the binaries |
 | `SHA256SUMS` | `sha256sum` of every other asset | each asset it lists is verified before anything is installed |
 
 `k3code update` (`core/src/k3code/update.py`) downloads every asset of the newest release on its channel, verifies

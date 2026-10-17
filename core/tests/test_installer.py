@@ -4,6 +4,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -140,6 +141,37 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert not (tmp_path / ".k3code").exists()
 
 
+def test_purge_also_removes_the_k3_pane_config(tmp_path: Path) -> None:
+    # the k3 binary writes its default config to ~/.config/tuios/config.toml on its first start
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    pane_config = tmp_path / ".config" / "tuios"
+    pane_config.mkdir(parents=True)
+    (pane_config / "config.toml").write_text("[appearance]\n")
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert (pane_config / "config.toml").is_file()  # a plain uninstall keeps it, like the rest of your settings
+    assert str(pane_config) in r.stdout
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert not pane_config.exists()
+
+
+def test_uninstall_names_the_shared_caches_it_leaves(tmp_path: Path) -> None:
+    # uv and npm fill these while installing; other projects use them too, so they stay, and the output says where
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert "uv cache" not in r.stdout and "npm cache" not in r.stdout  # nothing there, nothing to name
+    assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
+    (tmp_path / ".cache" / "uv").mkdir(parents=True)
+    (tmp_path / ".npm" / "_cacache").mkdir(parents=True)
+    r = run(tmp_path, UNINSTALL, "--purge", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert f"{tmp_path / '.cache' / 'uv'} (uv cache clean)" in r.stdout
+    assert f"{tmp_path / '.npm'} (npm cache clean --force)" in r.stdout
+    assert (tmp_path / ".cache" / "uv").is_dir() and (tmp_path / ".npm" / "_cacache").is_dir()
+
+
 def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
     # Git Bash / MSYS / Cygwin: install.sh cannot install there and says to use install.ps1 (WSL) instead.
     fake = tmp_path / "fakebin"
@@ -172,6 +204,30 @@ while [ $# -gt 0 ]; do
   shift
 done
 """
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(("redirect", "passed"), [(True, True), (False, False)], ids=["redirected", "console"])
+def test_install_ps1_passes_yes_when_its_output_is_redirected(tmp_path: Path, redirect: bool, passed: bool) -> None:
+    # wsl.exe hands install.sh a terminal even then, and install.sh would ask about sudo where nobody can answer
+    seen = tmp_path / "wsl-args"
+    wsl = tmp_path / "wsl"
+    wsl.write_text(FAKE_WSL.replace("while [ $# -gt 0 ]", f'printf "%s\\n" "$*" >>"{seen}"\nwhile [ $# -gt 0 ]', 1))
+    wsl.chmod(0o755)
+    script = REPO / "install" / "install.ps1"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{script}' --check; exit $LASTEXITCODE"]
+    if redirect:
+        subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    else:
+        # a pty on input and output is a console as far as .NET can tell
+        master, slave = os.openpty()
+        try:
+            subprocess.run(cmd, env=env, stdin=slave, stdout=slave, stderr=slave, check=False, start_new_session=True)
+        finally:
+            os.close(master)
+            os.close(slave)
+    assert ("--yes" in seen.read_text()) is passed
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
@@ -212,12 +268,59 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
     assert f'wsl.exe -d Ubuntu --exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
     assert "--cd" not in shim  # wsl.exe starts in the current directory by itself; Windows 10's WSL has no --cd
+    # #142/#112: without a compiler the installer writes a .ps1 launcher (exact args, UNC-safe) next to the .cmd
+    ps_shim = (appdata / "k3code" / "bin" / "k3code.ps1").read_text()
+    assert "wsl.exe" in ps_shim and "@args" in ps_shim
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
+    assert not (appdata / "k3code" / "bin" / "k3.ps1").exists()
 
     r = ps("uninstall.ps1")
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / ".local" / "share" / "k3code").exists()
     assert not (appdata / "k3code").exists()
+
+
+SHIM_DIR = "C:\\Users\\k\\AppData\\Local\\k3code\\bin"
+LOCAL_APPDATA = "C:\\Users\\k\\AppData\\Local"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+@pytest.mark.parametrize(
+    ("user_path", "expected"),
+    [
+        (f"C:\\Windows;{SHIM_DIR}", True),
+        (f"C:\\Windows;{SHIM_DIR}\\", True),  # the finding: a trailing backslash was added a second time
+        (f"C:\\Windows;{SHIM_DIR}\\\\", True),
+        ("C:\\Windows;c:\\users\\K\\APPDATA\\local\\K3CODE\\Bin", True),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code\\bin", True),  # the registry value keeps %VARIABLES% unexpanded
+        ("%LOCALAPPDATA%\\K3CODE\\BIN\\;C:\\Windows", True),
+        (f"C:\\Windows;;{SHIM_DIR};", True),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code\\bin2", False),
+        ("C:\\Windows;C:\\Users\\k\\AppData\\Local\\k3code", False),
+        (f"C:\\Windows;{SHIM_DIR}\\sub", False),
+        ("C:\\Windows;%LOCALAPPDATA%\\k3code", False),
+        ("C:\\Windows;;", False),
+        ("", False),
+    ],
+)
+def test_install_ps1_path_check_ignores_how_the_entry_is_spelled(user_path: str, expected: bool) -> None:
+    # The user PATH is read unexpanded from the registry. An entry that differs from the shim directory only by a
+    # trailing backslash, case or %VARIABLE% spelling is the same directory and must not be appended again. The check
+    # is one function: only that function is loaded from the script (the script itself needs Windows and WSL to run).
+    script = REPO / "install" / "install.ps1"
+    command = (
+        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{script}', [ref]$null, [ref]$null); "
+        "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+        "-and $n.Name -eq 'Test-OnPath' }, $true); "
+        "if (-not $fn) { [Console]::Error.WriteLine('no function Test-OnPath in install.ps1'); exit 2 }; "
+        "Invoke-Expression $fn.Extent.Text; "
+        f"[Console]::Out.Write((Test-OnPath '{user_path}' '{SHIM_DIR}'))"
+    )
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"), "LOCALAPPDATA": LOCAL_APPDATA}
+    cmd = ["pwsh", "-NoProfile", "-Command", command]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ("True" if expected else "False"), user_path
 
 
 def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
@@ -450,6 +553,31 @@ def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
     assert "installed but cannot create a sandbox" in r.stderr
 
 
+APPARMOR_TEXT = "Ubuntu restricts user namespaces with AppArmor"
+
+
+@linux_only
+@pytest.mark.parametrize(("value", "named"), [("1", True), ("0", False)])
+def test_bwrap_unusable_names_the_apparmor_restriction(tmp_path: Path, value: str, named: bool) -> None:
+    # Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1; the text is the one `k3code doctor` prints
+    bwrap = stub_bin(tmp_path, "bwrap", "exit 1\n")
+    sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+    sysctl.write_text(value + "\n")
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--from-source",
+        "--yes",
+        env_extra={"K3_BWRAP": str(bwrap / "bwrap"), "K3_APPARMOR_USERNS": str(sysctl)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "installed but cannot create a sandbox" in r.stderr
+    assert (APPARMOR_TEXT in r.stderr) is named
+    if named:
+        assert f"profile bwrap {bwrap / 'bwrap'} flags=(unconfined) {{ userns, }}" in r.stderr
+        assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in r.stderr
+
+
 @linux_only
 def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
     bwrap = stub_bin(tmp_path, "bwrap", "exit 0\n")
@@ -499,6 +627,49 @@ def test_from_git_branch_falls_back_to_the_installed_build_when_offline(tmp_path
     assert (home / ".local" / "bin" / "k3code").is_symlink()
 
 
+def test_from_source_on_a_commit_installed_from_git_becomes_a_source_install(tmp_path: Path) -> None:
+    # A git build and a source build of one commit share the version name `X.Y.Z-src.<sha>`, so the second run found
+    # the version complete and returned early: `k3code update` still took the install for a git install (.ref kept,
+    # no source_path) and followed the remote branch instead of the checkout.
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "versions" / ver / ".ref").is_file() and not (data / "source_path").exists()
+
+    again = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr  # the early return is the path under test
+    assert (data / "source_path").read_text().strip() == str(src)
+    assert not (data / "versions" / ver / ".ref").exists()
+    assert not (data / "versions" / ver / ".url").exists()  # the remote goes with the ref
+    assert (data / "current").resolve().name == ver
+
+
+def test_from_git_on_a_commit_installed_from_source_becomes_a_git_install(tmp_path: Path) -> None:
+    # the other direction of the same early return: the source build has no .ref, and the git run removes source_path
+    src, git = mini_checkout(tmp_path)
+    branch = subprocess.run([*git, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    first = run(home, src / "install" / "install.sh", "--from-source", "--yes", "--no-setup")
+    assert first.returncode == 0, first.stderr
+    (ver,) = [p.name for p in (data / "versions").iterdir()]
+    assert (data / "source_path").is_file() and not (data / "versions" / ver / ".ref").exists()
+
+    again = run(home, INSTALL, "--yes", "--no-setup", "--from-git", f"file://{src}", "--ref", branch.stdout.strip())
+    assert again.returncode == 0, again.stderr
+    assert f"version {ver} already installed" in again.stderr
+    assert (data / "versions" / ver / ".ref").read_text().strip() == branch.stdout.strip()
+    assert (data / "versions" / ver / ".url").read_text().strip() == f"file://{src}"  # update follows this remote
+    assert not (data / "source_path").exists()
+
+
 def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     assert real_git is not None
@@ -506,7 +677,8 @@ def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> N
     private = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
     cases = {offline: "no network", private: "private or needs credentials"}
     for i, (text, phrase) in enumerate(cases.items()):
-        body = f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
+        # the subcommand only: the checkout now sits under HOME, whose path (this test's name) holds "fetch" too
+        body = f'case "$*" in *" fetch "*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
         stubs = stub_bin(tmp_path / f"case{i}", "git", body)
         home = tmp_path / f"home{i}"
         home.mkdir()
@@ -540,11 +712,135 @@ def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> N
     assert list(tmpdir.glob("k3code-uv.*")) == []
 
 
+def _go_wanted() -> str:
+    """The Go release panes/go.mod asks for, named as install.sh's go_wanted names it."""
+    m = re.search(r"^go (\d+\.\d+(?:\.\d+)?)$", (REPO / "panes" / "go.mod").read_text(), re.MULTILINE)
+    assert m is not None
+    v = m.group(1)
+    return v if v.count(".") == 2 else f"{v}.0"
+
+
+@linux_only
+@pytest.mark.parametrize("runs", [True, False], ids=["go-runs", "go-does-not-run"])
+def test_a_fetched_go_is_staged_in_the_install_root_and_checked_by_running_it(tmp_path: Path, runs: bool) -> None:
+    # Issue #116: on a noexec TMPDIR, `[ -x go ]` said no for a good download, and the warning blamed the checksum.
+    # Go is now unpacked under DATA/tmp and accepted only when `go version` runs.
+    gv = _go_wanted()
+    home = tmp_path / "home"
+    home.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    ran = tmp_path / "go-ran.log"
+    pkg = tmp_path / "pkg"
+    (pkg / "go" / "bin").mkdir(parents=True)
+    fake_go = pkg / "go" / "bin" / "go"
+    version = f'echo "go version go{gv} linux/amd64"' if runs else "exit 1"
+    fake_go.write_text(
+        f'#!/bin/sh\necho "$0" >>"{ran}"\n'
+        f'if [ "$1" = version ]; then {version}; exit 0; fi\n'
+        'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then : >"$2"; chmod 755 "$2"; fi; shift; done\n'
+    )
+    fake_go.chmod(0o755)
+    tarballs = {}
+    for arch in ("amd64", "arm64"):
+        name = f"go{gv}.linux-{arch}.tar.gz"
+        subprocess.run(["tar", "-czf", str(tmp_path / name), "-C", str(pkg), "go"], check=True)
+        tarballs[name] = subprocess.run(
+            ["sha256sum", str(tmp_path / name)], capture_output=True, text=True, check=True
+        ).stdout.split()[0]
+    releases = tmp_path / "releases.json"
+    releases.write_text(
+        "".join(f'{{\n"filename": "{n}",\n"sha256": "{s}"\n}}\n' for n, s in tarballs.items()),
+    )
+    curl = stub_bin(
+        tmp_path,
+        "curl",
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        'case "$url" in\n'
+        f'  *mode=json*) cp "{releases}" "$out" ;;\n'
+        f'  https://go.dev/dl/go*) cp "{tmp_path}/${{url##*/}}" "$out" ;;\n'
+        "  *) exit 22 ;;\n"
+        "esac\n",
+    )
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _path_without(tmp_path, "go"), "TMPDIR": str(tmpdir)},
+        drop=("K3_SKIP_GO", "K3_NO_DOWNLOAD"),
+        path_front=curl,
+    )
+    assert r.returncode == 0, r.stderr
+    data = home / DATA_REL
+    probes = ran.read_text().splitlines() if ran.exists() else []
+    assert probes and probes[0].startswith(f"{data}/tmp/k3code-go."), probes  # run where it was unpacked
+    assert list(tmpdir.iterdir()) == []
+    assert not (data / "tmp").exists()  # the stage dir goes with the run
+    if runs:
+        assert (data / "go" / f"go{gv}" / "bin" / "go").is_file()
+        assert "WARNING" not in r.stderr.split("fetching Go", 1)[1].split("\n", 2)[1]
+    else:
+        assert not (data / "go" / f"go{gv}").exists()
+        assert "the downloaded Go does not run here" in r.stderr
+        assert "did not match the sha256" not in r.stderr
+
+
+def test_a_stale_lock_takes_the_stage_dir_the_killed_install_left(tmp_path: Path) -> None:
+    # SIGKILL skips the trap: a from-git checkout or a Go unpacked in DATA/tmp stays until the next run takes the lock
+    lock = _stale_lock(tmp_path)
+    left = tmp_path / DATA_REL / "tmp" / "k3code-go.Ab12Cd" / "go"
+    left.mkdir(parents=True)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "the build scratch an interrupted install left" in r.stderr
+    assert not (tmp_path / DATA_REL / "tmp").exists()
+    assert not lock.exists()
+
+
 def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--check")
     assert r.returncode == 0, r.stderr
     assert "node 20+ with npm" in r.stderr
     assert "node 18" not in r.stderr
+
+
+def _check_without_node(tmp_path: Path, ldd_says: str, loader_file_exists: bool) -> str:
+    """--check on a Linux host with no node, a network tool, an `ldd` that prints LDD_SAYS and, when
+    LOADER_FILE_EXISTS, a /lib/ld-musl-* file (what Debian/Ubuntu's musl package puts on a glibc system)."""
+    real_ls = shutil.which("ls")
+    stub_bin(tmp_path, "ldd", f"cat <<'EOF'\n{ldd_says}\nEOF\nexit 1\n")
+    stub_bin(
+        tmp_path,
+        "ls",
+        f'case "$*" in */ld-musl-*) exit {0 if loader_file_exists else 2} ;; esac\nexec {real_ls} "$@"\n',
+    )
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--check",
+        env_extra={"PATH": _path_without(tmp_path, "node")},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=tmp_path / "stubbin",
+    )
+    assert r.returncode == 0, r.stderr
+    (line,) = [ln for ln in r.stderr.splitlines() if "node 20+ with npm" in ln]
+    return line
+
+
+@linux_only
+def test_a_glibc_host_with_the_musl_package_still_gets_a_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(tmp_path, "ldd (Debian GLIBC 2.36-9+deb12u10) 2.36", loader_file_exists=True)
+    assert "a private Node 22 is fetched" in line
+
+
+@linux_only
+def test_a_musl_host_gets_no_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(
+        tmp_path, "musl libc (x86_64)\nVersion 1.2.5\nDynamic Program Loader", loader_file_exists=False
+    )
+    assert "optional: builds the TUI" in line
 
 
 def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path) -> None:
@@ -602,6 +898,54 @@ def test_chromium_opt_outs_write_no_marker(tmp_path: Path) -> None:
     m = run(minimal, INSTALL, "--from-source", "--yes", "--minimal")
     assert m.returncode == 0, m.stderr
     assert not (minimal / ".local" / "share" / "k3code" / CHROMIUM_MARKER).exists()
+
+
+def _seed_chromium(home: Path, body: str) -> None:
+    """An earlier run's Chromium (its marker and a headless shell that runs ``body``) so presetup only probes it."""
+    data = home / ".local" / "share" / "k3code"
+    (data / CHROMIUM_MARKER).parent.mkdir(parents=True)
+    (data / CHROMIUM_MARKER).write_text("1.63.0\n")
+    shell = data / "browsers" / "chromium_headless_shell-1" / "chrome-headless-shell-linux64" / "chrome-headless-shell"
+    shell.parent.mkdir(parents=True)
+    shell.write_text("#!/bin/sh\n" + body)
+    shell.chmod(0o755)
+
+
+@linux_only
+def test_chromium_that_cannot_start_is_a_warning_that_names_the_libraries(tmp_path: Path) -> None:
+    """#113: the download works but the loader lacks libnspr4 and friends; the install said "Chromium installed" and
+    stayed silent. Now it starts the shell once, names what ldd finds missing, and still exits 0."""
+    _seed_chromium(tmp_path, "echo 'error while loading shared libraries: libnspr4.so' >&2\nexit 127\n")
+    ldd = stub_bin(
+        tmp_path,
+        "ldd",
+        "echo '\tlibc.so.6 => /lib/libc.so.6 (0x1)'\n"
+        "echo '\tlibnspr4.so => not found'\n"
+        "echo '\tlibasound.so.2 => not found'\n",
+    )
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", path_front=ldd)
+    assert r.returncode == 0, r.stderr
+    assert "Chromium is downloaded but cannot start" in r.stderr
+    assert "libnspr4.so libasound.so.2" in r.stderr and "libc.so.6" not in r.stderr.split("cannot start")[1]
+    assert "Chromium already installed" not in r.stderr  # no success line for a browser that cannot run
+
+
+@linux_only
+def test_chromium_that_fails_for_another_reason_is_still_a_warning(tmp_path: Path) -> None:
+    _seed_chromium(tmp_path, "echo 'Illegal instruction' >&2\nexit 132\n")
+    ldd = stub_bin(tmp_path, "ldd", "echo '\tlibc.so.6 => /lib/libc.so.6 (0x1)'\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", path_front=ldd)
+    assert r.returncode == 0, r.stderr
+    assert "Chromium is downloaded but failed to run" in r.stderr and "Illegal instruction" in r.stderr
+
+
+@linux_only
+def test_chromium_that_starts_is_reported_as_installed(tmp_path: Path) -> None:
+    _seed_chromium(tmp_path, "echo 'Google Chrome for Testing 1'\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes")
+    assert r.returncode == 0, r.stderr
+    assert "Chromium already installed" in r.stderr
+    assert "cannot start" not in r.stderr and "failed to run" not in r.stderr
 
 
 def test_uninstall_removes_the_chromium_location(tmp_path: Path) -> None:
@@ -777,6 +1121,92 @@ def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) 
     r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": f"{tmp_path / 'tmp'}/"})
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+
+
+# What install.sh records in its lock (<kind>_tmp) for each scratch path it makes in TMPDIR as k3code-<kind>.XXXXXX.
+SCRATCH_FILES = ("giterr", "reqs")
+SCRATCH_KINDS = ("tui", "src", "giterr", "uv", "node", "go", "reqs")
+
+
+def _stale_lock(tmp_path: Path) -> Path:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    (lock / "pid").write_text(f"{dead}\n")
+    return lock
+
+
+@pytest.mark.parametrize("kind", SCRATCH_KINDS)
+def test_a_stale_lock_takes_every_scratch_path_the_killed_install_recorded(tmp_path: Path, kind: str) -> None:
+    # SIGKILL skips the trap: the checkout fetched into TMPDIR (236 MB with node_modules), its git error file and the
+    # uv, Node and Go downloads stayed there for good, because only the TUI build dir was recorded
+    lock = _stale_lock(tmp_path)
+    path = tmp_path / "tmp" / f"k3code-{kind}.Ab12Cd"
+    path.parent.mkdir()
+    refs = path.with_name(path.name + ".refs")  # without git, the HTTPS ref list lives next to the git error file
+    if kind in SCRATCH_FILES:
+        path.write_text("x\n")
+    else:
+        (path / "sub").mkdir(parents=True)
+    if kind == "giterr":
+        refs.write_text("x\n")
+    (lock / f"{kind}_tmp").write_text(f"{path}\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and re.search(f"removed .*{re.escape(str(path))}", r.stderr)
+    assert not path.exists() and not refs.exists()
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize(
+    ("recorded", "removed"),
+    [
+        ("tmp/k3code-src.Ab12Cd", True),  # the control: a k3code-src.* directly in TMPDIR goes
+        ("tmp/k3code-tui.Ab12Cd", False),  # another kind's name under this kind's record
+        ("tmp/not-k3code", False),
+        ("tmp/sub/k3code-src.Zz99", False),
+        ("elsewhere/k3code-src.Zz99", False),
+    ],
+)
+def test_only_a_scratch_path_of_the_recorded_kind_directly_in_tmpdir_is_removed(
+    tmp_path: Path, recorded: str, removed: bool
+) -> None:
+    lock = _stale_lock(tmp_path)
+    (tmp_path / recorded).mkdir(parents=True)
+    (lock / "src_tmp").write_text(f"{tmp_path / recorded}\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr
+    assert (tmp_path / recorded).exists() is not removed
+
+
+@pytest.mark.parametrize("slash", ["", "/"])  # macOS TMPDIR ends in "/"
+def test_a_sigkilled_from_git_install_leaves_nothing_in_tmpdir_once_the_next_run_took_over(
+    tmp_path: Path, slash: str
+) -> None:
+    src = _source_repo(tmp_path)
+    url = f"file://{src}"
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    env = {"TMPDIR": f"{tmp}{slash}"}
+    # the fetch is where the checkout and the git error file exist and the build has not started: kill the whole
+    # process group there (the stub is in it), so install.sh cannot run its exit trap
+    real = shutil.which("git")
+    killer = stub_bin(tmp_path, "git", f'case "$*" in *" fetch "*) kill -9 0 ;; esac\nexec "{real}" "$@"\n')
+    killed = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env, path_front=killer)
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    left = sorted(p.name.rpartition(".")[0] for p in tmp.iterdir())
+    assert left == ["k3code-giterr"], left  # the run really was killed with its scratch in place
+    # the checkout, where the TUI and k3 build, is staged in DATA/tmp (a noexec TMPDIR cannot run them, issue #116)
+    stage = tmp_path / DATA_REL / "tmp"
+    assert sorted(p.name.rpartition(".")[0] for p in stage.iterdir()) == ["k3code-src"]
+    assert (tmp_path / DATA_REL / ".install.lock").is_dir()
+    again = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", "--minimal", env_extra=env)
+    assert again.returncode == 0, again.stderr
+    assert "taking over the install lock" in again.stderr
+    assert list(tmp.iterdir()) == []
+    assert not stage.exists()
+    assert not (tmp_path / DATA_REL / ".install.lock").exists()
 
 
 def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -956,6 +1386,7 @@ def _path_without(root: Path, name: str) -> str:
 
 
 @linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
 @pytest.mark.parametrize("answer", ["y", "n"])
 def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path: Path, answer: str) -> None:
@@ -1019,6 +1450,51 @@ def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path
         assert "needs root to install" in text
 
 
+@linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+def test_bwrap_install_is_not_asked_when_stdout_and_stderr_are_redirected(tmp_path: Path) -> None:
+    # wsl.exe gives the Linux side a terminal even for a redirected install.ps1: nobody sees the question, so none is
+    # asked (it used to wait forever)
+    sudo_log = tmp_path / "sudo.log"
+    stubs = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    stub_bin(tmp_path, "dnf", "exit 0\n")
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{_path_without(tmp_path, 'bwrap')}",
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "K3_STUB_VENV": "1",
+        "K3_SKIP_TUI": "1",
+        "K3_SKIP_GO": "1",
+        "K3_NO_GH": "1",
+    }
+    master, slave = os.openpty()
+    log = tmp_path / "install.log"
+    try:
+        with log.open("wb") as out:
+            proc = subprocess.Popen(
+                ["setsid", "--ctty", "sh", str(INSTALL), "--from-source", "--minimal"],
+                stdin=slave,  # the controlling terminal is there and /dev/tty opens; only the output is redirected
+                stdout=out,
+                stderr=out,
+                env=env,
+            )
+            try:
+                rc = proc.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
+                pytest.fail(f"the installer waited for an answer nobody could see:\n{log.read_text(errors='replace')}")
+    finally:
+        os.close(master)
+        os.close(slave)
+    text = log.read_text(errors="replace")
+    assert rc == 0, text
+    assert "Install bubblewrap now with sudo" not in text
+    assert not sudo_log.exists()
+    assert "needs root to install" in text
+
+
 def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
     calls = tmp_path / "systemctl.log"
     stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
@@ -1075,6 +1551,174 @@ def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path
     assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
 
 
+def fake_install_root(tmp_path: Path) -> Path:
+    """An install root as uninstall.sh recognises one (versions/ and a current link) with no real install in it."""
+    data = tmp_path / DATA_REL
+    (data / "versions" / "v1" / "bin").mkdir(parents=True)
+    (data / "current").symlink_to(data / "versions" / "v1")
+    return data
+
+
+def start_k3code_process(program: Path, *, ignore_term: bool = False) -> subprocess.Popen[bytes]:
+    """A long-running `sh <program>`, so the install's script path is argv[1] like a venv's `python .../bin/k3code`."""
+    trap = "trap '' TERM" if ignore_term else "trap 'kill $!; exit 0' TERM"
+    program.write_text(f"#!/bin/sh\n{trap}\nsleep 60 &\nwait $!\n")
+    proc = subprocess.Popen(
+        ["sh", str(program)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+    )
+    deadline = time.monotonic() + 5
+    while str(program).encode() not in Path(f"/proc/{proc.pid}/cmdline").read_bytes():  # fork has not exec'd yet
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    return proc
+
+
+@linux_only
+def test_uninstall_refuses_to_delete_the_tree_under_a_running_k3code(tmp_path: Path) -> None:
+    # A daemon or TUI started by hand is not a systemd unit; deleting its install root left it running on a deleted tree
+    # (and with --purge it recreated ~/.k3code). Without --yes and a terminal to ask on, uninstall lists it and stops.
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode != 0
+        assert str(proc.pid) in r.stderr and "versions/v1/bin/k3code" in r.stderr
+        assert "--yes" in r.stderr
+        assert (data / "current").is_symlink()  # nothing was removed
+        assert proc.poll() is None  # and nothing was killed
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_stops_the_processes_running_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes")
+        assert r.returncode == 0, r.stderr
+        assert str(proc.pid) in r.stderr
+        assert proc.wait(timeout=5) is not None  # stopped before the tree went
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_kills_a_process_that_ignores_term(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code", ignore_term=True)
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes", env_extra={"K3_UNINSTALL_STOP_WAIT": "1"})
+        assert r.returncode == 0, r.stderr
+        assert proc.wait(timeout=5) == -9
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_uninstall_asks_on_the_terminal_before_stopping_a_running_k3code(tmp_path: Path, answer: str) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / ".config")}
+    master, slave = os.openpty()
+    try:
+        # setsid --ctty: a new session whose controlling terminal is the pty, so uninstall.sh can open /dev/tty
+        uninstall = subprocess.Popen(
+            ["setsid", "--ctty", "sh", str(UNINSTALL)], stdin=slave, stdout=slave, stderr=slave, env=env
+        )
+        os.close(slave)
+        slave = -1
+        out, answered = b"", False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: every writer to the terminal is gone
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if not answered and b"Type yes" in out:
+                    os.write(master, answer.encode() + b"\n")
+                    answered = True
+            elif uninstall.poll() is not None:
+                break
+        if uninstall.poll() is None:
+            uninstall.kill()
+        rc = uninstall.wait()
+        text = out.decode(errors="replace")
+        assert str(proc.pid) in text
+        if answer == "yes":
+            assert rc == 0, text
+            assert proc.wait(timeout=5) is not None
+            assert not data.exists()
+        else:
+            assert rc != 0, text
+            assert proc.poll() is None  # declined: still running, and the install is still there
+            assert (data / "current").is_symlink()
+    finally:
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_leaves_alone_a_process_that_is_not_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    proc = start_k3code_process(tmp_path / "elsewhere" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode == 0, r.stderr
+        assert not data.exists()
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("linger", ["yes", "no"])
+def test_uninstall_says_to_undo_linger_only_when_it_is_on(tmp_path: Path, linger: str) -> None:
+    # `k3code service install` advises `loginctl enable-linger`; uninstalling the unit leaves that setting behind
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    (units / "k3code.service").write_text("[Unit]\n")
+    stubs = stub_bin(tmp_path, "systemctl", "exit 0\n")
+    stub_bin(tmp_path, "loginctl", f'echo "Linger={linger}"\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert ("loginctl disable-linger" in r.stderr) == (linger == "yes")
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+def test_uninstall_ps1_names_windowsonly_when_the_distro_is_gone(tmp_path: Path) -> None:
+    # The WSL distribution was unregistered: uninstall.sh cannot run, and the failure had to say how to still clean up
+    wsl = tmp_path / "wsl"
+    wsl.write_text("#!/bin/sh\necho 'There is no distribution with the supplied name.' >&2\nexit 1\n")
+    wsl.chmod(0o755)
+    appdata = tmp_path / "appdata"
+    (appdata / "k3code").mkdir(parents=True)
+    (appdata / "k3code" / "wsl.json").write_text(f'{{"distro": "Gone", "prefix": "{tmp_path}/.local"}}')
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "LOCALAPPDATA": str(appdata), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{REPO / 'install' / 'uninstall.ps1'}'; exit $LASTEXITCODE"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode != 0
+    assert "-WindowsOnly" in r.stderr
+    assert (appdata / "k3code" / "wsl.json").is_file()  # nothing on the Windows side was touched
+
+
 def _git(src: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]
@@ -1093,6 +1737,103 @@ def test_stable_channel_skips_pre_release_tags(tmp_path: Path) -> None:
     assert (home / DATA_REL / "current" / ".ref").read_text().strip() == "v0.0.1"
 
 
+def test_a_git_install_records_the_remote_it_was_made_from(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == f"file://{src}"
+
+
+def test_the_recorded_remote_keeps_no_credentials(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake = "fake-" + "token-" + str(os.getpid())  # built at run time: not a real credential
+    url = f"https://builder:{fake}@mirror.invalid/k3code.git"
+    (home / ".gitconfig").write_text(f'[url "file://{src}"]\n\tinsteadOf = {url}\n')
+    r = run(home, INSTALL, "--from-git", url, "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == "https://mirror.invalid/k3code.git"
+    assert fake not in "".join(p.read_text() for p in (home / DATA_REL).rglob(".url"))
+
+
+OLDER_NOTICE = "this is older than the installed version"
+
+
+def _commit_at(src: Path, when: str, message: str, version: str | None = None) -> str:
+    """Commit in ``src`` with the committer date ``when`` (ISO 8601), optionally after setting VERSION; its SHA."""
+    if version is not None:
+        (src / "VERSION").write_text(f"{version}\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"GIT_COMMITTER_DATE": when}
+    cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src)]
+    subprocess.run([*cmd, "commit", "-q", "-a", "--allow-empty", "-m", message, "--date", when], check=True, env=env)
+    return _git(src, "rev-parse", "HEAD")
+
+
+def test_activating_an_older_commit_says_so_and_still_does_it(tmp_path: Path) -> None:
+    # install.sh --ref <older> over a newer install of the same X.Y.Z switched `current` with only the generic
+    # "current -> ..." line: nothing said it was a downgrade
+    src = _source_repo(tmp_path)
+    first = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+
+    def install(ref: str) -> str:
+        r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r.stderr
+
+    assert OLDER_NOTICE not in install(tip)  # the first install has nothing to be older than
+    newer = (data / "current").resolve().name
+    err = install(first)
+    assert OLDER_NOTICE in err and newer in err
+    assert (data / "current").resolve().name != newer  # still allowed: the older commit is now current
+    assert (data / "previous").read_text().strip() == newer  # and the newer one is what a rollback returns to
+    assert OLDER_NOTICE not in install(tip)  # going forward again is not a downgrade
+    assert OLDER_NOTICE not in install(tip)  # nor is re-running the current version
+
+
+def test_activating_a_lower_version_says_so_without_commit_times(tmp_path: Path) -> None:
+    # the lower X.Y.Z is older whatever the commit dates say, and an install made before commit times were
+    # recorded (no .committed file) can still be compared by its version
+    src = _source_repo(tmp_path)
+    old_tag = _git(src, "rev-parse", "HEAD")
+    _commit_at(src, "2000-01-01T00:00:00Z", "newer version, older timestamp", version="0.0.2")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    data = home / DATA_REL
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", tip, "--minimal")
+    assert r.returncode == 0, r.stderr
+    (data / "current" / ".committed").unlink(missing_ok=True)
+    r = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", old_tag, "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+    assert (data / "current").resolve().name.startswith("0.0.1-src.")
+
+
+def test_a_newer_checkout_over_an_older_install_gets_no_downgrade_notice(tmp_path: Path) -> None:
+    src, git = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE not in r.stderr
+    _commit_at(src, "2031-01-01T00:00:00Z", "later")
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "previous:" in r.stderr and OLDER_NOTICE not in r.stderr
+    subprocess.run([*git, "checkout", "-q", "HEAD~1"], check=True)  # a checkout of the older commit
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert OLDER_NOTICE in r.stderr
+
+
 def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
     (src / "VERSION").write_text("0.0.2\n")
@@ -1109,6 +1850,34 @@ def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     old = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", middle[:9], "--minimal")
     assert old.returncode != 0
     assert "full 40-character SHA" in old.stderr
+
+
+def test_reinstalling_a_built_commit_rewrites_its_ref(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    sha = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    ref_file = home / DATA_REL / "current" / ".ref"
+
+    def install(ref: str) -> subprocess.CompletedProcess[str]:
+        r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r
+
+    install(sha)
+    assert ref_file.read_text().strip() == sha  # an install of a full SHA is pinned
+
+    # main is the same commit: the build is reused, but the install now follows the branch (update --check stops
+    # saying "pinned")
+    again = install("main")
+    assert "already installed" in again.stderr
+    assert ref_file.read_text().strip() == "main"
+
+    # and the other way round: asking for a commit pins an install that followed a branch
+    pinned = install(sha)
+    assert "already installed" in pinned.stderr
+    assert ref_file.read_text().strip() == sha
+    assert not list(ref_file.parent.glob(".ref.*"))  # no temp file left behind
 
 
 def _download_stub(root: Path, files: dict[str, bytes]) -> tuple[Path, Path]:
@@ -1211,6 +1980,43 @@ def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> Non
         assert "did not match the sha256 go.dev lists" in r.stderr
 
 
+@pytest.mark.skipif(not GO_OS or not GO_ARCH, reason="needs a platform go.dev builds for")
+def test_the_private_go_keeps_its_caches_and_telemetry_in_the_data_dir(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    want = next(ln.split()[1] for ln in (REPO / "panes" / "go.mod").read_text().splitlines() if ln.startswith("go "))
+    seen = tmp_path / "go-calls.log"
+    fake_go = (
+        "#!/bin/sh\n"
+        f'echo "$1 cache=$GOCACHE config=$XDG_CONFIG_HOME path=$GOPATH" >>"{seen}"\n'
+        f'case "$1" in version) echo "go version go{want} {GO_OS}/{GO_ARCH}" ;;\n'
+        'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    )
+    archive = _tar_gz({"go/bin/go": fake_go})
+    name = f"go{want}.{GO_OS}-{GO_ARCH}.tar.gz"
+    releases = [
+        {
+            "version": f"go{want}",
+            "files": [
+                {"filename": name, "os": GO_OS, "arch": GO_ARCH, "sha256": hashlib.sha256(archive).hexdigest()},
+            ],
+        }
+    ]
+    curl, _ = _download_stub(tmp_path, {name: archive, "releases.json": json.dumps(releases).encode()})
+    # the go on PATH is too old for panes/go.mod (same stub dir as curl), so the installer fetches the private one;
+    # without it a host that has a current go would build with that and never reach the fake
+    stub_bin(tmp_path, "go", 'case "$1" in version) echo "go version go1.20.1 x/y" ;; *) exit 1 ;; esac\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", drop=("K3_NO_DOWNLOAD", "K3_SKIP_GO"), path_front=curl)
+    assert r.returncode == 0, r.stderr
+    data = tmp_path / DATA_REL
+    calls = seen.read_text().splitlines()
+    assert any(c.startswith("build ") for c in calls) and any(c.startswith("version ") for c in calls)
+    for c in calls:  # `go version` writes telemetry counters as `go build` does: both stay inside the data dir
+        assert f"cache={data}/go/cache config={data}/go/config path={data}/go/path" in c
+    assert not (tmp_path / ".cache").exists() and not (tmp_path / ".config" / "go").exists()
+
+
 def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     url = "https://alice:s3cr3t-token@example.invalid/x.git"
@@ -1264,9 +2070,154 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert not (src / "tui" / "dist").exists()
 
 
-def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
-    # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
-    # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
+def _checkout_with_a_failing_tui(tmp_path: Path) -> tuple[Path, Path]:
+    """A checkout whose TUI cannot build (npm cannot reach the registry), and the PATH dir with the node/npm stubs."""
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(tmp_path, "npm", 'echo "npm ERR! network request to https://registry.npmjs.org/ failed" >&2\nexit 1\n')
+    return src, tools
+
+
+def test_a_failed_tui_build_is_a_warning_for_an_install(tmp_path: Path) -> None:
+    """A fresh install without a working npm still gets k3code, on the line REPL."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_TUI",), path_front=tools
+    )
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: the TUI did not build" in r.stderr
+    current = tmp_path / DATA_REL / "current"
+    assert (current / ".complete").is_file() and not (current / "tui" / "dist").exists()
+
+
+def test_k3_require_tui_fails_the_build_when_the_tui_does_not_build(tmp_path: Path) -> None:
+    """`k3code update` sets K3_REQUIRE_TUI: its build is staged with --no-activate, and a version without the TUI used
+    to be staged, switched to and reported as updated (exit 0) when the npm registry was unreachable."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    args = ("--from-source", "--yes", "--minimal", "--no-activate", "--print-version")
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        *args,
+        env_extra={"K3_REQUIRE_TUI": "1"},
+        drop=("K3_SKIP_TUI",),
+        path_front=tools,
+    )
+    assert r.returncode != 0
+    assert "npm ERR! network request" in r.stderr and "ERROR: the TUI did not build" in r.stderr
+    assert "line REPL" not in r.stderr  # the fallback is not taken, so it is not announced (and the tail is short)
+    assert not r.stdout.strip()  # no version name: nothing to activate
+    versions = tmp_path / DATA_REL / "versions"
+    assert not versions.exists() or list(versions.iterdir()) == []  # the half-built version is gone, no .complete
+
+
+def test_k3_require_tui_does_not_fail_a_build_that_skips_the_tui(tmp_path: Path) -> None:
+    """No node (or K3_SKIP_TUI) is a skip, not a failed build: a machine without node keeps updating."""
+    src, _tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--yes",
+        "--minimal",
+        "--no-activate",
+        "--print-version",
+        env_extra={"K3_REQUIRE_TUI": "1"},  # K3_SKIP_TUI=1 is the run() default
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().startswith("9.9.9-src")
+
+
+@pytest.mark.parametrize("builds", [True, False])
+def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: bool) -> None:
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    build = 'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    fail = 'build) echo "go: module lookup disabled by GOPROXY=off" >&2; exit 1 ;; esac\n'
+    go = stub_bin(tmp_path, "go", 'case "$1" in ' + (build if builds else fail))
+    r = run(tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_GO",), path_front=go)
+    assert r.returncode == 0, r.stderr  # k3 is optional: the install goes on
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".complete").is_file()
+    if builds:
+        assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+    else:
+        assert "WARNING: the k3 pane binary did not build" in r.stderr
+        assert not (current / "bin" / "k3").exists()
+        assert (current / ".degraded").read_text().startswith("k3:")
+
+
+def test_a_failed_k3_build_is_retried_when_the_same_version_is_installed_again(tmp_path: Path) -> None:
+    """#95: the version was complete, so every later run for the same commit said "already installed" and the k3
+    binary never came back."""
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    args = ("--from-source", "--minimal")
+    fail = stub_bin(tmp_path / "fail", "go", 'case "$1" in build) echo "go: GOPROXY=off" >&2; exit 1 ;; esac\n')
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=fail)
+    assert r.returncode == 0, r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".degraded").is_file() and not (current / "bin" / "k3").exists()
+    # no go now: a skip keeps the record of the failure
+    r = run(tmp_path, src / "install" / "install.sh", *args)
+    assert r.returncode == 0, r.stderr
+    assert (current / ".degraded").is_file()
+    build = 'case "$1" in build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    good = stub_bin(tmp_path / "good", "go", build)
+    r = run(tmp_path, src / "install" / "install.sh", *args, drop=("K3_SKIP_GO",), path_front=good)
+    assert r.returncode == 0, r.stderr
+    assert "already installed" in r.stderr
+    assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+
+
+def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
+    # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
+    # (next test) must not promise an offline install
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    calls = tmp_path / "npm.log"
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        f'echo "npm $*" >>"{calls}"\ncase "$*" in "run build") mkdir -p dist ;; esac\n',
+    )
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--minimal",
+        "--no-install-deps",
+        drop=("K3_SKIP_TUI", "K3_NO_DOWNLOAD"),
+        path_front=tools,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "npm ci" in calls.read_text()
+
+
+def test_no_install_deps_docs_say_toolchains_only(tmp_path: Path) -> None:
+    # `uv pip install` (PyPI), `npm ci` and `go build` (module downloads) still fetch with --no-install-deps; the
+    # help text and the README must say the flag skips the toolchains only, not that it "fetches nothing"
+    help_out = run(tmp_path, INSTALL, "--help")
+    assert help_out.returncode == 0, help_out.stderr
+    (line,) = re.findall(r"^ +--no-install-deps .*(?:\n {10,}\S.*)*", help_out.stdout, re.M)  # with its wrapped lines
+    # each mention in the README runs up to the next inline-code span
+    mentions = re.findall(r"`--no-install-deps`[^`]*", (REPO / "README.md").read_text())
+    assert len(mentions) == 2, mentions  # the Requirements bullet and the flag list
+    header = re.sub(r"\n# ?", " ", INSTALL.read_text().split("set -eu")[0])
+    (comment,) = re.findall(r"--no-install-deps fetches[^.]*\.", header)
+    for text in (line, *mentions, comment):
+        assert "toolchain" in text, text
+        assert all(name in text for name in ("PyPI", "npm")), text
+        assert not re.search(r"fetch(es)? nothing|install nothing|all fetching", text, re.I), text
+
+
+def test_the_tui_builds_in_the_stage_dir_not_in_tmpdir(tmp_path: Path) -> None:
+    # npm ci runs the postinstall binaries it unpacks, which a noexec TMPDIR refuses (issue #116): the build dir is a
+    # k3code-tui.X in DATA/tmp, recorded in the lock, and a TMPDIR ending in "/" plays no part
     src = _mini_checkout(tmp_path)
     (src / "tui").mkdir()
     (src / "tui" / "package.json").write_text("{}\n")
@@ -1293,8 +2244,10 @@ def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path:
     )
     assert r.returncode == 0, r.stderr
     recorded = (seen / "tui_tmp").read_text().strip()
-    assert re.fullmatch(re.escape(f"{tmp}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
+    stage = tmp_path / DATA_REL / "tmp"
+    assert re.fullmatch(re.escape(f"{stage}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
     assert (seen / "cwd").read_text().strip().startswith(recorded + "/")
+    assert list(tmp.iterdir()) == []
 
 
 @linux_only
@@ -1314,6 +2267,28 @@ def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> N
     assert mark.read_text().strip() == "start-first"
 
 
+def _link_farm(farm: Path, dirs: list[str], skip: tuple[str, ...]) -> Path:
+    """FARM: a directory linking every entry of DIRS (first one wins) except the SKIP names."""
+    farm.mkdir()
+    for d in dirs:
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                # lexists: a dangling link in a directory listed twice is already there, however exists() sees it
+                if entry.name not in skip and not os.path.lexists(farm / entry.name):
+                    (farm / entry.name).symlink_to(entry)
+    return farm
+
+
+def test_link_farm_takes_a_dangling_link_in_a_directory_listed_twice_once(tmp_path: Path) -> None:
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "tool").write_text("")
+    (d / "gone").symlink_to(tmp_path / "missing")  # dangling, like /usr/local/bin/orca on kokadock
+    farm = _link_farm(tmp_path / "farm", [str(d), str(d)], skip=("tool",))
+    assert [p.name for p in farm.iterdir()] == ["gone"]
+    assert os.readlink(farm / "gone") == str(d / "gone")
+
+
 def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
     # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
     nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
@@ -1323,13 +2298,7 @@ def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) ->
     (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     (src / "VERSION").write_text("9.9.9\n")
     shutil.copy(INSTALL, src / "install" / "install.sh")
-    farm = tmp_path / "farm"
-    farm.mkdir()
-    for d in os.environ["PATH"].split(os.pathsep):
-        if d and Path(d).is_dir():
-            for entry in Path(d).iterdir():
-                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
-                    (farm / entry.name).symlink_to(entry)
+    farm = _link_farm(tmp_path / "farm", os.environ["PATH"].split(os.pathsep), skip=("sha256sum", "shasum", "git"))
     home = tmp_path / "home"
     home.mkdir()
     r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})
@@ -1376,18 +2345,35 @@ def test_k3_allow_root_lets_a_root_run_install_like_the_flag(tmp_path: Path) -> 
     assert (home / DATA_REL / "current").is_symlink()
 
 
-def _fetch_only(root: Path, url: str, tool_body: str, tool: str) -> subprocess.CompletedProcess[str]:
-    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else."""
+def _shell_function(lines: list[str], name: str) -> list[str]:
+    """The definition of ``name`` in install.sh: one line for ``name() { ...; }``, else up to the closing ``}``."""
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{name}() {{"))
+    return lines[start : start + 1] if lines[start].endswith("}") else lines[start : lines.index("}", start) + 1]
+
+
+def _fetch_only(
+    root: Path,
+    url: str,
+    tool_body: str,
+    tool: str,
+    env_extra: dict[str, str] | None = None,
+    runner: tuple[str, ...] = ("/bin/sh",),
+) -> subprocess.CompletedProcess[str]:
+    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else but sleep."""
     root.mkdir(parents=True, exist_ok=True)
     text = INSTALL.read_text().splitlines()
-    keep = [ln for ln in text if ln.startswith("have() ")]
-    start = next(i for i, ln in enumerate(text) if ln.startswith("fetch() {"))
-    end = text.index("}", start)
+    names = ("have", "redact", "say", "log", "fetch_still_trying", "fetch")
+    body = [ln for name in names for ln in _shell_function(text, name)]
     script = root / "fetch.sh"
-    script.write_text("\n".join([*keep, *text[start : end + 1], f'fetch "$1" "{root}/out"', ""]))
+    script.write_text("\n".join(["set -eu", 'INSTALL_LOG=""', *body, f'fetch "$1" "{root}/out"', ""]))
     bin_dir = stub_bin(root, tool, tool_body)
+    (bin_dir / "sleep").symlink_to(shutil.which("sleep") or "/bin/sleep")  # the "still trying" watcher sleeps
     return subprocess.run(
-        ["/bin/sh", str(script), url], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False
+        [*runner, str(script), url],
+        env={"PATH": str(bin_dir), **(env_extra or {})},
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -1434,3 +2420,66 @@ def test_a_bad_signature_on_the_node_checksum_list_skips_the_tui(tmp_path: Path)
     assert "signature on nodejs.org's SHASUMS256.txt is bad" in r.stderr, r.stderr
     assert "SHASUMS256.txt.asc" in log.read_text()
     assert not (home / DATA_REL / "node").exists()
+
+
+def _args_stub(calls: Path) -> str:
+    return f'echo "$*" >"{calls}"\n'
+
+
+@pytest.mark.parametrize(("tool", "flag"), [("curl", "--connect-timeout 15"), ("wget", "-T 15")], ids=["curl", "wget"])
+def test_a_download_gives_up_on_a_connection_after_15_seconds(tmp_path: Path, tool: str, flag: str) -> None:
+    calls = tmp_path / "calls"
+    r = _fetch_only(tmp_path, "https://example.invalid/x", _args_stub(calls), tool)
+    assert r.returncode == 0, r.stderr
+    assert f" {flag} " in f" {calls.read_text()} "
+
+
+@pytest.mark.parametrize(("given", "used"), [("7", "7"), ("", "15"), ("0", "15"), ("soon", "15"), ("-3", "15")])
+def test_the_connect_timeout_can_be_changed_and_junk_is_ignored(tmp_path: Path, given: str, used: str) -> None:
+    calls = tmp_path / "calls"
+    r = _fetch_only(
+        tmp_path, "https://example.invalid/x", _args_stub(calls), "curl", env_extra={"K3_CONNECT_TIMEOUT": given}
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"--connect-timeout {used} " in f"{calls.read_text()} "
+
+
+def test_a_download_that_cannot_connect_says_it_is_still_trying(tmp_path: Path) -> None:
+    # the 75 s of silence behind a proxy that swallows connections: curl -s says nothing while it waits and retries
+    curl = "sleep 3\nexit 28\n"
+    t0 = time.monotonic()
+    r = _fetch_only(
+        tmp_path, "https://alice:s3cr3t-token@example.invalid/x", curl, "curl", env_extra={"K3_CONNECT_TIMEOUT": "1"}
+    )
+    assert r.returncode == 28
+    assert time.monotonic() - t0 < 10
+    lines = [ln for ln in r.stderr.splitlines() if "still trying" in ln]
+    assert lines, r.stderr
+    assert "example.invalid (1s)" in lines[0] and "gives up after 1s" in lines[0]
+    assert "s3cr3t" not in r.stderr and "alice" not in r.stderr  # the credentials of a URL never reach the terminal
+    assert len(lines) >= 2 and "(2s)" in lines[1]  # and it keeps saying so while the wait goes on
+
+
+def test_a_download_that_answers_is_quiet_and_leaves_no_watcher_behind(tmp_path: Path) -> None:
+    t0 = time.monotonic()
+    r = _fetch_only(tmp_path, "https://example.invalid/x", "exit 0\n", "curl", env_extra={"K3_CONNECT_TIMEOUT": "30"})
+    assert r.returncode == 0
+    assert r.stderr == ""
+    assert time.monotonic() - t0 < 10  # a watcher still holding stderr open would keep subprocess.run waiting 30 s
+
+
+def test_the_still_trying_watcher_ends_with_the_installer(tmp_path: Path) -> None:
+    # a killed installer cannot clean up: the watcher notices that its parent is gone and stays silent. The outer
+    # shell reaps the killed one (a zombie still answers kill -0) and exits while the watcher holds the pipe open.
+    curl = 'kill -9 "$PPID"\nexit 0\n'
+    t0 = time.monotonic()
+    r = _fetch_only(
+        tmp_path,
+        "https://example.invalid/x",
+        curl,
+        "curl",
+        env_extra={"K3_CONNECT_TIMEOUT": "1"},
+        runner=("/bin/sh", "-c", 'sh "$0" "$@"; exit 0'),
+    )
+    assert time.monotonic() - t0 < 10
+    assert "still trying" not in r.stderr

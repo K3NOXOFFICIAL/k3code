@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from k3code.permissions import PermissionMode, Rule, decide
@@ -283,6 +286,45 @@ def test_auto_mode_denies_writes_outside_the_project_roots() -> None:
     assert d.action == "deny" and "project roots" in (d.message or "")
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest > /tmp/test-output.txt 2>&1; tail -n 30 /tmp/test-output.txt",
+        "go test ./... &> /tmp/go-test.log",
+        "cargo build 2> /tmp/build-errors.txt",
+        "echo done >> /tmp/k3/marker",
+    ],
+)
+def test_auto_mode_bash_writes_scratch_output_to_the_sandbox_tmp(command: str) -> None:
+    # auto-mode bash runs in the sandbox, whose /tmp is a private tmpfs: a redirect there reaches nothing on the host
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=CWD)
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human, (command, d)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > /tmp/../home/user/.bashrc",  # `..` leaves /tmp
+        "echo x > /var/tmp/x",  # not the sandbox's tmpfs
+        "echo x > /tmpfoo/x",
+        "echo x > ~/.cache/planted",  # ~/.cache is bound writable into the sandbox
+    ],
+)
+def test_auto_mode_bash_still_writes_nowhere_else_outside_the_roots(command: str) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=CWD)
+    assert d.action == "deny" and "project roots" in (d.message or ""), (command, d)
+
+
+def test_auto_mode_bash_tmp_redirect_through_a_host_symlink_stays_refused() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
+        link = Path(scratch) / "link"
+        link.symlink_to("/home/user/.bashrc")  # need not exist: realpath follows the link anyway
+        d = decide(mode="auto", tool="bash", args={"command": f"echo x > {link}"}, cwd=CWD)
+    assert d.action == "deny", d
+    # the write tool runs in the daemon, on the host's /tmp: still outside the roots
+    assert decide(mode="auto", tool="write", args={"path": "/tmp/scratch.py"}, cwd=CWD).action == "deny"
+
+
 def test_auto_mode_still_allows_project_writes_and_sandboxed_reads_outside() -> None:
     assert decide(mode="auto", tool="write", args={"path": "a.txt"}, cwd=CWD).action == "allow"
     assert decide(mode="auto", tool="bash", args={"command": "echo x > a.txt"}, cwd=CWD).action == "allow"
@@ -329,13 +371,81 @@ def test_reads_of_key_and_daemon_env_files_are_denied_in_every_mode(tmp_path, mo
     assert decide(mode="default", tool="read", args={"path": ".env.example"}, cwd=proj).action == "allow"
 
 
-def test_auto_mode_reads_outside_the_roots_are_not_silently_allowed() -> None:
+def test_auto_mode_reads_outside_the_roots_never_prompt() -> None:
+    # system/toolchain locations: allowed (and logged as an auto allow), also headless
     d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD)
-    assert d.action == "ask" and not d.auto_allowed and d.needs_human
-    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD).action == "ask"
-    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "deny"
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "allow"
+    assert decide(mode="auto", tool="grep", args={"path": "/usr/lib/python3/x.py"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="read", args={"path": "~/.cargo/registry/src/x/lib.rs"}, cwd=CWD).action == "allow"
+    site = "/srv/venv/lib/site-packages/a.py"
+    assert decide(mode="auto", tool="read", args={"path": site}, cwd=CWD).action == "allow"
+    # anything else: refused with guidance, no prompt
+    for tool, path in (("grep", "/var/log"), ("read", "/tmp/bootstrap.py"), ("glob", "~/.keno")):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "deny" and not d.needs_human, (tool, path, d)
+        assert "outside the project" in (d.message or "") and "/add-dir" in (d.message or "")
+    # credential paths stay hard-denied, a user rule still wins (allow and ask), default mode still asks a person
+    assert decide(mode="auto", tool="read", args={"path": "~/.ssh/id_rsa"}, cwd=CWD).hardline == "sensitive-path"
     user = [_r("read", "/etc/hosts", "allow")]
     assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/var/log*", "allow")]
+    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD, user_rules=user).action == "allow"
+    user = [_r("read", "/etc/hosts", "ask")]
+    d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user)
+    assert d.action == "ask" and d.needs_human
+    d = decide(mode="default", tool="read", args={"path": "/tmp/bootstrap.py"}, cwd=CWD)
+    assert d.action == "ask" and d.needs_human
+
+
+def test_uv_credentials_are_never_auto_allowed(tmp_path, monkeypatch) -> None:
+    # `uv auth dir` is ~/.local/share/uv/credentials: only uv's interpreters and tools count as a toolchain read
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    proj = str(tmp_path / "proj")
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+        ("read", "~/.local/share/uv/python/../credentials/credentials.toml"),
+    ):
+        # auto mode refuses it like any read outside the roots (never auto-allowed, never resolved without a person)
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert (d.action == "deny" or d.needs_human) and not d.auto_allowed, (tool, path, d)
+        d = decide(mode="default", tool=tool, args={"path": path, "pattern": "."}, cwd=proj)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+    for rel in ("python/cpython-3.12-linux/lib/python3.12/os.py", "tools/ruff/bin/ruff"):
+        d = decide(mode="auto", tool="read", args={"path": f"~/.local/share/uv/{rel}"}, cwd=proj)
+        assert d.action == "allow" and d.auto_allowed, (rel, d)
+
+
+def test_auto_mode_reads_of_the_uv_credentials_store_ask_a_person(tmp_path, monkeypatch) -> None:
+    # PR 347 review: `uv auth dir` is ~/.local/share/uv/credentials; the uv toolchain allow must not cover it
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for tool, path in (
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("grep", "~/.local/share/uv/credentials"),
+    ):
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "."}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human and not d.auto_allowed, (tool, path, d)
+    # uv's interpreters and tools stay a toolchain read; the uv root itself (it holds credentials/) does not
+    for path in ("~/.local/share/uv/python/cpython-3.12/lib/os.py", "~/.local/share/uv/tools/ruff/bin/ruff"):
+        assert decide(mode="auto", tool="read", args={"path": path}, cwd=CWD).action == "allow", path
+    d = decide(mode="auto", tool="grep", args={"path": "~/.local/share/uv", "pattern": "."}, cwd=CWD)
+    assert d.action != "allow", d
+
+
+def test_a_blank_extra_hardline_pattern_matches_nothing_and_is_reported() -> None:
+    from k3code.permissions.state import parse_permissions
+
+    # the owner's config had `hardline: ['']`: '' matched every command, so plain `ls` was a hardline deny
+    for mode in ("default", "auto"):
+        d = decide(mode=mode, tool="bash", args={"command": "ls"}, cwd=CWD, hardline_extra=["", "  "])
+        assert d.action == "allow" and d.hardline is None, (mode, d)
+    _, hard, problems = parse_permissions("permissions:\n  hardline: ['', 'ssh \\S+ reboot']\n")
+    assert hard == [r"ssh \S+ reboot"]
+    assert any("permissions.hardline[0]" in p and "blank" in p for p in problems), problems
+    d = decide(mode="auto", tool="bash", args={"command": "ssh box reboot"}, cwd=CWD, hardline_extra=hard)
+    assert d.action == "deny" and d.hardline == "config-hardline-0"  # a real pattern still denies
     assert decide(mode="auto", tool="read", args={"path": "src/a.py"}, cwd=CWD).action == "allow"
     assert decide(mode="yolo", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
 
@@ -368,3 +478,352 @@ def test_an_always_rule_never_carries_an_inline_environment_value() -> None:
         assert not any("sk-live" in p for p in patterns)
     d = decide(mode="default", tool="bash", args={"command": "API_KEY=sk-live-123"}, cwd=CWD)
     assert all("sk-live" not in r.pattern for r in suggest_rules("bash", d))
+
+
+@pytest.mark.parametrize(
+    ("command", "ok"),
+    [
+        ("ls -la", True),
+        ("cat notes.txt; ls", True),
+        ("grep -n KEY notes.txt | cat", True),
+        ("grep -rn KEY .", False),
+        ("grep -nR KEY .", False),
+        ("grep -d recurse KEY .", False),
+        ("grep --dir=recurse KEY .", False),
+        ("grep --recur KEY .", False),
+        ("grep --deref KEY .", False),
+        ("ls -R", False),
+        ("ls --recursive", False),
+        ("rg KEY", False),
+        ("git status", True),
+        ("git diff --no-index a b", False),
+        ("cat */notes", False),
+        ("cat .e{n,}v", False),
+        # quoted literal arguments are now allowed: the quotes make the word reach the program unchanged
+        ("cat 'notes'", True),
+        ('cat "notes"', True),
+        ("grep -n 'foo bar' notes", True),
+        ('grep -n "foo bar" notes', True),
+        ("grep -n 'a|b' notes", True),  # the pipe is inside quotes: literal, not a separator
+        # find on its own is a reader now (lists names); its risky primaries still refuse it
+        ("find . -name '*.py'", True),
+        ("find . -type f", True),
+        ("find . -name '*.py' -delete", False),
+        ("find . -exec rm {} ;", False),
+        ("find ~ -name x", False),  # unquoted ~ expands: still refused
+        ("cat *.py", False),  # an unquoted glob still asks
+        ('cat "$F"', False),  # a variable inside double quotes still expands
+        ("cat ~/notes", False),
+        ("cat $F", False),
+        ("cat notes > out", False),
+        ("cat 'notes' > out", False),  # a redirect still asks even with a quoted argument
+        ("ls; python3 x", False),
+        ("FOO=1 cat notes", False),
+        ("", False),
+    ],
+)
+def test_home_read_only_takes_only_plain_non_recursive_readers(command, ok):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is ok
+
+
+# --- dot-paths under $HOME keep the prompt (PR 347 review: credential stores no denylist names) ----------------
+
+
+@pytest.mark.parametrize("mode", ["auto", "default", "accept-edits"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat .cache/huggingface/token",
+        "cat {home}/.config/git/credentials",
+        "cat .config/github-copilot/hosts.json",
+        "cat .local/share/opencode/auth.json",
+        "cat notes/../.config/git/credentials",
+        "grep -n token .cache/huggingface/token",
+        "grep --file=.config/git/credentials notes",
+        "cat creds",  # a symlink to ~/.config/git/credentials
+    ],
+)
+def test_builtin_reads_of_a_home_dot_path_ask_at_home(tmp_path, monkeypatch, mode, command) -> None:
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:tok@example.com\n")
+    (home / "creds").symlink_to(home / ".config" / "git" / "credentials")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    d = decide(mode=mode, tool="bash", args={"command": command.format(home=home)}, cwd=str(home))
+    assert d.action == "ask", d
+    assert d.needs_human and not d.auto_allowed
+
+
+@pytest.mark.parametrize("command", ["cat notes.txt", "ls", "ls .", "ls -la", "grep -n KEY notes.txt"])
+def test_builtin_reads_of_plain_home_paths_keep_the_fast_path(tmp_path, monkeypatch, command) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
+    assert d.action == "allow" and not d.auto_allowed and d.rule is not None and d.rule.layer == 0, d
+
+
+def test_builtin_reads_of_dot_paths_inside_a_project_under_home_stay_allowed(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    proj = home / "src" / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for command in ("cat .gitignore", "cat .github/workflows/ci.yml", "ls .github"):
+        d = decide(mode="default", tool="bash", args={"command": command}, cwd=str(proj))
+        assert d.action == "allow" and d.rule is not None and d.rule.layer == 0, (command, d)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .config/git/credentials",
+        "cat /home/u/.cache/huggingface/token",
+        "ls notes .local/share/opencode",
+        "grep --file=.config/git/credentials notes",
+        "grep -f.config/git/credentials notes",
+    ],
+)
+def test_home_read_only_refuses_dot_paths(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -rn 'foo bar' notes",  # grep -r is a tree walker whatever the quotes
+        "grep -nR 'x' .",
+        'grep -n "a$b" notes',  # $ inside double quotes expands: not what is written
+        "cat `cat f`",  # a substitution
+        "cat '.env'",  # a quoted credential-shaped dot path
+        "find . -name '*.py' -exec rm {} ;",
+        "find . -name x -delete",
+        "find . -okdir sh -c id ;",
+        "cat 'notes' > out",  # a redirect, even with a quoted argument
+        r"cat 'a'\''b'",  # a quote-splice that reassembles across words
+    ],
+)
+def test_home_read_only_still_refuses_tree_walkers_and_expansions(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -n 'foo bar' notes",  # a single-quoted literal with a space
+        'grep -n "foo bar" notes',  # a double-quoted literal with no $/backtick/backslash
+        "grep -n 'a|b' notes",  # the pipe is inside quotes: a literal, not a separator
+        "find . -name '*.py'",  # the quoted glob is passed to find, not expanded by the shell
+        "find . -name '*.py' -type f",
+        "find . -type d",
+        "cat 'notes'",
+    ],
+)
+def test_home_read_only_allows_quoted_literals_and_find(command):
+    from k3code.permissions.engine import home_read_only
+
+    assert home_read_only(command) is True
+
+
+def test_home_fast_path_credential_paths_still_ask_at_home(tmp_path, monkeypatch) -> None:
+    """The quoted-literal/find relaxation must not touch credential-path handling: a named credential file under a
+    $HOME dot folder still asks (never auto-allows), as before."""
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "credentials").write_text("https://u:tok@example.com\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for command in ("cat .config/git/credentials", "grep -n tok .config/git/credentials"):
+        d = decide(mode="auto", tool="bash", args={"command": command}, cwd=str(home))
+        assert d.action == "ask" and d.needs_human and not d.auto_allowed, (command, d)
+
+
+# --- in-process reads where a root covers a home credential store (K3NOX-640) ------------------------------------
+# read/grep/glob run in the daemon, outside the sandbox: a root at $HOME (or ~/.config) put ~/.npmrc, ~/.config/gh and
+# uv's credentials inside the roots, where every read was allowed without a person, yolo and auto included.
+
+_HOME_FILES = (
+    ".local/share/uv/credentials/credentials.toml",
+    ".config/gh/hosts.yml",
+    ".config/git/credentials",
+    ".cache/huggingface/token",
+    ".docker/config.json",
+    ".npmrc",
+    ".bashrc",
+    ".cargo/registry/src/x/lib.rs",
+    ".local/share/uv/python/cpython-3.12/lib/os.py",
+    ".local/lib/python3.12/site-packages/pkg/a.py",
+    ".claude/skills/mine/SKILL.md",
+    "notes.txt",
+    "src/proj/.github/workflows/ci.yml",
+)
+
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    for rel in _HOME_FILES:
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("x\n")
+    (home / "creds").symlink_to(home / ".config" / "gh" / "hosts.yml")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return home
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize(
+    "tool, path",
+    [
+        ("read", ".local/share/uv/credentials/credentials.toml"),
+        ("grep", ".local/share/uv"),
+        ("grep", ".local/share/uv/credentials"),
+        ("read", "~/.config/gh/hosts.yml"),
+        ("read", "{home}/.docker/config.json"),
+        ("read", ".npmrc"),
+        ("read", ".cache/huggingface/token"),
+        ("read", ".config/git/credentials"),
+        ("read", ".bashrc"),
+        ("read", "notes/../.npmrc"),
+        ("read", "creds"),  # a symlink in $HOME to ~/.config/gh/hosts.yml
+        ("grep", ".config"),
+        ("glob", ".config/gh"),
+        ("read", ".claude/skills/mine/SKILL.md"),
+    ],
+)
+def test_in_process_reads_of_home_dot_paths_ask_a_person_at_home(fake_home, mode, tool, path) -> None:
+    path = path.format(home=fake_home)
+    # a session started in $HOME, one started above it, a project with $HOME added
+    for cwd, add_dirs in ((str(fake_home), []), ("/", []), ("/proj", [str(fake_home)])):
+        p = path if cwd == str(fake_home) or path[0] in "~/" else f"{fake_home}/{path}"
+        d = decide(mode=mode, tool=tool, args={"path": p, "pattern": "."}, cwd=cwd, add_dirs=add_dirs)
+        assert d.action == "ask", (cwd, d)
+        assert d.needs_human and d.always_ask and not d.auto_allowed, (cwd, d)
+        d = decide(mode=mode, tool=tool, args={"path": p, "pattern": "."}, cwd=cwd, add_dirs=add_dirs, headless=True)
+        assert d.action == "deny", (cwd, d)
+
+
+def test_a_glob_pattern_into_a_home_dot_folder_asks_at_home(fake_home) -> None:
+    for pattern in (".config/gh/*", ".local/share/uv/credentials/*", ".docker/*", ".cache/*/token"):
+        d = decide(mode="auto", tool="glob", args={"path": ".", "pattern": pattern}, cwd=str(fake_home))
+        assert d.action == "ask" and d.needs_human and d.always_ask, (pattern, d)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_root_that_covers_a_home_credential_store_asks_for_it(fake_home, mode) -> None:
+    # a dotfiles checkout at ~/.config, a session started in ~/.local: the store is inside the roots
+    for cwd, path in (
+        (fake_home / ".config", "gh/hosts.yml"),
+        (fake_home / ".local", "share/uv/credentials/credentials.toml"),
+        (fake_home / ".local/share/uv", "credentials"),
+    ):
+        tool = "grep" if path == "credentials" else "read"
+        d = decide(mode=mode, tool=tool, args={"path": path, "pattern": "."}, cwd=str(cwd))
+        assert d.action == "ask" and d.needs_human and d.always_ask, (cwd, path, d)
+    # the rest of such a root stays an ordinary read
+    d = decide(mode=mode, tool="read", args={"path": "nvim/init.lua"}, cwd=str(fake_home / ".config"))
+    assert d.action == "allow", d
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+def test_ordinary_reads_at_home_keep_working(fake_home, mode) -> None:
+    home = str(fake_home)
+    allowed = [
+        ("read", "notes.txt", home, []),
+        ("grep", ".", home, []),  # the walk itself withholds the dot folders, see test_grep_secrets
+        ("glob", ".", home, []),
+        # toolchain dirs under $HOME are read without a person, as outside the roots
+        ("read", ".cargo/registry/src/x/lib.rs", home, []),
+        ("read", ".local/share/uv/python/cpython-3.12/lib/os.py", home, []),
+        ("read", ".local/lib/python3.12/site-packages/pkg/a.py", home, []),
+        # a project below $HOME: its own dot folders are ordinary, as for bash
+        ("read", ".github/workflows/ci.yml", f"{home}/src/proj", []),
+        ("read", "src/proj/.github/workflows/ci.yml", home, [f"{home}/src/proj"]),
+        # a session started inside a store's folder (developing a skill in ~/.claude/skills) reads its own files
+        ("read", "SKILL.md", f"{home}/.claude/skills/mine", []),
+    ]
+    for tool, path, cwd, add_dirs in allowed:
+        d = decide(mode=mode, tool=tool, args={"path": path, "pattern": "*"}, cwd=cwd, add_dirs=add_dirs)
+        assert d.action == "allow" and not d.always_ask, (tool, path, cwd, d)
+
+
+def test_a_user_rule_still_decides_a_home_dot_read(fake_home) -> None:
+    allow = [_r("read", f"{fake_home}/.config/gh/*", "allow")]
+    d = decide(mode="default", tool="read", args={"path": ".config/gh/hosts.yml"}, cwd=str(fake_home), user_rules=allow)
+    assert d.action == "allow", d
+    deny = [_r("read", f"{fake_home}/.npmrc", "deny")]
+    assert (
+        decide(mode="yolo", tool="read", args={"path": ".npmrc"}, cwd=str(fake_home), user_rules=deny).action == "deny"
+    )
+    # a person's "session" answer is a session rule: the same read is not asked twice
+    session = [_r("read", f"{fake_home}/.npmrc", "allow")]
+    d = decide(mode="auto", tool="read", args={"path": ".npmrc"}, cwd=str(fake_home), session_rules=session)
+    assert d.action == "allow", d
+
+
+def test_reads_of_home_stores_outside_the_roots_are_unchanged(fake_home) -> None:
+    # outside the roots a person (or auto's refusal) already stands
+    store = "~/.config/gh/hosts.yml"
+    assert decide(mode="default", tool="read", args={"path": store}, cwd=CWD).needs_human
+    assert decide(mode="auto", tool="read", args={"path": store}, cwd=CWD).action == "deny"
+    d = decide(mode="auto", tool="read", args={"path": "~/.local/share/uv/credentials/x.toml"}, cwd=CWD)
+    assert d.action == "ask" and d.needs_human
+
+
+def test_the_stricter_of_the_written_and_the_reached_path_keeps_always_ask(fake_home, tmp_path) -> None:
+    # `link/../hosts.yml`: the tools follow link first, so ~/.config/gh/hosts.yml is read, not <cwd>/hosts.yml
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "link").symlink_to(fake_home / ".config" / "gh" / "sub", target_is_directory=True)
+    (fake_home / ".config" / "gh" / "sub").mkdir()
+    d = decide(mode="yolo", tool="read", args={"path": f"{outside}/link/../hosts.yml"}, cwd=str(fake_home))
+    assert d.action == "ask" and d.always_ask, d
+
+
+# --- a NUL byte in a path: decide() always returns a decision ------------------
+
+_NUL = chr(0)  # built at run time: it cannot sit in a shell argument, and a literal one would not survive an editor
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"echo hi > a{_NUL}b",
+        f"echo hi >> {{tmp}}/a{_NUL}b",
+        f"cat < a{_NUL}b",
+        f"echo hi | tee a{_NUL}b",
+        f"cat a{_NUL}b",
+        f"rm a{_NUL}b",
+        f"echo '<p>a{_NUL}b</p>'",
+        f"echo '<p>a{_NUL}b</p>' > out.html",
+    ],
+)
+def test_bash_with_a_nul_byte_still_gets_a_decision(mode, command, tmp_path) -> None:
+    d = decide(mode=mode, tool="bash", args={"command": command.replace("{tmp}", str(tmp_path))}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}
+
+
+@pytest.mark.parametrize("command", [f"echo hi > a{_NUL}b", f"echo hi > {{tmp}}/a{_NUL}b"])
+def test_auto_mode_refuses_a_redirect_target_it_cannot_resolve(command, tmp_path) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": command.replace("{tmp}", str(tmp_path))}, cwd=tmp_path)
+    assert d.action == "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "plan", "auto", "yolo"])
+@pytest.mark.parametrize("tool", ["read", "write", "edit", "glob", "grep"])
+def test_a_path_tool_with_a_nul_byte_still_gets_a_decision(mode, tool, tmp_path) -> None:
+    d = decide(mode=mode, tool=tool, args={"path": f"a{_NUL}b", "pattern": "*"}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}
+
+
+def test_a_nul_byte_in_the_cwd_args_still_gets_a_decision(tmp_path) -> None:
+    d = decide(mode="auto", tool="bash", args={"command": "echo hi > out", "cwd": f"x{_NUL}y"}, cwd=tmp_path)
+    assert d.action in {"allow", "ask", "deny"}

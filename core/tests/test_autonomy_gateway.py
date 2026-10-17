@@ -95,6 +95,8 @@ def make(tmp: Path, monkeypatch, steps: list[dict], mode: str = "auto", **cfg: A
         models={"default": "m-main"},
         tiers={"strong": "m-strong", "cheap": "m-cheap", "fast": "m-fast"},
     )
+    # the scripts answer one turn: auto-continue (on by default in auto/yolo) would add judge calls and turns
+    cfg["autonomy"] = {"auto_continue": False, **(cfg.get("autonomy") or {})}
     server = GatewayServer(
         config=Settings(providers=[provider], permission_mode=mode, **cfg), store=SessionStore(tmp / "sessions.db")
     )
@@ -169,7 +171,8 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     plans = events(server, "plan.show")
     assert [p["status"] for p in plans] == ["proposed", "approved"]
     assert plans[-1]["auto_approved"] is True and plans[-1]["sections"]["Goal"] == "Add flag"
-    assert "watch edge case X" in plans[-1]["advisor"]  # brief advisor critique appended
+    assert "advisor" not in plans[-1]  # a medium plan gets no critique (the strong call is for large/huge or high risk)
+    assert "brief critique" not in "".join(c["text"] for p in server.providers for c in p.log)
     assert server.session.stored.messages[-1]["content"] == "implemented"
     # the executor saw the plan; planning ran read-only (no edit tools offered in plan mode)
     main_call = next(c for p in server.providers for c in p.log if c["model"] == "m-main")
@@ -185,6 +188,138 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     assert server.session.perms.mode.value == "auto"  # plan approval did not leave auto mode
 
 
+async def test_large_and_high_risk_plans_get_the_advisor_critique(tmp_path, monkeypatch):
+    """The brief strong-tier critique after approval costs a strong call per plan: only a large/huge or high-risk
+    plan gets one (a medium plan is approved and run as is, see the test above)."""
+    server = make(tmp_path, monkeypatch, [verdict("large"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    plans = events(server, "plan.show")
+    assert plans[-1]["status"] == "approved" and "watch edge case X" in plans[-1]["advisor"]
+    steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR]
+    server2 = make(sub(tmp_path, "h"), monkeypatch, steps, autonomy={"proposals": False})
+    await start(server2, tmp_path / "h")
+    await run_turn(server2, "tidy things", [{"choice": "once"}])
+    assert "watch edge case X" in events(server2, "plan.show")[-1]["advisor"]
+
+
+async def test_medium_risk_in_auto_is_approved_without_asking(tmp_path, monkeypatch):
+    """Only high risk asks in auto mode: a medium-risk plan is auto-approved like a low-risk one."""
+    steps = [verdict("medium", risk="med"), *PLANNER, *EXECUTOR]
+    server = make(tmp_path, monkeypatch, steps, autonomy={"proposals": False})
+    await start(server, tmp_path)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []
+    plans = events(server, "plan.show")
+    assert [p["status"] for p in plans] == ["proposed", "approved"] and plans[-1]["auto_approved"] is True
+    assert plans[-1]["risk"] == "med"
+    assert server.session.stored.messages[-1]["content"] == "implemented"
+
+
+async def test_planner_of_an_auto_session_reads_outside_the_project_as_auto_mode_does(tmp_path, monkeypatch):
+    """The planning turn ran in plan mode, which asks a person for every read outside the project: an auto session got
+    an approval prompt for a planner read that its own turns refuse without asking. The planner now decides such reads
+    as the session does: refused with the /add-dir hint (credential paths stay hard-denied, see test_engine)."""
+    proj = sub(tmp_path, "proj")
+    (sub(tmp_path, "other") / "notes.md").write_text("elsewhere\n")
+    planner_call = {"type": "tool_call", "model": "m-strong", "match": "PLANNING mode"}
+    steps = [
+        verdict("medium"),
+        {**planner_call, "when": "first", "name": "read", "arguments": {"path": "../other/notes.md"}},
+        {**planner_call, "when": "after_tool", "name": "exit_plan", "arguments": {"plan": PLAN}},
+        *EXECUTOR,
+    ]
+    server = make(proj, monkeypatch, steps, autonomy={"proposals": False})
+    await start(server, proj)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []  # no approval prompt in auto mode
+    planner_texts = [c["text"] for p in server.providers for c in p.log if "PLANNING mode" in c["text"]]
+    assert any("outside the project" in t and "/add-dir" in t for t in planner_texts)
+    assert not any("elsewhere" in t for t in planner_texts)  # the file was not read
+    assert server.session.stored.messages[-1]["content"] == "implemented"
+
+
+def test_planner_permissions_follow_the_session(tmp_path):
+    from k3code.autonomy.plan_first import planner_permissions
+    from k3code.permissions import PermissionMode, Rule
+    from k3code.permissions.state import PermissionState
+
+    session = PermissionState(mode=PermissionMode.AUTO, cwd=tmp_path / "proj", add_dirs=[str(tmp_path / "lib")])
+    perms = planner_permissions(session)
+    assert perms.mode is PermissionMode.PLAN and perms.plan_for is PermissionMode.AUTO
+    assert perms.add_dirs == session.add_dirs and perms.add_dirs is not session.add_dirs
+    session.session_rules.append(Rule(tool="read", pattern="/srv/data/*", action="allow"))
+    assert perms.decide("read", {"path": "/srv/data/a.csv"}).action == "allow"  # the session's approval holds
+    assert perms.decide("read", {"path": "/srv/other/a.csv"}).action == "deny"
+    assert perms.decide("read", {"path": "/etc/k3code-test.conf"}).action == "allow"  # as auto mode reads it
+    # still read-only whatever a rule says, and credentials stay refused
+    session.session_rules.append(Rule(tool="bash", pattern="*", action="allow"))
+    assert perms.decide("bash", {"command": "ls"}).action == "deny"
+    assert perms.decide("write", {"path": "a.py", "content": "x"}).action == "deny"
+    assert perms.decide("read", {"path": "~/.ssh/id_rsa"}).hardline == "sensitive-path"
+    # a default-mode session's planner asks a person for both, as before
+    plain = planner_permissions(PermissionState(mode=PermissionMode.DEFAULT, cwd=tmp_path / "proj"))
+    for path in ("/srv/other/a.csv", "/etc/k3code-test.conf"):
+        d = plain.decide("read", {"path": path})
+        assert d.action == "ask" and d.needs_human, (path, d)
+
+
+async def test_planner_gets_the_conversation_condensed_not_as_history(tmp_path, monkeypatch):
+    """The planning turn carried the whole message history (every tool result in full) into the strong-tier call.
+    It now gets the condensed transcript the advisor gets: clipped messages, the old part summarized on the cheap
+    tier past ``advisor_compact_chars``."""
+    steps = [
+        verdict("medium"),
+        {"type": "text", "model": "m-cheap", "match": "Summarize this coding conversation", "text": "SUMMARY"},
+        *PLANNER,
+        *EXECUTOR,
+    ]
+    cfg = {"advisor_compact_chars": 500, "proposals": False}
+    server = make(tmp_path, monkeypatch, steps, autonomy=cfg)
+    await start(server, tmp_path)
+    server.session.messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300} for i in range(10)
+    ]
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    assert "Conversation so far:" in planner_call["text"] and "SUMMARY" in planner_call["text"]
+    assert "message 9 " in planner_call["text"]  # the recent tail stays verbatim
+    assert "message 0 " not in planner_call["text"]  # the old part went in summarized, not as history
+
+
+async def test_planner_sees_the_project_memory_the_executor_sees(tmp_path, monkeypatch):
+    """The planning loop used the bare base prompt: the plan was written without K3CODE.md, and then drove a turn that
+    had it. It gets the same composed prompt as the normal loop, with the planning addendum last."""
+    (tmp_path / "K3CODE.md").write_text("TEST-CMD-FOR-PLANNER: run make check")
+    skill = k3home(tmp_path) / "skills" / "demo-skill" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: demo-skill\ndescription: A demo skill\n---\nbody")
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    main_call = next(c for p in server.providers for c in p.log if c["model"] == "m-main")
+    for call_ in (planner_call, main_call):
+        assert "## Project memory (K3CODE.md)" in call_["text"] and "TEST-CMD-FOR-PLANNER" in call_["text"]
+    assert planner_call["text"].index("TEST-CMD-FOR-PLANNER") < planner_call["text"].index("PLANNING mode")
+    # the planner has no skill tool, so it is not told about skills; the normal loop is
+    assert "## Skills" in main_call["text"] and "## Skills" not in planner_call["text"]
+    assert "skill" not in planner_call["tools"] and "skill" in main_call["tools"]
+
+
+async def test_planner_is_not_told_about_an_advisor_tool_it_does_not_have(tmp_path, monkeypatch):
+    """With /advisor on, the prompt names the ``advisor`` tool. Only the normal loop registers it; the planner must not
+    be told to consult a tool it cannot call."""
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    main_call = next(c for p in server.providers for c in p.log if c["model"] == "m-main")
+    assert "advisor" in main_call["tools"] and "advisor` tool" in main_call["text"]  # the control: the normal loop
+    assert "advisor" not in planner_call["tools"] and "advisor` tool" not in planner_call["text"]
+
+
 async def test_high_risk_in_auto_requires_approval(tmp_path, monkeypatch):
     steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *EXECUTOR]
     server = make(tmp_path, monkeypatch, steps)
@@ -194,6 +329,53 @@ async def test_high_risk_in_auto_requires_approval(tmp_path, monkeypatch):
     assert seen[0]["params"]["choices"] == ["once", "deny"]
     assert server.session.stored.messages[-1]["content"] == "implemented"
     assert server.session.perms.mode.value == "auto"
+
+
+async def test_planner_that_produces_no_plan_in_auto_runs_the_task_directly(tmp_path, monkeypatch):
+    """A planner that spends its turns reading and never calls exit_plan (nor answers with text) ended the turn with
+    "Plan not approved": the task was dropped unexecuted. In auto mode, below high risk, it now runs directly."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+    planner_call = {"type": "tool_call", "model": "m-strong", "match": "PLANNING mode", "name": "read"}
+    reads = [
+        {**planner_call, "when": "first", "arguments": {"path": "a.py"}},
+        {**planner_call, "when": "after_tool", "arguments": {"path": "b.py"}},
+    ]
+    done = {"type": "text", "model": "m-main", "text": "implemented without a plan"}
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *reads, done], autonomy={"proposals": False})
+    await start(server, tmp_path)
+    seen = await run_turn(server, "add a --verbose flag to the CLI")
+    assert seen == []  # low risk: nothing to approve
+    called = models_called(server)
+    assert "m-strong" in called and "m-main" in called, called
+    assert server.session.stored.messages[-1]["content"] == "implemented without a plan"
+    assert "Plan not approved" not in events(server, "message.complete")[-1]["text"]
+    assert [p["status"] for p in events(server, "plan.show")] == []  # no plan was ever proposed
+    notes = [n for n in events(server, "notification.show") if n.get("key") == "plan"]
+    assert notes and "no plan" in notes[0]["text"]
+
+
+async def test_planning_turn_that_ends_with_nothing_runs_the_task_directly_in_auto(tmp_path, monkeypatch):
+    """The gate's own decision, with the planning turn stubbed to its max-turns outcome (no exit_plan, no text)."""
+    from k3code.autonomy.plan_first import PlanFirst, _Captured
+
+    async def nothing(self, session, text, verdict):
+        return _Captured()
+
+    monkeypatch.setattr(PlanFirst, "_planning_turn", nothing)
+    done = {"type": "text", "model": "m-main", "text": "implemented without a plan"}
+    server = make(tmp_path, monkeypatch, [verdict("medium"), done], autonomy={"proposals": False})
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    assert models_called(server) == ["m-cheap", "m-main"]
+    assert server.session.stored.messages[-1]["content"] == "implemented without a plan"
+    assert scope_rows(tmp_path)[-1] == {**scope_rows(tmp_path)[-1], "outcome": "done", "planned": False}
+    # a refused high-risk plan is still refused (nothing runs): only the no-plan case falls through
+    server2 = make(sub(tmp_path, "h"), monkeypatch, [verdict("small", risk="high", needs_plan=True), done])
+    await start(server2, tmp_path / "h")
+    await run_turn(server2, "tidy things")
+    assert "m-main" not in models_called(server2)
+    assert "Plan not approved" in events(server2, "message.complete")[-1]["text"]
 
 
 async def test_high_risk_denied_does_not_execute(tmp_path, monkeypatch):
@@ -517,7 +699,8 @@ async def test_proposer_emits_dedups_and_accept_sends_action(tmp_path, monkeypat
     await start(server, tmp_path)
     await run_turn(server, "add a flag")
     shown = events(server, "proposal.show")
-    assert len(shown) == 1  # after the plan; the post-task pass produced the same dedup key
+    assert len(shown) == 1  # one pass, after the task (none on the plan: a result is what proposals come from)
+    assert len([c for p in server.providers for c in p.log if "one step ahead" in c["text"]]) == 1
     assert shown[0]["kind"] == "also_setup" and shown[0]["action"] == "set up CI for this repo"
     lst = await call(server, "command.dispatch", {"name": "proposals", "arg": ""})
     assert shown[0]["id"] in lst["message"]
@@ -553,11 +736,13 @@ async def test_preview_has_no_tools_runs_on_fast_and_go_executes(tmp_path, monke
     server = make(tmp_path, monkeypatch, steps, mode="default")
     await start(server, tmp_path)
     out = await call(server, "command.dispatch", {"name": "preview", "arg": "a CLI todo app"})
-    assert out["tag"] == "preview" and "/go" in out["message"]
+    assert "Sketching" in out["message"]  # the ack; the sketch lands when the job ends
+    await asyncio.wait_for(server.session.turn_task, 20)
     call_ = server.providers[0].log[0]
     assert call_["model"] == "m-fast" and call_["tools"] == []  # no write tools, no tools at all
     done = events(server, "message.complete")[-1]
-    assert done["tag"] == "preview" and "[ todo ]" in done["text"] and "/go" in done["text"]
+    assert "[ todo ]" in done["text"] and "/go" in done["text"]
+    assert server.session.stored.meta["preview_task"] == "a CLI todo app"
     go = await call(server, "command.dispatch", {"name": "go", "arg": ""})
     assert go["type"] == "send" and go["message"] == "a CLI todo app"
     await run_turn(server, go["message"])  # what the TUI does with a "send" result
@@ -570,6 +755,7 @@ async def test_go_without_preview_and_gate_applies_to_go(tmp_path, monkeypatch):
     await start(server, tmp_path)
     assert "Nothing to run" in (await call(server, "command.dispatch", {"name": "go", "arg": ""}))["message"]
     await call(server, "command.dispatch", {"name": "preview", "arg": "add a flag"})
+    await asyncio.wait_for(server.session.turn_task, 20)
     go = await call(server, "command.dispatch", {"name": "go", "arg": ""})
     await run_turn(server, go["message"])
     assert events(server, "scope.verdict")  # /go goes through the normal flow, scope gate included
@@ -607,18 +793,76 @@ async def test_advisor_compacts_large_conversations_with_cheap_tier(tmp_path, mo
     live.messages = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300} for i in range(10)
     ]
-    await call(server, "command.dispatch", {"name": "advisor", "arg": ""})
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "ask"})
     log = server.providers[0].log
     assert [c["model"] for c in log] == ["m-cheap", "m-strong"]
     assert "SUMMARY" in log[1]["text"]
 
 
+# ── session advisor (Claude Code's advisor mode) ──
+
+
+TOOL_ADVICE = [{"type": "text", "model": "m-strong", "match": "advisor of a coding agent", "text": "Plan: do X."}]
+ASKS_ADVISOR = {
+    "type": "tool_call",
+    "model": "m-main",
+    "when": "first",
+    "id": "a1",
+    "name": "advisor",
+    "arguments": {"question": "How should I structure this?"},
+}
+
+
+async def test_advisor_set_for_session_gives_the_main_model_an_advisor_tool(tmp_path, monkeypatch):
+    finish = {"type": "text", "model": "m-main", "when": "after_tool", "text": "followed the advice"}
+    server = make(tmp_path, monkeypatch, [*TOOL_ADVICE, ASKS_ADVISOR, finish], mode="default")
+    await start(server, tmp_path)
+    shown = await call(server, "command.dispatch", {"name": "advisor", "arg": ""})
+    assert shown["message"].startswith("Advisor: off")
+    out = await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    assert "strong tier" in out["message"] and out["advisor"] == "strong"
+    assert server.session.stored.meta["advisor"] == "strong"
+    await run_turn(server, "build the thing")
+    log = server.providers[0].log
+    main = [c for c in log if c["model"] == "m-main"]
+    assert "advisor" in main[0]["tools"] and "advisor` tool" in main[0]["text"]  # tool + prompt note
+    assert [c["model"] for c in log] == ["m-main", "m-strong", "m-main"]
+    assert "build the thing" in log[1]["text"] and "How should I structure this?" in log[1]["text"]
+    assert any("Plan: do X." in str(m.get("content")) for m in server.session.stored.messages)
+    assert server.session.stored.messages[-1]["content"] == "followed the advice"
+
+
+async def test_advisor_off_removes_the_tool_and_unknown_keys_are_refused(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [{"type": "text", "model": "m-main", "text": "ok"}], mode="default")
+    await start(server, tmp_path)
+    bad = await call(server, "command.dispatch", {"name": "advisor", "arg": "no-such-model"})
+    assert "advisor" not in server.session.stored.meta and "/advisor <model-key>" in bad["message"]
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    off = await call(server, "command.dispatch", {"name": "advisor", "arg": "off"})
+    assert "off" in off["message"] and server.session.stored.meta["advisor"] == ""
+    await run_turn(server, "hello")
+    main = [c for c in server.providers[0].log if c["model"] == "m-main"]
+    assert "advisor" not in main[0]["tools"] and "advisor` tool" not in main[0]["text"]
+
+
+async def test_advisor_model_key_and_default_persist(tmp_path, monkeypatch):
+    from k3code.commands.tune import known_model_keys
+
+    server = make(tmp_path, monkeypatch, [], mode="default")
+    await start(server, tmp_path)
+    key = sorted(known_model_keys(server.config))[0]
+    out = await call(server, "command.dispatch", {"name": "advisor", "arg": f"{key} --default"})
+    assert out.get("advisor") == key and "and the default" in out["message"], out
+    assert server.session.stored.meta["advisor"] == key
+    assert server.session_advisor(server.session) == key
+
+
 async def test_advisor_auto_hooks_follow_config(tmp_path, monkeypatch):
-    # off in config: the plan event carries no critique
+    # off in config: the plan event carries no critique (large: a scope that gets one when the hook is on)
     server = make(
         tmp_path,
         monkeypatch,
-        [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
+        [verdict("large"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
         autonomy={"advisor_on_plan": False},
     )
     await start(server, tmp_path)
@@ -636,6 +880,38 @@ class _FakeSession:
         from types import SimpleNamespace
 
         self.perms = SimpleNamespace(mode=SimpleNamespace(value=mode))
+
+
+async def test_goal_judge_sees_the_failing_test_in_the_evidence_digest(tmp_path, monkeypatch):
+    """End to end through the gateway: the executor really runs a failing pytest, and the cheap-tier judge call of
+    the implicit goal carries that command and its exit code in the evidence digest."""
+    import sys
+
+    from k3code.goals import _EVIDENCE_LABEL
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
+    (tmp_path / "test_fail.py").write_text("def test_it():\n    assert False\n")
+    run_tests = {
+        "type": "tool_call",
+        "model": "m-main",
+        "when": "turn_first",
+        "id": "c1",
+        "name": "bash",
+        "arguments": {"command": f"{sys.executable} -m pytest -q -p no:cacheprovider test_fail.py"},
+    }
+    claim = {"type": "text", "model": "m-main", "when": "turn_after_tool", "text": "all green, done"}
+    judge = {"type": "text", "model": "m-cheap", "match": _EVIDENCE_LABEL, "text": '{"verdict": "done", "reason": "r"}'}
+    cfg = {"auto_continue": True, "advisor_on_goal": False, "proposals": False, "degrade_trivial": False}
+    server = make(tmp_path, monkeypatch, [verdict("small"), run_tests, claim, judge], autonomy=cfg)
+    await start(server, tmp_path)
+    await run_turn(server, "make the tests pass")
+    judge_calls = [c for p in server.providers for c in p.log if _EVIDENCE_LABEL in c["text"]]
+    assert len(judge_calls) == 1 and judge_calls[0]["model"] == "m-cheap"
+    digest = judge_calls[0]["text"]
+    # the command line is clipped to 160 characters in the digest (the interpreter path is long): pin the outcome
+    assert "-> exit 1" in digest and "pytest" in digest
+    assert "Last test/check: FAILED, after the last edit." in digest
 
 
 async def test_review_done_blocks_goal_only_on_blocking_issues(tmp_path, monkeypatch):
@@ -664,7 +940,8 @@ async def test_review_done_blocks_goal_only_on_blocking_issues(tmp_path, monkeyp
 
 
 async def test_stats_shows_tokens_and_calls_per_tier(tmp_path, monkeypatch):
-    steps = [verdict("medium"), usage("m-cheap", "You classify", 11, 3), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER]
+    # large: the plan gets the advisor critique, so the strong tier is called twice
+    steps = [verdict("large"), usage("m-cheap", "You classify", 11, 3), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER]
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
     await run_turn(server, "add a flag")

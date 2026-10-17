@@ -11,8 +11,9 @@ import { PASTE_SNIPPET_RE } from "../protocol/paste.js";
  * `@file:` / `@url:` / `@session:` ref, and a `[[ Image 1 ]]` / paste token.
  * The same vocabulary the desktop chips, so the two surfaces agree on what a
  * reference is. One more span is not a reference but a promise: an unambiguous
- * wake word (`ultracode`, `ultraplan`, `ultraresearch`) that will run that
- * mode once when the prompt is sent.
+ * wake word (`ultracode`, `ultraplan`, `ultraresearch`, `fanout`,
+ * `ultrasketch`, `ultrareview`) that will run that mode once when the prompt
+ * is sent.
  *
  * Concatenating every `text` reproduces the input exactly — styling only, the
  * text is never rewritten. Regexes are built per call: a shared `/g` instance
@@ -184,6 +185,12 @@ export const highlightsStable = (
  * the cursor line render outside the text input, and still have their wake
  * word judged (and painted) against the whole prompt. Detection runs once.
  */
+/** Whether the joined lines name an enabled wake word (the same hit the composer accent paints). */
+export const hasWakeWordHit = (
+  lines: readonly string[],
+  wake?: WakeConfig,
+): boolean =>
+  wakeHit(lines.join("\n"), wake ?? DEFAULT_WAKE) !== null;
 export const composerLineHighlights = (
   lines: readonly string[],
   wake?: WakeConfig,

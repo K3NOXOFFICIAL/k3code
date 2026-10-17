@@ -84,6 +84,9 @@ type UserConfig struct {
 	// Plugins is the [plugins] table: the herdr plugins tuios runs. Outside
 	// the option registry for the same reason as [hosts]. See plugins.go.
 	Plugins PluginsConfig `toml:"plugins,omitempty"`
+	// Reliability is the [reliability] table: agent retry behaviour. The Go
+	// side stores and surfaces the key; the agent runtime reads it.
+	Reliability ReliabilityConfig `toml:"reliability,omitempty"`
 }
 
 // NotificationsConfig holds how long a dock message stays up.
@@ -184,6 +187,14 @@ type StartupConfig struct {
 type TapeConfig struct {
 	Autorun    string `toml:"autorun"`     // off | ask | auto (default: ask)
 	AutoReview bool   `toml:"auto_review"` // auto-open the review dialog on detection (default: false)
+}
+
+// ReliabilityConfig holds agent retry behaviour. The Go side stores and
+// surfaces these keys; the agent runtime reads them and acts on them.
+type ReliabilityConfig struct {
+	// RetryForever keeps retrying after failover until the goal verifies
+	// (default: false).
+	RetryForever *bool `toml:"retry_forever"`
 }
 
 // DaemonConfig holds daemon-related settings
@@ -2235,6 +2246,11 @@ func ApplyAppearanceConfig(cfg *UserConfig, s *Settings) {
 	// CopyOnSelect defaults to true (nil means use default)
 	if cfg.Appearance.CopyOnSelect != nil {
 		s.CopyOnSelect = *cfg.Appearance.CopyOnSelect
+	}
+	// RetryForever defaults to false (nil means use default). The Go side
+	// stores and surfaces the key; the agent runtime reads it.
+	if cfg.Reliability.RetryForever != nil {
+		s.RetryForever = *cfg.Reliability.RetryForever
 	}
 	if cfg.Appearance.NvimNavigation != nil {
 		s.NvimNavigation = *cfg.Appearance.NvimNavigation

@@ -1,6 +1,6 @@
 <#
 Remove k3code from Windows: runs install/uninstall.sh in the WSL distribution install.ps1 used, then
-deletes the k3code.cmd/k3.cmd shims and their PATH entry. Your data in WSL (~/.k3code, ~/.config/k3code)
+deletes the k3code.exe/k3.exe launchers (or k3code.cmd/k3.cmd shims) and their PATH entry. Your data in WSL (~/.k3code, ~/.config/k3code, ~/.config/tuios)
 is kept unless you pass -Purge.
 
   powershell -ExecutionPolicy Bypass -File install\uninstall.ps1 [-Purge] [-WindowsOnly]
@@ -72,10 +72,15 @@ if (-not $WindowsOnly) {
   } else {
     & $Wsl -d $cfg.distro --exec sh -lc "curl -fsSL $(Quote-Sh $RawUrl) | sh -s -- $($shArgs -join ' ')"
   }
-  if ($LASTEXITCODE -ne 0) { Die "uninstall.sh failed in $($cfg.distro); the Windows shims are left in place" }
+  if ($LASTEXITCODE -ne 0) {
+    Die "uninstall.sh failed in $($cfg.distro); the Windows shims are left in place (if that distribution is gone, run this again with -WindowsOnly to remove them)"
+  }
 }
 
-foreach ($n in @('k3code.cmd', 'k3.cmd')) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir $n) }
+foreach ($n in @('k3code.exe', 'k3.exe', 'k3code.ps1', 'k3.ps1', 'k3code.cmd', 'k3.cmd', 'k3code.exe.old-*', 'k3.exe.old-*')) {
+  Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir $n)
+}
+if (Test-Path (Join-Path $shimDir '*.exe')) { Say "k3code.exe is still running: delete $shimDir once it has exited" }
 Remove-Item -Force -ErrorAction SilentlyContinue $state
 if ((Test-Path $shimDir) -and -not (Get-ChildItem $shimDir)) { Remove-Item -Force $shimDir }
 if ((Test-Path $home3) -and -not (Get-ChildItem $home3)) { Remove-Item -Force $home3 }
