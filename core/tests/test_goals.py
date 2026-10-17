@@ -278,6 +278,8 @@ async def test_an_unparseable_judge_reply_ends_an_implicit_goal_at_once_but_a_go
         explicit.state.paused_reason
         == f"judge returned unparseable output {MAX_CONSECUTIVE_PARSE_FAILURES} turns in a row"
     )
+
+
 FOREVER = {"retry_forever": True}
 
 
@@ -298,8 +300,9 @@ def _transport_failing_judge(fails: int):
 async def test_retry_forever_parks_on_transient_error_then_resumes_and_completes(tmp_path, monkeypatch):
     """Mid-goal transient error parks (stays active, never failed) and the next turn completes on judge agree."""
     repo = git_repo(tmp_path / "repo")
-    server, _ = make_server(tmp_path, monkeypatch, replies=["the feature is shipped"], autonomy=NO_ADVISOR,
-                            reliability=FOREVER)
+    server, _ = make_server(
+        tmp_path, monkeypatch, replies=["the feature is shipped"], autonomy=NO_ADVISOR, reliability=FOREVER
+    )
     sid = await new_session(server, repo)
     _goal(server, sid).set("ship the feature")
     assert server._retry_forever_on()  # the flag reads without a schema change
@@ -363,9 +366,7 @@ async def test_retry_forever_never_completes_on_an_error_path(tmp_path, monkeypa
     await server.close()
 
 
-async def test_retry_forever_waiting_goal_resumes_after_restart_without_spending_kick_budget(
-    tmp_path, monkeypatch
-):
+async def test_retry_forever_waiting_goal_resumes_after_restart_without_spending_kick_budget(tmp_path, monkeypatch):
     """A goal parked on a transient error is active on disk: the next boot re-kicks it, free of kick budget."""
     repo = git_repo(tmp_path / "repo")
     first, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR, reliability=FOREVER)

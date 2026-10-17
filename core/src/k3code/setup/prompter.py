@@ -206,8 +206,11 @@ class InteractivePrompter(Prompter):
             shown = "\n".join(f"  {i}) {c}" for i, c in enumerate(choices, 1))
             print(f"{message}\n{shown}")
             completer = FuzzyCompleter(WordCompleter(choices, ignore_case=True))
-            raw = _prompt(f"{message} [{default or choices[0]}] (number, name or filter text): ",
-                          completer=completer, complete_while_typing=True).strip()
+            raw = _prompt(
+                f"{message} [{default or choices[0]}] (number, name or filter text): ",
+                completer=completer,
+                complete_while_typing=True,
+            ).strip()
             if not raw:
                 return default or choices[0]
             if raw.isdigit() and 1 <= int(raw) <= len(choices):

@@ -109,9 +109,7 @@ class ProviderEntry(BaseModel):
 
     @field_validator("models", "tiers")
     @classmethod
-    def _normalize_retired_model_ids(
-        cls, v: dict[str, str | list[str]]
-    ) -> dict[str, str | list[str]]:
+    def _normalize_retired_model_ids(cls, v: dict[str, str | list[str]]) -> dict[str, str | list[str]]:
         """Rewrite model ids the endpoint no longer lists to their replacement.
 
         Older configs (and /model-era docs) wrote the bare ``claude-sonnet-5`` /

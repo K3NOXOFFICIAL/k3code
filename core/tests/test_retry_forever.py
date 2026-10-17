@@ -89,9 +89,7 @@ async def test_forever_auth_backoff_caps_at_one_hour():
         router, netwatch=FakeNetWatch(NetState.ONLINE), config=RetryConfig(retry_forever=True)
     )
     retry._forever_auth_strikes = 10
-    assert await retry._handle_exhausted_forever(
-        ChainExhausted("bad key", last_reason="auth"), None
-    )
+    assert await retry._handle_exhausted_forever(ChainExhausted("bad key", last_reason="auth"), None)
     parked = [e for e in seen if e.kind == PARKED]
     assert parked and parked[-1].data["delay"] == pytest.approx(3600.0)
 
