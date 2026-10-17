@@ -91,7 +91,10 @@ def message_tokens(messages: Sequence[Message]) -> int:
 
 
 def elide_marker(name: str | None, chars: int) -> str:
-    return f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed]"
+    return (
+        f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed] "
+        "(new arguments only; never re-run just to recover this text)"
+    )
 
 
 def elision_candidates(
@@ -129,7 +132,9 @@ def elide_old_results(
     old = set(tool_idx[:-ELIDE_KEEP_CALLS]) if len(tool_idx) > ELIDE_KEEP_CALLS else set()
     out: list[Message] = []
     for i, m in enumerate(messages):
-        candidate = i in old and m.tool_call_id not in keep and bool(m.content)
+        # A result with no id cannot be tracked across requests: eliding it rewrites the prefix every step for no
+        # gain (every id-less result collapses to "" in `elided`). Leave it whole.
+        candidate = i in old and bool(m.tool_call_id) and m.tool_call_id not in keep and bool(m.content)
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
             marker = elide_marker(m.name, len(m.content or ""))

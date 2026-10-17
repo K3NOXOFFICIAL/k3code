@@ -154,14 +154,29 @@ def persist_rules(path: Path, rules: list[Rule]) -> None:
         path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
+#: decisions.jsonl is append-only; past this size a 24/7 agent's log grows forever, so the oldest half
+#: is dropped (the learning hook reads recent rows first).
+_DECISIONS_MAX_BYTES = 1_000_000
+
+
 def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None) -> None:
     """Append one approval decision to ``$K3CODE_HOME/decisions.jsonl`` (learning hook for M5)."""
     path = (home or _home()) / "decisions.jsonl"
     ensure_private_dir(path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
+    try:
+        if path.is_file() and path.stat().st_size > _DECISIONS_MAX_BYTES:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            path.write_text("\n".join(lines[len(lines) // 2:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
     row = {"session": session, "tool": tool, "pattern": pattern, "choice": choice, "cwd": cwd, "ts": time.time()}
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+
+#: session_rules is append-only (every "always"/"session" approval adds one); past this many rules every
+#: permission decision pays a longer linear scan, so exact duplicates go and the oldest overflow is dropped.
+_SESSION_RULES_MAX = 200
 
 @dataclass
 class PermissionState:
@@ -203,9 +218,23 @@ class PermissionState:
         self.hardline_extra = [*user_hard, *accepted_hard, *project_hard]
         self.loaded = True
 
+    def _trim_session_rules(self) -> None:
+        seen: set[tuple[str, str, str]] = set()
+        kept: list[Rule] = []
+        for r in self.session_rules:
+            key = (r.tool, r.pattern, r.action)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(r)
+        if len(kept) > _SESSION_RULES_MAX:
+            kept = kept[-_SESSION_RULES_MAX:]
+        self.session_rules = kept
+
     def decide(self, tool: str, args: dict[str, object], *, headless: bool = False) -> Decision:
         if not self.loaded:
             self.reload()
+        self._trim_session_rules()
         return decide(
             mode=self.mode,
             tool=tool,

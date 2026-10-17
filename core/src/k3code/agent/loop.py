@@ -72,6 +72,10 @@ PlanCallback = Callable[[str], Awaitable[str | None]]
 #: Told about every side effect the mode auto-allowed: (tool, arguments, decision).
 AutoAllowCallback = Callable[[str, dict[str, Any], Decision], None]
 
+#: Cap for AgentLoop._notes (decision-model notes): one entry per elided result with no eviction would grow
+#: unboundedly across a long turn.
+_NOTES_MAX = 50
+
 
 class AgentLoop:
     """Runs the conversation loop with tool execution."""
@@ -782,8 +786,12 @@ class AgentLoop:
         kept = [m for m in candidates if decision.get(m.tool_call_id or "") == "keep"]
         for m in candidates:
             note = decision.get(m.tool_call_id or "")
-            if note and note != "keep":
-                self._notes[m.tool_call_id or ""] = note
+            if note and note != "keep" and m.tool_call_id:
+                self._notes[m.tool_call_id] = note
+        # One entry per elided result with no eviction: drop the oldest past the cap (an id-less result has no
+        # stable key, so it is never noted).
+        while len(self._notes) > _NOTES_MAX:
+            self._notes.pop(next(iter(self._notes)))
         # the request with every candidate elided, then the kept ones added back newest first while they fit in half of
         # the room left under the threshold: the other half is what the turn grows into before the next batch
         floor = context_budget.message_tokens(

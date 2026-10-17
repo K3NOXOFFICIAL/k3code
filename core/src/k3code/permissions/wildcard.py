@@ -9,18 +9,23 @@
 
 from __future__ import annotations
 
+import functools
 import re
+
+
+@functools.lru_cache(maxsize=4096)
+def _compiled(pattern: str) -> re.Pattern[str]:
+    """One wildcard pattern compiled once: match() runs per rule per decision."""
+    escaped = re.sub(r"[.+^${}()|\[\]\\]", r"\\\g<0>", pattern.replace("\\", "/"))
+    escaped = escaped.replace("*", ".*").replace("?", ".")
+    if escaped.endswith(" .*"):
+        escaped = escaped[:-3] + "( .*)?"
+    return re.compile("^" + escaped + "$", re.DOTALL)
 
 
 def match(value: str, pattern: str) -> bool:
     """True if ``value`` matches ``pattern``."""
-    value = value.replace("\\", "/")
-    pattern = pattern.replace("\\", "/")
-    escaped = re.sub(r"[.+^${}()|\[\]\\]", r"\\\g<0>", pattern)
-    escaped = escaped.replace("*", ".*").replace("?", ".")
-    if escaped.endswith(" .*"):
-        escaped = escaped[:-3] + "( .*)?"
-    return re.compile("^" + escaped + "$", re.DOTALL).search(value) is not None
+    return _compiled(pattern).search(value.replace("\\", "/")) is not None
 
 
 def _sort_key(item: tuple[str, object]) -> tuple[int, str]:

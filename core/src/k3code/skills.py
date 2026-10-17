@@ -21,8 +21,14 @@ class Skill:
     description: str
     path: Path
 
+    #: The most of one SKILL.md the skill tool answers with: an uncapped skill file lands whole in the prompt.
+    MAX_TEXT_CHARS = 8000
+
     def text(self) -> str:
-        return self.path.read_text(encoding="utf-8", errors="replace")
+        text = self.path.read_text(encoding="utf-8", errors="replace")
+        if len(text) <= self.MAX_TEXT_CHARS:
+            return text
+        return text[: self.MAX_TEXT_CHARS] + f"\n…[{len(text) - self.MAX_TEXT_CHARS} more chars in {self.path}]"
 
 
 def parse_frontmatter(text: str) -> dict[str, str]:
@@ -90,6 +96,8 @@ def find_markers(root: Path) -> list[Path]:
 
 #: root → (signature of its SKILL.md files, the skills parsed from them). discover() runs on every prompt build and
 #: at every turn end; with the cache a root is only walked (directory listings and stats), not read and parsed again.
+#: Capped: the gateway is long-lived, so one entry per distinct cwd/session root would grow forever.
+_CACHE_MAX = 256
 _CACHE: dict[Path, tuple[tuple[tuple[str, int, int], ...], list[Skill]]] = {}
 
 
@@ -121,6 +129,8 @@ def _root_skills(root: Path) -> list[Skill]:
         name = fm.get("name") or marker.parent.name
         found.append(Skill(name, " ".join(fm.get("description", "").split()), marker))
     _CACHE[root] = (sig, found)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
     return found
 
 
