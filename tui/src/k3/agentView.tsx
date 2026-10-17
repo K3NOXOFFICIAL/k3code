@@ -1,4 +1,5 @@
 import { Box, Text, useInput, useStdout } from "@k3code/ink";
+import { TextInput } from "../components/textInput.js";
 import type { SessionListResult } from "@k3code/shared/gateway-events";
 import { useStore } from "@nanostores/react";
 import { useEffect, useMemo, useState } from "react";
@@ -59,6 +60,8 @@ export interface AgentViewViewProps {
   height: number;
   loading?: boolean;
   nav: ViewNav;
+  onNewSessionTextChange: (text: string) => void;
+  onNewSessionSubmit: (text: string) => void;
   rows: readonly ViewRow[];
   t: Theme;
 }
@@ -182,9 +185,13 @@ export function AgentViewView({
   // New session prompt line
   const renderNewPrompt = () =>
     nav.newSessionPrompt ? (
-      <Text color={t.color.accent} wrap="truncate-end">
-        {`new session: ${nav.newSessionText}█`}
-      </Text>
+      <TextInput
+        color={t.color.text}
+        columns={cols}
+        value={nav.newSessionText}
+        onChange={onNewSessionTextChange}
+        onSubmit={onNewSessionSubmit}
+      />
     ) : null;
 
   return (
@@ -281,6 +288,15 @@ export function AgentViewPane({
   const compact = termRows < 8;
   // header, spacer, spacer, footer (+ the error line); compact: header and footer only
   const height = Math.max(1, termRows - (compact ? 2 : 4) - (error ? 1 : 0));
+
+  const handleNewSessionTextChange = (text: string) => {
+    setNav({ ...navState, newSessionText: text });
+  };
+
+  const handleNewSessionSubmit = (text: string) => {
+    setNav({ ...navState, newSessionPrompt: false, newSessionText: "" });
+    onNew(text);
+  };
 
   useEffect(() => {
     let stopped = false;
@@ -410,6 +426,8 @@ export function AgentViewPane({
       height={height}
       loading={loading}
       nav={nav}
+      onNewSessionTextChange={handleNewSessionTextChange}
+      onNewSessionSubmit={handleNewSessionSubmit}
       rows={rows}
       t={theme}
     />
