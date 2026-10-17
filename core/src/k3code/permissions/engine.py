@@ -384,17 +384,24 @@ class Decision:
     sandbox_only: bool = False
 
 
-def builtin_defaults(mode: PermissionMode | str | None = None) -> list[Rule]:
-    """Builtin ruleset: pure tools + safe bash allow, writes/other bash ask. In accept-edits and auto mode the test,
-    build and lint commands of BUILTIN_SANDBOXED_ALLOW are allowed too (sandboxed, see Decision.sandbox_only)."""
+@functools.lru_cache(maxsize=8)
+def _builtin_defaults_cached(mode_value: str | None) -> tuple[Rule, ...]:
+    """Builtin ruleset built once per mode: decide() rebuilt ~100 Rule objects on every call."""
     rules: list[Rule] = [Rule(tool=t, pattern="*", action="allow") for t in sorted(PURE_TOOLS - READ_TOOLS)]
     rules += [Rule(tool="bash", pattern=p, action="allow") for p in BUILTIN_BASH_ALLOW]
-    if mode is not None and PermissionMode(mode).value in SANDBOXED_ALLOW_MODES:
+    if mode_value is not None and mode_value in SANDBOXED_ALLOW_MODES:
         rules += [Rule(tool="bash", pattern=p, action="allow") for p in BUILTIN_SANDBOXED_ALLOW]
     # Flags that make an allowed read-only command execute or write something: longer patterns win, so these ask.
     rules += [Rule(tool="bash", pattern=p, action="ask") for p in BUILTIN_BASH_ASK]
     rules.append(Rule(tool=EXIT_PLAN_TOOL, pattern="*", action="allow"))
-    return rules
+    return tuple(rules)
+
+
+def builtin_defaults(mode: PermissionMode | str | None = None) -> list[Rule]:
+    """Builtin ruleset: pure tools + safe bash allow, writes/other bash ask. In accept-edits and auto mode the test,
+    build and lint commands of BUILTIN_SANDBOXED_ALLOW are allowed too (sandboxed, see Decision.sandbox_only)."""
+    mode_value = None if mode is None else PermissionMode(mode).value
+    return list(_builtin_defaults_cached(mode_value))
 
 
 _RANK: dict[str, int] = {"allow": 1, "ask": 2, "deny": 3}
@@ -610,13 +617,20 @@ def decide(
     ``plan_for``: in plan mode, the mode of the session the plan is made for (the plan-first planning turn). For an
     auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
-    mode = PermissionMode(mode)
+    try:
+        mode = PermissionMode(mode)
+    except ValueError:
+        return Decision(action="deny", message=f"Unknown permission mode: {mode}")
     # The planning turn of an auto session reads outside the roots what the session's own turns read there: toolchain
     # and system dirs without a prompt, anything else refused with a hint. Plan mode asked a person for both, in a
     # session whose user chose not to be asked (and the turn after the plan refuses the second kind anyway).
+    try:
+        plan_for_mode = PermissionMode(plan_for) if plan_for is not None else None
+    except ValueError:
+        return Decision(action="deny", message=f"Unknown permission mode: {plan_for}")
     outside_reads = (
         PermissionMode.AUTO
-        if mode == PermissionMode.PLAN and plan_for is not None and PermissionMode(plan_for) == PermissionMode.AUTO
+        if mode == PermissionMode.PLAN and plan_for_mode == PermissionMode.AUTO
         else mode
     )
     args = args or {}
@@ -674,7 +688,15 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
         dec.action = "deny"
         dec.message = dec.message or "Permission denied: approval required but unavailable (headless mode)."
     if dec.action == "deny" and not dec.message:
-        dec.message = f"Denied by rule {dec.rule.tool}:{dec.rule.pattern}" if dec.rule else "Denied."
+        # A weak model gets a bare "Denied." and retries the same call: name the rule and what to do instead.
+        if dec.rule:
+            dec.message = (
+                f"Denied by rule {dec.rule.tool}:{dec.rule.pattern}. "
+                "Do not retry the same call; use a narrower command inside the project, "
+                "or ask the user to allow it with /permissions."
+            )
+        else:
+            dec.message = "Denied."
     return dec
 
 

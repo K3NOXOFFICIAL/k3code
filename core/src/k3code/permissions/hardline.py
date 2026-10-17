@@ -558,15 +558,28 @@ def _body_payloads(body: str, budget: list[int] | None = None) -> tuple[list[str
     return out, unsure
 
 
+@lru_cache(maxsize=64)
+def _compiled_extra(patterns: tuple[str, ...]) -> tuple:
+    """User config hardline regexes compiled once: _match runs on every bash call (_hardline validated them)."""
+    out = []
+    for rx in patterns:
+        if not rx.strip():
+            continue  # a blank pattern would match every command (config load and doctor name it)
+        try:
+            out.append(re.compile(rx))
+        except (re.error, OverflowError, RecursionError):
+            continue  # _hardline reports the bad entry and substitutes UNREADABLE_HARDLINE
+    return tuple(out)
+
+
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
     for name, rx in _COMPILED:
         if rx.search(text):
             return name
-    for i, rx in enumerate(extra_patterns or []):
-        if not rx.strip():
-            continue  # a blank pattern would match every command (config load and doctor name it)
-        if re.search(rx, text):
-            return f"config-hardline-{i}"
+    if extra_patterns:
+        for i, rx in enumerate(_compiled_extra(tuple(extra_patterns))):
+            if rx.search(text):
+                return f"config-hardline-{i}"
     return None
 
 
