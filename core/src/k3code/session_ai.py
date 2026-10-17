@@ -45,14 +45,26 @@ async def make_title(caller: Any, first_message: str, *, session_id: str = "") -
     return clean_title(res.text)
 
 
+#: Tool results unconditionally kept across a compaction boundary (mirrors context_budget.ELIDE_KEEP_CALLS).
+COMPACT_KEEP_TOOL_RESULTS = 6
+
+
 def split_for_compaction(messages: list[dict[str, Any]], keep: int = 6) -> int:
     """Index where the kept tail starts: the latest user turn boundary at or before ``len - keep``.
 
     Cutting only at a user message keeps assistant tool calls together with their tool results.
+    The last COMPACT_KEEP_TOOL_RESULTS tool results are kept even if older than ``keep``.
     """
     cut = max(0, len(messages) - keep)
     while cut > 0 and messages[cut].get("role") != "user":
         cut -= 1
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(tool_idx) > COMPACT_KEEP_TOOL_RESULTS:
+        need = tool_idx[-COMPACT_KEEP_TOOL_RESULTS]
+        if need < cut:
+            cut = need
+            while cut > 0 and messages[cut].get("role") != "user":
+                cut -= 1
     return cut
 
 
