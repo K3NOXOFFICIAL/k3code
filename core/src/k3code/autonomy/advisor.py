@@ -106,6 +106,7 @@ async def condensed_context(caller: Any, messages: list[Any], *, threshold: int,
     if len(text) <= threshold:
         return text
     from k3code.session_ai import COMPACT_HEAD_CHARS, head_and_tail  # local: session_ai imports this module
+
     tail = transcript_text(messages[-4:])
     head = head_and_tail(transcript_text(messages[:-4]), threshold * 2, min(COMPACT_HEAD_CHARS, threshold // 4))
     try:

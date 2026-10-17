@@ -101,6 +101,7 @@ def message_tokens(messages: Sequence[Message]) -> int:
 #: (mirrors context_select.NOTE_CHARS; local to avoid a cycle).
 _NOTE_CHARS = 300
 
+
 def elide_marker(name: str | None, chars: int) -> str:
     return (
         f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed] "

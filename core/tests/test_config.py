@@ -230,6 +230,7 @@ def test_auto_continue_settings_are_checked_at_load(tmp_path, caplog, text, auto
     assert acfg["auto_continue_max_turns"] == (max_turns if max_turns is not None else 8)
     assert auto_continue_on(acfg, "auto") == (auto_continue is not False)
 
+
 @pytest.mark.parametrize(
     ("stale", "fixed"),
     [
@@ -257,12 +258,8 @@ def test_retired_model_ids_rewrite_to_dated_ids_on_load(stale: str, fixed: str):
         return d
 
     assert ProviderEntry(**block({"default": stale})).models == {"default": fixed}
-    assert ProviderEntry(**block({"default": [stale, "gpt-x"]})).models == {
-        "default": [fixed, "gpt-x"]
-    }
-    assert ProviderEntry(**block({"default": "m"}, {"cheap": stale})).tiers == {
-        "cheap": fixed
-    }
+    assert ProviderEntry(**block({"default": [stale, "gpt-x"]})).models == {"default": [fixed, "gpt-x"]}
+    assert ProviderEntry(**block({"default": "m"}, {"cheap": stale})).tiers == {"cheap": fixed}
 
 
 def test_current_model_ids_pass_through_untouched():
@@ -273,10 +270,13 @@ def test_current_model_ids_pass_through_untouched():
         "default": "claude-sonnet-5-5",
         "cheap": ["auto/coding-cheap", "claude/claude-sonnet-5"],
     }
-    assert ProviderEntry(
-        name="r",
-        kind="openai",
-        base_url="https://x",
-        api_key_env="K",
-        models=models,
-    ).models == models
+    assert (
+        ProviderEntry(
+            name="r",
+            kind="openai",
+            base_url="https://x",
+            api_key_env="K",
+            models=models,
+        ).models
+        == models
+    )

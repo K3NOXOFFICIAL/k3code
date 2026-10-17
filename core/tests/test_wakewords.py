@@ -37,7 +37,7 @@ def test_every_wake_word_names_a_command() -> None:
     from k3code.commands.builtin import build_registry
 
     registry = build_registry()
-    for word, command in WAKE_WORDS.items():
+    for command in WAKE_WORDS.values():
         assert registry.get(command) is not None
 
 

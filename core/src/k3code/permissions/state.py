@@ -166,7 +166,7 @@ def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str
     try:
         if path.is_file() and path.stat().st_size > _DECISIONS_MAX_BYTES:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            path.write_text("\n".join(lines[len(lines) // 2:]) + "\n", encoding="utf-8")
+            path.write_text("\n".join(lines[len(lines) // 2 :]) + "\n", encoding="utf-8")
     except OSError:
         pass
     row = {"session": session, "tool": tool, "pattern": pattern, "choice": choice, "cwd": cwd, "ts": time.time()}
@@ -177,6 +177,7 @@ def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str
 #: session_rules is append-only (every "always"/"session" approval adds one); past this many rules every
 #: permission decision pays a longer linear scan, so exact duplicates go and the oldest overflow is dropped.
 _SESSION_RULES_MAX = 200
+
 
 @dataclass
 class PermissionState:

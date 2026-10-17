@@ -10,15 +10,14 @@ import pytest
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted
 from k3code.providers.types import Message
-from k3code.reliability.events import GAVE_UP, PARKED, EventEmitter
+from k3code.reliability.events import GAVE_UP, PARKED
+from k3code.reliability.hooks import Reliability
 from k3code.reliability.netwatch import NetState
 from k3code.reliability.persistent_retry import (
     FOREVER_PARK_REASONS,
     RetryConfig,
     TurnCancelled,
 )
-from k3code.reliability.hooks import Reliability, ReliabilitySettings
-
 from test_persistent_retry import FakeNetWatch, FakeRouter, _drain, _retry
 
 
@@ -90,9 +89,7 @@ async def test_forever_auth_backoff_caps_at_one_hour():
         router, netwatch=FakeNetWatch(NetState.ONLINE), config=RetryConfig(retry_forever=True)
     )
     retry._forever_auth_strikes = 10
-    assert await retry._handle_exhausted_forever(
-        ChainExhausted("bad key", last_reason="auth"), None
-    )
+    assert await retry._handle_exhausted_forever(ChainExhausted("bad key", last_reason="auth"), None)
     parked = [e for e in seen if e.kind == PARKED]
     assert parked and parked[-1].data["delay"] == pytest.approx(3600.0)
 
