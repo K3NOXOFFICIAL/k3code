@@ -10,6 +10,7 @@ from k3code.autonomy import preview as preview_mod
 from k3code.autonomy.proposals import LEARNED_KINDS, format_proposals
 from k3code.autonomy.scope import SCOPES
 from k3code.commands import CommandDef
+from k3code.commands.ultra_cmd import JobSpec, start_spec
 from k3code.errors import ChainExhausted
 from k3code.learning import curator
 
@@ -96,35 +97,43 @@ class PreviewCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="preview", help="Fast sketch of a task's result, no changes: /preview <task>")
 
+    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
+        if not arg:
+            return _msg("Usage: /preview <task>")
+        task = arg.strip() or arg
+
+        async def job() -> str:
+            timeout = float(autonomy_cfg(ctx.config)["preview_timeout"])
+            try:
+                text = await preview_mod.preview(ctx.model_caller, task, session_id=live.session_id, timeout=timeout)
+            except TimeoutError:
+                return f"Preview timed out after {timeout:.0f}s; try a shorter task."
+            except ChainExhausted as e:  # e.g. "all providers rate-limited until HH:MM"
+                return f"Preview unavailable: {e}"
+            live.stored.meta["preview_task"] = task
+            write_artifact_file(
+                ctx,
+                "preview",
+                ctx._home() / "artifacts" / "preview",
+                f"preview {task}",
+                text,
+                session=live.session_id,
+            )
+            return text
+
+        return JobSpec(
+            f"/preview {task}",
+            job,
+            "Sketching the task's result (no changes)…",
+        )
+
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = _live(ctx, session_id)
         if live is None:
             return _msg("No active session.")
-        if not arg:
-            return _msg("Usage: /preview <task>")
         if getattr(live, "streaming", False):  # the running turn's persist would overwrite the transcript rows
             return _msg("A turn is running in this session; /preview when it ends (or /stop it).")
-        timeout = float(autonomy_cfg(ctx.config)["preview_timeout"])
-        try:
-            text = await preview_mod.preview(ctx.model_caller, arg, session_id=live.session_id, timeout=timeout)
-        except TimeoutError:
-            return _msg(f"Preview timed out after {timeout:.0f}s; try a shorter task.")
-        except ChainExhausted as e:  # e.g. "all providers rate-limited until HH:MM"
-            return _msg(f"Preview unavailable: {e}")
-        live.stored.meta["preview_task"] = arg
-        write_artifact_file(
-            ctx, "preview", ctx._home() / "artifacts" / "preview", f"preview {arg}", text, session=live.session_id
-        )
-        live.messages = [
-            *live.messages,
-            {"role": "user", "content": f"/preview {arg}"},
-            {"role": "assistant", "content": f"[preview]\n{text}"},
-        ]
-        ctx.store.save(live.stored)
-        live.emit("message.start", {})
-        live.emit("message.delta", {"text": text})
-        live.emit("message.complete", {"text": text, "tag": "preview", "status": "done", "state": live.state})
-        return _msg("Preview ready. Run it for real with /go, or adjust the task.", tag="preview")
+        return start_spec(ctx, live, await self.prepare(ctx, live, arg))
 
 
 class GoCommand(CommandDef):

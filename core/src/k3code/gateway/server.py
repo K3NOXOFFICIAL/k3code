@@ -1995,13 +1995,17 @@ class GatewayServer:
         ``context``: what the user's UserPromptSubmit hooks added, handed to the job with the task. ``pasted``: offsets
         of pasted text, where a wake word does not count."""
         if (hit := wakewords.detect_enabled(self.config, text, pasted)) is not None:
-            cmd: Any = self.commands.get(hit.mode)
+            # `hit.mode` is the wake word; WAKE_WORDS maps it to the command that runs (fanout -> ultracode,
+            # ultrasketch -> preview, ultrareview -> review).
+            cmd_name = wakewords.WAKE_WORDS[hit.mode]
+            cmd: Any = self.commands.get(cmd_name)
             if hit.mode == "ultracode" and (word := typed_mode_word(hit.task)):
                 # "ultracode off", "turn ultracode off": what /ultracode takes as mode control, not a task to run
-                return _Route(hit.mode, "wake word", "", cmd.apply_mode_word(self, session, word))
+                return _Route(cmd_name, "wake word", "", cmd.apply_mode_word(self, session, word))
             # an empty task (the word alone) comes back as the command's usage line
-            spec = await cmd.prepare(self, session, hit.task, context=context)
-            return _Route(hit.mode, "wake word", f'"{hit.mode}" in your message', spec)
+            kw: dict[str, Any] = {"max_agents": 5} if hit.mode == "fanout" else {}
+            spec = await cmd.prepare(self, session, hit.task, context=context, **kw)
+            return _Route(cmd_name, "wake word", f'"{hit.mode}" in your message', spec)
         if (
             getattr(session, "ultra_mode", "off") != "ultracode"
             or session.background  # unattended runs have nobody to watch a pipeline

@@ -121,12 +121,14 @@ class UltraCodeCommand(CommandDef):
             "(budget: ultracode.max_tokens / max_agents). Bare /ultracode, on, off, status: the always-on mode",
         )
 
-    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
+    async def prepare(
+        self, ctx: Any, live: Any, arg: str, *, context: str = "", max_agents: int | None = None
+    ) -> JobSpec | dict[str, Any]:
         if not arg:
             return reply("Usage: /ultracode <task>")
         return JobSpec(
             f"/ultracode {arg}",
-            lambda: ctx.ultra.ultracode(live, arg, context=context),
+            lambda: ctx.ultra.ultracode(live, arg, context=context, max_agents=max_agents),
             "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
         )
 

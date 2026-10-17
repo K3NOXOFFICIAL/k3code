@@ -485,5 +485,75 @@
   "input": "~/my\\ ultraplan\\ notes.txt",
   "mode": null,
   "task": null
+ },
+ {
+  "input": "fanout implement the login form",
+  "mode": "fanout",
+  "task": "implement the login form"
+ },
+ {
+  "input": "Fanout: split this into parallel tasks",
+  "mode": "fanout",
+  "task": "split this into parallel tasks"
+ },
+ {
+  "input": "implement the login form, fanout",
+  "mode": "fanout",
+  "task": "implement the login form"
+ },
+ {
+  "input": "fanout",
+  "mode": "fanout",
+  "task": ""
+ },
+ {
+  "input": "ultrasketch a settings page",
+  "mode": "ultrasketch",
+  "task": "a settings page"
+ },
+ {
+  "input": "Ultrasketch: the new onboarding flow",
+  "mode": "ultrasketch",
+  "task": "the new onboarding flow"
+ },
+ {
+  "input": "ultrasketch",
+  "mode": "ultrasketch",
+  "task": ""
+ },
+ {
+  "input": "ultrareview staged",
+  "mode": "ultrareview",
+  "task": "staged"
+ },
+ {
+  "input": "ultrareview",
+  "mode": "ultrareview",
+  "task": ""
+ },
+ {
+  "input": "what is the difference between fanout and ultraplan?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "fanout this and then ultraplan that",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultrasketch this and then ultrareview that",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does \"fanout\" do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "look at src/fanout.py",
+  "mode": null,
+  "task": null
  }
 ]

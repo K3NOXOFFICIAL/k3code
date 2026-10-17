@@ -24,11 +24,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-#: wake word (lower case) -> the slash command it runs
+#: wake word (lower case) -> the slash command it runs. `fanout` is an alias for
+#: the ultracode one-shot (max 5 sub-agents); `ultrasketch` runs /preview's fast
+#: sketch, `ultrareview` runs /review's diff sweep.
 WAKE_WORDS: dict[str, str] = {
     "ultracode": "ultracode",
     "ultraplan": "ultraplan",
     "ultraresearch": "ultraresearch",
+    "fanout": "ultracode",
+    "ultrasketch": "preview",
+    "ultrareview": "review",
 }
 
 # ASCII classes and re.ASCII on purpose: the TypeScript copy has no Unicode-aware \w, and re.I would otherwise fold

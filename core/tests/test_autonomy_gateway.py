@@ -736,11 +736,13 @@ async def test_preview_has_no_tools_runs_on_fast_and_go_executes(tmp_path, monke
     server = make(tmp_path, monkeypatch, steps, mode="default")
     await start(server, tmp_path)
     out = await call(server, "command.dispatch", {"name": "preview", "arg": "a CLI todo app"})
-    assert out["tag"] == "preview" and "/go" in out["message"]
+    assert "Sketching" in out["message"]  # the ack; the sketch lands when the job ends
+    await asyncio.wait_for(server.session.turn_task, 20)
     call_ = server.providers[0].log[0]
     assert call_["model"] == "m-fast" and call_["tools"] == []  # no write tools, no tools at all
     done = events(server, "message.complete")[-1]
-    assert done["tag"] == "preview" and "[ todo ]" in done["text"] and "/go" in done["text"]
+    assert "[ todo ]" in done["text"] and "/go" in done["text"]
+    assert server.session.stored.meta["preview_task"] == "a CLI todo app"
     go = await call(server, "command.dispatch", {"name": "go", "arg": ""})
     assert go["type"] == "send" and go["message"] == "a CLI todo app"
     await run_turn(server, go["message"])  # what the TUI does with a "send" result
@@ -753,6 +755,7 @@ async def test_go_without_preview_and_gate_applies_to_go(tmp_path, monkeypatch):
     await start(server, tmp_path)
     assert "Nothing to run" in (await call(server, "command.dispatch", {"name": "go", "arg": ""}))["message"]
     await call(server, "command.dispatch", {"name": "preview", "arg": "add a flag"})
+    await asyncio.wait_for(server.session.turn_task, 20)
     go = await call(server, "command.dispatch", {"name": "go", "arg": ""})
     await run_turn(server, go["message"])
     assert events(server, "scope.verdict")  # /go goes through the normal flow, scope gate included

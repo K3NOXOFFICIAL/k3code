@@ -15,11 +15,17 @@
  *  - the prompt does not name two different modes.
  */
 
-/** wake word (lower case) -> the slash command it runs. Mirrors `WAKE_WORDS` in wakewords.py. */
+/** wake word (lower case) -> the slash command it runs. `fanout` is an alias for
+ * the ultracode one-shot (max 5 sub-agents); `ultrasketch` runs /preview's fast
+ * sketch, `ultrareview` runs /review's diff sweep. Mirrors `WAKE_WORDS` in
+ * wakewords.py. */
 export const WAKE_WORDS: Readonly<Record<string, string>> = {
   ultracode: "ultracode",
   ultraplan: "ultraplan",
   ultraresearch: "ultraresearch",
+  fanout: "ultracode",
+  ultrasketch: "preview",
+  ultrareview: "review",
 };
 
 export interface WakeMatch {

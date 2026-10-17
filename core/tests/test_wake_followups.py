@@ -64,7 +64,7 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
 
-    async def ultracode(self, live: Any, task: str, *, context: str = "") -> str:
+    async def ultracode(self, live: Any, task: str, *, context: str = "", max_agents: int | None = None) -> str:
         self.calls.append(("ultracode", task, context))
         return "done"
 

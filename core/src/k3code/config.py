@@ -248,10 +248,18 @@ class Settings(BaseModel):
     # min_scope: with the ultracode mode on (/ultracode on), a prompt rated at least this runs the pipeline.
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
-    # Wake words (ultracode, ultraplan, ultraresearch typed in a prompt run that mode once): {enabled: true,
-    # ultracode: true, ultraplan: true, ultraresearch: true}; see k3code.wakewords
+    # Wake words (ultracode, ultraplan, ultraresearch, fanout, ultrasketch, ultrareview typed in a prompt
+    # run that mode once): {enabled: true, <word>: true, ...}; see k3code.wakewords
     wake_words: dict[str, Any] = Field(
-        default_factory=lambda: {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
+        default_factory=lambda: {
+            "enabled": True,
+            "ultracode": True,
+            "ultraplan": True,
+            "ultraresearch": True,
+            "fanout": True,
+            "ultrasketch": True,
+            "ultrareview": True,
+        }
     )
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
     # the exact origin of research.searxng_url is always allowed. While the guard is on, web_fetch connects directly
