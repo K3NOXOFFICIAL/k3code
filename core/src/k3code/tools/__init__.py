@@ -280,7 +280,14 @@ def _read_range(f: Any, start: int, end: int) -> dict[str, Any]:
     if not selected:
         return {"content": "", "lines": f"{start}-{start} (past the end of the file)"}
     last = start + len(selected) - 1
-    return {"content": "\n".join(selected), "lines": f"{start}-{last}", "first": start, "last": last, "total": None}
+    return {
+        "content": "\n".join(selected),
+        "lines": f"{start}-{last}",
+        "first": start,
+        "last": last,
+        "total": None,
+        "wanted_last": end,
+    }
 
 
 #: read: lines returned when no limit is given, chars kept of one line, and chars of numbered output per call. A read
@@ -371,6 +378,7 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
         "first": first,
         "last": last,
         "total": total,
+        "wanted_last": last_wanted,
     }
 
 
@@ -641,10 +649,17 @@ def _numbered_read(result: dict[str, Any]) -> str:
         return f"[file has {total} lines; offset {first} is past the end]"
     lines = str(result["content"]).split("\n")
     body = "\n".join(f"{n:>{_NUMBER_WIDTH}}\t{line}" for n, line in enumerate(lines, first))
+    wanted = result.get("wanted_last")
+    elided = (
+        f"; lines {last + 1}-{wanted} elided by READ_MAX_CHARS"
+        if isinstance(wanted, int) and last < wanted
+        else ""
+    )
+    continued = f"showed {first}-{last}{elided}; continue with offset={last + 1}"
     if total is None:  # a huge file, streamed: its length is not known
-        return f"{body}\n[showed {first}-{last}; continue with offset={last + 1}]"
+        return f"{body}\n[{continued}]"
     if last < total:
-        return f"{body}\n[file has {total} lines; showed {first}-{last}; continue with offset={last + 1}]"
+        return f"{body}\n[file has {total} lines; {continued}]"
     return body
 
 

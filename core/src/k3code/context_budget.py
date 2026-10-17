@@ -74,21 +74,32 @@ def compact_threshold(config: Any, model_id: str) -> int:
     return int(context_window(config, model_id) * float(ctx.get("compact_at_ratio", COMPACT_AT_RATIO)))
 
 
+def _text_tokens(text: str) -> int:
+    """Estimated tokens of ``text`` (~4 chars per token for ascii; CJK chars are 3 bytes in utf-8)."""
+    return len(text.encode("utf-8")) // 4
+
+
 def overhead_tokens(system_prompt: str, specs: Sequence[ToolSpec]) -> int:
     """Estimated tokens of what every request carries besides the conversation: system prompt and tool schemas."""
     schemas = [{"name": s.name, "description": s.description, "parameters": s.parameters} for s in specs]
-    return (len(system_prompt) + len(json.dumps(schemas, ensure_ascii=False))) // 4
+    return _text_tokens(system_prompt) + _text_tokens(json.dumps(schemas, ensure_ascii=False))
 
 
 def message_tokens(messages: Sequence[Message]) -> int:
-    """Estimated tokens of messages as sent (~4 chars per token), tool calls included."""
-    chars = 0
+    """Estimated tokens of messages as sent (~4 chars per token for ascii, byte-weighted), tool calls included."""
+    nbytes = 0
     for m in messages:
-        chars += len(m.content or "")
+        nbytes += len((m.content or "").encode("utf-8"))
         for tc in m.tool_calls:
-            chars += len(tc.name) + len(tc.raw_arguments or json.dumps(tc.arguments, ensure_ascii=False))
-    return chars // 4
+            nbytes += len(tc.name.encode("utf-8")) + len(
+                (tc.raw_arguments or json.dumps(tc.arguments, ensure_ascii=False)).encode("utf-8")
+            )
+    return nbytes // 4
 
+
+#: Chars of a decision-model note rendered after the elide marker
+#: (mirrors context_select.NOTE_CHARS; local to avoid a cycle).
+_NOTE_CHARS = 300
 
 def elide_marker(name: str | None, chars: int) -> str:
     return (
@@ -138,7 +149,7 @@ def elide_old_results(
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
             marker = elide_marker(m.name, len(m.content or ""))
-            note = (notes or {}).get(m.tool_call_id or "")
+            note = ((notes or {}).get(m.tool_call_id or "") or "")[:_NOTE_CHARS]
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         out.append(m)
     return out
