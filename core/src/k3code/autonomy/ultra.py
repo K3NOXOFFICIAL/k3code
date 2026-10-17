@@ -279,10 +279,12 @@ class Ultra:
 
     # ── /ultracode ──
 
-    async def ultracode(self, session: Any, task: str, *, context: str = "") -> str:
+    async def ultracode(self, session: Any, task: str, *, context: str = "", max_agents: int | None = None) -> str:
         cfg = ultra_cfg(self.server.config)
         brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
-        budget = AgentBudget(int(cfg["max_agents"]), int(cfg["max_tokens"]))
+        budget = AgentBudget(
+            int(max_agents) if max_agents is not None else int(cfg["max_agents"]), int(cfg["max_tokens"])
+        )
         report = _Report(task)
         cwd = Path(session.perms.cwd)
         try:

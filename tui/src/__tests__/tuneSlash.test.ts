@@ -250,8 +250,8 @@ describe("/tune, /model and /effort", () => {
     });
   });
 
-  describe("/ultracode, /ultraplan and /ultraresearch stay gateway pass-throughs", () => {
-    it.each(["ultracode", "ultraplan", "ultraresearch"])(
+  describe("/ultracode, /ultraplan, /ultraresearch, /preview and /review stay gateway pass-throughs", () => {
+    it.each(["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"])(
       "/%s has no local handler",
       (name) => {
         expect(findSlashCommand(name)).toBeUndefined();

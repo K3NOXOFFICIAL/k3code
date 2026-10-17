@@ -10,6 +10,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
@@ -30,7 +31,10 @@ import {
 } from "../config/env.js";
 import { PLACEHOLDER } from "../content/placeholders.js";
 import { prevRenderedMsg } from "../domain/blockLayout.js";
-import { composerLineHighlights } from "../domain/composerHighlights.js";
+import {
+  composerLineHighlights,
+  hasWakeWordHit,
+} from "../domain/composerHighlights.js";
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -296,6 +300,16 @@ const TranscriptPane = memo(function TranscriptPane({
   );
 });
 
+/** Rainbow hues cycled by the composer border while an ultramode is on. */
+const RAINBOW: readonly string[] = [
+  "#ff0000",
+  "#ff7f00",
+  "#ffff00",
+  "#00ff00",
+  "#0000ff",
+  "#4b0082",
+  "#9400d3",
+];
 const ComposerPane = memo(function ComposerPane({
   actions,
   composer,
@@ -328,6 +342,24 @@ const ComposerPane = memo(function ComposerPane({
         : [],
     [composer.inputBuf, composer.input, wake],
   );
+  // Animated rainbow border while an ultramode is on: either the session's
+  // ultra_mode, or the current prompt naming an enabled wake word (the same
+  // hit the composer accent paints). Cheap: one 500ms ticker, 7 hues.
+  const ultraModeOn = ui.info?.ultra_mode === "ultracode";
+  const ultraWakeHit = useMemo(
+    () => hasWakeWordHit([...composer.inputBuf, composer.input], wake),
+    [composer.inputBuf, composer.input, wake],
+  );
+  const ultraActive = ultraModeOn || ultraWakeHit;
+  const [rainbowTick, setRainbowTick] = useState(0);
+  useEffect(() => {
+    if (!ultraActive) {
+      return;
+    }
+    const timer = setInterval(() => setRainbowTick((t) => t + 1), 500);
+    return () => clearInterval(timer);
+  }, [ultraActive]);
+  const rainbow = RAINBOW[rainbowTick % RAINBOW.length];
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -531,6 +563,8 @@ const ComposerPane = memo(function ComposerPane({
               </Box>
 
               <Box
+                borderColor={ultraActive ? rainbow : undefined}
+                borderStyle={ultraActive ? "round" : undefined}
                 flexGrow={0}
                 flexShrink={0}
                 height={inputHeight}

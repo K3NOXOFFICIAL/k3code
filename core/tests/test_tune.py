@@ -341,7 +341,8 @@ async def test_tune_get_lists_one_row_per_model_key(server, tmp_path):
     assert res["model"] == "cheap" and res["default_model"] == "default" and res["has_session"] is True
     assert res["efforts"] == ["low", "medium", "high", "xhigh", "max"] and res["effort"] == "high"
     assert res["ultra_modes"] == ["off", "ultracode"] and res["ultra_mode"] == "off"
-    assert res["wake_words"] == ["ultracode", "ultraplan", "ultraresearch"] and res["wake_words_enabled"] is True
+    assert res["wake_words"] == ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]
+    assert res["wake_words_enabled"] is True
     rows = {r["key"]: r for r in res["models"]}
     assert [r["key"] for r in res["models"]] == ["default", "cheap", "plain", "deep", "local"]  # default first
     assert rows["default"] == {
@@ -436,7 +437,8 @@ async def test_tune_get_reports_a_session_model_that_left_the_config(server, tmp
 async def test_tune_get_reports_the_wake_word_settings(server):
     server.config.wake_words = {"enabled": True, "ultraplan": False}
     res = (await m1.rpc(server, "tune.get", {}))["result"]
-    assert res["wake_words"] == ["ultracode", "ultraresearch"] and res["wake_words_enabled"] is True
+    assert res["wake_words"] == ["ultracode", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]
+    assert res["wake_words_enabled"] is True
     server.config.wake_words = {"enabled": False}
     assert (await m1.rpc(server, "tune.get", {}))["result"]["wake_words_enabled"] is False
 

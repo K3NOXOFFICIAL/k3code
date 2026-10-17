@@ -42,7 +42,7 @@ const wire = (over: Record<string, unknown> = {}) => ({
   ],
   ultra_mode: "off",
   ultra_modes: ["off", "ultracode"],
-  wake_words: ["ultracode", "ultraplan", "ultraresearch"],
+  wake_words: ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"],
   wake_words_enabled: true,
   ...over,
 });
@@ -97,7 +97,7 @@ describe("normalizeTuneSnapshot", () => {
       ultraOn: false,
       wakeWordsEnabled: true,
     });
-    expect(snap.wakeWords).toEqual(["ultracode", "ultraplan", "ultraresearch"]);
+    expect(snap.wakeWords).toEqual(["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]);
   });
 
   it("reads the effort level, treating default/empty as no override", () => {
@@ -542,7 +542,7 @@ describe("tuneScreen", () => {
     ).toBe(true);
     expect(text.at(-2)).toMatch(/Esc cancel$/);
     expect(text.at(-1)).toMatch(
-      /^Say ultracode \/ ultraplan \/ ultraresearch in a prompt to run that mode once\.$/,
+      /^Wake words: ultracode · ultraplan · ultraresearch · fanout · ultrasketch · ultrareview$/,
     );
   });
 
@@ -579,7 +579,9 @@ describe("tuneScreen", () => {
       /… \+\d+ more$/,
     );
 
-    const mid = screenFor(many, 80, 24).lines.filter((l) => l.kind === "model");
+    const mid = screenFor(many, 80, 24, [DOWN, DOWN, DOWN]).lines.filter(
+      (l) => l.kind === "model",
+    );
 
     expect(lineText(mid[0]!)).toMatch(/^↑ /);
     expect(lineText(mid.at(-1)!)).toMatch(/^↓ /);
@@ -633,7 +635,9 @@ describe("tuneScreen", () => {
 
     expect(kinds.filter((k) => k === "effort")).toHaveLength(3);
     expect(kinds).toContain("keys");
-    expect(kinds).toContain("wake");
+    // six wake words no longer fit 80 columns even in the shortest wording,
+    // so the wake footer drops while the keys footer stays.
+    expect(kinds).not.toContain("wake");
   });
 
   it("fits other small terminals too, down to the three-row floor", () => {

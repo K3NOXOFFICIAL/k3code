@@ -34,14 +34,16 @@ class Pipeline:
     def __init__(self, server: Any, monkeypatch: pytest.MonkeyPatch, *, research_reason: str = "") -> None:
         self.calls: list[tuple[str, str]] = []
         self.contexts: list[str] = []  # what the user's hooks added, as the pipeline got it (apart from the task)
+        self.max_agents: list[int | None] = []  # the max_agents each ultracode run got (None = config default)
         self.sessions: list[Any] = []
         self.hold: asyncio.Event | None = None
         self.started = asyncio.Event()
         self.orphan = False  # leave a never-ending sub-agent behind, as a pipeline that was cut off would
         self.server = server
 
-        async def ultracode(session: Any, task: str, *, context: str = "") -> str:
+        async def ultracode(session: Any, task: str, *, context: str = "", max_agents: int | None = None) -> str:
             self.contexts.append(context)
+            self.max_agents.append(max_agents)
             return await self.run("ultracode", session, task)
 
         async def research(session: Any, question: str, *, n_sub: int | None = None, context: str = "") -> Any:
@@ -175,6 +177,84 @@ async def test_a_wake_word_for_an_unavailable_research_tool_says_so_and_runs_not
     await submit(server, "ultraresearch what changed in 3.14?")
     assert pipe.calls == [] and progress(server) == []
     assert "unavailable: no search server" in transcript(server)[-1][1]
+
+
+@pytest.mark.parametrize(
+    ("text", "mode", "task"),
+    [
+        ("fanout implement the login form", "ultracode", "implement the login form"),
+        ("ultrasketch a settings page", "preview", "a settings page"),
+        ("ultrareview staged", "review", "staged"),
+    ],
+)
+async def test_alias_wake_words_route_to_their_command(tmp_path, monkeypatch, text, mode, task):
+    """fanout -> ultracode, ultrasketch -> preview, ultrareview -> review (the job runs inline)."""
+    from k3code.commands.autonomy import PreviewCommand
+    from k3code.commands.review import ReviewCommand
+
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    previews: list[str] = []
+    reviews: list[str] = []
+
+    async def fake_preview(self: Any, ctx: Any, live: Any, arg: str, *, context: str = "") -> Any:
+        from k3code.commands.ultra_cmd import JobSpec
+
+        previews.append(arg)
+
+        async def job() -> str:
+            return f"preview result: {arg}"
+
+        return JobSpec(f"/preview {arg}", job, "sketching…")
+
+    async def fake_review(self: Any, ctx: Any, live: Any, arg: str, *, context: str = "") -> Any:
+        from k3code.commands.ultra_cmd import JobSpec
+
+        reviews.append(arg)
+
+        async def job() -> str:
+            return f"review result: {arg}"
+
+        return JobSpec(f"/review {arg}", job, "reviewing…")
+
+    monkeypatch.setattr(PreviewCommand, "prepare", fake_preview)
+    monkeypatch.setattr(ReviewCommand, "prepare", fake_review)
+    await start(server, tmp_path)
+    out = await submit(server, text)
+    assert out["status"] == "streaming"
+    first = progress(server)[0]
+    word = text.split()[0].lower().rstrip(":")
+    assert (first["command"], first["phase"], first["detail"]) == (mode, "wake word", f'"{word}" in your message')
+    if mode == "ultracode":
+        assert pipe.calls == [(mode, task)]
+    elif mode == "preview":
+        assert previews == [task]
+    else:
+        assert reviews == [task]
+    assert transcript(server)[0] == ("user", text)
+    assert models_called(server) == []  # no normal turn on the side
+
+
+async def test_fanout_wake_word_caps_agents_at_five(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    await submit(server, "fanout implement the login form")
+    assert pipe.calls == [("ultracode", "implement the login form")]
+    assert pipe.max_agents == [5]
+    await submit(server, "ultracode implement the other thing")
+    assert pipe.calls[-1] == ("ultracode", "implement the other thing")
+    assert pipe.max_agents[-1] is None  # plain ultracode keeps the config default
+
+
+@pytest.mark.parametrize("word,usage", [("fanout", "/ultracode <task>"), ("ultrasketch", "/preview <task>")])
+async def test_a_bare_alias_wake_word_answers_with_the_usage_line(tmp_path, monkeypatch, word, usage):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    await submit(server, word.capitalize())
+    assert transcript(server) == [("user", word.capitalize()), ("assistant", f"Usage: {usage}")]
+    assert pipe.calls == [] and progress(server) == [] and models_called(server) == []
 
 
 @pytest.mark.parametrize(
@@ -829,12 +909,23 @@ async def test_the_hooks_run_once_per_typed_prompt_whether_or_not_it_is_routed(t
 
 
 def test_wake_config_defaults_and_helpers():
-    assert Settings().wake_words == {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
+    assert Settings().wake_words == {
+        "enabled": True,
+        "ultracode": True,
+        "ultraplan": True,
+        "ultraresearch": True,
+        "fanout": True,
+        "ultrasketch": True,
+        "ultrareview": True,
+    }
     assert wake_cfg(Settings(wake_words={"ultraplan": False})) == {
         "enabled": True,
         "ultracode": True,
         "ultraplan": False,
         "ultraresearch": True,
+        "fanout": True,
+        "ultrasketch": True,
+        "ultrareview": True,
     }
     hit = detect_enabled(Settings(), "ultracode fix x")
     assert hit is not None and hit.mode == "ultracode"

@@ -10,6 +10,7 @@ from typing import Any
 from k3code.artifacts import write_artifact_file
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd, split_args
+from k3code.commands.ultra_cmd import JobSpec, start_spec
 from k3code.goals import _extract_json_object
 from k3code.reliability.sandbox import child_env
 
@@ -139,29 +140,45 @@ class ReviewCommand(CommandDef):
             help="Review changes with the main model: /review [staged|unstaged|<base>..HEAD|<path>]",
         )
 
-    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
         args = split_args(arg)
+        session_id = live.session_id if live is not None else None
         cwd = session_cwd(ctx, session_id)
         try:
             desc, text = await collect_target(cwd, args[0] if args else "")
         except ValueError as e:
-            return reply(str(e))
+            return reply(str(e))  # nothing to review / bad target: costs nothing, no job
         truncated = len(text) > MAX_INPUT_CHARS
         if truncated:
             text = text[:MAX_INPUT_CHARS] + "\n…(truncated)"
         rubric = RUBRIC_PATH.read_text(encoding="utf-8")
-        live = ctx.sessions.get(session_id) if session_id else None
-        model = live.stored.model if live and live.stored.model else None
+        model = live.stored.model if live is not None and live.stored.model else None
         user = f"Review the following {desc}.\n\n{text}"
-        raw = await ctx.oneshot(rubric, user, model_key=model, max_tokens=4096)
-        try:
-            result = parse_findings(raw)
-        except ValueError as e:
-            return reply(f"Review failed: {e}")
-        out = render_findings(result, desc) + ("\n(input truncated)" if truncated else "")
-        home = getattr(ctx, "_home", None)
-        if home is not None and getattr(ctx, "artifacts", None) is not None:
-            write_artifact_file(
-                ctx, "review", home() / "artifacts" / "review", f"review {desc}", out, session=session_id or ""
-            )
-        return reply(out, review=result)
+        if context:
+            user = f"{user}\n\nAdditional context:\n{context}"
+
+        async def job() -> str:
+            raw = await ctx.oneshot(rubric, user, model_key=model, max_tokens=4096)
+            try:
+                result = parse_findings(raw)
+            except ValueError as e:
+                return f"Review failed: {e}"
+            out = render_findings(result, desc) + ("\n(input truncated)" if truncated else "")
+            home = getattr(ctx, "_home", None)
+            if home is not None and getattr(ctx, "artifacts", None) is not None:
+                write_artifact_file(
+                    ctx, "review", home() / "artifacts" / "review", f"review {desc}", out, session=session_id or ""
+                )
+            return out
+
+        return JobSpec(
+            f"/review {desc}",
+            job,
+            f"Reviewing {desc} with the main model…",
+        )
+
+    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        live = ctx.sessions.get(session_id) if session_id else None
+        if live is None:
+            return reply("No active session.")
+        return start_spec(ctx, live, await self.prepare(ctx, live, arg))
