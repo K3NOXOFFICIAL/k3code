@@ -10,6 +10,7 @@ import {
 } from "../domain/settings.js";
 
 const snap: SettingsSnapshot = {
+  agentsView: false,
   busy: "queue",
   compact: false,
   details: "collapsed",
@@ -114,6 +115,7 @@ describe("settings panel state", () => {
 
 describe("settings panel theme row", () => {
   const local = {
+    agentsView: false,
     busy: "queue",
     compact: false,
     details: "expanded",

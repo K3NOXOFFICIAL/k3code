@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { providerDisplayNames } from "../domain/providers.js";
+import {
+  ADD_PROVIDER_ROW,
+  isAddProviderRow,
+  pickerNeedsKey,
+  providerDisplayNames,
+  providerPickerRows,
+  providerRowLabel,
+} from "../domain/providers.js";
 
 describe("providerDisplayNames", () => {
   it("returns bare names when all are unique", () => {
@@ -54,5 +61,44 @@ describe("providerDisplayNames", () => {
 
   it("handles empty input", () => {
     expect(providerDisplayNames([])).toEqual([]);
+  });
+});
+
+describe("providerPickerRows key/add rows", () => {
+  it("appends the + Add new provider trailing row", () => {
+    const rows = providerPickerRows([{ name: "A", slug: "a" }]);
+    expect(rows).toHaveLength(2);
+    expect(isAddProviderRow(rows[1]!.entry)).toBe(true);
+    expect(providerRowLabel(rows[1]!)).toBe(ADD_PROVIDER_ROW.name);
+  });
+
+  it("flags an unauthenticated api_key row as needing inline key entry", () => {
+    expect(
+      pickerNeedsKey({
+        authenticated: false,
+        auth_type: "api_key",
+        key_env: "FOO_KEY",
+        name: "Foo",
+        slug: "foo",
+      }),
+    ).toBe(true);
+    expect(
+      pickerNeedsKey({
+        authenticated: true,
+        auth_type: "api_key",
+        key_env: "FOO_KEY",
+        name: "Foo",
+        slug: "foo",
+      }),
+    ).toBe(false);
+    expect(
+      pickerNeedsKey({
+        authenticated: false,
+        auth_type: "none",
+        name: "Foo",
+        slug: "foo",
+      }),
+    ).toBe(false);
+    expect(pickerNeedsKey(undefined)).toBe(false);
   });
 });

@@ -4,7 +4,9 @@ import { useStore } from "@nanostores/react";
 import { useEffect, useMemo, useState } from "react";
 import { $overlayState, tuneLocked } from "../app/overlayStore.js";
 import {
+  isAddProviderRow,
   initialProviderIdx,
+  pickerNeedsKey,
   providerPickerRows,
   providerRowLabel,
   type ProviderPickerEntry,
@@ -27,6 +29,8 @@ const MAX_WIDTH = 90;
  * as `default_provider`); `/provider <name> [--save]` typed still goes to
  * the gateway. Stays shut while a prompt waits for an answer.
  */
+type Stage = "key" | "list";
+
 export function ProviderPicker({
   gw,
   maxWidth,
@@ -40,6 +44,10 @@ export function ProviderPicker({
   const [loading, setLoading] = useState(true);
   const [idx, setIdx] = useState(0);
   const [saveDefault, setSaveDefault] = useState(false);
+  const [stage, setStage] = useState<Stage>("list");
+  const [keyInput, setKeyInput] = useState("");
+  const [keySaving, setKeySaving] = useState(false);
+  const [keyError, setKeyError] = useState("");
   const overlay = useStore($overlayState);
   const locked = tuneLocked(overlay);
   const { stdout } = useStdout();
@@ -49,9 +57,11 @@ export function ProviderPicker({
     maxWidth,
   );
 
-  useEffect(() => {
+  const fetchOptions = () => {
+    setLoading(true);
     gw.request<ModelOptionsResult>("model.options", {
       ...(sessionId ? { session_id: sessionId } : {}),
+      include_unconfigured: true,
     })
       .then((raw) => {
         const r = asRpcResult<ModelOptionsResult>(raw);
@@ -73,14 +83,90 @@ export function ProviderPicker({
         setErr(rpcErrorMessage(e));
         setLoading(false);
       });
+  };
+
+  useEffect(() => {
+    fetchOptions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gw, sessionId]);
 
   const rows = useMemo(() => providerPickerRows(providers), [providers]);
 
+  const keyEntry = rows[idx]?.entry;
+
   // Own key handling (no useOverlayKeys): while a prompt is open the popup
   // ignores every key so the prompt owns the keyboard, like TunePicker.
+  // Key stage (inline API-key paste, ModelPicker pattern): raw useInput,
+  // printable append, backspace delete, Ctrl+U clear, Enter submit, Esc back.
   useInput((ch, key) => {
     if (locked) {
+      return;
+    }
+
+    if (stage === "key") {
+      if (keySaving) {
+        return;
+      }
+
+      if (key.escape) {
+        setKeyInput("");
+        setKeyError("");
+        setStage("list");
+
+        return;
+      }
+
+      if (key.return) {
+        if (!keyInput.trim() || !keyEntry || isAddProviderRow(keyEntry)) {
+          return;
+        }
+
+        setKeySaving(true);
+        setKeyError("");
+        gw.request<{ provider?: ProviderPickerEntry }>("model.save_key", {
+          slug: keyEntry.slug,
+          api_key: keyInput.trim(),
+          ...(sessionId ? { session_id: sessionId } : {}),
+        })
+          .then((raw) => {
+            const r = asRpcResult<{ provider?: ProviderPickerEntry }>(raw);
+
+            if (!r?.provider) {
+              setKeyError("failed to save key");
+              setKeySaving(false);
+
+              return;
+            }
+
+            setKeyInput("");
+            setKeySaving(false);
+            setStage("list");
+            fetchOptions();
+          })
+          .catch((e: unknown) => {
+            setKeyError(rpcErrorMessage(e));
+            setKeySaving(false);
+          });
+
+        return;
+      }
+
+      if (key.backspace || key.delete) {
+        setKeyInput((v) => v.slice(0, -1));
+
+        return;
+      }
+
+      if (ch === "" || (key.ctrl && ch === "u")) {
+        setKeyInput("");
+
+        return;
+      }
+
+      if (ch && !key.ctrl && !key.meta) {
+        setKeyInput((v) => v + ch);
+      }
+
       return;
     }
 
@@ -117,9 +203,30 @@ export function ProviderPicker({
     if (key.return) {
       const row = rows[idx];
 
-      if (row) {
-        onSelect(row.entry.slug, saveDefault);
+      if (!row) {
+        return;
       }
+
+      if (isAddProviderRow(row.entry)) {
+        onSelect(row.entry.slug, saveDefault);
+
+        return;
+      }
+
+      if (pickerNeedsKey(row.entry)) {
+        setKeyInput("");
+        setKeyError("");
+        setStage("key");
+
+        return;
+      }
+
+      if (row.entry.authenticated === false) {
+        // Other auth types: no-op (the row warning names the remedy).
+        return;
+      }
+
+      onSelect(row.entry.slug, saveDefault);
 
       return;
     }
@@ -129,9 +236,30 @@ export function ProviderPicker({
     if (n >= 1 && n <= rows.length) {
       const row = rows[n - 1];
 
-      if (row) {
-        onSelect(row.entry.slug, saveDefault);
+      if (!row) {
+        return;
       }
+
+      if (isAddProviderRow(row.entry)) {
+        onSelect(row.entry.slug, saveDefault);
+
+        return;
+      }
+
+      if (pickerNeedsKey(row.entry)) {
+        setKeyInput("");
+        setKeyError("");
+        setStage("key");
+        setIdx(n - 1);
+
+        return;
+      }
+
+      if (row.entry.authenticated === false) {
+        return;
+      }
+
+      onSelect(row.entry.slug, saveDefault);
     }
   });
 
@@ -153,6 +281,44 @@ export function ProviderPicker({
       <Box flexDirection="column">
         <Text color={t.color.muted}>no providers configured</Text>
         <OverlayHint t={t}>Esc/q cancel</OverlayHint>
+      </Box>
+    );
+  }
+
+  if (stage === "key" && keyEntry && !isAddProviderRow(keyEntry)) {
+    const masked = keyInput ? "\u2022".repeat(Math.min(keyInput.length, 40)) : "";
+
+    return (
+      <Box flexDirection="column" width={width}>
+        <Text bold color={t.color.accent} wrap="truncate-end">
+          Paste API key for {keyEntry.name} ({keyEntry.key_env}):
+        </Text>
+
+        <Text color={t.color.accent} wrap="truncate-end">
+          {"  "}
+          {masked || "(empty)"}
+          {keySaving ? "" : "\u258e"}
+        </Text>
+
+        <Text color={t.color.muted} wrap="truncate-end">
+          {" "}
+        </Text>
+
+        {keyError ? (
+          <Text color={t.color.label} wrap="truncate-end">
+            error: {keyError}
+          </Text>
+        ) : keySaving ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            saving\u2026
+          </Text>
+        ) : (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {" "}
+          </Text>
+        )}
+
+        <OverlayHint t={t}>Enter save \u00b7 Esc back</OverlayHint>
       </Box>
     );
   }
@@ -210,7 +376,7 @@ export function ProviderPicker({
         toggle save
       </Text>
       <OverlayHint t={t}>
-        ↑/↓ select · Enter switch · ^g save toggle · Esc/q close
+        ↑/↓ select · Enter switch/setup · ^g save toggle · Esc/q close
       </OverlayHint>
     </Box>
   );

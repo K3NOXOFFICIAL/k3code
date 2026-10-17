@@ -26,6 +26,7 @@ import { WHEEL_SCROLL_STEP } from "../config/limits.js";
 import { RESIZE_COALESCE_MS } from "../config/timing.js";
 import { hasLeadGap, prevRenderedMsg } from "../domain/blockLayout.js";
 import { SECTION_NAMES, sectionMode } from "../domain/details.js";
+import { ADD_PROVIDER_SLUG } from "../domain/providers.js";
 import {
   composeTabTitle,
   fmtProjectCwdBranch,
@@ -175,11 +176,16 @@ export interface PromptLiveSessionOptions {
     queuedSpans?: readonly (readonly [number, number])[],
     queuedDisplay?: string,
   ) => void;
+  /** The session being departed from (agent view); closed once the new one is attached if disposable. */
+  dropSid?: string;
+  keepAgentView?: boolean;
   maybeWarn: (value: unknown) => void;
   modelArg?: string;
   newLiveSession: (
     msg?: string,
     title?: string,
+    dropSid?: string,
+    keepAgentView?: boolean,
   ) => Promise<null | string> | null | string | void;
   onModelSwitched?: (value: string, result: ConfigSetResponse) => void;
   prompt: string;
@@ -189,6 +195,8 @@ export interface PromptLiveSessionOptions {
 
 export async function startPromptLiveSession({
   dispatchSubmission,
+  dropSid,
+  keepAgentView,
   maybeWarn,
   modelArg,
   newLiveSession,
@@ -207,7 +215,13 @@ export async function startPromptLiveSession({
   // the initial title. Auto-title generation can rename it after the first
   // response; pre-queuing prompt text here causes duplicate-title errors when
   // users dispatch common prompts like "Hello, what model are you?".
-  const sid = (await newLiveSession("new live session started")) ?? null;
+  const sid =
+    (await newLiveSession(
+      "new live session started",
+      undefined,
+      dropSid,
+      keepAgentView,
+    )) ?? null;
 
   if (!sid) {
     sys("error: failed to start new live session");
@@ -1480,10 +1494,20 @@ export function useMainApp(gw: GatewayClient) {
 
   // /provider popup: Enter switches the session to the picked block; with
   // `--save` it is also written as default_provider for new sessions.
+  // The trailing "+ Add new provider" row (ADD_PROVIDER_SLUG) prints the
+  // chain-add usage template instead of switching.
   const onProviderSelect = useCallback((slug: string, saveDefault: boolean) => {
     patchOverlayState({ providerPicker: false });
+    if (slug === ADD_PROVIDER_SLUG) {
+      sys(
+        "Add a provider block with: /model chain add <provider> <model> " +
+          "[kind=openai|anthropic base_url=... key_env=...]",
+      );
+
+      return;
+    }
     slashRef.current(`/provider ${slug}${saveDefault ? " --save" : ""}`);
-  }, []);
+  }, [sys]);
 
   // /tune popup: Enter / `s`. One tune.set carries the model, effort and ultracode changes; the gateway answers with
   // what changed and pushes a session.info, which updates the status line.
@@ -1500,6 +1524,12 @@ export function useMainApp(gw: GatewayClient) {
   );
 
   const onSettingsApply = useCallback((command: string) => {
+    slashRef.current(command);
+  }, []);
+  // /permissions popup: closes it and dispatches the slash string the row
+  // emitted (`/permissions mode X`, `/permissions allow|ask|deny ...`, `/permissions rm ...`).
+  const onPermissionsApply = useCallback((command: string) => {
+    patchOverlayState({ permissionsPicker: false });
     slashRef.current(command);
   }, []);
 
@@ -1526,9 +1556,15 @@ export function useMainApp(gw: GatewayClient) {
   );
 
   const newPromptSession = useCallback(
-    (prompt: string, modelArg?: string) => {
+    (
+      prompt: string,
+      modelArg?: string,
+      opts?: { dropSid?: string; keepAgentView?: boolean },
+    ) => {
       void startPromptLiveSession({
         dispatchSubmission,
+        dropSid: opts?.dropSid,
+        keepAgentView: opts?.keepAgentView,
         maybeWarn,
         modelArg,
         newLiveSession: session.newLiveSession,
@@ -1640,10 +1676,11 @@ export function useMainApp(gw: GatewayClient) {
       answerSecret,
       answerSudo,
       clearSelection,
-      newLiveSession: (dropSid?: string) =>
-        session.newLiveSession(undefined, undefined, dropSid),
+      newLiveSession: (msg?: string, title?: string, dropSid?: string) =>
+        session.newLiveSession(msg, title, dropSid),
       newPromptSession,
       onModelSelect,
+      onPermissionsApply,
       onProviderSelect,
       onSettingsApply,
       onTuneApply,
@@ -1670,6 +1707,7 @@ export function useMainApp(gw: GatewayClient) {
       closeLiveSession,
       newPromptSession,
       onModelSelect,
+      onPermissionsApply,
       onProviderSelect,
       onSettingsApply,
       onTuneApply,

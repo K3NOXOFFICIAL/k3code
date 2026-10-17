@@ -229,3 +229,54 @@ def test_auto_continue_settings_are_checked_at_load(tmp_path, caplog, text, auto
     assert acfg["auto_continue"] == (auto_continue if auto_continue is not None else "auto")
     assert acfg["auto_continue_max_turns"] == (max_turns if max_turns is not None else 8)
     assert auto_continue_on(acfg, "auto") == (auto_continue is not False)
+
+@pytest.mark.parametrize(
+    ("stale", "fixed"),
+    [
+        ("claude-sonnet-5", "claude-sonnet-5-5"),
+        ("claude-opus-5", "claude-opus-5-5"),
+        ("claude-haiku-4-5", "claude-haiku-5-5"),
+    ],
+)
+def test_retired_model_ids_rewrite_to_dated_ids_on_load(stale: str, fixed: str):
+    """A config that still names the bare ``claude-sonnet-5``-era ids loads with the
+    dated ids the relay catalog carries. Without this the cheap tier sends a dead
+    id and goal_judge dies on every tick with "unknown provider for model"."""
+    from k3code.config import ProviderEntry
+
+    def block(models: dict, tiers: dict | None = None) -> dict:
+        d: dict = {
+            "name": "r",
+            "kind": "openai",
+            "base_url": "https://x",
+            "api_key_env": "K",
+            "models": models,
+        }
+        if tiers is not None:
+            d["tiers"] = tiers
+        return d
+
+    assert ProviderEntry(**block({"default": stale})).models == {"default": fixed}
+    assert ProviderEntry(**block({"default": [stale, "gpt-x"]})).models == {
+        "default": [fixed, "gpt-x"]
+    }
+    assert ProviderEntry(**block({"default": "m"}, {"cheap": stale})).tiers == {
+        "cheap": fixed
+    }
+
+
+def test_current_model_ids_pass_through_untouched():
+    """Dated ids, gateway aliases and vendor-prefixed ids are not rewritten."""
+    from k3code.config import ProviderEntry
+
+    models = {
+        "default": "claude-sonnet-5-5",
+        "cheap": ["auto/coding-cheap", "claude/claude-sonnet-5"],
+    }
+    assert ProviderEntry(
+        name="r",
+        kind="openai",
+        base_url="https://x",
+        api_key_env="K",
+        models=models,
+    ).models == models

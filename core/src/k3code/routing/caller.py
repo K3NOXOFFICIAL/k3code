@@ -20,6 +20,11 @@ from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_fo
 
 logger = logging.getLogger(__name__)
 
+#: An unattended side call starts at its kind's tier on every tick: one broken tier turns each of them into the same
+#: "escalated" flood of a note the user has already seen. First identical note goes out; near-duplicates inside this
+#: window stay in the log (usage rows unaffected, the outage bookkeeping keeps every one).
+ESCALATION_EMIT_WINDOW = 300.0
+
 
 @dataclass
 class CallResult:
@@ -50,6 +55,8 @@ class ModelCaller:
         self._last_attempt = last_attempt
         #: session id -> the turn id in flight, so side calls (titles, compaction, judges) join that turn's totals
         self._turn_of = turn_of
+        #: (kind, from, to, reason) -> when this shape last went out to the user (see ESCALATION_EMIT_WINDOW)
+        self._escalation_emits: dict[tuple[str, str, str, str], float] = {}
 
     async def complete(
         self,
@@ -96,7 +103,21 @@ class ModelCaller:
                 detail=f"{old.value}->{new.value}: {reason}",
                 turn=self._turn_of(session_id) if self._turn_of else "",
             )
-        if self.emit is not None:
+        shape = (kind.value, old.value, new.value, reason)
+        now = time.monotonic()
+        seen = self._escalation_emits.get(shape)
+        if seen is not None and now - seen < ESCALATION_EMIT_WINDOW:
+            # the user has this note already: a judge call on every tick repeating it adds nothing
+            logger.info(
+                "routing.escalated.suppressed %s: %s -> %s (%s: same note %.0fs ago)",
+                kind.value,
+                old.value,
+                new.value,
+                cause,
+                now - seen,
+            )
+        elif self.emit is not None:
+            self._escalation_emits[shape] = now
             self.emit(
                 "routing.escalated",
                 {

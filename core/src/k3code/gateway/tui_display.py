@@ -2,7 +2,8 @@
 
 The TUI's /theme, /indicator, /statusbar, /battery, /mouse, /density, /busy, /details and /pet send short keys
 (``indicator``, ``statusbar``, ...). Each maps to a ``display.<field>`` the TUI reads back from ``config.full``.
-A set updates the live config and the user config file, so the choice survives a restart.
+A set updates the live config and the user config file, so the choice survives a restart. ``agents_view`` is the
+"Start k3code in agent view" checkbox.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "battery": ("battery", "bool"),
     "mouse": ("mouse_tracking", "bool"),
     "density": ("tui_compact", "bool"),
+    "agents_view": ("tui_start_agents_view", "bool"),
     "busy": ("busy_input_mode", "str"),
     "details_mode": ("details_mode", "str"),
     "pet": ("pet", "str"),

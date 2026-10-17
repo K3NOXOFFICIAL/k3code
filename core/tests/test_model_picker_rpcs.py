@@ -35,7 +35,7 @@ def _providers() -> list[ProviderEntry]:
             kind="anthropic",
             base_url="http://b",
             api_key_env="PICKER_B_KEY",
-            models={"default": "claude-sonnet-5", "cheap": "claude-haiku-4-5"},
+            models={"default": "claude-sonnet-5-5", "cheap": "claude-haiku-5-5"},
             descriptions={"default": "Everyday coding"},
         ),
         ProviderEntry(name="c", kind="claude-cli", models={"local": "sonnet"}),
@@ -86,8 +86,8 @@ async def test_options_send_descriptions_capabilities_and_key_state(server):
         "local": {"reasoning": False, "fast": False},  # llama3
     }
     assert b["capabilities"] == {
-        "default": {"reasoning": True, "fast": False},  # claude-sonnet-5
-        "cheap": {"reasoning": False, "fast": False},  # claude-haiku-4-5
+        "default": {"reasoning": True, "fast": False},  # claude-sonnet-5-5
+        "cheap": {"reasoning": True, "fast": False},  # claude-haiku-5-5
     }
     assert c["capabilities"] == {"local": {"reasoning": True, "fast": False}}  # claude-cli passes --effort
     assert d["capabilities"] == {}  # no model id: unknown, so the picker keeps offering the effort step
@@ -220,3 +220,21 @@ def test_unset_env_var_keeps_other_lines_and_the_mode(tmp_path):
     assert read_env_file(path) == {"B": "2"} and stat.S_IMODE(path.stat().st_mode) == 0o600
     assert unset_env_var("A", path) is False
     assert unset_env_var("B", path) is True and path.read_text() == ""
+
+# ── permissions.get ───────────────────────────────────────────────────────────────────────────────────────────────
+async def test_permissions_get_returns_mode_modes_and_effective_rules(server):
+    res = await _ok(server, "permissions.get", {})
+    assert res["mode"] in res["modes"] and "default" in res["modes"]
+    assert isinstance(res["rules"], list) and res["rules"]
+    first = res["rules"][0]
+    assert {"id", "source", "action", "tool", "pattern"} <= set(first)
+    assert first["id"].startswith("b")  # builtin rules come first (u/p/s after)
+
+
+async def test_permissions_get_is_a_read_only_open_method(server):
+    from k3code.gateway import server as srv
+
+    # Read-only like model.options/tune.get: no auth gate, session optional.
+    assert not srv._requires_auth("permissions.get", {})
+    res = await _ok(server, "permissions.get", {"session_id": None})
+    assert "mode" in res

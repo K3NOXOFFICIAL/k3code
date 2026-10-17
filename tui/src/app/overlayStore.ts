@@ -16,6 +16,7 @@ const buildOverlayState = (): OverlayState => ({
   modelPicker: false,
   pager: null,
   providerPicker: false,
+  permissionsPicker: false,
   secret: null,
   sessions: false,
   sudo: null,
@@ -35,6 +36,7 @@ export const $isBlocked = computed(
     confirm,
     modelPicker,
     pager,
+    permissionsPicker,
     providerPicker,
     secret,
     sessions,
@@ -51,6 +53,7 @@ export const $isBlocked = computed(
       confirm ||
       modelPicker ||
       pager ||
+      permissionsPicker ||
       providerPicker ||
       secret ||
       sessions ||
@@ -116,6 +119,7 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
   Boolean(
     overlay.modelPicker ||
     overlay.pager ||
+    overlay.permissionsPicker ||
     overlay.providerPicker ||
     overlay.sessions ||
     overlay.settingsPanel ||
@@ -196,6 +200,17 @@ export const openProviderPicker = (): boolean => {
   return true;
 };
 
+/** Open the /permissions popup; false (nothing opened) while a prompt is waiting for an answer. */
+export const openPermissionsPicker = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ permissionsPicker: true });
+
+  return true;
+};
+
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
  * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, agent view, model
@@ -214,6 +229,7 @@ export const resetFlowOverlays = () =>
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
     modelPicker: $overlayState.get().modelPicker,
+    permissionsPicker: $overlayState.get().permissionsPicker,
     providerPicker: $overlayState.get().providerPicker,
     sessions: $overlayState.get().sessions,
     settingsPanel: $overlayState.get().settingsPanel,

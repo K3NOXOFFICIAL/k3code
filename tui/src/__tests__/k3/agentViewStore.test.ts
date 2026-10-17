@@ -466,17 +466,56 @@ describe("reduceViewKey", () => {
     }
   });
 
-  it("n starts a new session; esc and ← close", () => {
-    const result = press(at(2), { ch: "n" });
-    expect(result.nav).toEqual({
-      ...IDLE_VIEW_NAV,
-      index: 2,
-      newSessionPrompt: true,
-      newSessionText: "",
-    });
-    expect(result.effect).toBeNull();
+  it("n and tab focus the composer; esc and ← close", () => {
+    const focus = { draft: "", focus: "input" as const };
+
+    for (const key of [{ ch: "n" }, { tab: true }]) {
+      const result = press(at(2), key);
+
+      expect(result.nav).toEqual({ ...IDLE_VIEW_NAV, index: 2, ...focus });
+      expect(result.effect).toBeNull();
+    }
+
     expect(press(at(2), { escape: true }).effect).toEqual({ type: "close" });
     expect(press(at(2), { left: true }).effect).toEqual({ type: "close" });
+  });
+
+  it("in input mode tab goes back to the list, keeping the draft", () => {
+    const typing = { ...IDLE_VIEW_NAV, draft: "hi", focus: "input" as const };
+
+    // printable keys belong to the composer, not the list
+    expect(press(typing, { ch: "q" })).toEqual({
+      consumed: true,
+      effect: null,
+      nav: typing,
+    });
+
+    const back = press(typing, { tab: true });
+
+    expect(back.nav).toEqual({ ...at(0), draft: "hi" });
+    expect(back.effect).toBeNull();
+  });
+
+  it("esc in input mode clears a typed draft first, closing only once empty", () => {
+    const typing = { ...IDLE_VIEW_NAV, draft: "hi", focus: "input" as const };
+
+    expect(press(typing, { escape: true }).nav).toEqual({
+      ...at(0),
+      draft: "",
+      focus: "input",
+    });
+    expect(
+      press({ ...typing, draft: "" }, { escape: true }).effect,
+    ).toEqual({ type: "close" });
+  });
+
+  it("in input mode even the list's own commands, like c, type into the draft", () => {
+    const typing = { ...at(0), draft: "hi", focus: "input" as const };
+    const r = press(typing, { ch: "c" });
+
+    expect(r.consumed).toBe(true);
+    expect(r.nav).toEqual(typing);
+    expect(r.effect).toBeNull();
   });
 
   it("ignores n, x and y chords with Ctrl or Meta; arrows, ⏎ and esc still work", () => {
@@ -532,8 +571,8 @@ describe("reduceViewKey", () => {
 
     expect(press(IDLE_VIEW_NAV, { ch: "n" }, none).nav).toEqual({
       ...IDLE_VIEW_NAV,
-      newSessionPrompt: true,
-      newSessionText: "",
+      draft: "",
+      focus: "input",
     });
     expect(press(IDLE_VIEW_NAV, { escape: true }, none).effect).toEqual({
       type: "close",

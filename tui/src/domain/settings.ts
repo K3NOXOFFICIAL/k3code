@@ -26,6 +26,8 @@ export interface SettingItem {
 
 /** Everything the panel shows, gathered from settings.get + the TUI's own state. */
 export interface SettingsSnapshot {
+  /** "Start k3code in agent view" (display.tui_start_agents_view). */
+  agentsView: boolean;
   busy: string;
   compact: boolean;
   details: string;
@@ -149,6 +151,16 @@ export function buildSettingsItems(s: SettingsSnapshot): SettingItem[] {
       ONOFF,
       (v) => `/density ${v}`,
       "Tighter transcript spacing",
+      "bool",
+    ),
+    item(
+      "Display",
+      "agents_view",
+      "Start in agent view",
+      onoff(s.agentsView),
+      ONOFF,
+      (v) => `/agents-view ${v === "on" ? "on" : "off"}`,
+      "Open the full-screen agent view on startup, before a session exists",
       "bool",
     ),
     item(
@@ -436,6 +448,7 @@ export function settingsSnapshot(
   raw: unknown,
   local: Pick<
     SettingsSnapshot,
+    | "agentsView"
     | "busy"
     | "compact"
     | "details"

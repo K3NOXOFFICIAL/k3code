@@ -173,13 +173,15 @@ describe("/tune, /model and /effort", () => {
     });
   });
 
-  it("/permissions bare opens the settings panel; with args goes to gateway (#415)", async () => {
+  it("/permissions bare opens its own popup; with args goes to gateway", async () => {
     expect(findSlashCommand("permissions")).toBeDefined();
     const ctx = buildCtx(() => Promise.resolve({ output: "ok" }));
 
     run(ctx, "/permissions");
 
-    expect(getOverlayState().settingsPanel).toBe(true);
+    expect(getOverlayState().permissionsPicker).toBe(true);
+    expect(getOverlayState().settingsPanel).toBe(false);
+    expect(getOverlayState().tunePicker).toBe(false);
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
     resetOverlayState();
     patchUiState({ sid: "sid-abc" });
