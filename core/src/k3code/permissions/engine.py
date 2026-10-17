@@ -617,6 +617,8 @@ def decide(
     ``plan_for``: in plan mode, the mode of the session the plan is made for (the plan-first planning turn). For an
     auto session, a read outside the roots is decided as that session decides it (see _decide_path).
     """
+    if not isinstance(tool, str):
+        return Decision(action="deny", message=f"Invalid tool name: {type(tool).__name__} (fail-closed).")
     try:
         mode = PermissionMode(mode)
     except ValueError:
@@ -678,6 +680,12 @@ def decide(
     return _finish(dec, mode, headless)
 
 
+#: Generic headless ask-to-deny message: carries no rule name, so _finish replaces it with rule guidance below.
+_HEADLESS_MSG = "Permission denied: approval required but unavailable (headless mode)."
+#: Kept inside the rule-named replacement so callers matching on the headless signal still see it.
+_HEADLESS_SUFFIX = "approval required but unavailable (headless mode)"
+
+
 def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     if dec.hardline is None and dec.action != "deny" and not dec.always_ask:
         if mode == PermissionMode.YOLO:
@@ -686,16 +694,17 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
             dec.action, dec.auto_allowed = "allow", True
     if dec.action == "ask" and headless:
         dec.action = "deny"
-        dec.message = dec.message or "Permission denied: approval required but unavailable (headless mode)."
-    if dec.action == "deny" and not dec.message:
-        # A weak model gets a bare "Denied." and retries the same call: name the rule and what to do instead.
+        dec.message = dec.message or _HEADLESS_MSG
+    if dec.action == "deny" and (not dec.message or dec.message == _HEADLESS_MSG):
+        # A weak model gets a bare "Denied." (or the generic headless line with no rule named) and retries the
+        # same call: name the rule and what to do instead, keeping the headless signal callers match on.
         if dec.rule:
             dec.message = (
-                f"Denied by rule {dec.rule.tool}:{dec.rule.pattern}. "
-                "Do not retry the same call; use a narrower command inside the project, "
+                f"Permission denied by rule {dec.rule.tool}:{dec.rule.pattern} "
+                f"({_HEADLESS_SUFFIX}). Do not retry the same call; use a narrower command inside the project, "
                 "or ask the user to allow it with /permissions."
             )
-        else:
+        elif not dec.message:
             dec.message = "Denied."
     return dec
 
@@ -2300,19 +2309,27 @@ def _toolchain_read(path: str) -> bool:
     return any(seg in _TOOLCHAIN_SEGMENTS for seg in _real(path).split(os.sep))
 
 
+@functools.lru_cache(maxsize=32)
+def _home_stores_cached(home: str, home_real: str, hidden: tuple[str, ...]) -> tuple[str, ...]:
+    """The materialized credential-store list for one $HOME (see _home_stores); cached, 32 most recent homes."""
+    stores = [
+        os.path.join(h, rel)
+        for h in dict.fromkeys((os.path.normpath(home), home_real))
+        for rel in (*hidden, _UV_CREDENTIALS)
+    ]
+    return tuple(dict.fromkeys([*stores, *map(_real, stores)]))
+
+
 def _home_stores() -> list[str]:
     """The credential stores of ``$HOME`` that the read-only home sandbox hides from bash (sandbox.HOME_RO_HIDDEN:
     ``~/.netrc``, ``~/.npmrc``, ``~/.config/gh``, ``~/.docker`` ...) plus uv's (_UV_CREDENTIALS): each below ``$HOME``
-    as written and below its realpath, and each one's own realpath (a dotfile manager's symlink)."""
+    as written and below its realpath, and each one's own realpath (a dotfile manager's symlink). Cached on
+    ($HOME, its realpath, the hidden list): $HOME only changes at process start or in tests, so a hot-path read
+    decide pays one realpath instead of ~65."""
     from k3code.reliability.sandbox import HOME_RO_HIDDEN  # that module imports this one
 
     home = os.path.expanduser("~")
-    stores = [
-        os.path.join(h, rel)
-        for h in dict.fromkeys((os.path.normpath(home), _real(home)))
-        for rel in (*HOME_RO_HIDDEN, _UV_CREDENTIALS)
-    ]
-    return list(dict.fromkeys([*stores, *map(_real, stores)]))
+    return list(_home_stores_cached(home, _real(home), tuple(HOME_RO_HIDDEN)))
 
 
 def _flat(path: str) -> str:
@@ -2348,10 +2365,16 @@ def _home_store_read(path: str, roots: list[str]) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=32)
+def _home_prefixes_cached(home: str, home_real: str) -> tuple[str, ...]:
+    """``$HOME/`` spellings for one home (see _home_prefixes); cached like _home_stores_cached."""
+    return tuple(h.rstrip("/") + "/" for h in dict.fromkeys((home, home_real)))
+
+
 def _home_prefixes() -> list[str]:
     """``$HOME/`` as written and by its realpath."""
     home = os.path.normpath(os.path.expanduser("~"))
-    return [h.rstrip("/") + "/" for h in dict.fromkeys((home, _real(home)))]
+    return list(_home_prefixes_cached(home, _real(home)))
 
 
 def _below_home_dot(path: str, homes: list[str]) -> bool:
