@@ -72,8 +72,8 @@ PlanCallback = Callable[[str], Awaitable[str | None]]
 #: Told about every side effect the mode auto-allowed: (tool, arguments, decision).
 AutoAllowCallback = Callable[[str, dict[str, Any], Decision], None]
 
-#: Cap for AgentLoop._notes (decision-model notes): one entry per elided result with no eviction would grow
-#: unboundedly across a long turn.
+#: Cap for AgentLoop._notes (decision-model notes): one entry per elided result; past the cap the
+#: stalest-by-last-access is evicted (see _notes_at).
 _NOTES_MAX = 50
 
 
@@ -116,12 +116,14 @@ class AgentLoop:
         self._pinned: set[str] = set()
         #: Per run(): what the decision model said is still worth knowing of an elided result (tool call id → note)
         self._notes: dict[str, str] = {}
+        #: Per run(): last self._step at which a note was written or rendered (LRU clock for _notes).
+        self._notes_at: dict[str, int] = {}
         #: The decision model (k3code.context_select), when one is configured: (request, candidates) → {tool call id:
         #: "keep" | note}. It is asked before a batch of old results is elided; None = plain elision.
         self.decide_context: Callable[[list[Message], list[Message]], Awaitable[dict[str, str]]] | None = None
         #: share of the context window past which old tool results are elided
         self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
-        self._reads: dict[tuple[Any, ...], tuple[int, str]] = {}
+        self._reads: dict[tuple[Any, ...], tuple[int, str, int, int, int]] = {}  # (step, call id, first, last, wanted)
         self._step = 0
         #: What this loop's model has seen of each file; write and edit refuse one it has not, or that changed since.
         #: Kept across run()s; the gateway hands every loop of a session the session's own (turns and tiers share it).
@@ -257,7 +259,7 @@ class AgentLoop:
         self.reliability.begin_turn()
         self._tell_home_started()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
-        self._notes = {}
+        self._notes, self._notes_at = {}, {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
@@ -626,7 +628,15 @@ class AgentLoop:
 
         read_key = self._read_key(args) if tool_call.name == "read" else None
         if read_key is not None and (seen := self._reads.get(read_key)) and seen[1] not in self._elided:
-            step, call_id = seen
+            if len(seen) == 5:
+                step, call_id, first, last, wanted = seen
+                if last < wanted:
+                    return {
+                        "content": f"[lines {last + 1}-{wanted} elided since the read at step {step} "
+                        f"(call {call_id}); re-read with offset={last + 1}]"
+                    }
+            else:
+                step, call_id = seen
             self._pinned.add(call_id)  # the earlier result must stay in the requests: this one points at it
             return {
                 "content": f"[unchanged since the read at step {step} (call {call_id}): same path, size and "
@@ -685,7 +695,16 @@ class AgentLoop:
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
-            self._reads[read_key] = (self._step if step is None else step, tool_call.id)
+            try:
+                self._reads[read_key] = (
+                    self._step if step is None else step,
+                    tool_call.id,
+                    int(result["first"]),
+                    int(result["last"]),
+                    int(result.get("wanted_last", result["last"])),
+                )
+            except (KeyError, TypeError, ValueError):
+                self._reads[read_key] = (self._step if step is None else step, tool_call.id, 0, 0, 0)
         seen = (tool_call.name == "read" and "first" in result) or (tool_call.name in FILE_TOOLS and result.get("ok"))
         if seen and (path := self._tool_path(args)) is not None:
             self.file_stamps.record(path)
@@ -768,6 +787,9 @@ class AgentLoop:
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
             view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
+        for m in view:
+            if m.tool_call_id in self._notes and "Still relevant:" in (m.content or ""):
+                self._notes_at[m.tool_call_id] = self._step
         return view
 
     async def _ask_decision_model(self, wire: list[Message], budget: float) -> set[str]:
@@ -788,10 +810,13 @@ class AgentLoop:
             note = decision.get(m.tool_call_id or "")
             if note and note != "keep" and m.tool_call_id:
                 self._notes[m.tool_call_id] = note
-        # One entry per elided result with no eviction: drop the oldest past the cap (an id-less result has no
+                self._notes_at[m.tool_call_id] = self._step
+        # One entry per elided result: evict the stalest-by-last-access past the cap (an id-less result has no
         # stable key, so it is never noted).
         while len(self._notes) > _NOTES_MAX:
-            self._notes.pop(next(iter(self._notes)))
+            victim = min(self._notes, key=lambda k: self._notes_at.get(k, -1))
+            del self._notes[victim]
+            self._notes_at.pop(victim, None)
         # the request with every candidate elided, then the kept ones added back newest first while they fit in half of
         # the room left under the threshold: the other half is what the turn grows into before the next batch
         floor = context_budget.message_tokens(
