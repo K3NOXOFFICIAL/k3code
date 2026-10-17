@@ -91,13 +91,10 @@ export const tuneCommands: SlashCommand[] = [
     name: "permissions",
     usage: "/permissions [...]",
     run: (arg, ctx) => {
-      if (!arg.trim()) {
-        if (!openSettingsPanel()) {
-          ctx.transcript.sys("finish the pending prompt first");
-        }
-        return;
+      if (arg.trim()) {
+        return runOnGateway("permissions", arg.trim(), ctx);
       }
-      return runOnGateway("permissions", arg.trim(), ctx);
+      return runOnGateway("permissions", "", ctx);
     },
   },
 ];
