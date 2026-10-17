@@ -14,6 +14,8 @@ rulesets (session > project > user > builtin).
 
 from __future__ import annotations
 
+import warnings
+
 from . import arity, hardline, rules, wildcard
 from .engine import (
     BUILTIN_BASH_ALLOW,
@@ -70,8 +72,15 @@ def check_permission(
 ) -> tuple[bool, str | None]:
     """Compat wrapper over :func:`decide` (M0 signature, no args available).
 
-    Only consults the mode; tools that need argument-aware checks (bash
-    command patterns, paths) must go through :func:`decide`.
+    Cannot enforce argument-level rules: bash is decided with ``command=""``
+    and read with ``path="."``, so a ``True`` here means nothing for gated
+    tools. New callers must go through :func:`decide` with real args.
+    Emits :class:`DeprecationWarning`.
     """
+    warnings.warn(
+        "check_permission cannot enforce argument-level rules; use decide() with args",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     decision = decide(mode=PermissionMode(mode), tool=tool_name, headless=headless)
     return decision.action == "allow", decision.message

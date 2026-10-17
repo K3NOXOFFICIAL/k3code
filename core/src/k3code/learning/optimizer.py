@@ -759,6 +759,8 @@ class Experiments:
                 self._judge_legacy(x, m, notify, config_path)
                 finished.append(x)
                 continue
+            # F2: the window only holds events since exp["started"] (session_done calls
+            # current_metrics(x["started"])), so every sample here ran under the treatment.
             per_session = m.get("per_session") or {}
             if x.get("design") == "concurrent":
                 treatment = [s for sid, s in per_session.items() if arm(x["id"], sid) == "treatment"]

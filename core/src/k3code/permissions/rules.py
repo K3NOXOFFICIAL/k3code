@@ -87,10 +87,16 @@ def from_config(permissions: dict[str, Any], problems: list[str] | None = None) 
 
 
 def merge(*rulesets: list[Rule]) -> list[Rule]:
-    """Concatenate rulesets (builtin < user < project < session)."""
+    """Concatenate rulesets (builtin < user < project < session).
+
+    Rules already stamped with their layer skip the rebuild: builtin rules come
+    from a cached tuple at layer 0, so a hot-path decide() avoids re-creating
+    ~150 Rule objects per call.
+    """
     merged: list[Rule] = []
     for layer, ruleset in enumerate(rulesets):
-        merged.extend(replace(r, layer=layer) for r in ruleset)
+        for r in ruleset:
+            merged.append(r if r.layer == layer else replace(r, layer=layer))
     return merged
 
 
@@ -101,6 +107,8 @@ def evaluate(tool: str, pattern: str, ruleset: list[Rule], *, default: Action = 
     user > builtin), then deny > ask > allow. Falls back to ``{"tool": tool, "pattern": "*", action: default}``.
     User config wins over a project's: a project allow never overrides a matching user (or session) deny, however
     specific it is (a cloned repo's ``git push origin *: allow`` beat the user's ``git push *: deny``).
+    Session outranks user by design (pinned by test): the session is the user's live intent for this run,
+    while project repos are untrusted third parties.
     """
     best: Rule | None = None
     best_key: tuple[int, ...] = (-1, -1, -1, -1)
