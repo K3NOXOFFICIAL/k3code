@@ -53,6 +53,7 @@ class ReliabilitySettings:
     flags: ReliabilityFlags = field(default_factory=ReliabilityFlags)
     max_wait: float | None = None  # persistent-retry total wait bound; None = forever
     max_park_seconds: float = 600.0  # park ladder cap (RetryConfig.park_max)
+    retry_forever: bool = False  # never abort a run on transient/infra errors (park + retry forever)
     # Optional session budget caps, enforced from router usage reports.
     session_tokens: int | None = None
     session_usd: float | None = None
@@ -81,6 +82,7 @@ class Reliability:
         cancel_token: CancelToken | None = None,
         max_wait: float | None = None,
         max_park_seconds: float | None = None,
+        retry_forever: bool = False,
         netwatch_config: dict[str, Any] | None = None,
         netwatch: NetWatch | None = None,
     ) -> None:
@@ -97,7 +99,7 @@ class Reliability:
             self.netwatch = None
         else:
             self.netwatch = netwatch if netwatch is not None else NetWatch(NetWatchConfig(**(netwatch_config or {})))
-        self.retry_config = RetryConfig(max_wait=max_wait)
+        self.retry_config = RetryConfig(max_wait=None if retry_forever else max_wait, retry_forever=retry_forever)
         if max_park_seconds is not None:  # reliability.max_park_seconds used to be read and then dropped
             self.retry_config.park_max = float(max_park_seconds)
         self.governor = (
@@ -138,6 +140,7 @@ class Reliability:
             home=home,
             max_wait=settings.max_wait if settings else None,
             max_park_seconds=settings.max_park_seconds if settings else None,
+            retry_forever=settings.retry_forever if settings else False,
             netwatch_config=settings.netwatch if settings else None,
             netwatch=netwatch,
         )
@@ -467,6 +470,7 @@ def reliability_settings(config: Any) -> ReliabilitySettings:
         "enabled",
         "max_wait",
         "max_park_seconds",
+        "retry_forever",
         "session_tokens",
         "session_usd",
         "day_tokens",

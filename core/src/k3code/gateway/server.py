@@ -1884,7 +1884,12 @@ class GatewayServer:
             if session.fanout_evidence is not None:  # the children's work comes first, the parent's (if any) after
                 evidence = session.fanout_evidence.followed_by(evidence)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer, evidence=evidence
+                final_text,
+                judge,
+                cwd=session.stored.cwd or None,
+                reviewer=reviewer,
+                evidence=evidence,
+                retry_forever=self._retry_forever_on(),
             )
             self.learning.turn_judged(session.turn_id, decision.verdict, decision.gate)
             self.emit_goal(session)
@@ -2013,6 +2018,20 @@ class GatewayServer:
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
+    def _retry_forever_on(self) -> bool:
+        """Verify-until-done mode ("don't stop until goal verified completed").
+
+        Read defensively: the ``reliability.retry_forever`` key is owned by another agent's schema change,
+        so this works whether or not the key exists yet. Only truthy enables the goal park-forever behavior.
+        """
+        try:
+            raw = getattr(self.config, "reliability", None) or {}
+            if not isinstance(raw, dict):
+                return False
+            return bool(raw.get("retry_forever", False))
+        except Exception:  # noqa: BLE001 - config shape must never break a turn
+            return False
+
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
 
@@ -2035,6 +2054,24 @@ class GatewayServer:
         elif status == "halted":
             reason, text = "halted", "Goal paused: the daemon is halted (/daemon pause). /goal resume after resume."
         elif status == "error" and isinstance(session.last_exc, (ChainExhausted, AllProvidersUnreachable)):
+            if self._retry_forever_on():
+                # Verify-until-done: a transient/infra error never marks the goal failed and never pauses it.
+                # The goal stays active (persisted) so the watchdog re-kicks it on recovery; no kick/tick budget
+                # is consumed while parked. TurnCancelled still ends the run via "interrupted" above.
+                already_waiting = bool((mgr.state is not None) and mgr.state.waiting_on_providers)
+                mgr.note_wait(scrub_text(session.last_error or "no provider answered")[:160])
+                self.emit_goal(session)
+                if not already_waiting:
+                    # One notice on the transition into the wait; recovery retries stay quiet until one
+                    # succeeds (a new blocker row per failed retry would pile up while providers are down).
+                    self.notify_blocker(
+                        session.session_id,
+                        "Goal waiting: no provider answered; it resumes automatically on recovery.",
+                        level="warning",
+                        kind="goal",
+                        key=f"k3.goal.waiting.{session.session_id}",
+                    )
+                return
             detail = scrub_text(session.last_error or "no provider answered")[:160]
             reason = "provider unavailable"
             text = f"Goal paused: no provider answered after the retries ({detail}). /goal resume to retry."
@@ -2227,7 +2264,13 @@ class GatewayServer:
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         session.fanout_evidence = None  # set below when this turn fans out
         reliability = await self._reliability_for(session)
-        reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
+        # A goal's turns are unattended work even on a foreground session: provider exhaustion parks
+        # instead of failing, and retry_forever parks forever instead of marking the goal failed.
+        goal_turn = self.goal_manager(session).is_active() or session.goal_continuation
+        reliability.set_unattended(session.background or goal_turn)
+        if self._retry_forever_on() and goal_turn:
+            reliability.retry_config.retry_forever = True
+            reliability.retry_config.max_wait = None  # forever ignores any bound (incl. --max-wait)
         await self.mcp.ensure_started()
         approval = await self._approval_callback_for(session)
 
@@ -3025,8 +3068,13 @@ class GatewayServer:
                 key=f"k3.goal.parked.{live.session_id}",
             )
             return False
-        mgr.record_kick(now)
-        logger.info("goal in session %s kicked (%s)", live.session_id, source)
+        if self._retry_forever_on() and goal.waiting_on_providers:
+            # Verify-until-done park: re-kicking a goal that is waiting on providers consumes no kick/tick
+            # budget, so recovery retries never trip the kick-storm guard and park the goal by mistake.
+            logger.info("goal in session %s re-kicked while waiting on providers (%s)", live.session_id, source)
+        else:
+            mgr.record_kick(now)
+            logger.info("goal in session %s kicked (%s)", live.session_id, source)
         live.turn_task = asyncio.get_running_loop().create_task(
             self._run_turn(live, mgr.kick_prompt() or goal.goal), name=f"kick-{live.session_id}"
         )

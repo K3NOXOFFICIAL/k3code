@@ -664,6 +664,13 @@ func (m *OS) settingsCategories() []settingsCategory {
 		}),
 	}
 
+	reliability := settingsCategory{
+		Name: "Reliability",
+		Items: m.resolveRows([]settingsRow{
+			opt("reliability.retry_forever"),
+		}),
+	}
+
 	// The two path options, screenshot.directory and screenshot.font_file, have
 	// no row here. See settingsUIExcluded for why.
 	screenshot := settingsCategory{
@@ -697,7 +704,7 @@ func (m *OS) settingsCategories() []settingsCategory {
 
 	cats := []settingsCategory{
 		appearance, backgrounds, sidebar, selection, dock, behavior,
-		notifications, startup, screenshot, screensaver, spotlight, advanced, daemon,
+		notifications, startup, screenshot, screensaver, spotlight, advanced, daemon, reliability,
 		m.hostsCategory(),
 	}
 	// The Agents tab goes with the agent features. See settings_agents.go.

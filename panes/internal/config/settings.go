@@ -415,6 +415,11 @@ type Settings struct {
 	// Set via appearance.nvim_navigation config.
 	NvimNavigation bool
 
+	// RetryForever keeps the agent retrying after failover until the goal
+	// verifies, instead of stopping at the attempt cap. Off by default.
+	// Set via reliability.retry_forever config.
+	RetryForever bool
+
 	// FocusFollowsMouse focuses the pane under the cursor as the mouse moves over
 	// it, without a click and without entering terminal mode. It is a divisive
 	// window-manager habit, so it defaults off and users opt in.
@@ -778,6 +783,7 @@ func DefaultSettings() Settings {
 		ScrollLines:                 3,
 		CopyOnSelect:                true,
 		NvimNavigation:              false,
+		RetryForever:                false,
 		FocusFollowsMouse:           false,
 		AltDrag:                     true,
 		ClickToType:                 ClickToTypeDouble,

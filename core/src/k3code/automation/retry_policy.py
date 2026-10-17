@@ -39,11 +39,23 @@ def classify_failure(error: str, exc: BaseException | None = None) -> tuple[str,
     return "other", None
 
 
-def plan_unreachable_retry(state: dict[str, Any] | None, now: float, natural_next: float) -> dict[str, Any] | None:
-    """Next ladder rung as ``{"attempt", "at"}``, or None (exhausted, or the natural occurrence comes first)."""
+def plan_unreachable_retry(
+    state: dict[str, Any] | None,
+    now: float,
+    natural_next: float,
+    *,
+    retry_forever: bool = False,
+) -> dict[str, Any] | None:
+    """Next ladder rung as ``{"attempt", "at"}``, or None (exhausted, or the natural occurrence comes first).
+
+    ``retry_forever`` replays the last rung (30 min) instead of exhausting, so a
+    scheduled run keeps retrying until the provider answers. Default False: unchanged.
+    """
     attempt = int((state or {}).get("attempt") or 0)
     if attempt >= len(RETRY_DELAYS_S):
-        return None
+        if not retry_forever:
+            return None
+        attempt = len(RETRY_DELAYS_S) - 1  # hold at the last rung forever
     at = now + RETRY_DELAYS_S[attempt]
     if natural_next <= at:
         return None

@@ -165,6 +165,10 @@ class GoalState:
     last_verdict: str | None = None  # done | blocked | continue | gate_failed
     last_reason: str | None = None
     paused_reason: str | None = None
+    #: Verify-until-done park: the last turn ended on a transient/infra error and the goal is waiting for
+    #: providers to recover (stays ``active`` so the watchdog re-kicks it; re-kicks consume no tick budget).
+    #: Cleared by the next judged turn, any pause, or a manual resume. Old rows load it as False.
+    waiting_on_providers: bool = False
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
     gates: list[GoalGate] = field(default_factory=list)
@@ -948,6 +952,7 @@ class GoalManager:
             self.clear()
             return None
         s.status, s.paused_reason = "paused", reason
+        s.waiting_on_providers = False  # a pause is a real stop: the watchdog only re-kicks active goals
         return self._save(s)
 
     def resume(self, *, reset_budget: bool = True) -> GoalState | None:
@@ -955,11 +960,27 @@ class GoalManager:
         if s is None or s.status == "cleared":
             return None
         s.status, s.paused_reason = "active", None
+        s.waiting_on_providers = False  # a manual resume restarts the wait from scratch
         s.consecutive_parse_failures = s.consecutive_transport_failures = 0
         if reset_budget:
             s.turns_used = 0
         for g in s.gates:
             g.attempts = 0
+        return self._save(s)
+
+    def note_wait(self, reason: str) -> GoalState | None:
+        """Verify-until-done park: record why the goal is waiting without pausing it.
+
+        The goal stays ``active`` (persisted) so boot resume and the watchdog re-kick it on recovery;
+        those re-kicks consume no kick/tick budget (see ``GatewayServer.kick_goal``). Never marks the
+        goal failed and never pauses it: only judge+check agreement ends the run.
+        """
+        s = self.state
+        if s is None or s.status != "active":
+            return s
+        s.last_reason = reason
+        s.paused_reason = None
+        s.waiting_on_providers = True
         return self._save(s)
 
     def clear(self) -> None:
@@ -1005,6 +1026,7 @@ class GoalManager:
         if s.implicit:
             return self._end_implicit(verdict, why)
         s.status, s.paused_reason = "paused", reason
+        s.waiting_on_providers = False
         self._save(s)
         return Decision("paused", False, None, verdict, why, message)
 
@@ -1022,17 +1044,22 @@ class GoalManager:
         cwd: str | None = None,
         reviewer: Reviewer | None = None,
         evidence: TurnEvidence | None = None,
+        retry_forever: bool = False,
     ) -> Decision:
         """Judge the finished turn; both user prompts and our continuations spend the turn budget.
 
         ``evidence``: the turn's ``turn_evidence``, so the judge weighs what the tools showed, not the claim. The
         goal's last check carries over (``GoalState.last_check``): a turn that runs none still shows an earlier one.
+        ``retry_forever`` ("don't stop until goal verified completed"): judge transport failures fail open
+        forever instead of pausing after ``MAX_CONSECUTIVE_TRANSPORT_FAILURES`` turns; the goal still ends
+        only on judge+check agreement, a ``blocked`` verdict, TurnCancelled, or an explicit /goal clear.
         """
         s = self.state
         if s is None or s.status != "active":
             return Decision(s.status if s else None, False, None, "inactive", "no active goal", "")
         s.turns_used += 1
         s.last_turn_at = time.time()
+        s.waiting_on_providers = False  # this turn reached the judge: providers answered, the park is over
         ev = evidence or TurnEvidence()
         if (carried := ev.carry(s.turns_used)) is not None:
             s.last_check = carried
@@ -1129,7 +1156,7 @@ class GoalManager:
             self._save(s)
             return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}", gate=gated)
 
-        if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+        if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES and not retry_forever:
             n = s.consecutive_transport_failures
             return self._pause_decision(
                 s,

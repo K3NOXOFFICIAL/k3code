@@ -19,6 +19,7 @@ const snap: SettingsSnapshot = {
   model: "a",
   modelKeys: ["a", "b"],
   mouse: true,
+  retryForever: false,
   outputStyle: "default",
   outputStyles: ["default", "concise"],
   permissionMode: "default",
@@ -119,6 +120,7 @@ describe("settings panel theme row", () => {
     indicator: "kaomoji",
     indicators: ["kaomoji"],
     mouse: true,
+    retryForever: false,
     showReasoning: false,
     statusBar: "top",
   };

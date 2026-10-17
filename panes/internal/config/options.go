@@ -1280,6 +1280,14 @@ var optionSpecs = []Option{
 		Description: "When you switch to a workspace with no panes, open a new pane there. It starts in the folder of the pane you came from",
 		Default:     "false",
 	},
+	// [reliability]. Read by the agent runtime, which fails over on error and
+	// then retries until the goal verifies. The Go side stores and surfaces
+	// the key; it does not act on it.
+	{
+		Path: "reliability.retry_forever", Type: OptionBool, Section: "reliability",
+		Description: "Don't stop until goal verified: on error fail over then retry forever",
+		Default:     "false",
+	},
 }
 
 // optionsByPath indexes the registry for lookup. Built once at init so a caller
