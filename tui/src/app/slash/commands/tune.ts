@@ -1,5 +1,9 @@
 import type { SlashExecResponse } from "../../../gatewayTypes.js";
-import { openSettingsPanel, openTunePicker } from "../../overlayStore.js";
+import {
+  openProviderPicker,
+  openSettingsPanel,
+  openTunePicker,
+} from "../../overlayStore.js";
 import type { SlashCommand, SlashRunCtx } from "../types.js";
 
 /**
@@ -8,6 +12,18 @@ import type { SlashCommand, SlashRunCtx } from "../types.js";
  */
 export function openTunePopup(ctx: SlashRunCtx): void {
   if (!openTunePicker()) {
+    ctx.transcript.sys(
+      "answer the open prompt first, then run the command again",
+    );
+  }
+}
+
+/**
+ * Bare `/provider` opens its own popup (the provider-block switcher, #421),
+ * not the /tune popup. Typed `/provider <name> [--save]` goes to the gateway.
+ */
+export function openProviderPopup(ctx: SlashRunCtx): void {
+  if (!openProviderPicker()) {
     ctx.transcript.sys(
       "answer the open prompt first, then run the command again",
     );
@@ -83,7 +99,7 @@ export const tuneCommands: SlashCommand[] = [
     run: (arg, ctx) =>
       arg.trim()
         ? runOnGateway("provider", arg.trim(), ctx)
-        : openTunePopup(ctx),
+        : openProviderPopup(ctx),
   },
 
   {

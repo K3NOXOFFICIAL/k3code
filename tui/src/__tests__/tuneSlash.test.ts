@@ -82,19 +82,32 @@ describe("/tune, /model and /effort", () => {
     patchUiState({ sid: "sid-abc" });
   });
 
-  it.each(["/tune", "/model", "/effort", "/provider", "/tune  ", "/model  "])(
+  it.each(["/tune", "/model", "/effort", "/tune  ", "/model  "])(
     "bare %j opens the one popup, and nothing else",
     (line) => {
       const ctx = buildCtx();
 
       expect(run(ctx, line)).toBe(true);
       expect(getOverlayState().tunePicker).toBe(true);
+      expect(getOverlayState().providerPicker).toBe(false);
       expect(getOverlayState().modelPicker).toBe(false);
       expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
       expect(ctx.gateway.rpc).not.toHaveBeenCalled();
       expect(ctx.transcript.sys).not.toHaveBeenCalled();
     },
   );
+
+  it("bare /provider opens its own popup, not the tune popup (#421)", () => {
+    const ctx = buildCtx();
+
+    expect(run(ctx, "/provider")).toBe(true);
+    expect(getOverlayState().providerPicker).toBe(true);
+    expect(getOverlayState().tunePicker).toBe(false);
+    expect(getOverlayState().modelPicker).toBe(false);
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled();
+    expect(ctx.transcript.sys).not.toHaveBeenCalled();
+  });
 
   it("opens without a session too (the popup greys effort and ultracode itself)", () => {
     resetUiState();
@@ -138,7 +151,7 @@ describe("/tune, /model and /effort", () => {
     );
   });
 
-  it("/provider with args goes to the gateway; bare opens the tune popup (#415)", async () => {
+  it("/provider with args goes to the gateway; bare opens its own popup (#421)", async () => {
     expect(findSlashCommand("provider")?.usage).toBe(
       "/provider [<name> [--save]]",
     );
@@ -148,7 +161,8 @@ describe("/tune, /model and /effort", () => {
 
     run(ctx, "/provider");
 
-    expect(getOverlayState().tunePicker).toBe(true);
+    expect(getOverlayState().providerPicker).toBe(true);
+    expect(getOverlayState().tunePicker).toBe(false);
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
     resetOverlayState();
 
@@ -280,11 +294,11 @@ describe("/tune, /model and /effort", () => {
 
   describe("while a prompt is open", () => {
     it.each(LOCKS)(
-      "bare /tune, /model, /effort and /provider refuse to open over a %s prompt",
+      "bare /tune, /model and /effort refuse to open over a %s prompt",
       (_name, overlay) => {
         patchOverlayState(overlay as never);
 
-        for (const line of ["/tune", "/model", "/effort", "/provider"]) {
+        for (const line of ["/tune", "/model", "/effort"]) {
           const ctx = buildCtx();
 
           expect(run(ctx, line)).toBe(true);
@@ -299,6 +313,21 @@ describe("/tune, /model and /effort", () => {
         expect(getOverlayState().settingsPanel).toBe(false);
         expect(pctx.transcript.sys).toHaveBeenCalledWith(
           expect.stringContaining("finish the pending prompt"),
+        );
+      },
+    );
+
+    it.each(LOCKS)(
+      "bare /provider refuses to open over a %s prompt",
+      (_name, overlay) => {
+        patchOverlayState(overlay as never);
+        const ctx = buildCtx();
+
+        expect(run(ctx, "/provider")).toBe(true);
+        expect(getOverlayState().providerPicker).toBe(false);
+        expect(getOverlayState().tunePicker).toBe(false);
+        expect(ctx.transcript.sys).toHaveBeenCalledWith(
+          expect.stringContaining("answer the open prompt first"),
         );
       },
     );

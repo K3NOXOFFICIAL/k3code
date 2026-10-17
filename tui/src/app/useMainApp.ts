@@ -1478,6 +1478,13 @@ export function useMainApp(gw: GatewayClient) {
     slashRef.current(`/model ${value}`);
   }, []);
 
+  // /provider popup: Enter switches the session to the picked block; with
+  // `--save` it is also written as default_provider for new sessions.
+  const onProviderSelect = useCallback((slug: string, saveDefault: boolean) => {
+    patchOverlayState({ providerPicker: false });
+    slashRef.current(`/provider ${slug}${saveDefault ? " --save" : ""}`);
+  }, []);
+
   // /tune popup: Enter / `s`. One tune.set carries the model, effort and ultracode changes; the gateway answers with
   // what changed and pushes a session.info, which updates the status line.
   const onTuneApply = useCallback(
@@ -1637,6 +1644,7 @@ export function useMainApp(gw: GatewayClient) {
         session.newLiveSession(undefined, undefined, dropSid),
       newPromptSession,
       onModelSelect,
+      onProviderSelect,
       onSettingsApply,
       onTuneApply,
       // Resuming a cold session from the overlay CLOSES the current one, so it
@@ -1662,6 +1670,7 @@ export function useMainApp(gw: GatewayClient) {
       closeLiveSession,
       newPromptSession,
       onModelSelect,
+      onProviderSelect,
       onSettingsApply,
       onTuneApply,
       session,

@@ -15,6 +15,7 @@ const buildOverlayState = (): OverlayState => ({
   widget: null,
   modelPicker: false,
   pager: null,
+  providerPicker: false,
   secret: null,
   sessions: false,
   sudo: null,
@@ -34,6 +35,7 @@ export const $isBlocked = computed(
     confirm,
     modelPicker,
     pager,
+    providerPicker,
     secret,
     sessions,
     settingsPanel,
@@ -49,6 +51,7 @@ export const $isBlocked = computed(
       confirm ||
       modelPicker ||
       pager ||
+      providerPicker ||
       secret ||
       sessions ||
       settingsPanel ||
@@ -73,8 +76,8 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `pager`,
- *   `sessions` — but ONLY when the rule sits at
+ * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `providerPicker`,
+ *   `pager`, `sessions` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
  *   over the `at="top"` rule and never reaches the `at="bottom"` one.
@@ -113,6 +116,7 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
   Boolean(
     overlay.modelPicker ||
     overlay.pager ||
+    overlay.providerPicker ||
     overlay.sessions ||
     overlay.settingsPanel ||
     overlay.tunePicker,
@@ -120,8 +124,8 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
 
 /**
  * A question to the user is open (approval, clarify, sudo/secret password,
- * confirm): it owns the keyboard. The /tune popup neither opens over one nor
- * reads a key while one is up.
+ * confirm): it owns the keyboard. The /tune and /provider popups neither open
+ * over one nor read a key while one is up.
  */
 export const tuneLocked = (
   overlay: Pick<
@@ -181,6 +185,17 @@ export const openTunePicker = (): boolean => {
   return true;
 };
 
+/** Open the /provider popup; false (nothing opened) while a prompt is waiting for an answer. */
+export const openProviderPicker = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ providerPicker: true });
+
+  return true;
+};
+
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
  * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, agent view, model
@@ -199,6 +214,7 @@ export const resetFlowOverlays = () =>
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
     modelPicker: $overlayState.get().modelPicker,
+    providerPicker: $overlayState.get().providerPicker,
     sessions: $overlayState.get().sessions,
     settingsPanel: $overlayState.get().settingsPanel,
     tunePicker: $overlayState.get().tunePicker,

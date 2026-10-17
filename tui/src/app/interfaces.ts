@@ -146,6 +146,8 @@ export interface OverlayState {
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
   settingsPanel: boolean;
+  /** /provider popup: provider-block switcher (bare /provider). */
+  providerPicker: boolean;
   tunePicker: boolean;
 }
 
@@ -441,6 +443,8 @@ export interface AppLayoutActions {
   newLiveSession: (msg?: string, title?: string, dropSid?: string) => void;
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
+  /** The /provider popup's Enter: closes it and switches the session's provider. */
+  onProviderSelect: (slug: string, saveDefault: boolean) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
   onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
@@ -512,6 +516,7 @@ export interface AppOverlaysProps {
   onModelSelect: (value: string) => void;
   onNewLiveSession: () => void;
   onNewPromptSession: (prompt: string, modelArg?: string) => void;
+  onProviderSelect: (slug: string, saveDefault: boolean) => void;
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;
