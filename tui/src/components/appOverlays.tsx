@@ -288,6 +288,7 @@ export function FloatingOverlays({
               indicator: ui.indicatorStyle,
               indicators: [...INDICATOR_STYLES],
               mouse: ui.mouseTracking !== "off",
+              retryForever: false,
               showReasoning: ui.showReasoning,
               statusBar: ui.statusBar,
             }}

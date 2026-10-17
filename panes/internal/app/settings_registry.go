@@ -92,6 +92,7 @@ var settingLabels = map[string]string{
 	"daemon.log_level":                    "Log level",
 	"daemon.window_size":                  "Session size",
 	"tape.auto_review":                    "Auto-open review",
+	"reliability.retry_forever":           "Retry forever",
 	"hints.builtins":                      "Hint patterns",
 	"hints.alphabet":                      "Hint letters",
 	"panes.label_keys":                    "Pane label keys",

@@ -35,6 +35,7 @@ export interface SettingsSnapshot {
   model: string;
   modelKeys: string[];
   mouse: boolean;
+  retryForever: boolean;
   outputStyle: string;
   outputStyles: string[];
   permissionMode: string;
@@ -185,6 +186,16 @@ export function buildSettingsItems(s: SettingsSnapshot): SettingItem[] {
       ONOFF,
       (v) => `/mouse ${v}`,
       "Mouse wheel + click tracking",
+      "bool",
+    ),
+    item(
+      "Reliability",
+      "retry_forever",
+      "Retry forever",
+      onoff(s.retryForever),
+      ONOFF,
+      (v) => `/config set reliability.retry_forever ${v}`,
+      "Don't stop until goal verified: on error fail over then retry forever",
       "bool",
     ),
   ];
@@ -431,6 +442,7 @@ export function settingsSnapshot(
     | "indicator"
     | "indicators"
     | "mouse"
+    | "retryForever"
     | "showReasoning"
     | "statusBar"
   > & {
@@ -447,6 +459,7 @@ export function settingsSnapshot(
 
   return {
     ...local,
+    retryForever: !!local.retryForever,
     effort: str(v.effort, local.effort ?? "default"),
     model: str(v.model_key),
     modelKeys: strs(v.model_keys),

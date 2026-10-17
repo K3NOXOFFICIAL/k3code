@@ -50,6 +50,10 @@ class AutomationEngine:
         cfg = server.config.automation
         self.governor = Governor(GovernorConfig(max_total=max(1, cfg.max_concurrent), home=home))
         self.loops = LoopManager(self.db, self.runner, self.clock, wait_online=self._online, on_change=self.changed)
+        def _jobs_retry_forever(srv=self.server) -> bool:
+            fn = getattr(srv, "_retry_forever_on", None)
+            return bool(fn()) if callable(fn) else False
+
         self.jobs = JobScheduler(
             self.db,
             self.runner,
@@ -58,6 +62,7 @@ class AutomationEngine:
             slot=lambda: self.governor.slot("llm"),
             on_change=self.changed,
             grace_s=cfg.grace_hours * 3600,
+            retry_forever=_jobs_retry_forever,
         )
         self.automations = AutomationManager(
             self.db,

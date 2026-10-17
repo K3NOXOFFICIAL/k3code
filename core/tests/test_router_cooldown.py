@@ -490,3 +490,70 @@ def test_accounts_survive_a_restart_separately(tmp_path):
     reborn = CooldownStore(path=path)
     assert reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="aaa")
     assert not reborn.in_cooldown(provider="relay", model="m", base_url="http://shared", account="bbb")
+def err500() -> ProviderError:
+    return ProviderError(message="internal server error", status_code=500, body={"error": {"message": "boom"}})
+
+
+async def test_failover_skips_cooling_entries():
+    """Next-best failover: a cooling entry is skipped even when it is next in chain order."""
+    a = Scripted("a", [err500()])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, events = make([a, b, c], max_retries=0)
+    store.arm(
+        FailoverReason.rate_limit,
+        provider="b",
+        model="m",
+        base_url="http://b",
+        account=key_fingerprint("key-b"),
+        retry_after=600,
+    )
+    assert (await router.complete(MSGS, [])).content == "from c"
+    assert b.calls == 0  # cooling entry never tried
+    failovers = [e for e in events if e.kind == "router.failover"]
+    assert len(failovers) == 1 and failovers[0].reason == "server"
+
+
+async def test_failover_prefers_healthy_entry():
+    """Failover prefers the entry with the fewest consecutive failures over chain order."""
+    a = Scripted("a", [err500()])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, _ = make([a, b, c], max_retries=0)
+    # b flaked twice before (kept working afterwards: no cooldown), c is pristine.
+    store.record_failure(provider="b", model="m", base_url="http://b", account=key_fingerprint("key-b"))
+    store.record_failure(provider="b", model="m", base_url="http://b", account=key_fingerprint("key-b"))
+    assert (await router.complete(MSGS, [])).content == "from c"
+    assert b.calls == 0 and c.calls == 1
+
+
+async def test_quota_triggers_cooldown_and_failover():
+    """Quota (no Retry-After): no same-entry retry, 1h cooldown armed, immediate failover with reason."""
+    a = Scripted("a", [err429(None, QUOTA_BODY)])
+    b = Scripted("b", ["from b"])
+    router, store, sleeps, events = make([a, b])
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert a.calls == 1 and sleeps == []  # immediate failover, nothing slept inline
+    assert store.reason_of(provider="a", model="m", base_url="http://a", account=ACCOUNT_A) is FailoverReason.quota
+    failovers = [e for e in events if e.kind == "router.failover"]
+    assert len(failovers) == 1 and failovers[0].reason == "quota"
+
+
+async def test_last_good_entry_is_preferred_failover_target():
+    """After recovery the chain prefers the last working entry as the failover target."""
+    a = Scripted("a", [err500(), "a recovered"])
+    b = Scripted("b", ["from b"])
+    c = Scripted("c", ["from c"])
+    router, store, _, _ = make([a, b, c], max_retries=0)
+    assert (await router.complete(MSGS, [])).content == "from b"  # a fails over to b; b is last-good
+    # a still fails (stale script head) but b — the last entry that answered — is tried before pristine c.
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert c.calls == 0
+async def test_quota_with_short_retry_after_sleeps_inline():
+    """Quota declaring a reset within max_inline_wait: same-entry retry after an inline sleep, no cooldown."""
+    body = {"error": {"message": "usage limit exceeded", "type": "usage_limit_exceeded"}}
+    a = Scripted("a", [err429(5, body), "ok after wait"])
+    router, store, sleeps, _ = make([a, Scripted("b", ["from b"])], max_retries=1)
+    assert (await router.complete(MSGS, [])).content == "ok after wait"
+    assert sleeps == [5.0]
+    assert not store.in_cooldown(provider="a", model="m", base_url="http://a", account=ACCOUNT_A)

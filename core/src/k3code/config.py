@@ -185,9 +185,11 @@ class Settings(BaseModel):
     permission_mode: str = "ask"  # ask | auto-edit | plan | auto | yolo
     headless_permission: str | None = None  # overrides permission_mode in -p mode
     # M2 reliability layer; keys mirror reliability.ReliabilitySettings, e.g.
-    #   reliability: {enabled: true, max_wait: 3600,
+    #   reliability: {enabled: true, max_wait: 3600, retry_forever: false,
     #                 flags: {netwatch: true, journal: true, ...},
     #                 session_tokens: 2000000, session_usd: 5.0}
+    # retry_forever: never abort on transient/infra errors; park with capped
+    # backoff and retry forever (forces max_wait=None).
     reliability: dict[str, Any] = Field(default_factory=dict)
     # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex]}
     permissions: dict[str, Any] = Field(default_factory=dict)

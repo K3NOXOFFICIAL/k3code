@@ -131,6 +131,14 @@ class CooldownStore:
     auth_strikes: dict[_Key, int] = field(default_factory=dict)
     #: consecutive breaker arms per entry (the breaker ladder's step), reset by ``record_success``
     breaker_strikes: dict[_Key, int] = field(default_factory=dict)
+    #: consecutive per-entry failures (any reason), reset by ``record_success``: failover prefers the
+    #: healthiest entry (fewest consecutive failures)
+    consecutive_failures: dict[_Key, int] = field(default_factory=dict)
+    #: wall-clock epoch of each entry's most recent success; failover breaks failure-count ties with it,
+    #: and the walk prefers the last-known-good entry after recovery
+    last_success: dict[_Key, float] = field(default_factory=dict)
+    #: key of the last entry that answered (set by ``record_success``): preferred after recovery
+    last_good: _Key | None = None
 
     def __post_init__(self) -> None:
         if self.path is not None:
@@ -313,9 +321,28 @@ class CooldownStore:
 
     def record_success(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> None:
         """The entry answered: its next rate limit starts the ladder from the bottom again."""
-        self.strikes.pop(_identity(provider, model, base_url, account), None)
-        self.auth_strikes.pop(_identity(provider, model, base_url, account), None)
-        self.breaker_strikes.pop(_identity(provider, model, base_url, account), None)
+        key = _identity(provider, model, base_url, account)
+        self.strikes.pop(key, None)
+        self.auth_strikes.pop(key, None)
+        self.breaker_strikes.pop(key, None)
+        self.consecutive_failures.pop(key, None)
+        self.last_success[key] = self.wall()
+        self.last_good = key
+
+    def record_failure(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> int:
+        """Count one failed call for an entry; returns its consecutive-failure count."""
+        key = _identity(provider, model, base_url, account)
+        count = self.consecutive_failures.get(key, 0) + 1
+        self.consecutive_failures[key] = count
+        return count
+
+    def failure_count(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> int:
+        """Consecutive failures of an entry since its last success (0 when never failed)."""
+        return self.consecutive_failures.get(_identity(provider, model, base_url, account), 0)
+
+    def last_success_at(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> float | None:
+        """Wall-clock epoch of the entry's most recent success, or None when it never answered."""
+        return self.last_success.get(_identity(provider, model, base_url, account))
 
     def tripped(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> bool:
         """Whether the entry's breaker opened before and the entry has not answered since: the call after a window

@@ -35,6 +35,7 @@ class JobScheduler:
         on_change: Callable[[], None] | None = None,
         on_fire: Callable[[dict[str, Any], RunResult], None] | None = None,
         grace_s: float = DEFAULT_GRACE_S,
+        retry_forever: bool | Callable[[], bool] = False,
     ) -> None:
         self.db = db
         self.runner = runner
@@ -44,9 +45,18 @@ class JobScheduler:
         self.on_change = on_change or (lambda: None)
         self.on_fire = on_fire
         self.grace_s = grace_s
+        self._retry_forever = retry_forever
         self._wake = asyncio.Event()
         self._running: dict[str, asyncio.Task[None]] = {}
         self._main: asyncio.Task[None] | None = None
+
+    def _retry_forever_on(self) -> bool:
+        """Verify-until-done mode: resolve the retry_forever flag (bool or callable)."""
+        try:
+            rf = self._retry_forever
+            return bool(rf() if callable(rf) else rf)
+        except Exception:  # noqa: BLE001 - flag must never break scheduling
+            return False
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -246,11 +256,18 @@ class JobScheduler:
         else:
             nxt = natural
         if result.status == "failed" and result.failure_kind == "unreachable" and result.api_calls == 0:
-            plan = plan_unreachable_retry(job["retry"], now, natural)
+            plan = plan_unreachable_retry(job["retry"], now, natural, retry_forever=self._retry_forever_on())
             if plan is not None:
                 fields["retry"] = plan
                 nxt, status, quiet = plan["at"], "retrying", True
-                note = f"network unreachable (0 API calls): retry {plan['attempt']}/3 in {int(plan['at'] - now)}s"
+                if self._retry_forever_on():
+                    wait_s = int(plan["at"] - now)
+                    note = (
+                        f"network unreachable (0 API calls): retry {plan['attempt']} "
+                        f"in {wait_s}s (retry-forever)"
+                    )
+                else:
+                    note = f"network unreachable (0 API calls): retry {plan['attempt']}/3 in {int(plan['at'] - now)}s"
             else:
                 fields["retry"] = None
                 note = "network unreachable; retry ladder exhausted, waiting for the next occurrence"

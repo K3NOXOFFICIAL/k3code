@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
 #: ChainExhausted reasons that are transient: an unattended run parks on them instead of failing its turn.
 UNATTENDED_PARK_REASONS = frozenset({"server", "timeout", "network", "unknown"})
+#: Retry-forever mode parks on ChainExhausted with these reasons (transient/infra +
+#: rate_limit/quota from the SESSION GOAL list). Auth gets its own long-backoff branch.
+FOREVER_PARK_REASONS = frozenset({"server", "timeout", "network", "unknown", "rate_limit", "quota"})
+#: Auth ladder in retry-forever mode: existing auth cooldown doubling reused (5 min base,
+#: doubling per strike to the 1 h cap in CooldownStore), then hold at the cap forever.
+FOREVER_AUTH_BASE = 300.0
+FOREVER_AUTH_CAP = 3600.0
 #: ChainExhausted reasons that waiting cannot fix: a rejected key, an unknown model, a certificate that does not
 #: verify (set SSL_CERT_FILE or fix the proxy; connectivity coming back changes nothing).
 PERMANENT_REASONS = frozenset({"auth", "bad_request", "ssl_cert"})
@@ -92,6 +99,9 @@ class RetryConfig:
     poll_interval: float = 0.5
     #: Unattended runs only: parks on a transient exhaustion (server, timeout, network, unknown) before giving up.
     max_unattended_parks: int = 6
+    #: Retry-forever mode ("don't stop until goal verified completed"): force max_wait=None,
+    #: unlimited unattended parks, and park (never raise) on transient failures.
+    retry_forever: bool = False
 
 
 class _RetryAfterObserver:
@@ -171,6 +181,8 @@ class PersistentRetry:
         self._park_step = 0
         self._unattended_parks = 0
         self._last_retry_after = None
+        if self.config.retry_forever:
+            self.config.max_wait = None  # forever ignores any bound (incl. --max-wait)
         deadline = None if self.config.max_wait is None else self._monotonic() + self.config.max_wait
         while True:
             self._raise_if_cancelled()
@@ -179,6 +191,7 @@ class PersistentRetry:
                     messages, tools, model=model, max_tokens=max_tokens, temperature=temperature
                 ):
                     yield event
+                self._forever_auth_strikes = 0  # a turn answered: auth ladder restarts
                 return
             except AllProvidersUnreachable as e:
                 try:
@@ -213,6 +226,8 @@ class PersistentRetry:
         return True
 
     async def _handle_exhausted(self, exc: ChainExhausted, deadline: float | None) -> bool:
+        if self.config.retry_forever:
+            return await self._handle_exhausted_forever(exc, deadline)
         if exc.last_reason in PERMANENT_REASONS:
             # A rejected key or an unknown model does not fix itself: the cooldown the router armed would only
             # make the user wait for the same error. Fail now with the reason.
@@ -241,6 +256,38 @@ class PersistentRetry:
             await self._park(f"providers unavailable ({exc.last_reason}); unattended run waits", deadline)
             return True
         return False  # auth, bad_request, ... : not transient, let it propagate
+
+    async def _handle_exhausted_forever(self, exc: ChainExhausted, deadline: float | None) -> bool:
+        """Retry-forever branch: park (never raise) on transient/rate-limit/auth exhaustion."""
+        if exc.retry_after is not None:  # every entry cooling down: park until the earliest reset
+            cooldowns = getattr(self.router, "cooldowns", None)
+            network_only = cooldowns is not None and cooldowns.only_network_cooling()
+            await self._park(str(exc), None, delay=exc.retry_after, until=exc.until, wake_on_recovery=network_only)
+            return True
+        if exc.last_reason == "auth":
+            # Reuse the existing auth-cooldown doubling (5 min base → 1 h cap), then hold at the cap
+            # forever instead of failing the turn.
+            strikes = getattr(self, "_forever_auth_strikes", 0)
+            delay = min(FOREVER_AUTH_BASE * (2.0 ** min(strikes, 16)), FOREVER_AUTH_CAP)
+            self._forever_auth_strikes = strikes + 1
+            await self._park(f"auth failure; retry-forever waits {delay:.0f}s for a new key", None, delay=delay)
+            return True
+        if exc.last_reason in FOREVER_PARK_REASONS:
+            retry_after = self._last_retry_after
+            detail = (
+                f"{exc.last_reason} (retry-after {retry_after:.0f}s)"
+                if retry_after is not None
+                else f"{exc.last_reason}; retry-forever waits"
+            )
+            await self._park(detail, None, delay=retry_after)
+            return True
+        if exc.last_reason in UNATTENDED_PARK_REASONS:
+            # Unattended-gated reasons outside FOREVER_PARK_REASONS (none today; future-proof):
+            # unlimited parks in forever mode.
+            self._unattended_parks += 1
+            await self._park(f"providers unavailable ({exc.last_reason}); retry-forever waits", None)
+            return True
+        return False  # bad_request, ssl_cert, ... : not transient, let it propagate
 
     # ── waits ──
 

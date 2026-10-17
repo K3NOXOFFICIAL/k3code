@@ -207,7 +207,12 @@ async def _run_headless(
     reliability = _build_reliability(config, session=session)
     reliability.register_providers(chain)
     # the retry wrapper is built from retry_config when AgentLoop attaches the router: bound the wait before that
-    reliability.retry_config.max_wait = _headless_max_wait(max_wait, config)
+    raw_rel = getattr(config, "reliability", None) or {}
+    if raw_rel.get("retry_forever"):
+        reliability.retry_config.retry_forever = True
+        reliability.retry_config.max_wait = None  # forever ignores --max-wait
+    else:
+        reliability.retry_config.max_wait = _headless_max_wait(max_wait, config)
     gave_up: dict[str, Any] = {}
     reliability.events.add(lambda ev: gave_up.update(ev.data) if ev.kind == GAVE_UP else None)
 
