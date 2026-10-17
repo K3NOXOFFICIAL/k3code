@@ -106,6 +106,8 @@ export interface ConfigDisplayConfig {
    * nothing — just advertises the command.  Default true.
    */
   tui_agents_nudge?: boolean;
+  /** Open the full-screen agent view on launch (/settings "Start in agent view"). */
+  tui_start_agents_view?: boolean;
   tui_auto_resume_recent?: boolean;
   tui_compact?: boolean;
   /** Legacy alias for display.mouse_tracking. */

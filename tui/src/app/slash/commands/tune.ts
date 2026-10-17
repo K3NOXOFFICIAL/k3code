@@ -1,5 +1,6 @@
 import type { SlashExecResponse } from "../../../gatewayTypes.js";
 import {
+  openPermissionsPicker,
   openProviderPicker,
   openSettingsPanel,
   openTunePicker,
@@ -24,6 +25,18 @@ export function openTunePopup(ctx: SlashRunCtx): void {
  */
 export function openProviderPopup(ctx: SlashRunCtx): void {
   if (!openProviderPicker()) {
+    ctx.transcript.sys(
+      "answer the open prompt first, then run the command again",
+    );
+  }
+}
+
+/**
+ * Bare `/permissions` opens the permissions popup (mode + effective rules),
+ * not the settings panel. Typed `/permissions ...` goes to the gateway.
+ */
+export function openPermissionsPopup(ctx: SlashRunCtx): void {
+  if (!openPermissionsPicker()) {
     ctx.transcript.sys(
       "answer the open prompt first, then run the command again",
     );
@@ -103,14 +116,17 @@ export const tuneCommands: SlashCommand[] = [
   },
 
   {
-    help: "permissions (popup, or /permissions ... passthrough to gateway)",
+    help: "permissions (mode + rules popup, or /permissions ... passthrough to gateway)",
     name: "permissions",
     usage: "/permissions [...]",
     run: (arg, ctx) => {
       if (arg.trim()) {
         return runOnGateway("permissions", arg.trim(), ctx);
       }
-      return runOnGateway("permissions", "", ctx);
+
+      if (!openPermissionsPicker()) {
+        ctx.transcript.sys("finish the pending prompt first");
+      }
     },
   },
 ];

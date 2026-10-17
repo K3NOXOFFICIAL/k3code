@@ -897,11 +897,23 @@ export function createGatewayEventHandler(
     // users aren't surprised.  (Shares the memoized full-config read.)
     getFullConfigOnce()
       .then((cfg) => {
-        // `k3code agents` wins over auto-resume: resuming closes the agent view it just opened.
+        // `k3code agents` and the "Start in agent view" setting win over
+        // auto-resume: resuming closes the agent view it just opened.
+        const startInAgentsView =
+          !!cfg?.config?.display?.tui_start_agents_view &&
+          STARTUP_VIEW !== "agents";
+
         if (
           !cfg?.config?.display?.tui_auto_resume_recent ||
-          STARTUP_VIEW === "agents"
+          STARTUP_VIEW === "agents" ||
+          startInAgentsView
         ) {
+          // The setting mirrors `k3code agents`, whose env read opened the
+          // view earlier (before the resume branch, without the config).
+          if (startInAgentsView) {
+            patchOverlayState({ agentView: true });
+          }
+
           patchUiState({ status: "forging session…" });
           newSession();
           scheduleStartupPrompt();

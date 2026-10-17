@@ -25,6 +25,7 @@ async def test_indicator_set_get_and_saved(tmp_path, monkeypatch):
         ("battery", "on", "battery", True, "on"),
         ("mouse", False, "mouse_tracking", False, "off"),
         ("density", "off", "tui_compact", False, "off"),
+        ("agents_view", "on", "tui_start_agents_view", True, "on"),
         ("statusbar", "top", "tui_statusbar", "top", "top"),
         ("theme", "dark", "tui_theme", "dark", "dark"),
         ("pet", "off", "pet", "off", "off"),

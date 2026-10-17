@@ -27,6 +27,7 @@ import { turnController } from "../app/turnController.js";
 import { patchTurnState, resetTurnState } from "../app/turnStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import { useInputHandlers } from "../app/useInputHandlers.js";
+import { startPromptLiveSession } from "../app/useMainApp.js";
 import { useSessionLifecycle } from "../app/useSessionLifecycle.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
@@ -615,11 +616,18 @@ describe("AppLayout agent view: leaving the startup session", () => {
   });
 
   // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
+  // Typing "test session" and pressing Enter now starts the session from the
+  // view's own composer (the view stays open) and leaves the empty startup
+  // session behind for the gateway to drop if it is disposable.
   it.each([
-    ["n", "newLiveSession", ["test session", undefined, "s1"]],
+    [
+      "n",
+      "newPromptSession",
+      ["test session", undefined, { dropSid: "s1", keepAgentView: true }],
+    ],
     ["\r", "activateLiveSession", ["s2", "s1"]],
   ] as const)(
-    "%j closes the empty session forged after the view opened",
+    "%j leaves the empty session forged after the view opened",
     async (key, method, args) => {
       const spy = vi.fn();
       const layout = mountLayout(
@@ -652,15 +660,19 @@ describe("AppLayout agent view: leaving the startup session", () => {
 
       layout.press(key);
 
-      // For "n", we need to type the session name and press Enter
+      // For "n": it focuses the composer; type the session name and press Enter.
       if (key === "n") {
-        await waitFor(() => expect(layout.output()).toContain("new session:"));
+        await waitFor(() =>
+          expect(layout.output()).toContain("start a new session"),
+        );
+        // let React (re)subscribe the focused TextInput before typing
+        await new Promise((r) => setTimeout(r, 30));
         for (const ch of "test session") {
           layout.press(ch);
           await new Promise((r) => setTimeout(r, 10));
         }
-        layout.press("\n");
-        await new Promise((r) => setTimeout(r, 500));
+            layout.press("\n");
+        await new Promise((r) => setTimeout(r, 200));
       }
 
       await waitFor(() => expect(spy).toHaveBeenCalled());
@@ -762,6 +774,24 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
             activateLiveSession: session.activateLiveSession,
             newLiveSession: (msg?: string, title?: string, dropSid?: string) =>
               void session.newLiveSession(msg, title, dropSid),
+            newPromptSession: (
+              prompt: string,
+              modelArg?: string,
+              opts?: { dropSid?: string; keepAgentView?: boolean },
+            ) =>
+              void startPromptLiveSession({
+                // the storyboard-level prompt dispatch is out of scope here
+                dispatchSubmission: () => {},
+                dropSid: opts?.dropSid,
+                keepAgentView: opts?.keepAgentView,
+                maybeWarn: () => {},
+                modelArg,
+                newLiveSession: (msg?: string, title?: string, sid?: string) =>
+                  session.newLiveSession(msg, title, sid),
+                prompt,
+                rpc: gateway.rpc,
+                sys: () => {},
+              }),
             resumeById: (id: string, dropSid?: string) =>
               void session.resumeById(id, { dropSid }),
           }}
@@ -803,7 +833,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
-    await waitFor(() => expect(layout.output()).toContain("new session:"));
+    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    // let React (re)subscribe the focused TextInput before typing
+    await new Promise((r) => setTimeout(r, 60));
     for (const ch of "test session") {
       layout.press(ch);
       await new Promise((r) => setTimeout(r, 10));
@@ -866,7 +898,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
-    await waitFor(() => expect(layout.output()).toContain("new session:"));
+    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    // let React (re)subscribe the focused TextInput before typing
+    await new Promise((r) => setTimeout(r, 60));
     for (const ch of "test session") {
       layout.press(ch);
       await new Promise((r) => setTimeout(r, 10));

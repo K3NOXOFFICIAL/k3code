@@ -18,6 +18,7 @@ import { ModelPicker } from "./modelPicker.js";
 import { OverlayHint } from "./overlayControls.js";
 import { listRowStyle } from "./overlayPrimitives.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
+import { PermissionsPicker } from "./permissionsPicker.js";
 import { ProviderPicker } from "./providerPicker.js";
 import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
@@ -176,6 +177,7 @@ export function FloatingOverlays({
   onModelSelect,
   onNewLiveSession,
   onNewPromptSession,
+  onPermissionsApply,
   onProviderSelect,
   onResumeSelect,
   onSettingsApply,
@@ -191,6 +193,7 @@ export function FloatingOverlays({
   | "onModelSelect"
   | "onNewLiveSession"
   | "onNewPromptSession"
+  | "onPermissionsApply"
   | "onProviderSelect"
   | "onResumeSelect"
   | "onSettingsApply"
@@ -282,6 +285,7 @@ export function FloatingOverlays({
           <SettingsPanel
             gw={gw}
             local={{
+              agentsView: ui.agentsView,
               busy: ui.busyInputMode,
               compact: ui.compact,
               details: ui.detailsMode,
@@ -312,6 +316,24 @@ export function FloatingOverlays({
             maxWidth={width}
             onApply={onTuneApply}
             onCancel={() => patchOverlayState({ tunePicker: false })}
+            sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
+  if (overlay.permissionsPicker) {
+    widgets.push({
+      id: "permissions-picker",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <PermissionsPicker
+            gw={gw}
+            maxWidth={width}
+            onApply={onPermissionsApply}
+            onCancel={() => patchOverlayState({ permissionsPicker: false })}
             sessionId={sid}
             t={theme}
           />

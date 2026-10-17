@@ -16,6 +16,8 @@ export const providerDisplayNames = (
 
 export interface ProviderPickerEntry {
   authenticated?: boolean | null;
+  auth_type?: string | null;
+  key_env?: string | null;
   is_current?: boolean | null;
   isCurrent?: boolean | null;
   models?: string[];
@@ -37,10 +39,45 @@ export function providerPickerRows(
 ): ProviderPickerRow[] {
   const names = providerDisplayNames(providers);
 
-  return providers.map((entry, i) => ({
-    displayName: names[i] ?? entry.name ?? entry.slug,
-    entry,
-  }));
+  return [
+    ...providers.map((entry, i) => ({
+      displayName: names[i] ?? entry.name ?? entry.slug,
+      entry,
+    })),
+    { displayName: ADD_PROVIDER_ROW.name, entry: ADD_PROVIDER_ROW },
+  ];
+}
+
+/**
+ * Trailing "+ Add new provider" row: picking it prints the chain-add usage
+ * (chain_config.apply_edit's `add` grammar) instead of switching providers.
+ * The slug is magic -- never a real provider block name.
+ */
+export const ADD_PROVIDER_SLUG = "__add_provider__";
+
+export const ADD_PROVIDER_ROW: ProviderPickerEntry = {
+  name: "+ Add new provider...",
+  slug: ADD_PROVIDER_SLUG,
+};
+
+/** Chain-add template printed when the trailing row is picked. */
+export const ADD_PROVIDER_USAGE =
+  "/model chain add <provider> <model> [kind=openai|anthropic base_url=... key_env=...]";
+
+export function isAddProviderRow(entry: ProviderPickerEntry): boolean {
+  return entry.slug === ADD_PROVIDER_SLUG;
+}
+
+/**
+ * An unauthenticated `api_key` row whose key can be pasted inline
+ * (`model.save_key`) -- mirrors modelPicker's pickerNeedsKey.
+ */
+export function pickerNeedsKey(entry: ProviderPickerEntry | undefined): boolean {
+  return (
+    entry?.authenticated === false &&
+    entry.auth_type === "api_key" &&
+    !!entry.key_env
+  );
 }
 
 /** Cursor start: the active provider, else the first row. */
@@ -59,6 +96,10 @@ export function providerPickerCommand(slug: string, saveDefault: boolean): strin
 
 /** One provider row: `*` current, `○` needs setup, else `●`, plus model count. */
 export function providerRowLabel(row: ProviderPickerRow): string {
+  if (isAddProviderRow(row.entry)) {
+    return row.displayName;
+  }
+
   const p = row.entry;
   const current = p.is_current ?? p.isCurrent;
   const mark = p.authenticated === false ? "○" : current ? "*" : "●";

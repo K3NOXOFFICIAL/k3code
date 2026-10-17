@@ -331,6 +331,39 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: "start k3code in the agent view on launch",
+    name: "agents-view",
+    run: (arg, ctx) => {
+      if (arg.trim()) {
+        ctx.gateway
+          .rpc<ConfigSetResponse>("config.set", {
+            key: "agents_view",
+            value: arg.trim(),
+          })
+          .then(
+            ctx.guarded<ConfigSetResponse>((r) =>
+              ctx.transcript.sys(`agent view at startup: ${r?.value ?? "off"}`),
+            ),
+          )
+          .catch(ctx.guardedErr);
+
+        return;
+      }
+
+      ctx.gateway
+        .rpc<ConfigGetValueResponse>("config.get", { key: "agents_view" })
+        .then(
+          ctx.guarded<ConfigGetValueResponse>((r) =>
+            ctx.transcript.sys(
+              `agent view at startup: ${r?.value === "on" ? "on" : "off"}`,
+            ),
+          ),
+        )
+        .catch(ctx.guardedErr);
+    },
+  },
+
+  {
     aliases: ["detail"],
     help: "control agent detail visibility (global or per-section)",
     name: "details",

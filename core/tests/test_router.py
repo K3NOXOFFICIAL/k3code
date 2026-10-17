@@ -400,6 +400,29 @@ def test_transient_tls_alert_is_still_network():
     assert result.hint == ""
 
 
+def test_unknown_provider_for_model_400_carries_the_model_id_hint():
+    """A relay that routes by the id's vendor prefix rejects `claude/<model>` (catalog only carries `cc/<model>`)
+    with "unknown provider for model <model>": failover happens as for any bad_request, plus a fix-it hint."""
+    from k3code.providers.base import ProviderError
+    from k3code.router.classifier import UNKNOWN_MODEL_ID_HINT
+
+    err = ProviderError(
+        "claude/claude-sonnet-5: model — [400]: unknown provider for model claude-sonnet-5", status_code=400
+    )
+    result = classify_api_error(err, provider="claude", model="claude/claude-sonnet-5")
+    assert result.reason is FailoverReason.bad_request
+    assert result.immediate_failover
+    assert result.hint == UNKNOWN_MODEL_ID_HINT
+    assert "/models" in result.hint and "vendor prefix" in result.hint
+
+
+def test_other_400s_get_no_hint():
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError("request failed: max_tokens is too large", status_code=400)
+    assert classify_api_error(err, provider="p", model="m").hint == ""
+
+
 async def test_certificate_failure_fails_the_turn_instead_of_parking(provider_factory, sample_messages, sample_tools):
     """An unattended run parks on network failures and waits for connectivity; a certificate that does not verify
     must end the turn at once, with the hint, and without inline retries."""

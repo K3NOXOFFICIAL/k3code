@@ -393,6 +393,7 @@ const ComposerPane = memo(function ComposerPane({
     onModelSelect: actions.onModelSelect,
     onNewLiveSession: actions.newLiveSession,
     onNewPromptSession: actions.newPromptSession,
+    onPermissionsApply: actions.onPermissionsApply,
     onProviderSelect: actions.onProviderSelect,
     onResumeSelect: actions.resumeById,
     onSettingsApply: actions.onSettingsApply,
@@ -652,9 +653,19 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
       gw={gw}
       onActivate={activate}
       onClose={close}
-      onNew={(text) => {
-        actions.newLiveSession(text, undefined, dropSid());
+      // A /command needs the transcript to be visible: the view folds away first.
+      onCommand={(command) => {
         close();
+        actions.onSettingsApply(command);
+      }}
+      // A plain prompt starts a session for it and the view STAYS up — watching
+      // it work is why this view exists. An empty session left behind (the one
+      // this client just departed) is dropped; the gateway judges disposability.
+      onNewPrompt={(text) => {
+        actions.newPromptSession(text, undefined, {
+          dropSid: dropSid(),
+          keepAgentView: true,
+        });
       }}
       onStop={({ kind, ...row }) => {
         if (kind !== "past") {

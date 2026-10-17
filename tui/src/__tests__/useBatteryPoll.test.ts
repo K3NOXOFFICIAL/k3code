@@ -44,6 +44,26 @@ describe("toBatteryInfo", () => {
       category: "warn",
       percent: 44,
       plugged: false,
+      power_profile: null,
+      temp_c: null,
+    });
+
+    expect(
+      toBatteryInfo({
+        available: true,
+        category: "good",
+        percent: 80,
+        plugged: true,
+        power_profile: "quiet",
+        temp_c: 37.5,
+      }),
+    ).toEqual({
+      available: true,
+      category: "good",
+      percent: 80,
+      plugged: true,
+      power_profile: "quiet",
+      temp_c: 37.5,
     });
   });
 

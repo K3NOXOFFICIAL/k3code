@@ -114,24 +114,25 @@ export function buildViewRows({
   ];
 }
 
+export type ViewFocus = "input" | "list";
+
 export interface ViewNav {
-  /** Row key awaiting a y/n stop confirmation. */
+  /** What the composer body holds; edited by the TextInput, never by the reducer. */
+  draft: string;
   confirmKey: null | string;
   index: number;
   /** Collapsed group names (groups whose rows are hidden). */
   collapsedGroups: ViewGroup[];
-  /** "new" input prompt is open. */
-  newSessionPrompt: boolean;
-  /** Text entered in the new-session prompt. */
-  newSessionText: string;
+  /** Which half owns the keyboard: the row list, or the bottom composer. */
+  focus: ViewFocus;
 }
 
 export const IDLE_VIEW_NAV: ViewNav = {
   collapsedGroups: [],
   confirmKey: null,
+  draft: "",
+  focus: "list",
   index: 0,
-  newSessionPrompt: false,
-  newSessionText: "",
 };
 
 export type ViewKey = {
@@ -147,16 +148,14 @@ export type ViewKey = {
   pageUp?: boolean;
   return?: boolean;
   right?: boolean;
+  tab?: boolean;
   up?: boolean;
 };
 
 export type ViewEffect =
   | { row: ViewRow; type: "activate" | "stop" }
   | { type: "close" }
-  | { type: "new" }
-  | { type: "toggle-group"; group: ViewGroup }
-  | { type: "new-prompt"; text: string }
-  | { type: "cancel-new" };
+  | { type: "toggle-group"; group: ViewGroup };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -224,23 +223,15 @@ export function reduceViewKey(
     nav: { ...nav, confirmKey: null, index, ...next },
   });
 
-  // Typing in the new-session prompt.
-  if (nav.newSessionPrompt) {
+  // The composer owns editing keys through its own useInput; only the two chords
+  // it hands up reach the reducer here. Esc clears the draft first, so leaving
+  // the view takes a second Esc — text is never lost to a stray Esc.
+  if (nav.focus === "input") {
+    if (key.tab) {
+      return done(null, { focus: "list" });
+    }
     if (key.escape) {
-      return done(null, { newSessionPrompt: false, newSessionText: "" });
-    }
-    if (key.return) {
-      const text = nav.newSessionText.trim();
-      return done(text ? { type: "new-prompt", text } : null, {
-        newSessionPrompt: false,
-        newSessionText: "",
-      });
-    }
-    if (ch && ch.length === 1) {
-      return done(null, { newSessionText: nav.newSessionText + ch });
-    }
-    if (key.left || key.right || key.up || key.down) {
-      return done(null);
+      return nav.draft ? done(null, { draft: "" }) : done({ type: "close" });
     }
     return done(null);
   }
@@ -262,8 +253,9 @@ export function reduceViewKey(
     return done({ type: "close" });
   }
 
-  if (ch === "n") {
-    return done(null, { newSessionPrompt: true, newSessionText: "" });
+  // n and tab both hand the keyboard to the composer; the draft survives the switch.
+  if (ch === "n" || key.tab) {
+    return done(null, { focus: "input" });
   }
 
   if (!rows.length) {

@@ -31,7 +31,7 @@ def _providers() -> list[ProviderEntry]:
             kind="anthropic",
             base_url="http://b",
             api_key_env="NOPE_B",
-            models={"default": "claude-sonnet-5", "cheap": "claude-haiku-4-5", "deep": "claude-opus-5"},
+            models={"default": "claude-sonnet-5-5", "cheap": "claude-haiku-5-5", "deep": "claude-opus-5-5"},
             descriptions={"default": "Everyday coding", "deep": "Hardest problems"},
         ),
         ProviderEntry(name="c", kind="claude-cli", models={"local": "sonnet"}),
@@ -256,10 +256,10 @@ async def test_tune_provider_pins_the_session_and_the_labels_follow_it(server, t
     assert (live.stored.model, live.stored.provider) == ("cheap", "b")
     assert server.store.get(sid).provider == "b"
     # the model ids are provider b's, the block a turn now tries first
-    assert _infos(server, sid)[-1]["model"] == "claude-haiku-4-5" == server._active_model(live)
-    assert tune.state_line(server.config, live).startswith("Model: cheap (claude-haiku-4-5) · ")
+    assert _infos(server, sid)[-1]["model"] == "claude-haiku-5-5" == server._active_model(live)
+    assert tune.state_line(server.config, live).startswith("Model: cheap (claude-haiku-5-5) · ")
     row = next(r for r in tune.snapshot(server, live)["models"] if r["key"] == "cheap")
-    assert row["providers"][0] == "b" and row["resolved"][0] == "claude-haiku-4-5"
+    assert row["providers"][0] == "b" and row["resolved"][0] == "claude-haiku-5-5"
     assert (await m1.cmd(server, "/tune --provider a", sid))["message"] == "Provider set to: a"
     assert _infos(server, sid)[-1]["model"] == "gpt-4o-mini"
 
@@ -347,23 +347,23 @@ async def test_tune_get_lists_one_row_per_model_key(server, tmp_path):
     assert rows["default"] == {
         "key": "default",
         "providers": ["a", "b", "c"],  # c has no 'default' either and falls back to its first model
-        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],
+        "resolved": ["gpt-5.1", "claude-sonnet-5-5", "sonnet"],
         "description": "Everyday coding",  # a's is empty: the first non-empty one wins
         "current": False,
         "default": True,
         "effort": True,
     }
-    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-4-5", "sonnet"]
+    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-5-5", "sonnet"]
     assert rows["cheap"]["description"] == "Fast and cheap" and rows["cheap"]["current"] is True
     assert rows["cheap"]["effort"] is True  # o3-mini takes one
     # a key that only some providers define still routes through all of them, in chain order: the others fall back
-    assert rows["plain"]["resolved"] == ["llama3", "claude-sonnet-5", "sonnet"] and rows["plain"]["effort"] is True
+    assert rows["plain"]["resolved"] == ["llama3", "claude-sonnet-5-5", "sonnet"] and rows["plain"]["effort"] is True
     assert rows["deep"]["providers"] == ["a", "b", "c"] and rows["deep"]["effort"] is True
-    assert rows["deep"]["resolved"] == ["gpt-5.1", "claude-opus-5", "sonnet"] and rows["deep"]["description"]
+    assert rows["deep"]["resolved"] == ["gpt-5.1", "claude-opus-5-5", "sonnet"] and rows["deep"]["description"]
     assert rows["local"] == {
         **rows["local"],
         "providers": ["a", "b", "c"],
-        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],  # a turn on 'local' goes to a's default first
+        "resolved": ["gpt-5.1", "claude-sonnet-5-5", "sonnet"],  # a turn on 'local' goes to a's default first
         "effort": True,
     }
     assert [r["key"] for r in res["models"] if r["current"]] == ["cheap"]
@@ -690,7 +690,7 @@ async def test_config_set_model_honours_reasoning_and_global(server, tmp_path):
     assert live.stored.model == "cheap" and live.reasoning_effort == "high"
     assert live.stored.provider == "a"  # the picker's provider step pins the session (#90)
     await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "cheap --provider b"})
-    assert live.stored.provider == "b" and _infos(server, sid)[-1]["model"] == "claude-haiku-4-5"
+    assert live.stored.provider == "b" and _infos(server, sid)[-1]["model"] == "claude-haiku-5-5"
     err = (await m1.rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "deep --provider zz"}))[
         "error"
     ]
@@ -754,7 +754,7 @@ async def test_model_options_marks_the_pinned_provider_and_maps_keys_to_model_id
     a, b = res["providers"][0], res["providers"][1]
     assert a["models"] == ["cheap", "default", "plain"]  # still the keys --provider and /model take
     assert a["model_ids"] == {"default": "gpt-5.1", "cheap": "gpt-4o-mini", "plain": "llama3"}  # a list: its first
-    assert b["model_ids"]["deep"] == "claude-opus-5"
+    assert b["model_ids"]["deep"] == "claude-opus-5-5"
 
 
 # ── /model and /effort keep working ─────────────────────────────────────────────────────────────────────────────
@@ -856,7 +856,7 @@ async def test_tune_is_a_command_in_the_model_and_settings_help_group(server):
         ("gpt-5.1", "openai", True),
         ("openai/o3-mini", "openai", True),
         ("gpt-4o-mini", "openai", False),
-        ("claude-opus-5", "openai", False),  # an OpenAI-style route only ever sends reasoning_effort
+        ("claude-opus-5-5", "openai", False),  # an OpenAI-style route only ever sends reasoning_effort
         ("sonnet", "claude-cli", False),
         ("", "openai", None),
         ("gpt-5.1", "somethingelse", None),

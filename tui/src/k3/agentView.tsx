@@ -32,7 +32,10 @@ import {
 } from "./agentViewStore.js";
 
 export const AGENT_VIEW_HINT =
-  "↑↓ select · →/⏎ attach · x stop · n new · c collapse · ←/esc back";
+  "↑↓ select · tab/→/⏎ attach · x stop · c collapse · ←/esc back";
+/** Shown while the bottom composer owns the keyboard. */
+export const AGENT_VIEW_INPUT_HINT =
+  "⏎ start · /command run · tab list · esc clear/back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
@@ -74,6 +77,8 @@ export function AgentViewView({
   height,
   loading = false,
   nav,
+  onNewSessionTextChange = () => {},
+  onNewSessionSubmit = () => {},
   rows,
   t,
 }: AgentViewViewProps) {
@@ -182,17 +187,34 @@ export function AgentViewView({
     );
   };
 
-  // New session prompt line
-  const renderNewPrompt = () =>
-    nav.newSessionPrompt ? (
-      <TextInput
-        color={t.color.text}
-        columns={cols}
-        value={nav.newSessionText}
-        onChange={onNewSessionTextChange}
-        onSubmit={onNewSessionSubmit}
-      />
-    ) : null;
+  // The bottom composer, like the one in the main view: starts a session, runs a
+  // /command. Focus state lives in `nav.focus` (tab toggles), not in the input.
+  // The long placeholder wraps on narrow panes, so small descriptors shrink it.
+  const placeholder =
+    cols - 2 >= "start a new session, or type a /command".length
+      ? "start a new session, or type a /command"
+      : cols - 2 >= "new session or /command".length
+        ? "new session or /command"
+        : "new…";
+  const renderNewPrompt = () => (
+    <Box flexDirection="row" width={cols}>
+      <Text color={nav.focus === "input" ? t.color.accent : t.color.muted}>
+        {"❯ "}
+      </Text>
+      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+        <TextInput
+          color={t.color.text}
+          columns={Math.max(1, cols - 2)}
+          focus={nav.focus === "input"}
+          onChange={onNewSessionTextChange}
+          onSubmit={onNewSessionSubmit}
+          placeholder={placeholder}
+          placeholderColor={t.color.muted}
+          value={nav.draft ?? ""}
+        />
+      </Box>
+    </Box>
+  );
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -244,17 +266,20 @@ export function AgentViewView({
       {renderNewPrompt()}
       {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
-        {AGENT_VIEW_HINT}
+        {nav.focus === "input" ? AGENT_VIEW_INPUT_HINT : AGENT_VIEW_HINT}
       </Text>
     </Box>
   );
 }
 
 export interface AgentViewPaneProps {
+  /** A `/command` typed in the composer: closes the view (output needs a transcript) and runs it. */
+  onCommand: (command: string) => void;
   gw: GatewayClient;
   onActivate: (row: ViewRow) => void;
   onClose: () => void;
-  onNew: (text?: string) => void;
+  /** A plain prompt typed in the composer: starts a session for it; the view stays open. */
+  onNewPrompt: (text: string) => void;
   onStop: (row: ViewRow) => void;
 }
 
@@ -263,7 +288,8 @@ export function AgentViewPane({
   gw,
   onActivate,
   onClose,
-  onNew,
+  onNewPrompt,
+  onCommand,
   onStop,
 }: AgentViewPaneProps) {
   const { stdout } = useStdout();
@@ -286,16 +312,36 @@ export function AgentViewPane({
   const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
   // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
   const compact = termRows < 8;
-  // header, spacer, spacer, footer (+ the error line); compact: header and footer only
-  const height = Math.max(1, termRows - (compact ? 2 : 4) - (error ? 1 : 0));
+  // header, composer, spacer, spacer, hint (+ the error line); compact: header, composer and hint only.
+  // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
+  const height = Math.max(
+    1,
+    termRows - (compact ? 3 : 5) - (error ? 1 : 0),
+  );
 
-  const handleNewSessionTextChange = (text: string) => {
-    setNav({ ...navState, newSessionText: text });
+  const handleNewSessionTextChange = (draft: string) => {
+    setNav({ ...navState, draft });
   };
 
+  // Enter on the composer: a /command runs through the app's slash handler with the
+  // view closed so its output lands in the transcript; a plain prompt starts a
+  // session for it with the view open — that is the orchestrator's purpose.
   const handleNewSessionSubmit = (text: string) => {
-    setNav({ ...navState, newSessionPrompt: false, newSessionText: "" });
-    onNew(text);
+    const trimmed = text.trim();
+
+    if (!trimmed) {
+      return;
+    }
+
+    setNav({ ...navState, draft: "", focus: "input" });
+
+    if (trimmed.startsWith("/")) {
+      onCommand(trimmed);
+
+      return;
+    }
+
+    onNewPrompt(trimmed);
   };
 
   useEffect(() => {
@@ -384,6 +430,7 @@ export function AgentViewPane({
         pageUp: key.pageUp,
         return: key.return,
         right: key.rightArrow,
+        tab: key.tab,
         up: key.upArrow,
       },
       Math.max(1, height - 2),
@@ -398,10 +445,6 @@ export function AgentViewPane({
         return onActivate(r.effect.row);
       case "stop":
         return onStop(r.effect.row);
-      case "new":
-        return onNew();
-      case "new-prompt":
-        return onNew(r.effect.text);
       case "close":
         return onClose();
       case "toggle-group": {
@@ -413,8 +456,6 @@ export function AgentViewPane({
         setNav((prev) => ({ ...prev, collapsedGroups: nextCollapsed }));
         break;
       }
-      case "cancel-new":
-        break;
     }
   });
 

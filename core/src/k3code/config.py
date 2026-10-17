@@ -14,6 +14,22 @@ from k3code import trust
 
 logger = logging.getLogger(__name__)
 
+#: Model ids the relay catalog no longer lists, and what they became. Keys match
+#: the whole id only (``claude-sonnet-5`` -> ``claude-sonnet-5-5``), so dated ids
+#: and gateway aliases (``auto/...``) pass through untouched.
+RETIRED_MODEL_IDS: dict[str, str] = {
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-opus-5": "claude-opus-5-5",
+    "claude-haiku-4-5": "claude-haiku-5-5",
+}
+
+
+def _normalize_retired_model_id(spec: str | list[str]) -> str | list[str]:
+    if isinstance(spec, list):
+        return [RETIRED_MODEL_IDS.get(s, s) for s in spec]
+    return RETIRED_MODEL_IDS.get(spec, spec)
+
+
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
 
@@ -91,6 +107,22 @@ class ProviderEntry(BaseModel):
                     raise ValueError(f"{key} is required for provider kind {data.get('kind')!r}")
         return data
 
+    @field_validator("models", "tiers")
+    @classmethod
+    def _normalize_retired_model_ids(
+        cls, v: dict[str, str | list[str]]
+    ) -> dict[str, str | list[str]]:
+        """Rewrite model ids the endpoint no longer lists to their replacement.
+
+        Older configs (and /model-era docs) wrote the bare ``claude-sonnet-5`` /
+        ``claude-opus-5`` / ``claude-haiku-4-5`` ids; the relay catalog now only
+        carries the dated ones (``claude-sonnet-5-5``, ...). Without this, the
+        cheap tier sends a dead id and the goal_judge dies with "unknown
+        provider for model" on every tick. Vendor-prefixed ids (``claude/...``)
+        are left alone: the prefix is the relay's routing, not the model.
+        """
+        return {k: _normalize_retired_model_id(s) for k, s in v.items()}
+
 
 class McpServerConfig(BaseModel):
     """One ``mcp.servers.<name>`` entry: stdio (command) or streamable HTTP (url)."""
@@ -142,6 +174,8 @@ class DisplayConfig(BaseModel):
 
     theme: str = ""
     focus_mode: bool = False
+    #: the TUI opens its full-screen agent view on startup instead of a session composer (setting from /settings)
+    tui_start_agents_view: bool = False
 
 
 class GoalConfig(BaseModel):

@@ -404,7 +404,13 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
     syntaxKeyword: ensureContrast(seeds.border ?? tones.border, bg, 3),
     syntaxComment: muted,
 
-    prompt: ensureContrast(seeds.prompt ?? seeds.text, bg, 4.5),
+    // A skin that writes the same tone into `prompt` and `ui_text`/`banner_text`
+    // means "same role, same colour" (#11300-style): contrast-stage the variant
+    // tone, but never dim one away from the other before the ANSI pass.
+    prompt:
+      (seeds.prompt ?? seeds.text) === seeds.text
+        ? seeds.text
+        : ensureContrast(seeds.prompt ?? seeds.text, bg, 4.5),
     // sessionLabel/sessionBorder track the muted tone — "same role, same
     // colour" by design (#11300).
     sessionLabel: muted,

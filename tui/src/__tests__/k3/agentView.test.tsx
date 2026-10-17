@@ -9,6 +9,7 @@ import { patchUiState, resetUiState } from "../../app/uiStore.js";
 import type { GatewayClient } from "../../gatewayClient.js";
 import {
   AGENT_VIEW_HINT,
+  AGENT_VIEW_INPUT_HINT,
   AgentViewPane,
   AgentViewView,
 } from "../../k3/agentView.js";
@@ -91,8 +92,7 @@ describe("AgentViewView", () => {
   it("groups rows under the three headers with the strip's glyphs and counts, past rows last", () => {
     const out = dump(mixed(), {}, { ...IDLE_VIEW_NAV, index: 1 });
 
-    console.log(`\n--- agent view dump ---\n${out}\n-----------------------`);
-
+    
     const lines = out.split("\n");
 
     expect(lines[0]).toContain("Agents");
@@ -121,8 +121,12 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · →/⏎ attach · x stop · n new · c collapse · ←/esc back",
+      "↑↓ select · tab/→/⏎ attach · x stop · c collapse · ←/esc back",
     );
+    // a permanent composer row sits between the list and the hint; while the
+    // list has focus the composer only shows its placeholder
+    expect(out).toContain("❯ ");
+    expect(out).not.toContain(AGENT_VIEW_INPUT_HINT);
   });
 
   it("shows a session with no turn yet as idle (○) inside Completed, not as completed (✓)", () => {
@@ -195,8 +199,14 @@ describe("AgentViewView", () => {
     const listLines = (out: string) =>
       out
         .split("\n")
-        .slice(2, -2)
-        .filter((l) => l.trim());
+        .filter(
+          (l) =>
+            l.trim() &&
+            !/(↑|↓) \d+ more/.test(l) &&
+            !l.includes("❯") &&
+            !l.includes("↑↓ select") &&
+            !l.includes("Agents"),
+        );
 
     const top = dump(rows, { height });
 
@@ -285,7 +295,7 @@ describe("AgentViewPane", () => {
         }
         onActivate={onActivate}
         onClose={onClose}
-        onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -357,7 +367,7 @@ describe("AgentViewPane", () => {
         }
         onActivate={onActivate}
         onClose={() => {}}
-        onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -437,7 +447,7 @@ describe("AgentViewPane", () => {
         }
         onActivate={() => {}}
         onClose={() => {}}
-        onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {
@@ -466,12 +476,15 @@ describe("AgentViewPane", () => {
       const out = lastFrame();
       const lines = out.split("\n");
 
-      // header, four list lines, footer: no spacers, no ↑/↓ indicators
+      // header, the three list rows that fit, composer, hint: no spacers, no ↑/↓
+      // indicators — the needs-input group's header is what got scrolled away
       expect(lines).toHaveLength(6);
       expect(lines[0]).toContain("Agents");
-      expect(lines[1]).toMatch(/▾ Needs input/);
-      expect(lines[2]).toContain("bravo");
+      expect(lines[1]).toContain("bravo");
+      expect(lines[2]).toContain("Working");
+      expect(lines[3]).toContain("(this session)");
       expect(out).not.toMatch(/more/);
+      expect(lines.at(-2)).toContain("❯");
       expect(lines.at(-1)).toContain("↑↓ select");
 
       for (const line of lines) {
@@ -502,7 +515,7 @@ describe("AgentViewPane", () => {
       { id: "b", status: "working", title: "bravo" },
     ]);
 
-    const onNew = vi.fn();
+    const onNewPrompt = vi.fn();
     const onStop = vi.fn();
     const stdin = Object.assign(new PassThrough(), {
       isTTY: true,
@@ -535,7 +548,7 @@ describe("AgentViewPane", () => {
         }
         onActivate={() => {}}
         onClose={() => {}}
-        onNew={onNew}
+        onNewPrompt={onNewPrompt}
         onStop={onStop}
       />,
       {
@@ -561,7 +574,7 @@ describe("AgentViewPane", () => {
       stdin.write("\x1b[A");
       await waitFor(() => expect(fresh).toContain("› ◐ alpha"));
 
-      expect(onNew).not.toHaveBeenCalled();
+      expect(onNewPrompt).not.toHaveBeenCalled();
       expect(onStop).not.toHaveBeenCalled();
       expect(output).not.toContain("stop? y/n");
 
@@ -572,20 +585,21 @@ describe("AgentViewPane", () => {
       await waitFor(() => expect(onStop).toHaveBeenCalled());
       expect(onStop.mock.calls[0]![0]).toMatchObject({ id: "a" });
 
-      // "n" opens the new-session prompt; type text and press Enter to submit.
+      // "n" focuses the composer; type text and press Enter to start the session.
       stdin.write("n");
-      await waitFor(() => expect(output).toContain("new session:"));
+      await waitFor(() => expect(output).toContain("start a new session"));
+      // give React a frame to (re)subscribe the now-focused TextInput before typing
+      await new Promise((r) => setTimeout(r, 30));
       for (const ch of "test session") {
         stdin.write(ch);
         await new Promise((r) => setTimeout(r, 10));
       }
       stdin.write("\n");
-      // Give it time to process
-      await new Promise((r) => setTimeout(r, 500));
-      console.error("DEBUG: onNew calls:", onNew.mock.calls);
-      console.error("DEBUG: output:", JSON.stringify(output.slice(-300)));
-      await waitFor(() => expect(onNew).toHaveBeenCalled(), { timeout: 10000 });
-      expect(onNew).toHaveBeenCalledWith("test session");
+      await new Promise((r) => setTimeout(r, 800));
+      await waitFor(
+        () => expect(onNewPrompt).toHaveBeenCalledWith("test session"),
+        { timeout: 10000 },
+      );
     } finally {
       view.unmount();
       view.cleanup();
@@ -613,7 +627,7 @@ describe("AgentViewPane", () => {
         gw={{ request } as unknown as GatewayClient}
         onActivate={() => {}}
         onClose={() => {}}
-        onNew={() => {}}
+        onNewPrompt={() => {}}
         onStop={() => {}}
       />,
       {

@@ -67,6 +67,21 @@ SSL_CERT_HINT = (
     "certificate, or check the proxy (it may be re-signing HTTPS traffic)"
 )
 
+#: Relays that route by the model id's vendor prefix ("vendor/model") reject one that is not in their catalog with
+#: wording like "unknown provider for model <rest>" — e.g. configured `claude/<model>` where the catalog only carries
+#: `cc/<model>` (or `claude/cc/<model>` combos). Failover is right; the hint tells the user what to reconfigure.
+_UNKNOWN_MODEL_VENDOR_PATTERNS = (
+    "unknown provider for model",
+    "unknown provider for the model",
+    "no provider configured for model",
+)
+
+#: What the user can do about a model id the endpoint does not know; carried on :attr:`ClassifiedError.hint`.
+UNKNOWN_MODEL_ID_HINT = (
+    "the endpoint has no model under this id — use exactly an id it lists (GET {base}/models or a /model "
+    "chain listing; relays often require their own vendor prefix, e.g. cc/<model> instead of claude/<model>)"
+)
+
 #: Reasons that abort the whole walk instead of trying the next entry:
 #: a context overflow will recur on every entry until the loop compacts.
 TERMINAL_REASONS = frozenset({FailoverReason.context_overflow})
@@ -704,6 +719,15 @@ def _cause_chain(error: BaseException, limit: int = 8) -> list[BaseException]:
 _STAGES = (_by_status, _by_error_code, _by_tls_cert, _by_message, _by_transport)
 
 
+def _hint_for(reason: FailoverReason, c: _Ctx) -> str:
+    """A fix-it note for the failure kinds the user must repair in their setup (empty = none)."""
+    if reason is _R.ssl_cert:
+        return SSL_CERT_HINT
+    if reason is _R.bad_request and any(p in c.msg for p in _UNKNOWN_MODEL_VENDOR_PATTERNS):
+        return UNKNOWN_MODEL_ID_HINT
+    return ""
+
+
 def classify_api_error(
     error: BaseException,
     *,
@@ -737,7 +761,7 @@ def classify_api_error(
         model=model,
         message=_extract_message(error, body),
         retry_after=retry_after,
-        hint=SSL_CERT_HINT if reason is _R.ssl_cert else "",
+        hint=_hint_for(reason, c),
     )
 
 

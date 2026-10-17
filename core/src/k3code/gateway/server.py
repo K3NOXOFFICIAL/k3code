@@ -145,6 +145,7 @@ OPEN_METHODS = frozenset(
         "complete.slash",
         "model.options",
         "tune.get",
+        "permissions.get",
         "settings.get",
         "config.get",
         "session.list",
@@ -4154,6 +4155,26 @@ def _use_saved_key(server: GatewayServer, name: str, value: str) -> None:
     server._tiers = None
 
 
+async def _permissions_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``permissions.get``: the interactive /permissions popup's rows (mode, modes, effective rules)."""
+    from k3code.commands import permissions_cmd
+
+    session = server._session_for(params.get("session_id"))
+    if session is not None:
+        perms = session.perms
+    else:
+        from k3code.commands._util import session_cwd
+        from k3code.permissions.state import PermissionState
+
+        perms = PermissionState(cwd=session_cwd(server, params.get("session_id")))
+    perms.reload()
+    rules = [
+        {"id": rid, "source": src, "action": r.action, "tool": r.tool, "pattern": r.pattern}
+        for rid, src, r in permissions_cmd.effective_rules(perms)
+    ]
+    return {"mode": perms.mode.value, "modes": list(MODE_CYCLE_NAMES), "rules": rules}
+
+
 def _option_for(server: GatewayServer, params: dict[str, Any], slug: str) -> dict[str, Any] | None:
     session = server._session_for(params.get("session_id"))
     active = active_provider(server.config, session.stored.provider if session is not None else "")
@@ -4818,6 +4839,7 @@ _HANDLERS: dict[str, Any] = {
     "complete.path": _complete_path,
     "model.options": _model_options,
     "tune.get": _tune_get,
+    "permissions.get": _permissions_get,
     "settings.get": _settings_get,
     "tune.set": _tune_set,
     "model.save_key": _model_save_key,

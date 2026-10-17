@@ -247,6 +247,24 @@ async def test_chain_exhausted_escalates_as_an_outage_row(tmp_path):
     assert m["escalation_rate"] == 0 and m["escalated_kinds"] == {} and m["outage_rate"] == 1.0  # per call row
 
 
+async def test_k3nox_repeats_of_the_same_outage_emit_the_note_once(tmp_path):
+    """A down tier under a ticking daemon produces the same `routing.escalated` shape on every judge call; the emit
+    is damped inside ESCALATION_EMIT_WINDOW, while the usage outage rows still land for the optimizer."""
+    db = UsageDB(tmp_path / "usage.db")
+    events = []
+    caller = ModelCaller(lambda: _Routers(), Settings(), db, emit=lambda when, payload: events.append((when, payload)))
+    msg = [Message(role="user", content="x")]
+    for _ in range(3):
+        assert (await caller.complete(TaskKind.CLASSIFICATION, msg, session_id="s1")).tier.value == "main"
+
+    escalation_events = [e for when, e in events if when == "routing.escalated"]
+    assert len(escalation_events) == 1
+    assert escalation_events[0]["from"] == "cheap"
+    assert escalation_events[0]["cause"] == "outage"
+    outage_rows = [r for r in db.rows(0) if r["kind"] == "outage"]
+    assert len(outage_rows) == 3
+
+
 def test_scope_accuracy_is_scored_from_the_verifier_outcome(tmp_path):
     scope = []
     for h, verdict_scope, outcome in (
