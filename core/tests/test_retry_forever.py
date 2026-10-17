@@ -10,15 +10,14 @@ import pytest
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted
 from k3code.providers.types import Message
-from k3code.reliability.events import GAVE_UP, PARKED, EventEmitter
+from k3code.reliability.events import GAVE_UP, PARKED
+from k3code.reliability.hooks import Reliability
 from k3code.reliability.netwatch import NetState
 from k3code.reliability.persistent_retry import (
     FOREVER_PARK_REASONS,
     RetryConfig,
     TurnCancelled,
 )
-from k3code.reliability.hooks import Reliability, ReliabilitySettings
-
 from test_persistent_retry import FakeNetWatch, FakeRouter, _drain, _retry
 
 
