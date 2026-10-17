@@ -18,6 +18,7 @@ import { ModelPicker } from "./modelPicker.js";
 import { OverlayHint } from "./overlayControls.js";
 import { listRowStyle } from "./overlayPrimitives.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
+import { ProviderPicker } from "./providerPicker.js";
 import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
@@ -175,6 +176,7 @@ export function FloatingOverlays({
   onModelSelect,
   onNewLiveSession,
   onNewPromptSession,
+  onProviderSelect,
   onResumeSelect,
   onSettingsApply,
   onTuneApply,
@@ -189,6 +191,7 @@ export function FloatingOverlays({
   | "onModelSelect"
   | "onNewLiveSession"
   | "onNewPromptSession"
+  | "onProviderSelect"
   | "onResumeSelect"
   | "onSettingsApply"
   | "onTuneApply"
@@ -309,6 +312,24 @@ export function FloatingOverlays({
             maxWidth={width}
             onApply={onTuneApply}
             onCancel={() => patchOverlayState({ tunePicker: false })}
+            sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
+  if (overlay.providerPicker) {
+    widgets.push({
+      id: "provider-picker",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <ProviderPicker
+            gw={gw}
+            maxWidth={width}
+            onCancel={() => patchOverlayState({ providerPicker: false })}
+            onSelect={onProviderSelect}
             sessionId={sid}
             t={theme}
           />

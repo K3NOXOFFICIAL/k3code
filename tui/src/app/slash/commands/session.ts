@@ -120,7 +120,7 @@ export const sessionCommands: SlashCommand[] = [
       // gateway QUEUES it and applies it at the next turn start (returning
       // deferred:true) instead of rejecting. Either way the pick sticks without
       // interrupting the stream or waiting on the swap.
-      // Bare /model is the combined popup (also bare /tune and /effort); `--refresh` below still opens the provider
+      // Bare /model is the combined popup (also bare /tune and /effort); `--refresh` below still opens the model
       // picker, and `/model <key>` / `/model chain` are unchanged.
       if (!arg.trim()) {
         return openTunePopup(ctx);
