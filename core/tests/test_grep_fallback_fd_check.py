@@ -145,6 +145,39 @@ def test_a_walked_file_below_a_directory_that_is_a_link_is_not_read(tmp_path, fa
         opener.close()
 
 
+def test_a_stale_index_entry_behind_a_link_opens_nothing_outside_the_roots(tmp_path, fallback_only) -> None:
+    """Not a race: the index lists cfg/p and cfg is now a link to a directory holding a FIFO. A writer blocked on that
+    FIFO is released by any open for reading, so it shows whether the fallback opened a path outside the roots."""
+    outside = tmp_path / "outside"
+    proj = tmp_path / "proj"
+    outside.mkdir()
+    (proj / "cfg").mkdir(parents=True)
+    (proj / "cfg" / "p").write_text("tracked\n")
+    (proj / "a.txt").write_text("TOKEN here\n")
+    _track_with_git(fallback_only, proj)
+    shutil.rmtree(proj / "cfg")
+    (proj / "cfg").symlink_to(outside)
+    os.mkfifo(outside / "p")
+
+    opened = threading.Event()
+
+    def writer() -> None:
+        fd = os.open(outside / "p", os.O_WRONLY)  # blocks until a reader opens the FIFO
+        opened.set()
+        os.close(fd)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    res = tools._grep_fallback("TOKEN", proj, None, None)
+    t.join(1)
+    outside_was_opened = opened.is_set()
+    if not outside_was_opened:  # release the writer
+        os.close(os.open(outside / "p", os.O_RDONLY | os.O_NONBLOCK))
+        t.join(1)
+    assert "a.txt:1:TOKEN here" in res["matches"]
+    assert not outside_was_opened
+
+
 def test_the_fallback_opens_without_becoming_the_controlling_terminal(tmp_path, monkeypatch) -> None:
     seen: list[int] = []
     real_open = os.open
