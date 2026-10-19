@@ -227,6 +227,7 @@ def test_the_usage_wire_payload_carries_the_cache_tokens():
         "total_tokens": 1010,
         "cache_read_tokens": 800,
         "cache_write_tokens": 150,
+        "cache_hit_pct": 80,  # 800 of the 1000 prompt tokens came from the cache; the TUI status bar shows it
     }
 
 
