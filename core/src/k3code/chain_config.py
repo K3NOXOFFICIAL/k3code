@@ -125,6 +125,19 @@ def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
     return backup
 
 
+def reload_providers(ctx: Any) -> None:
+    """Rebuild the live provider list from the config files after an edit (``/model chain``, ``provider.add``).
+
+    The list is replaced, not edited: the router is rebuilt on the next turn and only the changed blocks get a new
+    provider (``_swap_providers``); a turn in flight keeps its own."""
+    from k3code.config import load_config
+
+    reloaded = load_config(project_dir=Path.cwd())
+    ctx.config.providers = reloaded.providers
+    if hasattr(ctx, "_chain_key"):
+        ctx._chain_key = None  # rebuild the router on the next turn
+
+
 def set_default_model(key: str, home: Path | None = None) -> tuple[bool, str]:
     """Make ``key`` the ``default_model`` of the user config, for new sessions (``/tune --global``).
 
