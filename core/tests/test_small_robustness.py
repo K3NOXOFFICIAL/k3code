@@ -327,7 +327,7 @@ async def test_glob_and_grep_stop_at_the_time_budget_with_a_hint(tmp_path, no_gi
     assert res["files"] == [] and "stopped after" in res["note"] and "narrow" in res["note"]
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))  # the Python grep fallback
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
-    assert "stopped after" in res["warnings"]
+    assert "of an unknown number of files" in res["warnings"] and "results are partial" in res["warnings"]
 
 
 async def test_grep_stops_reading_at_the_result_cap(tmp_path, no_git_env):

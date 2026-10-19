@@ -106,7 +106,7 @@ def test_a_fifo_in_the_tree_is_skipped_and_the_search_returns(tmp_path, fallback
         worker.join(5)
         pytest.fail("the grep fallback blocked on a FIFO")
     assert "a.txt:1:TOKEN in a" in out["matches"]
-    assert "stopped after" not in out.get("warnings", "")
+    assert "partial" not in out.get("warnings", "")
 
 
 def _scan(opener: grep_worker.Beneath, rel: str, display: str) -> list[str | None]:

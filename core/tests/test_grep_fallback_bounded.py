@@ -5,6 +5,8 @@ The match runs in a worker process the fallback kills at the deadline."""
 from __future__ import annotations
 
 import asyncio
+import re
+import shutil
 import time
 from pathlib import Path
 
@@ -58,7 +60,8 @@ async def test_a_catastrophic_pattern_is_cut_at_the_budget_without_freezing_the_
     assert wall < 5.0
     assert stall < 0.25
     assert res["matches"] == ""
-    assert "partial" in res["warnings"] or "stopped after" in res["warnings"]
+    assert "results are partial" in res["warnings"]
+    assert "ripgrep (rg) is not installed" in res["warnings"]
 
 
 async def test_a_slow_pattern_that_finishes_in_the_budget_does_not_freeze_the_loop(tmp_path, no_rg) -> None:
@@ -78,3 +81,41 @@ async def test_a_regex_skips_a_very_long_line_and_says_so_while_a_literal_search
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)  # literal: no regex, no cap
     assert [line.split(":")[1] for line in res["matches"].splitlines()] == ["1", "2"]
     assert "warnings" not in res
+
+
+@pytest.mark.parametrize("rg", [None, "/usr/bin/rg"], ids=["no-rg", "rg"])
+@pytest.mark.parametrize("walk_done", [True, False], ids=["walk-done", "walk-cut"])
+def test_a_cut_result_says_how_much_was_searched_and_why_it_was_slow(monkeypatch, rg, walk_done) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: rg if name == "rg" else None)
+    feed = tools._Feed(sent=5000, walk_cut=not walk_done, walk_done=walk_done)
+    res = tools._grep_result(["a.py:1:x"], feed, 1234, 0, cut=True)
+    total = "~5000" if walk_done else "an unknown number of"
+    note = (
+        f"searched 1234 of {total} files before the 10 s budget; results are partial; "
+        "narrow the path or add an include glob"
+    )
+    slow = "; ripgrep (rg) is not installed, which makes this search much slower"
+    assert res == {"matches": "a.py:1:x", "warnings": note + (slow if rg is None else "")}
+
+
+def test_a_complete_result_says_nothing_extra(monkeypatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    res = tools._grep_result(["a.py:1:x"], tools._Feed(sent=3, walk_done=True), 3, 0, cut=False)
+    assert res == {"matches": "a.py:1:x"}
+
+
+async def test_a_search_cut_by_a_tiny_budget_counts_the_files_it_searched(tmp_path, no_rg, monkeypatch) -> None:
+    """The worker gets through some files, then the backtracking one holds it past the deadline: N is its last
+    progress count (written every 50 ms, so at most the five files before it), M the files the walk handed over (the
+    walk is done long before)."""
+    monkeypatch.setattr(tools, "SEARCH_BUDGET_S", 1.0)
+    for i in range(5):
+        (tmp_path / f"a{i}.txt").write_text("nothing\n")
+    (tmp_path / "z.txt").write_text("a" * 40 + "c\n")  # sorted last: searched after the five others
+    res = await tool_grep({"pattern": CATASTROPHIC}, cwd=tmp_path)
+    assert res["matches"] == ""
+    searched = re.match(
+        r"searched (\d) of ~6 files before the 1 s budget; results are partial; narrow", res["warnings"]
+    )
+    assert searched and int(searched[1]) <= 5, res
+    assert res["warnings"].endswith("ripgrep (rg) is not installed, which makes this search much slower")

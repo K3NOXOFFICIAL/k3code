@@ -1126,12 +1126,13 @@ def _search_glob_match(rel: str, pattern: str) -> bool:
 
 @dataclasses.dataclass
 class _Feed:
-    """What the feeder thread of _grep_fallback found: files handed to the worker, credential files withheld, and
-    whether the walk itself ran out of time."""
+    """What the feeder thread of _grep_fallback found: files handed to the worker, credential files withheld, whether
+    the walk itself ran out of time, and whether it reached its end (only then is ``sent`` the number of files)."""
 
     sent: int = 0
     skipped: int = 0
     walk_cut: bool = False
+    walk_done: bool = False
 
 
 def _feed_worker(
@@ -1170,6 +1171,7 @@ def _feed_worker(
                 batch.clear()
                 flushed = time.monotonic()
         sink.write(batch)
+        feed.walk_done = not feed.walk_cut
     except OSError:  # the worker was stopped (BrokenPipeError) or the walk failed: what was sent is searched
         pass
     finally:
@@ -1266,6 +1268,7 @@ def _grep_fallback(
             return {"matches": ""}
         pass_fds = (named_file.fileno(),)
         job.update(fd=named_file.fileno(), display=str(path))
+        feed.sent = 1
     else:
         real_base = os.path.realpath(path)  # path itself may be a link the engine decided on
         candidates = _iter_tree(path, deadline)
@@ -1333,10 +1336,18 @@ def _grep_fallback(
 
 
 def _grep_result(matches: list[str], feed: _Feed, files: int, long_lines: int, *, cut: bool) -> dict[str, Any]:
-    """The fallback's tool result: the matching lines (capped) and a warning for each way the search was cut short."""
+    """The fallback's tool result: the matching lines (capped) and a warning for each way the search was cut short.
+    Cut by the time budget, it says how much was searched (``files``, the worker's count, of the files the walk handed
+    over, when the walk got to its end) and that ripgrep, when missing, would have been much faster."""
     shown, note = _capped(matches)
     if cut:
-        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
+        total = f"~{feed.sent}" if feed.walk_done else "an unknown number of"
+        note = (
+            f"searched {files} of {total} files before the {SEARCH_BUDGET_S:.0f} s budget; results are partial; "
+            "narrow the path or add an include glob"
+        )
+        if shutil.which("rg") is None:
+            note += "; ripgrep (rg) is not installed, which makes this search much slower"
     result: dict[str, Any] = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
     if feed.skipped:
         _note_withheld(result, f"{feed.skipped} credential file(s) (.env, keys, home dot folders) not searched")
