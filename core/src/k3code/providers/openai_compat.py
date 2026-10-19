@@ -92,7 +92,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None,
     ) -> dict[str, Any]:
         wire = messages_to_openai(messages)
-        if self._marks(model):
+        if tools and self._marks(model):  # a tool-less side call is never read back: no write premium
             _add_cache_breakpoints(wire)
         # Reasoning models (gpt-5, o-series) on api.openai.com reject max_tokens (#171): send
         # max_completion_tokens instead, matching takes_effort (relay-prefixed ids like openai/gpt-5 covered).
@@ -129,7 +129,7 @@ class OpenAICompatProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         while True:
-            cached = self._marks(model)
+            cached = bool(tools) and self._marks(model)
             request = self._client.build_request(
                 "POST",
                 self._url(),

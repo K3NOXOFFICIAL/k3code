@@ -53,6 +53,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     api_key=entry.api_key,
                     keyless=not entry.api_key_env,
                     prompt_cache=entry.prompt_cache,
+                    prompt_cache_ttl=entry.prompt_cache_ttl,
                 )
             )
         elif entry.kind == "claude-cli":

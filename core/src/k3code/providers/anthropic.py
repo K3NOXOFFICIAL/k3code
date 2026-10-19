@@ -14,6 +14,7 @@ from k3code.providers.effort import anthropic_effort
 from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     EPHEMERAL,
+    EPHEMERAL_1H,
     Message,
     StreamEvent,
     ToolCall,
@@ -42,6 +43,7 @@ class AnthropicProvider(Provider):
         keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        prompt_cache_ttl: str = "auto",
         first_event_timeout: float | None = None,
         idle_timeout: float | None = None,
     ) -> None:
@@ -52,6 +54,13 @@ class AnthropicProvider(Provider):
         #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
         self.prompt_cache = prompt_cache != "off"
         self.base_url = base_url.rstrip("/")
+        #: 1h TTL on the tools and system breakpoints (2x write price, same read price; one reuse after a pause of more
+        #: than 5 minutes pays it back). auto = only on the first-party API, whose host is known to take the field; a
+        #: relay may refuse it. A 400 that names the field turns it off for good (see stream).
+        self.long_ttl = self.prompt_cache and (
+            prompt_cache_ttl == "1h"
+            or (prompt_cache_ttl == "auto" and httpx.URL(self.base_url).host == "api.anthropic.com")
+        )
         self.api_key = api_key
         self.keyless = keyless  # api_key_env "": the endpoint takes no key, send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -93,8 +102,8 @@ class AnthropicProvider(Provider):
             payload["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools
             ]
-        if self.prompt_cache:
-            _add_cache_breakpoints(payload)
+        if self.prompt_cache and tools:  # a tool-less side call (title, summary, classifier) is never read back
+            _add_cache_breakpoints(payload, long_ttl=self.long_ttl)
         return payload
 
     async def stream(
@@ -106,22 +115,30 @@ class AnthropicProvider(Provider):
         max_tokens: int = 8192,
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        request = self._client.build_request(
-            "POST",
-            self._url(),
-            headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
-            json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
-        )
-        watchdog = StreamWatchdog.for_model(
-            "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
-        )
-        try:
-            response = await watchdog.guard(self._client.send(request, stream=True))
-        except httpx.HTTPError as exc:
-            raise to_provider_error(exc, kind="anthropic") from exc
-        if response.status_code >= 400:
+        while True:
+            payload = self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature)
+            request = self._client.build_request(
+                "POST",
+                self._url(),
+                headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
+                json=payload,
+            )
+            watchdog = StreamWatchdog.for_model(
+                "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
+            )
+            try:
+                response = await watchdog.guard(self._client.send(request, stream=True))
+            except httpx.HTTPError as exc:
+                raise to_provider_error(exc, kind="anthropic") from exc
+            if response.status_code < 400:
+                break
             error = await _error_from_response(response)
             await response.aclose()
+            text = f"{error.message} {error.body}"
+            sent_ttl = '"ttl"' in json.dumps(payload)
+            if sent_ttl and response.status_code == 400 and ("ttl" in text or "cache_control" in text):
+                self.long_ttl = False  # this endpoint refuses the 1h TTL: drop it for good, resend once with 5m
+                continue
             raise error
         try:
             content_parts: list[str] = []
@@ -219,17 +236,21 @@ class AnthropicProvider(Provider):
             await response.aclose()
 
 
-def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
+def _add_cache_breakpoints(payload: dict[str, Any], *, long_ttl: bool = False) -> None:
     """Mark the four prompt-cache breakpoints the API allows: the system prompt, the last tool definition, the last
     block of the newest message, and the last block of the message before the newest assistant message. The newest
     one moves forward every call, so each request reads the prefix the request before it wrote instead of paying for
     the whole conversation again on every tool-loop step. The API looks for an earlier entry only about 20 blocks back
     from a breakpoint, and a step with 10 parallel tool calls appends more than that; the fourth breakpoint sits where
-    the previous request ended, so its entry is always found (#168)."""
+    the previous request ended, so its entry is always found (#168).
+
+    ``long_ttl`` gives the two stable breakpoints (tools, system) the 1h TTL; the moving tail keeps 5m. The API reads
+    tools, then system, then messages, and wants every longer-TTL entry before any shorter one: that order holds."""
+    stable = EPHEMERAL_1H if long_ttl else EPHEMERAL
     if payload.get("system"):
-        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
+        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": stable}]
     if payload.get("tools"):
-        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": EPHEMERAL}
+        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": stable}
     messages = payload["messages"]
     if messages:
         messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}

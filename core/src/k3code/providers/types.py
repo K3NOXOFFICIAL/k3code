@@ -35,6 +35,8 @@ class Usage:
 
 #: An Anthropic prompt-cache breakpoint: the prefix up to and including the block that carries it is cached.
 EPHEMERAL = {"type": "ephemeral"}
+#: The same with the 1-hour TTL (no beta header needed): written at 2x the input price instead of 1.25x, read alike.
+EPHEMERAL_1H = {"type": "ephemeral", "ttl": "1h"}
 
 
 def with_cache_breakpoint(content: Any) -> Any:

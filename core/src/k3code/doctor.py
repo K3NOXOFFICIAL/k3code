@@ -238,6 +238,37 @@ def check_prompt_cache(config: Settings) -> list[Check]:
     return checks or [Check("prompt-cache", OK, "no relay alias ids without cache breakpoints")]
 
 
+def check_prompt_cache_ttl(config: Settings) -> list[Check]:
+    """The TTL each anthropic-kind entry puts on its tools and system breakpoints (``prompt_cache_ttl``); an openai
+    entry that sets one is told it has no effect there."""
+    checks: list[Check] = []
+    for p in config.providers:
+        if p.kind == "openai" and p.prompt_cache_ttl != "auto":
+            checks.append(
+                Check(
+                    f"prompt-cache-ttl:{p.name}",
+                    WARN,
+                    f"prompt_cache_ttl {p.prompt_cache_ttl} has no effect on an openai-kind entry (no ttl is sent)",
+                    "remove prompt_cache_ttl from this provider entry",
+                    {"provider": p.name, "ttl": p.prompt_cache_ttl},
+                )
+            )
+        if p.kind != "anthropic" or p.prompt_cache == "off":
+            continue
+        first_party = httpx.URL(p.base_url).host == "api.anthropic.com"
+        long_ttl = p.prompt_cache_ttl == "1h" or (p.prompt_cache_ttl == "auto" and first_party)
+        stable = "1h" if long_ttl else "5m"
+        checks.append(
+            Check(
+                f"prompt-cache-ttl:{p.name}",
+                OK,
+                f"prompt_cache_ttl {p.prompt_cache_ttl}: {stable} on tools and system, 5m on the conversation tail",
+                data={"provider": p.name, "ttl": p.prompt_cache_ttl, "stable": stable},
+            )
+        )
+    return checks
+
+
 def check_keys(config: Settings) -> Check:
     # p.api_key is what load_config resolved from the process environment *or* ~/.config/k3code/env, where the setup
     # wizard stores keys: checking os.environ alone failed every shell run, and so did the update smoke test.
@@ -924,6 +955,7 @@ async def run_checks(
     checks.append(check_keys(config))
     checks += check_context_windows(config)
     checks += check_prompt_cache(config)
+    checks += check_prompt_cache_ttl(config)
     checks.append(await check_netwatch_async() if probe and network else Check("netwatch", SKIP, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", SKIP, "probe skipped")
