@@ -204,7 +204,10 @@ def _frozen(frozen: dict[str, Any] | None, slot: str, key: list[Any], make: Call
         return make()
     hit = frozen.get(slot)
     if hit is None or hit[0] != key:
-        hit = frozen[slot] = (key, make())
+        value = make()
+        if slot == "mcp" and not value:
+            return value  # no server is connected yet: keep looking, a snapshot of nothing would hide it for good
+        hit = frozen[slot] = (key, value)
     return hit[1]
 
 

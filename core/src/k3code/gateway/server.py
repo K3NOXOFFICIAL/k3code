@@ -2957,7 +2957,8 @@ class GatewayServer:
         if "providers" in changed:
             self.router = None
             self._tiers = None
-        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base))
+        if self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base)):
+            self.refresh_prompts("mcp")  # the restarted servers' tools, not the old set's
 
     def activate_session(self, session_id: str) -> LiveSession | None:
         stored = self.store.get(session_id)
@@ -4770,9 +4771,7 @@ async def _reload_env(server: GatewayServer, params: dict[str, Any]) -> dict[str
 async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """/reload-skills: lists what a fresh scan finds, and the session's prompt names those skills from its next loop
     (its skills index is otherwise the snapshot of its first prompt)."""
-    session = server._session_for(params.get("session_id"))
-    if session is not None:
-        session.refresh_prompt_inputs("skills")
+    server.refresh_prompts("skills")  # skill files are global: every session, as /mcp reload does for the servers
     res = await server.dispatch_command("skills", "", params.get("session_id"))
     return {"output": str(res.get("message") or res.get("output") or "")}
 

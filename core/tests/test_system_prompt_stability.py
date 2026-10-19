@@ -13,14 +13,17 @@ import random
 import time
 from pathlib import Path
 
+from k3code import mcpjson
 from k3code import skills as skills_mod
-from k3code.config import Settings
-from k3code.extratools import mcp_prompt
+from k3code.autonomy.proposals import Proposal
+from k3code.config import McpServerConfig, Settings
+from k3code.extratools import mcp_prompt, register_mcp_tools
 from k3code.learning.curator import record_use
-from k3code.mcpclient import McpManager, McpToolInfo
+from k3code.mcpclient import McpManager, McpServerState, McpToolInfo
 from k3code.paths import home
 from k3code.prompting import build_system_prompt
 from k3code.routing.tiers import TaskKind
+from k3code.tools import ToolRegistry
 from learn_helpers import FakeCaller
 from m1cmd_helpers import cmd, make_server, new_session, rpc
 
@@ -235,3 +238,117 @@ def test_two_fresh_snapshots_of_the_same_inputs_are_identical(tmp_path, monkeypa
     one = build_system_prompt("BASE", cwd=tmp_path, config=config, mcp=FakeMcp(tools), frozen={})
     two = build_system_prompt("BASE", cwd=tmp_path, config=config, mcp=FakeMcp(tools[::-1]), frozen={})
     assert one == two
+
+
+# ── what the user changes through other doors than the slash commands ──
+
+
+async def two_sessions(tmp_path, monkeypatch):
+    server, live = await started(tmp_path, monkeypatch)
+    repo2 = tmp_path / "repo2"
+    (repo2 / ".git").mkdir(parents=True)
+    return server, live, server.live[await new_session(server, repo2)]
+
+
+async def test_mcp_reload_refreshes_every_live_session(tmp_path, monkeypatch):
+    server, live, other = await two_sessions(tmp_path, monkeypatch)
+    try:
+        assert "mcp__alpha__read" in prompt_of(server, live) and "mcp__alpha__read" in prompt_of(server, other)
+        server.mcp.after_reload = [tool("zeta", "b")]
+        await cmd(server, "/mcp reload", live.session_id)
+        assert "mcp__zeta__b" in prompt_of(server, live)
+        assert "mcp__zeta__b" in prompt_of(server, other)
+    finally:
+        await server.close()
+
+
+async def test_an_accepted_skill_card_refreshes_the_skills_of_every_session(tmp_path, monkeypatch):
+    server, live, other = await two_sessions(tmp_path, monkeypatch)
+    try:
+        assert "- a: skill a" in prompt_of(server, other)
+        card = Proposal(
+            id="s1", kind="skill", text="archive a", action="", key="s1", payload=dict(op="archive", drop="a")
+        )
+        assert "archived" in await server.learning.apply(card, live)
+        for s in (live, other):
+            prompt = prompt_of(server, s)
+            assert "- a: skill a" not in prompt and "- b: skill b" in prompt  # the next skill fills the cap
+    finally:
+        await server.close()
+
+
+async def test_an_accepted_mcp_card_refreshes_the_mcp_section_of_every_session(tmp_path, monkeypatch):
+    server, live, other = await two_sessions(tmp_path, monkeypatch)
+    try:
+        assert "mcp__docs__q" not in prompt_of(server, other)
+        server.mcp.after_reload = [tool("docs", "q")]
+        payload = dict(op="recipe", type="mcp", root=str(live.perms.cwd), name="docs", server={"command": "true"})
+        card = Proposal(id="m1", kind="mcp", text="add docs", action="", key="m1", payload=payload)
+        await server.learning.apply(card, live)
+        for s in (live, other):
+            assert "mcp__docs__q" in prompt_of(server, s)
+    finally:
+        await server.close()
+
+
+async def test_a_change_of_the_mcp_servers_through_config_refreshes_the_prompt(tmp_path, monkeypatch):
+    server, live, other = await two_sessions(tmp_path, monkeypatch)
+    try:
+        first = prompt_of(server, live)
+        server.mcp.fake = [tool("gamma", "late")]
+        server.apply_file_config(live.perms.cwd)  # the servers did not change: the snapshot stays
+        assert prompt_of(server, live) == first
+        servers = {"gamma": McpServerConfig(command="true")}
+        monkeypatch.setattr(mcpjson, "merged", lambda *_a, **_k: servers)  # e.g. /config set mcp.servers.gamma
+        server.apply_file_config(live.perms.cwd)
+        for s in (live, other):
+            assert "mcp__gamma__late" in prompt_of(server, s)
+    finally:
+        await server.close()
+
+
+async def test_an_empty_first_mcp_snapshot_is_not_kept_once_a_server_connects(tmp_path, monkeypatch):
+    server, live = await started(tmp_path, monkeypatch)
+    try:
+        server.mcp.fake = []  # every server down when the session's first loop is built
+        assert "## MCP tools" not in prompt_of(server, live)
+        server.mcp.fake = [tool("alpha", "read")]
+        named = prompt_of(server, live)
+        assert "mcp__alpha__read" in named
+        server.mcp.fake = [tool("alpha", "read"), tool("beta", "run")]
+        assert prompt_of(server, live) == named  # and now it is the snapshot
+    finally:
+        await server.close()
+
+
+class _Runner:
+    def __init__(self, status: str, error: str = "") -> None:
+        self.state = McpServerState(name="alpha", transport="stdio", status=status, error=error)
+
+
+async def test_a_tool_of_a_crashed_then_restarted_server_is_reported_with_the_servers_state():
+    mcp = McpManager({})
+    mcp._runners["alpha"] = _Runner("failed", "connect timeout")  # type: ignore[assignment]  # restarted: no tools
+    assert await mcp.call("mcp__alpha__read", {}) == {"error": "MCP server alpha is failed: connect timeout"}
+    assert (await mcp.call("mcp__nope__x", {}))["error"] == "Unknown MCP tool: mcp__nope__x"
+
+    other = _Runner("connected")
+    other.state.name, other.state.tools = "beta", [tool("beta", "run")]
+    mcp._runners["beta"] = other  # type: ignore[assignment]
+    reg = ToolRegistry()
+    register_mcp_tools(reg, mcp)
+    found = await reg._tools["mcp_tool_search"][1]({"query": "read"})  # noqa: SLF001
+    assert found["content"].startswith("No matching MCP tools.")
+    assert "alpha (failed: connect timeout)" in found["content"]
+
+
+async def test_the_compaction_size_check_does_not_freeze_a_partial_mcp_section(tmp_path, monkeypatch):
+    # one server is up when the size check runs before the first turn, the other connects before the first loop
+    server, live = await started(tmp_path, monkeypatch)
+    try:
+        server.mcp.fake = [tool("alpha", "read")]
+        assert server._request_tokens(live) > 0
+        server.mcp.fake = [tool("alpha", "read"), tool("beta", "run")]
+        assert "mcp__beta__run" in prompt_of(server, live)
+    finally:
+        await server.close()

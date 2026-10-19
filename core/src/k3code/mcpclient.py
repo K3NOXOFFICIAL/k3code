@@ -242,11 +242,16 @@ class McpManager:
         self._stale = False
         self._lock = asyncio.Lock()  # ensure_started runs on every turn of every session: single-flight
 
-    def configure(self, servers: dict[str, McpServerConfig]) -> None:
-        """Adopt new server definitions; running servers are restarted on the next ``ensure_started``."""
-        if {k: v.model_dump() for k, v in servers.items()} != {k: v.model_dump() for k, v in self.servers.items()}:
+    def configure(self, servers: dict[str, McpServerConfig]) -> bool:
+        """Adopt new server definitions; running servers are restarted on the next ``ensure_started``. True when the
+        set differs from the one held."""
+        changed = {k: v.model_dump() for k, v in servers.items()} != {
+            k: v.model_dump() for k, v in self.servers.items()
+        }
+        if changed:
             self._stale = True
         self.servers = dict(servers)
+        return changed
 
     async def ensure_started(self) -> None:
         async with self._lock:
@@ -322,7 +327,7 @@ class McpManager:
     async def call(self, qualified: str, args: dict[str, Any]) -> dict[str, Any]:
         info = self.find(qualified)
         if info is None:
-            return {"error": f"Unknown MCP tool: {qualified}"}
+            return {"error": self.miss(qualified)}
         runner = self._runners[info.server]
         if runner.state.status != "connected":
             return {"error": f"MCP server {info.server} is {runner.state.status}: {runner.state.error}"}
@@ -336,6 +341,16 @@ class McpManager:
             return {"error": f"MCP call failed: {_describe(e)}"}
         text = "\n".join(getattr(c, "text", None) or f"[{getattr(c, 'type', 'content')}]" for c in res.content)
         return {"error": text or "MCP tool error"} if _attr(res, "is_error", "isError") else {"content": text}
+
+    def miss(self, qualified: str) -> str:
+        """Why ``qualified`` is not callable: its server's state when that server is known but has no such tool (a
+        crashed one is restarted without tools, and a session's prompt may still name them), else just unknown."""
+        for s in self.states():
+            if s.status != "connected" and qualified.startswith(f"mcp__{_SAFE.sub('_', s.name)}__"):
+                return (
+                    f"MCP server {s.name} is {s.status}: {s.error}" if s.error else f"MCP server {s.name} is {s.status}"
+                )
+        return f"Unknown MCP tool: {qualified}"
 
     def search(self, query: str, limit: int = 8) -> list[McpToolInfo]:
         """Tools whose qualified name/description match ``query`` (exact names first)."""

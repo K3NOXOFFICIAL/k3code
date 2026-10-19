@@ -63,6 +63,13 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
     if not tools:
         return
 
+    def down() -> str:
+        """The servers that are configured but not connected, for a search that finds nothing."""
+        bad = [
+            f"{s.name} ({s.status}{': ' + s.error if s.error else ''})" for s in mcp.states() if s.status != "connected"
+        ]
+        return f" Not connected: {', '.join(bad)}." if bad else ""
+
     def make_handler(qualified: str) -> Any:
         async def handler(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
             return await mcp.call(qualified, arguments)
@@ -88,7 +95,7 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         hits = mcp.search(query)
         reg.activate([t.qualified for t in hits])
         if not hits:
-            return {"content": "No matching MCP tools."}
+            return {"content": "No matching MCP tools." + down()}
         body = [{"name": t.qualified, "description": t.description, "input_schema": t.schema} for t in hits]
         return {"content": json.dumps(body, indent=2) + "\n\nThese tools can now be called directly."}
 
