@@ -26,7 +26,6 @@ import { WHEEL_SCROLL_STEP } from "../config/limits.js";
 import { RESIZE_COALESCE_MS } from "../config/timing.js";
 import { hasLeadGap, prevRenderedMsg } from "../domain/blockLayout.js";
 import { SECTION_NAMES, sectionMode } from "../domain/details.js";
-import { ADD_PROVIDER_SLUG } from "../domain/providers.js";
 import {
   composeTabTitle,
   fmtProjectCwdBranch,
@@ -1494,20 +1493,11 @@ export function useMainApp(gw: GatewayClient) {
 
   // /provider popup: Enter switches the session to the picked block; with
   // `--save` it is also written as default_provider for new sessions.
-  // The trailing "+ Add new provider" row (ADD_PROVIDER_SLUG) prints the
-  // chain-add usage template instead of switching.
+  // "+ Add new provider" opens the add form inside the popup, never here.
   const onProviderSelect = useCallback((slug: string, saveDefault: boolean) => {
     patchOverlayState({ providerPicker: false });
-    if (slug === ADD_PROVIDER_SLUG) {
-      sys(
-        "Add a provider block with: /model chain add <provider> <model> " +
-          "[kind=openai|anthropic base_url=... key_env=...]",
-      );
-
-      return;
-    }
     slashRef.current(`/provider ${slug}${saveDefault ? " --save" : ""}`);
-  }, [sys]);
+  }, []);
 
   // /tune popup: Enter / `s`. One tune.set carries the model, effort and ultracode changes; the gateway answers with
   // what changed and pushes a session.info, which updates the status line.
@@ -1681,6 +1671,7 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onModelSelect,
       onPermissionsApply,
+      onProviderNotice: sys,
       onProviderSelect,
       onSettingsApply,
       onTuneApply,
@@ -1712,6 +1703,7 @@ export function useMainApp(gw: GatewayClient) {
       onSettingsApply,
       onTuneApply,
       session,
+      sys,
     ],
   );
 

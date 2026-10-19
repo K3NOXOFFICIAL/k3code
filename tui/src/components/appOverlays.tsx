@@ -178,6 +178,7 @@ export function FloatingOverlays({
   onNewLiveSession,
   onNewPromptSession,
   onPermissionsApply,
+  onProviderNotice,
   onProviderSelect,
   onResumeSelect,
   onSettingsApply,
@@ -194,6 +195,7 @@ export function FloatingOverlays({
   | "onNewLiveSession"
   | "onNewPromptSession"
   | "onPermissionsApply"
+  | "onProviderNotice"
   | "onProviderSelect"
   | "onResumeSelect"
   | "onSettingsApply"
@@ -352,6 +354,7 @@ export function FloatingOverlays({
             gw={gw}
             maxWidth={width}
             onCancel={() => patchOverlayState({ providerPicker: false })}
+            onNotice={onProviderNotice}
             onSelect={onProviderSelect}
             sessionId={sid}
             t={theme}

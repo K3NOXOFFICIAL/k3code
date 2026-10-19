@@ -459,6 +459,8 @@ export interface AppLayoutActions {
   onModelSelect: (value: string) => void;
   /** The /provider popup's Enter: closes it and switches the session's provider. */
   onProviderSelect: (slug: string, saveDefault: boolean) => void;
+  /** The /provider add form's outcome when the popup was closed (Ctrl+C) while it saved: a system line. */
+  onProviderNotice: (text: string) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
   onSettingsApply: (command: string) => void;
   /** The /permissions popup: closes it and dispatches the slash string. */
@@ -534,6 +536,7 @@ export interface AppOverlaysProps {
   onNewPromptSession: (prompt: string, modelArg?: string) => void;
   onPermissionsApply: (command: string) => void;
   onProviderSelect: (slug: string, saveDefault: boolean) => void;
+  onProviderNotice?: (text: string) => void;
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;

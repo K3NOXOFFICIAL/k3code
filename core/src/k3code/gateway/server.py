@@ -28,6 +28,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -40,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from k3code import confio, mcpjson, userhooks, wakewords
@@ -94,7 +96,7 @@ from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
-from k3code.redact import redact, scrub_text
+from k3code.redact import REDACTED, redact, scrub_text, scrub_urls
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, shared_netwatch
 from k3code.reliability import events as rev
 from k3code.reliability.journal import delete_session_journal, prune_journals
@@ -4286,6 +4288,195 @@ async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"provider": _option_for(server, params, entry.name)}
 
 
+#: A provider block name the popup may create: a slug (``/provider <name>`` and ``provider/model`` take it as one word).
+_PROVIDER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+#: The custom kinds the add form offers next to the vendor presets of the setup wizard (``probe.PRESETS``).
+_CUSTOM_PRESETS = {
+    "custom": ("openai", "any OpenAI-compatible endpoint"),
+    "custom-anthropic": ("anthropic", "any Anthropic-compatible endpoint"),
+}
+
+
+async def _provider_presets(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.presets``: the /provider add form's first step, from the setup wizard's own preset list.
+
+    ``key_set`` says whether the preset's variable already holds a key (never the key);
+    ``name`` is a free block name."""
+    from k3code.config import env_value
+    from k3code.setup import probe
+    from k3code.setup.onboard import PROVIDER_HELP
+    from k3code.setup.steps import unique_name
+
+    taken = {p.name.lower() for p in server.config.providers}
+    rows = [
+        {
+            "id": pid,
+            "label": PROVIDER_HELP.get(pid, pid),
+            "kind": spec["kind"],
+            "base_url": spec["base_url"],
+            "key_env": spec["api_key_env"],
+            "keyless": pid == "local",
+            "key_set": bool(env_value(spec["api_key_env"])),
+            "name": unique_name(pid, taken),
+        }
+        for pid, spec in probe.PRESETS.items()
+    ]
+    rows += [
+        {"id": pid, "label": label, "kind": kind, "base_url": "", "key_env": "", "keyless": False, "key_set": False}
+        | {"name": unique_name("endpoint", taken)}
+        for pid, (kind, label) in _CUSTOM_PRESETS.items()
+    ]
+    return {"presets": rows}
+
+
+def _add_form_endpoint(params: dict[str, Any]) -> tuple[str, dict[str, str], str]:
+    """``(preset id, {kind, base_url}, key to send)`` of an add-form request; the key is never part of an error."""
+    from k3code.config import env_value
+    from k3code.setup import probe
+    from k3code.setup.onboard import clean_key
+
+    preset = str(params.get("preset") or "custom")
+    kind = str(params.get("kind") or "")
+    if kind not in ("openai", "anthropic"):
+        raise _InvalidParams("kind must be openai or anthropic")
+    known = probe.PRESETS.get(preset, {})
+    if known:
+        kind = known["kind"]  # a vendor preset speaks its own protocol, whatever the client sent
+    url = str(params.get("base_url") or "").strip().rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, userinfo = parts.hostname, parts.username is not None or parts.password is not None
+    except ValueError:  # e.g. an unclosed IPv6 bracket
+        raise _InvalidParams("base URL must start with http:// or https:// and name a host") from None
+    if parts.scheme not in ("http", "https") or not host or any(c.isspace() for c in url):
+        raise _InvalidParams("base URL must start with http:// or https:// and name a host")
+    if userinfo:  # it would land in config.yaml and the log; the URL is not echoed, it holds a password
+        raise _InvalidParams("base URL must not carry a user name or password: the key goes in the API key field")
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
+    if params.get("reuse_key"):
+        if not known or url != known["base_url"].rstrip("/"):
+            raise _InvalidParams("a saved key is reused only at its own vendor's URL")
+        key = env_value(known["api_key_env"])
+        if not key:
+            raise _InvalidParams(f"{known['api_key_env']} holds no key to reuse")
+        return preset, {"kind": kind, "base_url": url}, key
+    raw = params.get("api_key")
+    key = clean_key(raw) if isinstance(raw, str) else ""
+    if any(c.isspace() or not c.isprintable() or c in _BAD_KEY_CHARS for c in key):
+        raise _InvalidParams("that does not look like an API key (spaces, quotes or control characters): paste the key")
+    return preset, {"kind": kind, "base_url": url}, key
+
+
+async def _provider_probe(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.probe {preset, kind, base_url, api_key? | reuse_key?}``: the setup wizard's live test (list the
+    endpoint's models) for the add form. Models come best first; ``suggested`` is the default model to preselect."""
+    from k3code.setup import probe
+    from k3code.setup.onboard import TIER_MODELS
+
+    preset, entry, key = _add_form_endpoint(params)
+    ok, ms, ids, detail = await asyncio.to_thread(probe.list_models, entry, key)
+    hint = "" if ok else probe.explain(detail)[1]
+    known = TIER_MODELS.get(preset, {}).get("main", "")
+    suggested = known if known in ids else (ids[0] if ids else "")
+    return {"ok": ok, "ms": round(ms), "detail": detail, "hint": hint, "models": ids, "suggested": suggested}
+
+
+async def _provider_add(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.add {preset, name, kind, base_url, model, api_key? | reuse_key?}``: the /provider popup's add form.
+
+    The block is added the way ``/model chain add`` adds one (``chain_config.edit_config``: validate, back up, write
+    config.yaml) and the live providers are rebuilt the same way (``reload_providers``). The key goes where the setup
+    wizard and ``model.save_key`` put it: ``set_env_var`` into the 0600 env file under the block's ``api_key_env``, a
+    variable that held nothing (the vendor preset's own when it is free and the URL is the vendor's, else
+    ``K3CODE_<NAME>_API_KEY``: that variable holds only the vendor's key, as in ``key_env_at``), so no other block's
+    key is replaced; a reused key keeps the preset's variable. Nothing echoes the key: not the reply, an error or the
+    log. A failed config write (any error) removes the key line it stored; a failed reload after the write does not: the
+    reply is the normal one plus a ``warning`` string."""
+    from k3code import chain_config
+    from k3code.setup import probe
+    from k3code.setup.state import read_env_file, set_env_var, unset_env_var
+    from k3code.setup.steps import key_env_for
+
+    preset, entry, key = _add_form_endpoint(params)
+    name = str(params.get("name") or "").strip()
+    if not _PROVIDER_NAME.match(name):
+        raise _InvalidParams("name: a letter, then letters, digits, - or _ (at most 40)")
+    model = str(params.get("model") or "").strip()
+    if not model or any(c.isspace() for c in model):
+        raise _InvalidParams("model: one model id, no spaces")
+    path = chain_config.config_path()
+    # The config lock (reentrant: edit_config takes it again) makes the name check, the choice of a free variable
+    # and both writes one step for every k3code process, so a second add of the same name cannot slip in between.
+
+    def commit() -> tuple[str, str]:
+        """The locked read-modify-write; no await in it, so it runs on a worker thread (the flock does not block the
+        event loop). ``(key variable, backup)``."""
+        with confio.locked(path):
+            try:
+                on_disk = confio.read_yaml(path).get("providers") or []
+            except yaml.YAMLError:
+                raise _InvalidParams(f"cannot read {path}: not valid YAML") from None  # its text may hold anything
+            except (confio.ConfigError, OSError) as e:
+                raise _InvalidParams(f"cannot read {path}: {e}") from None
+            blocks = [p for p in on_disk if isinstance(p, dict)]
+            names = {p.name.lower() for p in server.config.providers} | {str(p.get("name", "")).lower() for p in blocks}
+            if name.lower() in names:
+                raise _InvalidParams(f"a provider named {name} already exists")
+            stored = ""
+            if params.get("reuse_key"):
+                var = probe.PRESETS[preset]["api_key_env"]
+            elif not key:
+                if preset != "local":
+                    raise _InvalidParams("an API key is needed (the local preset is the keyless one)")
+                var = ""  # Ollama takes no key: an empty name declares the block keyless (#107)
+            else:
+                used = {str(p.get("api_key_env") or "") for p in blocks} | {
+                    p.api_key_env for p in server.config.providers
+                }
+                held = {*os.environ, *read_env_file()}
+                own = probe.PRESETS.get(preset, {}).get("api_key_env", "")
+                # the vendor's variable holds only the vendor's key: a key for an edited URL gets a variable of its own
+                at_vendor = own and entry["base_url"] == probe.PRESETS[preset]["base_url"].rstrip("/")
+                free = at_vendor and own not in used and own not in held
+                presets = {s["api_key_env"] for s in probe.PRESETS.values()}
+                var = own if free else key_env_for(name, used | held | presets)
+                try:
+                    set_env_var(var, key)
+                except OSError as e:
+                    raise _InvalidParams(f"cannot write the key file: {e.strerror or type(e).__name__}") from None
+                stored = var
+            args = [name, model, f"kind={entry['kind']}", f"base_url={entry['base_url']}", f"key_env={var}"]
+            try:
+                backup = chain_config.edit_config("add", args)
+            except Exception as e:  # whatever it was, the key line stored above must not outlive the failed add
+                if stored:
+                    unset_env_var(stored)
+                if isinstance(e, yaml.YAMLError):
+                    msg = f"{path} is not valid YAML"
+                elif isinstance(e, chain_config.ChainEditError | OSError):
+                    msg = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                else:  # RuntimeError (a $K3CODE_HOME another user owns), ValueError ...: the class says enough
+                    msg = type(e).__name__
+                if key:
+                    msg = msg.replace(key, REDACTED)
+                raise _InvalidParams(f"could not add {name}: {msg}") from None
+            return var, backup
+
+    var, backup = await asyncio.to_thread(commit)
+    warning = ""
+    try:
+        chain_config.reload_providers(server)
+    except Exception as e:  # the block and key are written for good: report the add, not a failure
+        warning = f"providers not reloaded: {type(e).__name__}; run /reload"
+        logger.warning("provider.add: added %s but the provider reload failed: %s", name, type(e).__name__)
+    logger.info("provider.add: added %s (%s), key variable %s", name, scrub_urls(entry["base_url"]), var or "(keyless)")
+    reply = {"provider": _option_for(server, params, name), "key_env": var, "backup": backup}
+    return reply | {"warning": warning} if warning else reply
+
+
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``model.disconnect {slug}``: remove the saved key of provider ``slug`` and stop using it from the next turn.
 
@@ -4921,6 +5112,9 @@ _HANDLERS: dict[str, Any] = {
     "tune.set": _tune_set,
     "model.save_key": _model_save_key,
     "model.disconnect": _model_disconnect,
+    "provider.presets": _provider_presets,
+    "provider.probe": _provider_probe,
+    "provider.add": _provider_add,
     "config.get": _config_get,
     "config.set": _config_set,
     "setup.status": _setup_status,

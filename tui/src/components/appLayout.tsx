@@ -426,6 +426,7 @@ const ComposerPane = memo(function ComposerPane({
     onNewLiveSession: actions.newLiveSession,
     onNewPromptSession: actions.newPromptSession,
     onPermissionsApply: actions.onPermissionsApply,
+    onProviderNotice: actions.onProviderNotice,
     onProviderSelect: actions.onProviderSelect,
     onResumeSelect: actions.resumeById,
     onSettingsApply: actions.onSettingsApply,
