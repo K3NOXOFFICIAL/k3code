@@ -243,3 +243,27 @@ def test_a_cdpath_in_the_environment_counts_too(monkeypatch: pytest.MonkeyPatch)
     assert _check("cd usr; rm -rf *") is None
     monkeypatch.setenv("CDPATH", "/")
     assert _check("cd usr; rm -rf *") == "rm-rf-root"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cd "$(mktemp -d)" && rm -rf *',
+        'cd "$X" && rm -rf *',
+        'cd "$(mktemp -d)" && rm -rf ./*',
+        'cd "${TMPDIR:-/tmp}/x" && rm -rf *',
+        'cd "`mktemp -d`" && rm -rf *',
+        "cd \"$(printf '%s' \"$d\")\" && rm -rf *",
+    ],
+)
+def test_a_quoted_expansion_never_takes_cd_home(command: str) -> None:
+    # `cd ""` fails (null directory): only an unquoted expansion that gives no word is a plain `cd`
+    assert _check(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd $X && rm -rf *", "cd $(mktemp -d) && rm -rf *", 'cd "$A"$B && rm -rf *', "cd `x` && rm -rf *", "cd ${X}; rm -rf *"],
+)
+def test_an_unquoted_expansion_may_take_cd_home(command: str) -> None:
+    assert _check(command) == "rm-rf-home"

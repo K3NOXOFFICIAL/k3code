@@ -442,7 +442,7 @@ def _check_parsed(
         )
         if hit:
             return hit
-        dirs.follow(argv)
+        dirs.follow(argv, sub)
     hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
     if hit:
         return hit
@@ -1378,6 +1378,31 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
     return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
+def _unquoted_expansion(sub: str) -> bool:
+    """Whether the text ``sub`` has a ``$`` or a backtick outside quotes: an expansion that may give no word at all.
+    A ``$(...)``, backtick or ``${...}`` in double quotes is one unit, skipped whole (see _unit_end)."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c in "$`":
+            if not dquoted:
+                return True
+            end = _unit_end(sub, i)
+            if end == -2:
+                return True  # an unclosed unit: where the quotes end is unknown
+            i = max(i, end)
+        i += 1
+    return False
+
+
 def _join_dir(base: str, t: str) -> str:
     """The directory ``cd t`` goes to from ``base``, normalised (``//x`` is ``/x``)."""
     d = os.path.normpath(os.path.join(base, t))
@@ -1428,8 +1453,9 @@ class _Dirs:
             else:
                 self.all[d] = None
 
-    def follow(self, argv: list[str]) -> None:
-        """Take in the simple command ``argv`` if it changes directory (cd, pushd, popd)."""
+    def follow(self, argv: list[str], sub: str) -> None:
+        """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
+        popd)."""
         name = argv[0] if argv else ""
         if name == "popd":
             self.here = self._stack.pop() if self._stack and len(argv) == 1 else None
@@ -1449,8 +1475,8 @@ class _Dirs:
             self.here = self.home if name == "cd" else None  # pushd alone swaps the top two of the stack
             return
         t = expand_vars(operands[0], self.here, self.home)
-        if name == "cd" and any(c in t for c in "$`"):
-            self._add(self.home)  # unset, `cd $X` is a plain `cd`
+        if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(sub):
+            self._add(self.home)  # unset, `cd $X` is a plain `cd`; `cd "$X"` is `cd ""`, which fails
         unknown = t == "-" or t.startswith("+") or any(c in t for c in "$`~")
         if not unknown and self.cdpath is not None and t[:1] != "/" and t.split("/", 1)[0] not in ("", ".", ".."):
             for entry in ("/", *self.cdpath):  # CDPATH: bash tries its entries for an operand not starting . or ..
