@@ -2541,7 +2541,7 @@ def _risky_component(name: str) -> bool:
 
 def _guarded_tree(path: str) -> str | None:
     """The guarded tree ``path`` (absolute, normalised) lies in: one of _GUARDED_TREES, or another user's home
-    (``/home/bob``; the current user's own home, by its realpath too, is not one). None elsewhere."""
+    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere."""
     for tree in _GUARDED_TREES:
         if _under(path, tree):
             return tree
