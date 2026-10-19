@@ -37,6 +37,9 @@ class Usage:
 EPHEMERAL = {"type": "ephemeral"}
 #: The same with the 1-hour TTL (no beta header needed): written at 2x the input price instead of 1.25x, read alike.
 EPHEMERAL_1H = {"type": "ephemeral", "ttl": "1h"}
+#: ``Message.meta`` key on the leading system message: ``"5m"`` keeps the system breakpoint at 5m even where the
+#: provider uses 1h for the stable prefix (a sub-agent's prompt is unique to it, so a 1h write there is never read back)
+SYSTEM_CACHE_KEY = "system_cache_ttl"
 
 
 def with_cache_breakpoint(content: Any) -> Any:

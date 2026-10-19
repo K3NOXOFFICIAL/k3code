@@ -178,7 +178,9 @@ async def test_a_tool_schema_with_a_ttl_property_never_turns_a_400_into_a_resend
     def handler(req: httpx.Request) -> httpx.Response:
         sent.append(json.loads(req.content))
         if len(sent) < 3:  # a 200 on the third try lets a looping provider end instead of hanging the test
-            return httpx.Response(400, json={"error": {"type": "invalid_request_error", "message": "ttl too long"}})
+            return httpx.Response(
+                400, json={"error": {"type": "invalid_request_error", "message": "cache_control.ttl too long"}}
+            )
         return httpx.Response(200, content=_sse_ok())
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -224,3 +226,137 @@ def test_doctor_shows_the_ttl_policy_per_provider():
     assert by_name["prompt-cache-ttl:forced"].data["stable"] == "1h"
     assert "prompt-cache-ttl:off" not in by_name
     assert by_name["prompt-cache-ttl:gw"].status == WARN
+
+
+# -- sub-agent loops keep 5m on their own system prompt -------------------------------------------------------------
+
+
+class _CapturingProvider:
+    """Records the messages it is sent and ends the run with one text answer."""
+
+    name = "cap"
+    base_url = "https://fake.test"
+
+    def __init__(self) -> None:
+        self.seen: list[list[Message]] = []
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        from k3code.providers.types import StreamEvent, Usage
+
+        self.seen.append(list(messages))
+        yield StreamEvent(type="done", message=Message(role="assistant", content="ok"), usage=Usage())
+
+    async def aclose(self):
+        pass
+
+
+async def _request_after_loop(task_kind: str, tmp_path) -> dict:
+    from k3code.agent.loop import AgentLoop
+    from k3code.router import Router, build_chain
+
+    provider = _CapturingProvider()
+    router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    loop = AgentLoop(router, system_prompt="SYSTEM PROMPT", permission_mode="yolo", cwd=tmp_path, task_kind=task_kind)
+    [e async for e in loop.run("hello")]
+    assert provider.seen and loop.tool_specs()
+    # what AnthropicProvider would put on the wire for the request the loop made
+    p = AnthropicProvider(name="a", base_url=FIRST_PARTY, api_key="k")
+    return p._payload(provider.seen[0], loop.tool_specs(), "claude-test", max_tokens=100, temperature=None)
+
+
+async def test_a_subagent_loop_keeps_1h_on_tools_and_5m_on_its_unique_system_prompt(tmp_path):
+    payload = await _request_after_loop("subagent", tmp_path)
+    assert payload["tools"][-1]["cache_control"] == EPH_1H
+    assert payload["system"] == [{"type": "text", "text": "SYSTEM PROMPT", "cache_control": EPH}]
+    assert json.dumps(payload).count('"ttl"') == 1
+    marks = marks_in_request_order(payload)
+    assert marks[0] == EPH_1H and EPH_1H not in marks[1:]  # the longer TTL still comes first
+
+
+async def test_the_main_loop_keeps_1h_on_tools_and_system(tmp_path):
+    payload = await _request_after_loop("interactive_turn", tmp_path)
+    assert payload["tools"][-1]["cache_control"] == EPH_1H
+    assert payload["system"][0]["cache_control"] == EPH_1H
+
+
+# -- the fallback fires only on an error that names the ttl field ---------------------------------------------------
+
+
+def _refusing_client(status: int, message: str, sent: list[dict]) -> httpx.AsyncClient:
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(req.content))
+        if len(sent) == 1:
+            return httpx.Response(status, json={"error": {"type": "invalid_request_error", "message": message}})
+        return httpx.Response(200, content=_sse_ok())
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "A maximum of 4 blocks with cache_control may be provided. Found 5.",
+        "messages.0.content.0.text: cache_control cannot be set for empty text blocks",
+        "a little cache_control throttle",
+        "ttl too long",
+    ],
+)
+async def test_an_unrelated_400_does_not_turn_1h_off_and_is_not_resent(message):
+    sent: list[dict] = []
+    client = _refusing_client(400, message, sent)
+    p = AnthropicProvider(name="a", base_url=FIRST_PARTY, api_key="k", client=client)
+    with pytest.raises(ProviderError):
+        [e async for e in p.stream(conversation(), TOOLS, "claude-test")]
+    assert len(sent) == 1 and p.long_ttl is True
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [
+        (400, "system.0.cache_control.ephemeral.ttl: Extra inputs are not permitted"),
+        (422, "Extra inputs are not permitted: cache_control.ttl"),
+    ],
+)
+async def test_a_400_or_422_naming_cache_control_ttl_flips_once_logs_and_resends_at_5m(status, message, caplog):
+    sent: list[dict] = []
+    client = _refusing_client(status, message, sent)
+    p = AnthropicProvider(name="a", base_url=FIRST_PARTY, api_key="sk-secret", client=client)
+    with caplog.at_level("WARNING", logger="k3code.providers.anthropic"):
+        events = [e async for e in p.stream(conversation(), TOOLS, "claude-test")]
+    assert any(getattr(e, "text", None) == "ok" for e in events)
+    assert p.long_ttl is False and len(sent) == 2 and '"ttl"' not in json.dumps(sent[1])
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    text = warnings[0].getMessage()
+    assert "api.anthropic.com" in text and "sk-secret" not in text
+    await client.aclose()
+
+
+# -- doctor and provider share one policy ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "base_url,ttl,cache,expected",
+    [
+        (FIRST_PARTY, "auto", "auto", True),
+        (FIRST_PARTY + "/", "auto", "auto", True),
+        (RELAY, "auto", "auto", False),
+        (RELAY, "1h", "auto", True),
+        (FIRST_PARTY, "5m", "auto", False),
+        (FIRST_PARTY, "1h", "off", False),
+    ],
+)
+def test_doctor_and_provider_agree_on_the_ttl_policy(base_url, ttl, cache, expected):
+    from k3code.doctor import check_prompt_cache_ttl
+
+    entry = ProviderEntry(
+        name="p", kind="anthropic", base_url=base_url, api_key_env="K", prompt_cache_ttl=ttl, prompt_cache=cache
+    )
+    provider = AnthropicProvider(name="p", base_url=base_url, api_key="k", prompt_cache=cache, prompt_cache_ttl=ttl)
+    assert provider.long_ttl is expected
+    checks = {c.name: c for c in check_prompt_cache_ttl(Settings(providers=[entry]))}
+    if cache == "off":
+        assert "prompt-cache-ttl:p" not in checks
+    else:
+        assert checks["prompt-cache-ttl:p"].data["stable"] == ("1h" if expected else "5m")

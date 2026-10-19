@@ -27,6 +27,7 @@ from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_win
 from k3code.daemon import k3_home, socket_path
 from k3code.halt import load_halt
 from k3code.paths import ensure_private_dir
+from k3code.providers.anthropic import ttl_policy
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
 from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe, default_internet_probe
@@ -255,9 +256,7 @@ def check_prompt_cache_ttl(config: Settings) -> list[Check]:
             )
         if p.kind != "anthropic" or p.prompt_cache == "off":
             continue
-        first_party = httpx.URL(p.base_url).host == "api.anthropic.com"
-        long_ttl = p.prompt_cache_ttl == "1h" or (p.prompt_cache_ttl == "auto" and first_party)
-        stable = "1h" if long_ttl else "5m"
+        stable = "1h" if ttl_policy(p.base_url, p.prompt_cache_ttl, p.prompt_cache) else "5m"
         checks.append(
             Check(
                 f"prompt-cache-ttl:{p.name}",
