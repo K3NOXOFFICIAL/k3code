@@ -91,7 +91,8 @@ async def test_a_pattern_only_python_accepts_still_searches(project):
 
 
 async def test_a_bad_pattern_without_rg_still_fails(project, no_rg):
-    import re
-
-    with pytest.raises(re.error):
-        await tool_grep({"pattern": "foo("}, cwd=project)
+    # an error naming the fault and how to escape it, not a raised re.error ("Tool execution failed: error: ...")
+    res = await tool_grep({"pattern": "foo("}, cwd=project)
+    assert "matches" not in res
+    assert res["error"].startswith("invalid regex for 'pattern' ('foo('): missing ), unterminated subpattern")
+    assert "escape metacharacters" in res["error"]
