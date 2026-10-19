@@ -16,7 +16,7 @@ import pytest
 
 from k3code.permissions import hardline
 
-HOME = "/home/tester"
+HOME = "/home/dev"
 DEMO = f"{HOME}/projects/demo"
 
 
@@ -156,3 +156,37 @@ def test_xargs_rm_fed_by_any_earlier_printed_word() -> None:
     assert _check("echo ~ | xargs ls | xargs rm -rf") == "rm-rf-home"
     assert _check("echo ~ | xargs rm -f") is None  # not recursive
     assert _check("echo hi | xargs rm -rf") is None
+
+
+# ---- final review round ----
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -euo pipefail -c env",  # a cluster ending in `o` takes the next word as its value
+        "bash -eo pipefail -c printenv",
+        "bash +o posix -c env",
+        "fish --command env",
+        "fish --command=env",
+        "fish --comm env",
+    ],
+)
+def test_a_c_payload_after_value_options_is_read_as_code(command: str) -> None:
+    assert _check(command) == "env-dump"
+
+
+@pytest.mark.parametrize("command", ["sh -- -c env", "bash -c", "fish --command", "bash -o env -c ls"])
+def test_a_word_that_is_not_the_c_payload_is_not_code(command: str) -> None:
+    assert _check(command) is None
+
+
+def test_wrapper_and_eval_chains_read_the_same_command() -> None:
+    wrapped = ["sudo", "nice", "timeout", "5", "env", "X=1", "rm", "-rf", "/"]
+    assert hardline.normalize_argv(wrapped) == ["rm", "-rf", "/"]
+    assert hardline.normalize_argv(["eval", "eval", "rm -rf", "/"]) == ["rm", "-rf", "/"]
+    assert hardline.normalize_argv(["eval", "", "rm", "x"]) == ["rm", "x"]
+    assert hardline.normalize_argv(["eval", "eval", "'"]) == ["'"]
+    assert hardline.normalize_argv(["env", "-S", "sudo rm", "-rf", "/"]) == ["rm", "-rf", "/"]
+    assert hardline.normalize_argv(["eval", "eval"]) == ["eval"]
+    assert _check("sudo " * 50 + "rm -rf ~") == "rm-rf-home"

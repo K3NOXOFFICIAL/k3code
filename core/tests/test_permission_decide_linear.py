@@ -43,6 +43,9 @@ SPELLINGS: dict[str, Callable[[int], str]] = {
     "xargs-pipeline": lambda n: "echo a" + "".join(f" | xargs rm -rf f691_{k}" for k in range(n)),
     "time-braces": lambda n: "time { " * n + "echo hi" + " }" * n,
     "find-exec": lambda n: "find ~" + "".join(f" -exec echo f691_{k} {{}} \\;" for k in range(n)),
+    # wrapper chains (older than the readings above: each wrapper or eval copied or re-split the rest of the words)
+    "eval-chain": lambda n: "eval " * n + "echo hi",
+    "sudo-chain": lambda n: "sudo " * n + "echo hi",
 }
 
 

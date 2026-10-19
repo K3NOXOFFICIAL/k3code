@@ -1003,20 +1003,23 @@ def _env_long_option(key: str) -> str:
 def _skip_wrapper_options(
     name: str,
     args: list[str],
+    start: int,
     spec: tuple[str, frozenset[str], int],
     reads: list[str] | None = None,
     chdirs: list[str] | None = None,
     replaces: list[str] | None = None,
-) -> list[str]:
-    """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
-    none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
-    option's place and are parsed in turn as env's own options, assignments and command, so ``env -S '-u PATH'`` is
-    ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make' test`` runs ``make test``."""
+) -> tuple[list[str], int]:
+    """Where the wrapped command starts in ``args`` when the wrapper's own options (and its ``positionals``) start at
+    ``start`` (past the end when there is none), and the words that index is in: ``args`` itself, or a new list when an
+    ``env -S`` string put its words in (``args`` is never changed, and not copied otherwise, so a chain of wrappers
+    costs time linear in its words). ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it:
+    the words of STRING take the option's place and are parsed in turn as env's own options, assignments and command,
+    so ``env -S '-u PATH'`` is ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make'
+    test`` runs ``make test``."""
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
     chdir_short, chdir_long = _WRAPPER_CHDIR_OPTS.get(name, ("", frozenset()))
-    args = list(args)
-    i = 0
+    i = start
     while i < len(args):
         a = args[i]
         if a == "--":
@@ -1065,8 +1068,9 @@ def _skip_wrapper_options(
         else:
             break
         i += 1
-        args[i:i] = split  # STRING's words are never longer than STRING, so this ends
-    return args[i + positionals :]
+        if split:  # STRING's words are never longer than STRING, so this ends
+            args = [*args[:i], *split, *args[i:]]
+    return args, i + positionals
 
 
 def normalize_argv(
@@ -1083,19 +1087,34 @@ def normalize_argv(
     ``replaces`` the strings ``xargs -I``/``-i``/``--replace`` swaps for its input in the command it runs.
     """
     argv = list(tokens)
+    # the words are walked with an index (argv[s] is the next one to read), not copied once per wrapper or eval, so a
+    # chain of thousands of them costs time linear in its length. eval re-splits its words only from the first one a
+    # re-split can change (whitespace, a quote, a backslash, an empty word): the plain words before it come back as they
+    # are. argv[s + 1 : plain] are known to be plain, argv[fixed:] to come back unchanged from a re-split.
+    s, plain, fixed = 0, 0, len(argv) + 1
     # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
     for _ in range(sum(len(t) + 1 for t in tokens) + 1):
-        while argv and _is_assignment(argv[0]):
-            argv = argv[1:]
-        if not argv:
+        while s < len(argv) and _is_assignment(argv[s]):
+            s += 1
+        if s >= len(argv):
             return []
-        name = os.path.basename(argv[0]) or argv[0]
-        argv = [name, *argv[1:]]
-        if name == "eval" and len(argv) > 1:
-            argv = _tokens(" ".join(argv[1:]))
+        name = os.path.basename(argv[s]) or argv[s]
+        if name == "eval" and s + 1 < len(argv):
+            k = max(s + 1, plain)
+            while k < len(argv) and k < fixed and argv[k] and not _RESPLIT_CHANGES.search(argv[k]):
+                k += 1
+            plain = k
+            if k < len(argv) and k < fixed:
+                tail = _tokens(" ".join(argv[k:]))
+                if tail == argv[k:]:
+                    fixed = k
+                else:
+                    argv = [*argv[:k], *tail]
+                    fixed = len(argv) + 1
+            s += 1
             continue
         if name == "git":
-            i = 1
+            i = s + 1
             while i < len(argv) and argv[i].startswith("-"):
                 if argv[i] == "-C" and chdirs is not None and i + 1 < len(argv):
                     chdirs.append(argv[i + 1])
@@ -1103,12 +1122,19 @@ def normalize_argv(
             return [name, *argv[i:]]
         spec = _WRAPPER_SPECS.get(name)
         if spec is None:
-            return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec, reads, chdirs, replaces)
-        if not rest:
-            return argv
-        argv = rest
-    return argv
+            return [name, *argv[s + 1 :]]
+        words, rest = _skip_wrapper_options(name, argv, s + 1, spec, reads, chdirs, replaces)
+        if rest >= len(words):
+            return [name, *argv[s + 1 :]]
+        if words is not argv:  # an env -S string put its words in: the words after them moved
+            argv, plain, fixed = words, rest, len(words) + 1
+        s = rest
+    return argv[s:]
+
+
+#: A character that makes eval's re-split of a word give something other than the word: shlex's whitespace, quotes
+#: and escape character.
+_RESPLIT_CHANGES = re.compile(r"[ \t\r\n'\"\\]")
 
 
 #: Commands that download content, and commands that run what they are fed as code.
@@ -1984,15 +2010,20 @@ _SHELL_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"
 
 def _shell_c_code(argv: list[str]) -> list[str]:
     """The command string of a shell run with ``-c`` (``sh -c CMD``, ``bash -lc CMD``, ``bash -o pipefail -c CMD``):
-    the first word after the options, when an option cluster has a ``c``; else nothing."""
+    the first word after the options, when an option cluster has a ``c``; else nothing. A cluster ending in ``o``/``O``
+    takes the next word as its value (``bash -euo pipefail -c CMD``); fish also takes ``--command CMD`` (any prefix of
+    it down to ``--c``, as its getopt does) and ``--command=CMD``."""
     code, i = False, 1
     while i < len(argv) and argv[i][:1] in ("-", "+") and len(argv[i]) > 1:
         a = argv[i]
         if a == "--":
             i += 1
             break
+        key, eq, value = a.partition("=")
+        if argv[0] == "fish" and len(key) >= 3 and "--command".startswith(key):
+            return [value] if eq else argv[i + 1 : i + 2]
         code = code or (a[0] == "-" and not a.startswith("--") and "c" in a[1:])
-        i += 2 if a in _SHELL_VALUE_OPTS else 1
+        i += 2 if a in _SHELL_VALUE_OPTS or (not a.startswith("--") and a[-1] in "oO") else 1
     return [argv[i]] if code and i < len(argv) else []
 
 
