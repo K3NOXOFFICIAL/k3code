@@ -1526,15 +1526,23 @@ class _Dirs:
         t = expand_vars(operands[0], self.here, self.home)
         if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(sub):
             self._add(self.home)  # unset, `cd $X` is a plain `cd`; `cd "$X"` is `cd ""`, which fails
-        unknown = t == "-" or t.startswith("+") or any(c in t for c in "$`~")
-        if not unknown and self.cdpath is not None and t[:1] != "/" and t.split("/", 1)[0] not in ("", ".", ".."):
+        if t == "-" or t.startswith("+") or any(c in t for c in "$`~"):
+            self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user
+            return
+        if t[:1] == "/":
+            self.here = _join_dir("/", t)
+            self._add(self.here)
+            return
+        # relative: from here, or from every directory the line may be in when here is unknown (fail closed)
+        bases = [self.here] if self.here is not None else [d for d in self.all if d is not None]
+        joined = list(dict.fromkeys(_join_dir(b, t) for b in bases))
+        for d in joined:
+            self._add(d)
+        self.here = joined[0] if len(joined) == 1 else None
+        if self.cdpath is not None and t.split("/", 1)[0] not in ("", ".", ".."):
             for entry in ("/", *self.cdpath):  # CDPATH: bash tries its entries for an operand not starting . or ..
                 self._add(_join_dir(entry, t))
-        if unknown or (self.here is None and t[:1] != "/"):
-            self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user, relative to unknown
-            return
-        self.here = _join_dir(self.here or "/", t)
-        self._add(self.here)
+            self.here = None  # it may have gone to any of them
 
 
 def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = False) -> str | None:

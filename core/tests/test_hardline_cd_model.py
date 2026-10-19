@@ -398,3 +398,38 @@ def test_an_and_chain_after_a_cd_still_reads_every_earlier_directory(
 ) -> None:
     monkeypatch.delenv("CDPATH", raising=False)
     assert _check(command, cwd=cwd) == rule
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        # one payload read once for subs in different directories: a relative cd in it starts from each of them
+        ("bash -c 'cd ../..; rm -rf *'; cd /tmp; bash -c 'cd ../..; rm -rf *'", "rm-rf-home"),
+        ("echo $(cd ../..; rm -rf *); cd /tmp; echo $(cd ../..; rm -rf *)", "rm-rf-home"),
+        # a relative cd after a cd to an unknown place (OLDPWD, popd, a variable) starts from every directory
+        ("cd /usr/lib; cd /tmp; cd -; cd ..; rm -rf *", "rm-rf-root"),
+        ("cd /usr/lib; pushd /tmp; popd; cd ..; rm -rf *", "rm-rf-root"),
+        ("cd /usr/lib; cd ~-; cd ..; rm -rf *", "rm-rf-root"),
+        ("CDPATH=/usr/lib cd x; cd ..; rm -rf *", "rm-rf-root"),  # here is unknown after a CDPATH cd
+    ],
+)
+def test_a_relative_cd_from_an_unknown_directory_starts_from_every_possible_one(
+    command: str, rule: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check(command, cwd=f"{HOME}/proj/x") == rule
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'cd build; rm -rf *'; cd /tmp; bash -c 'cd build; rm -rf *'",
+        "cd /tmp; cd -; cd build; rm -rf *",
+        "cd $X; cd build; rm -rf ./out",
+    ],
+)
+def test_a_relative_cd_from_an_unknown_directory_into_a_harmless_one_is_not_hardline(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check(command, cwd=f"{HOME}/proj/x") is None
