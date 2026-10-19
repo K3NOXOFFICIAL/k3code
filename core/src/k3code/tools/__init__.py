@@ -1187,23 +1187,36 @@ def _stop_worker(proc: Any) -> None:
 
 
 def _walk_filter(
-    path: Path, real_base: str, includes: list[str], excludes: list[str], secret_file: Callable[[str], bool]
+    path: Path, real_base: str, includes: list[str], excludes: list[str], secret_file: Callable[..., bool]
 ) -> Callable[[str], bool | None]:
     """The fallback's rule for a walked file ``rel``: None to leave it out (include, exclude, a link on the way),
-    False for a credential file the search withholds (counted), True to search it."""
+    False for a credential file the search withheld (counted), True to search it.
+
+    A file is judged by its name below ``real_base`` (``path`` resolved), not by a realpath of its own: that cost about
+    eight realpath calls (a hundred lstat) per file. Each directory the walk enters is resolved once and must be
+    ``real_base/dir`` (no link on the way); a link as the file itself, or one swapped in after this check, is never
+    opened: the worker opens every component with O_NOFOLLOW (see grep_worker.Beneath)."""
+    entered: dict[str, bool] = {}  # directory below path -> it resolves to real_base/directory
+
+    def link_free(d: str) -> bool:
+        if (ok := entered.get(d)) is None:
+            try:
+                ok = os.path.realpath(path / d) == os.path.join(real_base, d)
+            except OSError:  # realpath raises when a link is swapped for a directory mid-resolve
+                ok = False
+            entered[d] = ok
+        return ok
 
     def allowed(rel: str) -> bool | None:
         if includes and not any(_search_glob_match(rel, p) for p in includes):
             return None
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             return None
-        fp = str(path / rel)
-        try:
-            if os.path.realpath(fp) != os.path.join(real_base, rel):
-                return None  # a link met before the open is never opened; the worker opens no link either
-            return not secret_file(fp)  # the tree walk lists hidden files too: dotenv files and key dirs stay out
-        except OSError:  # realpath raises when a link is swapped for a directory mid-resolve: the file stays unread
-            return None
+        d = rel.rpartition("/")[0]
+        if d and not link_free(d):
+            return None  # below a link: never opened, the worker opens no link either
+        # the tree walk lists hidden files too: dotenv files and key dirs stay out
+        return not secret_file(str(path / rel), real=os.path.join(real_base, rel))
 
     return allowed
 

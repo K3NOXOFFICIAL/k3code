@@ -2539,16 +2539,18 @@ def _risky_component(name: str) -> bool:
     return (name.startswith(".") and not _benign_dot(name)) or bool(_CREDENTIAL_NAME.fullmatch(name))
 
 
-def _guarded_tree(path: str) -> str | None:
+def _guarded_tree(path: str, own: list[str] | None = None) -> str | None:
     """The guarded tree ``path`` (absolute, normalised) lies in: one of _GUARDED_TREES, or another user's home
-    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere."""
+    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere. ``own`` is
+    _home_prefixes(), for a caller that checks many paths."""
     for tree in _GUARDED_TREES:
         if _under(path, tree):
             return tree
     for homes in _HOMES_DIRS:
         if path.startswith(homes + "/"):
             home = homes + "/" + path[len(homes) + 1 :].split("/", 1)[0]
-            own = _home_prefixes()  # $HOME/ as written and by realpath
+            if own is None:
+                own = _home_prefixes()  # $HOME/ as written and by realpath
             if home + "/" not in own and _real(home) + "/" not in own:
                 return home
     return None
@@ -2671,7 +2673,7 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     )
 
 
-def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[[str], bool]:
+def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[..., bool]:
     """Which files a search below ``searched`` (grep or glob over a directory) returns nothing of: a credential file
     (sensitive_path); a file in a credential store of ``$HOME`` (see _home_stores) that ``searched`` is not itself
     inside (a search of the store was decided on that path); and, in a search of ``$HOME`` or a directory above it,
@@ -2691,16 +2693,21 @@ def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[[
     stores = [s.casefold().rstrip("/") for s in _home_stores() if not _stores_holding(inside, [s])]
     exact, below = frozenset(stores), tuple(s + "/" for s in stores)
     homes = _home_prefixes() if _inside(os.path.expanduser("~"), [searched]) else []
+    # resolved once per search, not once per file: each costs a realpath (an lstat per component) of $HOME's entries
+    dirs, own = _folded_secret_dirs(), _home_prefixes()
 
-    def withheld(path: str) -> bool:
-        if sensitive_path(path):
+    def withheld(path: str, real: str | None = None) -> bool:
+        """``real``: the realpath of ``path`` when the caller knows it, so it is not resolved again. The grep
+        fallback's walk passes the file's name below the resolved directories it entered: its worker opens no link
+        on the way (see grep_worker.Beneath), so the file it reads is that one or none."""
+        if sensitive_path(path, dirs, real=real):
             return True
-        spellings = _spellings(path)
+        spellings = _spellings(path) if real is None else list(dict.fromkeys((_flat(path), real)))
         for p in spellings:
             low = p.casefold()
             if low in exact or low.startswith(below) or _below_home_dot(p, homes):
                 return True
-        return strict and _outside_withheld(_flat(path), spellings, inside, tops)
+        return strict and _outside_withheld(_flat(path), spellings, inside, tops, own)
 
     return withheld
 
@@ -2711,15 +2718,16 @@ def outside_search_withheld(searched: str, roots: list[str]) -> Callable[[str], 
     return None if _inside(searched, roots) else search_withheld(searched, roots)
 
 
-def _outside_withheld(flat: str, spellings: list[str], inside: list[str], tops: list[str]) -> bool:
+def _outside_withheld(flat: str, spellings: list[str], inside: list[str], tops: list[str], own: list[str]) -> bool:
     """search_withheld's check for a search outside the roots: ``flat`` (the file as the walk names it, normalised)
     is withheld unless it lies below a spelling of the searched directory (``inside``, ``tops`` with a trailing slash)
-    with no risky component there, and no spelling of it is in a guarded tree the search did not start in."""
+    with no risky component there, and no spelling of it is in a guarded tree the search did not start in. ``own``:
+    _home_prefixes()."""
     rel = next((flat[len(t) :] for t in tops if flat.startswith(t)), None)
     if rel is None or any(_risky_component(c) for c in rel.split("/") if c):
         return True
     for p in spellings:
-        tree = _guarded_tree(p)
+        tree = _guarded_tree(p, own)
         if tree and not any(_under(s, tree) for s in inside):
             return True
     return False
@@ -2781,24 +2789,27 @@ def windows_profile_secret(path: str, drives: list[str] | None = None) -> bool:
     return False
 
 
-def sensitive_path(path: str, dirs: list[str] | None = None) -> bool:
+def sensitive_path(path: str, dirs: list[str] | None = None, *, real: str | None = None) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
     (``/proc/*/environ``), a dotenv file, or the keys and credential stores of a Windows profile WSL mounts (see
     :func:`windows_profile_secret`). Checked on the path as written and on its realpath (symlinks), and
     case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files. ``dirs``
-    is :func:`_folded_secret_dirs`, for a caller that checks many paths."""
-    if secret_store(path, dirs):
+    is :func:`_folded_secret_dirs`, for a caller that checks many paths; ``real`` is the realpath of ``path`` when the
+    caller already knows it (see search_withheld)."""
+    if secret_store(path, dirs, real=real):
         return True
-    return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), _real(path))))
+    real = _real(path) if real is None else real
+    return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), real)))
 
 
-def secret_store(path: str, dirs: list[str] | None = None) -> bool:
+def secret_store(path: str, dirs: list[str] | None = None, *, real: str | None = None) -> bool:
     """``path`` (absolute) is in a key or credential store (``sensitive_path`` without the dotenv files): the secret
     dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
-    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
+    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133). ``real``: the
+    realpath of ``path`` when the caller already knows it (see search_withheld)."""
     folded_dirs = dirs if dirs is not None else _folded_secret_dirs()
-    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
+    for p in dict.fromkeys((os.path.normpath(path), _real(path) if real is None else real)):
         folded = p.lower()
         if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in folded_dirs):
             return True
