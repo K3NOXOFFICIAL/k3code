@@ -224,7 +224,8 @@ def normalize_arguments(tool: str, schema: dict[str, Any] | None, args: Any) -> 
     alias is present), an unknown argument is rejected, path-like values lose surrounding whitespace/quotes, a
     ``file://`` scheme and a leading ``~``, a URL loses surrounding whitespace/quotes, and an empty command, pattern
     or query is rejected. For every tool: a string that is exactly a number or boolean the schema asks for is
-    converted, and a null for an optional argument whose type does not allow null is dropped. Everything after this (schema check, permission engine, hooks, guards, handler) sees the result."""
+    converted, and a null for an optional argument whose type does not allow null is dropped. Everything after this
+    (schema check, permission engine, hooks, guards, handler) sees the result."""
     if not isinstance(args, dict) or not isinstance(schema, dict) or schema.get("type", "object") != "object":
         return Normalized(args)
     props = schema.get("properties") or {}
