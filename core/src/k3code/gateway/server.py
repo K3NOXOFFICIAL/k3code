@@ -316,6 +316,9 @@ class LiveSession:
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
+        #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
+        #: compaction or an /undo): the size of the context as the provider counted it.
+        self.last_prompt_tokens = 0
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -2240,6 +2243,10 @@ class GatewayServer:
             **router_options(self.config),
         )
 
+    def _context_max(self, session: LiveSession) -> int:
+        """The window of the session's active model: the denominator of the context usage shown to clients."""
+        return context_window(self.config, self._active_model(session))
+
     def _router_window(self, router: Router, session: LiveSession) -> int:
         """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
         has its own), so in-turn elision starts before the tightest model overflows."""
@@ -2531,7 +2538,7 @@ class GatewayServer:
             "message.complete",
             {
                 "text": final_text,
-                "usage": _usage_payload(usage),
+                "usage": _usage_payload(usage, self._context_max(session)),
                 "status": status,
                 "error": error,
                 "error_surface": _error_surface(session.last_exc) if status == "error" else None,
@@ -2709,6 +2716,7 @@ class GatewayServer:
             return 0
         if folded:
             session.stored.messages = new
+            session.last_prompt_tokens = 0  # the reported size described the history before it was folded
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
             # be matched to its turn, so their outcomes stop waiting for one
             self.learning.settle_turns(session.session_id)
@@ -2804,7 +2812,8 @@ class GatewayServer:
                 session.call_started = None
                 session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:
-                    session.emit("session.usage", {"usage": _usage_payload(u)})
+                    session.last_prompt_tokens = max(0, u.prompt_tokens)
+                    session.emit("session.usage", {"usage": _usage_payload(u, self._context_max(session))})
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
                 for tc in msg.tool_calls:
                     self._announce_tool(session, tc)
@@ -3584,9 +3593,26 @@ def _file_keys(base: Path) -> set[str]:
     return keys
 
 
-def _usage_payload(usage: Usage) -> dict[str, Any]:
-    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens."""
+def _context_fields(used: int, window: int) -> dict[str, int]:
+    """``context_used`` / ``context_max`` / ``context_percent`` (percent capped at 100; ``context_used`` is not);
+    empty when either is unknown, so clients hide the segment."""
+    if used <= 0 or window <= 0:
+        return {}
+    return {"context_used": used, "context_max": window, "context_percent": min(100, round(100 * used / window))}
+
+
+def _usage_payload(usage: Usage, context_max: int = 0) -> dict[str, Any]:
+    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens.
+
+    ``usage`` is one model request's (the last of the turn for ``message.complete``), so its prompt_tokens is the
+    current context size. ``cache_hit_pct`` is present only when the provider reported cache reads; the context keys
+    only with ``context_max`` and a reported prompt (clients hide a segment whose key is missing)."""
+    extra: dict[str, int] = {}
+    if usage.cache_read_tokens > 0 and usage.prompt_tokens > 0:
+        extra["cache_hit_pct"] = round(100 * usage.cache_read_tokens / usage.prompt_tokens)
+    extra.update(_context_fields(usage.prompt_tokens, context_max))
     return {
+        **extra,
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
@@ -4674,6 +4700,7 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     # failures, not "finished" (issue #140)
     server.learning.turn_undone(session, last_user)
     session.messages = messages[:last_user]
+    session.last_prompt_tokens = 0
     server.store.save(session.stored)
     return {"removed": len(messages) - last_user}
 
@@ -4686,12 +4713,18 @@ async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[
     rows = server.usage.aggregate(by="session", session=session.session_id)
     row = rows[0] if rows else {}
     t_in, t_out = int(row.get("tokens_in") or 0), int(row.get("tokens_out") or 0)
+    reported = session.last_prompt_tokens > 0
+    used = session.last_prompt_tokens if reported else server._request_tokens(session)
+    ctx = _context_fields(used, server._context_max(session))
+    if ctx:
+        ctx["context_estimated"] = not reported
     return {
         "model": session.stored.model or server.config.default_model,
         "input": t_in,
         "output": t_out,
         "total": t_in + t_out,
         "calls": int(row.get("calls") or 0),
+        **ctx,
     }
 
 
