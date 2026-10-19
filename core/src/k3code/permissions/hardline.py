@@ -35,7 +35,7 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     (
         "git-push-force-main",
         r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)"
-        r"(?=[^\n;|&]*(?:[\s:+]|refs/heads/)(?:main|master)(?![^\s;|&]))",
+        r"(?=[^\n;|&]*(?:[\s:+]|refs/heads/)(?i:main|master)(?![^\s;|&]))",
     ),
 ]
 
@@ -1204,6 +1204,12 @@ def _fetch_run_check(argv: list[str], payloads: list[str]) -> str | None:
 _MAIN_REFS = frozenset({"main", "master", "refs/heads/main", "refs/heads/master"})
 
 
+def _is_main_ref(ref: str) -> bool:
+    """``ref`` names main/master, in any letter case: this repository's default branch is ``Main``, and the shared
+    drvfs/macOS checkouts fold case anyway. Over-denying a branch that differs from main only in case is cheap."""
+    return ref.lower() in _MAIN_REFS
+
+
 def _git_push_check(argv: list[str]) -> str | None:
     """``git push`` with a force flag or a ``+refspec`` onto main/master, ``--delete``/``-d`` or an empty-source
     refspec (``:main``) deleting main/master, or ``--mirror``. A force push without a refspec (the upstream, unknown
@@ -1225,13 +1231,13 @@ def _git_push_check(argv: list[str]) -> str | None:
         if not a.startswith("-"):
             positional.append(a)
     # with --delete every operand is a ref to delete (a lone `git push --delete main` too, whatever git reads it as)
-    if delete and any(p.lstrip("+") in _MAIN_REFS for p in positional):
+    if delete and any(_is_main_ref(p.lstrip("+")) for p in positional):
         return "git-push-delete-main"
     for refspec in positional[1:]:
         src, colon, dst = refspec.lstrip("+").rpartition(":")
-        if dst in _MAIN_REFS and colon and not src:
+        if _is_main_ref(dst) and colon and not src:
             return "git-push-delete-main"
-        if dst in _MAIN_REFS and (force or refspec.startswith("+")):
+        if _is_main_ref(dst) and (force or refspec.startswith("+")):
             return "git-push-force-main"
     return None
 

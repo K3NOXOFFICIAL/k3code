@@ -511,3 +511,35 @@ def test_builtin_git_allows_do_not_cover_lookalike_subcommands_or_external_progr
         assert action(cmd) == "ask", cmd
     for cmd in ("git diff", "git diff --stat", "git log", "git log --oneline -5", "git status", "git status -s"):
         assert action(cmd) == "allow", cmd
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # this repository's default branch is `Main`: the check must not depend on the letter case
+        "git push --force origin Main",
+        "git push -f origin MAIN",
+        "git push origin +Main",
+        "git push origin HEAD:Main --force",
+        "git push --force-with-lease origin refs/heads/Main",
+        "git push --delete origin Main",
+        "git push origin :Main",
+        "git push --force origin Master",
+    ],
+)
+def test_force_push_and_delete_of_main_are_denied_in_any_letter_case(command):
+    assert hardline.check(command) in ("git-push-force-main", "git-push-delete-main"), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin Main",
+        "git push --force origin fix/Main",
+        "git push --force origin Main-docs",
+        "git push --force origin feature",
+        "git push origin HEAD:feature --force",
+    ],
+)
+def test_the_main_check_does_not_catch_look_alike_branches_or_plain_pushes(command):
+    assert hardline.check(command) is None, command
