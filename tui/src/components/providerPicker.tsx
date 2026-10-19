@@ -16,6 +16,7 @@ import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import type { Theme } from "../theme.js";
 
 import { OverlayHint, windowItems } from "./overlayControls.js";
+import { ProviderAddForm } from "./providerAddForm.js";
 import { chipRowProps, clampOverlayWidth } from "./overlayPrimitives.js";
 
 const VISIBLE = 12;
@@ -27,9 +28,12 @@ const MAX_WIDTH = 90;
  * `model.options`, marks the active one (`*`), and switches the session to
  * the highlighted block on Enter. `Ctrl+G` toggles `--save` (also write it
  * as `default_provider`); `/provider <name> [--save]` typed still goes to
- * the gateway. Stays shut while a prompt waits for an answer.
+ * the gateway. "+ Add new provider" opens the add form (providerAddForm.tsx)
+ * in the popup; after a save the list comes back with the new block
+ * highlighted, to switch to now (Enter) or later (Esc). Stays shut while a
+ * prompt waits for an answer.
  */
-type Stage = "key" | "list";
+type Stage = "add" | "key" | "list";
 
 export function ProviderPicker({
   gw,
@@ -48,6 +52,7 @@ export function ProviderPicker({
   const [keyInput, setKeyInput] = useState("");
   const [keySaving, setKeySaving] = useState(false);
   const [keyError, setKeyError] = useState("");
+  const [added, setAdded] = useState("");
   const overlay = useStore($overlayState);
   const locked = tuneLocked(overlay);
   const { stdout } = useStdout();
@@ -57,7 +62,7 @@ export function ProviderPicker({
     maxWidth,
   );
 
-  const fetchOptions = () => {
+  const fetchOptions = (focus = "") => {
     setLoading(true);
     gw.request<ModelOptionsResult>("model.options", {
       ...(sessionId ? { session_id: sessionId } : {}),
@@ -75,7 +80,8 @@ export function ProviderPicker({
 
         const next = (r.providers ?? []) as ProviderPickerEntry[];
         setProviders(next);
-        setIdx(initialProviderIdx(next));
+        const at = focus ? next.findIndex((p) => p.slug === focus) : -1;
+        setIdx(at >= 0 ? at : initialProviderIdx(next));
         setErr("");
         setLoading(false);
       })
@@ -99,7 +105,7 @@ export function ProviderPicker({
   // Key stage (inline API-key paste, ModelPicker pattern): raw useInput,
   // printable append, backspace delete, Ctrl+U clear, Enter submit, Esc back.
   useInput((ch, key) => {
-    if (locked) {
+    if (locked || stage === "add") {
       return;
     }
 
@@ -208,7 +214,8 @@ export function ProviderPicker({
       }
 
       if (isAddProviderRow(row.entry)) {
-        onSelect(row.entry.slug, saveDefault);
+        setAdded("");
+        setStage("add");
 
         return;
       }
@@ -241,7 +248,8 @@ export function ProviderPicker({
       }
 
       if (isAddProviderRow(row.entry)) {
-        onSelect(row.entry.slug, saveDefault);
+        setAdded("");
+        setStage("add");
 
         return;
       }
@@ -282,6 +290,24 @@ export function ProviderPicker({
         <Text color={t.color.muted}>no providers configured</Text>
         <OverlayHint t={t}>Esc/q cancel</OverlayHint>
       </Box>
+    );
+  }
+
+  if (stage === "add") {
+    return (
+      <ProviderAddForm
+        existingNames={providers.map((p) => p.slug)}
+        gw={gw}
+        onCancel={() => setStage("list")}
+        onSaved={(slug) => {
+          setStage("list");
+          setAdded(slug);
+          fetchOptions(slug);
+        }}
+        sessionId={sessionId}
+        t={t}
+        width={width}
+      />
     );
   }
 
@@ -364,6 +390,12 @@ export function ProviderPicker({
           ? ` ↓ ${rows.length - offset - VISIBLE} more`
           : " "}
       </Text>
+
+      {added ? (
+        <Text color={t.color.accent} wrap="truncate-end">
+          added {added} · Enter use now · Esc later
+        </Text>
+      ) : null}
 
       {current?.warning ? (
         <Text color={t.color.label} wrap="truncate-end">

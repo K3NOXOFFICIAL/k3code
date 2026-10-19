@@ -49,9 +49,9 @@ export function providerPickerRows(
 }
 
 /**
- * Trailing "+ Add new provider" row: picking it prints the chain-add usage
- * (chain_config.apply_edit's `add` grammar) instead of switching providers.
- * The slug is magic -- never a real provider block name.
+ * Trailing "+ Add new provider" row: picking it opens the popup's add form
+ * (providerAddForm.tsx) instead of switching providers. The slug is magic --
+ * never a real provider block name.
  */
 export const ADD_PROVIDER_SLUG = "__add_provider__";
 
@@ -59,10 +59,6 @@ export const ADD_PROVIDER_ROW: ProviderPickerEntry = {
   name: "+ Add new provider...",
   slug: ADD_PROVIDER_SLUG,
 };
-
-/** Chain-add template printed when the trailing row is picked. */
-export const ADD_PROVIDER_USAGE =
-  "/model chain add <provider> <model> [kind=openai|anthropic base_url=... key_env=...]";
 
 export function isAddProviderRow(entry: ProviderPickerEntry): boolean {
   return entry.slug === ADD_PROVIDER_SLUG;
