@@ -169,6 +169,26 @@ async def test_a_400_without_a_ttl_in_the_request_is_raised_as_before():
     await client.aclose()
 
 
+@pytest.mark.parametrize("base_url,expected_tries", [(RELAY, 1), (FIRST_PARTY, 2)])
+async def test_a_tool_schema_with_a_ttl_property_never_turns_a_400_into_a_resend_loop(base_url, expected_tries):
+    schema = {"type": "object", "properties": {"ttl": {"type": "string"}}}
+    tools = [*TOOLS, ToolSpec(name="cache_set", description="set", parameters=schema)]
+    sent: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(req.content))
+        if len(sent) < 3:  # a 200 on the third try lets a looping provider end instead of hanging the test
+            return httpx.Response(400, json={"error": {"type": "invalid_request_error", "message": "ttl too long"}})
+        return httpx.Response(200, content=_sse_ok())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    p = AnthropicProvider(name="a", base_url=base_url, api_key="k", client=client)
+    with pytest.raises(ProviderError):
+        [e async for e in p.stream(conversation(), tools, "claude-test")]
+    assert len(sent) == expected_tries
+    await client.aclose()
+
+
 def test_prompt_cache_ttl_is_validated_and_reaches_the_anthropic_provider():
     base = {"name": "a", "kind": "anthropic", "base_url": RELAY, "api_key_env": "K"}
     with pytest.raises(ValidationError):

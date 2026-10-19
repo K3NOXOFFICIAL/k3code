@@ -116,6 +116,7 @@ class AnthropicProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         while True:
+            sent_ttl = self.long_ttl and bool(tools)  # from the policy, not the body: a tool schema may say "ttl"
             payload = self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature)
             request = self._client.build_request(
                 "POST",
@@ -135,7 +136,6 @@ class AnthropicProvider(Provider):
             error = await _error_from_response(response)
             await response.aclose()
             text = f"{error.message} {error.body}"
-            sent_ttl = '"ttl"' in json.dumps(payload)
             if sent_ttl and response.status_code == 400 and ("ttl" in text or "cache_control" in text):
                 self.long_ttl = False  # this endpoint refuses the 1h TTL: drop it for good, resend once with 5m
                 continue

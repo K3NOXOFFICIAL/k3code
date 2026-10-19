@@ -4,13 +4,13 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ## Unreleased
 
-### Changed
-
-- **Prompt caching: 1-hour TTL on the stable prefix for the first-party API, and no cache writes for side calls.** On an `anthropic` provider whose `base_url` is `api.anthropic.com`, the tools and system-prompt breakpoints now carry `ttl: "1h"` (the conversation-tail breakpoints keep the 5-minute default), so a pause of more than five minutes no longer re-writes the whole stable prefix; other Anthropic-wire endpoints send exactly what they sent before. The new per-provider key `prompt_cache_ttl` (`auto` default, `5m`, `1h`) forces the field on (`1h`, for a relay that accepts it) or off (`5m`); a 400 from an endpoint that refuses it turns it off for good and resends once. A 1-hour write costs 2x the input price instead of 1.25x and reads cost the same, so one reuse after a pause pays it back. Requests without tools (title generation, compaction summary, advisor, classifier) now carry no `cache_control` at all on both the Anthropic and the OpenAI-compatible path: they were never read back and only paid the write premium. `k3code doctor` lists the TTL policy per provider.
-
 ### Added
 
 - **`/learned` (issue #141).** Lists the project's gotchas, auto gotchas and learned notes plus the machine gotchas, preferences and overlays with an id each; `/learned forget <id>` removes one and `/learned purge --yes` clears auto gotchas, learned notes and overlays outside an active experiment.
+
+### Changed
+
+- **Prompt caching: 1-hour TTL on the stable prefix for the first-party API, and no cache writes for side calls.** On an `anthropic` provider whose `base_url` is `api.anthropic.com`, the tools and system-prompt breakpoints now carry `ttl: "1h"` (the conversation-tail breakpoints keep the 5-minute default), so a pause of more than five minutes no longer re-writes the whole stable prefix; other Anthropic-wire endpoints send exactly what they sent before. The new per-provider key `prompt_cache_ttl` (`auto` default, `5m`, `1h`) forces the field on (`1h`, for a relay that accepts it) or off (`5m`); a 400 from an endpoint that refuses it turns it off for good and resends once. A 1-hour write costs 2x the input price instead of 1.25x and reads cost the same, so one reuse after a pause pays it back. Requests without tools (title generation, compaction summary, advisor, classifier) now carry no `cache_control` at all on both the Anthropic and the OpenAI-compatible path: they were never read back and only paid the write premium. `k3code doctor` lists the TTL policy per provider.
 
 ### Fixed
 
