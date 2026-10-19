@@ -211,13 +211,9 @@ def test_a_failed_lookup_still_knows_where_root_lives(monkeypatch: pytest.Monkey
         raise KeyError(name)
 
     monkeypatch.setattr(pwd, "getpwnam", missing)
-    hardline._user_home.cache_clear()
-    try:
-        assert hardline._user_home("root") == "/root"
-        assert hardline._user_home("ada") is None
-        assert _check("rm -rf ~root") == "rm-rf-root"
-    finally:
-        hardline._user_home.cache_clear()
+    assert hardline._user_home("root") == "/root"
+    assert hardline._user_home("ada") is None
+    assert _check("rm -rf ~root") == "rm-rf-root"
 
 
 @pytest.mark.parametrize(

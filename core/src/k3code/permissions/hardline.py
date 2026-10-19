@@ -14,8 +14,11 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cache, lru_cache
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
@@ -406,7 +409,14 @@ def check_parse(
     command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
 ) -> tuple[str | None, Parsed]:
     """:func:`check` and the parse it read (``parse(command)``): the engine decides on that parse instead of parsing a
-    long command line a second time."""
+    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope)."""
+    with lookup_scope():
+        return _check_parse(command, extra_patterns, cwd, home)
+
+
+def _check_parse(
+    command: str, extra_patterns: list[str] | None, cwd: str | None, home: str | None
+) -> tuple[str | None, Parsed]:
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
     parsed = parse(command, budget=budget)
@@ -416,6 +426,7 @@ def check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+    _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
     try:
         return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs), parsed
@@ -1334,25 +1345,118 @@ _HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
 _TILDE_USER = re.compile(r"~([A-Za-z_][A-Za-z0-9._-]*)(?=/|$)")
 
 
-@lru_cache(maxsize=64)
 def _user_home(name: str) -> str | None:
     """The home folder of the user ``name`` (``~name``), None when unknown; ``root``'s is ``/root`` when the lookup
-    fails (no pwd module, no such entry)."""
+    fails (no pwd module, no such entry). Every call is a user database lookup (with sssd or LDAP, a network round
+    trip): a check reaches it through _home_of, which caps the lookups and remembers them for that check only."""
     try:
         import pwd  # Unix only
 
         return pwd.getpwnam(name).pw_dir
-    except (ImportError, KeyError):
+    except (ImportError, KeyError, ValueError):
         return "/root" if name == "root" else None
 
 
+#: How many distinct ``~name`` users one check may look up (see lookup_scope). A command that names more is too long
+#: to look them all up: the user database may be a network service, and the lookups ran synchronously in the daemon.
+_TILDE_MAX_USERS = 32
+#: A ``~name`` at the start of a word (or after ``=``/``:`` in an assignment, a quote or a brace): the names a check
+#: gives a place in its budget, in line order.
+_TILDE_WORD = re.compile(r"""(?:^|(?<=[\s;&|()<>=:'"`{,]))~([A-Za-z_][A-Za-z0-9._-]*)(?=[/\s;&|()<>'"`},:]|$)""")
+#: The users a check has given a place in its budget: name -> home, None (no such user) or _PENDING (not looked up
+#: yet). None outside a check. A ContextVar, so a decision in a worker thread or another task has its own.
+_TILDE_USERS: ContextVar[dict[str, object] | None] = ContextVar("k3code_tilde_users", default=None)
+_PENDING = object()
+#: _home_of for a ``~name`` past the budget: whose home it is was not looked up, so where the word goes is unknown.
+PAST_BUDGET = object()
+
+
+@contextmanager
+def lookup_scope() -> Iterator[None]:
+    """One check's budget of ``~name`` lookups: at most _TILDE_MAX_USERS distinct users, one lookup each. Opened by
+    engine.decide and check_parse; a scope already open (check_parse under decide) is reused."""
+    if _TILDE_USERS.get() is not None:
+        yield
+        return
+    token = _TILDE_USERS.set({})
+    try:
+        yield
+    finally:
+        _TILDE_USERS.reset(token)
+
+
+def _reserve_users(text: str) -> None:
+    """Give the ``~name`` words of ``text`` their places in the open scope's budget in line order, before any of them
+    is judged: which names fall past the budget depends on the command alone, not on which check reads a word first
+    (``cat ~a/x ~b/x ...; rm -rf ~bin`` has ``~bin`` past it however few words the checks expand)."""
+    users = _TILDE_USERS.get()
+    if users is None:
+        return
+    for m in _TILDE_WORD.finditer(text):
+        if len(users) >= _TILDE_MAX_USERS:
+            return
+        name = m.group(1)
+        if name != "root" and name != _own_name():
+            users.setdefault(name, _PENDING)
+
+
+@cache
+def _own_name() -> str | None:
+    """The name of the user this process runs as (one lookup by uid, once), None when unknown."""
+    try:
+        import pwd  # Unix only
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, AttributeError):
+        return None
+
+
+def _home_of(name: str, home: str) -> object:
+    """Where ``~name`` goes: a home folder, None for a user the machine does not know, or PAST_BUDGET when the open
+    scope has given its _TILDE_MAX_USERS places to other users. ``root`` (``/root``) and the user this process runs
+    as (``home``) cost no lookup; outside a scope every name is looked up."""
+    if name == "root":
+        return "/root"
+    if name == _own_name():
+        return home
+    users = _TILDE_USERS.get()
+    if users is None:
+        return _user_home(name)
+    found = users.get(name, _PENDING if len(users) < _TILDE_MAX_USERS else PAST_BUDGET)
+    if found is _PENDING:
+        found = users[name] = _user_home(name)
+    return found
+
+
+def past_budget(word: str) -> bool:
+    """``word`` starts with a ``~name`` past the open scope's lookup budget: where it goes is unknown."""
+    m = _TILDE_USER.match(word) if word.startswith("~") else None
+    return bool(m) and _home_of(m.group(1), "") is PAST_BUDGET
+
+
+def expand_user(path: str) -> str:
+    """``os.path.expanduser(path)`` with a ``~name`` looked up within the open scope's budget (see _home_of): past it,
+    or for a user the machine does not know, ``path`` is returned as written."""
+    if not path.startswith("~") or os.name != "posix":
+        return os.path.expanduser(path)
+    end = path.find("/")
+    end = len(path) if end < 0 else end
+    if end == 1:
+        return os.path.expanduser(path)  # ~ and ~/x: $HOME
+    found = _home_of(path[1:end], os.path.expanduser("~"))
+    if not isinstance(found, str):
+        return path
+    return (found.rstrip("/") + path[end:]) or "/"
+
+
 def _expand_tilde(word: str, home: str) -> str:
-    """``word`` with a leading ``~`` (``home``) or ``~name`` (that user's home, when known) expanded."""
+    """``word`` with a leading ``~`` (``home``) or ``~name`` (that user's home, when known and within the lookup
+    budget) expanded."""
     if word == "~" or word.startswith("~/"):
         return home + word[1:]
     m = _TILDE_USER.match(word) if word.startswith("~") else None
-    user_home = _user_home(m.group(1)) if m else None
-    return user_home + word[m.end() :] if m and user_home else word
+    user_home = _home_of(m.group(1), home) if m else None
+    return user_home + word[m.end() :] if m and isinstance(user_home, str) else word
 
 
 def expand_vars(word: str, cwd: str | None, home: str) -> str:
@@ -1528,6 +1632,9 @@ class _Dirs:
                 self._add(self.home)
             self.here = self.home if name == "cd" else None  # pushd alone swaps the top two of the stack
             return
+        if past_budget(operands[0]):
+            self.overflow = True  # whose home it is was not looked up: the line may go anywhere from here
+            return
         t = expand_vars(operands[0], self.here, self.home)
         if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(sub):
             self._add(self.home)  # unset, `cd $X` is a plain `cd`; `cd "$X"` is `cd ""`, which fails
@@ -1582,6 +1689,8 @@ def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) ->
     ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
     if t in ("~+", "~-") or t.startswith(("~+/", "~-/")):
         t = "$PWD" + t[2:]  # the current or previous directory: one of the set, read in every one
+    if past_budget(t):
+        return "scan-budget"  # another user's folder whose home was not looked up: it may be any folder (~bin is /bin)
     if t.startswith(("/", "~", "$")) and "PWD" not in t:
         return _delete_target_rule(t, None, home, above_home)
     if dirs.overflow:

@@ -48,6 +48,9 @@ SPELLINGS: dict[str, Callable[[int], str]] = {
     "sudo-chain": lambda n: "sudo " * n + "echo hi",
     # a relative cd walked every CDPATH entry on the line (each prefix assignment adds one)
     "cdpath-chain": lambda n: "; ".join(f"CDPATH=/a{k} cd b{k % 5}" for k in range(n)),
+    # every distinct ~name was a user database lookup, three per word (a C call the step count does not see: the
+    # lookup count is pinned in test_hardline_tilde_budget); a check now looks up at most 32
+    "tilde-users": lambda n: "cat " + " ".join(f"~u691_{k}/x" for k in range(n)),
 }
 
 
