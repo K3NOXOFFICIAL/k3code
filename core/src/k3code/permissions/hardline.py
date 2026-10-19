@@ -416,31 +416,31 @@ def check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
-    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home), parsed
+    try:
+        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home), parsed
+    except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
+        return "scan-depth", parsed
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
-    # after a `cd` on the line, relative rm/find targets are read in the directory it moved to (`cd / && rm -rf *`);
-    # `here` is None once a cd went somewhere unknown. Followed in line order, assuming every cd succeeds.
-    moved, here = False, cwd
+    # relative rm/find targets are read in the cwd and in every directory a `cd` earlier on the line went to (see _Dirs)
+    dirs = _Dirs(cwd, home)
     for k, sub in enumerate(parsed.subs):
         argv = _command_argv(_tokens(sub))
-        base = here if moved else None
         hit = (
             _match(sub, extra)
             or _match(" ".join(argv), extra)
             or _simple_check(sub)
-            or _rm_check(argv, cwd, home, base)
-            or _find_check(argv, cwd, home, base)
+            or _rm_check(argv, dirs, home)
+            or _find_check(argv, dirs, home)
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
             return hit
-        if argv[:1] and argv[0] in ("cd", "pushd"):
-            moved, here = True, _cd_dir(argv[0], argv[1:], here, home)
-    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, cwd, home)
+        dirs.follow(argv)
+    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
     if hit:
         return hit
     for child in parsed.children:
@@ -826,19 +826,31 @@ def _past_reserved(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
+#: How many times :func:`_command_argv` may switch between wrappers and reserved words or busybox in one simple command
+#: (``time { sudo busybox env`` is three). Every switch copies the rest of the words, so an endless alternation
+#: (``time { time { ...``) would cost the square of its length; past the cap the command is denied (``scan-depth``).
+_ARGV_MAX_ROUNDS = 32
+
+
+class _TooDeep(Exception):
+    """A simple command alternates wrappers and reserved words more often than _ARGV_MAX_ROUNDS: what it runs was not
+    read, so check() denies it (``scan-depth``) and parse() marks it too deep."""
+
+
 def _command_argv(tokens: list[str]) -> list[str]:
     """:func:`normalize_argv` of the command that runs past the reserved words in front of it (see _past_reserved)
     and through ``busybox APPLET`` (``busybox rm``, ``busybox env``, ``busybox sh -c``), in any order and nesting
-    (``time { busybox rm``, ``sudo busybox env``). The hardline checks read this; the engine keeps its own reading."""
+    (``time { busybox rm``, ``sudo busybox env``). The hardline checks read this; the engine keeps its own reading.
+    Raises _TooDeep past _ARGV_MAX_ROUNDS switches."""
     argv = tokens
-    # every round drops a reserved word or busybox, or a wrapper/eval inside normalize_argv (fewer characters)
-    for _ in range(sum(len(t) + 1 for t in tokens) + 1):
+    # a round drops the reserved words in front, then the wrappers/eval (normalize_argv), then one busybox
+    for _ in range(_ARGV_MAX_ROUNDS):
         argv = normalize_argv(_past_reserved(argv))
         if argv[:1] == ["busybox"] and len(argv) > 1 and not argv[1].startswith("-"):
             argv = argv[1:]
         elif not argv or argv[0] not in _RESERVED_WORDS:
             return argv
-    return argv
+    raise _TooDeep
 
 
 #: Wrapper option arity for :func:`normalize_argv`: (short options taking a value, long options taking a value,
@@ -1316,40 +1328,77 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
     return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
-def _cd_dir(name: str, args: list[str], here: str | None, home: str) -> str | None:
-    """The directory ``cd``/``pushd`` with ``args`` moves to from ``here``; None when it is unknown (a variable, ``-``,
-    ``pushd`` swapping the stack, a relative path from an unknown directory)."""
-    operands: list[str] = []
-    for a in args:
-        if not operands and a.startswith("-") and a != "-":
-            continue  # -L, -P, -e, -@, --
-        operands.append(a)
-    if not operands:
-        return home if name == "cd" else None
-    t = expand_vars(operands[0], here, home)
-    if t == "-" or t.startswith("+") or any(c in t for c in "$`~"):
-        return None
-    if not t.startswith("/"):
-        if here is None:
-            return None
-        t = os.path.join(here, t)
-    t = os.path.normpath(t)
-    return "/" + t.lstrip("/") if t.startswith("//") else t
+#: How many directories a command line may ``cd`` into (the cwd included) before a relative rm/find target is too many
+#: places to read: each is read in every one of them (see _Dirs), so past the cap such a target is denied
+#: (``scan-depth``) rather than read thousands of times over.
+_CD_MAX_DIRS = 32
 
 
-def _delete_target_rule(t: str, cwd: str | None, home: str, base: str | None, above_home: bool = False) -> str | None:
-    """The rule a recursive delete of the path word ``t`` breaks: rm-rf-home for ~, $HOME (and, with ``above_home``, a
-    folder above it), rm-rf-root for /, a top-level system dir or a Windows drive (see windows_rm_target). ``base`` is
-    the directory a ``cd`` earlier on the line moved to: a relative ``t`` is read there, and ``$PWD`` is it."""
+class _Dirs:
+    """The directories a simple command of the line may run in, followed in line order: the cwd and every directory a
+    ``cd``/``pushd`` before it went to. A cd may fail (``cd /; cd /nonexistent; rm -rf *``) or run in a subshell, a
+    pipeline stage or the background and not take effect (``cd / && (cd tmp) && rm -rf *``), so no directory ever
+    leaves the set. ``here`` is where the line is if every cd took effect (None once unknown): it only resolves the next
+    relative cd. A cd to a variable adds home, which a plain ``cd`` (the variable unset) goes to."""
+
+    def __init__(self, cwd: str | None, home: str) -> None:
+        self.home = home
+        self.here = cwd
+        self.all: dict[str | None, None] = {cwd: None}  # insertion-ordered set
+        self.overflow = False
+        self._stack: list[str | None] = []  # pushd's directory stack, for popd
+
+    def _add(self, d: str) -> None:
+        if d not in self.all:
+            if len(self.all) >= _CD_MAX_DIRS:
+                self.overflow = True
+            else:
+                self.all[d] = None
+
+    def follow(self, argv: list[str]) -> None:
+        """Take in the simple command ``argv`` if it changes directory (cd, pushd, popd)."""
+        name = argv[0] if argv else ""
+        if name == "popd":
+            self.here = self._stack.pop() if self._stack and len(argv) == 1 else None
+            return
+        if name not in ("cd", "pushd"):
+            return
+        operands: list[str] = []
+        for a in argv[1:]:
+            if not operands and a.startswith("-") and a != "-":
+                continue  # -L, -P, -e, -@, --
+            operands.append(a)
+        if name == "pushd":
+            self._stack.append(self.here)
+        if not operands:
+            if name == "cd":
+                self._add(self.home)
+            self.here = self.home if name == "cd" else None  # pushd alone swaps the top two of the stack
+            return
+        t = expand_vars(operands[0], self.here, self.home)
+        if name == "cd" and any(c in t for c in "$`"):
+            self._add(self.home)  # unset, `cd $X` is a plain `cd`
+        if t == "-" or t.startswith("+") or any(c in t for c in "$`~") or (self.here is None and t[:1] != "/"):
+            self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user, relative to unknown
+            return
+        t = os.path.normpath(os.path.join(self.here or "/", t))
+        self.here = "/" + t.lstrip("/") if t.startswith("//") else t
+        self._add(self.here)
+
+
+def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = False) -> str | None:
+    """The rule a recursive delete of the path word ``t`` run in the directory ``here`` breaks: rm-rf-home for ~, $HOME
+    (and, with ``above_home``, a folder above it), rm-rf-root for /, a top-level system dir or a Windows drive (see
+    windows_rm_target), or everything in one of those (``/usr/*``). A relative ``t`` is read in ``here`` (``../..`` from
+    ``~/projects/demo`` is ``~``), and ``$PWD`` is it."""
     if not t:
         return None
-    if base and not t.startswith(("/", "~", "$")):
-        t = os.path.join(base, t)
-    target = _expand_target(t, base or cwd, home)
-    if target in _DANGEROUS_RM_TARGETS or target in (home, home + "/*"):
-        homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
+    path = os.path.join(here, t) if here and not t.startswith(("/", "~", "$")) else t
+    target = _expand_target(path, here, home)
+    folder = (target[:-2] if target.endswith("/*") else target) or "/"  # `/*` is everything in /
+    if folder in _DANGEROUS_RM_TARGETS or folder == home:
+        homeish = "~" in t or "HOME" in t or path.startswith("/home") or folder == home
         return "rm-rf-home" if homeish else "rm-rf-root"
-    folder = target[:-2] if target.endswith("/*") else target
     if above_home and folder.startswith("/") and home.startswith(folder.rstrip("/") + "/"):
         return "rm-rf-home"
     from .engine import windows_drives  # engine imports this module
@@ -1359,10 +1408,24 @@ def _delete_target_rule(t: str, cwd: str | None, home: str, base: str | None, ab
     return None
 
 
-def _rm_check(argv: list[str], cwd: str | None, home: str, base: str | None = None) -> str | None:
+def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) -> str | None:
+    """:func:`_delete_target_rule` of ``t`` in every directory of ``dirs`` it may run in: a relative ``t`` or one with
+    ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
+    if t.startswith(("/", "~", "$")) and "PWD" not in t:
+        return _delete_target_rule(t, None, home, above_home)
+    if dirs.overflow:
+        return "scan-depth"
+    for here in dirs.all:
+        hit = _delete_target_rule(t, here, home, above_home)
+        if hit:
+            return hit
+    return None
+
+
+def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
     (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
-    ``cd /``: see _delete_target_rule)."""
+    ``cd /``: see _delete_rule_in)."""
     if not argv or argv[0] != "rm":
         return None
     flags: list[str] = []
@@ -1379,17 +1442,17 @@ def _rm_check(argv: list[str], cwd: str | None, home: str, base: str | None = No
     if not recursive:
         return None
     for t in targets:
-        hit = _delete_target_rule(t, cwd, home, base)
+        hit = _delete_rule_in(t, dirs, home)
         if hit:
             return hit
     return None
 
 
-#: find actions that run a command on every file found.
+#: find actions that run a command on every file found, up to a ``;`` or ``+``.
 _FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 
 
-def _find_check(argv: list[str], cwd: str | None, home: str, base: str | None = None) -> str | None:
+def _find_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     """``find`` deleting what it finds (``-delete``, or ``-exec``/``-execdir``/``-ok``/``-okdir`` running rm) under
     a start path an ``rm -rf`` of which is refused (see _rm_check) or a folder above home: ``find ~ -delete``, ``find
     $HOME -exec rm -rf {} +``, ``find / -delete``. No start path is ``.``, which after ``cd /`` is the root."""
@@ -1403,34 +1466,45 @@ def _find_check(argv: list[str], cwd: str | None, home: str, base: str | None = 
         paths.append(argv[i])
         i += 1
     expr = argv[i:]
-    deletes = "-delete" in expr or any(
-        a in _FIND_EXEC_ACTIONS and _command_argv(expr[k + 1 :])[:1] == ["rm"] for k, a in enumerate(expr)
-    )
+    deletes = "-delete" in expr
+    k = 0
+    while not deletes and k < len(expr):
+        if expr[k] in _FIND_EXEC_ACTIONS:
+            # the command runs up to the `;` or `+` that ends the action, and the next action starts after it (an
+            # `-exec` in the command is one of its words): every word is read once
+            end = k + 1
+            while end < len(expr) and expr[end] not in (";", "+"):
+                end += 1
+            deletes = _command_argv(expr[k + 1 : end])[:1] == ["rm"]
+            k = end
+        k += 1
     if not deletes:
         return None
     for p in paths or ["."]:
-        hit = _delete_target_rule(p, cwd, home, base, above_home=True)
+        hit = _delete_rule_in(p, dirs, home, above_home=True)
         if hit:
             return hit
     return None
 
 
-def _xargs_rm_check(pipelines: list[list[str]], cwd: str | None, home: str) -> str | None:
+def _xargs_rm_check(pipelines: list[list[str]], dirs: _Dirs, home: str) -> str | None:
     """``... | xargs rm -rf``: xargs adds what the earlier stages of the pipeline print to rm's arguments, so a word of
     theirs that rm -rf must not get (``echo ~ | xargs rm -rf``, ``find $HOME | xargs rm -r``) is checked as one of
-    rm's targets (see _rm_check)."""
+    rm's targets (see _rm_check). Each printed word is checked once, as it is printed: the first one that hits stands
+    for them all."""
     for stages in pipelines:
         if len(stages) < 2 or not any("xargs" in s for s in stages[1:]):
             continue
-        printed: list[str] = []
+        bad: str | None = None  # the first printed word an rm -r must not get
         for stage in stages:
             argv = _command_argv(_tokens(stage))
-            if printed and argv[:1] == ["rm"] and "xargs" in stage:
+            if bad is not None and argv[:1] == ["rm"] and "xargs" in stage:
                 words = [os.path.basename(t) for t in _tokens(stage)]
                 fed = "rm" in words and "xargs" in words[: words.index("rm")]  # xargs runs this rm
-                if fed and (hit := _rm_check([*argv, "--", *printed], cwd, home)):
+                if fed and (hit := _rm_check([*argv, "--", bad], dirs, home)):
                     return hit
-            printed += argv[1:]
+            if bad is None:
+                bad = next((w for w in argv[1:] if _delete_rule_in(w, dirs, home)), None)
     return None
 
 
@@ -1802,7 +1876,11 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
     out.open_heredoc = bool(heredocs)
     out.open_bracket = any(kind != "((" or end >= n for kind, end in ctx)
     out.clean = "".join(clean)
-    out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
+    try:
+        out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
+    except _TooDeep:  # a stage that alternates wrappers and reserved words endlessly (see _command_argv)
+        out.code_heredoc, out.remote_heredoc = [""] * len(out.subs), [[] for _ in out.subs]
+        out.too_deep = True
     return out
 
 
@@ -1900,6 +1978,24 @@ def _trap_actions(args: list[str]) -> list[str]:
     return [a for a in dict.fromkeys(out) if a not in ("", "-")]
 
 
+#: Shell options that take the next word as their value (``bash -o pipefail -c ...``, ``--rcfile FILE``).
+_SHELL_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _shell_c_code(argv: list[str]) -> list[str]:
+    """The command string of a shell run with ``-c`` (``sh -c CMD``, ``bash -lc CMD``, ``bash -o pipefail -c CMD``):
+    the first word after the options, when an option cluster has a ``c``; else nothing."""
+    code, i = False, 1
+    while i < len(argv) and argv[i][:1] in ("-", "+") and len(argv[i]) > 1:
+        a = argv[i]
+        if a == "--":
+            i += 1
+            break
+        code = code or (a[0] == "-" and not a.startswith("--") and "c" in a[1:])
+        i += 2 if a in _SHELL_VALUE_OPTS else 1
+    return [argv[i]] if code and i < len(argv) else []
+
+
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
     action string of ``trap`` (see _trap_action), the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and
@@ -1921,6 +2017,8 @@ def _launcher_payloads(sub: str) -> list[str]:
         real = _command_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real and (real[0] in _SHELLS or real[0] == "ash"):
+            out += _shell_c_code(real)  # `bash -c env`: one word with nothing to split is code all the same
         if real and real[0] == "trap":
             out += _trap_actions(real[1:])
         if real:
@@ -1937,8 +2035,12 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     if budget[0] < 0 or parsed.too_deep:
         return parsed  # the parser gave up and check() denies the command: its nested commands are not read
     payloads = [p for ps in parsed.sub_payloads for p in ps]
-    for sub in parsed.subs:
-        payloads.extend(_launcher_payloads(sub))
+    try:
+        for sub in parsed.subs:
+            payloads.extend(_launcher_payloads(sub))
+    except _TooDeep:  # see _command_argv
+        parsed.too_deep = True
+        return parsed
     if _depth >= _PARSE_MAX_DEPTH:
         # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
         parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc

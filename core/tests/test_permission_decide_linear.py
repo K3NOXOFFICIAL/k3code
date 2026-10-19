@@ -39,6 +39,10 @@ SPELLINGS: dict[str, Callable[[int], str]] = {
     "pipelines": lambda n: "\n".join(f"echo {k} | wc -c" for k in range(n)),
     "bash-c": lambda n: 'bash -c "' + "; ".join(_lines(n)) + '"',
     "substitution": lambda n: "echo $(" + "; ".join(_lines(n)) + ")",
+    # the hardline's xargs, wrapper/reserved-word and find -exec readings (each once grew with the square)
+    "xargs-pipeline": lambda n: "echo a" + "".join(f" | xargs rm -rf f691_{k}" for k in range(n)),
+    "time-braces": lambda n: "time { " * n + "echo hi" + " }" * n,
+    "find-exec": lambda n: "find ~" + "".join(f" -exec echo f691_{k} {{}} \\;" for k in range(n)),
 }
 
 
