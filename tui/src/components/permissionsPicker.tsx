@@ -81,10 +81,7 @@ export function PermissionsPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gw, sessionId]);
 
-  const rows = useMemo(
-    () => (snap ? permissionRows(snap) : []),
-    [snap],
-  );
+  const rows = useMemo(() => (snap ? permissionRows(snap) : []), [snap]);
 
   useInput((ch, key) => {
     if (locked || !snap) {
@@ -204,7 +201,8 @@ export function PermissionsPicker({
       </Text>
 
       <OverlayHint t={t}>
-        ↑/↓ select · Enter/m cycle mode · a allow · s ask · d deny · r rm · Esc/q close
+        ↑/↓ select · Enter/m cycle mode · a allow · s ask · d deny · r rm ·
+        Esc/q close
       </OverlayHint>
     </Box>
   );

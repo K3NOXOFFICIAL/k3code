@@ -73,7 +73,14 @@ const snapshot = (over: Record<string, unknown> = {}) => ({
     { description: "", effort: false, key: "tiny", resolved: ["tiny"] },
   ],
   ultra_mode: "off",
-  wake_words: ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"],
+  wake_words: [
+    "ultracode",
+    "ultraplan",
+    "ultraresearch",
+    "fanout",
+    "ultrasketch",
+    "ultrareview",
+  ],
   wake_words_enabled: true,
   ...over,
 });

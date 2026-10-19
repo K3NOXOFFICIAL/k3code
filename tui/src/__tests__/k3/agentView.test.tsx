@@ -92,7 +92,6 @@ describe("AgentViewView", () => {
   it("groups rows under the three headers with the strip's glyphs and counts, past rows last", () => {
     const out = dump(mixed(), {}, { ...IDLE_VIEW_NAV, index: 1 });
 
-    
     const lines = out.split("\n");
 
     expect(lines[0]).toContain("Agents");

@@ -558,7 +558,9 @@ export class GatewayClient extends EventEmitter {
     const cwd =
       process.env.K3CODE_CWD ||
       process.env.K3CODE_TUI_CWD ||
-      (cmdOverride ? process.cwd() : process.env.HERMES_CWD || process.env.HERMES_TUI_CWD || root);
+      (cmdOverride
+        ? process.cwd()
+        : process.env.HERMES_CWD || process.env.HERMES_TUI_CWD || root);
     const env = { ...process.env };
     const pyPath = env.PYTHONPATH?.trim();
 

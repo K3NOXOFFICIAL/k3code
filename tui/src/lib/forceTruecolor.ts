@@ -13,7 +13,11 @@ export function shouldForceTruecolor(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   // K3CODE_* first, HERMES_* as a legacy fallback (#170).
-  const override = (env.K3CODE_TUI_TRUECOLOR ?? env.HERMES_TUI_TRUECOLOR ?? "").trim();
+  const override = (
+    env.K3CODE_TUI_TRUECOLOR ??
+    env.HERMES_TUI_TRUECOLOR ??
+    ""
+  ).trim();
 
   if (FALSE_RE.test(override) || "NO_COLOR" in env) {
     return false;
