@@ -54,6 +54,7 @@ export function ProviderPicker({
   const [keySaving, setKeySaving] = useState(false);
   const [keyError, setKeyError] = useState("");
   const [added, setAdded] = useState("");
+  const [addedWarning, setAddedWarning] = useState("");
   const overlay = useStore($overlayState);
   const locked = tuneLocked(overlay);
   const { stdout } = useStdout();
@@ -302,9 +303,10 @@ export function ProviderPicker({
         locked={locked}
         onCancel={() => setStage("list")}
         onClosedNotice={onNotice}
-        onSaved={(slug) => {
+        onSaved={(slug, warning) => {
           setStage("list");
           setAdded(slug);
+          setAddedWarning(warning ?? "");
           fetchOptions(slug);
         }}
         sessionId={sessionId}
@@ -398,7 +400,9 @@ export function ProviderPicker({
 
       {added && current?.slug === added ? (
         <Text color={t.color.accent} wrap="truncate-end">
-          added {added} · Enter use now · Esc later
+          {addedWarning
+            ? `added ${added} · ${addedWarning}`
+            : `added ${added} · Enter use now · Esc later`}
         </Text>
       ) : null}
 

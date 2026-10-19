@@ -15,7 +15,6 @@ import m1cmd_helpers as m1
 from k3code import chain_config
 from k3code import config as config_mod
 from k3code.config import ProviderEntry
-from k3code.redact import scrub_urls
 from k3code.setup import probe
 from k3code.setup.state import env_file_path, read_env_file, set_env_var
 
@@ -202,12 +201,45 @@ async def test_a_url_with_a_user_or_password_is_refused_and_never_echoed(server,
     assert chain_config.config_path().read_text() == before and read_env_file() == {}
 
 
-async def test_the_add_log_line_scrubs_the_url(server, caplog):
+@pytest.mark.parametrize("method", ["provider.add", "provider.probe"])
+async def test_a_url_with_a_query_or_fragment_is_refused_and_never_echoed(server, monkeypatch, caplog, method):
     caplog.set_level(logging.DEBUG)
-    url = "https://gw.example/v1?key=Abc123Def456Gh"
-    assert scrub_urls(url) != url  # a token-shaped query value: the scrubber hides it
-    await _ok(server, "provider.add", _add(preset="custom", base_url=url))
-    assert "provider.add: added mine" in caplog.text and "Abc123Def456Gh" not in caplog.text
+    monkeypatch.setattr(probe, "list_models", lambda *_a, **_k: pytest.fail("probed"))
+    before = chain_config.config_path().read_text()
+    secret = "QSECRET" + "0123456789"
+    for url in (f"https://gw.example/v1?api_key={secret}", f"https://gw.example/v1#{secret}", "https://gw.example/v1?"):
+        msg = await _err(server, method, _add(preset="custom", base_url=url))
+        assert "must not carry a query string or fragment" in msg and secret not in msg and "gw.example" not in msg
+    assert secret not in caplog.text
+    assert chain_config.config_path().read_text() == before and read_env_file() == {}
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("owned by another user"), ValueError("bad")])
+async def test_any_failure_of_the_config_write_removes_the_stored_key(server, monkeypatch, exc):
+    def boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(chain_config, "edit_config", boom)
+    msg = await _err(server, "provider.add", _add())
+    assert msg == f"could not add mine: {type(exc).__name__}" and KEY not in msg
+    assert read_env_file() == {}
+    assert [p.name for p in server.config.providers] == ["first"]
+
+
+async def test_a_failed_reload_after_the_write_reports_the_add_with_a_warning_and_keeps_the_key(
+    server, monkeypatch, caplog
+):
+    def boom(_ctx):
+        raise RuntimeError(f"reload failed {KEY}")
+
+    monkeypatch.setattr(chain_config, "reload_providers", boom)
+    caplog.set_level(logging.DEBUG)
+    res = await _ok(server, "provider.add", _add())
+    assert KEY not in caplog.text and "reload failed" in caplog.text
+    assert res["warning"] == "providers not reloaded: RuntimeError; run /reload" and KEY not in str(res)
+    assert res["key_env"] == "OPENAI_API_KEY" and read_env_file() == {"OPENAI_API_KEY": KEY}
+    assert "mine" in chain_config.config_path().read_text()
+    assert "already exists" in await _err(server, "provider.add", _add())  # the retry: the block is there
 
 
 async def test_the_reload_reads_the_project_a_config_reload_applies(server, monkeypatch, tmp_path):

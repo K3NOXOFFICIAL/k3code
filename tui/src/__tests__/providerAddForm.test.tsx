@@ -141,6 +141,7 @@ function mount(
   opts: {
     add?: (params: Params) => Promise<unknown>;
     probe?: () => Promise<unknown>;
+    warning?: string;
   } = {},
   size: { columns: number; rows: number } = { columns: 80, rows: 24 },
 ) {
@@ -205,6 +206,7 @@ function mount(
           backup: "",
           key_env: "OPENAI_API_KEY",
           provider: { name: added, slug: added },
+          ...(opts.warning ? { warning: opts.warning } : {}),
         });
 
       default:
@@ -726,6 +728,37 @@ describe("ProviderAddForm (in the /provider popup)", () => {
     await t.press(ENTER, "no user or password in the URL");
     expect(t.last()).toContain("Add provider · base URL");
     expect(t.calls("provider.probe")).toEqual([]);
+    t.stop();
+  });
+
+  it("refuses a base URL with a query string or fragment at the URL step", async () => {
+    const t = mount();
+
+    await openForm(t);
+    await t.press(DOWN, "▸ anthropic");
+    await t.press(DOWN, "▸ local");
+    await t.press(DOWN, "▸ custom");
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    await t.press("https://gw.example/v1?x=y", "gw.example");
+    await t.press(ENTER, "no query string or fragment in the URL");
+    expect(t.last()).toContain("Add provider · base URL");
+    await t.press(CTRL_U, "(empty)");
+    await t.press("https://gw.example/v1#f", "gw.example");
+    await t.press(ENTER, "no query string or fragment in the URL");
+    expect(t.last()).toContain("Add provider · base URL");
+    expect(t.calls("provider.probe")).toEqual([]);
+    t.stop();
+  });
+
+  it("shows the reload warning in the success line", async () => {
+    const t = mount({
+      warning: "providers not reloaded: RuntimeError; run /reload",
+    });
+
+    await fillToReview(t);
+    await t.press(ENTER, "added openai · providers not reloaded: RuntimeError");
+    expect(t.last()).not.toContain("Enter use now");
     t.stop();
   });
 });

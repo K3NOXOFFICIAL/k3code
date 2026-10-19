@@ -4334,6 +4334,10 @@ def _add_form_endpoint(params: dict[str, Any]) -> tuple[str, dict[str, str], str
         raise _InvalidParams("base URL must start with http:// or https:// and name a host")
     if userinfo:  # it would land in config.yaml and the log; the URL is not echoed, it holds a password
         raise _InvalidParams("base URL must not carry a user name or password: the key goes in the API key field")
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
     if params.get("reuse_key"):
         if not known or url != known["base_url"].rstrip("/"):
             raise _InvalidParams("a saved key is reused only at its own vendor's URL")
@@ -4371,7 +4375,8 @@ async def _provider_add(server: GatewayServer, params: dict[str, Any]) -> dict[s
     variable that held nothing (the vendor preset's own when it is free and the URL is the vendor's, else
     ``K3CODE_<NAME>_API_KEY``: that variable holds only the vendor's key, as in ``key_env_at``), so no other block's
     key is replaced; a reused key keeps the preset's variable. Nothing echoes the key: not the reply, an error or the
-    log. A failed config write removes the key line it stored."""
+    log. A failed config write (any error) removes the key line it stored; a failed reload after the write does not: the
+    reply is the normal one plus a ``warning`` string."""
     from k3code import chain_config
     from k3code.setup import probe
     from k3code.setup.state import read_env_file, set_env_var, unset_env_var
@@ -4387,54 +4392,71 @@ async def _provider_add(server: GatewayServer, params: dict[str, Any]) -> dict[s
     path = chain_config.config_path()
     # The config lock (reentrant: edit_config takes it again) makes the name check, the choice of a free variable
     # and both writes one step for every k3code process, so a second add of the same name cannot slip in between.
-    with confio.locked(path):
-        try:
-            on_disk = confio.read_yaml(path).get("providers") or []
-        except yaml.YAMLError:
-            raise _InvalidParams(f"cannot read {path}: not valid YAML") from None  # its text may hold anything
-        except (confio.ConfigError, OSError) as e:
-            raise _InvalidParams(f"cannot read {path}: {e}") from None
-        blocks = [p for p in on_disk if isinstance(p, dict)]
-        names = {p.name.lower() for p in server.config.providers} | {str(p.get("name", "")).lower() for p in blocks}
-        if name.lower() in names:
-            raise _InvalidParams(f"a provider named {name} already exists")
-        stored = ""
-        if params.get("reuse_key"):
-            var = probe.PRESETS[preset]["api_key_env"]
-        elif not key:
-            if preset != "local":
-                raise _InvalidParams("an API key is needed (the local preset is the keyless one)")
-            var = ""  # Ollama takes no key: an empty name declares the block keyless (#107)
-        else:
-            used = {str(p.get("api_key_env") or "") for p in blocks} | {p.api_key_env for p in server.config.providers}
-            held = {*os.environ, *read_env_file()}
-            own = probe.PRESETS.get(preset, {}).get("api_key_env", "")
-            # the vendor's variable holds only the vendor's key: a key for an edited URL gets a variable of its own
-            at_vendor = own and entry["base_url"] == probe.PRESETS[preset]["base_url"].rstrip("/")
-            free = at_vendor and own not in used and own not in held
-            presets = {s["api_key_env"] for s in probe.PRESETS.values()}
-            var = own if free else key_env_for(name, used | held | presets)
+
+    def commit() -> tuple[str, str]:
+        """The locked read-modify-write; no await in it, so it runs on a worker thread (the flock does not block the
+        event loop). ``(key variable, backup)``."""
+        with confio.locked(path):
             try:
-                set_env_var(var, key)
-            except OSError as e:
-                raise _InvalidParams(f"cannot write the key file: {e.strerror or type(e).__name__}") from None
-            stored = var
-        args = [name, model, f"kind={entry['kind']}", f"base_url={entry['base_url']}", f"key_env={var}"]
-        try:
-            backup = chain_config.edit_config("add", args)
-        except (chain_config.ChainEditError, OSError, yaml.YAMLError) as e:
-            if stored:
-                unset_env_var(stored)
-            if isinstance(e, yaml.YAMLError):
-                msg = f"{path} is not valid YAML"
+                on_disk = confio.read_yaml(path).get("providers") or []
+            except yaml.YAMLError:
+                raise _InvalidParams(f"cannot read {path}: not valid YAML") from None  # its text may hold anything
+            except (confio.ConfigError, OSError) as e:
+                raise _InvalidParams(f"cannot read {path}: {e}") from None
+            blocks = [p for p in on_disk if isinstance(p, dict)]
+            names = {p.name.lower() for p in server.config.providers} | {str(p.get("name", "")).lower() for p in blocks}
+            if name.lower() in names:
+                raise _InvalidParams(f"a provider named {name} already exists")
+            stored = ""
+            if params.get("reuse_key"):
+                var = probe.PRESETS[preset]["api_key_env"]
+            elif not key:
+                if preset != "local":
+                    raise _InvalidParams("an API key is needed (the local preset is the keyless one)")
+                var = ""  # Ollama takes no key: an empty name declares the block keyless (#107)
             else:
-                msg = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
-            if key:
-                msg = msg.replace(key, REDACTED)
-            raise _InvalidParams(f"could not add {name}: {msg}") from None
-    chain_config.reload_providers(server)
+                used = {str(p.get("api_key_env") or "") for p in blocks} | {
+                    p.api_key_env for p in server.config.providers
+                }
+                held = {*os.environ, *read_env_file()}
+                own = probe.PRESETS.get(preset, {}).get("api_key_env", "")
+                # the vendor's variable holds only the vendor's key: a key for an edited URL gets a variable of its own
+                at_vendor = own and entry["base_url"] == probe.PRESETS[preset]["base_url"].rstrip("/")
+                free = at_vendor and own not in used and own not in held
+                presets = {s["api_key_env"] for s in probe.PRESETS.values()}
+                var = own if free else key_env_for(name, used | held | presets)
+                try:
+                    set_env_var(var, key)
+                except OSError as e:
+                    raise _InvalidParams(f"cannot write the key file: {e.strerror or type(e).__name__}") from None
+                stored = var
+            args = [name, model, f"kind={entry['kind']}", f"base_url={entry['base_url']}", f"key_env={var}"]
+            try:
+                backup = chain_config.edit_config("add", args)
+            except Exception as e:  # whatever it was, the key line stored above must not outlive the failed add
+                if stored:
+                    unset_env_var(stored)
+                if isinstance(e, yaml.YAMLError):
+                    msg = f"{path} is not valid YAML"
+                elif isinstance(e, chain_config.ChainEditError | OSError):
+                    msg = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                else:  # RuntimeError (a $K3CODE_HOME another user owns), ValueError ...: the class says enough
+                    msg = type(e).__name__
+                if key:
+                    msg = msg.replace(key, REDACTED)
+                raise _InvalidParams(f"could not add {name}: {msg}") from None
+            return var, backup
+
+    var, backup = await asyncio.to_thread(commit)
+    warning = ""
+    try:
+        chain_config.reload_providers(server)
+    except Exception as e:  # the block and key are written for good: report the add, not a failure
+        warning = f"providers not reloaded: {type(e).__name__}; run /reload"
+        logger.warning("provider.add: added %s but the provider reload failed: %s", name, type(e).__name__)
     logger.info("provider.add: added %s (%s), key variable %s", name, scrub_urls(entry["base_url"]), var or "(keyless)")
-    return {"provider": _option_for(server, params, name), "key_env": var, "backup": backup}
+    reply = {"provider": _option_for(server, params, name), "key_env": var, "backup": backup}
+    return reply | {"warning": warning} if warning else reply
 
 
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

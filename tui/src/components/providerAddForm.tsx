@@ -61,6 +61,12 @@ export function providerNameError(
     : "";
 }
 
+/** `provider.add`'s reply: `warning` is set when the block is saved but the live providers were not reloaded. */
+interface AddReply {
+  provider?: { slug?: string };
+  warning?: string;
+}
+
 /** An http(s) URL with a host, as `provider.add` checks it. */
 export function baseUrlError(url: string): string {
   try {
@@ -69,6 +75,10 @@ export function baseUrlError(url: string): string {
     if ((u.protocol === "http:" || u.protocol === "https:") && u.hostname) {
       if (u.username || u.password) {
         return "no user or password in the URL: the key goes in the next step";
+      }
+
+      if (u.search || u.hash || /[?#]/.test(url)) {
+        return "no query string or fragment in the URL";
       }
 
       return /\s/.test(url) ? "no spaces in the URL" : "";
@@ -242,20 +252,20 @@ export function ProviderAddForm({
 
     setBusy(true);
     setErr("");
-    gw.request<{ provider?: { slug?: string } }>("provider.add", {
+    gw.request<AddReply>("provider.add", {
       ...endpoint(reuse),
       model,
       name: blockName,
       ...(sessionId ? { session_id: sessionId } : {}),
     })
       .then((raw) => {
-        const slug =
-          asRpcResult<{ provider?: { slug?: string } }>(raw)?.provider?.slug ||
-          blockName;
+        const reply = asRpcResult<AddReply>(raw);
+        const slug = reply?.provider?.slug || blockName;
+        const warning = reply?.warning || "";
 
         if (!mounted.current) {
           onClosedNotice?.(
-            `added provider ${slug} · /provider ${slug} switches to it`,
+            `added provider ${slug} · /provider ${slug} switches to it${warning ? ` · ${warning}` : ""}`,
           );
 
           return;
@@ -263,7 +273,7 @@ export function ProviderAddForm({
 
         setBusy(false);
         setApiKey("");
-        onSaved(slug);
+        onSaved(slug, warning);
       })
       .catch((e: unknown) => {
         if (!mounted.current) {
@@ -689,7 +699,7 @@ interface ProviderAddFormProps {
   onCancel: () => void;
   /** How a save that ended after the popup closed reports (a transcript line); unset, it is silent. */
   onClosedNotice?: (text: string) => void;
-  onSaved: (slug: string) => void;
+  onSaved: (slug: string, warning?: string) => void;
   sessionId: string | null;
   t: Theme;
   width: number;
