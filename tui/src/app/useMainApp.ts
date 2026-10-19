@@ -1671,6 +1671,7 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onModelSelect,
       onPermissionsApply,
+      onProviderNotice: sys,
       onProviderSelect,
       onSettingsApply,
       onTuneApply,
@@ -1702,6 +1703,7 @@ export function useMainApp(gw: GatewayClient) {
       onSettingsApply,
       onTuneApply,
       session,
+      sys,
     ],
   );
 

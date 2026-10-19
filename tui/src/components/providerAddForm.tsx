@@ -1,5 +1,5 @@
 import { Box, Text, useInput } from "@k3code/ink";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { GatewayClient } from "../gatewayClient.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
@@ -43,6 +43,9 @@ type Step =
 const VISIBLE_PRESETS = 6;
 const VISIBLE_MODELS = 4;
 const NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,39}$/;
+// The gateway's probe waits up to 8 s per phase (connect, read): past this the test reports a timeout, not 120 s.
+const PROBE_TIMEOUT_MS = 15_000;
+const MULTILINE_PASTE = "that paste has a line break: paste one line";
 
 /** A block name the gateway accepts and no existing block has (names are unique regardless of case). */
 export function providerNameError(
@@ -64,6 +67,10 @@ export function baseUrlError(url: string): string {
     const u = new URL(url);
 
     if ((u.protocol === "http:" || u.protocol === "https:") && u.hostname) {
+      if (u.username || u.password) {
+        return "no user or password in the URL: the key goes in the next step";
+      }
+
       return /\s/.test(url) ? "no spaces in the URL" : "";
     }
   } catch {
@@ -75,7 +82,10 @@ export function baseUrlError(url: string): string {
 
 const trimUrl = (url: string) => url.trim().replace(/\/+$/, "");
 
-/** Text-field keys, the key stage's pattern: printable append, Backspace, Ctrl+U clear. */
+/**
+ * Text-field keys, the key stage's pattern: printable append, Backspace, Ctrl+U clear. A paste's leading or
+ * trailing line break is dropped; one inside it (two lines: no key, URL or name has one) refuses the paste: false.
+ */
 function editText(
   ch: string,
   key: {
@@ -85,28 +95,38 @@ function editText(
     meta?: boolean;
   },
   set: (f: (v: string) => string) => void,
-): void {
+): boolean {
   if (key.backspace || key.delete) {
     set((v) => v.slice(0, -1));
   } else if (ch === "\u0015" || (key.ctrl && ch === "u")) {
     set(() => "");
   } else if (ch && !key.ctrl && !key.meta) {
-    set((v) => v + ch.replace(/[\r\n]/g, ""));
+    const text = ch.replace(/^[\r\n]+|[\r\n]+$/g, "");
+
+    if (/[\r\n]/.test(text)) {
+      return false;
+    }
+
+    set((v) => v + text);
   }
+
+  return true;
 }
 
 /**
  * /provider's "+ Add new provider" form (in the popup, no slash command):
  * preset -> name -> base URL -> key (or reuse the preset's saved key) ->
  * live test -> default model -> save through `provider.add`. Esc steps
- * back one step and leaves the form from the first; nothing is written
- * before the last Enter. The key is only ever shown masked.
+ * back one step (out of a running test too) and leaves the form from the
+ * first; nothing is written before the last Enter. The key is only ever
+ * shown masked.
  */
 export function ProviderAddForm({
   existingNames,
   gw,
   locked,
   onCancel,
+  onClosedNotice,
   onSaved,
   sessionId,
   t,
@@ -125,6 +145,18 @@ export function ProviderAddForm({
   const [model, setModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  // The probe in flight: a reply that is not the latest one's (Esc left the test, or a retest) is dropped.
+  const probeSeq = useRef(0);
+  // False once the popup is gone (Ctrl+C closes it even mid-save): a save that ends then reports in the transcript.
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     gw.request<{ presets?: ProviderPreset[] }>("provider.presets", {})
@@ -162,11 +194,21 @@ export function ProviderAddForm({
   });
 
   const runProbe = (useReuse: boolean) => {
+    const seq = ++probeSeq.current;
+
     setProbe(null);
     setBusy(true);
     setErr("");
-    gw.request<ProbeResult>("provider.probe", endpoint(useReuse))
+    gw.request<ProbeResult>(
+      "provider.probe",
+      endpoint(useReuse),
+      PROBE_TIMEOUT_MS,
+    )
       .then((raw) => {
+        if (seq !== probeSeq.current) {
+          return;
+        }
+
         const r = asRpcResult<ProbeResult>(raw);
 
         setBusy(false);
@@ -186,29 +228,52 @@ export function ProviderAddForm({
         }
       })
       .catch((e: unknown) => {
+        if (seq !== probeSeq.current) {
+          return;
+        }
+
         setBusy(false);
         setErr(rpcErrorMessage(e));
       });
   };
 
   const save = () => {
+    const blockName = name.trim();
+
     setBusy(true);
     setErr("");
     gw.request<{ provider?: { slug?: string } }>("provider.add", {
       ...endpoint(reuse),
       model,
-      name: name.trim(),
+      name: blockName,
       ...(sessionId ? { session_id: sessionId } : {}),
     })
       .then((raw) => {
-        const slug = asRpcResult<{ provider?: { slug?: string } }>(raw)
-          ?.provider?.slug;
+        const slug =
+          asRpcResult<{ provider?: { slug?: string } }>(raw)?.provider?.slug ||
+          blockName;
+
+        if (!mounted.current) {
+          onClosedNotice?.(
+            `added provider ${slug} · /provider ${slug} switches to it`,
+          );
+
+          return;
+        }
 
         setBusy(false);
         setApiKey("");
-        onSaved(slug || name.trim());
+        onSaved(slug);
       })
       .catch((e: unknown) => {
+        if (!mounted.current) {
+          onClosedNotice?.(
+            `could not add provider ${blockName}: ${rpcErrorMessage(e)}`,
+          );
+
+          return;
+        }
+
         setBusy(false);
         setErr(rpcErrorMessage(e));
       });
@@ -229,9 +294,37 @@ export function ProviderAddForm({
     runProbe(useReuse);
   };
 
+  /** Back from the test to the input before it; a probe still running is dropped (its late reply too). */
+  const leaveTest = () => {
+    probeSeq.current++;
+    setBusy(false);
+    setProbe(null);
+    go(inputBefore());
+  };
+
+  /** A text field's key; a multi-line paste is refused in the form. */
+  const edit = (
+    ch: string,
+    key: Parameters<typeof editText>[1],
+    set: (f: (v: string) => string) => void,
+  ) => {
+    if (!editText(ch, key, set)) {
+      setErr(MULTILINE_PASTE);
+    }
+  };
+
   // Like the picker: while a prompt waits for an answer the form ignores every key.
   useInput((ch, key) => {
-    if (busy || locked) {
+    if (locked) {
+      return;
+    }
+
+    // A test can run up to PROBE_TIMEOUT_MS: Esc leaves it. A save runs to its end (the gateway writes it anyway).
+    if (busy) {
+      if (step === "test" && key.escape) {
+        leaveTest();
+      }
+
       return;
     }
 
@@ -265,7 +358,7 @@ export function ProviderAddForm({
             go("url");
           }
         } else {
-          editText(ch, key, setName);
+          edit(ch, key, setName);
         }
 
         return;
@@ -288,7 +381,7 @@ export function ProviderAddForm({
             }
           }
         } else {
-          editText(ch, key, setUrl);
+          edit(ch, key, setUrl);
         }
 
         return;
@@ -315,15 +408,14 @@ export function ProviderAddForm({
             startTest(false);
           }
         } else {
-          editText(ch, key, setApiKey);
+          edit(ch, key, setApiKey);
         }
 
         return;
 
       case "test":
         if (key.escape) {
-          setProbe(null);
-          go(inputBefore());
+          leaveTest();
         } else if (ch === "r") {
           runProbe(reuse);
         } else if (probe?.ok && key.return) {
@@ -359,7 +451,7 @@ export function ProviderAddForm({
             go("review");
           }
         } else if (!key.upArrow && !key.downArrow) {
-          editText(ch, key, setQuery);
+          edit(ch, key, setQuery);
           setModelIdx(0);
         }
 
@@ -595,6 +687,8 @@ interface ProviderAddFormProps {
   gw: GatewayClient;
   locked: boolean;
   onCancel: () => void;
+  /** How a save that ended after the popup closed reports (a transcript line); unset, it is silent. */
+  onClosedNotice?: (text: string) => void;
   onSaved: (slug: string) => void;
   sessionId: string | null;
   t: Theme;

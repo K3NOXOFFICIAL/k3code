@@ -126,6 +126,17 @@ const PROBE_FAIL = {
 
 type Params = Record<string, unknown>;
 
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, reject, resolve };
+}
+
 function mount(
   opts: {
     add?: (params: Params) => Promise<unknown>;
@@ -170,7 +181,7 @@ function mount(
     output += String(chunk);
   });
 
-  const request = vi.fn((method: string, params: Params = {}) => {
+  const request = vi.fn((method: string, params: Params = {}, _ms?: number) => {
     switch (method) {
       case "model.options":
         return Promise.resolve({
@@ -202,6 +213,7 @@ function mount(
   });
 
   const onCancel = vi.fn();
+  const onNotice = vi.fn<(text: string) => void>();
   const onSelect = vi.fn<(slug: string, saveDefault: boolean) => void>();
 
   const instance = renderSync(
@@ -209,6 +221,7 @@ function mount(
       <ProviderPicker
         gw={{ request } as unknown as GatewayClient}
         onCancel={onCancel}
+        onNotice={onNotice}
         onSelect={onSelect}
         sessionId="sid-1"
         t={DEFAULT_THEME}
@@ -250,6 +263,7 @@ function mount(
     calls,
     last,
     onCancel,
+    onNotice,
     onSelect,
     press,
     request,
@@ -280,6 +294,31 @@ function expectKeyOnlyInSecretField(t: ReturnType<typeof mount>) {
       expect(secret).toBe(KEY);
     }
   }
+}
+
+/** The screen now fits a 60x15 terminal. */
+function expectFits60x15(t: ReturnType<typeof mount>) {
+  const lines = t.last().split("\n");
+
+  // box + its top margin + the status rule under it
+  expect(lines.length + 2).toBeLessThanOrEqual(15);
+
+  // the renderer clips at 60 columns: a box that is too wide loses its right border
+  for (const line of lines) {
+    expect([...line].length).toBeLessThanOrEqual(60);
+    expect(line).toMatch(/[║╗╝]$/);
+  }
+}
+
+/** openai preset, default name and URL, the key typed: up to the review step. */
+async function fillToReview(t: ReturnType<typeof mount>) {
+  await openForm(t);
+  await t.press(ENTER, "Add provider · name");
+  await t.press(ENTER, "Add provider · base URL");
+  await t.press(ENTER, "Add provider · API key");
+  await t.press(KEY, "•");
+  await t.press(ENTER, "Add provider · default model");
+  await t.press(ENTER, "Add provider · save");
 }
 
 afterEach(() => {
@@ -537,18 +576,7 @@ describe("ProviderAddForm (in the /provider popup)", () => {
       { columns: 60, rows: 15 },
     );
 
-    const fits = () => {
-      const lines = t.last().split("\n");
-
-      // box + its top margin + the status rule under it
-      expect(lines.length + 2).toBeLessThanOrEqual(15);
-
-      // the renderer clips at 60 columns: a box that is too wide loses its right border
-      for (const line of lines) {
-        expect([...line].length).toBeLessThanOrEqual(60);
-        expect(line).toMatch(/[║╗╝]$/);
-      }
-    };
+    const fits = () => expectFits60x15(t);
 
     await openForm(t);
     fits();
@@ -566,5 +594,138 @@ describe("ProviderAddForm (in the /provider popup)", () => {
     fits();
     t.stop();
     expect(t.all()).not.toContain("TOPSECRET");
+  });
+
+  it("fits 60x15 at the reuse, failed-test and confirm steps", async () => {
+    const t = mount(
+      { probe: () => Promise.resolve(PROBE_FAIL) },
+      { columns: 60, rows: 15 },
+    );
+
+    await openForm(t);
+    await t.press(DOWN, "▸ anthropic");
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    await t.press(ENTER, "already holds a key");
+    expectFits60x15(t);
+    await t.press("n", "Add provider · API key");
+    await settle(); // the key step's input handler is in place after the paint
+    await t.press(KEY, "•");
+    await t.press(ENTER, "FAIL: connection refused");
+    expectFits60x15(t);
+    await t.press("s", "Add provider · save untested?");
+    expectFits60x15(t);
+    await t.press("y", "Add provider · default model");
+    await t.press("claude-x", "claude-x");
+    expectFits60x15(t);
+    await t.press(ENTER, "Add provider · save");
+    expectFits60x15(t);
+    t.stop();
+    expect(t.all()).not.toContain("TOPSECRET");
+  });
+
+  it("Esc leaves a running test at once, with a 15 s probe timeout, and drops the probe's late reply", async () => {
+    const slow = deferred<unknown>();
+    let probes = 0;
+    const t = mount({
+      probe: () => (++probes === 1 ? slow.promise : Promise.resolve(PROBE_OK)),
+    });
+
+    await openForm(t);
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    await t.press(ENTER, "Add provider · API key");
+    await t.press(KEY, "•");
+    await t.press(ENTER, "testing…");
+    expect(
+      t.request.mock.calls.find(([m]) => m === "provider.probe")?.[2],
+    ).toBe(15_000);
+
+    await t.press(ESC, "Add provider · API key");
+    slow.resolve({ ...PROBE_OK, models: ["late-model"], suggested: "" });
+    await settle(80);
+    expect(t.last()).toContain("Add provider · API key");
+    expect(t.all()).not.toContain("late-model");
+
+    // the form still works: a new test runs and moves on
+    await t.press(ENTER, "Add provider · default model");
+    expect(t.last()).toContain("▸ gpt-b");
+    expect(t.calls("provider.probe")).toHaveLength(2);
+    t.stop();
+  });
+
+  it("shows 'added' only while the new block is highlighted", async () => {
+    const t = mount();
+
+    await fillToReview(t);
+    await t.press(ENTER, "added openai · Enter use now");
+    await t.press("\u001b[A", "▸ 1. ");
+    expect(t.last()).not.toContain("added openai");
+    await t.press(DOWN, "added openai · Enter use now");
+    t.stop();
+  });
+
+  it("reports a save that ends after the popup closed (Ctrl+C) in the transcript", async () => {
+    const ok = deferred<unknown>();
+    const t = mount({ add: () => ok.promise });
+
+    await fillToReview(t);
+    await t.press(ENTER, "saving…");
+    t.stop(); // what Ctrl+C does to the popup
+    ok.resolve({ key_env: "K", provider: { slug: "openai" } });
+    await waitFor(() =>
+      expect(t.onNotice).toHaveBeenCalledWith(
+        "added provider openai · /provider openai switches to it",
+      ),
+    );
+
+    const bad = deferred<unknown>();
+    const u = mount({ add: () => bad.promise });
+
+    await fillToReview(u);
+    await u.press(ENTER, "saving…");
+    u.stop();
+    bad.reject(new Error("disk full"));
+    await waitFor(() =>
+      expect(u.onNotice).toHaveBeenCalledWith(
+        "could not add provider openai: disk full",
+      ),
+    );
+    expect(JSON.stringify(u.onNotice.mock.calls)).not.toContain("TOPSECRET");
+  });
+
+  it("refuses a paste with a line break inside, and drops one at its end", async () => {
+    const t = mount();
+
+    await openForm(t);
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    await t.press(ENTER, "Add provider · API key");
+    await t.press(`${KEY}\nsecond-line`, "that paste has a line break");
+    expect(t.last()).toContain("(empty)");
+    await t.press(`${KEY}\r\n`, "•".repeat(KEY.length));
+    await t.press(ENTER, "Add provider · default model");
+    expect(t.calls("provider.probe")).toEqual([
+      expect.objectContaining({ api_key: KEY }),
+    ]);
+    t.stop();
+    expect(t.all()).not.toContain("TOPSECRET");
+    expect(t.all()).not.toContain("second-line");
+  });
+
+  it("refuses a base URL with a user or password in the form", async () => {
+    const t = mount();
+
+    await openForm(t);
+    await t.press(DOWN, "▸ anthropic");
+    await t.press(DOWN, "▸ local");
+    await t.press(DOWN, "▸ custom");
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    await t.press("https://bob:hunter2pass@gw.example/v1", "gw.example");
+    await t.press(ENTER, "no user or password in the URL");
+    expect(t.last()).toContain("Add provider · base URL");
+    expect(t.calls("provider.probe")).toEqual([]);
+    t.stop();
   });
 });

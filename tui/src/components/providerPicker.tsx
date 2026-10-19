@@ -39,6 +39,7 @@ export function ProviderPicker({
   gw,
   maxWidth,
   onCancel,
+  onNotice,
   onSelect,
   sessionId,
   t,
@@ -300,6 +301,7 @@ export function ProviderPicker({
         gw={gw}
         locked={locked}
         onCancel={() => setStage("list")}
+        onClosedNotice={onNotice}
         onSaved={(slug) => {
           setStage("list");
           setAdded(slug);
@@ -394,7 +396,7 @@ export function ProviderPicker({
           : " "}
       </Text>
 
-      {added ? (
+      {added && current?.slug === added ? (
         <Text color={t.color.accent} wrap="truncate-end">
           added {added} · Enter use now · Esc later
         </Text>
@@ -421,6 +423,8 @@ interface ProviderPickerProps {
   gw: GatewayClient;
   maxWidth?: number;
   onCancel: () => void;
+  /** A system line for an add-form save that ended after the popup closed (Ctrl+C while saving). */
+  onNotice?: (text: string) => void;
   onSelect: (slug: string, saveDefault: boolean) => void;
   sessionId: string | null;
   t: Theme;
