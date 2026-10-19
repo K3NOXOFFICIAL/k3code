@@ -22,7 +22,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
+import httpx
+
 from k3code import paths
+from k3code.net_guard import _literal, _refused
 
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
@@ -357,8 +360,13 @@ PURE_TOOLS = frozenset(
         "bash_output",
         "bash_kill",
         "advisor",
+        # reads the web through SearXNG, DuckDuckGo or a connected MCP search tool and changes nothing: no prompt in
+        # any mode, plan included (a user/project/session rule still decides, see _builtin_defaults_cached)
+        "web_search",
     }
 )
+#: Tools that read one URL (research/tools.py). A public host is read without a prompt; see _decide_web.
+WEB_URL_TOOLS = frozenset({"web_fetch", "web_browse"})
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
 EXIT_PLAN_TOOL = "exit_plan"
@@ -666,6 +674,8 @@ def decide(
                 dec.message = f"Edits k3code's own install (code, launcher, service unit); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
+    elif tool in WEB_URL_TOOLS:
+        dec = _decide_web(tool, str(args.get("url") or ""), ruleset)
     else:
         base: Action = "deny" if mode == PermissionMode.PLAN else "ask"
         if tool in PURE_TOOLS:
@@ -676,6 +686,64 @@ def decide(
             dec.action, dec.message = "deny", PLAN_MSG
 
     return _finish(dec, mode, headless)
+
+
+#: A host name as it can be stored in a rule: labels of letters, digits, ``-`` and ``_``; no wildcard characters (``*``
+#: survives httpx's parse and would make an "always" answer store ``web_fetch:*``), no percent escapes.
+_WEB_HOST = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
+#: Names that never leave the machine or the local network: mDNS, the internal zones of clouds and companies.
+_WEB_LOCAL_SUFFIXES = (".local", ".internal", ".localhost")
+#: A last label that is a number: ``127.1``, ``0x7f.1`` and ``0177.0.0.1`` are the loopback address to the resolver
+#: (inet_aton), but not to ipaddress. No real top-level domain is numeric.
+_WEB_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _web_host(url: str) -> tuple[str | None, str | None]:
+    """(host, why it needs a person) for a web_fetch/web_browse URL. ``host`` is what an "always" answer stores (None
+    when the URL has no usable one); ``why`` is None for a public host. Parsed as httpx parses it, so the host judged
+    is the one the client connects to. No lookup: decide() is synchronous and on the hot path, and the transport
+    (net_guard: pinned, vetted addresses) refuses a public name that resolves to a private address at fetch time."""
+    try:
+        u = httpx.URL(url)
+        host = u.raw_host.decode("ascii").lower()
+        userinfo = u.userinfo
+    except (httpx.InvalidURL, UnicodeError, ValueError, TypeError):
+        return None, "not a valid URL"
+    if u.scheme not in ("http", "https"):
+        return None, "not an http(s) URL"
+    if not host:
+        return None, "the URL names no host"
+    if (ip := _literal(host)) is not None:
+        # web.allow_private may let the transport reach a private address; decide() has no config: a person answers
+        return host, "a private, loopback or link-local address" if _refused(ip) else None
+    name = host.removesuffix(".")
+    if not _WEB_HOST.fullmatch(name):
+        return None, "not a valid host name"
+    if userinfo:
+        # a user name or password in the URL: credentials sent along, or a host that only looks like another one
+        return name, "the URL carries a user name or password"
+    if name == "localhost" or name.endswith(_WEB_LOCAL_SUFFIXES):
+        return name, "a local host name"
+    if "." not in name:
+        return name, "a single-label host name (a machine on the local network)"
+    if _WEB_NUMERIC_LABEL.fullmatch(name.rsplit(".", 1)[-1]):
+        return name, "a numeric address spelling"
+    return name, None
+
+
+def _decide_web(tool: str, url: str, ruleset: list[Rule]) -> Decision:
+    """web_fetch / web_browse read one URL and change nothing: a public host is allowed in every mode, plan included.
+    A private, loopback or local host, a URL with credentials, a non-http(s) or unparsable URL needs a person: auto
+    does not convert the ask and headless denies it. Rules are matched against the host, so a user/project/session rule
+    decides first (``web_fetch: deny``) and an "always" answer stores ``web_fetch:<host>``, which matches next time."""
+    host, why = _web_host(url)
+    rule = evaluate(tool, host or "", ruleset, default="ask" if why else "allow")
+    dec = Decision(action=rule.action, patterns=[host] if host else [], rule=rule)
+    if why and rule.layer == 0:
+        # the URL is left out of the message: it may hold a password
+        dec.action, dec.needs_human = "ask", True
+        dec.message = f"{tool} of {host or 'a URL'}: {why}; confirm it yourself"
+    return dec
 
 
 #: Generic headless ask-to-deny message: carries no rule name, so _finish replaces it with rule guidance below.
@@ -2252,6 +2320,18 @@ def _decide_path(
             # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
             dec.action = "deny"
             dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
+        elif (
+            not is_edit
+            and rule.action == "ask"
+            and outside_reads == PermissionMode.ACCEPT_EDITS
+            and rule.layer == 0
+            and not _home_secret_spelled(_spellings(path))
+        ):
+            # accept-edits: the user chose not to be asked about file changes, so a read-only look outside the roots
+            # is not worth a prompt either. Credential paths were refused above; the stores and dot folders of $HOME
+            # keep the person below, as the bash sandbox hides them (_home_store_read and _home_dot_read guard them
+            # only when a root covers them). A user/project/session rule still wins.
+            dec.action = "allow"
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
@@ -2387,6 +2467,14 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     does (``.github`` there is ordinary). Credential stores sit in dot folders no list names in full
     (``~/.config/git/credentials``, ``~/.cache/huggingface/token``). Checked on the path as written and its realpath."""
     return _home_dot_spelled(_spellings(path), roots)
+
+
+def _home_secret_spelled(spellings: list[str]) -> bool:
+    """A path, given as its spellings, lies in a credential store of ``$HOME`` (see _home_stores) or below a dot folder
+    of ``$HOME``, wherever the roots are."""
+    return bool(_stores_holding(spellings, _home_stores())) or any(
+        _below_home_dot(p, _home_prefixes()) for p in spellings
+    )
 
 
 def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
