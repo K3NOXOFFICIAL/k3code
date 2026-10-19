@@ -253,12 +253,16 @@ describe("/tune, /model and /effort", () => {
   });
 
   describe("/ultracode, /ultraplan, /ultraresearch, /preview and /review stay gateway pass-throughs", () => {
-    it.each(["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"])(
-      "/%s has no local handler",
-      (name) => {
-        expect(findSlashCommand(name)).toBeUndefined();
-      },
-    );
+    it.each([
+      "ultracode",
+      "ultraplan",
+      "ultraresearch",
+      "fanout",
+      "ultrasketch",
+      "ultrareview",
+    ])("/%s has no local handler", (name) => {
+      expect(findSlashCommand(name)).toBeUndefined();
+    });
 
     it("tune, effort and model do have one", () => {
       for (const name of ["tune", "effort", "model"]) {

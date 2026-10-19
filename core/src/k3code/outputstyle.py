@@ -59,10 +59,21 @@ def style_text(name: str, cwd: str | Path, *, attended: bool = True) -> str | No
 
     ``attended=False``: no human reads the run as it goes, so a preset that hands work to the user says otherwise.
     """
+    custom = custom_text(name, cwd)
+    return custom if custom is not None else preset_text(name, attended=attended)
+
+
+def custom_text(name: str, cwd: str | Path) -> str | None:
+    """The text of the custom style file ``name``; None when there is none."""
     custom = custom_styles(cwd)
     if name in custom:
         # A non-UTF-8 style/overlay file must not break every turn (#171): replace, don't raise.
         return custom[name].read_text(encoding="utf-8", errors="replace").strip()
+    return None
+
+
+def preset_text(name: str, *, attended: bool = True) -> str | None:
+    """The preset ``name``'s text ('' for default); None if there is no such preset."""
     if name in PRESETS:
         return PRESETS[name] if attended else UNATTENDED_PRESETS.get(name, PRESETS[name])
     return None

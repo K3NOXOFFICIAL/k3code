@@ -73,12 +73,23 @@ class ProviderEntry(BaseModel):
     #: openai kind, ``prompt_cache: auto``: globs (case-insensitive, whole id, e.g. ``auto/*``) of further model ids
     #: that get the breakpoints.
     cache_models: list[str] = Field(default_factory=list)
+    #: anthropic kind: TTL of the tools and system breakpoints (the conversation tail always keeps 5m). auto = 1h when
+    #: base_url is the first-party api.anthropic.com, 5m (no ttl field) everywhere else; ``1h`` forces it for a relay
+    #: that takes the field; ``5m`` never sends it. The openai kind never sends a ttl.
+    prompt_cache_ttl: str = "auto"
 
     @field_validator("prompt_cache")
     @classmethod
     def validate_prompt_cache(cls, v: str) -> str:
         if v not in ("auto", "on", "off"):
             raise ValueError("prompt_cache must be 'auto', 'on' or 'off'")
+        return v
+
+    @field_validator("prompt_cache_ttl")
+    @classmethod
+    def validate_prompt_cache_ttl(cls, v: str) -> str:
+        if v not in ("auto", "5m", "1h"):
+            raise ValueError("prompt_cache_ttl must be 'auto', '5m' or '1h'")
         return v
 
     @field_validator("effort")

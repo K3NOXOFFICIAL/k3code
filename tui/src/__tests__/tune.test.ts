@@ -42,7 +42,14 @@ const wire = (over: Record<string, unknown> = {}) => ({
   ],
   ultra_mode: "off",
   ultra_modes: ["off", "ultracode"],
-  wake_words: ["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"],
+  wake_words: [
+    "ultracode",
+    "ultraplan",
+    "ultraresearch",
+    "fanout",
+    "ultrasketch",
+    "ultrareview",
+  ],
   wake_words_enabled: true,
   ...over,
 });
@@ -97,7 +104,14 @@ describe("normalizeTuneSnapshot", () => {
       ultraOn: false,
       wakeWordsEnabled: true,
     });
-    expect(snap.wakeWords).toEqual(["ultracode", "ultraplan", "ultraresearch", "fanout", "ultrasketch", "ultrareview"]);
+    expect(snap.wakeWords).toEqual([
+      "ultracode",
+      "ultraplan",
+      "ultraresearch",
+      "fanout",
+      "ultrasketch",
+      "ultrareview",
+    ]);
   });
 
   it("reads the effort level, treating default/empty as no override", () => {

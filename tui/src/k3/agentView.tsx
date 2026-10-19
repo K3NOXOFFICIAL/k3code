@@ -314,10 +314,7 @@ export function AgentViewPane({
   const compact = termRows < 8;
   // header, composer, spacer, spacer, hint (+ the error line); compact: header, composer and hint only.
   // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
-  const height = Math.max(
-    1,
-    termRows - (compact ? 3 : 5) - (error ? 1 : 0),
-  );
+  const height = Math.max(1, termRows - (compact ? 3 : 5) - (error ? 1 : 0));
 
   const handleNewSessionTextChange = (draft: string) => {
     setNav({ ...navState, draft });

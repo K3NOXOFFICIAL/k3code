@@ -106,7 +106,7 @@ export const tuneCommands: SlashCommand[] = [
   },
 
   {
-    help: "list the providers, or switch this session's (--save: also the default in config.yaml)",
+    help: "popup: switch this session's provider or add a new one (+ Add new provider); /provider <name> [--save] switches (--save: also the default in config.yaml)",
     name: "provider",
     usage: "/provider [<name> [--save]]",
     run: (arg, ctx) =>

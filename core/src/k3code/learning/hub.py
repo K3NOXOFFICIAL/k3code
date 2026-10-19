@@ -302,6 +302,8 @@ class LearningHub:
         if p.kind in PROMPT_KINDS and hasattr(session, "refresh_prompt_inputs"):
             # what the user accepted applies to this conversation now; background writers wait for a compaction
             session.refresh_prompt_inputs()
+        if p.kind == "skill" and hasattr(self.server, "refresh_prompts"):
+            self.server.refresh_prompts("skills")  # curator save/merge/archive and recipe-pinned skills: global files
         return msg
 
     async def _apply(self, p: Proposal, session: Any = None) -> str:
@@ -313,6 +315,8 @@ class LearningHub:
                 session.perms.reload()
             if payload.get("type") == "mcp":
                 await self._reload_mcp(str(payload.get("root") or cwd))
+                if hasattr(self.server, "refresh_prompts"):
+                    self.server.refresh_prompts("mcp")  # like /mcp reload: every session names the new set
             return msg
         if p.kind == "permission_rule":
             msg = permrules.apply(payload, cwd=cwd)

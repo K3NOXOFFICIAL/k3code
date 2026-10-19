@@ -14,7 +14,6 @@ from k3code.commands.doctor import DoctorCommand
 from k3code.commands.stats import StatsCommand
 from k3code.commands.tune import TuneCommand
 from k3code.commands.update_cmd import UpdateCommand
-from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
 from k3code.routing.tiers import active_provider
 from k3code.session_ai import compact_messages
@@ -102,10 +101,7 @@ class _ModelCommand(CommandDef):
             backup = chain_config.edit_config(args[0], args[1:])
         except chain_config.ChainEditError as e:
             return {"type": "message", "message": f"/model chain: {e}"}
-        reloaded = load_config(project_dir=Path.cwd())
-        ctx.config.providers = reloaded.providers
-        if hasattr(ctx, "_chain_key"):
-            ctx._chain_key = None  # rebuild the router on the next turn
+        chain_config.reload_providers(ctx)
         note = f" (backup: {backup})" if backup else ""
         return {
             "type": "message",

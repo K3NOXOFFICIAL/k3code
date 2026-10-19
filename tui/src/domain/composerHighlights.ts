@@ -189,8 +189,7 @@ export const highlightsStable = (
 export const hasWakeWordHit = (
   lines: readonly string[],
   wake?: WakeConfig,
-): boolean =>
-  wakeHit(lines.join("\n"), wake ?? DEFAULT_WAKE) !== null;
+): boolean => wakeHit(lines.join("\n"), wake ?? DEFAULT_WAKE) !== null;
 export const composerLineHighlights = (
   lines: readonly string[],
   wake?: WakeConfig,

@@ -22,7 +22,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
+import httpx
+
 from k3code import paths
+from k3code.net_guard import literal_refused
 
 from . import hardline
 from .rules import Action, Rule, evaluate, merge
@@ -357,8 +360,13 @@ PURE_TOOLS = frozenset(
         "bash_output",
         "bash_kill",
         "advisor",
+        # reads the web through SearXNG, DuckDuckGo or a connected MCP search tool and changes nothing: no prompt in
+        # any mode, plan included (a user/project/session rule still decides, see _builtin_defaults_cached)
+        "web_search",
     }
 )
+#: Tools that read one URL (research/tools.py). A public host is read without a prompt; see _decide_web.
+WEB_URL_TOOLS = frozenset({"web_fetch", "web_browse"})
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
 EXIT_PLAN_TOOL = "exit_plan"
@@ -666,6 +674,8 @@ def decide(
                 dec.message = f"Edits k3code's own install (code, launcher, service unit); confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
+    elif tool in WEB_URL_TOOLS:
+        dec = _decide_web(tool, str(args.get("url") or ""), ruleset)
     else:
         base: Action = "deny" if mode == PermissionMode.PLAN else "ask"
         if tool in PURE_TOOLS:
@@ -676,6 +686,71 @@ def decide(
             dec.action, dec.message = "deny", PLAN_MSG
 
     return _finish(dec, mode, headless)
+
+
+#: A host name as it can be stored in a rule: labels of letters, digits, ``-`` and ``_``; no wildcard characters (``*``
+#: survives httpx's parse and would make an "always" answer store ``web_fetch:*``), no percent escapes.
+_WEB_HOST = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
+#: Names that never leave the machine or the local network: mDNS, the internal zones of clouds and companies, the
+#: zones home routers hand out (``.home.arpa``, ``.lan``, ``.localdomain``).
+_WEB_LOCAL_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".lan", ".localdomain")
+#: A last label that is a number: ``127.1``, ``0x7f.1`` and ``0177.0.0.1`` are the loopback address to the resolver
+#: (inet_aton), but not to ipaddress. No real top-level domain is numeric.
+_WEB_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _web_host(url: str) -> tuple[str | None, str | None]:
+    """(host, why it needs a person) for a web_fetch/web_browse URL. ``host`` is what an "always" answer stores (None
+    when the URL has no usable one); ``why`` is None for a public host. Parsed as httpx parses it, so the host judged
+    is the one the client connects to. No lookup: decide() is synchronous and on the hot path, and the transport
+    (net_guard: pinned, vetted addresses) refuses a public name that resolves to a private address at fetch time."""
+    try:
+        u = httpx.URL(url)
+        host = u.raw_host.decode("ascii").lower()
+        userinfo = u.userinfo
+    except (httpx.InvalidURL, UnicodeError, ValueError, TypeError):
+        return None, "not a valid URL"
+    if u.scheme not in ("http", "https"):
+        return None, "not an http(s) URL"
+    if not host:
+        return None, "the URL names no host"
+    if "%" in host and ":" not in host:
+        # a percent sign outside an IPv6 literal (``8.8.8.8%25x``): no host name or IPv4 address holds one, and the
+        # resolver may read the part before it alone. Nothing is stored.
+        return None, "not a valid host name"
+    if (refused := literal_refused(host)) is not None:
+        # web.allow_private may let the transport reach a private address; decide() has no config: a person answers
+        return host, "a private, loopback or link-local address" if refused else None
+    name = host.removesuffix(".")
+    if not _WEB_HOST.fullmatch(name):
+        return None, "not a valid host name"
+    if userinfo:
+        # a user name or password in the URL: credentials sent along, or a host that only looks like another one
+        return name, "the URL carries a user name or password"
+    if name == "localhost" or name.endswith(_WEB_LOCAL_SUFFIXES):
+        return name, "a local host name"
+    if "." not in name:
+        return name, "a single-label host name (a machine on the local network)"
+    if _WEB_NUMERIC_LABEL.fullmatch(name.rsplit(".", 1)[-1]):
+        return name, "a numeric address spelling"
+    return name, None
+
+
+def _decide_web(tool: str, url: str, ruleset: list[Rule]) -> Decision:
+    """web_fetch / web_browse read one URL and change nothing: a public host is allowed in every mode, plan included.
+    A private, loopback or local host, a URL with credentials, a non-http(s) or unparsable URL needs a person: auto
+    does not convert the ask and headless denies it. Rules are matched against the host, so a user/project/session rule
+    decides first (``web_fetch: deny``) and an "always" answer stores ``web_fetch:<host>``, which matches next time."""
+    host, why = _web_host(url)
+    rule = evaluate(tool, host or "", ruleset, default="ask" if why else "allow")
+    dec = Decision(action=rule.action, patterns=[host] if host else [], rule=rule)
+    if why and (rule.layer == 0 or dec.action == "ask"):
+        # an ask rule of the user or project (``web_fetch: {'*': ask}``) is meant to be stricter: it keeps the person
+        # too, or auto mode would answer it. An allow rule still decides. The URL is left out of the message: it may
+        # hold a password
+        dec.action, dec.needs_human = "ask", True
+        dec.message = f"{tool} of {host or 'a URL'}: {why}; confirm it yourself"
+    return dec
 
 
 #: Generic headless ask-to-deny message: carries no rule name, so _finish replaces it with rule guidance below.
@@ -2252,6 +2327,21 @@ def _decide_path(
             # auto mode does not stop for a wandering read: anything outside the toolchain is refused with a hint
             dec.action = "deny"
             dec.message = f"{path} is outside the project: stay inside the project, or ask the user to /add-dir it"
+        elif (
+            not is_edit
+            and rule.action == "ask"
+            and outside_reads == PermissionMode.ACCEPT_EDITS
+            and rule.layer == 0
+            and not _home_secret_spelled(_spellings(path))
+            and _outside_read_ok(path)
+        ):
+            # accept-edits: the user chose not to be asked about file changes, so a read-only look outside the roots
+            # is not worth a prompt either. Credential paths were refused above; the stores and dot folders of $HOME
+            # keep the person below, as the bash sandbox hides them (_home_store_read and _home_dot_read guard them
+            # only when a root covers them), and so do dot folders, credential-like names and the system and other
+            # users' trees anywhere (_outside_read_ok). A grep or glob of such a directory withholds the same files
+            # below it (search_withheld with the roots). A user/project/session rule still wins.
+            dec.action = "allow"
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
@@ -2389,6 +2479,89 @@ def _home_dot_read(path: str, roots: list[str]) -> bool:
     return _home_dot_spelled(_spellings(path), roots)
 
 
+def _home_secret_spelled(spellings: list[str]) -> bool:
+    """A path, given as its spellings, lies in a credential store of ``$HOME`` (see _home_stores) or below a dot folder
+    of ``$HOME``, wherever the roots are."""
+    return bool(_stores_holding(spellings, _home_stores())) or any(
+        _below_home_dot(p, _home_prefixes()) for p in spellings
+    )
+
+
+#: Dot names a look outside the roots in accept-edits sees without a person: repository and editor settings, which hold
+#: no credentials (lower case; ``.prettierrc*``, ``.eslintrc*`` and the dotenv templates are matched by prefix and
+#: suffix, see _benign_dot). ``.git`` is not one: ``.git/config`` can hold a token in a remote URL.
+_BENIGN_DOT_NAMES = frozenset(
+    {
+        ".github",
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".vscode",
+        ".nvmrc",
+        ".python-version",
+        ".tool-versions",
+        ".dockerignore",
+    }
+)
+_BENIGN_DOT_PREFIXES = (".prettierrc", ".eslintrc")
+#: File names that look like a key or a credential wherever they lie: certificates, keystores and keys, ssh keys, any
+#: name containing ``credentials`` (cloud CLIs, ``gcloud-credentials.json``), Kerberos ticket caches
+#: (``/tmp/krb5cc_1000``), kubeconfigs, Terraform state, a file that is just ``token``/``tokens`` or a service-account
+#: key, and ``secret(s).<data extension>``. Deliberately not ``*token*`` or ``*secret*``: ``tokenizer.py`` and
+#: ``secrets_manager.py`` are ordinary source. Matched case-insensitively on one component.
+_CREDENTIAL_NAME = re.compile(
+    r".*\.(?:pem|key|p12|pfx|jks|keystore|ppk|kdbx)"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519).*"
+    r"|.*credentials.*|krb5cc.*|kubeconfig.*|.*\.tfstate.*"
+    r"|tokens?(?:\.[a-z]+)?|.*secrets?\.(?:ya?ml|json|toml|ini|env|txt)|service[-_]account.*\.json",
+    re.IGNORECASE,
+)
+#: Trees a look outside the roots does not see without a person: process and device state (``/proc/self/cmdline``,
+#: ``/proc/1/cwd``), runtime secrets (``/run/secrets``, ``/var/run/secrets/kubernetes.io``, ``/run/user/<uid>``),
+#: root's home, the boot files and ``/etc`` (a read of it asks a person outside auto mode, see _toolchain_read).
+_GUARDED_TREES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/root", "/boot", "/etc")
+#: Folders that hold the users' homes: any home there but the current user's own is guarded like _GUARDED_TREES.
+_HOMES_DIRS = ("/home", "/var/home", "/Users")
+
+
+def _benign_dot(name: str) -> bool:
+    low = name.casefold()
+    return (
+        low in _BENIGN_DOT_NAMES
+        or low.startswith(_BENIGN_DOT_PREFIXES)
+        or (low.startswith(".env.") and low.endswith(_DOTENV_TEMPLATES))
+    )
+
+
+def _risky_component(name: str) -> bool:
+    """A path component that keeps a look outside the roots in front of a person: a dot name not on the benign list
+    (``.npmrc``, ``.git``, ``.aws``, ``..``) or a name that looks like a credential (see _CREDENTIAL_NAME)."""
+    return (name.startswith(".") and not _benign_dot(name)) or bool(_CREDENTIAL_NAME.fullmatch(name))
+
+
+def _guarded_tree(path: str) -> str | None:
+    """The guarded tree ``path`` (absolute, normalised) lies in: one of _GUARDED_TREES, or another user's home
+    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere."""
+    for tree in _GUARDED_TREES:
+        if _under(path, tree):
+            return tree
+    for homes in _HOMES_DIRS:
+        if path.startswith(homes + "/"):
+            home = homes + "/" + path[len(homes) + 1 :].split("/", 1)[0]
+            own = _home_prefixes()  # $HOME/ as written and by realpath
+            if home + "/" not in own and _real(home) + "/" not in own:
+                return home
+    return None
+
+
+def _outside_read_ok(path: str) -> bool:
+    """A read, grep or glob of ``path`` outside the roots that accept-edits allows without a person: no component is
+    risky (a non-benign dot name or a credential-like name, see _risky_component) and the path is in no guarded tree
+    (``/proc``, ``/run``, ``/root``, another user's home, see _guarded_tree). Checked on the path as written and on its
+    realpath. A walk of an allowed directory still withholds what lies in such places (see search_withheld)."""
+    return not any(_guarded_tree(p) or any(_risky_component(c) for c in p.split("/") if c) for p in _spellings(path))
+
+
 def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
     """_home_dot_read for a path given as its spellings."""
     home = os.path.normpath(os.path.expanduser("~"))
@@ -2498,13 +2671,22 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     )
 
 
-def search_withheld(searched: str) -> Callable[[str], bool]:
-    """Which files a search below ``searched`` (grep over a directory) returns no lines of: a credential file
+def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[[str], bool]:
+    """Which files a search below ``searched`` (grep or glob over a directory) returns nothing of: a credential file
     (sensitive_path); a file in a credential store of ``$HOME`` (see _home_stores) that ``searched`` is not itself
     inside (a search of the store was decided on that path); and, in a search of ``$HOME`` or a directory above it,
     every file below a dot folder of ``$HOME``, whose read asks a person there (see _decide_path). A walk of ``$HOME``
-    thus leaves a project's ``.github`` out too: search the project."""
+    thus leaves a project's ``.github`` out too: search the project.
+
+    With ``roots`` (the session's project roots) and ``searched`` outside all of them, also every file or directory
+    whose path below ``searched`` has a risky component (a dot name not on the benign list, a credential-like name, see
+    _risky_component), and one in a guarded tree (``/proc``, ``/run``, ``/etc``, another user's home, see
+    _guarded_tree) that ``searched`` is not itself in: what a read of that file outside the roots would ask a person
+    for. accept-edits allows such a search without a person (see _outside_read_ok), and the walk must not hand over
+    what the read guards (a fallback walk, an include glob or a ``.ignore`` reopens hidden files)."""
     inside = _spellings(searched)
+    strict = roots is not None and not _inside(searched, roots)
+    tops = [p.rstrip("/") + "/" for p in inside]
     # _stores_holding per file, precomputed: a walk of $HOME checks every file it finds
     stores = [s.casefold().rstrip("/") for s in _home_stores() if not _stores_holding(inside, [s])]
     exact, below = frozenset(stores), tuple(s + "/" for s in stores)
@@ -2513,13 +2695,34 @@ def search_withheld(searched: str) -> Callable[[str], bool]:
     def withheld(path: str) -> bool:
         if sensitive_path(path):
             return True
-        for p in _spellings(path):
+        spellings = _spellings(path)
+        for p in spellings:
             low = p.casefold()
             if low in exact or low.startswith(below) or _below_home_dot(p, homes):
                 return True
-        return False
+        return strict and _outside_withheld(_flat(path), spellings, inside, tops)
 
     return withheld
+
+
+def outside_search_withheld(searched: str, roots: list[str]) -> Callable[[str], bool] | None:
+    """For glob, which lists names: None when ``searched`` lies in one of ``roots`` (every name there is listed, as
+    before); else search_withheld with the roots, so a glob outside the roots lists no name its grep would withhold."""
+    return None if _inside(searched, roots) else search_withheld(searched, roots)
+
+
+def _outside_withheld(flat: str, spellings: list[str], inside: list[str], tops: list[str]) -> bool:
+    """search_withheld's check for a search outside the roots: ``flat`` (the file as the walk names it, normalised)
+    is withheld unless it lies below a spelling of the searched directory (``inside``, ``tops`` with a trailing slash)
+    with no risky component there, and no spelling of it is in a guarded tree the search did not start in."""
+    rel = next((flat[len(t) :] for t in tops if flat.startswith(t)), None)
+    if rel is None or any(_risky_component(c) for c in rel.split("/") if c):
+        return True
+    for p in spellings:
+        tree = _guarded_tree(p)
+        if tree and not any(_under(s, tree) for s in inside):
+            return True
+    return False
 
 
 #: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).

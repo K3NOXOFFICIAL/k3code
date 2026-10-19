@@ -49,6 +49,28 @@ def file_guard(guard: Guard | None) -> Iterator[None]:
         _GUARD.reset(token)
 
 
+#: The session's project roots for grep and glob (see :func:`search_roots`); unset, the tools take their ``cwd``.
+_SEARCH_ROOTS: contextvars.ContextVar[tuple[str, ...] | None] = contextvars.ContextVar(
+    "k3code_search_roots", default=None
+)
+
+
+@contextlib.contextmanager
+def search_roots(roots: list[str]) -> Iterator[None]:
+    """Make ``roots`` (cwd and add-dirs) the project roots grep and glob in this context judge a search by: one outside
+    them withholds what a read outside the roots guards (see permissions.engine.search_withheld)."""
+    token = _SEARCH_ROOTS.set(tuple(roots))
+    try:
+        yield
+    finally:
+        _SEARCH_ROOTS.reset(token)
+
+
+def session_search_roots() -> tuple[str, ...] | None:
+    """The roots set by :func:`search_roots`, or None outside one."""
+    return _SEARCH_ROOTS.get()
+
+
 def _fd_path(fd: int) -> str:
     return os.readlink(f"/proc/self/fd/{fd}")
 

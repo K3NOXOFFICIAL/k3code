@@ -15,10 +15,11 @@ from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.engine import home_read_only
 from k3code.permissions.state import PermissionState
-from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall
+from k3code.providers.types import INVALID_TOOL_CALL, SYSTEM_CACHE_KEY, Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
+from k3code.routing.tiers import TaskKind
 from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import (
     FILE_TOOLS,
@@ -29,7 +30,7 @@ from k3code.tools import (
     clip_tool_results,
     format_tool_result,
 )
-from k3code.tools.safe_open import Guard, file_guard
+from k3code.tools.safe_open import Guard, file_guard, search_roots
 from k3code.tools.validate import invalid_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
@@ -264,7 +265,7 @@ class AgentLoop:
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
-            Message(role="system", content=self.system_prompt),
+            Message(role="system", content=self.system_prompt, meta=self._system_meta()),
             *(history or []),
             Message(role="user", content=user_prompt, meta=prompt_meta),
         ]
@@ -685,7 +686,9 @@ class AgentLoop:
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
-                with file_guard(self._file_guard(tool_call.name, args, decision)):
+                # grep and glob judge a search outside the roots by the session's roots (see search_withheld)
+                roots = [str(self.cwd), *self.permissions.add_dirs]
+                with file_guard(self._file_guard(tool_call.name, args, decision)), search_roots(roots):
                     result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": self._bash_refusal(exc)}
@@ -762,6 +765,11 @@ class AgentLoop:
             return None
         window = tuple(args.get(k) for k in ("offset", "limit", "start", "end"))
         return (str(path), st.st_mtime_ns, st.st_size, window)
+
+    def _system_meta(self) -> dict[str, Any] | None:
+        """A sub-agent's system prompt is unique to it and only its own tool loop reads it back: tell the provider to
+        keep that breakpoint at the 5m TTL (the tools breakpoint, shared by agents of one type, keeps 1h)."""
+        return {SYSTEM_CACHE_KEY: "5m"} if self.task_kind == TaskKind.SUBAGENT.value else None
 
     async def _request_messages(self, messages: list[Message], specs: list[Any]) -> list[Message]:
         """What the provider is sent: long tool results clipped, and once the request passes ``elide_at_ratio`` of the

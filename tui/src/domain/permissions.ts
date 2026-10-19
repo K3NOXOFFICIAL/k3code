@@ -48,7 +48,8 @@ export function permissionsCommandForKey(
     // Mode row: Enter/m cycles the mode through the advertised list.
     if (k === "m" || k === "enter") {
       const modes = snap.modes.length ? snap.modes : [snap.mode];
-      const next = modes[(modes.indexOf(snap.mode) + 1) % modes.length] ?? snap.mode;
+      const next =
+        modes[(modes.indexOf(snap.mode) + 1) % modes.length] ?? snap.mode;
       return `/permissions mode ${next}`;
     }
 

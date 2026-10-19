@@ -777,6 +777,71 @@ def test_reads_of_home_stores_outside_the_roots_are_unchanged(fake_home) -> None
     assert d.action == "ask" and d.needs_human
 
 
+def test_accept_edits_reads_outside_the_roots_without_asking(fake_home, tmp_path) -> None:
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    (sibling / "notes.txt").write_text("x\n")
+    for tool, path in (
+        ("read", f"{sibling}/notes.txt"),
+        ("grep", str(sibling)),
+        ("glob", str(sibling)),
+        ("read", "/var/log/syslog"),
+        ("read", "~/notes.txt"),  # an ordinary file of $HOME, which no root covers
+        ("grep", "~"),  # a walk of $HOME withholds its dot folders and stores (search_withheld)
+    ):
+        d = decide(mode="accept-edits", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "allow" and not d.needs_human, (tool, path, d)
+        # default mode asks a person as before; plan mode too; auto refuses with a hint as before
+        d = decide(mode="default", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+        d = decide(mode="plan", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+        d = decide(mode="auto", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "deny" and "/add-dir" in (d.message or ""), (tool, path, d)
+    # the planning turn of an accept-edits session is plan mode: it still asks
+    d = decide(mode="plan", tool="read", args={"path": f"{sibling}/notes.txt"}, cwd=CWD, plan_for="accept-edits")
+    assert d.action == "ask" and d.needs_human, d
+    # writes outside the roots still ask
+    for tool in ("write", "edit"):
+        d = decide(mode="accept-edits", tool=tool, args={"path": f"{sibling}/notes.txt"}, cwd=CWD)
+        assert d.action == "ask", (tool, d)
+    # a user/project/session rule still decides
+    for layer in ("user_rules", "project_rules", "session_rules"):
+        for action in ("ask", "deny"):
+            rules = [_r("read", f"{sibling}/*", action)]
+            d = decide(
+                mode="accept-edits", tool="read", args={"path": f"{sibling}/notes.txt"}, cwd=CWD, **{layer: rules}
+            )
+            assert d.action == action, (layer, action, d)
+
+
+def test_accept_edits_still_asks_for_home_secrets_and_etc_outside_the_roots(fake_home, tmp_path) -> None:
+    # the stores and dot folders of $HOME are guarded by the outside-roots prompt when no root covers them
+    link = tmp_path / "innocent.txt"
+    link.symlink_to(fake_home / ".netrc")
+    for tool, path in (
+        ("read", "~/.config/gh/hosts.yml"),
+        ("read", "~/.netrc"),
+        ("read", "~/.npmrc"),
+        ("read", "~/.docker/config.json"),
+        ("read", "~/.config/gcloud/credentials.db"),
+        ("read", "~/.cache/huggingface/token"),
+        ("grep", "~/.config"),
+        ("glob", "~/.config/gh"),
+        ("read", str(link)),  # a link to a store, by its target
+        ("read", f"{fake_home}/creds"),
+        ("read", "~/.local/share/uv/credentials/credentials.toml"),
+        ("read", "/etc/hostname"),
+    ):
+        d = decide(mode="accept-edits", tool=tool, args={"path": path, "pattern": "*"}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human, (tool, path, d)
+        assert decide(mode="accept-edits", tool=tool, args={"path": path}, cwd=CWD, headless=True).action == "deny"
+    # key and credential locations stay a hardline deny
+    for path in ("~/.ssh/id_rsa", "~/.aws/credentials", "/proc/self/environ", f"{tmp_path}/.env"):
+        d = decide(mode="accept-edits", tool="read", args={"path": path}, cwd=CWD)
+        assert d.action == "deny" and d.hardline == "sensitive-path", (path, d)
+
+
 def test_the_stricter_of_the_written_and_the_reached_path_keeps_always_ask(fake_home, tmp_path) -> None:
     # `link/../hosts.yml`: the tools follow link first, so ~/.config/gh/hosts.yml is read, not <cwd>/hosts.yml
     outside = tmp_path / "elsewhere"

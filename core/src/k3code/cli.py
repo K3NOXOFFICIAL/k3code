@@ -179,6 +179,7 @@ async def _run_headless(
     """
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
+    from k3code.context_budget import router_window, tool_output_chars
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
@@ -227,6 +228,8 @@ async def _run_headless(
         cwd=Path.cwd(),
         reliability=reliability,
         session=session,
+        tool_output_chars=tool_output_chars(config),
+        context_window=router_window(config, router, config.default_model),
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     loop.on_home_started = _warn_home_started
@@ -520,6 +523,7 @@ async def _run_repl(
     """Run minimal REPL."""
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
+    from k3code.context_budget import router_window, tool_output_chars
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
@@ -564,6 +568,8 @@ async def _run_repl(
         on_event=_print_event,
         cwd=Path.cwd(),
         reliability=reliability,
+        tool_output_chars=tool_output_chars(config),
+        context_window=router_window(config, router, config.default_model),
     )
     loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     loop.on_home_started = _warn_home_started
@@ -601,7 +607,9 @@ async def _run_repl(
             if err := _use_model_key(config, user_input[7:].strip()):
                 print(f"[Error] {err}")
             else:
-                loop.router = make_router()  # the chain resolves the key to each provider's model id
+                router = make_router()  # the chain resolves the key to each provider's model id
+                loop.router = router
+                loop.context_window = router_window(config, router, config.default_model)
                 print(f"Model set to: {config.default_model}")
             continue
 

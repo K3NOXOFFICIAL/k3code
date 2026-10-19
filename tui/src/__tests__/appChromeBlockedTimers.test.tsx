@@ -671,7 +671,7 @@ describe("AppLayout agent view: leaving the startup session", () => {
           layout.press(ch);
           await new Promise((r) => setTimeout(r, 10));
         }
-            layout.press("\n");
+        layout.press("\n");
         await new Promise((r) => setTimeout(r, 200));
       }
 
@@ -833,7 +833,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
-    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    await waitFor(() =>
+      expect(layout.output()).toContain("start a new session"),
+    );
     // let React (re)subscribe the focused TextInput before typing
     await new Promise((r) => setTimeout(r, 60));
     for (const ch of "test session") {
@@ -898,7 +900,9 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       expect(layout.output()).toContain("No sessions yet - press n"),
     );
     layout.press("n");
-    await waitFor(() => expect(layout.output()).toContain("start a new session"));
+    await waitFor(() =>
+      expect(layout.output()).toContain("start a new session"),
+    );
     // let React (re)subscribe the focused TextInput before typing
     await new Promise((r) => setTimeout(r, 60));
     for (const ch of "test session") {

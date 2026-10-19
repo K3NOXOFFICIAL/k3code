@@ -43,9 +43,9 @@ describe("permissionsCommandForKey", () => {
 
   it("wraps the mode cycle", () => {
     const rows = permissionRows({ ...SNAP, mode: "auto" });
-    expect(permissionsCommandForKey({ ...SNAP, mode: "auto" }, rows[0]!, "m")).toBe(
-      "/permissions mode default",
-    );
+    expect(
+      permissionsCommandForKey({ ...SNAP, mode: "auto" }, rows[0]!, "m"),
+    ).toBe("/permissions mode default");
   });
 
   it("maps a/s/d/r on a rule row", () => {
@@ -60,7 +60,9 @@ describe("permissionsCommandForKey", () => {
     expect(permissionsCommandForKey(SNAP, rule, "d")).toBe(
       "/permissions deny bash rm *",
     );
-    expect(permissionsCommandForKey(SNAP, rule, "r")).toBe("/permissions rm u1");
+    expect(permissionsCommandForKey(SNAP, rule, "r")).toBe(
+      "/permissions rm u1",
+    );
   });
 
   it("returns null for unbound keys", () => {

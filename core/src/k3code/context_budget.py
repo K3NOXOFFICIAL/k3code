@@ -51,6 +51,21 @@ def context_window(config: Any, model_id: str) -> int:
     return _explicit_window(config, model_id) or family_window(model_id) or FALLBACK_WINDOW
 
 
+def router_window(config: Any, router: Any, fallback_model: str) -> int:
+    """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one has
+    its own), so in-turn elision starts before the tightest model overflows. ``fallback_model``: the window to use
+    when the router's chain names no model."""
+    models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
+    if not models:
+        return context_window(config, fallback_model)
+    return min(context_window(config, m) for m in models)
+
+
+def tool_output_chars(config: Any) -> int | None:
+    """``context.tool_output_chars`` from config, or None when unset (the loop then clips at its default)."""
+    return int((getattr(config, "context", None) or {}).get("tool_output_chars", 0)) or None
+
+
 def has_explicit_window(config: Any, model_id: str) -> bool:
     """Whether config sets ``models.<model_id>.context_window``."""
     return _explicit_window(config, model_id) is not None

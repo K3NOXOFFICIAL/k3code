@@ -193,16 +193,19 @@ def rank_skills(skills: list[Skill], cwd: str | Path, *, now: float | None = Non
     return sorted(skills, key=lambda s: (not fits(s), not recent_ok(s.name), s.name))
 
 
-def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None, limit: int = PROMPT_LIMIT) -> str:
+def skills_prompt(
+    cwd: str | Path, extra_roots: list[str] | None = None, limit: int = PROMPT_LIMIT, *, now: float | None = None
+) -> str:
     """Names + descriptions only; full text is loaded on demand via the ``skill`` tool.
 
-    With more than ``limit`` skills, which ones are named is decided by rank (:func:`rank_skills`); the named ones
-    are listed by name, so the section changes only when the chosen set does."""
+    With more than ``limit`` skills, which ones are named is decided by rank (:func:`rank_skills`, its recent-use
+    cutoff counted back from ``now``); the named ones are listed by name, so the section changes only when the chosen
+    set does."""
     skills = discover(cwd, extra_roots)
     if not skills:
         return ""
     lines = ["## Skills", "", "Load a skill's full instructions with the `skill` tool (`name`, or `query` to search)."]
-    chosen = sorted(rank_skills(skills, cwd)[:limit], key=lambda s: s.name) if len(skills) > limit else skills
+    chosen = sorted(rank_skills(skills, cwd, now=now)[:limit] if len(skills) > limit else skills, key=lambda s: s.name)
     for s in chosen:
         desc = s.description if len(s.description) <= 90 else s.description[:87] + "..."
         lines.append(f"- {s.name}: {desc}")

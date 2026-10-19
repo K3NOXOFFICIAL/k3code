@@ -28,6 +28,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -40,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from k3code import confio, mcpjson, userhooks, wakewords
@@ -58,7 +60,7 @@ from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
-from k3code.context_budget import compact_threshold, context_window, overhead_tokens
+from k3code.context_budget import compact_threshold, context_window, overhead_tokens, router_window
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -94,7 +96,7 @@ from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
-from k3code.redact import redact, scrub_text
+from k3code.redact import REDACTED, redact, scrub_text, scrub_urls
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability, shared_netwatch
 from k3code.reliability import events as rev
 from k3code.reliability.journal import delete_session_journal, prune_journals
@@ -316,6 +318,9 @@ class LiveSession:
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
+        #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
+        #: compaction or an /undo): the size of the context as the provider counted it.
+        self.last_prompt_tokens = 0
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -332,15 +337,22 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
-        #: The prompt's learned tail (memory files, learned notes, facts, gotchas, overlay) as the session's first
-        #: prompt read it (``prompting.frozen_learned_sections``): the background review and distill rewrite those
-        #: files mid-session, and the prompt must stay the cached prefix until the conversation is rewritten anyway.
+        #: What the session's first prompt read of the inputs that change under it (``prompting.prompt_sections``):
+        #: the custom style text, the skills index, the MCP section and the learned tail (memory files, learned notes,
+        #: facts, gotchas, overlay). Skill files, MCP connections and the background review and distill change those
+        #: mid-session, and the prompt must stay the cached prefix until the conversation is rewritten anyway or the
+        #: user changes an input on purpose.
         self.prompt_frozen: dict[str, Any] = {}
 
-    def refresh_prompt_inputs(self) -> None:
-        """Read the learned tail of the prompt afresh at the next loop: the conversation was rewritten (compaction,
-        /clear), the session moved to another project, or the user changed its memory on purpose (/memory add)."""
-        self.prompt_frozen.clear()
+    def refresh_prompt_inputs(self, *slots: str) -> None:
+        """Read the prompt's snapshot afresh at the next loop: all of it when the conversation was rewritten
+        (compaction, /clear), the session moved to another project or the user changed its memory on purpose
+        (/memory add); only ``slots`` (``style``, ``skills``, ``mcp``, ``learned``) after a command that changed
+        those (/output-style, /reload-skills, /mcp reload, /reload)."""
+        if not slots:
+            self.prompt_frozen.clear()
+        for slot in slots:
+            self.prompt_frozen.pop(slot, None)
 
     @property
     def turn_in_flight(self) -> bool:
@@ -2146,7 +2158,7 @@ class GatewayServer:
                 )
             )
             or None,
-            context_window=self._router_window(router, session),
+            context_window=router_window(self.config, router, self._active_model(session)),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
         loop.on_home_started = session.notify_home_started
@@ -2240,13 +2252,9 @@ class GatewayServer:
             **router_options(self.config),
         )
 
-    def _router_window(self, router: Router, session: LiveSession) -> int:
-        """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
-        has its own), so in-turn elision starts before the tightest model overflows."""
-        models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
-        if not models:
-            return context_window(self.config, self._active_model(session))
-        return min(context_window(self.config, m) for m in models)
+    def _context_max(self, session: LiveSession) -> int:
+        """The window of the session's active model: the denominator of the context usage shown to clients."""
+        return context_window(self.config, self._active_model(session))
 
     async def _run_one_turn(
         self, session: LiveSession, text: str, *, hooked: userhooks.HookOutcome | None = None
@@ -2531,7 +2539,7 @@ class GatewayServer:
             "message.complete",
             {
                 "text": final_text,
-                "usage": _usage_payload(usage),
+                "usage": _usage_payload(usage, self._context_max(session)),
                 "status": status,
                 "error": error,
                 "error_surface": _error_surface(session.last_exc) if status == "error" else None,
@@ -2709,6 +2717,7 @@ class GatewayServer:
             return 0
         if folded:
             session.stored.messages = new
+            session.last_prompt_tokens = 0  # the reported size described the history before it was folded
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
             # be matched to its turn, so their outcomes stop waiting for one
             self.learning.settle_turns(session.session_id)
@@ -2730,6 +2739,8 @@ class GatewayServer:
         """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
         the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
         if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
+            # an estimate, not the session's snapshot: on the first turn after a daemon start this runs before the MCP
+            # servers are started, and a snapshot taken here would leave their tools out of the prompt for good
             prompt = build_system_prompt(
                 session.system_prompt,
                 cwd=session.perms.cwd,
@@ -2737,7 +2748,6 @@ class GatewayServer:
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
                 session_id=session.session_id,
-                frozen=session.prompt_frozen,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
@@ -2804,7 +2814,8 @@ class GatewayServer:
                 session.call_started = None
                 session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:
-                    session.emit("session.usage", {"usage": _usage_payload(u)})
+                    session.last_prompt_tokens = max(0, u.prompt_tokens)
+                    session.emit("session.usage", {"usage": _usage_payload(u, self._context_max(session))})
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
                 for tc in msg.tool_calls:
                     self._announce_tool(session, tc)
@@ -2923,6 +2934,12 @@ class GatewayServer:
         live = self.live.get(session_id)
         return live.turn_id if live is not None else ""
 
+    def refresh_prompts(self, *slots: str) -> None:
+        """``refresh_prompt_inputs(*slots)`` for every live session: the user changed an input the daemon shares (its
+        config, the MCP servers), and a session's snapshot would otherwise keep naming what is gone."""
+        for live in list(self.live.values()):
+            live.refresh_prompt_inputs(*slots)
+
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
         """Re-read config files into the live settings.
 
@@ -2943,7 +2960,8 @@ class GatewayServer:
         if "providers" in changed:
             self.router = None
             self._tiers = None
-        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base))
+        if self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base)):
+            self.refresh_prompts("mcp")  # the restarted servers' tools, not the old set's
 
     def activate_session(self, session_id: str) -> LiveSession | None:
         stored = self.store.get(session_id)
@@ -3584,9 +3602,26 @@ def _file_keys(base: Path) -> set[str]:
     return keys
 
 
-def _usage_payload(usage: Usage) -> dict[str, Any]:
-    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens."""
+def _context_fields(used: int, window: int) -> dict[str, int]:
+    """``context_used`` / ``context_max`` / ``context_percent`` (percent capped at 100; ``context_used`` is not);
+    empty when either is unknown, so clients hide the segment."""
+    if used <= 0 or window <= 0:
+        return {}
+    return {"context_used": used, "context_max": window, "context_percent": min(100, round(100 * used / window))}
+
+
+def _usage_payload(usage: Usage, context_max: int = 0) -> dict[str, Any]:
+    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens.
+
+    ``usage`` is one model request's (the last of the turn for ``message.complete``), so its prompt_tokens is the
+    current context size. ``cache_hit_pct`` is present only when the provider reported cache reads; the context keys
+    only with ``context_max`` and a reported prompt (clients hide a segment whose key is missing)."""
+    extra: dict[str, int] = {}
+    if usage.cache_read_tokens > 0 and usage.prompt_tokens > 0:
+        extra["cache_hit_pct"] = round(100 * usage.cache_read_tokens / usage.prompt_tokens)
+    extra.update(_context_fields(usage.prompt_tokens, context_max))
     return {
+        **extra,
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
@@ -4268,6 +4303,195 @@ async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"provider": _option_for(server, params, entry.name)}
 
 
+#: A provider block name the popup may create: a slug (``/provider <name>`` and ``provider/model`` take it as one word).
+_PROVIDER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+#: The custom kinds the add form offers next to the vendor presets of the setup wizard (``probe.PRESETS``).
+_CUSTOM_PRESETS = {
+    "custom": ("openai", "any OpenAI-compatible endpoint"),
+    "custom-anthropic": ("anthropic", "any Anthropic-compatible endpoint"),
+}
+
+
+async def _provider_presets(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.presets``: the /provider add form's first step, from the setup wizard's own preset list.
+
+    ``key_set`` says whether the preset's variable already holds a key (never the key);
+    ``name`` is a free block name."""
+    from k3code.config import env_value
+    from k3code.setup import probe
+    from k3code.setup.onboard import PROVIDER_HELP
+    from k3code.setup.steps import unique_name
+
+    taken = {p.name.lower() for p in server.config.providers}
+    rows = [
+        {
+            "id": pid,
+            "label": PROVIDER_HELP.get(pid, pid),
+            "kind": spec["kind"],
+            "base_url": spec["base_url"],
+            "key_env": spec["api_key_env"],
+            "keyless": pid == "local",
+            "key_set": bool(env_value(spec["api_key_env"])),
+            "name": unique_name(pid, taken),
+        }
+        for pid, spec in probe.PRESETS.items()
+    ]
+    rows += [
+        {"id": pid, "label": label, "kind": kind, "base_url": "", "key_env": "", "keyless": False, "key_set": False}
+        | {"name": unique_name("endpoint", taken)}
+        for pid, (kind, label) in _CUSTOM_PRESETS.items()
+    ]
+    return {"presets": rows}
+
+
+def _add_form_endpoint(params: dict[str, Any]) -> tuple[str, dict[str, str], str]:
+    """``(preset id, {kind, base_url}, key to send)`` of an add-form request; the key is never part of an error."""
+    from k3code.config import env_value
+    from k3code.setup import probe
+    from k3code.setup.onboard import clean_key
+
+    preset = str(params.get("preset") or "custom")
+    kind = str(params.get("kind") or "")
+    if kind not in ("openai", "anthropic"):
+        raise _InvalidParams("kind must be openai or anthropic")
+    known = probe.PRESETS.get(preset, {})
+    if known:
+        kind = known["kind"]  # a vendor preset speaks its own protocol, whatever the client sent
+    url = str(params.get("base_url") or "").strip().rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, userinfo = parts.hostname, parts.username is not None or parts.password is not None
+    except ValueError:  # e.g. an unclosed IPv6 bracket
+        raise _InvalidParams("base URL must start with http:// or https:// and name a host") from None
+    if parts.scheme not in ("http", "https") or not host or any(c.isspace() for c in url):
+        raise _InvalidParams("base URL must start with http:// or https:// and name a host")
+    if userinfo:  # it would land in config.yaml and the log; the URL is not echoed, it holds a password
+        raise _InvalidParams("base URL must not carry a user name or password: the key goes in the API key field")
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
+    if parts.query or parts.fragment or "?" in url or "#" in url:  # same: a secret there is stored and shown, and
+        raise _InvalidParams("base URL must not carry a query string or fragment")  # models_url cannot build on it
+    if params.get("reuse_key"):
+        if not known or url != known["base_url"].rstrip("/"):
+            raise _InvalidParams("a saved key is reused only at its own vendor's URL")
+        key = env_value(known["api_key_env"])
+        if not key:
+            raise _InvalidParams(f"{known['api_key_env']} holds no key to reuse")
+        return preset, {"kind": kind, "base_url": url}, key
+    raw = params.get("api_key")
+    key = clean_key(raw) if isinstance(raw, str) else ""
+    if any(c.isspace() or not c.isprintable() or c in _BAD_KEY_CHARS for c in key):
+        raise _InvalidParams("that does not look like an API key (spaces, quotes or control characters): paste the key")
+    return preset, {"kind": kind, "base_url": url}, key
+
+
+async def _provider_probe(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.probe {preset, kind, base_url, api_key? | reuse_key?}``: the setup wizard's live test (list the
+    endpoint's models) for the add form. Models come best first; ``suggested`` is the default model to preselect."""
+    from k3code.setup import probe
+    from k3code.setup.onboard import TIER_MODELS
+
+    preset, entry, key = _add_form_endpoint(params)
+    ok, ms, ids, detail = await asyncio.to_thread(probe.list_models, entry, key)
+    hint = "" if ok else probe.explain(detail)[1]
+    known = TIER_MODELS.get(preset, {}).get("main", "")
+    suggested = known if known in ids else (ids[0] if ids else "")
+    return {"ok": ok, "ms": round(ms), "detail": detail, "hint": hint, "models": ids, "suggested": suggested}
+
+
+async def _provider_add(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``provider.add {preset, name, kind, base_url, model, api_key? | reuse_key?}``: the /provider popup's add form.
+
+    The block is added the way ``/model chain add`` adds one (``chain_config.edit_config``: validate, back up, write
+    config.yaml) and the live providers are rebuilt the same way (``reload_providers``). The key goes where the setup
+    wizard and ``model.save_key`` put it: ``set_env_var`` into the 0600 env file under the block's ``api_key_env``, a
+    variable that held nothing (the vendor preset's own when it is free and the URL is the vendor's, else
+    ``K3CODE_<NAME>_API_KEY``: that variable holds only the vendor's key, as in ``key_env_at``), so no other block's
+    key is replaced; a reused key keeps the preset's variable. Nothing echoes the key: not the reply, an error or the
+    log. A failed config write (any error) removes the key line it stored; a failed reload after the write does not: the
+    reply is the normal one plus a ``warning`` string."""
+    from k3code import chain_config
+    from k3code.setup import probe
+    from k3code.setup.state import read_env_file, set_env_var, unset_env_var
+    from k3code.setup.steps import key_env_for
+
+    preset, entry, key = _add_form_endpoint(params)
+    name = str(params.get("name") or "").strip()
+    if not _PROVIDER_NAME.match(name):
+        raise _InvalidParams("name: a letter, then letters, digits, - or _ (at most 40)")
+    model = str(params.get("model") or "").strip()
+    if not model or any(c.isspace() for c in model):
+        raise _InvalidParams("model: one model id, no spaces")
+    path = chain_config.config_path()
+    # The config lock (reentrant: edit_config takes it again) makes the name check, the choice of a free variable
+    # and both writes one step for every k3code process, so a second add of the same name cannot slip in between.
+
+    def commit() -> tuple[str, str]:
+        """The locked read-modify-write; no await in it, so it runs on a worker thread (the flock does not block the
+        event loop). ``(key variable, backup)``."""
+        with confio.locked(path):
+            try:
+                on_disk = confio.read_yaml(path).get("providers") or []
+            except yaml.YAMLError:
+                raise _InvalidParams(f"cannot read {path}: not valid YAML") from None  # its text may hold anything
+            except (confio.ConfigError, OSError) as e:
+                raise _InvalidParams(f"cannot read {path}: {e}") from None
+            blocks = [p for p in on_disk if isinstance(p, dict)]
+            names = {p.name.lower() for p in server.config.providers} | {str(p.get("name", "")).lower() for p in blocks}
+            if name.lower() in names:
+                raise _InvalidParams(f"a provider named {name} already exists")
+            stored = ""
+            if params.get("reuse_key"):
+                var = probe.PRESETS[preset]["api_key_env"]
+            elif not key:
+                if preset != "local":
+                    raise _InvalidParams("an API key is needed (the local preset is the keyless one)")
+                var = ""  # Ollama takes no key: an empty name declares the block keyless (#107)
+            else:
+                used = {str(p.get("api_key_env") or "") for p in blocks} | {
+                    p.api_key_env for p in server.config.providers
+                }
+                held = {*os.environ, *read_env_file()}
+                own = probe.PRESETS.get(preset, {}).get("api_key_env", "")
+                # the vendor's variable holds only the vendor's key: a key for an edited URL gets a variable of its own
+                at_vendor = own and entry["base_url"] == probe.PRESETS[preset]["base_url"].rstrip("/")
+                free = at_vendor and own not in used and own not in held
+                presets = {s["api_key_env"] for s in probe.PRESETS.values()}
+                var = own if free else key_env_for(name, used | held | presets)
+                try:
+                    set_env_var(var, key)
+                except OSError as e:
+                    raise _InvalidParams(f"cannot write the key file: {e.strerror or type(e).__name__}") from None
+                stored = var
+            args = [name, model, f"kind={entry['kind']}", f"base_url={entry['base_url']}", f"key_env={var}"]
+            try:
+                backup = chain_config.edit_config("add", args)
+            except Exception as e:  # whatever it was, the key line stored above must not outlive the failed add
+                if stored:
+                    unset_env_var(stored)
+                if isinstance(e, yaml.YAMLError):
+                    msg = f"{path} is not valid YAML"
+                elif isinstance(e, chain_config.ChainEditError | OSError):
+                    msg = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                else:  # RuntimeError (a $K3CODE_HOME another user owns), ValueError ...: the class says enough
+                    msg = type(e).__name__
+                if key:
+                    msg = msg.replace(key, REDACTED)
+                raise _InvalidParams(f"could not add {name}: {msg}") from None
+            return var, backup
+
+    var, backup = await asyncio.to_thread(commit)
+    warning = ""
+    try:
+        chain_config.reload_providers(server)
+    except Exception as e:  # the block and key are written for good: report the add, not a failure
+        warning = f"providers not reloaded: {type(e).__name__}; run /reload"
+        logger.warning("provider.add: added %s but the provider reload failed: %s", name, type(e).__name__)
+    logger.info("provider.add: added %s (%s), key variable %s", name, scrub_urls(entry["base_url"]), var or "(keyless)")
+    reply = {"provider": _option_for(server, params, name), "key_env": var, "backup": backup}
+    return reply | {"warning": warning} if warning else reply
+
+
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``model.disconnect {slug}``: remove the saved key of provider ``slug`` and stop using it from the next turn.
 
@@ -4674,6 +4898,7 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     # failures, not "finished" (issue #140)
     server.learning.turn_undone(session, last_user)
     session.messages = messages[:last_user]
+    session.last_prompt_tokens = 0
     server.store.save(session.stored)
     return {"removed": len(messages) - last_user}
 
@@ -4686,12 +4911,18 @@ async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[
     rows = server.usage.aggregate(by="session", session=session.session_id)
     row = rows[0] if rows else {}
     t_in, t_out = int(row.get("tokens_in") or 0), int(row.get("tokens_out") or 0)
+    reported = session.last_prompt_tokens > 0
+    used = session.last_prompt_tokens if reported else server._request_tokens(session)
+    ctx = _context_fields(used, server._context_max(session))
+    if ctx:
+        ctx["context_estimated"] = not reported
     return {
         "model": session.stored.model or server.config.default_model,
         "input": t_in,
         "output": t_out,
         "total": t_in + t_out,
         "calls": int(row.get("calls") or 0),
+        **ctx,
     }
 
 
@@ -4740,6 +4971,7 @@ async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str
     await server.mcp.reload(
         mcpjson.merged(server.config.mcp.servers, _session_cwd(server, params) or default_project_dir())
     )
+    server.refresh_prompts("mcp")
     return {"status": "reloaded"}
 
 
@@ -4748,11 +4980,14 @@ async def _reload_env(server: GatewayServer, params: dict[str, Any]) -> dict[str
     from k3code.setup.state import read_env_file
 
     server.apply_file_config(_session_cwd(server, params))
+    server.refresh_prompts("style", "skills", "mcp")  # the config names the skill roots, the style, the servers
     return {"updated": len(read_env_file())}
 
 
 async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """/reload-skills: skill discovery is never cached, so this lists what a fresh scan finds."""
+    """/reload-skills: lists what a fresh scan finds, and the session's prompt names those skills from its next loop
+    (its skills index is otherwise the snapshot of its first prompt)."""
+    server.refresh_prompts("skills")  # skill files are global: every session, as /mcp reload does for the servers
     res = await server.dispatch_command("skills", "", params.get("session_id"))
     return {"output": str(res.get("message") or res.get("output") or "")}
 
@@ -4896,6 +5131,9 @@ _HANDLERS: dict[str, Any] = {
     "tune.set": _tune_set,
     "model.save_key": _model_save_key,
     "model.disconnect": _model_disconnect,
+    "provider.presets": _provider_presets,
+    "provider.probe": _provider_probe,
+    "provider.add": _provider_add,
     "config.get": _config_get,
     "config.set": _config_set,
     "setup.status": _setup_status,

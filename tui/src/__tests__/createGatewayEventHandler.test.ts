@@ -1292,7 +1292,10 @@ describe("createGatewayEventHandler", () => {
       if (method === "config.get") {
         return {
           config: {
-            display: { tui_auto_resume_recent: true, tui_start_agents_view: true },
+            display: {
+              tui_auto_resume_recent: true,
+              tui_start_agents_view: true,
+            },
           },
         };
       }

@@ -504,9 +504,9 @@ describe("reduceViewKey", () => {
       draft: "",
       focus: "input",
     });
-    expect(
-      press({ ...typing, draft: "" }, { escape: true }).effect,
-    ).toEqual({ type: "close" });
+    expect(press({ ...typing, draft: "" }, { escape: true }).effect).toEqual({
+      type: "close",
+    });
   });
 
   it("in input mode even the list's own commands, like c, type into the draft", () => {

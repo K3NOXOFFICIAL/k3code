@@ -289,6 +289,16 @@ commands: they run in the Python gateway through `slash.exec`.
 A bare `/model` or `/effort` opens the same popup, not the provider/key picker;
 `/model --refresh` still opens the provider picker.
 
+`/provider` — the provider popup: switch this session to another provider
+block (`Ctrl+G` toggles also saving it as `default_provider`). Its last row,
+`+ Add new provider`, opens a form in the popup: pick a preset or a custom
+OpenAI-/Anthropic-compatible kind, then the name, base URL and API key
+(masked; a key already saved for the preset can be reused), test the
+connection, pick the default model and save. The key goes to the 0600 env
+file, never to `config.yaml`; after the save the list shows the new block,
+Enter switches to it now and Esc leaves it for later. `/provider <name>
+[--save]` typed still switches directly.
+
 ### Ops (`ops.ts`)
 
 `/stop`, `/reload-mcp` (alias `/reload_mcp`), `/reload`, `/browser`,
