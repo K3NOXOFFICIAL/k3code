@@ -453,3 +453,52 @@ def test_past_the_directory_cap_a_cdpath_cd_walks_no_more_entries(monkeypatch: p
 )
 def test_tilde_plus_and_minus_are_read_in_every_directory_of_the_line(command: str, cwd: str, rule: str | None) -> None:
     assert _check(command, cwd=cwd) == rule
+
+
+# eval re-parses the words it is given: the `$X` of `eval 'cd $X'` is UNQUOTED in the cd that runs (unset, a plain `cd`:
+# home), while `eval 'cd "$X"'` runs a quoted one (`cd ""` fails). The quoting was read from the outer text, where the
+# single quotes hid the `$`, so a delete in $HOME after such a cd passed.
+EVAL_CD_DENIED = [
+    "eval 'cd $X' && rm -rf *",
+    'eval "cd $X" && find . -delete',
+    "eval cd \\$X && rm -rf *",
+    "eval 'cd ${X}' && rm -rf *",
+    "eval 'cd $(true)' && rm -rf *",
+    "eval 'cd `true`' && rm -rf *",
+    "eval 'cd $1' && rm -rf ./*",
+    "eval 'cd $OLDPWD'; rm -rf *",
+    "eval 'cd $X' && echo * | xargs rm -rf",
+    "time eval 'cd $X' && rm -rf *",
+]
+
+
+@pytest.mark.parametrize("command", EVAL_CD_DENIED)
+def test_an_unquoted_expansion_inside_eval_is_a_cd_to_home(command: str) -> None:
+    assert _check(command) == "rm-rf-home", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["eval 'cd \"$X\"' && rm -rf *", "eval 'cd /tmp' && rm -rf build", 'eval "cd \\"$X\\"" && rm -rf *'],
+)
+def test_a_quoted_expansion_inside_eval_still_stays_out_of_home(command: str) -> None:
+    assert _check(command) is None, command
+
+
+# ~N, ~+N, ~-N are entries of the directory stack (pushd/popd/dirs): one of the directories the line may be in.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd ~ && pushd /tmp && rm -rf ~1",
+        "cd ~ && pushd /tmp && rm -rf ~+1/..",
+        "pushd /tmp; rm -rf ~1/..",
+        "cd ~ && pushd /tmp && find ~1 -delete",
+        "cd / ; pushd /tmp; rm -rf ~-1/*",
+    ],
+)
+def test_the_directory_stack_tilde_forms_are_read_in_every_directory_of_the_line(command: str) -> None:
+    assert _check(command) in ("rm-rf-home", "rm-rf-root"), command
+
+
+def test_a_directory_stack_tilde_form_in_a_project_is_not_a_home_delete() -> None:
+    assert _check("rm -rf ~1/build") is None  # no pushd on the line: nothing of home or root in the set

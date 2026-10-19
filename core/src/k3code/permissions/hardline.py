@@ -1485,6 +1485,16 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
     return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
+def _reparsed_text(sub: str) -> str:
+    """The text a ``cd`` in ``sub`` is finally read from: for ``eval ARGS`` the shell joins the words and parses them
+    again, so ``eval 'cd $X'`` and ``eval "cd $X"`` run a ``cd`` whose ``$X`` is UNQUOTED (unset, that is a plain
+    ``cd``, home), while ``eval 'cd "$X"'`` still runs a quoted one (``cd ""`` fails). Any other command: ``sub``."""
+    pre = _strip_wrappers(_past_reserved(_tokens(sub)))
+    if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
+        return " ".join(pre[1:])
+    return sub
+
+
 def _unquoted_expansion(sub: str) -> bool:
     """Whether the text ``sub`` has a ``$`` or a backtick outside quotes: an expansion that may give no word at all.
     A ``$(...)``, backtick or ``${...}`` in double quotes is one unit, skipped whole (see _unit_end)."""
@@ -1636,7 +1646,7 @@ class _Dirs:
             self.overflow = True  # whose home it is was not looked up: the line may go anywhere from here
             return
         t = expand_vars(operands[0], self.here, self.home)
-        if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(sub):
+        if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(_reparsed_text(sub)):
             self._add(self.home)  # unset, `cd $X` is a plain `cd`; `cd "$X"` is `cd ""`, which fails
         if t == "-" or t.startswith("+") or any(c in t for c in "$`~"):
             self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user
@@ -1684,11 +1694,17 @@ def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = 
     return None
 
 
+#: ``~N``, ``~+N``, ``~-N``: the N-th entry of the directory stack (``pushd``/``popd``/``dirs``).
+_TILDE_STACK = re.compile(r"~[+-]?[0-9]+(?=/|$)")
+
+
 def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) -> str | None:
     """:func:`_delete_target_rule` of ``t`` in every directory of ``dirs`` it may run in: a relative ``t`` or one with
     ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
     if t in ("~+", "~-") or t.startswith(("~+/", "~-/")):
         t = "$PWD" + t[2:]  # the current or previous directory: one of the set, read in every one
+    elif m := _TILDE_STACK.match(t):
+        t = "$PWD" + t[m.end() :]  # ~1, ~+1, ~-1: an entry of the directory stack, which is in the set as well
     if past_budget(t):
         return "scan-budget"  # another user's folder whose home was not looked up: it may be any folder (~bin is /bin)
     if t.startswith(("/", "~", "$")) and "PWD" not in t:
