@@ -420,20 +420,27 @@ def check_parse(
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
+    # after a `cd` on the line, relative rm/find targets are read in the directory it moved to (`cd / && rm -rf *`);
+    # `here` is None once a cd went somewhere unknown. Followed in line order, assuming every cd succeeds.
+    moved, here = False, cwd
     for k, sub in enumerate(parsed.subs):
-        argv = normalize_argv(_tokens(sub))
+        argv = _command_argv(_tokens(sub))
+        base = here if moved else None
         hit = (
             _match(sub, extra)
             or _match(" ".join(argv), extra)
             or _simple_check(sub)
-            or _rm_check(argv, cwd, home)
+            or _rm_check(argv, cwd, home, base)
+            or _find_check(argv, cwd, home, base)
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
             return hit
-    hit = _pipeline_check(parsed.pipelines)
+        if argv[:1] and argv[0] in ("cd", "pushd"):
+            moved, here = True, _cd_dir(argv[0], argv[1:], here, home)
+    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, cwd, home)
     if hit:
         return hit
     for child in parsed.children:
@@ -785,6 +792,55 @@ def _is_assignment(t: str) -> bool:
     return "=" in t and not t.startswith("=") and t.split("=", 1)[0].isidentifier()
 
 
+#: Reserved words, braces and ``!`` that open or close a compound command in front of the command it runs (``if rm
+#: ...``, ``then rm ...``, ``do rm ...``, ``{ rm ...``, ``! rm ...``, ``f() { rm ...``): the shell runs the command
+#: after them, so the checks look past them (see _command_argv). ``(`` and ``)`` already split commands (see _scan) and
+#: ``time`` is a wrapper.
+_RESERVED_LEADERS = frozenset(
+    {"{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "esac"}
+)
+#: Compound-command headers that run nothing themselves: ``for NAME in WORDS``, ``select NAME in WORDS``, ``case WORD
+#: in``. A ``$(...)`` in them is a payload, checked on its own.
+_RESERVED_HEADERS = frozenset({"for", "select", "case"})
+_RESERVED_WORDS = _RESERVED_LEADERS | _RESERVED_HEADERS | {"function", "coproc"}
+
+
+def _past_reserved(tokens: list[str]) -> list[str]:
+    """``tokens`` from the command the shell runs: past the leading reserved words, braces and ``!`` (nested ones
+    too: ``{ { if ! rm``), ``function NAME`` and ``coproc [NAME]``; empty for a for/select/case header."""
+    i, n = 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t in _RESERVED_LEADERS:
+            i += 1
+        elif t in _RESERVED_HEADERS:
+            return []
+        elif t == "function":
+            i += 2  # ``function NAME { ...``; ``function f()`` is split at the ``(``
+        elif t == "coproc":
+            i += 1
+            if i + 1 < n and tokens[i + 1] == "{" and tokens[i].isidentifier():
+                i += 1  # ``coproc NAME { ...; }``: a name only comes before a compound command
+        else:
+            break
+    return tokens[i:]
+
+
+def _command_argv(tokens: list[str]) -> list[str]:
+    """:func:`normalize_argv` of the command that runs past the reserved words in front of it (see _past_reserved)
+    and through ``busybox APPLET`` (``busybox rm``, ``busybox env``, ``busybox sh -c``), in any order and nesting
+    (``time { busybox rm``, ``sudo busybox env``). The hardline checks read this; the engine keeps its own reading."""
+    argv = tokens
+    # every round drops a reserved word or busybox, or a wrapper/eval inside normalize_argv (fewer characters)
+    for _ in range(sum(len(t) + 1 for t in tokens) + 1):
+        argv = normalize_argv(_past_reserved(argv))
+        if argv[:1] == ["busybox"] and len(argv) > 1 and not argv[1].startswith("-"):
+            argv = argv[1:]
+        elif not argv or argv[0] not in _RESERVED_WORDS:
+            return argv
+    return argv
+
+
 #: Wrapper option arity for :func:`normalize_argv`: (short options taking a value, long options taking a value,
 #: positional arguments before the wrapped command).
 _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
@@ -1122,7 +1178,7 @@ def _pipeline_check(pipelines: list[list[str]]) -> str | None:
     for stages in pipelines:
         fetched = False
         for stage in stages:
-            argv = normalize_argv(_tokens(stage))
+            argv = _command_argv(_tokens(stage))
             name = argv[0] if argv else ""
             if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
@@ -1140,7 +1196,7 @@ def _fetch_run_check(argv: list[str], payloads: list[str]) -> str | None:
     for payload in payloads:
         inner = parse(payload)
         for s in (*inner.subs, *inner.nested):
-            if normalize_argv(_tokens(s))[:1] and normalize_argv(_tokens(s))[0] in _FETCHERS:
+            if _command_argv(_tokens(s))[:1] and _command_argv(_tokens(s))[0] in _FETCHERS:
                 return "fetch-and-run"
     return None
 
@@ -1197,7 +1253,7 @@ def _env_dump_check(sub: str) -> str | None:
     The shell builtins that list variables with their values when given no name: ``set``, ``export`` (``-p``, ``-n``,
     ``--``) and ``declare`` / ``typeset`` (``-x``, ``-p``, ``-g``, none, ...); ``export -f`` and ``declare -f``/``-F``
     list functions instead. ``compgen -e`` / ``-v`` print variable names only, never a value, and are left alone."""
-    argv = normalize_argv(_without_redirects(_tokens(sub)))
+    argv = _command_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
     name, args = os.path.basename(argv[0]), argv[1:]
@@ -1251,12 +1307,56 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
         base = os.path.normpath(base)
         if base.startswith("//"):
             base = "/" + base.lstrip("/")
-    return base + "/*" if glob else base
+    return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
-def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
+def _cd_dir(name: str, args: list[str], here: str | None, home: str) -> str | None:
+    """The directory ``cd``/``pushd`` with ``args`` moves to from ``here``; None when it is unknown (a variable, ``-``,
+    ``pushd`` swapping the stack, a relative path from an unknown directory)."""
+    operands: list[str] = []
+    for a in args:
+        if not operands and a.startswith("-") and a != "-":
+            continue  # -L, -P, -e, -@, --
+        operands.append(a)
+    if not operands:
+        return home if name == "cd" else None
+    t = expand_vars(operands[0], here, home)
+    if t == "-" or t.startswith("+") or any(c in t for c in "$`~"):
+        return None
+    if not t.startswith("/"):
+        if here is None:
+            return None
+        t = os.path.join(here, t)
+    t = os.path.normpath(t)
+    return "/" + t.lstrip("/") if t.startswith("//") else t
+
+
+def _delete_target_rule(t: str, cwd: str | None, home: str, base: str | None, above_home: bool = False) -> str | None:
+    """The rule a recursive delete of the path word ``t`` breaks: rm-rf-home for ~, $HOME (and, with ``above_home``, a
+    folder above it), rm-rf-root for /, a top-level system dir or a Windows drive (see windows_rm_target). ``base`` is
+    the directory a ``cd`` earlier on the line moved to: a relative ``t`` is read there, and ``$PWD`` is it."""
+    if not t:
+        return None
+    if base and not t.startswith(("/", "~", "$")):
+        t = os.path.join(base, t)
+    target = _expand_target(t, base or cwd, home)
+    if target in _DANGEROUS_RM_TARGETS or target in (home, home + "/*"):
+        homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
+        return "rm-rf-home" if homeish else "rm-rf-root"
+    folder = target[:-2] if target.endswith("/*") else target
+    if above_home and folder.startswith("/") and home.startswith(folder.rstrip("/") + "/"):
+        return "rm-rf-home"
+    from .engine import windows_drives  # engine imports this module
+
+    if windows_rm_target(target.lower(), windows_drives()):
+        return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
+    return None
+
+
+def _rm_check(argv: list[str], cwd: str | None, home: str, base: str | None = None) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
-    (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /)."""
+    (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
+    ``cd /``: see _delete_target_rule)."""
     if not argv or argv[0] != "rm":
         return None
     flags: list[str] = []
@@ -1272,17 +1372,59 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
     if not recursive:
         return None
-    dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
-    from .engine import windows_drives  # engine imports this module
-
-    drives = windows_drives()
     for t in targets:
-        target = _expand_target(t, cwd, home) if t else t
-        if target in dangerous:
-            homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
-            return "rm-rf-home" if homeish else "rm-rf-root"
-        if target and windows_rm_target(target.lower(), drives):
-            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
+        hit = _delete_target_rule(t, cwd, home, base)
+        if hit:
+            return hit
+    return None
+
+
+#: find actions that run a command on every file found.
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_check(argv: list[str], cwd: str | None, home: str, base: str | None = None) -> str | None:
+    """``find`` deleting what it finds (``-delete``, or ``-exec``/``-execdir``/``-ok``/``-okdir`` running rm) under
+    a start path an ``rm -rf`` of which is refused (see _rm_check) or a folder above home: ``find ~ -delete``, ``find
+    $HOME -exec rm -rf {} +``, ``find / -delete``. No start path is ``.``, which after ``cd /`` is the root."""
+    if not argv or argv[0] != "find":
+        return None
+    i = 1
+    while i < len(argv) and (argv[i] in ("-H", "-L", "-P") or argv[i][:2] in ("-D", "-O")):
+        i += 2 if argv[i] == "-D" else 1  # the options before the start paths (``-D debugopts``, ``-O3``)
+    paths: list[str] = []
+    while i < len(argv) and not argv[i].startswith("-") and argv[i] not in ("(", "!", ","):
+        paths.append(argv[i])
+        i += 1
+    expr = argv[i:]
+    deletes = "-delete" in expr or any(
+        a in _FIND_EXEC_ACTIONS and _command_argv(expr[k + 1 :])[:1] == ["rm"] for k, a in enumerate(expr)
+    )
+    if not deletes:
+        return None
+    for p in paths or ["."]:
+        hit = _delete_target_rule(p, cwd, home, base, above_home=True)
+        if hit:
+            return hit
+    return None
+
+
+def _xargs_rm_check(pipelines: list[list[str]], cwd: str | None, home: str) -> str | None:
+    """``... | xargs rm -rf``: xargs adds what the earlier stages of the pipeline print to rm's arguments, so a word of
+    theirs that rm -rf must not get (``echo ~ | xargs rm -rf``, ``find $HOME | xargs rm -r``) is checked as one of
+    rm's targets (see _rm_check)."""
+    for stages in pipelines:
+        if len(stages) < 2 or not any("xargs" in s for s in stages[1:]):
+            continue
+        printed: list[str] = []
+        for stage in stages:
+            argv = _command_argv(_tokens(stage))
+            if printed and argv[:1] == ["rm"] and "xargs" in stage:
+                words = [os.path.basename(t) for t in _tokens(stage)]
+                fed = "rm" in words and "xargs" in words[: words.index("rm")]  # xargs runs this rm
+                if fed and (hit := _rm_check([*argv, "--", *printed], cwd, home)):
+                    return hit
+            printed += argv[1:]
     return None
 
 
@@ -1702,7 +1844,7 @@ def _ssh_command(args: list[str]) -> list[str]:
 def _stdin_program(stage: str) -> str:
     """ "shell" or "other" when ``stage`` is an interpreter that executes its stdin as a program (``bash``,
     ``python3 -``, ``sudo sh -s``, ``ssh host`` with no command: the remote login shell), else ""."""
-    argv = normalize_argv(_without_redirects(_tokens(stage)))
+    argv = _command_argv(_without_redirects(_tokens(stage)))
     if argv[:1] == ["ssh"]:
         remote = _ssh_command(argv[1:])
         return _stdin_program(" ".join(remote)) if remote else "shell"
@@ -1721,7 +1863,7 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
     base = 0  # the pipelines list the subs in order
     for stages in parsed.pipelines:
         runs = [_stdin_program(s) for s in stages]
-        argvs = [normalize_argv(_without_redirects(_tokens(s))) for s in stages]
+        argvs = [_command_argv(_without_redirects(_tokens(s))) for s in stages]
         ssh = [shlex.join(a) if a[:1] == ["ssh"] and r == "shell" else "" for a, r in zip(argvs, runs, strict=True)]
         for k in range(len(stages)):
             if parsed.heredocs[base + k]:
@@ -1767,10 +1909,10 @@ def _launcher_payloads(sub: str) -> list[str]:
     flags = [(u, e) for u in (False, True) for e in (True, False)] if "${" in sub else [(False, True)]
     readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote, unescape in flags]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
-        pre = _strip_wrappers(list(toks))
+        pre = _strip_wrappers(_past_reserved(list(toks)))
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
             out.append(" ".join(pre[1:]))
-        real = normalize_argv(list(toks))
+        real = _command_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
         if real and real[0] == "trap":
