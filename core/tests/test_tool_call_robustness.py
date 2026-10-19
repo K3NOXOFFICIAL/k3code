@@ -132,8 +132,7 @@ def _cases() -> list[Case]:
             "read",
             "unknown field",
             {"path": "a.py", "encoding": "utf-8"},
-            ACT,
-            r"'encoding'.*'path'",
+            OK,  # accepted and ignored: the handler reads no encoding
             check=has("return 1"),
         )
     )
@@ -305,8 +304,7 @@ def _cases() -> list[Case]:
             "write",
             "unknown field",
             {"path": "e.txt", "content": "x", "mode": "w"},
-            ACT,
-            r"'mode'.*'content'",
+            OK,  # accepted and ignored: the handler writes as given
             check=file_is("e.txt", "x"),
         )
     )
@@ -784,9 +782,9 @@ def _cases() -> list[Case]:
             "bash",
             "near-miss name",
             {"command": "echo hi", "run_in_background": True},
-            ACT,
-            r"'run_in_background'.*'background'",
-            check=has("hi"),
+            REP,  # read as 'background'
+            r"run_in_background",
+            check=has("in the background"),
         )
     )
     add(
@@ -795,8 +793,7 @@ def _cases() -> list[Case]:
             "bash",
             "unknown field",
             {"command": "echo hi", "description": "say hi"},
-            ACT,
-            r"'description'.*'command'",
+            OK,  # accepted and ignored: the handler runs the command only
             check=has("hi"),
         )
     )

@@ -85,7 +85,7 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
 #: means a protected path cannot be reached through a spelling it does not know.
 _PATH_ALIASES = {"file_path": "path", "filepath": "path", "filename": "path", "file": "path"}
 _DIR_ALIASES = {"dir": "path", "directory": "path"}
-_JOB_ALIASES = {"id": "job_id", "shell_id": "job_id"}
+_JOB_ALIASES = {"id": "job_id", "shell_id": "job_id", "bash_id": "job_id"}
 ALIASES: dict[str, dict[str, str]] = {
     "read": _PATH_ALIASES,
     "write": _PATH_ALIASES,
@@ -100,11 +100,11 @@ ALIASES: dict[str, dict[str, str]] = {
         **_DIR_ALIASES,
     },
     "glob": _DIR_ALIASES,
-    "bash": dict.fromkeys(("cmd", "script", "shell"), "command"),
+    "bash": {**dict.fromkeys(("cmd", "script", "shell"), "command"), "run_in_background": "background"},
     "bash_output": _JOB_ALIASES,
     "bash_kill": _JOB_ALIASES,
     "todo": {"items": "todos"},
-    "task": {"task": "prompt"},
+    "task": {"task": "prompt", "subagent_type": "agent_type"},
     "web_search": {"q": "query"},
 }
 #: Built-in tools whose handler reads nothing but its schema's arguments (plus these older names): any other argument
@@ -113,12 +113,15 @@ ALIASES: dict[str, dict[str, str]] = {
 STRICT: dict[str, frozenset[str]] = {
     name: frozenset(extra)
     for name, extra in {
-        "read": ("start", "end"),
-        "write": (),
+        # ``encoding`` (read) and ``mode`` (write) are accepted and ignored: the handlers read neither (files are
+        # read as UTF-8 with replacement and written as given), and models send them out of habit.
+        "read": ("start", "end", "encoding"),
+        "write": ("mode",),
         "edit": (),
         "grep": (),
         "glob": (),
-        "bash": (),
+        # ``description`` is a label Claude-Code-trained models send on nearly every call; the handler ignores it.
+        "bash": ("description",),
         "bash_output": (),
         "bash_kill": (),
         "todo": (),
@@ -147,6 +150,9 @@ _NONEMPTY: dict[str, tuple[str, bool, str]] = {
     "grep": ("pattern", False, "the text or regex to search for"),
     "web_search": ("query", True, "the words to search for"),
 }
+#: Keys the providers put in a call's arguments when what the model sent did not parse to a JSON object (a string that
+#: is not JSON: ``_unparsed``; JSON that is not an object: ``_raw``). The model never sent these names.
+_PROVIDER_MARKERS = ("_unparsed", "_raw")
 _QUOTES = ('"', "'", "`")
 
 
@@ -184,6 +190,15 @@ def _clean_url(value: str) -> str:
     return v
 
 
+def _rejects_null(prop: Any) -> bool:
+    """True when ``prop`` declares a type and null is not among them."""
+    if not isinstance(prop, dict):
+        return False
+    typ = prop.get("type")
+    types = typ if isinstance(typ, list) else [typ] if isinstance(typ, str) else []
+    return bool(types) and "null" not in types
+
+
 def _coerce(value: Any, prop: Any) -> Any:
     """A string the schema wants as an integer, number or boolean, converted when it is exactly one; else unchanged."""
     if not isinstance(prop, dict) or not isinstance(value, str):
@@ -195,9 +210,9 @@ def _coerce(value: Any, prop: Any) -> Any:
     v = value.strip()
     if "boolean" in types and v.lower() in ("true", "false"):
         return v.lower() == "true"
-    if ("integer" in types or "number" in types) and re.fullmatch(r"-?\d+", v):
+    if ("integer" in types or "number" in types) and re.fullmatch(r"-?[0-9]+", v):
         return int(v)
-    if "number" in types and re.fullmatch(r"-?(\d+\.\d*|\.\d+)", v):
+    if "number" in types and re.fullmatch(r"-?([0-9]+\.[0-9]*|\.[0-9]+)", v):
         return float(v)
     return value
 
@@ -209,10 +224,17 @@ def normalize_arguments(tool: str, schema: dict[str, Any] | None, args: Any) -> 
     alias is present), an unknown argument is rejected, path-like values lose surrounding whitespace/quotes, a
     ``file://`` scheme and a leading ``~``, a URL loses surrounding whitespace/quotes, and an empty command, pattern
     or query is rejected. For every tool: a string that is exactly a number or boolean the schema asks for is
-    converted. Everything after this (schema check, permission engine, hooks, guards, handler) sees the result."""
+    converted, and a null for an optional argument whose type does not allow null is dropped. Everything after this (schema check, permission engine, hooks, guards, handler) sees the result."""
     if not isinstance(args, dict) or not isinstance(schema, dict) or schema.get("type", "object") != "object":
         return Normalized(args)
     props = schema.get("properties") or {}
+    for marker in _PROVIDER_MARKERS:
+        if marker in args and marker not in props:
+            return Normalized(
+                args,
+                error="your arguments were not a valid JSON object; send one JSON object with the fields: "
+                + compact_schema(schema),
+            )
     out = dict(args)
     changes: list[str] = []
     aliases = {a: c for a, c in ALIASES.get(tool, {}).items() if c in props}
@@ -248,6 +270,11 @@ def normalize_arguments(tool: str, schema: dict[str, Any] | None, args: Any) -> 
             if isinstance(value, str) and (new := clean(value)) != value:
                 out[name] = new
                 changes.append(f"'{name}' {shown(value)} as {shown(new)}")
+    required = set(schema.get("required") or [])
+    for name, value in list(out.items()):
+        if value is None and name not in required and _rejects_null(props.get(name)):
+            del out[name]  # a provider quirk: "offset": null for "not given"
+            changes.append(f"dropped null '{name}'")
     for name, value in list(out.items()):
         if (new := _coerce(value, props.get(name))) is not value:
             out[name] = new
