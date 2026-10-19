@@ -98,19 +98,20 @@ def _cases() -> list[Case]:
     # ── read ──
     add(Case("read-ok", "read", "baseline", {"path": "a.py"}, OK, check=has("return 1")))
     for alias in ("file_path", "filepath", "filename", "file"):
-        add(Case(f"read-alias-{alias}", "read", "near-miss name", {alias: "a.py"}, OPQ, path_alias, known_gap=True))
+        add(Case(f"read-alias-{alias}", "read", "near-miss name", {alias: "a.py"}, REP, path_alias))
     add(
         Case(
             "read-alias-and-path",
             "read",
             "near-miss name",
             {"path": "a.py", "file_path": "a.py"},
-            OK,
+            ACT,
+            path_alias,
             check=has("return 1"),
         )
     )
-    add(Case("read-offset-str", "read", "wrong type", {"path": "notes.md", "offset": "5"}, ACT, r"'offset'.*integer"))
-    add(Case("read-limit-str", "read", "wrong type", {"path": "notes.md", "limit": "3"}, ACT, r"'limit'.*integer"))
+    add(Case("read-offset-str", "read", "wrong type", {"path": "notes.md", "offset": "5"}, REP, r"'offset'.*integer"))
+    add(Case("read-limit-str", "read", "wrong type", {"path": "notes.md", "limit": "3"}, REP, r"'limit'.*integer"))
     add(
         Case(
             "read-offset-float",
@@ -125,19 +126,23 @@ def _cases() -> list[Case]:
     add(Case("read-path-list", "read", "wrong type", {"path": ["a.py"]}, ACT, r"'path'.*string"))
     add(Case("read-missing", "read", "missing field", {}, ACT, r"missing required 'path'"))
     add(Case("read-args-str", "read", "wrong type", "a.py", ACT, r"object"))
-    add(Case("read-extra", "read", "unknown field", {"path": "a.py", "encoding": "utf-8"}, OK, check=has("return 1")))
-    add(Case("read-abs", "read", "path form", {"path": f"{P}/a.py"}, OK, check=has("return 1")))
-    add(Case("read-dot-slash", "read", "path form", {"path": "./a.py"}, OK, check=has("return 1")))
-    add(
-        Case("read-trailing-space", "read", "path form", {"path": "a.py "}, OPQ, r"whitespace|trailing", known_gap=True)
-    )
     add(
         Case(
-            "read-trailing-newline", "read", "path form", {"path": "a.py\n"}, OPQ, r"whitespace|newline", known_gap=True
+            "read-extra",
+            "read",
+            "unknown field",
+            {"path": "a.py", "encoding": "utf-8"},
+            ACT,
+            r"'encoding'.*'path'",
+            check=has("return 1"),
         )
     )
-    add(Case("read-quoted", "read", "path form", {"path": '"a.py"'}, OPQ, r"quote", known_gap=True))
-    add(Case("read-file-url", "read", "path form", {"path": f"file://{P}/a.py"}, OPQ, r"file://", known_gap=True))
+    add(Case("read-abs", "read", "path form", {"path": f"{P}/a.py"}, OK, check=has("return 1")))
+    add(Case("read-dot-slash", "read", "path form", {"path": "./a.py"}, OK, check=has("return 1")))
+    add(Case("read-trailing-space", "read", "path form", {"path": "a.py "}, REP, r"whitespace|trailing"))
+    add(Case("read-trailing-newline", "read", "path form", {"path": "a.py\n"}, REP, r"whitespace|newline"))
+    add(Case("read-quoted", "read", "path form", {"path": '"a.py"'}, REP, r"quote"))
+    add(Case("read-file-url", "read", "path form", {"path": f"file://{P}/a.py"}, REP, r"file://"))
     add(Case("read-dir", "read", "dir vs file", {"path": "sub"}, OPQ, r"directory.*(glob|bash|ls)", known_gap=True))
     add(
         Case(
@@ -194,7 +199,7 @@ def _cases() -> list[Case]:
             check=has("row 2"),
         )
     )
-    add(Case("read-tilde", "read", "path form", {"path": "~/h.txt"}, OK, check=has("home file")))
+    add(Case("read-tilde", "read", "path form", {"path": "~/h.txt"}, REP, check=has("home file")))
     # ── write ──
     add(
         Case("write-new", "write", "baseline", {"path": "new.txt", "content": "hi"}, OK, check=file_is("new.txt", "hi"))
@@ -206,9 +211,8 @@ def _cases() -> list[Case]:
                 "write",
                 "near-miss name",
                 {alias: "new.txt", "content": "hi"},
-                OPQ,
+                REP,
                 path_alias,
-                known_gap=True,
             )
         )
     add(
@@ -217,9 +221,8 @@ def _cases() -> list[Case]:
             "write",
             "near-miss name",
             {"path": "new.txt", "text": "hi"},
-            OPQ,
+            ACT,
             r"'text'.*'content'",
-            known_gap=True,
         )
     )
     add(
@@ -228,9 +231,8 @@ def _cases() -> list[Case]:
             "write",
             "near-miss name",
             {"path": "new.txt", "contents": "hi"},
-            OPQ,
+            ACT,
             r"'contents'.*'content'",
-            known_gap=True,
         )
     )
     add(Case("write-content-int", "write", "wrong type", {"path": "n.txt", "content": 5}, ACT, r"'content'.*string"))
@@ -273,10 +275,9 @@ def _cases() -> list[Case]:
             "write",
             "path form",
             {"path": "out.txt ", "content": "x"},
-            OPQ,
+            REP,
             r"whitespace|trailing",
             check=file_is("out.txt", "x"),
-            known_gap=True,
         )
     )
     add(
@@ -285,10 +286,9 @@ def _cases() -> list[Case]:
             "write",
             "path form",
             {"path": f"file://{P}/out.txt", "content": "x"},
-            OPQ,
+            REP,
             r"file://",
             check=file_is("out.txt", "x"),
-            known_gap=True,
         )
     )
     add(
@@ -307,7 +307,8 @@ def _cases() -> list[Case]:
             "write",
             "unknown field",
             {"path": "e.txt", "content": "x", "mode": "w"},
-            OK,
+            ACT,
+            r"'mode'.*'content'",
             check=file_is("e.txt", "x"),
         )
     )
@@ -339,9 +340,8 @@ def _cases() -> list[Case]:
                 "edit",
                 "near-miss name",
                 edit(**{o: "return 1", n: "return 2"}),
-                OPQ,
+                REP,
                 rf"'{o}'.*'old_string'",
-                known_gap=True,
             )
         )
     add(
@@ -350,9 +350,8 @@ def _cases() -> list[Case]:
             "edit",
             "near-miss name",
             {"file_path": "a.py", "old_string": "return 1", "new_string": "return 2"},
-            OPQ,
+            REP,
             path_alias,
-            known_gap=True,
         )
     )
     add(
@@ -371,7 +370,7 @@ def _cases() -> list[Case]:
             "edit",
             "wrong type",
             {"path": "dup.txt", "old_string": "x = 1", "new_string": "y", "replace_all": "true"},
-            ACT,
+            REP,
             r"'replace_all'.*boolean",
         )
     )
@@ -523,10 +522,9 @@ def _cases() -> list[Case]:
             "edit",
             "path form",
             {"path": "a.py\n", "old_string": "return 1", "new_string": "return 2"},
-            OPQ,
+            REP,
             r"whitespace|newline",
             check=lambda p, t: "return 2" in (p / "a.py").read_text(),
-            known_gap=True,
         )
     )
     add(
@@ -549,9 +547,8 @@ def _cases() -> list[Case]:
                 "grep",
                 "near-miss name",
                 {alias: "needle"},
-                OPQ,
+                REP,
                 rf"'{alias}'.*'pattern'",
-                known_gap=True,
             )
         )
     for alias in ("dir", "directory"):
@@ -561,10 +558,9 @@ def _cases() -> list[Case]:
                 "grep",
                 "near-miss name",
                 {"pattern": "needle", alias: "src"},
-                OPQ,
+                REP,
                 path_alias,
                 check=lacks("b.py"),
-                known_gap=True,
             )
         )
     add(
@@ -573,10 +569,9 @@ def _cases() -> list[Case]:
             "grep",
             "near-miss name",
             {"pattern": "needle", "include_pattern": "*.py"},
-            OPQ,
+            REP,
             r"'include_pattern'.*'include'",
             check=lacks("c.txt", "app.ts"),
-            known_gap=True,
         )
     )
     add(
@@ -585,10 +580,9 @@ def _cases() -> list[Case]:
             "grep",
             "near-miss name",
             {"pattern": "needle", "glob": "*.py"},
-            OPQ,
+            REP,
             r"'glob'.*'include'",
             check=lacks("c.txt", "app.ts"),
-            known_gap=True,
         )
     )
     add(
@@ -624,7 +618,7 @@ def _cases() -> list[Case]:
             hint=r"(regex|escape|bracket|range|unterminated)",
         )
     )
-    add(Case("grep-empty", "grep", "regex", {"pattern": ""}, OPQ, r"pattern.*empty", check=never, known_gap=True))
+    add(Case("grep-empty", "grep", "regex", {"pattern": ""}, ACT, r"pattern.*empty", check=never))
     add(Case("grep-pattern-null", "grep", "wrong type", {"pattern": None}, ACT, r"'pattern'.*string"))
     add(Case("grep-pattern-list", "grep", "wrong type", {"pattern": ["a", "b"]}, ACT, r"'pattern'.*string"))
     add(Case("grep-missing", "grep", "missing field", {"path": "."}, ACT, r"missing required 'pattern'"))
@@ -671,10 +665,9 @@ def _cases() -> list[Case]:
             "grep",
             "unknown field",
             {"pattern": "NEEDLE", "-i": True},
-            OPQ,
+            ACT,
             r"-i",
             check=has("b.py"),
-            known_gap=True,
         )
     )
     # ── glob ──
@@ -711,13 +704,12 @@ def _cases() -> list[Case]:
             "glob",
             "near-miss name",
             {"pattern": "*.py", "directory": "sub"},
-            OPQ,
+            REP,
             path_alias,
             check=lacks("a.py"),
-            known_gap=True,
         )
     )
-    add(Case("glob-alias-glob", "glob", "near-miss name", {"glob": "*.py"}, OPQ, r"'glob'.*'pattern'", known_gap=True))
+    add(Case("glob-alias-glob", "glob", "near-miss name", {"glob": "*.py"}, ACT, r"'glob'.*'pattern'"))
     add(
         Case(
             "glob-nonexistent",
@@ -752,9 +744,8 @@ def _cases() -> list[Case]:
                 "bash",
                 "near-miss name",
                 {alias: "echo hi"},
-                OPQ,
+                REP,
                 rf"'{alias}'.*'command'",
-                known_gap=True,
             )
         )
     add(Case("bash-missing", "bash", "missing field", {}, ACT, r"missing required 'command'"))
@@ -763,7 +754,7 @@ def _cases() -> list[Case]:
     add(Case("bash-trailing-amp", "bash", "bash form", {"command": "sleep 3 &", "timeout": 1}, ACT, r"background"))
     add(
         Case(
-            "bash-timeout-str", "bash", "wrong type", {"command": "echo hi", "timeout": "5"}, ACT, r"'timeout'.*number"
+            "bash-timeout-str", "bash", "wrong type", {"command": "echo hi", "timeout": "5"}, REP, r"'timeout'.*number"
         )
     )
     add(Case("bash-timeout-ms", "bash", "wrong type", {"command": "echo hi", "timeout": 120000}, OK, check=has("hi")))
@@ -796,7 +787,7 @@ def _cases() -> list[Case]:
             "bash",
             "wrong type",
             {"command": "echo hi", "background": "true"},
-            ACT,
+            REP,
             r"'background'.*boolean",
         )
     )
@@ -806,7 +797,8 @@ def _cases() -> list[Case]:
             "bash",
             "near-miss name",
             {"command": "echo hi", "run_in_background": True},
-            OK,
+            ACT,
+            r"'run_in_background'.*'background'",
             check=has("hi"),
         )
     )
@@ -816,15 +808,12 @@ def _cases() -> list[Case]:
             "bash",
             "unknown field",
             {"command": "echo hi", "description": "say hi"},
-            OK,
+            ACT,
+            r"'description'.*'command'",
             check=has("hi"),
         )
     )
-    add(
-        Case(
-            "bash-empty", "bash", "missing field", {"command": ""}, OPQ, r"command.*empty", check=never, known_gap=True
-        )
-    )
+    add(Case("bash-empty", "bash", "missing field", {"command": ""}, ACT, r"command.*empty", check=never))
     # ── bash_output / bash_kill ──
     add(Case("bash_output-unknown", "bash_output", "nonexistent", {"job_id": "job-9"}, ACT, r"no job .*\(jobs:"))
     add(Case("bash_output-int", "bash_output", "wrong type", {"job_id": 3}, ACT, r"'job_id'.*string"))
@@ -834,9 +823,8 @@ def _cases() -> list[Case]:
             "bash_output",
             "near-miss name",
             {"id": "job-1"},
-            OPQ,
+            ACT,
             r"'id'.*'job_id'",
-            known_gap=True,
         )
     )
     add(
@@ -845,21 +833,16 @@ def _cases() -> list[Case]:
             "bash_output",
             "near-miss name",
             {"shell_id": "job-1"},
-            OPQ,
+            ACT,
             r"'shell_id'.*'job_id'",
-            known_gap=True,
         )
     )
     add(Case("bash_kill-unknown", "bash_kill", "nonexistent", {"job_id": "job-9"}, ACT, r"no job .*\(jobs:"))
-    add(
-        Case(
-            "bash_kill-alias-pid", "bash_kill", "near-miss name", {"pid": 123}, OPQ, r"'pid'.*'job_id'", known_gap=True
-        )
-    )
+    add(Case("bash_kill-alias-pid", "bash_kill", "near-miss name", {"pid": 123}, ACT, r"'pid'.*'job_id'"))
     # ── todo ──
     td = [{"content": "a", "status": "pending"}]
     add(Case("todo-ok", "todo", "baseline", {"todos": td}, OK, check=has("[ ] a")))
-    add(Case("todo-items-alias", "todo", "near-miss name", {"items": td}, OPQ, r"'items'.*'todos'", known_gap=True))
+    add(Case("todo-items-alias", "todo", "near-miss name", {"items": td}, REP, r"'items'.*'todos'"))
     add(
         Case(
             "todo-json-string",
@@ -930,9 +913,8 @@ def _cases() -> list[Case]:
             "web_fetch",
             "near-miss name",
             {"uri": "https://example.com/doc"},
-            OPQ,
+            ACT,
             r"'uri'.*'url'",
-            known_gap=True,
         )
     )
     add(
@@ -946,10 +928,9 @@ def _cases() -> list[Case]:
             "web_fetch",
             "url form",
             {"url": " https://example.com/doc \n"},
-            OPQ,
+            REP,
             r"whitespace",
             check=has("hello web"),
-            known_gap=True,
         )
     )
     add(Case("web_search-ok", "web_search", "baseline", {"query": "k3code"}, OK, check=has("Result for k3code")))
@@ -959,24 +940,19 @@ def _cases() -> list[Case]:
             "web_search",
             "wrong type",
             {"query": "k3code", "limit": "3"},
-            ACT,
+            REP,
             r"'limit'.*integer",
         )
     )
-    add(
-        Case(
-            "web_search-alias-q", "web_search", "near-miss name", {"q": "k3code"}, OPQ, r"'q'.*'query'", known_gap=True
-        )
-    )
+    add(Case("web_search-alias-q", "web_search", "near-miss name", {"q": "k3code"}, REP, r"'q'.*'query'"))
     add(
         Case(
             "web_search-empty",
             "web_search",
             "missing field",
             {"query": "  "},
-            OPQ,
+            ACT,
             r"query.*(empty|non-empty)",
-            known_gap=True,
         )
     )
     # ── skill ──
@@ -989,9 +965,8 @@ def _cases() -> list[Case]:
             "skill",
             "near-miss name",
             {"skill": "nope-skill"},
-            OPQ,
+            ACT,
             r"'skill'.*'name'",
-            known_gap=True,
         )
     )
     # ── task ──
@@ -1022,7 +997,7 @@ def _cases() -> list[Case]:
             "task",
             "wrong type",
             {"description": "d", "prompt": "p", "background": "false"},
-            ACT,
+            REP,
             r"'background'.*boolean",
         )
     )
@@ -1032,9 +1007,8 @@ def _cases() -> list[Case]:
             "task",
             "near-miss name",
             {"description": "d", "task": "find x"},
-            OPQ,
+            REP,
             r"'task'.*'prompt'",
-            known_gap=True,
         )
     )
     return c

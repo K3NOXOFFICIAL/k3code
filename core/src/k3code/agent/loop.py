@@ -30,7 +30,7 @@ from k3code.tools import (
     format_tool_result,
 )
 from k3code.tools.safe_open import Guard, file_guard
-from k3code.tools.validate import invalid_arguments
+from k3code.tools.validate import Normalized, invalid_arguments, normalize_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
 CUT_OFF_CONTINUE = (
@@ -512,9 +512,10 @@ class AgentLoop:
 
     def _plain_allow(self, tc: ToolCall) -> bool:
         spec = self.tools.get(tc.name)[0]
-        if invalid_arguments(tc.name, spec.parameters, tc.arguments) is not None:
+        norm = normalize_arguments(tc.name, spec.parameters, tc.arguments)  # decided as _execute_tool decides it
+        if norm.error is not None or invalid_arguments(tc.name, spec.parameters, norm.args) is not None:
             return True  # answered with an error before any permission check
-        return self.permissions.decide(tc.name, tc.arguments, headless=self.headless).action == "allow"
+        return self.permissions.decide(tc.name, norm.args, headless=self.headless).action == "allow"
 
     async def _execute_tool(self, tool_call: ToolCall, *, step: int | None = None) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
@@ -536,9 +537,16 @@ class AgentLoop:
         args = tool_call.arguments
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
+        # Aliases, path forms and string numbers repaired in one place (tools.validate), before anything decides on the
+        # arguments: the schema check, the permission engine, hooks, the approval prompt and the file guards all see
+        # the normalised call. tool_call.arguments (transcript, journal) keeps what the model sent.
+        norm = normalize_arguments(tool_call.name, spec.parameters, args)
+        if norm.error is not None:
+            return {"error": norm.error}
+        args = norm.args
         # before the permission prompt: a call the handler cannot run is not worth an approval
         if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
-            return {"error": invalid}
+            return _noted({"error": invalid}, norm)
         if tool_call.name == "bash":
             # parsing a long command line takes a while (linear, about a second per 200 KB of simple commands): off the
             # event loop, so the daemon's other sessions, its socket and heartbeats keep running meanwhile (K3NOX-691)
@@ -692,6 +700,7 @@ class AgentLoop:
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
+        result = _noted(result, norm)
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
@@ -1036,6 +1045,13 @@ class AgentLoop:
             return {"error": "User rejected the plan; revise it and call exit_plan again."}
         self.permissions.mode = PermissionMode(target)
         return {"content": f"Plan approved; mode is now {self.permissions.mode.value}. Implement it."}
+
+
+def _noted(result: dict[str, Any], norm: Normalized) -> dict[str, Any]:
+    """A failed call whose arguments were repaired says so: the model sees which of its names the error is about."""
+    if not norm.changes or "error" not in result:
+        return result
+    return {**result, "error": f"{result['error']} (arguments normalised: {'; '.join(norm.changes)})"}
 
 
 def _preview(tool: str, args: dict[str, Any]) -> str:
