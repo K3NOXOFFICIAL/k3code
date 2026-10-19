@@ -112,8 +112,8 @@ async def test_an_alias_is_decided_exactly_like_the_canonical_name(proj: Path, m
     assert a_plain == c_plain
     assert "file" not in a_seen[0] and "path" in a_seen[0]
     first = c_actions[0]
-    if tool in ("write", "edit"):
-        assert not first.startswith("allow"), f"a protected or outside write was allowed: {first}"
+    if tool in ("write", "edit") or "/home/ada" in str(canonical.get("path")):
+        assert not first.startswith("allow"), f"a protected or outside path was allowed: {first}"
     if canonical.get("path") in (".env", "~/.ssh/id_rsa", "~/.aws") and tool != "glob":
         assert first.startswith("deny"), first
 
