@@ -26,6 +26,7 @@ class McpCommand(CommandDef):
         if args and args[0] == "reload" and len(args) == 1:
             ctx.apply_file_config(cwd)
             await ctx.mcp.reload(mcpjson.merged(ctx.config.mcp.servers, cwd))
+            _refresh_prompts(ctx)
             note = "Reloaded.\n"
         elif args and args[0] in ("enable", "disable") and len(args) == 2:
             name = args[1]
@@ -35,6 +36,7 @@ class McpCommand(CommandDef):
             mcpjson.set_enabled(cwd, name, servers[name] if args[0] == "enable" else None)
             ctx.apply_file_config(cwd)  # the merged server set changed: restarted on ensure_started below
             await ctx.mcp.ensure_started()
+            _refresh_prompts(ctx)
             note = f"{name} {args[0]}d.\n"
         elif args:
             return reply(USAGE)
@@ -61,3 +63,11 @@ class McpCommand(CommandDef):
         if not rows:
             return reply("No MCP servers configured (add them under mcp.servers in config).", servers=[])
         return reply(note + "\n".join(lines), servers=rows)
+
+
+def _refresh_prompts(ctx: Any) -> None:
+    """The user restarted or (dis)connected servers: every session's prompt names the new set from its next loop (the
+    MCP section is otherwise the snapshot of a session's first prompt, and the servers are the daemon's, not one
+    session's)."""
+    if hasattr(ctx, "refresh_prompts"):
+        ctx.refresh_prompts("mcp")

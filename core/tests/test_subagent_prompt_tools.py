@@ -40,7 +40,9 @@ async def spawn(tmp_path, monkeypatch, agent_type: str, description: str = "chil
         autonomy={"plan_first": False, "proposals": False, "advisor": "strong"},
         skills={"roots": [str(tmp_path / "skills")], "import_claude": False},
     )
-    tool = SimpleNamespace(qualified="mcp__demo__lookup", description="look it up", schema=None)
+    tool = SimpleNamespace(
+        server="demo", name="lookup", qualified="mcp__demo__lookup", description="look it up", schema=None
+    )
 
     async def nothing():
         return None

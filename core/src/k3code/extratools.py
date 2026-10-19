@@ -110,7 +110,7 @@ def mcp_prompt(mcp: McpManager, limit: int = 150) -> str:
     tools = mcp.tools()
     if not tools:
         return ""
-    names = [t.qualified for t in tools]
+    names = [t.qualified for t in sorted(tools, key=lambda t: (t.server, t.name))]  # not connection order
     shown = ", ".join(names[:limit]) + (f", …(+{len(names) - limit} more)" if len(names) > limit else "")
     return (
         "## MCP tools (deferred)\n\n"

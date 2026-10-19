@@ -6,7 +6,8 @@ import functools
 import hashlib
 import json
 import re
-from collections.abc import Collection
+import time
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
 
@@ -111,8 +112,10 @@ def prompt_sections(
     With ``session_id``, the settings are the session's own (``optimizer.session_settings``): a session in the
     treatment arm of a concurrent config experiment gets its memory and skills limits.
 
-    ``frozen`` is a session's snapshot of the learned tail (``learned_sections``, see
-    ``LiveSession.prompt_frozen``): empty, it is filled from disk; filled for the same inputs, it is used as it is."""
+    ``frozen`` is a session's snapshot (``LiveSession.prompt_frozen``) of what changes under a session without the
+    user asking: the custom style text, the skills index, the MCP section and the learned tail. Each is kept in a slot
+    of its own with the inputs it was taken for; a slot that is empty or was taken for other inputs is filled now, and
+    a loop that does not show a section leaves its slot alone."""
     from k3code.learning.optimizer import session_settings
 
     config = session_settings(config, session_id)
@@ -120,7 +123,10 @@ def prompt_sections(
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
     # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
     parts = [("base", base.rstrip())]
-    style = outputstyle.style_text(effective_style(config, session_meta), cwd, attended=attended)
+    name, where = effective_style(config, session_meta), str(Path(cwd).resolve())
+    # a custom style is a file the user may edit mid-session: its text is the session's snapshot (a preset is fixed)
+    custom = _frozen(frozen, "style", [name, where], lambda: outputstyle.custom_text(name, cwd))
+    style = custom if custom is not None else outputstyle.preset_text(name, attended=attended)
     if style:
         parts.append(("style", style))
     from k3code.autonomy import advisor as _advisor
@@ -129,11 +135,18 @@ def prompt_sections(
     if advisor and _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the tool exists
         parts.append(("advisor", _advisor.PROMPT_NOTE))
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
+    roots, limit = list(config.skills.roots), int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))
+    # ``skills=False`` for a loop that has no ``skill`` tool to load them with; the ranking above the cap reads the
+    # clock once, when the snapshot is taken
     if skills and (
-        index := skills_prompt(cwd, list(config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT)))
-    ):  # ``skills=False`` for a loop that has no ``skill`` tool to load them with
+        index := _frozen(
+            frozen, "skills", [where, roots, limit], lambda: skills_prompt(cwd, roots, limit=limit, now=time.time())
+        )
+    ):
         parts.append(("skills", index))
-    if mcp is not None and (m := mcp_prompt(mcp)):
+    # the tools of the servers connected when the snapshot was taken: a server that connects later is found through
+    # ``mcp_tool_search`` and named here after the next refresh
+    if mcp is not None and (m := _frozen(frozen, "mcp", [], lambda: mcp_prompt(mcp))):
         parts.append(("mcp", m))
     # where the session works: project-specific like everything after it, and fixed for the session (an /add-dir
     # changes it, rarely), so it sits ahead of the facts and learned sections
@@ -178,16 +191,21 @@ def frozen_learned_sections(
     from disk every turn then changed its prefix and missed the provider's cache. The snapshot is taken at the first
     prompt and kept until the session clears it (``LiveSession.refresh_prompt_inputs``: compaction, /clear, a
     project move, /memory add) or the inputs it was taken for change (the directory, learning on or off, the cap)."""
-    if frozen is None:
-        return learned_sections(cwd, config, session_id)
     from k3code.learning import learning_cfg
 
     key = [str(Path(cwd).resolve()), bool(learning_cfg(config)["enabled"]), memory_limit(config), session_id or ""]
-    if frozen.get("key") != key:
-        frozen.clear()
-        frozen["key"] = key
-        frozen["sections"] = learned_sections(cwd, config, session_id)
-    return list(frozen["sections"])
+    return list(_frozen(frozen, "learned", key, lambda: learned_sections(cwd, config, session_id)))
+
+
+def _frozen(frozen: dict[str, Any] | None, slot: str, key: list[Any], make: Callable[[], Any]) -> Any:
+    """``make()``, kept in ``frozen[slot]`` for the inputs ``key``: the same value until the session clears the slot
+    (``LiveSession.refresh_prompt_inputs``) or asks for other inputs. No snapshot (``frozen`` None): ``make()`` now."""
+    if frozen is None:
+        return make()
+    hit = frozen.get(slot)
+    if hit is None or hit[0] != key:
+        hit = frozen[slot] = (key, make())
+    return hit[1]
 
 
 def build_system_prompt(

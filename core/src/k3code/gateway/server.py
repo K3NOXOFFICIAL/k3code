@@ -332,15 +332,22 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
-        #: The prompt's learned tail (memory files, learned notes, facts, gotchas, overlay) as the session's first
-        #: prompt read it (``prompting.frozen_learned_sections``): the background review and distill rewrite those
-        #: files mid-session, and the prompt must stay the cached prefix until the conversation is rewritten anyway.
+        #: What the session's first prompt read of the inputs that change under it (``prompting.prompt_sections``):
+        #: the custom style text, the skills index, the MCP section and the learned tail (memory files, learned notes,
+        #: facts, gotchas, overlay). Skill files, MCP connections and the background review and distill change those
+        #: mid-session, and the prompt must stay the cached prefix until the conversation is rewritten anyway or the
+        #: user changes an input on purpose.
         self.prompt_frozen: dict[str, Any] = {}
 
-    def refresh_prompt_inputs(self) -> None:
-        """Read the learned tail of the prompt afresh at the next loop: the conversation was rewritten (compaction,
-        /clear), the session moved to another project, or the user changed its memory on purpose (/memory add)."""
-        self.prompt_frozen.clear()
+    def refresh_prompt_inputs(self, *slots: str) -> None:
+        """Read the prompt's snapshot afresh at the next loop: all of it when the conversation was rewritten
+        (compaction, /clear), the session moved to another project or the user changed its memory on purpose
+        (/memory add); only ``slots`` (``style``, ``skills``, ``mcp``, ``learned``) after a command that changed
+        those (/output-style, /reload-skills, /mcp reload, /reload)."""
+        if not slots:
+            self.prompt_frozen.clear()
+        for slot in slots:
+            self.prompt_frozen.pop(slot, None)
 
     @property
     def turn_in_flight(self) -> bool:
@@ -2730,6 +2737,8 @@ class GatewayServer:
         """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
         the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
         if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
+            # an estimate, not the session's snapshot: on the first turn after a daemon start this runs before the MCP
+            # servers are started, and a snapshot taken here would leave their tools out of the prompt for good
             prompt = build_system_prompt(
                 session.system_prompt,
                 cwd=session.perms.cwd,
@@ -2737,7 +2746,6 @@ class GatewayServer:
                 session_meta=session.stored.meta,
                 mcp=self.mcp,
                 session_id=session.session_id,
-                frozen=session.prompt_frozen,
             )
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
@@ -2922,6 +2930,12 @@ class GatewayServer:
         """The turn id in flight for a live session ("" when it is idle or unknown)."""
         live = self.live.get(session_id)
         return live.turn_id if live is not None else ""
+
+    def refresh_prompts(self, *slots: str) -> None:
+        """``refresh_prompt_inputs(*slots)`` for every live session: the user changed an input the daemon shares (its
+        config, the MCP servers), and a session's snapshot would otherwise keep naming what is gone."""
+        for live in list(self.live.values()):
+            live.refresh_prompt_inputs(*slots)
 
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
         """Re-read config files into the live settings.
@@ -4740,6 +4754,7 @@ async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str
     await server.mcp.reload(
         mcpjson.merged(server.config.mcp.servers, _session_cwd(server, params) or default_project_dir())
     )
+    server.refresh_prompts("mcp")
     return {"status": "reloaded"}
 
 
@@ -4748,11 +4763,16 @@ async def _reload_env(server: GatewayServer, params: dict[str, Any]) -> dict[str
     from k3code.setup.state import read_env_file
 
     server.apply_file_config(_session_cwd(server, params))
+    server.refresh_prompts("style", "skills", "mcp")  # the config names the skill roots, the style, the servers
     return {"updated": len(read_env_file())}
 
 
 async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """/reload-skills: skill discovery is never cached, so this lists what a fresh scan finds."""
+    """/reload-skills: lists what a fresh scan finds, and the session's prompt names those skills from its next loop
+    (its skills index is otherwise the snapshot of its first prompt)."""
+    session = server._session_for(params.get("session_id"))
+    if session is not None:
+        session.refresh_prompt_inputs("skills")
     res = await server.dispatch_command("skills", "", params.get("session_id"))
     return {"output": str(res.get("message") or res.get("output") or "")}
 
