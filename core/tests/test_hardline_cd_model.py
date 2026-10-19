@@ -433,3 +433,12 @@ def test_a_relative_cd_from_an_unknown_directory_into_a_harmless_one_is_not_hard
 ) -> None:
     monkeypatch.delenv("CDPATH", raising=False)
     assert _check(command, cwd=f"{HOME}/proj/x") is None
+
+
+def test_past_the_directory_cap_a_cdpath_cd_walks_no_more_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    chain = "; ".join(f"CDPATH=/a{k} cd b{k % 5}" for k in range(40))
+    assert _check(chain + "; rm -rf build") == "scan-depth"  # too many places to read a relative target in
+    assert _check(chain + "; rm -rf /") == "rm-rf-root"
+    assert _check(chain + "; rm -rf /tmp/x") is None
+    assert _check("CDPATH=" + ":".join(f"/a{k}" for k in range(40)) + " cd b; rm -rf build") == "scan-depth"

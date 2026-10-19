@@ -1503,6 +1503,8 @@ class _Dirs:
         """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
         popd)."""
         name = argv[0] if argv else ""
+        if self.overflow:
+            return  # every later relative delete is scan-depth: where the line goes no longer matters
         if name == "popd":
             self.here = self._stack.pop() if self._stack and len(argv) == 1 else None
             return
@@ -1540,7 +1542,11 @@ class _Dirs:
             self._add(d)
         self.here = joined[0] if len(joined) == 1 else None
         if self.cdpath is not None and t.split("/", 1)[0] not in ("", ".", ".."):
+            if len(self.cdpath) >= _CD_MAX_DIRS:
+                self.overflow = True  # too many places to go: walking them all for every cd grew with the square
             for entry in ("/", *self.cdpath):  # CDPATH: bash tries its entries for an operand not starting . or ..
+                if self.overflow:
+                    break
                 self._add(_join_dir(entry, t))
             self.here = None  # it may have gone to any of them
 

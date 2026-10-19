@@ -46,6 +46,8 @@ SPELLINGS: dict[str, Callable[[int], str]] = {
     # wrapper chains (older than the readings above: each wrapper or eval copied or re-split the rest of the words)
     "eval-chain": lambda n: "eval " * n + "echo hi",
     "sudo-chain": lambda n: "sudo " * n + "echo hi",
+    # a relative cd walked every CDPATH entry on the line (each prefix assignment adds one)
+    "cdpath-chain": lambda n: "; ".join(f"CDPATH=/a{k} cd b{k % 5}" for k in range(n)),
 }
 
 
