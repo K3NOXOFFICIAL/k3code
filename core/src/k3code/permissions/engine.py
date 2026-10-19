@@ -416,7 +416,7 @@ _RANK: dict[str, int] = {"allow": 1, "ask": 2, "deny": 3}
 
 
 def _norm(path: str | Path) -> str:
-    return os.path.normpath(os.path.expanduser(str(path)))
+    return os.path.normpath(hardline.expand_user(str(path)))
 
 
 def _real(path: str) -> str:
@@ -441,7 +441,7 @@ def _real_strict(path: str) -> str | None:
 
 
 def _abs(raw: str, cwd: str) -> str:
-    p = os.path.expanduser(raw or ".")
+    p = hardline.expand_user(raw or ".")
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
 
 
@@ -601,6 +601,7 @@ def _unusable_argument(args: dict[str, object]) -> str | None:
     return None
 
 
+@hardline.lookup_scope()  # one budget of ~name lookups for the whole decision (see hardline._home_of)
 def decide(
     *,
     mode: PermissionMode | str,
@@ -653,7 +654,7 @@ def decide(
         bash_cwd = _abs(str(args.get("cwd") or "."), cwd_s)
         dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, bash_cwd)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
-        raw = os.path.expanduser(str(args.get("path") or args.get("file") or "."))
+        raw = hardline.expand_user(str(args.get("path") or args.get("file") or "."))
         path = _abs(raw, cwd_s)
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
@@ -1268,7 +1269,7 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
         if not t or t.startswith("$"):
             continue
         lexical = _abs(t, cwd)
-        for p in dict.fromkeys((lexical, _real(os.path.join(cwd, os.path.expanduser(t))))):
+        for p in dict.fromkeys((lexical, _real(os.path.join(cwd, hardline.expand_user(t))))):
             if projects and _inside(p, projects):
                 continue
             for h in homes:
@@ -1615,6 +1616,10 @@ def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = N
     word = hardline.expand_vars(arg, cwd, home)
     if "$" in word or "`" in word:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
+    if hardline.past_budget(word):
+        # another user's home past the lookup budget (see hardline._home_of) may be any folder (``~nobody`` is ``/``):
+        # a credential name after it is refused, as it was when the home was looked up and the path was a credential
+        return "deny" if _sensitive_name(word.partition("/")[2]) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
         reads = _glob_reads_secret(path, home, budget or _GlobBudget())
@@ -1924,7 +1929,7 @@ def _link_names(args: list[str]) -> list[str]:
     """Where an ``ln -s``/``cp -s`` may put its links: the last operand (and below it, when that is a folder), or the
     ``-t`` folder."""
     opts, positional = _options(args, "St", frozenset({"--suffix", "--target-directory"}))
-    positional = [os.path.expanduser(p.replace("${HOME}", "~").replace("$HOME", "~")) for p in positional]
+    positional = [hardline.expand_user(p.replace("${HOME}", "~").replace("$HOME", "~")) for p in positional]
     folder = next((v for o, v in opts if o in ("-t", "--target-directory") and v), None)
     if folder is not None:
         return [os.path.join(folder, os.path.basename(p)) for p in positional]
@@ -2056,9 +2061,9 @@ def _cd_targets(operand: str, bases: tuple[str, ...], home: str, cdpath: bool) -
         if _GLOB_CHARS & set(word):
             return None
         if word.startswith("~") and word != "~" and not word.startswith("~/"):
-            expanded = os.path.expanduser(word)
+            expanded = hardline.expand_user(word)
             if expanded == word:
-                return None  # a user this machine does not know, ``~+``, ``~-``
+                return None  # a user this machine does not know or not looked up (see hardline), ``~+``, ``~-``
             word = expanded
         if cdpath and word not in (".", "..") and not word.startswith(("/", "~", "./", "../", "$")):
             return None

@@ -45,3 +45,39 @@ def test_shorter_input_than_arity() -> None:
 
 def test_systemctl() -> None:
     assert arity.prefix(["systemctl", "restart", "nginx"]) == ["systemctl", "restart"]
+
+
+def test_prefix_only_joins_as_many_words_as_the_longest_key_has() -> None:
+    from k3code.permissions import arity
+
+    def old_prefix(tokens: list[str]) -> list[str]:  # the loop before the bound: every length from len(tokens) down
+        for length in range(len(tokens), 0, -1):
+            found = arity.ARITY.get(" ".join(tokens[:length]))
+            if found is not None:
+                return tokens[:found]
+        return tokens[:1] if tokens else []
+
+    samples = [
+        [],
+        ["git"],
+        ["git", "commit", "-m", "x"],
+        ["docker", "compose", "up", "-d"],
+        ["python", "-m", "pytest", "-q"],
+        ["terraform", "workspace", "list"],
+        ["yarn", "dlx", "create-react-app", "app"],
+        ["echo", "a", "b", "c"],
+        ["vault", "kv", "get", "secret/x"],
+    ]
+    assert all(arity.prefix(s) == old_prefix(s) for s in samples)
+    assert max(len(k.split()) for k in arity.ARITY) == arity._MAX_KEY_WORDS
+
+
+def test_prefix_of_a_huge_command_takes_linear_time() -> None:
+    import time
+
+    from k3code.permissions import arity
+
+    tokens = ["echo"] + ["a"] * 40_000
+    t = time.perf_counter()
+    arity.prefix(tokens)
+    assert time.perf_counter() - t < 1.0  # was 3-5 s: one join of up to 40,000 words per length
