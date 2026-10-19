@@ -218,3 +218,28 @@ def test_a_failed_lookup_still_knows_where_root_lives(monkeypatch: pytest.Monkey
         assert _check("rm -rf ~root") == "rm-rf-root"
     finally:
         hardline._user_home.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        ("CDPATH=/ cd usr; rm -rf *", "rm-rf-root"),
+        ("export CDPATH=/; cd usr; rm -rf *", "rm-rf-root"),
+        ("CDPATH=$X cd usr; rm -rf *", "rm-rf-root"),  # an entry it cannot read may be /
+        ("export CDPATH=/srv:/home; cd dev; rm -rf *", "rm-rf-home"),  # /home/dev is home
+        ("export CDPATH='/srv:/home'; cd dev && find . -delete", "rm-rf-home"),
+        ("export CDPATH=/srv; cd app; rm -rf *", None),
+        ("CDPATH=/ cd ./usr; rm -rf *", None),  # bash reads no CDPATH for ./ and ../
+        ("CDPATH=/ cd /srv/usr; rm -rf *", None),
+    ],
+)
+def test_a_relative_cd_may_go_through_cdpath(command: str, rule: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check(command) == rule
+
+
+def test_a_cdpath_in_the_environment_counts_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check("cd usr; rm -rf *") is None
+    monkeypatch.setenv("CDPATH", "/")
+    assert _check("cd usr; rm -rf *") == "rm-rf-root"

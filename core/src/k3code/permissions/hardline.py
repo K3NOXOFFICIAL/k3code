@@ -416,15 +416,18 @@ def check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+    cdpath = _cdpath_entries(command)
     try:
-        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home), parsed
+        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home, cdpath), parsed
     except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
         return "scan-depth", parsed
 
 
-def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
+def _check_parsed(
+    parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str, cdpath: tuple[str, ...] | None
+) -> str | None:
     # relative rm/find targets are read in the cwd and in every directory a `cd` earlier on the line went to (see _Dirs)
-    dirs = _Dirs(cwd, home)
+    dirs = _Dirs(cwd, home, cdpath)
     for k, sub in enumerate(parsed.subs):
         argv = _command_argv(_tokens(sub))
         hit = (
@@ -444,7 +447,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
     if hit:
         return hit
     for child in parsed.children:
-        hit = _match(child.clean, extra) or _check_parsed(child, extra, cwd, home)
+        hit = _match(child.clean, extra) or _check_parsed(child, extra, cwd, home, cdpath)
         if hit:
             return hit
     return None
@@ -1375,6 +1378,26 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
     return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
+def _join_dir(base: str, t: str) -> str:
+    """The directory ``cd t`` goes to from ``base``, normalised (``//x`` is ``/x``)."""
+    d = os.path.normpath(os.path.join(base, t))
+    return "/" + d.lstrip("/") if d.startswith("//") else d
+
+
+_CDPATH_VALUE = re.compile(r"""\bCDPATH=("[^"]*"|'[^']*'|[^\s;&|()<>]*)""")
+
+
+def _cdpath_entries(command: str) -> tuple[str, ...] | None:
+    """None when neither ``command`` nor the environment mentions CDPATH, else the literal absolute entries of the
+    values it is given on the line (``CDPATH=/srv cd app``, ``export CDPATH=/srv``) and in the environment."""
+    env = os.environ.get("CDPATH")
+    if env is None and "CDPATH" not in command:
+        return None
+    values = [m.group(1).strip("\"'") for m in _CDPATH_VALUE.finditer(command)]
+    entries = [e for v in [*values, env or ""] for e in v.split(":")]
+    return tuple(dict.fromkeys(e for e in entries if e.startswith("/") and not any(c in e for c in "$`\\")))
+
+
 #: How many directories a command line may ``cd`` into (the cwd included) before a relative rm/find target is too many
 #: places to read: each is read in every one of them (see _Dirs), so past the cap such a target is denied
 #: (``scan-depth``) rather than read thousands of times over.
@@ -1386,10 +1409,13 @@ class _Dirs:
     ``cd``/``pushd`` before it went to. A cd may fail (``cd /; cd /nonexistent; rm -rf *``) or run in a subshell, a
     pipeline stage or the background and not take effect (``cd / && (cd tmp) && rm -rf *``), so no directory ever
     leaves the set. ``here`` is where the line is if every cd took effect (None once unknown): it only resolves the next
-    relative cd. A cd to a variable adds home, which a plain ``cd`` (the variable unset) goes to."""
+    relative cd. A cd to a variable adds home, which a plain ``cd`` (the variable unset) goes to. ``cdpath`` is None
+    when no CDPATH is in play, else its literal absolute entries (see _cdpath_entries): a relative cd may then go to
+    any of them or, through an entry it cannot read, anywhere, read as ``/``."""
 
-    def __init__(self, cwd: str | None, home: str) -> None:
+    def __init__(self, cwd: str | None, home: str, cdpath: tuple[str, ...] | None = None) -> None:
         self.home = home
+        self.cdpath = cdpath
         self.here = cwd
         self.all: dict[str | None, None] = {cwd: None}  # insertion-ordered set
         self.overflow = False
@@ -1425,11 +1451,14 @@ class _Dirs:
         t = expand_vars(operands[0], self.here, self.home)
         if name == "cd" and any(c in t for c in "$`"):
             self._add(self.home)  # unset, `cd $X` is a plain `cd`
-        if t == "-" or t.startswith("+") or any(c in t for c in "$`~") or (self.here is None and t[:1] != "/"):
+        unknown = t == "-" or t.startswith("+") or any(c in t for c in "$`~")
+        if not unknown and self.cdpath is not None and t[:1] != "/" and t.split("/", 1)[0] not in ("", ".", ".."):
+            for entry in ("/", *self.cdpath):  # CDPATH: bash tries its entries for an operand not starting . or ..
+                self._add(_join_dir(entry, t))
+        if unknown or (self.here is None and t[:1] != "/"):
             self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user, relative to unknown
             return
-        t = os.path.normpath(os.path.join(self.here or "/", t))
-        self.here = "/" + t.lstrip("/") if t.startswith("//") else t
+        self.here = _join_dir(self.here or "/", t)
         self._add(self.here)
 
 
