@@ -25,7 +25,8 @@ from k3code.tools.fuzzy_match import (
     fuzzy_find_and_replace,
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
-from k3code.tools.safe_open import NotAllowed, open_regular
+from k3code.tools.safe_open import NotAllowed, NotRegular, open_regular
+from k3code.tools.validate import shown
 from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
@@ -334,7 +335,11 @@ def _read_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
         f = open_regular(path)
     except NotAllowed:
         return {"error": f"Permission denied: {path} leads to a file the permission check did not allow (a link)"}
-    except (OSError, ValueError):  # missing, a directory or other non-regular file, not readable
+    except NotRegular as e:
+        if e.errno == errno.EISDIR:
+            return {"error": f"{path} is a directory; use glob to list it (read takes a file)"}
+        return {"error": f"File not found: {path}"}
+    except (OSError, ValueError):  # missing, a FIFO or other non-regular file, not readable
         return {"error": f"File not found: {path}"}
     with f:
         explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
@@ -390,6 +395,8 @@ async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> d
 def _write_sync(arguments: dict[str, Any], cwd: Path | None) -> dict[str, Any]:
     path = _resolve_path(arguments["path"], cwd)
     content = arguments["content"]
+    if path.is_dir():
+        return {"error": f"{path} is a directory; send 'path' as the file to write (e.g. {path}/name.txt)"}
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(path, content.encode("utf-8"))
     return {"ok": True, "path": str(path)}
@@ -413,8 +420,13 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
     """The change ``edit`` would make, or its error result; nothing is written. The approval prompt shows the same
     change (issue #131), so this is the one place the replacement is computed."""
     path = _resolve_path(arguments["path"], cwd)
+    if path.is_dir():
+        return {"error": f"{path} is a directory; edit takes a file (use glob to find it)"}
     if not path.is_file():
-        return {"error": f"File not found: {path}"}
+        return {
+            "error": f"File not found: {path}; edit changes an existing file: use write to create it, or glob to "
+            "find the right path"
+        }
     old_string = arguments["old_string"]
     new_string = arguments["new_string"]
     replace_all = arguments.get("replace_all", False)
@@ -516,6 +528,11 @@ async def tool_bash(
     cmd = arguments["command"]
     timeout = min(float(arguments.get("timeout") or BASH_DEFAULT_TIMEOUT), BASH_MAX_TIMEOUT)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
+    if not workdir.is_dir():
+        what = "is not a directory" if workdir.exists() else "does not exist"
+        return {
+            "error": f"'cwd' {what}: {workdir}; send an existing directory (relative to the session cwd) or omit it"
+        }
     proc: asyncio.subprocess.Process | None = None
     if sandbox:
         sandbox = with_chdir(sandbox, workdir)  # the command starts in the requested cwd, not the session's
@@ -829,6 +846,8 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     exclude = arguments.get("exclude")
     if sensitive_path(str(path)):
         return {"error": f"Hardline deny (sensitive-path): {path}"}
+    if not path.exists():  # rg and the fallback both answered "(no matches)", which reads like a search that ran
+        return {"error": f"Path not found: {path} (grep 'path'); send an existing file or directory, or omit 'path'"}
     try:
         # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
@@ -907,10 +926,14 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
         try:
             return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
-        except re.error:
-            if isinstance(rg_failure, RuntimeError):  # a pattern neither engine takes: rg's message names the fault
-                raise rg_failure from None
-            raise
+        except re.error as e:
+            # a pattern neither engine takes: rg's own message names the fault when rg ran, else Python's
+            said = [ln.strip() for ln in str(rg_failure).splitlines() if ln.strip()]
+            reason = said[-1].removeprefix("error: ") if isinstance(rg_failure, RuntimeError) and said else str(e)
+            return {
+                "error": f"invalid regex for 'pattern' ({shown(pattern)}): {reason}; escape metacharacters "
+                '(e.g. "f\\\\(" for a literal "f(")'
+            }
 
 
 #: Directories glob and the grep fallback never enter, even inside a git work tree where .gitignore may not list
@@ -1239,6 +1262,10 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     outside a git tree also caches and build output). Stops at MAX_SEARCH_RESULTS or SEARCH_BUDGET_S."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
+    if not path.exists():
+        return {"error": f"Path not found: {path} (glob 'path'); send an existing directory, or omit 'path'"}
+    if not path.is_dir():
+        return {"error": f"{path} is a file, not a directory (glob 'path'); send its directory, or read the file"}
     return await asyncio.to_thread(_glob_sync, path, pattern)
 
 
@@ -1261,7 +1288,9 @@ def parse_todos(raw: Any) -> tuple[list[dict[str, str]], str | None]:
         content = " ".join(str(item.get("content") or "").split())
         status = str(item.get("status") or "")
         if not content:
-            return [], f"todo {i} has no content"
+            other = [k for k in item if k not in ("content", "status", "id")]
+            got = f" (got {', '.join(repr(k) for k in other)}: send the text as 'content')" if other else ""
+            return [], f"todo {i} has no content{got}"
         if status not in TODO_STATUSES:
             return [], f"todo {i} has status {status!r}; use one of {', '.join(TODO_STATUSES)}"
         todos.append({"id": str(item.get("id") or i), "content": content, "status": status})

@@ -131,8 +131,9 @@ def open_regular(path: str | os.PathLike[str], *, guard: Guard | None = None) ->
 def _checked(fd: int, guard: Guard | None, path: str) -> BinaryIO:
     """The open ``fd`` as a file object, if it is a regular file the guard allows (decided on where it really is)."""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise NotRegular(errno.EINVAL, "not a regular file", path)
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise NotRegular(errno.EISDIR if stat.S_ISDIR(mode) else errno.EINVAL, "not a regular file", path)
         if guard is not None and not guard(_fd_path(fd)):
             raise NotAllowed(errno.EACCES, "not the file the permission check allowed", path)
         return os.fdopen(fd, "rb")

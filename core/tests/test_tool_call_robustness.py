@@ -143,7 +143,7 @@ def _cases() -> list[Case]:
     add(Case("read-trailing-newline", "read", "path form", {"path": "a.py\n"}, REP, r"whitespace|newline"))
     add(Case("read-quoted", "read", "path form", {"path": '"a.py"'}, REP, r"quote"))
     add(Case("read-file-url", "read", "path form", {"path": f"file://{P}/a.py"}, REP, r"file://"))
-    add(Case("read-dir", "read", "dir vs file", {"path": "sub"}, OPQ, r"directory.*(glob|bash|ls)", known_gap=True))
+    add(Case("read-dir", "read", "dir vs file", {"path": "sub"}, ACT, r"directory.*(glob|bash|ls)"))
     add(
         Case(
             "read-nonexistent",
@@ -266,9 +266,7 @@ def _cases() -> list[Case]:
             "write-existing-read", "write", "baseline", {"path": "a.py", "content": "x"}, OK, check=file_is("a.py", "x")
         )
     )
-    add(
-        Case("write-to-dir", "write", "dir vs file", {"path": "sub", "content": "x"}, OPQ, r"directory", known_gap=True)
-    )
+    add(Case("write-to-dir", "write", "dir vs file", {"path": "sub", "content": "x"}, ACT, r"directory"))
     add(
         Case(
             "write-trailing-space",
@@ -491,9 +489,8 @@ def _cases() -> list[Case]:
             "edit",
             "nonexistent",
             {"path": "nope.py", "old_string": "a", "new_string": "b"},
-            OPQ,
+            ACT,
             r"(write|create|glob|did you mean)",
-            known_gap=True,
         )
     )
     add(
@@ -502,9 +499,8 @@ def _cases() -> list[Case]:
             "edit",
             "dir vs file",
             {"path": "sub", "old_string": "a", "new_string": "b"},
-            OPQ,
+            ACT,
             r"directory",
-            known_gap=True,
         )
     )
     add(
@@ -601,8 +597,7 @@ def _cases() -> list[Case]:
             "grep",
             "regex",
             {"pattern": "f("},
-            OPQ,
-            known_gap=True,
+            ACT,
             hint=r"(regex|escape|parenthesis|unterminated)",
         )
     )
@@ -613,8 +608,7 @@ def _cases() -> list[Case]:
             "grep",
             "regex",
             {"pattern": "[a-"},
-            OPQ,
-            known_gap=True,
+            ACT,
             hint=r"(regex|escape|bracket|range|unterminated)",
         )
     )
@@ -629,10 +623,9 @@ def _cases() -> list[Case]:
             "grep",
             "nonexistent",
             {"pattern": "needle", "path": "nope"},
-            OPQ,
+            ACT,
             r"(not found|does not exist|no such)",
             check=never,
-            known_gap=True,
         )
     )
     add(
@@ -641,10 +634,9 @@ def _cases() -> list[Case]:
             "grep",
             "path outside roots",
             {"pattern": "root", "path": "/etc/hostname"},
-            OPQ,
+            ACT,
             r"(add-dir|ask the user)",  # "Outside project roots" names no way forward
             extra={"mode": "default"},
-            known_gap=True,
         )
     )
     add(
@@ -653,10 +645,9 @@ def _cases() -> list[Case]:
             "grep",
             "path form",
             {"pattern": "home", "path": "~/h.txt"},
-            OPQ,
+            ACT,
             r"(add-dir|ask the user)",
             extra={"mode": "default"},
-            known_gap=True,
         )
     )
     add(
@@ -716,10 +707,9 @@ def _cases() -> list[Case]:
             "glob",
             "nonexistent",
             {"pattern": "*.py", "path": "nope"},
-            OPQ,
+            ACT,
             r"(not found|does not exist|no such)",
             check=never,
-            known_gap=True,
         )
     )
     add(
@@ -728,10 +718,9 @@ def _cases() -> list[Case]:
             "glob",
             "dir vs file",
             {"pattern": "*.py", "path": "a.py"},
-            OPQ,
+            ACT,
             r"directory",
             check=never,
-            known_gap=True,
         )
     )
     add(Case("glob-missing", "glob", "missing field", {}, ACT, r"missing required 'pattern'"))
@@ -764,9 +753,8 @@ def _cases() -> list[Case]:
             "bash",
             "bash cwd",
             {"command": "pwd", "cwd": "nope"},
-            OPQ,
+            ACT,
             r"cwd.*(exist|found)",
-            known_gap=True,
         )
     )
     add(
@@ -775,9 +763,8 @@ def _cases() -> list[Case]:
             "bash",
             "bash cwd",
             {"command": "pwd", "cwd": "a.py"},
-            OPQ,
+            ACT,
             r"cwd.*director",
-            known_gap=True,
         )
     )
     add(Case("bash-cwd-ok", "bash", "bash cwd", {"command": "pwd", "cwd": "sub"}, OK, check=has("/sub")))
@@ -879,9 +866,8 @@ def _cases() -> list[Case]:
             "todo",
             "near-miss name",
             {"todos": [{"text": "a", "status": "pending"}]},
-            OPQ,
+            ACT,
             r"'text'.*'content'",
-            known_gap=True,
         )
     )
     add(
@@ -902,9 +888,8 @@ def _cases() -> list[Case]:
             "web_fetch",
             "url form",
             {"url": "example.com/doc"},
-            OPQ,
+            ACT,
             r"https?://",
-            known_gap=True,
         )
     )
     add(

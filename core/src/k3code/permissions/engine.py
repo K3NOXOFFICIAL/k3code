@@ -2194,7 +2194,11 @@ def _decide_bash(
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     if worst.action == "allow" and not _inside(cwd, roots):
-        return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            message=f"Working directory outside project roots: {cwd}; to use it, ask the user to /add-dir {cwd}",
+        )
     return Decision(
         action=worst.action, patterns=prefixes, rule=worst, sandbox_only=sandbox_only and worst.action == "allow"
     )
@@ -2231,7 +2235,9 @@ def _decide_path(
     if not inside:
         uv_credentials = _inside(path, [os.path.join(os.path.expanduser("~"), _UV_CREDENTIALS)])
         if rule.layer == 0:
-            dec.message = f"Outside project roots: {path}"
+            dec.message = (
+                f"Outside project roots: {path}; to use it, ask the user to /add-dir {path} (or its directory)"
+            )
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
