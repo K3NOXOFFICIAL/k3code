@@ -116,6 +116,21 @@ async def test_a_search_outside_the_roots_returns_no_credential_file(world, tmp_
         "{sib}/deploy.pem",
         "{sib}/keys/id_rsa.bak",
         "{sib}/credentials.json",
+        "{sib}/gcloud-credentials.json",
+        "{sib}/kubeconfig",
+        "{sib}/kubeconfig-prod.yaml",
+        "{sib}/terraform.tfstate",
+        "{sib}/terraform.tfstate.backup",
+        "{sib}/token",
+        "{sib}/token.json",
+        "{sib}/secrets.yaml",
+        "{sib}/secret.json",
+        "{sib}/service-account.json",
+        "{sib}/service_account_key.json",
+        "{sib}/cert.p12",
+        "{sib}/store.jks",
+        "{sib}/vault.kdbx",
+        "{sib}/putty.ppk",
     ],
 )
 def test_accept_edits_still_asks_for_credential_places_outside_the_roots(world, tmp_path, path) -> None:
@@ -153,6 +168,11 @@ def test_a_link_into_a_dot_folder_asks_by_its_target(world, tmp_path) -> None:
         ".tool-versions",
         ".dockerignore",
         ".env.example",
+        "tokenizer.py",
+        "token_utils.py",
+        "secrets_manager.py",
+        "docs/secret-handling.md",
+        "src/service_account_model.py",
     ],
 )
 def test_accept_edits_reads_ordinary_files_outside_the_roots(world, tmp_path, rel) -> None:

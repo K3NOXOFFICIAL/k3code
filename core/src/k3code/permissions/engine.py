@@ -2504,9 +2504,18 @@ _BENIGN_DOT_NAMES = frozenset(
     }
 )
 _BENIGN_DOT_PREFIXES = (".prettierrc", ".eslintrc")
-#: File names that look like a key or a credential wherever they lie: certificates and keys, ssh keys, ``credentials``
-#: files (cloud CLIs) and Kerberos ticket caches (``/tmp/krb5cc_1000``). Matched case-insensitively on one component.
-_CREDENTIAL_NAME = re.compile(r".*\.(?:pem|key)|id_(?:rsa|dsa|ecdsa|ed25519).*|credentials.*|krb5cc.*", re.IGNORECASE)
+#: File names that look like a key or a credential wherever they lie: certificates, keystores and keys, ssh keys, any
+#: name containing ``credentials`` (cloud CLIs, ``gcloud-credentials.json``), Kerberos ticket caches
+#: (``/tmp/krb5cc_1000``), kubeconfigs, Terraform state, a file that is just ``token``/``tokens`` or a service-account
+#: key, and ``secret(s).<data extension>``. Deliberately not ``*token*`` or ``*secret*``: ``tokenizer.py`` and
+#: ``secrets_manager.py`` are ordinary source. Matched case-insensitively on one component.
+_CREDENTIAL_NAME = re.compile(
+    r".*\.(?:pem|key|p12|pfx|jks|keystore|ppk|kdbx)"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519).*"
+    r"|.*credentials.*|krb5cc.*|kubeconfig.*|.*\.tfstate.*"
+    r"|tokens?(?:\.[a-z]+)?|.*secrets?\.(?:ya?ml|json|toml|ini|env|txt)|service[-_]account.*\.json",
+    re.IGNORECASE,
+)
 #: Trees a look outside the roots does not see without a person: process and device state (``/proc/self/cmdline``,
 #: ``/proc/1/cwd``), runtime secrets (``/run/secrets``, ``/var/run/secrets/kubernetes.io``, ``/run/user/<uid>``),
 #: root's home, the boot files and ``/etc`` (a read of it asks a person outside auto mode, see _toolchain_read).
