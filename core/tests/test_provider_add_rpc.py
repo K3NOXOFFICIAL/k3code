@@ -13,7 +13,9 @@ import yaml
 
 import m1cmd_helpers as m1
 from k3code import chain_config
+from k3code import config as config_mod
 from k3code.config import ProviderEntry
+from k3code.redact import scrub_urls
 from k3code.setup import probe
 from k3code.setup.state import env_file_path, read_env_file, set_env_var
 
@@ -26,13 +28,14 @@ async def server(tmp_path, monkeypatch):
     for spec in probe.PRESETS.values():
         monkeypatch.delenv(spec["api_key_env"], raising=False)
     monkeypatch.delenv("K3CODE_MINE_API_KEY", raising=False)
+    monkeypatch.delenv("K3CODE_PROJECT_DIR", raising=False)
     srv, _ = m1.make_server(tmp_path, monkeypatch, ["ok"])
     path = chain_config.config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     first = {"name": "first", "kind": "openai", "base_url": "http://first/v1", "api_key_env": "FIRST_KEY"}
     path.write_text(yaml.safe_dump({"providers": [{**first, "models": {"default": "m1"}}]}))
     srv.config.providers = [ProviderEntry(**first, models={"default": "m1"})]
-    monkeypatch.chdir(tmp_path)  # reload_providers reads the project config of the cwd: none here
+    monkeypatch.chdir(tmp_path)  # reload_providers reads the project config of the cwd (no K3CODE_PROJECT_DIR): none
     assert str(env_file_path()).startswith(str(tmp_path.parent))  # never the real ~/.config
     yield srv
     await srv.close()
@@ -124,6 +127,7 @@ async def test_keyless_local_preset(server):
         ({"name": "first"}, "a provider named first already exists"),
         ({"base_url": "ftp://host/v1"}, "base URL must start with http:// or https://"),
         ({"base_url": "not a url"}, "base URL must start with http:// or https://"),
+        ({"base_url": "http://[::1/v1"}, "base URL must start with http:// or https://"),
         ({"name": "has space"}, "name: a letter"),
         ({"model": ""}, "model: one model id"),
         ({"api_key": ""}, "an API key is needed"),
@@ -141,7 +145,7 @@ async def test_bad_requests_are_clean_errors_and_write_nothing(server, caplog, o
 
 async def test_a_failed_config_write_removes_the_stored_key(server, monkeypatch):
     def boom(*_a, **_k):
-        raise chain_config.ChainEditError(f"disk full {KEY[:0]}")
+        raise chain_config.ChainEditError(f"disk full {KEY}")
 
     monkeypatch.setattr(chain_config, "edit_config", boom)
     msg = await _err(server, "provider.add", _add())
@@ -149,7 +153,8 @@ async def test_a_failed_config_write_removes_the_stored_key(server, monkeypatch)
     assert read_env_file() == {}
 
 
-async def test_probe_lists_models_with_the_key_and_suggests_a_default(server, monkeypatch):
+async def test_probe_lists_models_with_the_key_and_suggests_a_default(server, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
     seen = {}
 
     def fake(entry, key, timeout=8.0):
@@ -170,3 +175,71 @@ async def test_probe_lists_models_with_the_key_and_suggests_a_default(server, mo
     monkeypatch.setattr(probe, "list_models", lambda e, k, timeout=8.0: (False, 3.0, [], "HTTP 401"))
     res = await _ok(server, "provider.probe", _add())
     assert res["ok"] is False and res["hint"] == "the endpoint rejected the key" and KEY not in str(res)
+    assert KEY not in caplog.text
+
+
+async def test_a_key_for_an_edited_url_never_takes_the_vendor_variable(server, monkeypatch):
+    res = await _ok(server, "provider.add", _add(base_url="https://proxy.example/v1"))
+    assert res["key_env"] == "K3CODE_MINE_API_KEY"  # OPENAI_API_KEY is free, but holds only OpenAI's key
+    assert read_env_file() == {"K3CODE_MINE_API_KEY": KEY}
+    rows = {r["id"]: r for r in (await _ok(server, "provider.presets", {}))["presets"]}
+    assert rows["openai"]["key_set"] is False
+    sent = []
+    monkeypatch.setattr(probe, "list_models", lambda e, k, timeout=8.0: sent.append(k) or (True, 1.0, [], ""))
+    msg = await _err(server, "provider.probe", _add(api_key=None, reuse_key=True))  # at api.openai.com
+    assert "OPENAI_API_KEY holds no key to reuse" in msg and sent == []
+
+
+@pytest.mark.parametrize("method", ["provider.add", "provider.probe"])
+async def test_a_url_with_a_user_or_password_is_refused_and_never_echoed(server, monkeypatch, caplog, method):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(probe, "list_models", lambda *_a, **_k: pytest.fail("probed"))
+    before = chain_config.config_path().read_text()
+    for url in ("https://bob:hunter2pass@gw.example/v1", "https://hunter2pass@gw.example/v1"):
+        msg = await _err(server, method, _add(preset="custom", base_url=url))
+        assert "must not carry a user name or password" in msg and "hunter2pass" not in msg
+    assert "hunter2pass" not in caplog.text
+    assert chain_config.config_path().read_text() == before and read_env_file() == {}
+
+
+async def test_the_add_log_line_scrubs_the_url(server, caplog):
+    caplog.set_level(logging.DEBUG)
+    url = "https://gw.example/v1?key=Abc123Def456Gh"
+    assert scrub_urls(url) != url  # a token-shaped query value: the scrubber hides it
+    await _ok(server, "provider.add", _add(preset="custom", base_url=url))
+    assert "provider.add: added mine" in caplog.text and "Abc123Def456Gh" not in caplog.text
+
+
+async def test_the_reload_reads_the_project_a_config_reload_applies(server, monkeypatch, tmp_path):
+    project = tmp_path / "elsewhere"
+    project.mkdir()
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))  # what `k3code --config-dir` sets; the cwd is tmp_path
+    seen = []
+    real = config_mod.load_config
+
+    def spy(**kw):
+        seen.append(kw.get("project_dir"))
+        return real(**kw)
+
+    monkeypatch.setattr(config_mod, "load_config", spy)
+    await _ok(server, "provider.add", _add())
+    assert seen == [project]
+    assert [p.name for p in server.config.providers] == ["first", "mine"]
+
+
+async def test_a_broken_config_file_is_a_clean_error_without_its_text(server):
+    chain_config.config_path().write_text("providers:\n  - name: first\n    SNIPPETMARK: [unclosed\n")
+    msg = await _err(server, "provider.add", _add())
+    assert "not valid YAML" in msg and "SNIPPETMARK" not in msg
+    assert read_env_file() == {}
+
+
+async def test_a_vendor_preset_keeps_its_own_kind(server, monkeypatch):
+    set_env_var("ANTHROPIC_API_KEY", OLD)
+    seen = []
+    monkeypatch.setattr(probe, "list_models", lambda e, k, timeout=8.0: seen.append(e) or (True, 1.0, ["c"], ""))
+    params = _add(preset="anthropic", kind="openai", base_url="https://api.anthropic.com", api_key=None, reuse_key=True)
+    await _ok(server, "provider.probe", params)
+    assert seen == [{"kind": "anthropic", "base_url": "https://api.anthropic.com"}]
+    await _ok(server, "provider.add", params)
+    assert yaml.safe_load(chain_config.config_path().read_text())["providers"][-1]["kind"] == "anthropic"

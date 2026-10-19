@@ -130,9 +130,9 @@ def reload_providers(ctx: Any) -> None:
 
     The list is replaced, not edited: the router is rebuilt on the next turn and only the changed blocks get a new
     provider (``_swap_providers``); a turn in flight keeps its own."""
-    from k3code.config import load_config
+    from k3code.config import default_project_dir, load_config
 
-    reloaded = load_config(project_dir=Path.cwd())
+    reloaded = load_config(project_dir=default_project_dir())  # the project a config reload applies (--config-dir)
     ctx.config.providers = reloaded.providers
     if hasattr(ctx, "_chain_key"):
         ctx._chain_key = None  # rebuild the router on the next turn
