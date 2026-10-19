@@ -101,6 +101,13 @@ def _literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         return None
 
 
+def literal_refused(host: str) -> bool | None:
+    """None when ``host`` (a raw_host) is not an IP address literal; else whether the guard refuses that address
+    (private, loopback, link-local and the rest, see _refused). An IPv6 zone id is ignored. No lookup."""
+    ip = _literal(host)
+    return None if ip is None else _refused(ip)
+
+
 def vetted_addresses(host: str) -> list[str]:
     """The addresses ``host`` (a raw_host) reaches, each of them public. Raises ``BlockedURL`` when any answer is
     private/loopback, when an answer is not an address, or when the name does not resolve."""

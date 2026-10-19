@@ -122,9 +122,13 @@ def test_toolchain_reads_never_prompt_in_any_mode(mode: PermissionMode, tmp_path
     assert decide(mode=mode, tool="read", args={"path": site}, cwd=tmp_path).action == "allow"
     usr = decide(mode=mode, tool="grep", args={"path": "/usr/lib/python3", "pattern": "x"}, cwd=tmp_path)
     assert usr.action == "allow"
-    # anything else outside the roots still asks a person; a user rule still wins
+    # anything else outside the roots still asks a person (accept-edits reads it: a non-secret path); a user rule
+    # still wins
     d = decide(mode=mode, tool="read", args={"path": "/tmp/elsewhere.py"}, cwd=tmp_path)
-    assert d.action == "ask" and d.needs_human
+    if mode == PermissionMode.ACCEPT_EDITS:
+        assert d.action == "allow" and not d.needs_human
+    else:
+        assert d.action == "ask" and d.needs_human
     user = [Rule(tool="read", pattern="/srv/venv/*", action="ask")]
     assert decide(mode=mode, tool="read", args={"path": site}, cwd=tmp_path, user_rules=user).action == "ask"
     dotenv = decide(mode=mode, tool="read", args={"path": "/srv/venv/lib/site-packages/.env"}, cwd=tmp_path)
