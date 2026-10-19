@@ -68,7 +68,9 @@ export function isAddProviderRow(entry: ProviderPickerEntry): boolean {
  * An unauthenticated `api_key` row whose key can be pasted inline
  * (`model.save_key`) -- mirrors modelPicker's pickerNeedsKey.
  */
-export function pickerNeedsKey(entry: ProviderPickerEntry | undefined): boolean {
+export function pickerNeedsKey(
+  entry: ProviderPickerEntry | undefined,
+): boolean {
   return (
     entry?.authenticated === false &&
     entry.auth_type === "api_key" &&
@@ -86,7 +88,10 @@ export function initialProviderIdx(
 }
 
 /** The `/provider` argument the picker emits: name plus optional `--save`. */
-export function providerPickerCommand(slug: string, saveDefault: boolean): string {
+export function providerPickerCommand(
+  slug: string,
+  saveDefault: boolean,
+): string {
   return saveDefault ? `${slug} --save` : slug;
 }
 

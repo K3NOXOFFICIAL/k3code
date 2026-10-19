@@ -298,6 +298,7 @@ export function ProviderPicker({
       <ProviderAddForm
         existingNames={providers.map((p) => p.slug)}
         gw={gw}
+        locked={locked}
         onCancel={() => setStage("list")}
         onSaved={(slug) => {
           setStage("list");
@@ -312,7 +313,9 @@ export function ProviderPicker({
   }
 
   if (stage === "key" && keyEntry && !isAddProviderRow(keyEntry)) {
-    const masked = keyInput ? "\u2022".repeat(Math.min(keyInput.length, 40)) : "";
+    const masked = keyInput
+      ? "\u2022".repeat(Math.min(keyInput.length, 40))
+      : "";
 
     return (
       <Box flexDirection="column" width={width}>

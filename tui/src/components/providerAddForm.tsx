@@ -78,7 +78,12 @@ const trimUrl = (url: string) => url.trim().replace(/\/+$/, "");
 /** Text-field keys, the key stage's pattern: printable append, Backspace, Ctrl+U clear. */
 function editText(
   ch: string,
-  key: { backspace?: boolean; ctrl?: boolean; delete?: boolean; meta?: boolean },
+  key: {
+    backspace?: boolean;
+    ctrl?: boolean;
+    delete?: boolean;
+    meta?: boolean;
+  },
   set: (f: (v: string) => string) => void,
 ): void {
   if (key.backspace || key.delete) {
@@ -100,6 +105,7 @@ function editText(
 export function ProviderAddForm({
   existingNames,
   gw,
+  locked,
   onCancel,
   onSaved,
   sessionId,
@@ -123,7 +129,9 @@ export function ProviderAddForm({
   useEffect(() => {
     gw.request<{ presets?: ProviderPreset[] }>("provider.presets", {})
       .then((raw) => {
-        setPresets(asRpcResult<{ presets?: ProviderPreset[] }>(raw)?.presets ?? []);
+        setPresets(
+          asRpcResult<{ presets?: ProviderPreset[] }>(raw)?.presets ?? [],
+        );
       })
       .catch((e: unknown) => setErr(rpcErrorMessage(e)));
   }, [gw]);
@@ -141,18 +149,23 @@ export function ProviderAddForm({
     return q ? all.filter((m) => m.toLowerCase().includes(q)) : all;
   }, [probe, query]);
 
-  const endpoint = () => ({
+  // `useReuse` is passed, not read from state: the reuse answer and the probe it starts land in one key event.
+  const endpoint = (useReuse: boolean) => ({
     base_url: trimUrl(url),
     kind: preset?.kind ?? "openai",
     preset: preset?.id ?? "custom",
-    ...(reuse ? { reuse_key: true } : apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+    ...(useReuse
+      ? { reuse_key: true }
+      : apiKey.trim()
+        ? { api_key: apiKey.trim() }
+        : {}),
   });
 
-  const runProbe = () => {
+  const runProbe = (useReuse: boolean) => {
     setProbe(null);
     setBusy(true);
     setErr("");
-    gw.request<ProbeResult>("provider.probe", endpoint())
+    gw.request<ProbeResult>("provider.probe", endpoint(useReuse))
       .then((raw) => {
         const r = asRpcResult<ProbeResult>(raw);
 
@@ -182,15 +195,18 @@ export function ProviderAddForm({
     setBusy(true);
     setErr("");
     gw.request<{ provider?: { slug?: string } }>("provider.add", {
-      ...endpoint(),
+      ...endpoint(reuse),
       model,
       name: name.trim(),
       ...(sessionId ? { session_id: sessionId } : {}),
     })
-      .then(() => {
+      .then((raw) => {
+        const slug = asRpcResult<{ provider?: { slug?: string } }>(raw)
+          ?.provider?.slug;
+
         setBusy(false);
         setApiKey("");
-        onSaved(name.trim());
+        onSaved(slug || name.trim());
       })
       .catch((e: unknown) => {
         setBusy(false);
@@ -205,14 +221,17 @@ export function ProviderAddForm({
   const go = (next: Step) => {
     setErr("");
     setStep(next);
-
-    if (next === "test") {
-      runProbe();
-    }
   };
 
+  /** Forward into the test step: probe now. Stepping back to it keeps the last result. */
+  const startTest = (useReuse: boolean) => {
+    go("test");
+    runProbe(useReuse);
+  };
+
+  // Like the picker: while a prompt waits for an answer the form ignores every key.
   useInput((ch, key) => {
-    if (busy) {
+    if (busy || locked) {
       return;
     }
 
@@ -261,7 +280,12 @@ export function ProviderAddForm({
             setErr(e);
           } else {
             setReuse(false);
-            go(preset?.keyless ? "test" : offersReuse ? "reuse" : "key");
+
+            if (preset?.keyless) {
+              startTest(false);
+            } else {
+              go(offersReuse ? "reuse" : "key");
+            }
           }
         } else {
           editText(ch, key, setUrl);
@@ -274,7 +298,7 @@ export function ProviderAddForm({
           go("url");
         } else if (ch === "y" || ch === "Y") {
           setReuse(true);
-          go("test");
+          startTest(true);
         } else if (ch === "n" || ch === "N") {
           setReuse(false);
           go("key");
@@ -288,7 +312,7 @@ export function ProviderAddForm({
           go(offersReuse ? "reuse" : "url");
         } else if (key.return) {
           if (apiKey.trim()) {
-            go("test");
+            startTest(false);
           }
         } else {
           editText(ch, key, setApiKey);
@@ -301,7 +325,7 @@ export function ProviderAddForm({
           setProbe(null);
           go(inputBefore());
         } else if (ch === "r") {
-          runProbe();
+          runProbe(reuse);
         } else if (probe?.ok && key.return) {
           go("model");
         } else if (probe && !probe.ok && ch === "s") {
@@ -334,7 +358,7 @@ export function ProviderAddForm({
             setModel(pick);
             go("review");
           }
-        } else {
+        } else if (!key.upArrow && !key.downArrow) {
           editText(ch, key, setQuery);
           setModelIdx(0);
         }
@@ -432,7 +456,9 @@ export function ProviderAddForm({
         return (
           <>
             {title("API key")}
-            <Text wrap="truncate-end">{preset?.key_env} already holds a key.</Text>
+            <Text wrap="truncate-end">
+              {preset?.key_env} already holds a key.
+            </Text>
             <Text wrap="truncate-end">Reuse it for {name}?</Text>
             {status}
             <OverlayHint t={t}>y reuse · n new key · Esc back</OverlayHint>
@@ -458,7 +484,10 @@ export function ProviderAddForm({
             {title("test connection")}
             <Text wrap="truncate-end">{trimUrl(url)}</Text>
             {probe ? (
-              <Text color={probe.ok ? t.color.accent : t.color.label} wrap="truncate-end">
+              <Text
+                color={probe.ok ? t.color.accent : t.color.label}
+                wrap="truncate-end"
+              >
                 {probe.ok
                   ? `OK · ${probe.models.length} models (${probe.ms} ms)`
                   : `FAIL: ${probe.detail}`}
@@ -482,7 +511,9 @@ export function ProviderAddForm({
         return (
           <>
             {title("save untested?")}
-            <Text wrap="truncate-end">The endpoint did not answer the test.</Text>
+            <Text wrap="truncate-end">
+              The endpoint did not answer the test.
+            </Text>
             <Text wrap="truncate-end">Save {name} anyway?</Text>
             <OverlayHint t={t}>y save anyway · n back</OverlayHint>
           </>
@@ -494,6 +525,14 @@ export function ProviderAddForm({
         return (
           <>
             {title("default model")}
+            <Text
+              color={probe?.ok ? t.color.accent : t.color.muted}
+              wrap="truncate-end"
+            >
+              {probe?.ok
+                ? `connection OK · ${probe.models.length} models (${probe.ms} ms)`
+                : "untested"}
+            </Text>
             <Text wrap="truncate-end">
               {"search: "}
               {query}
@@ -554,6 +593,7 @@ export function ProviderAddForm({
 interface ProviderAddFormProps {
   existingNames: readonly string[];
   gw: GatewayClient;
+  locked: boolean;
   onCancel: () => void;
   onSaved: (slug: string) => void;
   sessionId: string | null;
