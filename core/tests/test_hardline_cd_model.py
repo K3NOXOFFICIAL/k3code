@@ -190,3 +190,31 @@ def test_wrapper_and_eval_chains_read_the_same_command() -> None:
     assert hardline.normalize_argv(["env", "-S", "sudo rm", "-rf", "/"]) == ["rm", "-rf", "/"]
     assert hardline.normalize_argv(["eval", "eval"]) == ["eval"]
     assert _check("sudo " * 50 + "rm -rf ~") == "rm-rf-home"
+
+
+# ---- after the final review: cd model completions ----
+
+
+def test_another_users_home_is_expanded_through_the_user_database() -> None:
+    root = hardline._user_home("root")
+    assert root
+    assert _check("rm -rf ~root") == "rm-rf-root"
+    assert _check("cd ~root; rm -rf *") == "rm-rf-root"
+    assert _check("rm -rf ~root/tmp/x") is None
+    assert _check("rm -rf ~k3-no-such-user-x") is None  # unknown: the word stays as written
+
+
+def test_a_failed_lookup_still_knows_where_root_lives(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pwd
+
+    def missing(name: str) -> None:
+        raise KeyError(name)
+
+    monkeypatch.setattr(pwd, "getpwnam", missing)
+    hardline._user_home.cache_clear()
+    try:
+        assert hardline._user_home("root") == "/root"
+        assert hardline._user_home("ada") is None
+        assert _check("rm -rf ~root") == "rm-rf-root"
+    finally:
+        hardline._user_home.cache_clear()

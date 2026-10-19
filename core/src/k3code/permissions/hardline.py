@@ -1324,13 +1324,35 @@ def _builtin_options(args: list[str]) -> tuple[str, list[str]]:
 
 
 _HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
+#: A leading ``~name`` (another user's home), up to the first slash.
+_TILDE_USER = re.compile(r"~([A-Za-z_][A-Za-z0-9._-]*)(?=/|$)")
+
+
+@lru_cache(maxsize=64)
+def _user_home(name: str) -> str | None:
+    """The home folder of the user ``name`` (``~name``), None when unknown; ``root``'s is ``/root`` when the lookup
+    fails (no pwd module, no such entry)."""
+    try:
+        import pwd  # Unix only
+
+        return pwd.getpwnam(name).pw_dir
+    except (ImportError, KeyError):
+        return "/root" if name == "root" else None
+
+
+def _expand_tilde(word: str, home: str) -> str:
+    """``word`` with a leading ``~`` (``home``) or ``~name`` (that user's home, when known) expanded."""
+    if word == "~" or word.startswith("~/"):
+        return home + word[1:]
+    m = _TILDE_USER.match(word) if word.startswith("~") else None
+    user_home = _user_home(m.group(1)) if m else None
+    return user_home + word[m.end() :] if m and user_home else word
 
 
 def expand_vars(word: str, cwd: str | None, home: str) -> str:
-    """``word`` with a leading ``~`` and every ``$HOME``/``${HOME}`` (and ``$PWD``/``${PWD}`` when ``cwd`` is known)
-    expanded; other variables stay as written."""
-    if word == "~" or word.startswith("~/"):
-        word = home + word[1:]
+    """``word`` with a leading ``~`` or ``~name`` and every ``$HOME``/``${HOME}`` (and ``$PWD``/``${PWD}`` when
+    ``cwd`` is known) expanded; other variables stay as written."""
+    word = _expand_tilde(word, home)
 
     def sub(m: re.Match[str]) -> str:
         name = m.group(1) or m.group(2)
@@ -1340,8 +1362,7 @@ def expand_vars(word: str, cwd: str | None, home: str) -> str:
 
 
 def _expand_target(t: str, cwd: str | None, home: str) -> str:
-    if t == "~" or t.startswith("~/"):
-        t = home + t[1:]
+    t = _expand_tilde(t, home)
     t = t.replace("${HOME}", home).replace("$HOME", home)
     if cwd:
         t = t.replace("${PWD}", cwd).replace("$PWD", cwd)
@@ -1423,7 +1444,8 @@ def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = 
     target = _expand_target(path, here, home)
     folder = (target[:-2] if target.endswith("/*") else target) or "/"  # `/*` is everything in /
     if folder in _DANGEROUS_RM_TARGETS or folder == home:
-        homeish = "~" in t or "HOME" in t or path.startswith("/home") or folder == home
+        own_tilde = "~" in t and not _TILDE_USER.match(t)  # `~root` is root's folder, not home
+        homeish = own_tilde or "HOME" in t or path.startswith("/home") or folder == home
         return "rm-rf-home" if homeish else "rm-rf-root"
     if above_home and folder.startswith("/") and home.startswith(folder.rstrip("/") + "/"):
         return "rm-rf-home"
