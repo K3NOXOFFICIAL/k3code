@@ -416,19 +416,27 @@ def check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
-    cdpath = _cdpath_entries(command)
+    dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command), narrow=not _cd_redefined(command))
     try:
-        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home, cdpath), parsed
+        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs), parsed
     except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
         return "scan-depth", parsed
 
 
-def _check_parsed(
-    parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str, cdpath: tuple[str, ...] | None
-) -> str | None:
-    # relative rm/find targets are read in the cwd and in every directory a `cd` earlier on the line went to (see _Dirs)
-    dirs = _Dirs(cwd, home, cdpath)
+def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
+    # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
+    home = dirs.home
+    starts: list[int] = []  # the first sub of each pipeline (they list the subs in order)
+    first = 0
+    for stages in parsed.pipelines:
+        starts.append(first)
+        first += len(stages)
+    need = {k for ks in parsed.child_subs for k in ks} | set(starts)
+    where: dict[int, _Where] = {}  # the directories of the subs a child or a pipeline starts at
     for k, sub in enumerate(parsed.subs):
+        dirs.separators(parsed.ops[k] if k < len(parsed.ops) else ())
+        if k in need:
+            where[k] = dirs.where()
         argv = _command_argv(_tokens(sub))
         hit = (
             _match(sub, extra)
@@ -442,12 +450,16 @@ def _check_parsed(
         )
         if hit:
             return hit
-        dirs.follow(argv, sub)
-    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
+        narrows = argv[:1] == ["cd"] and k + 1 < len(parsed.ops) and _plain_cd(sub)
+        narrows = narrows and _last_op(parsed.ops[k]) not in ("||", "|", "|&") and parsed.ops[k + 1][:1] == ("&&",)
+        dirs.follow(argv, sub, narrows)
+    xargs_where = [where.get(b) or dirs.where() for b in starts]
+    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, xargs_where, home)
     if hit:
         return hit
-    for child in parsed.children:
-        hit = _match(child.clean, extra) or _check_parsed(child, extra, cwd, home, cdpath)
+    for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
+        start = [where[k] for k in ks if k in where]
+        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start))
         if hit:
             return hit
     return None
@@ -1429,22 +1441,138 @@ def _cdpath_entries(command: str) -> tuple[str, ...] | None:
 _CD_MAX_DIRS = 32
 
 
-class _Dirs:
-    """The directories a simple command of the line may run in, followed in line order: the cwd and every directory a
-    ``cd``/``pushd`` before it went to. A cd may fail (``cd /; cd /nonexistent; rm -rf *``) or run in a subshell, a
-    pipeline stage or the background and not take effect (``cd / && (cd tmp) && rm -rf *``), so no directory ever
-    leaves the set. ``here`` is where the line is if every cd took effect (None once unknown): it only resolves the next
-    relative cd. A cd to a variable adds home, which a plain ``cd`` (the variable unset) goes to. ``cdpath`` is None
-    when no CDPATH is in play, else its literal absolute entries (see _cdpath_entries): a relative cd may then go to
-    any of them or, through an entry it cannot read, anywhere, read as ``/``."""
+@dataclass(frozen=True)
+class _Where:
+    """The directories a sub may run in, taken at that sub (see _Dirs.where)."""
 
-    def __init__(self, cwd: str | None, home: str, cdpath: tuple[str, ...] | None = None) -> None:
+    dirs: tuple[str | None, ...]
+    overflow: bool
+    here: str | None
+
+    def current(self) -> tuple[str | None, ...]:
+        return self.dirs
+
+
+#: The separators that end a chain of ``&&`` (see _Dirs): what follows runs whether or not a cd in it worked.
+_CHAIN_ENDS = frozenset({"||", ";", "\n", "&", ""})
+#: Operators a newline may follow without ending the command (``a &&<newline>b``).
+_CONTINUED = frozenset({"&&", "||", "|", "|&", "("})
+
+
+def _last_op(ops: tuple[str, ...]) -> str:
+    """The last separator of ``ops`` that is not a newline, "" when there is none."""
+    return next((o for o in reversed(ops) if o != "\n"), "")
+
+
+_CD_REDEFINED = re.compile(r"\bcd\s*\(\s*\)|\bfunction\s+cd\b|\balias\b[^\n;&|]*\bcd=|\benable\b[^\n;&|]*\bcd\b")
+
+
+def _cd_redefined(command: str) -> bool:
+    """Whether ``command`` (quotes and backslashes aside) or the environment may make ``cd`` something else than the
+    builtin: a function, an alias, ``enable -n cd``, an exported ``BASH_FUNC_cd%%``."""
+    if any(k.startswith(("BASH_FUNC_cd%", "BASH_FUNC_cd(")) for k in os.environ):
+        return True
+    return "cd" in command and bool(_CD_REDEFINED.search(re.sub(r"[\\'\"]", "", command)))
+
+
+_SIMPLE_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[^\s'\"\\$`]*")
+
+
+def _plain_cd(sub: str) -> bool:
+    """Whether the text ``sub`` runs the builtin written exactly ``cd``, after nothing but reserved words (no ``!``),
+    plain assignments, ``builtin``, ``command`` or ``time``."""
+    for word in sub.split():
+        if word == "cd":
+            return True
+        if word == "!" or not (
+            word in _RESERVED_LEADERS or word in ("builtin", "command", "time") or _SIMPLE_ASSIGNMENT.fullmatch(word)
+        ):
+            return False
+    return False
+
+
+class _Dirs:
+    """The directories a simple command of the line may run in, followed in line order.
+
+    The union ``all`` is the cwd and every directory a ``cd``/``pushd`` went to. A cd may fail (``cd /; cd
+    /nonexistent; rm -rf *``) or run in a subshell, a pipeline stage or the background and not take effect (``cd / &&
+    (cd tmp) && rm -rf *``), so no directory ever leaves it. ``here`` is where the line is if every cd took effect (None
+    once unknown): it only resolves the next relative cd. A cd to an unquoted variable adds home, which a plain ``cd``
+    (the variable unset) goes to; ``cd "$X"`` is ``cd ""``, which fails. ``cdpath`` is None when no CDPATH is in play,
+    else its literal absolute entries (see _cdpath_entries): a relative cd may then go to any of them or, through an
+    entry it cannot read, anywhere, read as ``/``.
+
+    A chain of ``&&`` narrows that: in ``cd T && X``, X runs only if the cd worked, so in T joined to each directory
+    still possible before the cd (not only ``here``: ``cd /tmp/missing; cd .. && rm -rf *`` from /usr/bin may delete in
+    /usr). That holds only for the builtin written ``cd`` (see _plain_cd) with a known target, no CDPATH and nothing on
+    the line redefining cd (``narrow``), not after ``||``, ``|`` or ``!`` and followed by ``&&``. The narrowed set lasts
+    to the end of the chain (``||``, ``;``, a newline, ``&``: see _CHAIN_ENDS) and through ``&&`` and ``|``; a later cd
+    in the chain that does not narrow adds its directories to it. Each subshell level has its own: a subshell starts in
+    the directories its parent may be in (``base``), and after a chain ends there it is back in those. At the top level
+    that is the union. A command nested in a sub (a payload, a heredoc script) starts in the directories of that sub
+    (see spawn).
+
+    Known gaps, left as they are: ``here`` drifts past a cd that did not take effect, so a later relative cd is resolved
+    from the wrong place when no dangerous directory is in the set (``cd /usr/local; (cd x); cd ..; rm -rf *``); and a
+    line that cds into _CD_MAX_DIRS distinct directories or more has every later relative recursive delete refused
+    (``scan-depth``), however harmless."""
+
+    def __init__(
+        self,
+        start: list[str | None],
+        here: str | None,
+        home: str,
+        cdpath: tuple[str, ...] | None = None,
+        *,
+        overflow: bool = False,
+        narrow: bool = True,
+    ) -> None:
         self.home = home
         self.cdpath = cdpath
-        self.here = cwd
-        self.all: dict[str | None, None] = {cwd: None}  # insertion-ordered set
-        self.overflow = False
+        self.narrow = narrow
+        self.here = here
+        self.all: dict[str | None, None] = dict.fromkeys(start)  # insertion-ordered set
+        self.overflow = overflow or len(self.all) > _CD_MAX_DIRS
         self._stack: list[str | None] = []  # pushd's directory stack, for popd
+        #: per subshell level: [base, chain], None for "the union" and "no chain"
+        self._frames: list[list[dict[str | None, None] | None]] = [[None, None]]
+
+    def current(self) -> dict[str | None, None]:
+        """The directories the next simple command may run in."""
+        base, chain = self._frames[-1]
+        return chain if chain is not None else base if base is not None else self.all
+
+    def where(self) -> _Where:
+        return _Where(tuple(self.current()), self.overflow, self.here)
+
+    def spawn(self, wheres: list[_Where]) -> _Dirs:
+        """A model for a command nested in the subs taken at ``wheres`` (a payload, a heredoc script): it starts in
+        every directory they may run in."""
+        if not wheres:
+            wheres = [_Where(tuple(self.all), self.overflow, None)]
+        start = list(dict.fromkeys(d for w in wheres for d in w.dirs))
+        heres = {w.here for w in wheres}
+        here = heres.pop() if len(heres) == 1 else None
+        overflow = any(w.overflow for w in wheres)
+        return _Dirs(start, here, self.home, self.cdpath, overflow=overflow, narrow=self.narrow)
+
+    def separators(self, ops: tuple[str, ...]) -> None:
+        """Take in the separators before the next sub (see Parsed.ops)."""
+        last = ""
+        for op in ops:
+            if op == "(":
+                base, chain = self._frames[-1]
+                start = None if base is None and chain is None else dict.fromkeys(self.current())
+                self._frames.append([start, None])
+            elif op == ")":
+                if len(self._frames) > 1:
+                    self._frames.pop()
+                else:
+                    self._frames[-1][1] = None
+            elif op in _CHAIN_ENDS and not (op == "\n" and last in _CONTINUED):
+                self._frames[-1][1] = None
+            if op != "\n":
+                last = op
 
     def _add(self, d: str) -> None:
         if d not in self.all:
@@ -1452,11 +1580,31 @@ class _Dirs:
                 self.overflow = True
             else:
                 self.all[d] = None
+        if self.overflow:
+            return
+        for dirs in self._frames[-1]:
+            if dirs is not None and d not in dirs:
+                if len(dirs) >= _CD_MAX_DIRS:
+                    self.overflow = True
+                    return
+                dirs[d] = None
 
-    def follow(self, argv: list[str], sub: str) -> None:
+    def _narrow(self, before: tuple[str | None, ...], operands: list[str]) -> None:
+        """The chain set once ``cd`` with ``operands`` worked, run in one of ``before`` (see the class docstring)."""
+        if len(operands) != 1 or self.overflow or not self.narrow:
+            return
+        t = _expand_tilde(operands[0], self.home)
+        if not t or t == "-" or t.startswith("+") or any(c in t for c in "$`~*?[{"):
+            return
+        if t[:1] != "/" and (self.cdpath is not None or None in before):
+            return
+        self._frames[-1][1] = dict.fromkeys(_join_dir(b or "/", t) for b in before)
+
+    def follow(self, argv: list[str], sub: str, narrows: bool = False) -> None:
         """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
-        popd)."""
+        popd). ``narrows``: a cd that lets the rest of its ``&&`` chain run only if it worked (see _narrow)."""
         name = argv[0] if argv else ""
+        before = tuple(self.current()) if narrows else ()
         if name == "popd":
             self.here = self._stack.pop() if self._stack and len(argv) == 1 else None
             return
@@ -1469,6 +1617,11 @@ class _Dirs:
             operands.append(a)
         if name == "pushd":
             self._stack.append(self.here)
+        self._follow_operands(name, operands, sub)
+        if narrows:  # the rest of the chain runs in the narrowed set, whatever this cd added to the union
+            self._narrow(before, _without_redirects(operands))
+
+    def _follow_operands(self, name: str, operands: list[str], sub: str) -> None:
         if not operands:
             if name == "cd":
                 self._add(self.home)
@@ -1511,21 +1664,21 @@ def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = 
     return None
 
 
-def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) -> str | None:
+def _delete_rule_in(t: str, dirs: _Dirs | _Where, home: str, above_home: bool = False) -> str | None:
     """:func:`_delete_target_rule` of ``t`` in every directory of ``dirs`` it may run in: a relative ``t`` or one with
     ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
     if t.startswith(("/", "~", "$")) and "PWD" not in t:
         return _delete_target_rule(t, None, home, above_home)
     if dirs.overflow:
         return "scan-depth"
-    for here in dirs.all:
+    for here in dirs.current():
         hit = _delete_target_rule(t, here, home, above_home)
         if hit:
             return hit
     return None
 
 
-def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
+def _rm_check(argv: list[str], dirs: _Dirs | _Where, home: str) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
     (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
     ``cd /``: see _delete_rule_in)."""
@@ -1590,12 +1743,12 @@ def _find_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     return None
 
 
-def _xargs_rm_check(pipelines: list[list[str]], dirs: _Dirs, home: str) -> str | None:
+def _xargs_rm_check(pipelines: list[list[str]], wheres: list[_Where], home: str) -> str | None:
     """``... | xargs rm -rf``: xargs adds what the earlier stages of the pipeline print to rm's arguments, so a word of
     theirs that rm -rf must not get (``echo ~ | xargs rm -rf``, ``find $HOME | xargs rm -r``) is checked as one of
     rm's targets (see _rm_check). Each printed word is checked once, as it is printed: the first one that hits stands
     for them all."""
-    for stages in pipelines:
+    for stages, dirs in zip(pipelines, wheres, strict=True):  # each pipeline in the directories it starts in
         if len(stages) < 2 or not any("xargs" in s for s in stages[1:]):
             continue
         bad: str | None = None  # the first printed word an rm -r must not get
@@ -1649,6 +1802,12 @@ class Parsed:
     #: nested deeper than the parser follows (_SCAN_MAX_DEPTH, parse): what runs in there was never read as commands
     too_deep: bool = False
     children: list[Parsed] = field(default_factory=list)  # the parsed payloads
+    #: per child: the indices of the subs it came from (a payload of theirs, the heredoc fed to one): the child runs in
+    #: the directories that sub may run in (see _check_parsed)
+    child_subs: list[list[int]] = field(default_factory=list)
+    #: the separators around the subs, one tuple per gap (``len(subs) + 1``): ``ops[k]`` are the ``&& || ; | |& &``,
+    #: newlines and parentheses between sub k-1 and sub k, ``""`` the end of the text (see _Dirs.separator)
+    ops: list[tuple[str, ...]] = field(default_factory=list)
 
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
@@ -1747,6 +1906,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
     cur_payloads: list[str] = []
     clean: list[str] = []
     pipe: list[str] = []
+    gap: list[str] = []  # the separators since the last sub (see Parsed.ops)
     heredocs: list[HeredocWord] = []  # the heredocs started on this line
     heredoc_info: list[tuple[bool, int]] = []  # per delimiter: quoted, index of the sub it is fed to
     # the open brackets, innermost last: "((" (with the index of its last ")"), "${", "{" (inside "${"), "[" (also for
@@ -1766,6 +1926,8 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         nonlocal pipe
         part = "".join(cur).strip()
         if part:
+            out.ops.append(tuple(gap))
+            gap.clear()
             out.subs.append(part)
             out.sub_payloads.append(list(cur_payloads))
             out.heredocs.append([])
@@ -1777,6 +1939,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         if not piped and pipe:
             out.pipelines.append(pipe)
             pipe = []
+        gap.append(sep)
         clean.append(sep)
 
     def subst(at: int, open_len: int) -> tuple[int, str]:
@@ -1976,6 +2139,7 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             emit(c)
             i += 1
     flush("")
+    out.ops.append(tuple(gap))
     out.open_heredoc = bool(heredocs)
     out.open_bracket = any(kind != "((" or end >= n for kind, end in ctx)
     out.clean = "".join(clean)
@@ -2142,10 +2306,15 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     parsed = _scan(command, budget)
     if budget[0] < 0 or parsed.too_deep:
         return parsed  # the parser gave up and check() denies the command: its nested commands are not read
-    payloads = [p for ps in parsed.sub_payloads for p in ps]
+    # each payload, read once, and the subs it came from (Parsed.child_subs), in the order they appear
+    payloads: dict[str, list[int]] = {}
+    for k, ps in enumerate(parsed.sub_payloads):
+        for p in ps:
+            payloads.setdefault(p, []).append(k)
     try:
-        for sub in parsed.subs:
-            payloads.extend(_launcher_payloads(sub))
+        for k, sub in enumerate(parsed.subs):
+            for p in _launcher_payloads(sub):
+                payloads.setdefault(p, []).append(k)
     except _TooDeep:  # see _command_argv
         parsed.too_deep = True
         return parsed
@@ -2157,13 +2326,14 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     # of its own, so the work would multiply with every level of nesting. An identical reading is parsed once, and the
     # characters of every reading but the first are charged to the shared budget: past it the command is denied
     # (``scan-budget``) instead of read twice over
-    for n, payload in enumerate(dict.fromkeys(payloads)):
+    for n, (payload, origin) in enumerate(payloads.items()):
         if n:
             budget[0] -= len(payload) or 1
         if budget[0] < 0:
             return parsed
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
+        parsed.child_subs.append(origin)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
         # the outer text goes on after a payload ($(...), `bash -c '...'`): a quote in its last comment still counts
@@ -2176,14 +2346,16 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         for heredoc in bodies if parsed.code_heredoc[k] == "shell" else ():
             inner = parse(heredoc.body, _depth + 1, budget)
             parsed.children.append(inner)
+            parsed.child_subs.append([k])
             parsed.nested.extend([*inner.subs, *inner.nested])
             parsed.too_deep = parsed.too_deep or inner.too_deep
             # `ssh host <<EOF` runs the body on host: each command is also checked as `ssh host '<command>'`, the
             # spelling the rules about remote hosts match
             remote = [*inner.subs, *inner.nested]
-            parsed.children += [
-                _scan(f"{ssh} {shlex.quote(c)}", budget) for ssh in parsed.remote_heredoc[k] for c in remote
-            ]
+            for ssh in parsed.remote_heredoc[k]:
+                for c in remote:
+                    parsed.children.append(_scan(f"{ssh} {shlex.quote(c)}", budget))
+                    parsed.child_subs.append([k])
     return parsed
 
 

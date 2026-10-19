@@ -52,10 +52,11 @@ CD_ALLOWED = [
 
 
 def test_a_directory_the_line_was_in_stays_possible() -> None:
-    # over-denied on purpose: which separator joins the commands is not followed, so the rm is read in / although
-    # `&&` keeps it from running when the cd fails
-    assert _check("cd /; ls; cd /tmp/x && rm -rf ./*") == "rm-rf-root"
-    assert _check("cd build && rm -rf *", cwd=HOME) == "rm-rf-home"
+    # `&&` keeps the rm from running when the cd fails, so it runs in /tmp/x only; after `;` / stays possible
+    assert _check("cd /; ls; cd /tmp/x && rm -rf ./*") is None
+    assert _check("cd /; ls; cd /tmp/x; rm -rf ./*") == "rm-rf-root"
+    assert _check("cd build && rm -rf *", cwd=HOME) is None
+    assert _check("cd build; rm -rf *", cwd=HOME) == "rm-rf-home"
 
 
 @pytest.mark.parametrize(("command", "rule"), CD_DENIED)
@@ -253,7 +254,7 @@ def test_a_cdpath_in_the_environment_counts_too(monkeypatch: pytest.MonkeyPatch)
         'cd "$(mktemp -d)" && rm -rf ./*',
         'cd "${TMPDIR:-/tmp}/x" && rm -rf *',
         'cd "`mktemp -d`" && rm -rf *',
-        "cd \"$(printf '%s' \"$d\")\" && rm -rf *",
+        'cd "$(printf \'%s\' "$d")" && rm -rf *',
     ],
 )
 def test_a_quoted_expansion_never_takes_cd_home(command: str) -> None:
@@ -263,7 +264,128 @@ def test_a_quoted_expansion_never_takes_cd_home(command: str) -> None:
 
 @pytest.mark.parametrize(
     "command",
-    ["cd $X && rm -rf *", "cd $(mktemp -d) && rm -rf *", 'cd "$A"$B && rm -rf *', "cd `x` && rm -rf *", "cd ${X}; rm -rf *"],
+    [
+        "cd $X && rm -rf *",
+        "cd $(mktemp -d) && rm -rf *",
+        'cd "$A"$B && rm -rf *',
+        "cd `x` && rm -rf *",
+        "cd ${X}; rm -rf *",
+    ],
 )
 def test_an_unquoted_expansion_may_take_cd_home(command: str) -> None:
     assert _check(command) == "rm-rf-home"
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        ("cd / && bash -c 'rm -rf *'", DEMO),
+        ("cd / && echo $(rm -rf *)", DEMO),
+        ("cd / && `rm -rf *`", DEMO),
+        ("cd /; sh -c 'rm -rf ./*'", DEMO),
+        ("cd / && bash -c 'cd usr && bash -c \"rm -rf *\"'", DEMO),
+        ("cd / && bash <<'EOF'\nrm -rf *\nEOF", DEMO),
+        ("cd / && cat <<EOF\n$(rm -rf *)\nEOF", DEMO),
+        ('cd / && echo "$(find . -delete)"', DEMO),
+        ("cd /usr && eval 'rm -rf *'", DEMO),
+        ("cd ~ && bash -c 'rm -rf *'", "/"),
+    ],
+)
+def test_a_command_nested_after_a_cd_runs_where_the_cd_went(command: str, cwd: str) -> None:
+    assert _check(command, cwd=cwd) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd build && bash -c 'rm -rf *'",
+        "cd build && echo $(rm -rf ./*)",
+        "cd / && cd /srv/app && bash -c 'rm -rf *'",
+        "bash -c 'cd /tmp/x && rm -rf *'",
+    ],
+)
+def test_a_nested_command_after_a_harmless_cd_is_not_hardline(command: str) -> None:
+    assert _check(command) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd"),
+    [
+        ("cd build && rm -rf *", HOME),
+        ("cd dist && rm -rf ./*", HOME),
+        ("cd x && find . -delete", HOME),
+        ("cd /srv/app && rm -rf ./*", "/"),
+        ("cd /srv/app && make && rm -rf ./*", "/"),
+        ("cd /srv/app && ls | rm -rf ./*", "/"),  # the chain survives `|`
+        ("cd /srv && cd app && rm -rf ./*", "/"),
+        ("cd /srv/app &&\nrm -rf ./*", "/"),  # a newline after && goes on with the chain
+        ("cd /srv/app && (rm -rf ./*)", "/"),  # a subshell starts where its parent is
+        ("cd /srv/app && (cd /; true) && rm -rf ./*", "/"),  # a subshell's cd stays in it
+        ("cd /srv/app && (true; rm -rf ./*)", "/"),
+        ("if cd build && rm -rf *; then :; fi", HOME),
+        ("builtin cd build && rm -rf *", HOME),
+        ("command cd build && rm -rf *", HOME),
+        ("X=1 cd build && rm -rf *", HOME),
+        ("cd -P build && rm -rf *", HOME),
+        ("cd build > /dev/null && rm -rf *", HOME),
+        ("cd /srv && echo build | xargs rm -rf", "/"),
+        ("cd /tmp/missing; cd .. && rm -rf build", "/usr/bin"),
+    ],
+)
+def test_a_cd_narrows_the_rest_of_its_and_chain(command: str, cwd: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check(command, cwd=cwd) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd", "rule"),
+    [
+        ("cd /; cd /nonexistent; rm -rf *", "/", "rm-rf-root"),
+        ("cd / && (cd tmp) && rm -rf *", "/", "rm-rf-root"),
+        ("cd /; cd tmp & rm -rf *", "/", "rm-rf-root"),
+        ("cd /; cd tmp | true; rm -rf *", "/", "rm-rf-root"),
+        ("cd /nonexistent || rm -rf *", "/", "rm-rf-root"),
+        ("cd /tmp/missing; cd .. && rm -rf *", "/usr/bin", "rm-rf-root"),  # .. from every possible directory
+        ("cd build || true && rm -rf *", HOME, "rm-rf-home"),  # `||` ends the chain
+        ("false || cd build && rm -rf *", HOME, "rm-rf-home"),  # the cd may be skipped
+        ("ls | cd build && rm -rf *", HOME, "rm-rf-home"),  # a pipeline stage's cd
+        ("cd build | cat && rm -rf *", HOME, "rm-rf-home"),
+        ("! cd build && rm -rf *", HOME, "rm-rf-home"),
+        ("cd build && true; rm -rf *", HOME, "rm-rf-home"),  # `;` ends the chain
+        ("cd build && true\nrm -rf *", HOME, "rm-rf-home"),
+        ("cd build && make & rm -rf *", HOME, "rm-rf-home"),
+        ("cd() { :; }; cd build && rm -rf *", HOME, "rm-rf-home"),  # cd is not the builtin
+        ("function cd { :; }; cd build && rm -rf *", HOME, "rm-rf-home"),
+        ("alias cd=true; cd build && rm -rf *", HOME, "rm-rf-home"),
+        ("enable -n cd; cd build && rm -rf *", HOME, "rm-rf-home"),
+        ("\\cd build && rm -rf *", HOME, "rm-rf-home"),  # not written exactly `cd`
+        ("busybox cd build && rm -rf *", HOME, "rm-rf-home"),
+        ("cd $X && rm -rf *", DEMO, "rm-rf-home"),  # the target is not known
+        ("cd build/* && rm -rf *", HOME, "rm-rf-home"),
+        ("cd a b && rm -rf *", HOME, "rm-rf-home"),
+        ("CDPATH=/srv cd build && rm -rf *", HOME, "rm-rf-home"),  # CDPATH may send it elsewhere
+        ("cd /srv/app && cd $X && rm -rf *", DEMO, "rm-rf-home"),  # a later cd adds to the chain
+        ("cd /srv && (cd / && rm -rf *)", DEMO, "rm-rf-root"),
+        ("cd /srv && echo / | xargs rm -rf", DEMO, "rm-rf-root"),
+        ("cd /srv; echo usr | xargs rm -rf", "/", "rm-rf-root"),
+    ],
+)
+def test_a_cd_that_may_not_have_worked_keeps_the_earlier_directories(
+    command: str, cwd: str, rule: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check(command, cwd=cwd) == rule
+
+
+def test_an_exported_cd_function_keeps_the_chain_from_narrowing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CDPATH", raising=False)
+    assert _check("cd build && rm -rf *", cwd=HOME) is None
+    monkeypatch.setenv("BASH_FUNC_cd%%", "() { :; }")
+    assert _check("cd build && rm -rf *", cwd=HOME) == "rm-rf-home"
+
+
+def test_the_parser_records_the_separators_and_the_subs_of_each_child() -> None:
+    parsed = hardline.parse("cd / && (cd tmp) || echo $(rm x); bash -c 'ls'")
+    assert parsed.subs == ["cd /", "cd tmp", "echo $(rm x)", "bash -c 'ls'"]
+    assert parsed.ops == [(), ("&&", "("), (")", "||"), (";",), ("",)]
+    assert parsed.child_subs == [[2], [3]]
