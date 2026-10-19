@@ -442,3 +442,18 @@ def test_past_the_directory_cap_a_cdpath_cd_walks_no_more_entries(monkeypatch: p
     assert _check(chain + "; rm -rf /") == "rm-rf-root"
     assert _check(chain + "; rm -rf /tmp/x") is None
     assert _check("CDPATH=" + ":".join(f"/a{k}" for k in range(40)) + " cd b; rm -rf build") == "scan-depth"
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd", "rule"),
+    [
+        ("rm -rf ~+", HOME, "rm-rf-home"),
+        ("cd / && rm -rf ~+/*", DEMO, "rm-rf-root"),
+        ("cd /; cd /tmp; rm -rf ~-/*", DEMO, "rm-rf-root"),
+        ("rm -rf ~-", HOME, "rm-rf-home"),
+        ("rm -rf ~+/build", DEMO, None),
+        ("cd /tmp; rm -rf ~-/build", DEMO, None),
+    ],
+)
+def test_tilde_plus_and_minus_are_read_in_every_directory_of_the_line(command: str, cwd: str, rule: str | None) -> None:
+    assert _check(command, cwd=cwd) == rule

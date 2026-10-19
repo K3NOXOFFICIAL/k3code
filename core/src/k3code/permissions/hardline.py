@@ -1577,6 +1577,8 @@ def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = 
 def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) -> str | None:
     """:func:`_delete_target_rule` of ``t`` in every directory of ``dirs`` it may run in: a relative ``t`` or one with
     ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
+    if t in ("~+", "~-") or t.startswith(("~+/", "~-/")):
+        t = "$PWD" + t[2:]  # the current or previous directory: one of the set, read in every one
     if t.startswith(("/", "~", "$")) and "PWD" not in t:
         return _delete_target_rule(t, None, home, above_home)
     if dirs.overflow:
