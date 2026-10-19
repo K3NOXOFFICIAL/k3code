@@ -37,6 +37,24 @@ def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
     assert chk.status == doctor.OK and "/usr/bin/bwrap" in chk.detail
 
 
+def test_ripgrep_warns_when_rg_is_missing_and_names_the_fix(monkeypatch):
+    from k3code import doctor
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: None)
+    chk = doctor.check_ripgrep()
+    assert chk.status == doctor.WARN and chk.name == "ripgrep"
+    assert "~10x slower" in chk.detail and "cut off after 10 s" in chk.detail
+    assert "install ripgrep" in chk.fix and "dnf/apt" in chk.fix and "brew" in chk.fix
+
+
+def test_ripgrep_is_ok_when_rg_is_on_path(monkeypatch):
+    from k3code import doctor
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: "/usr/bin/rg" if name == "rg" else None)
+    chk = doctor.check_ripgrep()
+    assert chk.status == doctor.OK and "/usr/bin/rg" in chk.detail
+
+
 async def test_sandbox_no_probe_still_reports_an_unusable_bwrap(monkeypatch, tmp_path):
     """--no-probe skips network probes, not the local bwrap self-test: it printed "bubblewrap at ..." as OK on a host
     where every sandboxed command fails (and so did the summary step of `setup --no-probe`)."""

@@ -707,6 +707,21 @@ def check_sandbox(probe: bool = True) -> Check:
     )
 
 
+def check_ripgrep() -> Check:
+    """grep and glob run ripgrep when it is on PATH; without it a pure-Python fallback walks and matches, about ten
+    times slower, and a big repository's search stops at the time budget with partial results."""
+    path = shutil.which("rg")
+    if path:
+        return Check("ripgrep", OK, f"rg at {path}")
+    return Check(
+        "ripgrep",
+        WARN,
+        "rg not found: grep and glob use a Python fallback; searches in big repositories are ~10x slower and are cut "
+        "off after 10 s with partial results",
+        "install ripgrep (dnf/apt install ripgrep, or brew install ripgrep)",
+    )
+
+
 def check_isolation() -> Check:
     """k3code never reads ~/.hermes/.env (no dotenv loader); flag Hermes env vars that could leak in."""
     leaked = sorted(k for k in os.environ if k.startswith("HERMES_") and k != "HERMES_TUI_GATEWAY_URL")
@@ -973,6 +988,7 @@ async def run_checks(
         check_vendor(),
         # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
+        check_ripgrep(),
         check_isolation(),
         check_permissions(home, default_project_dir()),
         await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree

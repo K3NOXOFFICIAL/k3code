@@ -9,7 +9,6 @@ import errno
 import json
 import os
 import shutil
-import stat
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -24,10 +23,11 @@ from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
+from k3code.tools.grep_worker import BINARY_SNIFF_BYTES as _BINARY_SNIFF_BYTES
+from k3code.tools.grep_worker import MAX_COLUMNS, MAX_REGEX_LINE
 from k3code.tools.jobs import MAX_UNREAD_BYTES
 from k3code.tools.safe_open import NotAllowed, NotRegular, open_regular, session_search_roots
 from k3code.tools.validate import shown
-from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
 
@@ -803,7 +803,7 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
 #: rg excludes on top of its own defaults (.gitignore, hidden files): dependency trees and other sessions' worktrees.
 _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/worktrees/", "!**/.claude/jobs/")
 #: Longest line rg prints in full; minified bundles and data blobs would otherwise fill the context with one match.
-_RG_MAX_COLUMNS = 400
+_RG_MAX_COLUMNS = MAX_COLUMNS
 
 
 def _grep_line(raw: bytes, verdicts: dict[bytes, bool], withheld: Callable[[str], bool]) -> tuple[str, bool]:
@@ -930,9 +930,14 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # Python fallback (no rg, or a pattern rg refuses such as look-around): off the event loop, same tree rules as
         # glob, capped
         import re
+        import threading
 
+        cancel = threading.Event()  # a cancelled call kills the worker now, not at the deadline
         try:
-            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, roots)
+            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, roots, cancel)
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
         except re.error as e:
             # a pattern neither engine takes: rg's own message names the fault when rg ran, else Python's
             said = [ln.strip() for ln in str(rg_failure).splitlines() if ln.strip()]
@@ -1126,73 +1131,10 @@ def _glob_sync(path: Path, pattern: str, roots: list[str] | None = None) -> dict
     return {"files": files, **({"note": note} if note else {})}
 
 
-#: The grep fallback treats a file with a NUL byte in its first _BINARY_SNIFF_BYTES as binary (as ripgrep does), reads
-#: in pieces of at most _GREP_PIECE_BYTES and looks at the clock every _GREP_CLOCK_BYTES: read_text of a 300 MB binary
-#: took 2.6 GB of memory and ran past the time budget.
-_BINARY_SNIFF_BYTES = 8192
-_GREP_PIECE_BYTES = 1 << 20
-_GREP_CLOCK_BYTES = 64 * 1024
-
-
-def _open_regular(fp: Path, expect: str | None) -> Any:
-    """``fp`` opened for reading, or None when it is not a regular file or, with ``expect`` (the real path a walked
-    entry must have), is not that file. The decision is made on the open descriptor: a check by name followed by an
-    open by name loses to a process that swaps a directory for a link in between. ``O_NOFOLLOW`` refuses a link as the
-    last component and the descriptor names the file actually opened (``/proc/self/fd`` on Linux, ``F_GETPATH`` on
-    macOS), whatever a directory above it became;
-    ``O_NONBLOCK`` keeps the open of a FIFO without a writer from blocking and ``O_NOCTTY`` keeps a terminal device
-    from becoming the daemon's controlling terminal."""
-    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | (os.O_NOFOLLOW if expect is not None else 0)
-    fd = os.open(fp, flags)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        if expect is not None and str(_opened_path(fd)) != expect:
-            raise OSError(errno.ELOOP, "not the file the walk listed")
-        return os.fdopen(fd, "rb")
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def _grep_file(
-    fp: Path, rx: Any, deadline: float, *, named: bool = False, expect: str | None = None
-) -> Iterator[str | None]:
-    """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
-    preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
-    matches`` line, as rg says. A walked entry passes the real path it must be (``expect``); one that is a link, a
-    FIFO or any other non-regular file, or that is not that path when opened, raises OSError unread. A named file is
-    opened as the permission check decided on it (see open_regular); a walked one by its descriptor (see
-    _open_regular). Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
-    _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
-    anchor at one, is approximate."""
-    # a named file is opened as the permission check decided on it (see open_regular); a walked one must still be
-    # the walked path when opened (see _open_regular)
-    with open_regular(fp) if named else _open_regular(fp, expect) as f:
-        binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
-        if binary and not named:
-            return
-        f.seek(0)
-        number, line_start, unclocked = 0, True, 0
-        for raw in iter(lambda: f.readline(_GREP_PIECE_BYTES), b""):
-            unclocked += len(raw)
-            if unclocked >= _GREP_CLOCK_BYTES:
-                unclocked = 0
-                if time.monotonic() > deadline:
-                    yield None
-                    return
-            if line_start:  # a piece of a longer line keeps that line's number
-                number += 1
-            line_start = raw.endswith(b"\n")
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not rx.search(line):
-                continue
-            if binary:
-                yield f"{fp}: binary file matches"
-                return
-            if len(line) > _RG_MAX_COLUMNS:
-                line = line[:_RG_MAX_COLUMNS] + " [... omitted end of long line]"
-            yield f"{fp}:{number}:{line}"
+#: The grep fallback's reader and matcher, run as ``python -I <this file>`` (see grep_worker and _grep_fallback).
+_GREP_WORKER = str(Path(__file__).with_name("grep_worker.py"))
+#: How long past the deadline the fallback waits for the worker to stop by itself before it kills it.
+_GREP_WORKER_GRACE_S = 0.25
 
 
 def _search_glob_match(rel: str, pattern: str) -> bool:
@@ -1205,74 +1147,239 @@ def _search_glob_match(rel: str, pattern: str) -> bool:
     return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
 
 
+@dataclasses.dataclass
+class _Feed:
+    """What the feeder thread of _grep_fallback found: files handed to the worker, credential files withheld, whether
+    the walk itself ran out of time, and whether it reached its end (only then is ``sent`` the number of files)."""
+
+    sent: int = 0
+    skipped: int = 0
+    walk_cut: bool = False
+    walk_done: bool = False
+
+
+def _feed_worker(
+    sink: Any,
+    job: dict[str, Any],
+    candidates: Iterator[tuple[str | None, bool]] | None,
+    allowed: Callable[[str], bool | None] | None,
+    feed: _Feed,
+    stop: Any,
+) -> None:
+    """Write ``job`` and then each walked file ``allowed`` accepts (True: search it, False: a credential file, counted,
+    None: left out) to the worker's stdin, NUL-terminated, in batches. Ends at the end of the walk, on ``stop``, or
+    when the worker is gone (a broken pipe)."""
+    batch = bytearray(json.dumps(job).encode() + b"\n")
+    flushed = time.monotonic()
+    try:
+        for rel, is_dir in candidates or ():
+            if stop.is_set():
+                return
+            if rel is None:
+                feed.walk_cut = True
+                break
+            if is_dir:
+                continue
+            verdict = allowed(rel) if allowed else None
+            if verdict is None:
+                continue
+            if not verdict:
+                feed.skipped += 1
+                continue
+            batch += os.fsencode(rel) + b"\0"
+            feed.sent += 1
+            if len(batch) >= 1 << 15 or time.monotonic() - flushed > 0.02:  # paths reach the worker while it works
+                sink.write(batch)
+                sink.flush()
+                batch.clear()
+                flushed = time.monotonic()
+        sink.write(batch)
+        feed.walk_done = not feed.walk_cut
+    except OSError:  # the worker was stopped (BrokenPipeError) or the walk failed: what was sent is searched
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            sink.close()
+
+
+def _stop_worker(proc: Any) -> None:
+    """Kill the worker's process group (it is a session leader) and reap it."""
+    import signal
+
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
+
+
+def _walk_filter(
+    path: Path, real_base: str, includes: list[str], excludes: list[str], secret_file: Callable[..., bool]
+) -> Callable[[str], bool | None]:
+    """The fallback's rule for a walked file ``rel``: None to leave it out (include, exclude, a link on the way),
+    False for a credential file the search withheld (counted), True to search it.
+
+    A file is judged by its name below ``real_base`` (``path`` resolved), not by a realpath of its own: that cost about
+    eight realpath calls (a hundred lstat) per file. Each directory the walk enters is resolved once and must be
+    ``real_base/dir`` (no link on the way); a link as the file itself, or one swapped in after this check, is never
+    opened: the worker opens every component with O_NOFOLLOW (see grep_worker.Beneath)."""
+    entered: dict[str, bool] = {}  # directory below path -> it resolves to real_base/directory
+
+    def link_free(d: str) -> bool:
+        if (ok := entered.get(d)) is None:
+            try:
+                ok = os.path.realpath(path / d) == os.path.join(real_base, d)
+            except OSError:  # realpath raises when a link is swapped for a directory mid-resolve
+                ok = False
+            entered[d] = ok
+        return ok
+
+    def allowed(rel: str) -> bool | None:
+        if includes and not any(_search_glob_match(rel, p) for p in includes):
+            return None
+        if excludes and any(_search_glob_match(rel, p) for p in excludes):
+            return None
+        d = rel.rpartition("/")[0]
+        if d and not link_free(d):
+            return None  # below a link: never opened, the worker opens no link either
+        # the tree walk lists hidden files too: dotenv files and key dirs stay out
+        return not secret_file(str(path / rel), real=os.path.join(real_base, rel))
+
+    return allowed
+
+
 def _grep_fallback(
-    pattern: str, path: Path, include: Any, exclude: Any, roots: list[str] | None = None
+    pattern: str,
+    path: Path,
+    include: Any,
+    exclude: Any,
+    roots: list[str] | None = None,
+    cancel: Any = None,
 ) -> dict[str, Any]:
-    """tool_grep without rg. ``roots``: the session's project roots, see search_withheld."""
+    """tool_grep without rg. ``roots``: the session's project roots, see search_withheld. ``cancel``: a
+    ``threading.Event`` that stops the search (the tool call was cancelled).
+
+    This thread walks the tree and decides which files are searched (the tree rules, include and exclude, the
+    credential files ``search_withheld`` names); a worker process (see grep_worker) opens those files, without
+    following a symlink at any level, and matches their lines. A pattern can backtrack for minutes on one line while
+    holding the GIL, so the match must not run in the daemon: the worker is killed at the deadline, on ``cancel`` and
+    once the result cap is passed, and what it found until then is the result."""
     import re
+    import selectors
+    import subprocess
+    import sys
+    import threading
 
     includes = include if isinstance(include, list) else [include] if include else []
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
-    rx = re.compile(pattern)
+    re.compile(pattern)  # a pattern neither engine takes fails here (re.error), before a worker starts
     deadline = time.monotonic() + SEARCH_BUDGET_S
+    feed = _Feed()
     named = path.is_file()
+    job: dict[str, Any] = {"pattern": pattern, "budget": max(0.0, deadline - time.monotonic())}
+    candidates: Iterator[tuple[str | None, bool]] | None = None
+    allowed: Callable[[str], bool | None] | None = None
+    pass_fds: tuple[int, ...] = ()
+    named_file = None
     if named:
-        base, candidates = path.parent, iter([(path.name, False)])
+        if sensitive_path(str(path)):  # tool_grep refuses these first; a direct caller is held to it too
+            return _grep_result([], _Feed(skipped=1), 0, 0, cut=False)
+        try:
+            named_file = open_regular(path)  # as the permission check decided on it; the worker reads this descriptor
+        except NotAllowed:  # the path changed under the permission check: nothing of it was read
+            gone = f"{path} leads to a file the permission check did not allow (a link on the path): not searched"
+            return {"matches": "", "warnings": gone}
+        except OSError:
+            return {"matches": ""}
+        pass_fds = (named_file.fileno(),)
+        job.update(fd=named_file.fileno(), display=str(path))
+        feed.sent = 1
     else:
-        base, candidates = path, _iter_tree(path, deadline)
-    real_base = os.path.realpath(base)  # base itself may be a link the engine decided on
+        real_base = os.path.realpath(path)  # path itself may be a link the engine decided on
+        candidates = _iter_tree(path, deadline)
+        allowed = _walk_filter(path, real_base, includes, excludes, search_withheld(str(path), roots))
+        job.update(base=real_base, display=str(path))
+    proc = subprocess.Popen(
+        [sys.executable, "-I", _GREP_WORKER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        pass_fds=pass_fds,
+        start_new_session=True,  # its own group: the kill reaches anything it started
+        env=child_env(),
+    )
+    if named_file is not None:
+        named_file.close()  # the worker holds its own copy
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    stop = threading.Event()
+    feeder = threading.Thread(
+        target=_feed_worker, args=(proc.stdin, job, candidates, allowed, feed, stop), name="grep-feed", daemon=True
+    )
+    feeder.start()
     matches: list[str] = []
-    skipped = 0
-    changed = False
-    timed_out = False
-    # a named file: tool_grep decided on it
-    secret_file = sensitive_path if named else search_withheld(str(path), roots)
-    for rel, is_dir in candidates:
-        if rel is None or time.monotonic() > deadline:
-            timed_out = True
-            break
-        if is_dir:
-            continue
-        fp = base / rel
-        if includes and not any(_search_glob_match(rel, p) for p in includes):
-            continue
-        if excludes and any(_search_glob_match(rel, p) for p in excludes):
-            continue
+    files = long_lines = 0
+    ended = worker_cut = cut = False
+    pending = bytearray()
+    out = proc.stdout.fileno()
+    with selectors.DefaultSelector() as sel:  # not select(): a descriptor past 1023 cannot be polled by it
+        sel.register(out, selectors.EVENT_READ)
         try:
-            if not named and os.path.realpath(fp) != os.path.join(real_base, rel):
-                continue  # a link met before the open is never opened; the fd check in _open_regular catches a swap
-            if secret_file(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
-                skipped += 1
-                continue
-        except OSError:  # realpath raises when a link is swapped for a directory mid-resolve: the file stays unread
-            continue
-        try:
-            # rg follows no link in a walk; one (even a directory above the file) may lead out of the roots, so the
-            # opened file must be the walked path (see _open_regular)
-            expect = None if named else os.path.join(real_base, rel)
-            for hit in _grep_file(fp, rx, deadline, named=named, expect=expect):
-                if hit is None:
-                    timed_out = True
+            while not ended and len(matches) <= MAX_SEARCH_RESULTS:
+                left = deadline + _GREP_WORKER_GRACE_S - time.monotonic()
+                if left <= 0:
+                    cut = True
                     break
-                matches.append(hit)
-                if len(matches) > MAX_SEARCH_RESULTS:
+                if cancel is not None and cancel.is_set():
                     break
-        except NotAllowed:  # a named file whose path changed under the permission check: nothing of it was read
-            changed = True
-            continue
-        except OSError:  # unreadable, not a regular file, a link, or an index entry deleted from the work tree
-            continue
-        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
-            break
+                if not sel.select(min(left, 0.1)):
+                    continue
+                chunk = os.read(out, 1 << 16)
+                if not chunk:
+                    break
+                pending += chunk
+                *lines, rest = pending.split(b"\n")
+                pending = bytearray(rest)
+                for line in lines:
+                    msg = json.loads(line)
+                    if msg[0] == "m":
+                        matches.append(msg[1])
+                    else:
+                        files, long_lines = msg[1], msg[2]
+                        if msg[0] == "end":
+                            ended, worker_cut = True, msg[3]
+        finally:
+            stop.set()
+            _stop_worker(proc)
+            feeder.join(1.0)  # past the deadline it may still be in a git listing: a daemon thread, it ends on stop
+    if not ended and not cut and len(matches) <= MAX_SEARCH_RESULTS and not (cancel is not None and cancel.is_set()):
+        err = proc.stderr.read(4096).decode("utf-8", errors="replace").strip()
+        proc.stderr.close()
+        raise RuntimeError(f"grep worker exited with status {proc.returncode}: {err}")
+    proc.stdout.close()
+    proc.stderr.close()
+    return _grep_result(matches, feed, files, long_lines, cut=cut or worker_cut or feed.walk_cut)
+
+
+def _grep_result(matches: list[str], feed: _Feed, files: int, long_lines: int, *, cut: bool) -> dict[str, Any]:
+    """The fallback's tool result: the matching lines (capped) and a warning for each way the search was cut short.
+    Cut by the time budget, it says how much was searched (``files``, the worker's count, of the files the walk handed
+    over, when the walk got to its end) and that ripgrep, when missing, would have been much faster."""
     shown, note = _capped(matches)
-    if timed_out:
-        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
-    result = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
-    if skipped:
-        _note_withheld(result, f"{skipped} credential file(s) (.env, keys, home dot folders) not searched")
-    if changed:
-        gone = f"{path} leads to a file the permission check did not allow (a link on the path): not searched"
-        result["warnings"] = f"{result['warnings']}; {gone}" if result.get("warnings") else gone
+    if cut:
+        total = f"~{feed.sent}" if feed.walk_done else "an unknown number of"
+        note = (
+            f"searched {files} of {total} files before the {SEARCH_BUDGET_S:.0f} s budget; results are partial; "
+            "narrow the path or add an include glob"
+        )
+        if shutil.which("rg") is None:
+            note += "; ripgrep (rg) is not installed, which makes this search much slower"
+    result: dict[str, Any] = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
+    if feed.skipped:
+        _note_withheld(result, f"{feed.skipped} credential file(s) (.env, keys, home dot folders) not searched")
+    if long_lines:
+        _note_withheld(
+            result,
+            f"{long_lines} line(s) longer than {MAX_REGEX_LINE} characters not searched with a regular expression: "
+            "search them with a literal pattern",
+        )
     return result
 
 
