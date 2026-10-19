@@ -16,6 +16,7 @@ from k3code.autonomy import advisor as advisor_mod
 from k3code.autonomy import autonomy_cfg, scope
 from k3code.autonomy.proposals import ProposalStore, propose
 from k3code.autonomy.scope import ScopeLog, ScopeVerdict
+from k3code.context_budget import router_window, tool_output_chars
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
@@ -302,6 +303,8 @@ class PlanFirst:
             reliability=await server._reliability_for(session),
             session=sid,
             task_kind=TaskKind.PLAN,
+            tool_output_chars=tool_output_chars(server.config),
+            context_window=router_window(server.config, router, server._active_model(session)),
         )
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one
