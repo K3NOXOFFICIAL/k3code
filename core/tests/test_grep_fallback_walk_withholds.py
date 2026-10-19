@@ -13,12 +13,15 @@ import time
 from pathlib import Path
 
 import pytest
-from test_permission_outside_walk import MARKER, SECRET, SECRET_FILES, _assert_clean, world  # noqa: F401
 
 import k3code.tools as tools
+import test_permission_outside_walk as outside_walk
 from k3code.permissions import decide
 from k3code.permissions.engine import search_withheld
 from k3code.tools import grep_worker, tool_grep
+from test_permission_outside_walk import MARKER, SECRET, SECRET_FILES, _assert_clean
+
+world = outside_walk.world  # the fake $HOME with credential files below ~/projects/other, and the session's cwd
 
 #: Planted below ~/projects/other next to the fixture's SECRET_FILES.
 MORE_SECRETS = ("id_rsa", ".env", "deep/er/.env")

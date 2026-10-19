@@ -75,7 +75,7 @@ def test_the_walk_costs_a_few_file_system_calls_per_file(tree, tmp_path, monkeyp
     files = DIRS * FILES_PER_DIR
     assert feed.sent == files and feed.skipped == 0
     per_file = sum(parent.values()) / files
-    print(f"calls per file: {per_file:.2f} {({k: round(v / files, 2) for k, v in parent.items()})}")
+    print(f"calls per file: {per_file:.2f} { ({k: round(v / files, 2) for k, v in parent.items()}) }")
     assert per_file <= MAX_CALLS_PER_FILE, parent
 
     # and the worker, run in this process on what the parent sent, finds every match
