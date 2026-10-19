@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -14,6 +16,8 @@ from k3code.providers.effort import anthropic_effort
 from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     EPHEMERAL,
+    EPHEMERAL_1H,
+    SYSTEM_CACHE_KEY,
     Message,
     StreamEvent,
     ToolCall,
@@ -23,6 +27,7 @@ from k3code.providers.types import (
     with_cache_breakpoint,
 )
 
+logger = logging.getLogger(__name__)
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
 
@@ -42,6 +47,7 @@ class AnthropicProvider(Provider):
         keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        prompt_cache_ttl: str = "auto",
         first_event_timeout: float | None = None,
         idle_timeout: float | None = None,
     ) -> None:
@@ -52,6 +58,10 @@ class AnthropicProvider(Provider):
         #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
         self.prompt_cache = prompt_cache != "off"
         self.base_url = base_url.rstrip("/")
+        #: 1h TTL on the tools and system breakpoints (2x write price, same read price; one reuse after a pause of more
+        #: than 5 minutes pays it back). auto = only on the first-party API, whose host is known to take the field; a
+        #: relay may refuse it. A 400 that names the field turns it off for good (see stream).
+        self.long_ttl = ttl_policy(self.base_url, prompt_cache_ttl, prompt_cache)
         self.api_key = api_key
         self.keyless = keyless  # api_key_env "": the endpoint takes no key, send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -93,8 +103,9 @@ class AnthropicProvider(Provider):
             payload["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools
             ]
-        if self.prompt_cache:
-            _add_cache_breakpoints(payload)
+        if self.prompt_cache and tools:  # a tool-less side call (title, summary, classifier) is never read back
+            # a sub-agent's system prompt is unique to it (see prompting.py): 1h there only adds the write premium
+            _add_cache_breakpoints(payload, long_ttl=self.long_ttl, short_system=_short_system(messages))
         return payload
 
     async def stream(
@@ -106,22 +117,37 @@ class AnthropicProvider(Provider):
         max_tokens: int = 8192,
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        request = self._client.build_request(
-            "POST",
-            self._url(),
-            headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
-            json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
-        )
-        watchdog = StreamWatchdog.for_model(
-            "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
-        )
-        try:
-            response = await watchdog.guard(self._client.send(request, stream=True))
-        except httpx.HTTPError as exc:
-            raise to_provider_error(exc, kind="anthropic") from exc
-        if response.status_code >= 400:
+        while True:
+            sent_ttl = self.long_ttl and bool(tools)  # from the policy, not the body: a tool schema may say "ttl"
+            payload = self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature)
+            request = self._client.build_request(
+                "POST",
+                self._url(),
+                headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
+                json=payload,
+            )
+            watchdog = StreamWatchdog.for_model(
+                "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
+            )
+            try:
+                response = await watchdog.guard(self._client.send(request, stream=True))
+            except httpx.HTTPError as exc:
+                raise to_provider_error(exc, kind="anthropic") from exc
+            if response.status_code < 400:
+                break
             error = await _error_from_response(response)
             await response.aclose()
+            text = f"{error.message} {error.body}"
+            if sent_ttl and response.status_code in (400, 422) and _TTL_REFUSED.search(text):
+                # this endpoint refuses the 1h TTL: drop it for good, resend once with 5m
+                if self.long_ttl:  # a concurrent stream may have flipped it already
+                    self.long_ttl = False
+                    logger.warning(
+                        "prompt cache: %s refused the 1h TTL (HTTP %d); using 5m from now on",
+                        httpx.URL(self.base_url).host,
+                        response.status_code,
+                    )
+                continue
             raise error
         try:
             content_parts: list[str] = []
@@ -219,17 +245,42 @@ class AnthropicProvider(Provider):
             await response.aclose()
 
 
-def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
+def ttl_policy(base_url: str, setting: str, prompt_cache: str = "auto") -> bool:
+    """Whether the tools and system breakpoints get the 1h TTL: ``prompt_cache_ttl`` ``1h`` always, ``auto`` only on the
+    first-party API (whose host is known to take the field), never with ``prompt_cache`` off. One answer for the
+    provider and ``k3code doctor``."""
+    if prompt_cache == "off":
+        return False
+    return setting == "1h" or (setting == "auto" and httpx.URL(base_url.rstrip("/")).host == "api.anthropic.com")
+
+
+#: an error text that names the ttl field of a cache_control (``system.0.cache_control.ephemeral.ttl: Extra inputs``).
+#: A bare "ttl" or "cache_control" is not enough: the 4-breakpoint limit and the empty-text error name only the latter.
+_TTL_REFUSED = re.compile(r"cache_control.{0,40}\bttl\b|\bttl\b.{0,40}cache_control", re.IGNORECASE | re.DOTALL)
+
+
+def _short_system(messages: list[Message]) -> bool:
+    """True when the caller marked the leading system prompt as one only its own loop reads back (a sub-agent's)."""
+    return any(m.role == "system" and (m.meta or {}).get(SYSTEM_CACHE_KEY) == "5m" for m in messages[:1])
+
+
+def _add_cache_breakpoints(payload: dict[str, Any], *, long_ttl: bool = False, short_system: bool = False) -> None:
     """Mark the four prompt-cache breakpoints the API allows: the system prompt, the last tool definition, the last
     block of the newest message, and the last block of the message before the newest assistant message. The newest
     one moves forward every call, so each request reads the prefix the request before it wrote instead of paying for
     the whole conversation again on every tool-loop step. The API looks for an earlier entry only about 20 blocks back
     from a breakpoint, and a step with 10 parallel tool calls appends more than that; the fourth breakpoint sits where
-    the previous request ended, so its entry is always found (#168)."""
+    the previous request ended, so its entry is always found (#168).
+
+    ``long_ttl`` gives the two stable breakpoints (tools, system) the 1h TTL; the moving tail keeps 5m. The API reads
+    tools, then system, then messages, and wants every longer-TTL entry before any shorter one: that order holds.
+    ``short_system`` keeps the system breakpoint at 5m while tools keep ``long_ttl``: still in order."""
+    stable = EPHEMERAL_1H if long_ttl else EPHEMERAL
     if payload.get("system"):
-        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
+        system_mark = EPHEMERAL if short_system else stable
+        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": system_mark}]
     if payload.get("tools"):
-        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": EPHEMERAL}
+        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": stable}
     messages = payload["messages"]
     if messages:
         messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}

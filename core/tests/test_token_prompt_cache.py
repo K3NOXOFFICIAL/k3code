@@ -41,8 +41,9 @@ def test_the_anthropic_payload_marks_system_last_tool_newest_message_and_previou
     p = AnthropicProvider(name="a", api_key="k")
     payload = p._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)
     eph = {"type": "ephemeral"}
-    assert payload["system"] == [{"type": "text", "text": "SYSTEM PROMPT", "cache_control": eph}]
-    assert payload["tools"][-1]["cache_control"] == eph and "cache_control" not in payload["tools"][0]
+    stable = {"type": "ephemeral", "ttl": "1h"}  # the default base_url is the first-party API (prompt_cache_ttl auto)
+    assert payload["system"] == [{"type": "text", "text": "SYSTEM PROMPT", "cache_control": stable}]
+    assert payload["tools"][-1]["cache_control"] == stable and "cache_control" not in payload["tools"][0]
     last = payload["messages"][-1]["content"][-1]
     assert last["type"] == "tool_result" and last["cache_control"] == eph
     # the previous request ended at the message before the newest assistant message (#168)
@@ -72,17 +73,17 @@ def test_a_step_with_many_parallel_tool_calls_keeps_a_breakpoint_where_the_previ
 def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_empty_text():
     p = AnthropicProvider(name="a", api_key="k")
     msgs = [Message(role="system", content="S"), Message(role="user", content="hello")]
-    payload = p._payload(msgs, [], "claude-test", max_tokens=100, temperature=None)
+    payload = p._payload(msgs, TOOLS, "claude-test", max_tokens=100, temperature=None)
     assert payload["messages"][-1]["content"] == [
         {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
     ]
-    assert "tools" not in payload and breakpoints(payload) == 2
-    empty = p._payload([Message(role="user", content="")], [], "claude-test", max_tokens=100, temperature=None)
-    assert breakpoints(empty) == 0 and "system" not in empty
+    assert breakpoints(payload) == 3  # last tool, system, newest message
+    empty = p._payload([Message(role="user", content="")], TOOLS, "claude-test", max_tokens=100, temperature=None)
+    assert breakpoints(empty) == 1 and "system" not in empty  # only the last tool
     silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]
-    payload = p._payload(silent, [], "claude-test", max_tokens=100, temperature=None)
-    # the system prompt and the previous request's end (the user message), never on an empty tool result
-    assert breakpoints(payload) == 2
+    payload = p._payload(silent, TOOLS, "claude-test", max_tokens=100, temperature=None)
+    # the last tool, the system prompt and the previous request's end (the user message), never an empty tool result
+    assert breakpoints(payload) == 3
 
 
 def test_prompt_cache_off_sends_no_breakpoints():

@@ -405,7 +405,7 @@ mcp:
     search: {url: "https://example.org/mcp"}
 ```
 
-`descriptions` is optional on each provider; for a model key that several providers define, the first non-empty description is shown. `ultracode.min_scope` must be one of the five scope names, and an unknown key under `ultracode` or `wake_words` is ignored with a warning. See [Ultracode mode](#ultracode-mode) and [Wake words](#wake-words).
+`descriptions` is optional on each provider; for a model key that several providers define, the first non-empty description is shown. `prompt_cache_ttl` (per provider: `auto`, `5m` or `1h`) sets the prompt-cache lifetime of the tools and system prompt on an `anthropic` entry: `auto` uses 1 hour when `base_url` is `api.anthropic.com` and 5 minutes elsewhere, the conversation tail always keeps 5 minutes, and a request without tools (titles, summaries) sets no cache breakpoint; `k3code doctor` shows the policy per provider. `ultracode.min_scope` must be one of the five scope names, and an unknown key under `ultracode` or `wake_words` is ignored with a warning. See [Ultracode mode](#ultracode-mode) and [Wake words](#wake-words).
 
 ### Hooks
 
