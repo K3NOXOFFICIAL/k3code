@@ -12,7 +12,12 @@ import { ProviderPicker } from "../components/providerPicker.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { DEFAULT_THEME } from "../theme.js";
 
-import { waitFor } from "./waitFor.js";
+import { type WaitForOptions, waitFor as waitForWithin } from "./waitFor.js";
+
+/** The form takes a key press per step; a loaded machine (the whole suite runs in parallel) needs more than 5 s. */
+function waitFor<T>(check: () => T | Promise<T>, options: WaitForOptions = {}) {
+  return waitForWithin(check, { timeout: 20_000, ...options });
+}
 
 // The /provider popup's "+ Add new provider" form, driven through the picker
 // (the form only ever runs inside it) with a gateway fake routed by method.
@@ -48,6 +53,19 @@ class FakeInput extends EventEmitter {
 }
 
 const settle = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The screen that just painted attaches its input handler in an effect a moment later; a key sent in between is read
+ * by the app and dropped. Let several event-loop turns pass so the effects have run (order, not wall time, is what
+ * matters, so this holds on a loaded machine too).
+ */
+async function inputReady() {
+  for (let i = 0; i < 5; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  await settle(30);
+}
 
 const DOWN = "\u001b[B";
 const ENTER = "\r";
@@ -251,6 +269,7 @@ function mount(
 
   /** Send one key or chunk, then wait for the screen to show `expectText`. */
   const press = async (chunk: string, expectText?: string) => {
+    await inputReady();
     stdin.send(chunk);
 
     if (expectText) {
@@ -263,6 +282,7 @@ function mount(
   return {
     all,
     calls,
+    stdin,
     last,
     onCancel,
     onNotice,
@@ -280,7 +300,19 @@ function mount(
 /** From the list into the form's first step (the add row is the last row). */
 async function openForm(t: ReturnType<typeof mount>) {
   await waitFor(() => expect(t.last()).toContain("Add new provider"));
-  await t.press("2", "Add provider · kind");
+
+  // "2" only selects the second row while the list shows: pressing it again until the form opens is safe
+  for (
+    let attempt = 0;
+    attempt < 40 && !t.last().includes("Add provider · kind");
+    attempt++
+  ) {
+    await inputReady();
+    t.stdin.send("2");
+    await settle(100);
+  }
+
+  await waitFor(() => expect(t.last()).toContain("Add provider · kind"));
   await waitFor(() => expect(t.last()).toContain("openai · OpenAI"));
 }
 
@@ -322,6 +354,10 @@ async function fillToReview(t: ReturnType<typeof mount>) {
   await t.press(ENTER, "Add provider · default model");
   await t.press(ENTER, "Add provider · save");
 }
+
+// The walks press a key per step and wait for the next screen: about a second alone, but several times that while the
+// whole suite loads the machine, which exceeded vitest's 5 s default once in a few full runs.
+vi.setConfig({ testTimeout: 30_000 });
 
 afterEach(() => {
   resetOverlayState();
