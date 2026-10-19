@@ -29,7 +29,7 @@ from k3code.tools import (
     clip_tool_results,
     format_tool_result,
 )
-from k3code.tools.safe_open import Guard, file_guard
+from k3code.tools.safe_open import Guard, file_guard, search_roots
 from k3code.tools.validate import invalid_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
@@ -685,7 +685,9 @@ class AgentLoop:
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
-                with file_guard(self._file_guard(tool_call.name, args, decision)):
+                # grep and glob judge a search outside the roots by the session's roots (see search_withheld)
+                roots = [str(self.cwd), *self.permissions.add_dirs]
+                with file_guard(self._file_guard(tool_call.name, args, decision)), search_roots(roots):
                     result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": self._bash_refusal(exc)}

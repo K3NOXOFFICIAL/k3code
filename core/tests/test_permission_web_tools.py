@@ -77,6 +77,35 @@ def test_a_private_local_or_odd_url_needs_a_person(mode, url) -> None:
         assert d.action == "deny", (tool, d)
 
 
+@pytest.mark.parametrize("url", ["http://router.home.arpa/", "http://nas.lan/", "http://x.localdomain/"])
+def test_home_network_zones_need_a_person(url) -> None:
+    for mode in MODES:
+        d = decide(mode=mode, tool="web_fetch", args={"url": url}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human, (mode, d)
+
+
+@pytest.mark.parametrize("url", ["http://8.8.8.8%25x/", "http://example.com%25x/", "http://10.0.0.1%2525/"])
+def test_a_percent_sign_in_a_host_needs_a_person_and_stores_nothing(url) -> None:
+    for mode in MODES:
+        d = decide(mode=mode, tool="web_fetch", args={"url": url}, cwd=CWD)
+        assert d.action == "ask" and d.needs_human and d.patterns == [], (mode, d)
+
+
+@pytest.mark.parametrize("pattern", ["*", "169.254.*", "169.254.169.254"])
+@pytest.mark.parametrize("layer", ["user_rules", "project_rules", "session_rules"])
+def test_an_ask_rule_on_a_private_host_keeps_the_person_in_auto_mode(pattern, layer) -> None:
+    # a rule meant to be stricter must not let auto mode answer what needs a person without it
+    rules = [_r("web_fetch", pattern, "ask")]
+    url = "http://169.254.169.254/"
+    d = decide(mode="auto", tool="web_fetch", args={"url": url}, cwd=CWD, **{layer: rules})
+    assert (d.action, d.needs_human) == ("ask", True), d
+    headless = decide(mode="auto", tool="web_fetch", args={"url": url}, cwd=CWD, headless=True, **{layer: rules})
+    assert headless.action == "deny", headless
+    # on a public host the ask rule is an ordinary ask: auto mode answers it as before
+    d = decide(mode="auto", tool="web_fetch", args={"url": PUBLIC}, cwd=CWD, **{layer: [_r("web_fetch", "*", "ask")]})
+    assert not d.needs_human, d
+
+
 def test_yolo_still_reads_a_private_host() -> None:
     assert decide(mode="yolo", tool="web_fetch", args={"url": "http://127.0.0.1/"}, cwd=CWD).action == "allow"
 

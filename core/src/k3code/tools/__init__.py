@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from k3code.permissions.engine import search_withheld, sensitive_path
+from k3code.permissions.engine import outside_search_withheld, search_withheld, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
@@ -25,7 +25,7 @@ from k3code.tools.fuzzy_match import (
     fuzzy_find_and_replace,
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
-from k3code.tools.safe_open import NotAllowed, open_regular
+from k3code.tools.safe_open import NotAllowed, open_regular, session_search_roots
 from k3code.trust import _opened_path
 
 # ── Tool registry ──────────────────────────────────────────────────────
@@ -816,6 +816,12 @@ def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
     return result
 
 
+def _search_roots(cwd: Path | None) -> list[str]:
+    """The project roots grep and glob judge a search by: the session's (see safe_open.search_roots), else ``cwd``."""
+    roots = session_search_roots()
+    return list(roots) if roots is not None else [str(cwd or Path.cwd())]
+
+
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
 
@@ -829,6 +835,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     exclude = arguments.get("exclude")
     if sensitive_path(str(path)):
         return {"error": f"Hardline deny (sensitive-path): {path}"}
+    roots = _search_roots(cwd)
     try:
         # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
@@ -859,7 +866,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         withheld = 0
         cut = ""
         verdicts: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
-        secret_file = search_withheld(str(path))
+        secret_file = search_withheld(str(path), roots)
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
             try:
@@ -906,7 +913,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         import re
 
         try:
-            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+            return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, roots)
         except re.error:
             if isinstance(rg_failure, RuntimeError):  # a pattern neither engine takes: rg's message names the fault
                 raise rg_failure from None
@@ -1063,7 +1070,9 @@ def _capped(items: list[str]) -> tuple[list[str], str]:
     return items[:MAX_SEARCH_RESULTS], f"truncated to the first {MAX_SEARCH_RESULTS} results: {_NARROW}"
 
 
-def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
+def _glob_sync(path: Path, pattern: str, roots: list[str] | None = None) -> dict[str, Any]:
+    """tool_glob's walk. ``roots``: the session's project roots; a glob outside them lists no name its grep would
+    withhold (see outside_search_withheld)."""
     import fnmatch
     import re
 
@@ -1073,12 +1082,18 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
     basename_ok = (lambda _: True) if last[0] == "**" else re.compile(fnmatch.translate(last[0])).match
     found: list[str] = []
     timed_out = False
+    hide = outside_search_withheld(str(path), roots) if roots is not None else None
     for rel, _ in _iter_tree(path, time.monotonic() + SEARCH_BUDGET_S):
         if rel is None:
             timed_out = True
             break
         # the work tree decides on a hit the index still lists (see _git_files); a stat per listed path would not
-        if basename_ok(rel.rpartition("/")[2]) and _glob_match(rel, pattern) and os.path.lexists(path / rel):
+        if (
+            basename_ok(rel.rpartition("/")[2])
+            and _glob_match(rel, pattern)
+            and os.path.lexists(path / rel)
+            and not (hide and hide(str(path / rel)))
+        ):
             found.append(rel)
             if len(found) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; no need to walk further
                 break
@@ -1167,7 +1182,10 @@ def _search_glob_match(rel: str, pattern: str) -> bool:
     return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
 
 
-def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
+def _grep_fallback(
+    pattern: str, path: Path, include: Any, exclude: Any, roots: list[str] | None = None
+) -> dict[str, Any]:
+    """tool_grep without rg. ``roots``: the session's project roots, see search_withheld."""
     import re
 
     includes = include if isinstance(include, list) else [include] if include else []
@@ -1184,7 +1202,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     skipped = 0
     changed = False
     timed_out = False
-    secret_file = sensitive_path if named else search_withheld(str(path))  # a named file: tool_grep decided on it
+    # a named file: tool_grep decided on it
+    secret_file = sensitive_path if named else search_withheld(str(path), roots)
     for rel, is_dir in candidates:
         if rel is None or time.monotonic() > deadline:
             timed_out = True
@@ -1239,7 +1258,7 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     outside a git tree also caches and build output). Stops at MAX_SEARCH_RESULTS or SEARCH_BUDGET_S."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
-    return await asyncio.to_thread(_glob_sync, path, pattern)
+    return await asyncio.to_thread(_glob_sync, path, pattern, _search_roots(cwd))
 
 
 TODO_STATUSES = ("pending", "in_progress", "completed")
