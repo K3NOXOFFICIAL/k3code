@@ -1460,7 +1460,10 @@ class _Dirs:
     Known gaps, left as they are: ``here`` drifts past a cd that did not take effect, so a later relative cd is resolved
     from the wrong place when no dangerous directory is in the set (``cd /usr/local; (cd x); cd ..; rm -rf *``); and a
     line that cds into _CD_MAX_DIRS distinct directories or more has every later relative recursive delete refused
-    (``scan-depth``), however harmless."""
+    (``scan-depth``), however harmless. Not modelled either: loops (``for i in a b; do cd .. && rm -rf *; done``) and
+    a function body run after a later cd, ``shopt -s cdable_vars``, ``trap 'cd /' DEBUG``, ``. /dev/stdin <<< 'cd /'``,
+    an OLDPWD set on the line (``OLDPWD=/; cd /tmp && cd -``) and a symlink made on the line. ``cd build || exit 1;
+    rm -rf *`` (the SC2164 idiom) is refused from $HOME or ``/``."""
 
     def __init__(
         self,
