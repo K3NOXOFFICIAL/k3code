@@ -6,6 +6,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Added
 
+- **Add a provider from the `/provider` popup.** `+ Add new provider` now opens a form in the popup instead of printing the `/model chain add` template: pick a preset (the setup wizard's vendors) or an OpenAI-/Anthropic-compatible endpoint, set the name, base URL and API key (masked, never echoed; a key already saved for the preset's own variable can be reused at the vendor's URL), test the connection, pick the default model from the endpoint's list and save. A failed or offline test still lets you save after an explicit confirm. The key is written to the 0600 env file under a variable that held nothing (never `config.yaml`), the block is added like `/model chain add` adds one, and the list comes back with the new block highlighted to switch to now or later. New gateway RPCs `provider.presets`, `provider.probe` and `provider.add` back it.
 - **`/learned` (issue #141).** Lists the project's gotchas, auto gotchas and learned notes plus the machine gotchas, preferences and overlays with an id each; `/learned forget <id>` removes one and `/learned purge --yes` clears auto gotchas, learned notes and overlays outside an active experiment.
 
 ### Fixed
