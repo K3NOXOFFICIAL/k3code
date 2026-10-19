@@ -58,7 +58,7 @@ from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
-from k3code.context_budget import compact_threshold, context_window, overhead_tokens
+from k3code.context_budget import compact_threshold, overhead_tokens, router_window
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -2146,7 +2146,7 @@ class GatewayServer:
                 )
             )
             or None,
-            context_window=self._router_window(router, session),
+            context_window=router_window(self.config, router, self._active_model(session)),
         )
         loop.on_unsandboxed = session.notify_unsandboxed
         loop.on_home_started = session.notify_home_started
@@ -2239,14 +2239,6 @@ class GatewayServer:
             tier="cheap",
             **router_options(self.config),
         )
-
-    def _router_window(self, router: Router, session: LiveSession) -> int:
-        """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
-        has its own), so in-turn elision starts before the tightest model overflows."""
-        models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
-        if not models:
-            return context_window(self.config, self._active_model(session))
-        return min(context_window(self.config, m) for m in models)
 
     async def _run_one_turn(
         self, session: LiveSession, text: str, *, hooked: userhooks.HookOutcome | None = None

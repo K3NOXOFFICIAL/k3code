@@ -21,6 +21,7 @@ from typing import Any
 from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
+from k3code.context_budget import router_window, tool_output_chars
 from k3code.goals import loop_evidence
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
@@ -448,6 +449,8 @@ class SubagentManager:
             unattended_network=bool(autonomy_cfg(server.config)["unattended_network"]),
             task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
+            tool_output_chars=tool_output_chars(server.config),
+            context_window=router_window(server.config, router, server._active_model(parent)),
         )
         from k3code.extratools import register_skill_tool
 
