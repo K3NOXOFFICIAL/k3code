@@ -44,7 +44,12 @@ export function openPermissionsPopup(ctx: SlashRunCtx): void {
 }
 
 /** `/<name> <arg>` on the gateway, which owns the /tune grammar; its message is what the user sees. */
-function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
+function runOnGateway(
+  name: string,
+  arg: string,
+  ctx: SlashRunCtx,
+  after?: () => void,
+) {
   return ctx.gateway.gw
     .request<SlashExecResponse>("slash.exec", {
       command: arg ? `${name} ${arg}` : name,
@@ -53,6 +58,7 @@ function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
     .then((r) => {
       if (!ctx.stale()) {
         ctx.transcript.sys(r?.output || `/${name}: no output`);
+        after?.();
       }
     })
     .catch(ctx.guardedErr);
@@ -109,10 +115,20 @@ export const tuneCommands: SlashCommand[] = [
     help: "popup: switch this session's provider or add a new one (+ Add new provider); /provider <name> [--save] switches (--save: also the default in config.yaml)",
     name: "provider",
     usage: "/provider [<name> [--save]]",
-    run: (arg, ctx) =>
-      arg.trim()
-        ? runOnGateway("provider", arg.trim(), ctx)
-        : openProviderPopup(ctx),
+    run: (arg, ctx) => {
+      if (!arg.trim()) {
+        return openProviderPopup(ctx);
+      }
+
+      // Setup Required has no session to switch (the popup's "use now" after the first add lands here): the switch
+      // sets the daemon's default, then a session starts on it, as /setup does once onboarding has added a provider.
+      const startSession =
+        !ctx.sid && ctx.ui.status === "setup required"
+          ? () => ctx.session.newSession()
+          : undefined;
+
+      return runOnGateway("provider", arg.trim(), ctx, startSession);
+    },
   },
 
   {

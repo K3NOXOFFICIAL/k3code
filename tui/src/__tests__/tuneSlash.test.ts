@@ -173,6 +173,45 @@ describe("/tune, /model and /effort", () => {
     });
   });
 
+  it("/provider <name> on Setup Required (no session) starts a session after the switch", async () => {
+    resetUiState();
+    patchUiState({ status: "setup required" });
+    const ctx = buildCtx(() =>
+      Promise.resolve({ output: "Default provider set to: stubby" }),
+    );
+
+    run(ctx, "/provider stubby");
+
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "provider stubby",
+      session_id: null,
+    });
+    await vi.waitFor(() =>
+      expect(ctx.session.newSession).toHaveBeenCalledOnce(),
+    );
+    expect(ctx.transcript.sys).toHaveBeenCalledWith(
+      "Default provider set to: stubby",
+    );
+  });
+
+  it("/provider <name> with a live session, or when the gateway refuses, starts no session", async () => {
+    const ok = buildCtx(() =>
+      Promise.resolve({ output: "Provider set to: b (from the next turn)" }),
+    );
+
+    run(ok, "/provider b");
+    await vi.waitFor(() => expect(ok.transcript.sys).toHaveBeenCalled());
+    expect(ok.session.newSession).not.toHaveBeenCalled();
+
+    resetUiState();
+    patchUiState({ status: "setup required" });
+    const refused = buildCtx(() => Promise.reject(new Error("boom")));
+
+    run(refused, "/provider b");
+    await vi.waitFor(() => expect(refused.transcript.sys).toHaveBeenCalled());
+    expect(refused.session.newSession).not.toHaveBeenCalled();
+  });
+
   it("/permissions bare opens its own popup; with args goes to gateway", async () => {
     expect(findSlashCommand("permissions")).toBeDefined();
     const ctx = buildCtx(() => Promise.resolve({ output: "ok" }));
