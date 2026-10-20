@@ -103,8 +103,10 @@ def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
     path = config_path(home)
     with confio.locked(path):  # read-modify-write: a second edit waits for the first, then reads its result
         data: dict[str, Any] = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
-        providers = data.get("providers")
-        if not providers:
+        providers = data.get("providers") or []
+        # A full `add` (kind, base_url, key_env) may start the chain: the first provider of a fresh install, added
+        # from the /provider popup. Any other edit needs a chain in this file to edit.
+        if not providers and op != "add":
             raise ChainEditError(f"no providers in {path}; the chain is defined elsewhere (project config?)")
         new = apply_edit(providers, op, args)
         if not new:

@@ -92,19 +92,25 @@ export function baseUrlError(url: string): string {
 
 const trimUrl = (url: string) => url.trim().replace(/\/+$/, "");
 
+interface EditKey {
+  backspace?: boolean;
+  ctrl?: boolean;
+  delete?: boolean;
+  leftArrow?: boolean;
+  meta?: boolean;
+  rightArrow?: boolean;
+}
+
 /**
  * Text-field keys, the key stage's pattern: printable append, Backspace, Ctrl+U clear. A paste's leading or
  * trailing line break is dropped; one inside it (two lines: no key, URL or name has one) refuses the paste: false.
+ * `selected` (a pre-filled default not yet touched) makes the first printable key or paste replace the whole value.
  */
 function editText(
   ch: string,
-  key: {
-    backspace?: boolean;
-    ctrl?: boolean;
-    delete?: boolean;
-    meta?: boolean;
-  },
+  key: EditKey,
   set: (f: (v: string) => string) => void,
+  selected = false,
 ): boolean {
   if (key.backspace || key.delete) {
     set((v) => v.slice(0, -1));
@@ -117,11 +123,16 @@ function editText(
       return false;
     }
 
-    set((v) => v + text);
+    set((v) => (selected ? text : v + text));
   }
 
   return true;
 }
+
+/** Whether a key ends a pre-filled field's selection: any edit, or an arrow key (it starts editing in place). */
+const endsSelection = (ch: string, key: EditKey) =>
+  !!(key.backspace || key.delete || key.leftArrow || key.rightArrow) ||
+  (!!ch && !key.meta);
 
 /**
  * /provider's "+ Add new provider" form (in the popup, no slash command):
@@ -147,6 +158,9 @@ export function ProviderAddForm({
   const [presetIdx, setPresetIdx] = useState(0);
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  // A pre-filled name or URL starts selected: the first printable key replaces it, Backspace/arrows edit it.
+  const [nameSelected, setNameSelected] = useState(false);
+  const [urlSelected, setUrlSelected] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [reuse, setReuse] = useState(false);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
@@ -315,11 +329,16 @@ export function ProviderAddForm({
   /** A text field's key; a multi-line paste is refused in the form. */
   const edit = (
     ch: string,
-    key: Parameters<typeof editText>[1],
+    key: EditKey,
     set: (f: (v: string) => string) => void,
+    selection?: [boolean, (v: boolean) => void],
   ) => {
-    if (!editText(ch, key, set)) {
+    const [selected, setSelected] = selection ?? [false, () => {}];
+
+    if (!editText(ch, key, set, selected)) {
       setErr(MULTILINE_PASTE);
+    } else if (selected && endsSelection(ch, key)) {
+      setSelected(false);
     }
   };
 
@@ -349,6 +368,8 @@ export function ProviderAddForm({
         } else if (key.return && preset) {
           setName(preset.name);
           setUrl(preset.base_url);
+          setNameSelected(!!preset.name);
+          setUrlSelected(!!preset.base_url);
           setApiKey("");
           setReuse(false);
           go("name");
@@ -368,7 +389,7 @@ export function ProviderAddForm({
             go("url");
           }
         } else {
-          edit(ch, key, setName);
+          edit(ch, key, setName, [nameSelected, setNameSelected]);
         }
 
         return;
@@ -391,7 +412,7 @@ export function ProviderAddForm({
             }
           }
         } else {
-          edit(ch, key, setUrl);
+          edit(ch, key, setUrl, [urlSelected, setUrlSelected]);
         }
 
         return;
@@ -484,13 +505,19 @@ export function ProviderAddForm({
     </Text>
   );
 
-  const field = (value: string) => (
+  const field = (value: string, selected = false) => (
     <Text color={t.color.accent} wrap="truncate-end">
       {"  "}
-      {value || "(empty)"}
+      {selected && value ? <Text inverse>{value}</Text> : value || "(empty)"}
       {busy ? "" : "▎"}
     </Text>
   );
+
+  /** A text step's hint: while the pre-filled default is selected, say what replaces it and what edits it. */
+  const textHint = (selected: boolean) =>
+    selected
+      ? "type to replace · ⌫/←/→ edit · Enter next · Esc back"
+      : "Enter next · ^U clear · Esc back";
 
   const status = err ? (
     <Text color={t.color.label} wrap="truncate-end">
@@ -538,9 +565,9 @@ export function ProviderAddForm({
         return (
           <>
             {title("name")}
-            {field(name)}
+            {field(name, nameSelected)}
             {status}
-            <OverlayHint t={t}>Enter next · Esc back</OverlayHint>
+            <OverlayHint t={t}>{textHint(nameSelected)}</OverlayHint>
           </>
         );
 
@@ -548,9 +575,9 @@ export function ProviderAddForm({
         return (
           <>
             {title("base URL")}
-            {field(url)}
+            {field(url, urlSelected)}
             {status}
-            <OverlayHint t={t}>Enter next · ^U clear · Esc back</OverlayHint>
+            <OverlayHint t={t}>{textHint(urlSelected)}</OverlayHint>
           </>
         );
 

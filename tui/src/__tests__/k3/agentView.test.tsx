@@ -120,7 +120,7 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · tab/→/⏎ attach · x stop · c collapse · ←/esc back",
+      "↑↓ select · ⏎/→ open · c collapse · x stop · tab compose · ←/esc back",
     );
     // a permanent composer row sits between the list and the hint; while the
     // list has focus the composer only shows its placeholder
@@ -599,6 +599,90 @@ describe("AgentViewPane", () => {
         () => expect(onNewPrompt).toHaveBeenCalledWith("test session"),
         { timeout: 10000 },
       );
+    } finally {
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
+  it("composer: ⏎ empties it after starting a session, esc clears a draft without closing the view", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([{ id: "a", status: "working", title: "alpha" }]);
+
+    const onNewPrompt = vi.fn();
+    const onClose = vi.fn();
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    let fresh = "";
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+
+    stdout.on("data", (c) => {
+      fresh += stripAnsi(c.toString());
+    });
+
+    const typeSlowly = async (text: string) => {
+      for (const ch of text) {
+        stdin.write(ch);
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    };
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={() => {}}
+        onClose={onClose}
+        onNewPrompt={onNewPrompt}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await waitFor(() => expect(fresh).toContain("◐ alpha"));
+      stdin.write("\t");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_INPUT_HINT));
+      await new Promise((r) => setTimeout(r, 30));
+
+      await typeSlowly("first task");
+      stdin.write("\r");
+      await waitFor(() =>
+        expect(onNewPrompt).toHaveBeenCalledWith("first task"),
+      );
+      await new Promise((r) => setTimeout(r, 200));
+      expect(view.lastFrame?.() ?? fresh.split("❯").at(-1)).not.toContain(
+        "first task",
+      );
+
+      await typeSlowly("draft");
+      fresh = "";
+      stdin.write("\x1b");
+      await new Promise((r) => setTimeout(r, 300));
+      expect(onClose).not.toHaveBeenCalled();
+      expect(fresh.split("❯").at(-1)).toContain("start a new session");
+
+      stdin.write("\x1b");
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
     } finally {
       view.unmount();
       view.cleanup();

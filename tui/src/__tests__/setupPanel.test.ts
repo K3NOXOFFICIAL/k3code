@@ -22,6 +22,15 @@ describe("Setup Required panel", () => {
     expect(panelText()).not.toContain("`k3code setup`");
   });
 
+  it("names the in-TUI route first: /provider and its + Add new provider... row", () => {
+    const [first] = buildSetupRequiredSections()[1]!.rows!;
+
+    expect(first![0]).toBe("/provider");
+    expect(first![1]).toContain("+ Add new provider...");
+    // the second column fits the 80-column panel without an ellipsis
+    expect(first![1]!.length).toBeLessThanOrEqual(50);
+  });
+
   it("does not point at a dashboard or Desktop settings page k3code does not have", () => {
     expect(panelText()).not.toMatch(/dashboard|desktop/i);
   });

@@ -8,6 +8,7 @@ export const buildSetupRequiredSections = (): PanelSection[] => [
   },
   {
     rows: [
+      ["/provider", 'pick "+ Add new provider..." in the popup'],
       [
         "/setup",
         "run `k3code onboard` in-place: fast setup asks only for an endpoint and key",

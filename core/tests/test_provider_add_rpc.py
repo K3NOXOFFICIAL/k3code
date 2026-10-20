@@ -275,3 +275,26 @@ async def test_a_vendor_preset_keeps_its_own_kind(server, monkeypatch):
     assert seen == [{"kind": "anthropic", "base_url": "https://api.anthropic.com"}]
     await _ok(server, "provider.add", params)
     assert yaml.safe_load(chain_config.config_path().read_text())["providers"][-1]["kind"] == "anthropic"
+
+
+@pytest.mark.parametrize("existing", ["display:\n  tui_start_agents_view: true\n", None])
+async def test_the_first_provider_of_a_fresh_install_is_added(server, existing):
+    """A fresh home has no providers (or no config file at all): the popup's add form is how the first one gets in."""
+    path = chain_config.config_path()
+    if existing is None:
+        path.unlink()
+    else:
+        path.write_text(existing)
+    server.config.providers = []
+    await _ok(server, "provider.add", _add())
+    data = yaml.safe_load(path.read_text())
+    assert [p["name"] for p in data["providers"]] == ["mine"]
+    if existing is not None:
+        assert data["display"] == {"tui_start_agents_view": True}  # the rest of the file is kept
+    assert [p.name for p in server.config.providers] == ["mine"]
+
+
+async def test_other_chain_edits_still_need_a_chain_in_the_file(server):
+    chain_config.config_path().write_text("display: {}\n")
+    with pytest.raises(chain_config.ChainEditError, match="no providers in"):
+        chain_config.edit_config("remove", ["first"])

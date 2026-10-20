@@ -95,7 +95,7 @@ def wait_cs(t: Tui, pattern: str, timeout: float = 10) -> bool:
     return False
 
 
-VIEW_FOOTER = r"→/⏎ attach"
+VIEW_FOOTER = r"⏎/→ open"
 VIEW_GROUP = r"\b(Needs input|Working|Completed)\b"
 STRIP_MARKER = r"›\s*[◐●✓✗○]"
 STRIP_ROW = r"^\s*[◐●✓✗○] {}.* · (working|needs input|idle|completed|failed)\b"  # a strip row by title
@@ -457,7 +457,7 @@ def agent_view_keys() -> str:
         need(not re.search(STRIP_MARKER, t.text()), "↓ put a selection marker in the strip\n" + tail_screen(t))
 
         t.key("left")
-        need(wait_cs(t, VIEW_FOOTER, 10), "agent view footer '→/⏎ attach' not shown\n" + tail_screen(t))
+        need(wait_cs(t, VIEW_FOOTER, 10), "agent view footer '⏎/→ open' not shown\n" + tail_screen(t))
         need(wait_cs(t, VIEW_GROUP, 5), "no Needs input/Working/Completed group header\n" + tail_screen(t))
         groups = sorted(set(re.findall(VIEW_GROUP, t.text())))
         start = marker_line(t)
@@ -499,7 +499,7 @@ def agent_view_keys() -> str:
                 break
         need("say himark" in input_line(t), "↑ did not recall the earlier prompt\n" + tail_screen(t))
         return (
-            f"↓ left the strip unselected; ← view with groups {groups} and footer '→/⏎ attach', opened on the current "
+            f"↓ left the strip unselected; ← view with groups {groups} and footer '⏎/→ open', opened on the current "
             "row; ↑/↓ moved '›' to the bg session and back; → attached it (composer busy, its strip row gone); "
             "← reopened, esc closed; "
             f"↑ recalled: {input_line(t).strip()!r}"

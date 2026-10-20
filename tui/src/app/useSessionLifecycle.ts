@@ -267,6 +267,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       const setup = await rpc<SetupStatusResponse>("setup.status", {});
 
       if (setup?.provider_configured === false) {
+        // The agent view (`k3code agents`, "Start in agent view") would cover the Setup Required panel: close it.
+        patchOverlayState({ agentView: false });
         panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections());
         patchUiState({ status: "setup required" });
 

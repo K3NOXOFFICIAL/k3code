@@ -29,17 +29,18 @@ const runSlash = (name: string, arg = "") =>
   );
 
 /** Mount the real lifecycle hook against a gateway that never answers: only the synchronous part of each call runs. */
-function mountLifecycle() {
+function mountLifecycle(rpcReply?: (method: string) => Promise<unknown>) {
   let api: null | ReturnType<typeof useSessionLifecycle> = null;
   const pending = () => new Promise<never>(() => {});
+  const panel = vi.fn();
 
   function Probe() {
     const lifecycle = useSessionLifecycle({
       colsRef: { current: 80 },
       composerActions: { setComposerTokens: vi.fn() } as never,
       gw: { request: pending } as never,
-      panel: vi.fn(),
-      rpc: vi.fn(pending) as never,
+      panel,
+      rpc: vi.fn(rpcReply ?? pending) as never,
       scrollRef: { current: null },
       setHistoryItems: vi.fn(),
       setLastUserMsg: vi.fn(),
@@ -65,7 +66,7 @@ function mountLifecycle() {
     stdout: stream() as unknown as NodeJS.WriteStream,
   });
 
-  return { api: () => api!, unmount: () => instance.unmount() };
+  return { api: () => api!, panel, unmount: () => instance.unmount() };
 }
 
 beforeEach(() => {
@@ -139,6 +140,31 @@ describe("agent view overlay state", () => {
 
       void (lifecycle.api()[method] as (id?: string) => unknown)("sid-2");
 
+      expect(getOverlayState().agentView).toBe(false);
+    } finally {
+      lifecycle.unmount();
+    }
+  });
+
+  it("a new session that finds no provider closes it, so the Setup Required panel shows", async () => {
+    const lifecycle = mountLifecycle((method) =>
+      Promise.resolve(
+        method === "setup.status" ? { provider_configured: false } : {},
+      ),
+    );
+
+    try {
+      await vi.waitFor(() => expect(lifecycle.api()).toBeTruthy());
+      patchOverlayState({ agentView: true });
+
+      lifecycle.api().newSession();
+
+      await vi.waitFor(() =>
+        expect(lifecycle.panel).toHaveBeenCalledWith(
+          "Setup Required",
+          expect.anything(),
+        ),
+      );
       expect(getOverlayState().agentView).toBe(false);
     } finally {
       lifecycle.unmount();

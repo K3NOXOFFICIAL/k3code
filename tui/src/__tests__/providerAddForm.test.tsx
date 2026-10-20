@@ -442,6 +442,71 @@ describe("ProviderAddForm (in the /provider popup)", () => {
     t.stop();
   });
 
+  it("the pre-filled name is selected: the first typed key replaces it, Backspace edits it instead", async () => {
+    const t = mount();
+
+    await openForm(t);
+    await t.press(
+      ENTER,
+      "type to replace · ⌫/←/→ edit · Enter next · Esc back",
+    );
+    expect(t.last()).toContain("openai");
+
+    for (const ch of "stub") {
+      await t.press(ch);
+    }
+
+    await waitFor(() => expect(t.last()).toContain("stub▎"));
+    expect(t.last()).not.toContain("openaistub");
+    // once typed over, the field is plain text again: ^U clears it, a key appends
+    expect(t.last()).toContain("Enter next · ^U clear · Esc back");
+    await t.press("by", "stubby▎");
+    await t.press(ENTER, "Add provider · base URL");
+    t.stop();
+
+    const u = mount();
+
+    await openForm(u);
+    await u.press(ENTER, "type to replace");
+    await u.press("\u007f", "opena▎");
+    await u.press("x", "openax▎");
+    expect(u.last()).toContain("Enter next · ^U clear · Esc back");
+    u.stop();
+  });
+
+  it("the pre-filled base URL is selected: typing a new URL replaces it without ^U first", async () => {
+    const t = mount();
+
+    await openForm(t);
+    await t.press(ENTER, "Add provider · name");
+    await t.press(ENTER, "Add provider · base URL");
+    expect(t.last()).toContain("https://api.openai.com/v1");
+    expect(t.last()).toContain("type to replace");
+
+    for (const ch of "http://127.0.0.1:9/v1") {
+      await t.press(ch);
+    }
+
+    await waitFor(() => expect(t.last()).toContain("  http://127.0.0.1:9/v1▎"));
+    await t.press(ENTER, "Add provider · API key");
+    await t.press(KEY, "•");
+    await t.press(ENTER, "Add provider · default model");
+    expect(t.calls("provider.probe")[0]).toMatchObject({
+      base_url: "http://127.0.0.1:9/v1",
+    });
+    t.stop();
+
+    // an arrow key starts editing in place: the next key appends
+    const u = mount();
+
+    await openForm(u);
+    await u.press(ENTER, "Add provider · name");
+    await u.press(ENTER, "Add provider · base URL");
+    await u.press("\u001b[D", "Enter next · ^U clear");
+    await u.press("x", "https://api.openai.com/v1x▎");
+    u.stop();
+  });
+
   it("refuses a name an existing block has, regardless of case", async () => {
     const t = mount();
 
