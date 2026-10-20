@@ -14,8 +14,11 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cache, lru_cache
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
@@ -35,7 +38,7 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     (
         "git-push-force-main",
         r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)"
-        r"(?=[^\n;|&]*(?:[\s:+]|refs/heads/)(?:main|master)(?![^\s;|&]))",
+        r"(?=[^\n;|&]*(?:[\s:+]|refs/heads/)(?i:main|master)(?![^\s;|&]))",
     ),
 ]
 
@@ -406,7 +409,14 @@ def check_parse(
     command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
 ) -> tuple[str | None, Parsed]:
     """:func:`check` and the parse it read (``parse(command)``): the engine decides on that parse instead of parsing a
-    long command line a second time."""
+    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope)."""
+    with lookup_scope():
+        return _check_parse(command, extra_patterns, cwd, home)
+
+
+def _check_parse(
+    command: str, extra_patterns: list[str] | None, cwd: str | None, home: str | None
+) -> tuple[str | None, Parsed]:
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
     parsed = parse(command, budget=budget)
@@ -416,28 +426,42 @@ def check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
-    return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, cwd, home), parsed
+    _reserve_users(parsed.clean)
+    dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
+    try:
+        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs), parsed
+    except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
+        return "scan-depth", parsed
 
 
-def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home: str) -> str | None:
+def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
+    # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
+    home = dirs.home
+    need = {k for ks in parsed.child_subs for k in ks}
+    where: dict[int, _Where] = {}  # the directories of the subs a child came from, taken at that sub
     for k, sub in enumerate(parsed.subs):
-        argv = normalize_argv(_tokens(sub))
+        if k in need:
+            where[k] = dirs.where()
+        argv = _command_argv(_tokens(sub))
         hit = (
             _match(sub, extra)
             or _match(" ".join(argv), extra)
             or _simple_check(sub)
-            or _rm_check(argv, cwd, home)
+            or _rm_check(argv, dirs, home)
+            or _find_check(argv, dirs, home)
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
         )
         if hit:
             return hit
-    hit = _pipeline_check(parsed.pipelines)
+        dirs.follow(argv, sub)
+    hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
     if hit:
         return hit
-    for child in parsed.children:
-        hit = _match(child.clean, extra) or _check_parsed(child, extra, cwd, home)
+    for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
+        start = [where[k] for k in ks if k in where]
+        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start))
         if hit:
             return hit
     return None
@@ -785,6 +809,67 @@ def _is_assignment(t: str) -> bool:
     return "=" in t and not t.startswith("=") and t.split("=", 1)[0].isidentifier()
 
 
+#: Reserved words, braces and ``!`` that open or close a compound command in front of the command it runs (``if rm
+#: ...``, ``then rm ...``, ``do rm ...``, ``{ rm ...``, ``! rm ...``, ``f() { rm ...``): the shell runs the command
+#: after them, so the checks look past them (see _command_argv). ``(`` and ``)`` already split commands (see _scan) and
+#: ``time`` is a wrapper.
+_RESERVED_LEADERS = frozenset(
+    {"{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "esac"}
+)
+#: Compound-command headers that run nothing themselves: ``for NAME in WORDS``, ``select NAME in WORDS``, ``case WORD
+#: in``. A ``$(...)`` in them is a payload, checked on its own.
+_RESERVED_HEADERS = frozenset({"for", "select", "case"})
+_RESERVED_WORDS = _RESERVED_LEADERS | _RESERVED_HEADERS | {"function", "coproc"}
+
+
+def _past_reserved(tokens: list[str]) -> list[str]:
+    """``tokens`` from the command the shell runs: past the leading reserved words, braces and ``!`` (nested ones
+    too: ``{ { if ! rm``), ``function NAME`` and ``coproc [NAME]``; empty for a for/select/case header."""
+    i, n = 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t in _RESERVED_LEADERS:
+            i += 1
+        elif t in _RESERVED_HEADERS:
+            return []
+        elif t == "function":
+            i += 2  # ``function NAME { ...``; ``function f()`` is split at the ``(``
+        elif t == "coproc":
+            i += 1
+            if i + 1 < n and tokens[i + 1] == "{" and tokens[i].isidentifier():
+                i += 1  # ``coproc NAME { ...; }``: a name only comes before a compound command
+        else:
+            break
+    return tokens[i:]
+
+
+#: How many times :func:`_command_argv` may switch between wrappers and reserved words or busybox in one simple command
+#: (``time { sudo busybox env`` is three). Every switch copies the rest of the words, so an endless alternation
+#: (``time { time { ...``) would cost the square of its length; past the cap the command is denied (``scan-depth``).
+_ARGV_MAX_ROUNDS = 32
+
+
+class _TooDeep(Exception):
+    """A simple command alternates wrappers and reserved words more often than _ARGV_MAX_ROUNDS: what it runs was not
+    read, so check() denies it (``scan-depth``) and parse() marks it too deep."""
+
+
+def _command_argv(tokens: list[str]) -> list[str]:
+    """:func:`normalize_argv` of the command that runs past the reserved words in front of it (see _past_reserved)
+    and through ``busybox APPLET`` (``busybox rm``, ``busybox env``, ``busybox sh -c``), in any order and nesting
+    (``time { busybox rm``, ``sudo busybox env``). The hardline checks read this; the engine keeps its own reading.
+    Raises _TooDeep past _ARGV_MAX_ROUNDS switches."""
+    argv = tokens
+    # a round drops the reserved words in front, then the wrappers/eval (normalize_argv), then one busybox
+    for _ in range(_ARGV_MAX_ROUNDS):
+        argv = normalize_argv(_past_reserved(argv))
+        if argv[:1] == ["busybox"] and len(argv) > 1 and not argv[1].startswith("-"):
+            argv = argv[1:]
+        elif not argv or argv[0] not in _RESERVED_WORDS:
+            return argv
+    raise _TooDeep
+
+
 #: Wrapper option arity for :func:`normalize_argv`: (short options taking a value, long options taking a value,
 #: positional arguments before the wrapped command).
 _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
@@ -935,20 +1020,23 @@ def _env_long_option(key: str) -> str:
 def _skip_wrapper_options(
     name: str,
     args: list[str],
+    start: int,
     spec: tuple[str, frozenset[str], int],
     reads: list[str] | None = None,
     chdirs: list[str] | None = None,
     replaces: list[str] | None = None,
-) -> list[str]:
-    """``args`` after the wrapper's own options (and its ``positionals``): the wrapped command, empty when there is
-    none. ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it: the words of STRING take the
-    option's place and are parsed in turn as env's own options, assignments and command, so ``env -S '-u PATH'`` is
-    ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make' test`` runs ``make test``."""
+) -> tuple[list[str], int]:
+    """Where the wrapped command starts in ``args`` when the wrapper's own options (and its ``positionals``) start at
+    ``start`` (past the end when there is none), and the words that index is in: ``args`` itself, or a new list when an
+    ``env -S`` string put its words in (``args`` is never changed, and not copied otherwise, so a chain of wrappers
+    costs time linear in its words). ``env -S STRING`` / ``--split-string=STRING`` is read the way GNU env reads it:
+    the words of STRING take the option's place and are parsed in turn as env's own options, assignments and command,
+    so ``env -S '-u PATH'`` is ``env -u PATH`` (nothing to run: it prints the environment) and ``env -S 'X=1 make'
+    test`` runs ``make test``."""
     short_val, long_val, positionals = spec
     read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
     chdir_short, chdir_long = _WRAPPER_CHDIR_OPTS.get(name, ("", frozenset()))
-    args = list(args)
-    i = 0
+    i = start
     while i < len(args):
         a = args[i]
         if a == "--":
@@ -997,8 +1085,9 @@ def _skip_wrapper_options(
         else:
             break
         i += 1
-        args[i:i] = split  # STRING's words are never longer than STRING, so this ends
-    return args[i + positionals :]
+        if split:  # STRING's words are never longer than STRING, so this ends
+            args = [*args[:i], *split, *args[i:]]
+    return args, i + positionals
 
 
 def normalize_argv(
@@ -1015,19 +1104,34 @@ def normalize_argv(
     ``replaces`` the strings ``xargs -I``/``-i``/``--replace`` swaps for its input in the command it runs.
     """
     argv = list(tokens)
+    # the words are walked with an index (argv[s] is the next one to read), not copied once per wrapper or eval, so a
+    # chain of thousands of them costs time linear in its length. eval re-splits its words only from the first one a
+    # re-split can change (whitespace, a quote, a backslash, an empty word): the plain words before it come back as they
+    # are. argv[s + 1 : plain] are known to be plain, argv[fixed:] to come back unchanged from a re-split.
+    s, plain, fixed = 0, 0, len(argv) + 1
     # every round drops at least a wrapper name, or turns an env -S string into its (shorter) words
     for _ in range(sum(len(t) + 1 for t in tokens) + 1):
-        while argv and _is_assignment(argv[0]):
-            argv = argv[1:]
-        if not argv:
+        while s < len(argv) and _is_assignment(argv[s]):
+            s += 1
+        if s >= len(argv):
             return []
-        name = os.path.basename(argv[0]) or argv[0]
-        argv = [name, *argv[1:]]
-        if name == "eval" and len(argv) > 1:
-            argv = _tokens(" ".join(argv[1:]))
+        name = os.path.basename(argv[s]) or argv[s]
+        if name == "eval" and s + 1 < len(argv):
+            k = max(s + 1, plain)
+            while k < len(argv) and k < fixed and argv[k] and not _RESPLIT_CHANGES.search(argv[k]):
+                k += 1
+            plain = k
+            if k < len(argv) and k < fixed:
+                tail = _tokens(" ".join(argv[k:]))
+                if tail == argv[k:]:
+                    fixed = k
+                else:
+                    argv = [*argv[:k], *tail]
+                    fixed = len(argv) + 1
+            s += 1
             continue
         if name == "git":
-            i = 1
+            i = s + 1
             while i < len(argv) and argv[i].startswith("-"):
                 if argv[i] == "-C" and chdirs is not None and i + 1 < len(argv):
                     chdirs.append(argv[i + 1])
@@ -1035,12 +1139,19 @@ def normalize_argv(
             return [name, *argv[i:]]
         spec = _WRAPPER_SPECS.get(name)
         if spec is None:
-            return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec, reads, chdirs, replaces)
-        if not rest:
-            return argv
-        argv = rest
-    return argv
+            return [name, *argv[s + 1 :]]
+        words, rest = _skip_wrapper_options(name, argv, s + 1, spec, reads, chdirs, replaces)
+        if rest >= len(words):
+            return [name, *argv[s + 1 :]]
+        if words is not argv:  # an env -S string put its words in: the words after them moved
+            argv, plain, fixed = words, rest, len(words) + 1
+        s = rest
+    return argv[s:]
+
+
+#: A character that makes eval's re-split of a word give something other than the word: shlex's whitespace, quotes
+#: and escape character.
+_RESPLIT_CHANGES = re.compile(r"[ \t\r\n'\"\\]")
 
 
 #: Commands that download content, and commands that run what they are fed as code.
@@ -1122,7 +1233,7 @@ def _pipeline_check(pipelines: list[list[str]]) -> str | None:
     for stages in pipelines:
         fetched = False
         for stage in stages:
-            argv = normalize_argv(_tokens(stage))
+            argv = _command_argv(_tokens(stage))
             name = argv[0] if argv else ""
             if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
@@ -1140,12 +1251,18 @@ def _fetch_run_check(argv: list[str], payloads: list[str]) -> str | None:
     for payload in payloads:
         inner = parse(payload)
         for s in (*inner.subs, *inner.nested):
-            if normalize_argv(_tokens(s))[:1] and normalize_argv(_tokens(s))[0] in _FETCHERS:
+            if _command_argv(_tokens(s))[:1] and _command_argv(_tokens(s))[0] in _FETCHERS:
                 return "fetch-and-run"
     return None
 
 
 _MAIN_REFS = frozenset({"main", "master", "refs/heads/main", "refs/heads/master"})
+
+
+def _is_main_ref(ref: str) -> bool:
+    """``ref`` names main/master, in any letter case: this repository's default branch is ``Main``, and the shared
+    drvfs/macOS checkouts fold case anyway. Over-denying a branch that differs from main only in case is cheap."""
+    return ref.lower() in _MAIN_REFS
 
 
 def _git_push_check(argv: list[str]) -> str | None:
@@ -1169,13 +1286,13 @@ def _git_push_check(argv: list[str]) -> str | None:
         if not a.startswith("-"):
             positional.append(a)
     # with --delete every operand is a ref to delete (a lone `git push --delete main` too, whatever git reads it as)
-    if delete and any(p.lstrip("+") in _MAIN_REFS for p in positional):
+    if delete and any(_is_main_ref(p.lstrip("+")) for p in positional):
         return "git-push-delete-main"
     for refspec in positional[1:]:
         src, colon, dst = refspec.lstrip("+").rpartition(":")
-        if dst in _MAIN_REFS and colon and not src:
+        if _is_main_ref(dst) and colon and not src:
             return "git-push-delete-main"
-        if dst in _MAIN_REFS and (force or refspec.startswith("+")):
+        if _is_main_ref(dst) and (force or refspec.startswith("+")):
             return "git-push-force-main"
     return None
 
@@ -1197,7 +1314,7 @@ def _env_dump_check(sub: str) -> str | None:
     The shell builtins that list variables with their values when given no name: ``set``, ``export`` (``-p``, ``-n``,
     ``--``) and ``declare`` / ``typeset`` (``-x``, ``-p``, ``-g``, none, ...); ``export -f`` and ``declare -f``/``-F``
     list functions instead. ``compgen -e`` / ``-v`` print variable names only, never a value, and are left alone."""
-    argv = normalize_argv(_without_redirects(_tokens(sub)))
+    argv = _command_argv(_without_redirects(_tokens(sub)))
     if not argv:
         return None
     name, args = os.path.basename(argv[0]), argv[1:]
@@ -1224,13 +1341,128 @@ def _builtin_options(args: list[str]) -> tuple[str, list[str]]:
 
 
 _HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
+#: A leading ``~name`` (another user's home), up to the first slash.
+_TILDE_USER = re.compile(r"~([A-Za-z_][A-Za-z0-9._-]*)(?=/|$)")
+
+
+def _user_home(name: str) -> str | None:
+    """The home folder of the user ``name`` (``~name``), None when unknown; ``root``'s is ``/root`` when the lookup
+    fails (no pwd module, no such entry). Every call is a user database lookup (with sssd or LDAP, a network round
+    trip): a check reaches it through _home_of, which caps the lookups and remembers them for that check only."""
+    try:
+        import pwd  # Unix only
+
+        return pwd.getpwnam(name).pw_dir
+    except (ImportError, KeyError, ValueError):
+        return "/root" if name == "root" else None
+
+
+#: How many distinct ``~name`` users one check may look up (see lookup_scope). A command that names more is too long
+#: to look them all up: the user database may be a network service, and the lookups ran synchronously in the daemon.
+_TILDE_MAX_USERS = 32
+#: A ``~name`` at the start of a word (or after ``=``/``:`` in an assignment, a quote or a brace): the names a check
+#: gives a place in its budget, in line order.
+_TILDE_WORD = re.compile(r"""(?:^|(?<=[\s;&|()<>=:'"`{,]))~([A-Za-z_][A-Za-z0-9._-]*)(?=[/\s;&|()<>'"`},:]|$)""")
+#: The users a check has given a place in its budget: name -> home, None (no such user) or _PENDING (not looked up
+#: yet). None outside a check. A ContextVar, so a decision in a worker thread or another task has its own.
+_TILDE_USERS: ContextVar[dict[str, object] | None] = ContextVar("k3code_tilde_users", default=None)
+_PENDING = object()
+#: _home_of for a ``~name`` past the budget: whose home it is was not looked up, so where the word goes is unknown.
+PAST_BUDGET = object()
+
+
+@contextmanager
+def lookup_scope() -> Iterator[None]:
+    """One check's budget of ``~name`` lookups: at most _TILDE_MAX_USERS distinct users, one lookup each. Opened by
+    engine.decide and check_parse; a scope already open (check_parse under decide) is reused."""
+    if _TILDE_USERS.get() is not None:
+        yield
+        return
+    token = _TILDE_USERS.set({})
+    try:
+        yield
+    finally:
+        _TILDE_USERS.reset(token)
+
+
+def _reserve_users(text: str) -> None:
+    """Give the ``~name`` words of ``text`` their places in the open scope's budget in line order, before any of them
+    is judged: which names fall past the budget depends on the command alone, not on which check reads a word first
+    (``cat ~a/x ~b/x ...; rm -rf ~bin`` has ``~bin`` past it however few words the checks expand)."""
+    users = _TILDE_USERS.get()
+    if users is None:
+        return
+    for m in _TILDE_WORD.finditer(text):
+        if len(users) >= _TILDE_MAX_USERS:
+            return
+        name = m.group(1)
+        if name != "root" and name != _own_name():
+            users.setdefault(name, _PENDING)
+
+
+@cache
+def _own_name() -> str | None:
+    """The name of the user this process runs as (one lookup by uid, once), None when unknown."""
+    try:
+        import pwd  # Unix only
+
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, AttributeError):
+        return None
+
+
+def _home_of(name: str, home: str) -> object:
+    """Where ``~name`` goes: a home folder, None for a user the machine does not know, or PAST_BUDGET when the open
+    scope has given its _TILDE_MAX_USERS places to other users. ``root`` (``/root``) and the user this process runs
+    as (``home``) cost no lookup; outside a scope every name is looked up."""
+    if name == "root":
+        return "/root"
+    if name == _own_name():
+        return home
+    users = _TILDE_USERS.get()
+    if users is None:
+        return _user_home(name)
+    found = users.get(name, _PENDING if len(users) < _TILDE_MAX_USERS else PAST_BUDGET)
+    if found is _PENDING:
+        found = users[name] = _user_home(name)
+    return found
+
+
+def past_budget(word: str) -> bool:
+    """``word`` starts with a ``~name`` past the open scope's lookup budget: where it goes is unknown."""
+    m = _TILDE_USER.match(word) if word.startswith("~") else None
+    return bool(m) and _home_of(m.group(1), "") is PAST_BUDGET
+
+
+def expand_user(path: str) -> str:
+    """``os.path.expanduser(path)`` with a ``~name`` looked up within the open scope's budget (see _home_of): past it,
+    or for a user the machine does not know, ``path`` is returned as written."""
+    if not path.startswith("~") or os.name != "posix":
+        return os.path.expanduser(path)
+    end = path.find("/")
+    end = len(path) if end < 0 else end
+    if end == 1:
+        return os.path.expanduser(path)  # ~ and ~/x: $HOME
+    found = _home_of(path[1:end], os.path.expanduser("~"))
+    if not isinstance(found, str):
+        return path
+    return (found.rstrip("/") + path[end:]) or "/"
+
+
+def _expand_tilde(word: str, home: str) -> str:
+    """``word`` with a leading ``~`` (``home``) or ``~name`` (that user's home, when known and within the lookup
+    budget) expanded."""
+    if word == "~" or word.startswith("~/"):
+        return home + word[1:]
+    m = _TILDE_USER.match(word) if word.startswith("~") else None
+    user_home = _home_of(m.group(1), home) if m else None
+    return user_home + word[m.end() :] if m and isinstance(user_home, str) else word
 
 
 def expand_vars(word: str, cwd: str | None, home: str) -> str:
-    """``word`` with a leading ``~`` and every ``$HOME``/``${HOME}`` (and ``$PWD``/``${PWD}`` when ``cwd`` is known)
-    expanded; other variables stay as written."""
-    if word == "~" or word.startswith("~/"):
-        word = home + word[1:]
+    """``word`` with a leading ``~`` or ``~name`` and every ``$HOME``/``${HOME}`` (and ``$PWD``/``${PWD}`` when
+    ``cwd`` is known) expanded; other variables stay as written."""
+    word = _expand_tilde(word, home)
 
     def sub(m: re.Match[str]) -> str:
         name = m.group(1) or m.group(2)
@@ -1240,8 +1472,7 @@ def expand_vars(word: str, cwd: str | None, home: str) -> str:
 
 
 def _expand_target(t: str, cwd: str | None, home: str) -> str:
-    if t == "~" or t.startswith("~/"):
-        t = home + t[1:]
+    t = _expand_tilde(t, home)
     t = t.replace("${HOME}", home).replace("$HOME", home)
     if cwd:
         t = t.replace("${PWD}", cwd).replace("$PWD", cwd)
@@ -1251,12 +1482,246 @@ def _expand_target(t: str, cwd: str | None, home: str) -> str:
         base = os.path.normpath(base)
         if base.startswith("//"):
             base = "/" + base.lstrip("/")
-    return base + "/*" if glob else base
+    return base.rstrip("/") + "/*" if glob else base  # `/./*` is `/*`
 
 
-def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
+def _reparsed_text(sub: str) -> str:
+    """The text a ``cd`` in ``sub`` is finally read from: for ``eval ARGS`` the shell joins the words and parses them
+    again, so ``eval 'cd $X'`` and ``eval "cd $X"`` run a ``cd`` whose ``$X`` is UNQUOTED (unset, that is a plain
+    ``cd``, home), while ``eval 'cd "$X"'`` still runs a quoted one (``cd ""`` fails). Any other command: ``sub``."""
+    pre = _strip_wrappers(_past_reserved(_tokens(sub)))
+    if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
+        return " ".join(pre[1:])
+    return sub
+
+
+def _unquoted_expansion(sub: str) -> bool:
+    """Whether the text ``sub`` has a ``$`` or a backtick outside quotes: an expansion that may give no word at all.
+    A ``$(...)``, backtick or ``${...}`` in double quotes is one unit, skipped whole (see _unit_end)."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c in "$`":
+            if not dquoted:
+                return True
+            end = _unit_end(sub, i)
+            if end == -2:
+                return True  # an unclosed unit: where the quotes end is unknown
+            i = max(i, end)
+        i += 1
+    return False
+
+
+def _join_dir(base: str, t: str) -> str:
+    """The directory ``cd t`` goes to from ``base``, normalised (``//x`` is ``/x``)."""
+    d = os.path.normpath(os.path.join(base, t))
+    return "/" + d.lstrip("/") if d.startswith("//") else d
+
+
+_CDPATH_VALUE = re.compile(r"""\bCDPATH=("[^"]*"|'[^']*'|[^\s;&|()<>]*)""")
+
+
+def _cdpath_entries(command: str) -> tuple[str, ...] | None:
+    """None when neither ``command`` nor the environment mentions CDPATH, else the literal absolute entries of the
+    values it is given on the line (``CDPATH=/srv cd app``, ``export CDPATH=/srv``) and in the environment."""
+    env = os.environ.get("CDPATH")
+    if env is None and "CDPATH" not in command:
+        return None
+    values = [m.group(1).strip("\"'") for m in _CDPATH_VALUE.finditer(command)]
+    entries = [e for v in [*values, env or ""] for e in v.split(":")]
+    return tuple(dict.fromkeys(e for e in entries if e.startswith("/") and not any(c in e for c in "$`\\")))
+
+
+#: How many directories a command line may ``cd`` into (the cwd included) before a relative rm/find target is too many
+#: places to read: each is read in every one of them (see _Dirs), so past the cap such a target is denied
+#: (``scan-depth``) rather than read thousands of times over.
+_CD_MAX_DIRS = 32
+
+
+@dataclass(frozen=True)
+class _Where:
+    """The directories a sub may run in, taken at that sub (see _Dirs.where)."""
+
+    dirs: tuple[str | None, ...]
+    overflow: bool
+    here: str | None
+
+
+class _Dirs:
+    """The directories a simple command of the line may run in, followed in line order: the cwd and every directory a
+    ``cd``/``pushd`` before it went to (``all``). A cd may fail (``cd /; cd /nonexistent; rm -rf *``), run in a
+    subshell, a pipeline stage or the background and not take effect (``cd / && (cd tmp) && rm -rf *``), or be
+    something else than the builtin (a function, an alias), so no directory ever leaves the set, ``&&`` after a cd
+    included. ``here`` is where the line is if every cd took effect (None once unknown): it only resolves the next
+    relative cd. A cd to an unquoted variable adds home, which a plain ``cd`` (the variable unset) goes to; ``cd "$X"``
+    is ``cd ""``, which fails. ``cdpath`` is None when no CDPATH is in play, else its literal absolute entries (see
+    _cdpath_entries): a relative cd may then go to any of them or, through an entry it cannot read, anywhere, read as
+    ``/``. A command nested in a sub (a payload, a heredoc script) starts in the directories of that sub (see spawn).
+
+    The cwd itself never leaves the set either, so from a session rooted at $HOME or ``/`` a delete after a cd into a
+    harmless directory is refused (``cd build && rm -rf *``, ``cd dist && rm -rf ./*``, ``cd x && find . -delete``,
+    ``cd /srv/app && rm -rf ./*``); from a project directory it is allowed. The permission engine asks a person before
+    every bash command in such a session anyway.
+
+    Known gaps, left as they are: ``here`` drifts past a cd that did not take effect, so a later relative cd is resolved
+    from the wrong place when no dangerous directory is in the set (``cd /usr/local; (cd x); cd ..; rm -rf *``); and a
+    line that cds into _CD_MAX_DIRS distinct directories or more has every later relative recursive delete refused
+    (``scan-depth``), however harmless. Not modelled either: loops (``for i in a b; do cd .. && rm -rf *; done``) and
+    a function body run after a later cd, ``shopt -s cdable_vars``, ``trap 'cd /' DEBUG``, ``. /dev/stdin <<< 'cd /'``,
+    an OLDPWD set on the line (``OLDPWD=/; cd /tmp && cd -``) and a symlink made on the line. ``cd build || exit 1;
+    rm -rf *`` (the SC2164 idiom) is refused from $HOME or ``/``."""
+
+    def __init__(
+        self,
+        start: list[str | None],
+        here: str | None,
+        home: str,
+        cdpath: tuple[str, ...] | None = None,
+        *,
+        overflow: bool = False,
+    ) -> None:
+        self.home = home
+        self.cdpath = cdpath
+        self.here = here
+        self.all: dict[str | None, None] = dict.fromkeys(start)  # insertion-ordered set
+        self.overflow = overflow or len(self.all) > _CD_MAX_DIRS
+        self._stack: list[str | None] = []  # pushd's directory stack, for popd
+
+    def where(self) -> _Where:
+        return _Where(tuple(self.all), self.overflow, self.here)
+
+    def spawn(self, wheres: list[_Where]) -> _Dirs:
+        """A model for a command nested in the subs taken at ``wheres`` (a payload, a heredoc script): it starts in
+        every directory they may run in."""
+        if not wheres:
+            wheres = [_Where(tuple(self.all), self.overflow, None)]
+        start = list(dict.fromkeys(d for w in wheres for d in w.dirs))
+        heres = {w.here for w in wheres}
+        here = heres.pop() if len(heres) == 1 else None
+        overflow = any(w.overflow for w in wheres)
+        return _Dirs(start, here, self.home, self.cdpath, overflow=overflow)
+
+    def _add(self, d: str) -> None:
+        if d not in self.all:
+            if len(self.all) >= _CD_MAX_DIRS:
+                self.overflow = True
+            else:
+                self.all[d] = None
+
+    def follow(self, argv: list[str], sub: str) -> None:
+        """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
+        popd)."""
+        name = argv[0] if argv else ""
+        if self.overflow:
+            return  # every later relative delete is scan-depth: where the line goes no longer matters
+        if name == "popd":
+            self.here = self._stack.pop() if self._stack and len(argv) == 1 else None
+            return
+        if name not in ("cd", "pushd"):
+            return
+        operands: list[str] = []
+        for a in argv[1:]:
+            if not operands and a.startswith("-") and a != "-":
+                continue  # -L, -P, -e, -@, --
+            operands.append(a)
+        if name == "pushd":
+            self._stack.append(self.here)
+        self._follow_operands(name, operands, sub)
+
+    def _follow_operands(self, name: str, operands: list[str], sub: str) -> None:
+        if not operands:
+            if name == "cd":
+                self._add(self.home)
+            self.here = self.home if name == "cd" else None  # pushd alone swaps the top two of the stack
+            return
+        if past_budget(operands[0]):
+            self.overflow = True  # whose home it is was not looked up: the line may go anywhere from here
+            return
+        t = expand_vars(operands[0], self.here, self.home)
+        if name == "cd" and any(c in t for c in "$`") and _unquoted_expansion(_reparsed_text(sub)):
+            self._add(self.home)  # unset, `cd $X` is a plain `cd`; `cd "$X"` is `cd ""`, which fails
+        if t == "-" or t.startswith("+") or any(c in t for c in "$`~"):
+            self.here = None  # OLDPWD, a stack entry (already in the set), a variable, ~user
+            return
+        if t[:1] == "/":
+            self.here = _join_dir("/", t)
+            self._add(self.here)
+            return
+        # relative: from here, or from every directory the line may be in when here is unknown (fail closed)
+        bases = [self.here] if self.here is not None else [d for d in self.all if d is not None]
+        joined = list(dict.fromkeys(_join_dir(b, t) for b in bases))
+        for d in joined:
+            self._add(d)
+        self.here = joined[0] if len(joined) == 1 else None
+        if self.cdpath is not None and t.split("/", 1)[0] not in ("", ".", ".."):
+            if len(self.cdpath) >= _CD_MAX_DIRS:
+                self.overflow = True  # too many places to go: walking them all for every cd grew with the square
+            for entry in ("/", *self.cdpath):  # CDPATH: bash tries its entries for an operand not starting . or ..
+                if self.overflow:
+                    break
+                self._add(_join_dir(entry, t))
+            self.here = None  # it may have gone to any of them
+
+
+def _delete_target_rule(t: str, here: str | None, home: str, above_home: bool = False) -> str | None:
+    """The rule a recursive delete of the path word ``t`` run in the directory ``here`` breaks: rm-rf-home for ~, $HOME
+    (and, with ``above_home``, a folder above it), rm-rf-root for /, a top-level system dir or a Windows drive (see
+    windows_rm_target), or everything in one of those (``/usr/*``). A relative ``t`` is read in ``here`` (``../..`` from
+    ``~/projects/demo`` is ``~``), and ``$PWD`` is it."""
+    if not t:
+        return None
+    path = os.path.join(here, t) if here and not t.startswith(("/", "~", "$")) else t
+    target = _expand_target(path, here, home)
+    folder = (target[:-2] if target.endswith("/*") else target) or "/"  # `/*` is everything in /
+    if folder in _DANGEROUS_RM_TARGETS or folder == home:
+        own_tilde = "~" in t and not _TILDE_USER.match(t)  # `~root` is root's folder, not home
+        homeish = own_tilde or "HOME" in t or path.startswith("/home") or folder == home
+        return "rm-rf-home" if homeish else "rm-rf-root"
+    if above_home and folder.startswith("/") and home.startswith(folder.rstrip("/") + "/"):
+        return "rm-rf-home"
+    from .engine import windows_drives  # engine imports this module
+
+    if windows_rm_target(target.lower(), windows_drives()):
+        return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
+    return None
+
+
+#: ``~N``, ``~+N``, ``~-N``: the N-th entry of the directory stack (``pushd``/``popd``/``dirs``).
+_TILDE_STACK = re.compile(r"~[+-]?[0-9]+(?=/|$)")
+
+
+def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) -> str | None:
+    """:func:`_delete_target_rule` of ``t`` in every directory of ``dirs`` it may run in: a relative ``t`` or one with
+    ``$PWD`` depends on it, another is read once. Past _CD_MAX_DIRS directories a relative one is ``scan-depth``."""
+    if t in ("~+", "~-") or t.startswith(("~+/", "~-/")):
+        t = "$PWD" + t[2:]  # the current or previous directory: one of the set, read in every one
+    elif m := _TILDE_STACK.match(t):
+        t = "$PWD" + t[m.end() :]  # ~1, ~+1, ~-1: an entry of the directory stack, which is in the set as well
+    if past_budget(t):
+        return "scan-budget"  # another user's folder whose home was not looked up: it may be any folder (~bin is /bin)
+    if t.startswith(("/", "~", "$")) and "PWD" not in t:
+        return _delete_target_rule(t, None, home, above_home)
+    if dirs.overflow:
+        return "scan-depth"
+    for here in dirs.all:
+        hit = _delete_target_rule(t, here, home, above_home)
+        if hit:
+            return hit
+    return None
+
+
+def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
-    (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /)."""
+    (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
+    ``cd /``: see _delete_rule_in)."""
     if not argv or argv[0] != "rm":
         return None
     flags: list[str] = []
@@ -1272,17 +1737,70 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
     if not recursive:
         return None
-    dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
-    from .engine import windows_drives  # engine imports this module
-
-    drives = windows_drives()
     for t in targets:
-        target = _expand_target(t, cwd, home) if t else t
-        if target in dangerous:
-            homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
-            return "rm-rf-home" if homeish else "rm-rf-root"
-        if target and windows_rm_target(target.lower(), drives):
-            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
+        hit = _delete_rule_in(t, dirs, home)
+        if hit:
+            return hit
+    return None
+
+
+#: find actions that run a command on every file found, up to a ``;`` or ``+``.
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
+    """``find`` deleting what it finds (``-delete``, or ``-exec``/``-execdir``/``-ok``/``-okdir`` running rm) under
+    a start path an ``rm -rf`` of which is refused (see _rm_check) or a folder above home: ``find ~ -delete``, ``find
+    $HOME -exec rm -rf {} +``, ``find / -delete``. No start path is ``.``, which after ``cd /`` is the root."""
+    if not argv or argv[0] != "find":
+        return None
+    i = 1
+    while i < len(argv) and (argv[i] in ("-H", "-L", "-P") or argv[i][:2] in ("-D", "-O")):
+        i += 2 if argv[i] == "-D" else 1  # the options before the start paths (``-D debugopts``, ``-O3``)
+    paths: list[str] = []
+    while i < len(argv) and not argv[i].startswith("-") and argv[i] not in ("(", "!", ","):
+        paths.append(argv[i])
+        i += 1
+    expr = argv[i:]
+    deletes = "-delete" in expr
+    k = 0
+    while not deletes and k < len(expr):
+        if expr[k] in _FIND_EXEC_ACTIONS:
+            # the command runs up to the `;` or `+` that ends the action, and the next action starts after it (an
+            # `-exec` in the command is one of its words): every word is read once
+            end = k + 1
+            while end < len(expr) and expr[end] not in (";", "+"):
+                end += 1
+            deletes = _command_argv(expr[k + 1 : end])[:1] == ["rm"]
+            k = end
+        k += 1
+    if not deletes:
+        return None
+    for p in paths or ["."]:
+        hit = _delete_rule_in(p, dirs, home, above_home=True)
+        if hit:
+            return hit
+    return None
+
+
+def _xargs_rm_check(pipelines: list[list[str]], dirs: _Dirs, home: str) -> str | None:
+    """``... | xargs rm -rf``: xargs adds what the earlier stages of the pipeline print to rm's arguments, so a word of
+    theirs that rm -rf must not get (``echo ~ | xargs rm -rf``, ``find $HOME | xargs rm -r``) is checked as one of
+    rm's targets (see _rm_check). Each printed word is checked once, as it is printed: the first one that hits stands
+    for them all."""
+    for stages in pipelines:
+        if len(stages) < 2 or not any("xargs" in s for s in stages[1:]):
+            continue
+        bad: str | None = None  # the first printed word an rm -r must not get
+        for stage in stages:
+            argv = _command_argv(_tokens(stage))
+            if bad is not None and argv[:1] == ["rm"] and "xargs" in stage:
+                words = [os.path.basename(t) for t in _tokens(stage)]
+                fed = "rm" in words and "xargs" in words[: words.index("rm")]  # xargs runs this rm
+                if fed and (hit := _rm_check([*argv, "--", bad], dirs, home)):
+                    return hit
+            if bad is None:
+                bad = next((w for w in argv[1:] if _delete_rule_in(w, dirs, home)), None)
     return None
 
 
@@ -1324,6 +1842,9 @@ class Parsed:
     #: nested deeper than the parser follows (_SCAN_MAX_DEPTH, parse): what runs in there was never read as commands
     too_deep: bool = False
     children: list[Parsed] = field(default_factory=list)  # the parsed payloads
+    #: per child: the indices of the subs it came from (a payload of theirs, the heredoc fed to one): the child runs in
+    #: the directories that sub may run in (see _check_parsed)
+    child_subs: list[list[int]] = field(default_factory=list)
 
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
@@ -1654,7 +2175,11 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
     out.open_heredoc = bool(heredocs)
     out.open_bracket = any(kind != "((" or end >= n for kind, end in ctx)
     out.clean = "".join(clean)
-    out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
+    try:
+        out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
+    except _TooDeep:  # a stage that alternates wrappers and reserved words endlessly (see _command_argv)
+        out.code_heredoc, out.remote_heredoc = [""] * len(out.subs), [[] for _ in out.subs]
+        out.too_deep = True
     return out
 
 
@@ -1702,7 +2227,7 @@ def _ssh_command(args: list[str]) -> list[str]:
 def _stdin_program(stage: str) -> str:
     """ "shell" or "other" when ``stage`` is an interpreter that executes its stdin as a program (``bash``,
     ``python3 -``, ``sudo sh -s``, ``ssh host`` with no command: the remote login shell), else ""."""
-    argv = normalize_argv(_without_redirects(_tokens(stage)))
+    argv = _command_argv(_without_redirects(_tokens(stage)))
     if argv[:1] == ["ssh"]:
         remote = _ssh_command(argv[1:])
         return _stdin_program(" ".join(remote)) if remote else "shell"
@@ -1721,7 +2246,7 @@ def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
     base = 0  # the pipelines list the subs in order
     for stages in parsed.pipelines:
         runs = [_stdin_program(s) for s in stages]
-        argvs = [normalize_argv(_without_redirects(_tokens(s))) for s in stages]
+        argvs = [_command_argv(_without_redirects(_tokens(s))) for s in stages]
         ssh = [shlex.join(a) if a[:1] == ["ssh"] and r == "shell" else "" for a, r in zip(argvs, runs, strict=True)]
         for k in range(len(stages)):
             if parsed.heredocs[base + k]:
@@ -1752,6 +2277,29 @@ def _trap_actions(args: list[str]) -> list[str]:
     return [a for a in dict.fromkeys(out) if a not in ("", "-")]
 
 
+#: Shell options that take the next word as their value (``bash -o pipefail -c ...``, ``--rcfile FILE``).
+_SHELL_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _shell_c_code(argv: list[str]) -> list[str]:
+    """The command string of a shell run with ``-c`` (``sh -c CMD``, ``bash -lc CMD``, ``bash -o pipefail -c CMD``):
+    the first word after the options, when an option cluster has a ``c``; else nothing. A cluster ending in ``o``/``O``
+    takes the next word as its value (``bash -euo pipefail -c CMD``); fish also takes ``--command CMD`` (any prefix of
+    it down to ``--c``, as its getopt does) and ``--command=CMD``."""
+    code, i = False, 1
+    while i < len(argv) and argv[i][:1] in ("-", "+") and len(argv[i]) > 1:
+        a = argv[i]
+        if a == "--":
+            i += 1
+            break
+        key, eq, value = a.partition("=")
+        if argv[0] == "fish" and len(key) >= 3 and "--command".startswith(key):
+            return [value] if eq else argv[i + 1 : i + 2]
+        code = code or (a[0] == "-" and not a.startswith("--") and "c" in a[1:])
+        i += 2 if a in _SHELL_VALUE_OPTS or (not a.startswith("--") and a[-1] in "oO") else 1
+    return [argv[i]] if code and i < len(argv) else []
+
+
 def _launcher_payloads(sub: str) -> list[str]:
     """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval``, the
     action string of ``trap`` (see _trap_action), the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands) and
@@ -1767,12 +2315,14 @@ def _launcher_payloads(sub: str) -> list[str]:
     flags = [(u, e) for u in (False, True) for e in (True, False)] if "${" in sub else [(False, True)]
     readings = [tuple(_shell_words(sub, unquote, unescape)) for unquote, unescape in flags]
     for toks in dict.fromkeys([*readings, tuple(_tokens(sub))]):  # shlex's reading too, as before _shell_words
-        pre = _strip_wrappers(list(toks))
+        pre = _strip_wrappers(_past_reserved(list(toks)))
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
             out.append(" ".join(pre[1:]))
-        real = normalize_argv(list(toks))
+        real = _command_argv(list(toks))
         if real and _is_launcher_name(real[0]):
             out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+        if real and (real[0] in _SHELLS or real[0] == "ash"):
+            out += _shell_c_code(real)  # `bash -c env`: one word with nothing to split is code all the same
         if real and real[0] == "trap":
             out += _trap_actions(real[1:])
         if real:
@@ -1788,9 +2338,18 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     parsed = _scan(command, budget)
     if budget[0] < 0 or parsed.too_deep:
         return parsed  # the parser gave up and check() denies the command: its nested commands are not read
-    payloads = [p for ps in parsed.sub_payloads for p in ps]
-    for sub in parsed.subs:
-        payloads.extend(_launcher_payloads(sub))
+    # each payload, read once, and the subs it came from (Parsed.child_subs), in the order they appear
+    payloads: dict[str, list[int]] = {}
+    for k, ps in enumerate(parsed.sub_payloads):
+        for p in ps:
+            payloads.setdefault(p, []).append(k)
+    try:
+        for k, sub in enumerate(parsed.subs):
+            for p in _launcher_payloads(sub):
+                payloads.setdefault(p, []).append(k)
+    except _TooDeep:  # see _command_argv
+        parsed.too_deep = True
+        return parsed
     if _depth >= _PARSE_MAX_DEPTH:
         # pathological nesting is cut off: commands nested in here are never read, so the command is too deep
         parsed.too_deep = bool(payloads) or "shell" in parsed.code_heredoc
@@ -1799,13 +2358,14 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
     # of its own, so the work would multiply with every level of nesting. An identical reading is parsed once, and the
     # characters of every reading but the first are charged to the shared budget: past it the command is denied
     # (``scan-budget``) instead of read twice over
-    for n, payload in enumerate(dict.fromkeys(payloads)):
+    for n, (payload, origin) in enumerate(payloads.items()):
         if n:
             budget[0] -= len(payload) or 1
         if budget[0] < 0:
             return parsed
         inner = parse(payload, _depth + 1, budget)
         parsed.children.append(inner)
+        parsed.child_subs.append(origin)
         parsed.nested.extend([*inner.subs, *inner.nested])
         parsed.unterminated = parsed.unterminated or inner.unterminated
         # the outer text goes on after a payload ($(...), `bash -c '...'`): a quote in its last comment still counts
@@ -1818,14 +2378,16 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         for heredoc in bodies if parsed.code_heredoc[k] == "shell" else ():
             inner = parse(heredoc.body, _depth + 1, budget)
             parsed.children.append(inner)
+            parsed.child_subs.append([k])
             parsed.nested.extend([*inner.subs, *inner.nested])
             parsed.too_deep = parsed.too_deep or inner.too_deep
             # `ssh host <<EOF` runs the body on host: each command is also checked as `ssh host '<command>'`, the
             # spelling the rules about remote hosts match
             remote = [*inner.subs, *inner.nested]
-            parsed.children += [
-                _scan(f"{ssh} {shlex.quote(c)}", budget) for ssh in parsed.remote_heredoc[k] for c in remote
-            ]
+            for ssh in parsed.remote_heredoc[k]:
+                for c in remote:
+                    parsed.children.append(_scan(f"{ssh} {shlex.quote(c)}", budget))
+                    parsed.child_subs.append([k])
     return parsed
 
 

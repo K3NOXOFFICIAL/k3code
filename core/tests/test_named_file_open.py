@@ -191,9 +191,12 @@ def test_ordinary_paths_read_as_before(tmp_path: Path) -> None:
 def test_a_missing_file_a_directory_and_a_fifo_are_not_found_and_nothing_blocks(tmp_path: Path) -> None:
     (tmp_path / "d").mkdir()
     os.mkfifo(tmp_path / "p")
-    for name in ("nope.txt", "d", "p", "d/nope/x"):
+    for name in ("nope.txt", "p", "d/nope/x"):
         res = _read_sync({"path": str(tmp_path / name)}, None)
         assert res == {"error": f"File not found: {tmp_path / name}"}
+    # a directory is named as one, with what to use instead (the model used to retry a "missing" directory)
+    res = _read_sync({"path": str(tmp_path / "d")}, None)
+    assert res == {"error": f"{tmp_path / 'd'} is a directory; use glob to list it (read takes a file)"}
     with pytest.raises(NotRegular):
         open_regular(tmp_path / "p")
     with pytest.raises(FileNotFoundError):

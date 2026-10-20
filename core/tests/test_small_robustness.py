@@ -327,7 +327,7 @@ async def test_glob_and_grep_stop_at_the_time_budget_with_a_hint(tmp_path, no_gi
     assert res["files"] == [] and "stopped after" in res["note"] and "narrow" in res["note"]
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))  # the Python grep fallback
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
-    assert "stopped after" in res["warnings"]
+    assert "of an unknown number of files" in res["warnings"] and "results are partial" in res["warnings"]
 
 
 async def test_grep_stops_reading_at_the_result_cap(tmp_path, no_git_env):
@@ -418,14 +418,17 @@ async def test_the_grep_fallback_streams_a_large_text_file(tmp_path, no_git_env,
 def test_the_grep_fallback_checks_the_deadline_inside_a_file(tmp_path, monkeypatch, line, count):
     import types
 
-    import k3code.tools as tools
+    from k3code.tools import grep_worker
 
     ticks = iter(range(1_000_000))
-    monkeypatch.setattr(tools, "time", types.SimpleNamespace(monotonic=lambda: float(next(ticks))))
+    monkeypatch.setattr(grep_worker, "time", types.SimpleNamespace(monotonic=lambda: float(next(ticks))))
     big = tmp_path / "big.txt"
     big.write_text(line * count)  # no match, so only the clock can stop the search before the end of the file
-    res = tools._grep_fallback("needle", big, None, None)
-    assert "stopped after" in res.get("warnings", "")
+    sent: list[tuple] = []
+    with big.open("rb") as f:
+        job = {"pattern": "needle", "budget": 10, "fd": os.dup(f.fileno()), "display": str(big)}
+    grep_worker.run(job, iter(()), lambda *msg: sent.append(msg))
+    assert sent[-1][0] == "end" and sent[-1][3] is True  # the worker stopped itself: timed out
 
 
 async def test_the_grep_fallback_cuts_long_matching_lines_like_rg(tmp_path, no_git_env, monkeypatch):

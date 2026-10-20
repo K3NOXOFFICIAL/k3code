@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import re
 import shutil
 import subprocess
 import threading
@@ -18,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import k3code.tools as tools
+from k3code.tools import grep_worker
 
 pytestmark = pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc (Linux)")
 
@@ -106,7 +106,13 @@ def test_a_fifo_in_the_tree_is_skipped_and_the_search_returns(tmp_path, fallback
         worker.join(5)
         pytest.fail("the grep fallback blocked on a FIFO")
     assert "a.txt:1:TOKEN in a" in out["matches"]
-    assert "stopped after" not in out.get("warnings", "")
+    assert "partial" not in out.get("warnings", "")
+
+
+def _scan(opener: grep_worker.Beneath, rel: str, display: str) -> list[str | None]:
+    match, literal = grep_worker.matcher("TOKEN")
+    with opener.open(rel) as f:
+        return list(grep_worker.scan(f, display, match, literal, 1e18, False, {"long": 0}))
 
 
 def test_a_file_swapped_for_a_link_after_the_walk_is_not_read(tmp_path, fallback_only) -> None:
@@ -115,23 +121,28 @@ def test_a_file_swapped_for_a_link_after_the_walk_is_not_read(tmp_path, fallback
     proj = tmp_path / "proj"
     proj.mkdir()
     (proj / "a.txt").write_text("TOKEN in a\n")
-    real_base = os.path.realpath(proj)
-    lines = list(tools._grep_file(proj / "a.txt", re.compile("TOKEN"), 1e18, expect=f"{real_base}/a.txt"))
-    assert lines == [f"{proj / 'a.txt'}:1:TOKEN in a"]
-    (proj / "a.txt").unlink()
-    (proj / "a.txt").symlink_to(secret)
-    with pytest.raises(OSError):
-        list(tools._grep_file(proj / "a.txt", re.compile("TOKEN"), 1e18, expect=f"{real_base}/a.txt"))
+    opener = grep_worker.Beneath(os.path.realpath(proj))
+    try:
+        assert _scan(opener, "a.txt", str(proj / "a.txt")) == [f"{proj / 'a.txt'}:1:TOKEN in a"]
+        (proj / "a.txt").unlink()
+        (proj / "a.txt").symlink_to(secret)
+        with pytest.raises(OSError):
+            _scan(opener, "a.txt", str(proj / "a.txt"))
+    finally:
+        opener.close()
 
 
-def test_a_walked_file_whose_open_fd_points_elsewhere_is_not_read(tmp_path, fallback_only) -> None:
-    """A parent directory swapped for a link: the name looks right, the open file is not the one expected."""
+def test_a_walked_file_below_a_directory_that_is_a_link_is_not_read(tmp_path, fallback_only) -> None:
+    """A parent directory swapped for a link: the name looks right, but the open follows no link on the way."""
     (tmp_path / "elsewhere").mkdir()
     (tmp_path / "elsewhere" / "a.txt").write_text(f"TOKEN={SECRET}\n")
     (tmp_path / "proj").symlink_to(tmp_path / "elsewhere")
-    expect = os.path.join(os.path.realpath(tmp_path), "proj", "a.txt")  # what the walk listed
-    with pytest.raises(OSError):
-        list(tools._grep_file(tmp_path / "proj" / "a.txt", re.compile("TOKEN"), 1e18, expect=expect))
+    opener = grep_worker.Beneath(os.path.realpath(tmp_path))  # the walk listed proj/a.txt below it
+    try:
+        with pytest.raises(OSError):
+            _scan(opener, "proj/a.txt", str(tmp_path / "proj" / "a.txt"))
+    finally:
+        opener.close()
 
 
 def test_a_stale_index_entry_behind_a_link_opens_nothing_outside_the_roots(tmp_path, fallback_only) -> None:
@@ -172,8 +183,12 @@ def test_the_fallback_opens_without_becoming_the_controlling_terminal(tmp_path, 
     real_open = os.open
     monkeypatch.setattr(os, "open", lambda p, flags, *a, **k: (seen.append(flags), real_open(p, flags, *a, **k))[1])
     (tmp_path / "a.txt").write_text("TOKEN\n")
-    list(tools._grep_file(tmp_path / "a.txt", re.compile("TOKEN"), 1e18, expect=os.path.realpath(tmp_path / "a.txt")))
-    assert seen and all(f & os.O_NOCTTY and f & os.O_NONBLOCK for f in seen)
+    opener = grep_worker.Beneath(os.path.realpath(tmp_path))
+    try:
+        _scan(opener, "a.txt", str(tmp_path / "a.txt"))
+    finally:
+        opener.close()
+    assert seen and all(f & os.O_NOCTTY and f & os.O_NONBLOCK and f & os.O_NOFOLLOW for f in seen)
 
 
 def test_without_proc_the_walk_reads_the_opened_path_off_the_descriptor(tmp_path, fallback_only, monkeypatch) -> None:

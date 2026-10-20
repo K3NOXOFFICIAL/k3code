@@ -416,7 +416,7 @@ _RANK: dict[str, int] = {"allow": 1, "ask": 2, "deny": 3}
 
 
 def _norm(path: str | Path) -> str:
-    return os.path.normpath(os.path.expanduser(str(path)))
+    return os.path.normpath(hardline.expand_user(str(path)))
 
 
 def _real(path: str) -> str:
@@ -441,7 +441,7 @@ def _real_strict(path: str) -> str | None:
 
 
 def _abs(raw: str, cwd: str) -> str:
-    p = os.path.expanduser(raw or ".")
+    p = hardline.expand_user(raw or ".")
     return os.path.normpath(p if os.path.isabs(p) else os.path.join(cwd, p))
 
 
@@ -601,6 +601,7 @@ def _unusable_argument(args: dict[str, object]) -> str | None:
     return None
 
 
+@hardline.lookup_scope()  # one budget of ~name lookups for the whole decision (see hardline._home_of)
 def decide(
     *,
     mode: PermissionMode | str,
@@ -653,7 +654,7 @@ def decide(
         bash_cwd = _abs(str(args.get("cwd") or "."), cwd_s)
         dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, bash_cwd)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
-        raw = os.path.expanduser(str(args.get("path") or args.get("file") or "."))
+        raw = hardline.expand_user(str(args.get("path") or args.get("file") or "."))
         path = _abs(raw, cwd_s)
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
@@ -1268,7 +1269,7 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
         if not t or t.startswith("$"):
             continue
         lexical = _abs(t, cwd)
-        for p in dict.fromkeys((lexical, _real(os.path.join(cwd, os.path.expanduser(t))))):
+        for p in dict.fromkeys((lexical, _real(os.path.join(cwd, hardline.expand_user(t))))):
             if projects and _inside(p, projects):
                 continue
             for h in homes:
@@ -1615,6 +1616,10 @@ def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = N
     word = hardline.expand_vars(arg, cwd, home)
     if "$" in word or "`" in word:
         return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
+    if hardline.past_budget(word):
+        # another user's home past the lookup budget (see hardline._home_of) may be any folder (``~nobody`` is ``/``):
+        # a credential name after it is refused, as it was when the home was looked up and the path was a credential
+        return "deny" if _sensitive_name(word.partition("/")[2]) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
         reads = _glob_reads_secret(path, home, budget or _GlobBudget())
@@ -1924,7 +1929,7 @@ def _link_names(args: list[str]) -> list[str]:
     """Where an ``ln -s``/``cp -s`` may put its links: the last operand (and below it, when that is a folder), or the
     ``-t`` folder."""
     opts, positional = _options(args, "St", frozenset({"--suffix", "--target-directory"}))
-    positional = [os.path.expanduser(p.replace("${HOME}", "~").replace("$HOME", "~")) for p in positional]
+    positional = [hardline.expand_user(p.replace("${HOME}", "~").replace("$HOME", "~")) for p in positional]
     folder = next((v for o, v in opts if o in ("-t", "--target-directory") and v), None)
     if folder is not None:
         return [os.path.join(folder, os.path.basename(p)) for p in positional]
@@ -2056,9 +2061,9 @@ def _cd_targets(operand: str, bases: tuple[str, ...], home: str, cdpath: bool) -
         if _GLOB_CHARS & set(word):
             return None
         if word.startswith("~") and word != "~" and not word.startswith("~/"):
-            expanded = os.path.expanduser(word)
+            expanded = hardline.expand_user(word)
             if expanded == word:
-                return None  # a user this machine does not know, ``~+``, ``~-``
+                return None  # a user this machine does not know or not looked up (see hardline), ``~+``, ``~-``
             word = expanded
         if cdpath and word not in (".", "..") and not word.startswith(("/", "~", "./", "../", "$")):
             return None
@@ -2269,7 +2274,11 @@ def _decide_bash(
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     if worst.action == "allow" and not _inside(cwd, roots):
-        return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            message=f"Working directory outside project roots: {cwd} (/add-dir {cwd} adds it to this session)",
+        )
     return Decision(
         action=worst.action, patterns=prefixes, rule=worst, sandbox_only=sandbox_only and worst.action == "allow"
     )
@@ -2306,7 +2315,7 @@ def _decide_path(
     if not inside:
         uv_credentials = _inside(path, [os.path.join(os.path.expanduser("~"), _UV_CREDENTIALS)])
         if rule.layer == 0:
-            dec.message = f"Outside project roots: {path}"
+            dec.message = f"Outside project roots: {path} (/add-dir {path} adds it to this session)"
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
@@ -2539,16 +2548,18 @@ def _risky_component(name: str) -> bool:
     return (name.startswith(".") and not _benign_dot(name)) or bool(_CREDENTIAL_NAME.fullmatch(name))
 
 
-def _guarded_tree(path: str) -> str | None:
+def _guarded_tree(path: str, own: list[str] | None = None) -> str | None:
     """The guarded tree ``path`` (absolute, normalised) lies in: one of _GUARDED_TREES, or another user's home
-    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere."""
+    (``/home/ada``; the current user's own home, by its realpath too, is not one). None elsewhere. ``own`` is
+    _home_prefixes(), for a caller that checks many paths."""
     for tree in _GUARDED_TREES:
         if _under(path, tree):
             return tree
     for homes in _HOMES_DIRS:
         if path.startswith(homes + "/"):
             home = homes + "/" + path[len(homes) + 1 :].split("/", 1)[0]
-            own = _home_prefixes()  # $HOME/ as written and by realpath
+            if own is None:
+                own = _home_prefixes()  # $HOME/ as written and by realpath
             if home + "/" not in own and _real(home) + "/" not in own:
                 return home
     return None
@@ -2671,7 +2682,7 @@ def memory_import_withheld(path: str, roots: Sequence[str], extra_stores: Sequen
     )
 
 
-def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[[str], bool]:
+def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[..., bool]:
     """Which files a search below ``searched`` (grep or glob over a directory) returns nothing of: a credential file
     (sensitive_path); a file in a credential store of ``$HOME`` (see _home_stores) that ``searched`` is not itself
     inside (a search of the store was decided on that path); and, in a search of ``$HOME`` or a directory above it,
@@ -2691,16 +2702,21 @@ def search_withheld(searched: str, roots: list[str] | None = None) -> Callable[[
     stores = [s.casefold().rstrip("/") for s in _home_stores() if not _stores_holding(inside, [s])]
     exact, below = frozenset(stores), tuple(s + "/" for s in stores)
     homes = _home_prefixes() if _inside(os.path.expanduser("~"), [searched]) else []
+    # resolved once per search, not once per file: each costs a realpath (an lstat per component) of $HOME's entries
+    dirs, own = _folded_secret_dirs(), _home_prefixes()
 
-    def withheld(path: str) -> bool:
-        if sensitive_path(path):
+    def withheld(path: str, real: str | None = None) -> bool:
+        """``real``: the realpath of ``path`` when the caller knows it, so it is not resolved again. The grep
+        fallback's walk passes the file's name below the resolved directories it entered: its worker opens no link
+        on the way (see grep_worker.Beneath), so the file it reads is that one or none."""
+        if sensitive_path(path, dirs, real=real):
             return True
-        spellings = _spellings(path)
+        spellings = _spellings(path) if real is None else list(dict.fromkeys((_flat(path), real)))
         for p in spellings:
             low = p.casefold()
             if low in exact or low.startswith(below) or _below_home_dot(p, homes):
                 return True
-        return strict and _outside_withheld(_flat(path), spellings, inside, tops)
+        return strict and _outside_withheld(_flat(path), spellings, inside, tops, own)
 
     return withheld
 
@@ -2711,15 +2727,16 @@ def outside_search_withheld(searched: str, roots: list[str]) -> Callable[[str], 
     return None if _inside(searched, roots) else search_withheld(searched, roots)
 
 
-def _outside_withheld(flat: str, spellings: list[str], inside: list[str], tops: list[str]) -> bool:
+def _outside_withheld(flat: str, spellings: list[str], inside: list[str], tops: list[str], own: list[str]) -> bool:
     """search_withheld's check for a search outside the roots: ``flat`` (the file as the walk names it, normalised)
     is withheld unless it lies below a spelling of the searched directory (``inside``, ``tops`` with a trailing slash)
-    with no risky component there, and no spelling of it is in a guarded tree the search did not start in."""
+    with no risky component there, and no spelling of it is in a guarded tree the search did not start in. ``own``:
+    _home_prefixes()."""
     rel = next((flat[len(t) :] for t in tops if flat.startswith(t)), None)
     if rel is None or any(_risky_component(c) for c in rel.split("/") if c):
         return True
     for p in spellings:
-        tree = _guarded_tree(p)
+        tree = _guarded_tree(p, own)
         if tree and not any(_under(s, tree) for s in inside):
             return True
     return False
@@ -2781,24 +2798,27 @@ def windows_profile_secret(path: str, drives: list[str] | None = None) -> bool:
     return False
 
 
-def sensitive_path(path: str, dirs: list[str] | None = None) -> bool:
+def sensitive_path(path: str, dirs: list[str] | None = None, *, real: str | None = None) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
     (``/proc/*/environ``), a dotenv file, or the keys and credential stores of a Windows profile WSL mounts (see
     :func:`windows_profile_secret`). Checked on the path as written and on its realpath (symlinks), and
     case-insensitively: on drvfs (``/mnt/c``) and macOS ``.ENV`` and ``~/.SSH/id_rsa`` open the same files. ``dirs``
-    is :func:`_folded_secret_dirs`, for a caller that checks many paths."""
-    if secret_store(path, dirs):
+    is :func:`_folded_secret_dirs`, for a caller that checks many paths; ``real`` is the realpath of ``path`` when the
+    caller already knows it (see search_withheld)."""
+    if secret_store(path, dirs, real=real):
         return True
-    return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), _real(path))))
+    real = _real(path) if real is None else real
+    return any(_dotenv_name(os.path.basename(p)) for p in dict.fromkeys((os.path.normpath(path), real)))
 
 
-def secret_store(path: str, dirs: list[str] | None = None) -> bool:
+def secret_store(path: str, dirs: list[str] | None = None, *, real: str | None = None) -> bool:
     """``path`` (absolute) is in a key or credential store (``sensitive_path`` without the dotenv files): the secret
     dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
-    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
+    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133). ``real``: the
+    realpath of ``path`` when the caller already knows it (see search_withheld)."""
     folded_dirs = dirs if dirs is not None else _folded_secret_dirs()
-    for p in dict.fromkeys((os.path.normpath(path), _real(path))):
+    for p in dict.fromkeys((os.path.normpath(path), _real(path) if real is None else real)):
         folded = p.lower()
         if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in folded_dirs):
             return True

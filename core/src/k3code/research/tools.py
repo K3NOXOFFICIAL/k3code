@@ -645,6 +645,10 @@ def register_web_tools(
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
+        if "://" not in url:  # "example.com/doc": the fetcher's "not an http(s) URL" did not say what to send
+            return {
+                "error": f"web_fetch 'url' has no scheme ({url[:80]!r}): send an http(s) URL, e.g. https://{url[:80]}"
+            }
         try:
             title, text = await fetch_page(url, fetcher=fetcher, browser=browser)
         except Exception as e:  # noqa: BLE001

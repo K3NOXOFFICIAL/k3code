@@ -78,8 +78,10 @@ async def test_a_path_glob_is_relative_to_the_searched_directory(project, no_rg)
 async def test_a_bad_pattern_reports_rgs_message(project):
     if not shutil.which("rg"):
         pytest.skip("rg not installed")
-    with pytest.raises(RuntimeError, match="unclosed group"):
-        await tool_grep({"pattern": "foo("}, cwd=project)
+    # rg's own reason, as an error result that says how to escape (it raised, i.e. "Tool execution failed: ...")
+    res = await tool_grep({"pattern": "foo("}, cwd=project)
+    assert res["error"].startswith("invalid regex for 'pattern' ('foo('): ")
+    assert "unclosed group" in res["error"] and "escape metacharacters" in res["error"]
 
 
 async def test_a_pattern_only_python_accepts_still_searches(project):
@@ -91,7 +93,8 @@ async def test_a_pattern_only_python_accepts_still_searches(project):
 
 
 async def test_a_bad_pattern_without_rg_still_fails(project, no_rg):
-    import re
-
-    with pytest.raises(re.error):
-        await tool_grep({"pattern": "foo("}, cwd=project)
+    # an error naming the fault and how to escape it, not a raised re.error ("Tool execution failed: error: ...")
+    res = await tool_grep({"pattern": "foo("}, cwd=project)
+    assert "matches" not in res
+    assert res["error"].startswith("invalid regex for 'pattern' ('foo('): missing ), unterminated subpattern")
+    assert "escape metacharacters" in res["error"]

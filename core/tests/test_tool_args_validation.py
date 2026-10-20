@@ -60,8 +60,11 @@ async def test_invalid_call_never_asks_for_approval(tmp_path):
         return ApprovalResult("once")
 
     loop = _loop(tmp_path, mode="ask", headless=False, approval_callback=approve)
-    result = await loop._execute_tool(ToolCall(id="c", name="bash", arguments={"cmd": "ls"}))
+    # ({"cmd": "ls"} is no longer invalid: cmd is an alias of command, see tools.validate.ALIASES)
+    result = await loop._execute_tool(ToolCall(id="c", name="bash", arguments={"timeout": 5}))
     assert "missing required 'command'" in result["error"]
+    result = await loop._execute_tool(ToolCall(id="c", name="bash", arguments={"command": "ls", "cmd": "ls"}))
+    assert "send only 'command'" in result["error"]
     assert asked == []
 
 

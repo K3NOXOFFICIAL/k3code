@@ -152,9 +152,14 @@ ARITY: dict[str, int] = {
 }
 
 
+#: The most words an ARITY key has: a longer prefix of ``tokens`` cannot be a key, so it is not joined and looked up
+#: (for a command of N words that was N joins of up to N words, quadratic: 50,000 tokens took 4.9 s).
+_MAX_KEY_WORDS = max(len(key.split()) for key in ARITY)
+
+
 def prefix(tokens: list[str]) -> list[str]:
     """Longest ARITY-known prefix of ``tokens``, trimmed to its arity."""
-    for length in range(len(tokens), 0, -1):
+    for length in range(min(len(tokens), _MAX_KEY_WORDS), 0, -1):
         candidate = " ".join(tokens[:length])
         arity = ARITY.get(candidate)
         if arity is not None:

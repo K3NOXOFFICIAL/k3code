@@ -39,6 +39,18 @@ SPELLINGS: dict[str, Callable[[int], str]] = {
     "pipelines": lambda n: "\n".join(f"echo {k} | wc -c" for k in range(n)),
     "bash-c": lambda n: 'bash -c "' + "; ".join(_lines(n)) + '"',
     "substitution": lambda n: "echo $(" + "; ".join(_lines(n)) + ")",
+    # the hardline's xargs, wrapper/reserved-word and find -exec readings (each once grew with the square)
+    "xargs-pipeline": lambda n: "echo a" + "".join(f" | xargs rm -rf f691_{k}" for k in range(n)),
+    "time-braces": lambda n: "time { " * n + "echo hi" + " }" * n,
+    "find-exec": lambda n: "find ~" + "".join(f" -exec echo f691_{k} {{}} \\;" for k in range(n)),
+    # wrapper chains (older than the readings above: each wrapper or eval copied or re-split the rest of the words)
+    "eval-chain": lambda n: "eval " * n + "echo hi",
+    "sudo-chain": lambda n: "sudo " * n + "echo hi",
+    # a relative cd walked every CDPATH entry on the line (each prefix assignment adds one)
+    "cdpath-chain": lambda n: "; ".join(f"CDPATH=/a{k} cd b{k % 5}" for k in range(n)),
+    # every distinct ~name was a user database lookup, three per word (a C call the step count does not see: the
+    # lookup count is pinned in test_hardline_tilde_budget); a check now looks up at most 32
+    "tilde-users": lambda n: "cat " + " ".join(f"~u691_{k}/x" for k in range(n)),
 }
 
 
