@@ -125,6 +125,8 @@ export interface ViewNav {
   collapsedGroups: ViewGroup[];
   /** Which half owns the keyboard: the row list, or the bottom composer. */
   focus: ViewFocus;
+  /** A collapsed group's header holds the selection (its rows are hidden); null on a row. */
+  header: null | ViewGroup;
 }
 
 export const IDLE_VIEW_NAV: ViewNav = {
@@ -132,6 +134,7 @@ export const IDLE_VIEW_NAV: ViewNav = {
   confirmKey: null,
   draft: "",
   focus: "list",
+  header: null,
   index: 0,
 };
 
@@ -153,9 +156,7 @@ export type ViewKey = {
 };
 
 export type ViewEffect =
-  | { row: ViewRow; type: "activate" | "stop" }
-  | { type: "close" }
-  | { type: "toggle-group"; group: ViewGroup };
+  { row: ViewRow; type: "activate" | "stop" } | { type: "close" };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -200,6 +201,66 @@ export function buildLines(
   }
 
   return lines;
+}
+
+/** What ↑↓ step through: the rows of open groups and the header of each collapsed group. */
+export type NavItem =
+  { group: ViewGroup; type: "header" } | { index: number; type: "row" };
+
+export function navItems(
+  rows: readonly ViewRow[],
+  collapsedGroups: readonly ViewGroup[],
+): NavItem[] {
+  // In row order (buildViewRows already sorts rows by group): a collapsed group's header takes its first row's place.
+  return rows.flatMap((r, index): NavItem[] =>
+    !collapsedGroups.includes(r.group)
+      ? [{ index, type: "row" }]
+      : rows.findIndex((o) => o.group === r.group) === index
+        ? [{ group: r.group, type: "header" }]
+        : [],
+  );
+}
+
+/** The header holding the selection: only a collapsed group that still has rows. */
+export const selectedHeader = (
+  nav: ViewNav,
+  rows: readonly ViewRow[],
+): null | ViewGroup =>
+  nav.header &&
+  nav.collapsedGroups.includes(nav.header) &&
+  rows.some((r) => r.group === nav.header)
+    ? nav.header
+    : null;
+
+/**
+ * Collapse or expand `group` (c, ⏎ on a header, a click on it). Collapsing the group the selection is in moves the
+ * selection to its header, so it never sits on a hidden row; expanding from the header lands on the group's first row.
+ */
+export function toggleGroup(
+  nav: ViewNav,
+  rows: readonly ViewRow[],
+  group: ViewGroup,
+): ViewNav {
+  const first = rows.findIndex((r) => r.group === group);
+
+  if (nav.collapsedGroups.includes(group)) {
+    const onIt = selectedHeader(nav, rows) === group;
+
+    return {
+      ...nav,
+      collapsedGroups: nav.collapsedGroups.filter((g) => g !== group),
+      ...(onIt ? { header: null, index: Math.max(0, first) } : {}),
+    };
+  }
+
+  const holdsSelection =
+    !selectedHeader(nav, rows) && rows[nav.index]?.group === group;
+
+  return {
+    ...nav,
+    collapsedGroups: [...nav.collapsedGroups, group],
+    ...(holdsSelection ? { header: group } : {}),
+  };
 }
 
 /** Live sessions other than this one and in-turn agents can be stopped; past rows and the current session cannot. */
@@ -263,15 +324,38 @@ export function reduceViewKey(
   }
 
   const step = Math.max(1, pageSize);
-  const move = (to: number) =>
-    done(null, { index: Math.max(0, Math.min(last, to)) });
+  // Navs built before groups could collapse (older callers, tests) may carry no list.
+  const collapsed: readonly ViewGroup[] = nav.collapsedGroups ?? [];
+  const items = navItems(rows, collapsed);
+  // A selected row its group's collapse has hidden stands on that group's header.
+  const header =
+    selectedHeader(nav, rows) ??
+    (collapsed.includes(rows[index]!.group) ? rows[index]!.group : null);
+  const at = Math.max(
+    0,
+    items.findIndex((it) =>
+      it.type === "header"
+        ? it.group === header
+        : !header && it.index === index,
+    ),
+  );
+  const move = (to: number) => {
+    const it = items[Math.max(0, Math.min(items.length - 1, to))]!;
+
+    return it.type === "row"
+      ? done(null, { header: null, index: it.index })
+      : done(null, {
+          header: it.group,
+          index: rows.findIndex((r) => r.group === it.group),
+        });
+  };
 
   if (key.up) {
-    return move(index - 1);
+    return move(at - 1);
   }
 
   if (key.down) {
-    return move(index + 1);
+    return move(at + 1);
   }
 
   if (key.home) {
@@ -279,15 +363,22 @@ export function reduceViewKey(
   }
 
   if (key.end) {
-    return move(last);
+    return move(items.length - 1);
   }
 
   if (key.pageUp) {
-    return move(index - step);
+    return move(at - step);
   }
 
   if (key.pageDown) {
-    return move(index + step);
+    return move(at + step);
+  }
+
+  // On a collapsed header ⏎/→ and c expand it; nothing else applies to a header.
+  if (header) {
+    return key.return || key.right || ch === "c"
+      ? done(null, toggleGroup({ ...nav, index }, rows, header))
+      : done(null);
   }
 
   const row = rows[index]!;
@@ -300,12 +391,9 @@ export function reduceViewKey(
     return done(null, { confirmKey: row.key });
   }
 
-  // Collapse/expand group headers with 'c' or Enter when on a header line.
-  // We don't know the current line type here (header vs row) — the caller will
-  // convert a header line selection to a toggle-group effect.
-  // For now, 'c' toggles the group of the currently selected row.
+  // c collapses the selected row's group; the selection moves to its header.
   if (ch === "c") {
-    return done({ type: "toggle-group", group: row.group });
+    return done(null, toggleGroup({ ...nav, index }, rows, row.group));
   }
 
   return done(null);

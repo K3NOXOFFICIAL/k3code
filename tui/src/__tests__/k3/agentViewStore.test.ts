@@ -6,6 +6,7 @@ import {
   type PastSessionRow,
   reduceViewKey,
   selectedIndex,
+  toggleGroup,
   type ViewKey,
   type ViewNav,
   type ViewRow,
@@ -351,6 +352,71 @@ const ROWS: ViewRow[] = [
 const press = (nav: ViewNav, key: ViewKey, rows = ROWS, page = 2) =>
   reduceViewKey(nav, rows, key, page);
 const at = (index: number): ViewNav => ({ ...IDLE_VIEW_NAV, index });
+
+describe("collapsible groups", () => {
+  // Needs input: n1 · Working: w1, w2 · Completed: c1
+  const G: ViewRow[] = [
+    vrow("n1", { group: "input", state: "input" }),
+    vrow("w1"),
+    vrow("w2"),
+    vrow("c1", { group: "completed", state: "done" }),
+  ];
+  const onHeader: ViewNav = {
+    ...IDLE_VIEW_NAV,
+    collapsedGroups: ["working"],
+    header: "working",
+    index: 1,
+  };
+
+  it("c collapses the selected row's group and the selection moves to its header", () => {
+    const r = reduceViewKey(at(2), G, { ch: "c" }, 2);
+
+    expect(r.effect).toBeNull();
+    expect(r.nav).toMatchObject({
+      collapsedGroups: ["working"],
+      header: "working",
+    });
+  });
+
+  it("↑↓ stop on a collapsed group's header and never on its hidden rows", () => {
+    const down = reduceViewKey(onHeader, G, { down: true }, 2).nav;
+
+    expect(down).toMatchObject({ header: null, index: 3 });
+    expect(reduceViewKey(down, G, { up: true }, 2).nav).toMatchObject({
+      header: "working",
+    });
+    expect(reduceViewKey(onHeader, G, { up: true }, 2).nav).toMatchObject({
+      header: null,
+      index: 0,
+    });
+  });
+
+  it("⏎, → and c on a collapsed header expand it onto its first row, attaching nothing", () => {
+    for (const key of [{ return: true }, { right: true }, { ch: "c" }]) {
+      const r = reduceViewKey(onHeader, G, key, 2);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toMatchObject({
+        collapsedGroups: [],
+        header: null,
+        index: 1,
+      });
+    }
+  });
+
+  it("a header click collapses another group without moving the selection", () => {
+    expect(toggleGroup(at(0), G, "working")).toMatchObject({
+      collapsedGroups: ["working"],
+      header: null,
+      index: 0,
+    });
+    expect(toggleGroup(onHeader, G, "working")).toMatchObject({
+      collapsedGroups: [],
+      header: null,
+      index: 1,
+    });
+  });
+});
 
 describe("reduceViewKey", () => {
   it("moves with ↑/↓ and clamps at both ends without wrapping", () => {

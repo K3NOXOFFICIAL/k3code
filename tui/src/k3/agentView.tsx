@@ -22,7 +22,9 @@ import {
   IDLE_VIEW_NAV,
   type PastSessionRow,
   reduceViewKey,
+  selectedHeader,
   selectedIndex,
+  toggleGroup,
   VIEW_GROUP_LABEL,
   VIEW_GROUPS,
   type ViewGroup,
@@ -32,7 +34,7 @@ import {
 } from "./agentViewStore.js";
 
 export const AGENT_VIEW_HINT =
-  "↑↓ select · tab/→/⏎ attach · x stop · c collapse · ←/esc back";
+  "↑↓ select · ⏎/→ open · c collapse · x stop · tab compose · ←/esc back";
 /** Shown while the bottom composer owns the keyboard. */
 export const AGENT_VIEW_INPUT_HINT =
   "⏎ start · /command run · tab list · esc clear/back";
@@ -65,6 +67,8 @@ export interface AgentViewViewProps {
   nav: ViewNav;
   onNewSessionTextChange: (text: string) => void;
   onNewSessionSubmit: (text: string) => void;
+  /** A click on a group header collapses or expands it. */
+  onToggleGroup?: (group: ViewGroup) => void;
   rows: readonly ViewRow[];
   t: Theme;
 }
@@ -79,13 +83,19 @@ export function AgentViewView({
   nav,
   onNewSessionTextChange = () => {},
   onNewSessionSubmit = () => {},
+  onToggleGroup = () => {},
   rows,
   t,
 }: AgentViewViewProps) {
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
   const lines = buildLines(rows, nav.collapsedGroups);
 
-  const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
+  const header = selectedHeader(nav, rows);
+  const selLine = lines.findIndex((l) =>
+    header
+      ? l.type === "header" && l.group === header
+      : l.type === "row" && l.index === index,
+  );
   // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
   const overflow = !compact && lines.length > height;
   const inner = overflow ? Math.max(1, height - 2) : Math.max(1, height);
@@ -115,7 +125,7 @@ export function AgentViewView({
   );
 
   const renderRow = (row: ViewRow, i: number) => {
-    const selected = i === index;
+    const selected = !header && i === index;
     const style = listRowStyle(t, selected);
     const confirm = nav.confirmKey === row.key;
     const tag = row.current ? CURRENT_TAG : "";
@@ -172,18 +182,22 @@ export function AgentViewView({
     const isCollapsed = nav.collapsedGroups.includes(group);
     const count = rows.filter((r) => r.group === group).length;
     const arrow = isCollapsed ? "▸ " : "▾ ";
+    // Only a collapsed header takes the selection; it stands for its hidden rows.
+    const style = listRowStyle(t, header === group);
 
     return (
-      <Text
-        bold
-        color={t.color.text}
-        key={`group:${group}`}
-        wrap="truncate-end"
-      >
-        <Text color={t.color.accent}>{arrow}</Text>
-        {VIEW_GROUP_LABEL[group]}
-        {count ? <Text color={t.color.muted}>{`  ${count}`}</Text> : null}
-      </Text>
+      <Box key={`group:${group}`} onClick={() => onToggleGroup(group)}>
+        <Text
+          backgroundColor={style.backgroundColor}
+          bold
+          color={style.color ?? t.color.text}
+          wrap="truncate-end"
+        >
+          <Text color={t.color.accent}>{arrow}</Text>
+          {VIEW_GROUP_LABEL[group]}
+          {count ? <Text color={t.color.muted}>{`  ${count}`}</Text> : null}
+        </Text>
+      </Box>
     );
   };
 
@@ -317,7 +331,7 @@ export function AgentViewPane({
   const height = Math.max(1, termRows - (compact ? 3 : 5) - (error ? 1 : 0));
 
   const handleNewSessionTextChange = (draft: string) => {
-    setNav({ ...navState, draft });
+    setNav((prev) => ({ ...prev, draft }));
   };
 
   // Enter on the composer: a /command runs through the app's slash handler with the
@@ -330,7 +344,7 @@ export function AgentViewPane({
       return;
     }
 
-    setNav({ ...navState, draft: "", focus: "input" });
+    setNav((prev) => ({ ...prev, draft: "", focus: "input" }));
 
     if (trimmed.startsWith("/")) {
       onCommand(trimmed);
@@ -433,7 +447,12 @@ export function AgentViewPane({
       Math.max(1, height - 2),
     );
 
-    setNav(r.nav);
+    // The composer's TextInput owns the draft (its onChange/onSubmit run before this handler on the same key); only an
+    // explicit change by the reducer (Esc clearing it) replaces it, so a stale copy never restores a submitted draft.
+    setNav((prev) => ({
+      ...r.nav,
+      draft: r.nav.draft !== nav.draft ? r.nav.draft : prev.draft,
+    }));
     setSelKey(rows[r.nav.index]?.key ?? null);
 
     // Side effects run here, never inside a state updater, so a stop cannot fire twice.
@@ -444,15 +463,6 @@ export function AgentViewPane({
         return onStop(r.effect.row);
       case "close":
         return onClose();
-      case "toggle-group": {
-        const group = r.effect.group;
-        const isCollapsed = nav.collapsedGroups.includes(group);
-        const nextCollapsed = isCollapsed
-          ? nav.collapsedGroups.filter((g) => g !== group)
-          : [...nav.collapsedGroups, group];
-        setNav((prev) => ({ ...prev, collapsedGroups: nextCollapsed }));
-        break;
-      }
     }
   });
 
@@ -466,6 +476,12 @@ export function AgentViewPane({
       nav={nav}
       onNewSessionTextChange={handleNewSessionTextChange}
       onNewSessionSubmit={handleNewSessionSubmit}
+      onToggleGroup={(group) => {
+        const next = toggleGroup(nav, rows, group);
+
+        setNav(next);
+        setSelKey(rows[next.index]?.key ?? null);
+      }}
       rows={rows}
       t={theme}
     />
