@@ -1,6 +1,7 @@
 import type { SessionListRow } from "@k3code/shared/gateway-events";
 
 import { resumableHistory } from "../components/activeSessionSwitcher.js";
+import { stripControl } from "../lib/text.js";
 import type { SessionActiveItem } from "../gatewayTypes.js";
 import type { SubagentProgress } from "../types.js";
 
@@ -267,6 +268,9 @@ export function toggleGroup(
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);
 
+/** Letters the list acts on while it has the keyboard: c collapse, x stop, n new (compose). */
+const LIST_HOTKEYS = ["c", "n", "x"];
+
 /** Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. */
 export function reduceViewKey(
   nav: ViewNav,
@@ -284,15 +288,21 @@ export function reduceViewKey(
     nav: { ...nav, confirmKey: null, index, ...next },
   });
 
-  // The composer owns editing keys through its own useInput; only the two chords
-  // it hands up reach the reducer here. Esc clears the draft first, so leaving
-  // the view takes a second Esc — text is never lost to a stray Esc.
+  // The composer owns editing keys through its own useInput; only the chords it
+  // hands up reach the reducer here. Esc clears the draft first, so leaving the
+  // view takes a second Esc — text is never lost to a stray Esc. ↑/↓ on an empty
+  // composer hand the keyboard to the list, the selection where it was. (⏎ on an
+  // empty composer opens the selected row: the pane does that from the submit,
+  // which sees the real text; the draft here can lag the TextInput by a frame.)
   if (nav.focus === "input") {
     if (key.tab) {
       return done(null, { focus: "list" });
     }
     if (key.escape) {
       return nav.draft ? done(null, { draft: "" }) : done({ type: "close" });
+    }
+    if ((key.up || key.down) && !nav.draft && rows.length) {
+      return done(null, { focus: "list" });
     }
     return done(null);
   }
@@ -317,6 +327,16 @@ export function reduceViewKey(
   // n and tab both hand the keyboard to the composer; the draft survives the switch.
   if (ch === "n" || key.tab) {
     return done(null, { focus: "input" });
+  }
+
+  // Any other typed text is meant for the composer: it takes the keyboard and the text, so no letter is lost.
+  if (
+    ch &&
+    !LIST_HOTKEYS.includes(ch) &&
+    !key.return &&
+    stripControl(key.ch ?? "") === key.ch
+  ) {
+    return done(null, { draft: nav.draft + (key.ch ?? ""), focus: "input" });
   }
 
   if (!rows.length) {

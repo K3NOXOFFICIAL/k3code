@@ -608,13 +608,72 @@ describe("reduceViewKey", () => {
   });
 
   it("swallows every other key without an effect", () => {
-    for (const key of [{ ch: "q" }, { ch: "y" }, {}]) {
+    for (const key of [{}, { ch: "\x7f" }, { ch: "\x1b[1;5A" }]) {
       const r = press(at(2), key);
 
       expect(r.consumed).toBe(true);
       expect(r.effect).toBeNull();
       expect(r.nav).toEqual(at(2));
     }
+  });
+
+  it("on the list, typed text other than c/x/n goes to the composer with the keyboard", () => {
+    expect(press(at(2), { ch: "q" })).toEqual({
+      consumed: true,
+      effect: null,
+      nav: { ...at(2), draft: "q", focus: "input" },
+    });
+    // The case is kept, a burst arrives whole, and an earlier draft is extended rather than replaced.
+    expect(press({ ...at(2), draft: "fix " }, { ch: "Hello" }).nav).toEqual({
+      ...at(2),
+      draft: "fix Hello",
+      focus: "input",
+    });
+    // The list's own letters stay commands while the list has the keyboard: c collapses, x asks, n composes.
+    expect(press(at(1), { ch: "c" }).nav.focus).toBe("list");
+    expect(press(at(1), { ch: "c" }).nav.draft).toBe("");
+    expect(press(at(1), { ch: "x" }).nav).toEqual({
+      ...at(1),
+      confirmKey: ROWS[1]!.key,
+    });
+    expect(press(at(1), { ch: "n" }).nav).toEqual({
+      ...at(1),
+      focus: "input",
+    });
+    // A pending stop confirmation still eats the next key.
+    const ask = press(at(1), { ch: "x" }).nav;
+
+    expect(press(ask, { ch: "q" }).nav).toEqual(at(1));
+  });
+
+  it("in input mode ↑/↓ on an empty composer hand the keyboard to the list, the selection where it was", () => {
+    const empty = { ...at(2), focus: "input" as const };
+
+    expect(press(empty, { up: true })).toEqual({
+      consumed: true,
+      effect: null,
+      nav: at(2),
+    });
+    expect(press(empty, { down: true }).nav).toEqual(at(2));
+    // A collapsed header keeps the selection too.
+    const onHeader: ViewNav = {
+      ...empty,
+      collapsedGroups: ["completed"],
+      header: "completed",
+    };
+
+    expect(press(onHeader, { up: true }).nav).toEqual({
+      ...onHeader,
+      focus: "list",
+    });
+    // With text in it the arrows stay with the composer; with no rows there is no list to go to.
+    expect(press({ ...empty, draft: "hi" }, { up: true }).nav).toEqual({
+      ...empty,
+      draft: "hi",
+    });
+    expect(
+      press({ ...IDLE_VIEW_NAV, focus: "input" }, { up: true }, []).nav,
+    ).toEqual({ ...at(0), focus: "input" });
   });
 
   it("with no rows only n, esc and ← do anything", () => {

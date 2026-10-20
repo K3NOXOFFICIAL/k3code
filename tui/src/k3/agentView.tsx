@@ -33,11 +33,15 @@ import {
   visibleWindow,
 } from "./agentViewStore.js";
 
+/** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
 export const AGENT_VIEW_HINT =
-  "↑↓ select · ⏎/→ open · c collapse · x stop · tab compose · ←/esc back";
-/** Shown while the bottom composer owns the keyboard. */
+  "↑↓ select · ⏎/→ open · c collapse · x stop · tab/type compose · ←/esc back";
+/** The list hint on a pane too narrow for the full one. */
+export const AGENT_VIEW_HINT_SHORT =
+  "↑↓ ⏎ open · c collapse · x stop · tab compose · esc back";
+/** Shown while the bottom composer owns the keyboard: the view opens this way. */
 export const AGENT_VIEW_INPUT_HINT =
-  "⏎ start · /command run · tab list · esc clear/back";
+  "⏎ start (empty: open) · ↑ list · esc clear/back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   completed: "completed",
@@ -202,7 +206,8 @@ export function AgentViewView({
   };
 
   // The bottom composer, like the one in the main view: starts a session, runs a
-  // /command. Focus state lives in `nav.focus` (tab toggles), not in the input.
+  // /command. Focus state lives in `nav.focus`, not in the input: the composer has
+  // it on open, ↑ hands it to the list, tab or typing hands it back.
   // The long placeholder wraps on narrow panes, so small descriptors shrink it.
   const placeholder =
     cols - 2 >= "start a new session, or type a /command".length
@@ -249,7 +254,7 @@ export function AgentViewView({
         <Text color={t.color.muted} wrap="truncate-end">
           {loading
             ? "Loading sessions…"
-            : "No sessions yet - press n to start one"}
+            : "No sessions yet - type a prompt below to start one"}
         </Text>
       ) : (
         <Box flexDirection="column">
@@ -280,7 +285,11 @@ export function AgentViewView({
       {renderNewPrompt()}
       {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
-        {nav.focus === "input" ? AGENT_VIEW_INPUT_HINT : AGENT_VIEW_HINT}
+        {nav.focus === "input"
+          ? AGENT_VIEW_INPUT_HINT
+          : cols >= AGENT_VIEW_HINT.length
+            ? AGENT_VIEW_HINT
+            : AGENT_VIEW_HINT_SHORT}
       </Text>
     </Box>
   );
@@ -313,7 +322,11 @@ export function AgentViewPane({
   const [past, setPast] = useState<PastSessionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
-  const [navState, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
+  // The composer has the keyboard from the start: the view opens ready to type a prompt; ↑ reaches the list.
+  const [navState, setNav] = useState<ViewNav>({
+    ...IDLE_VIEW_NAV,
+    focus: "input",
+  });
   // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it. Until the user
   // moves, it rests on this session's row, where they came from.
   const [selKey, setSelKey] = useState<null | string>(null);
@@ -330,29 +343,10 @@ export function AgentViewPane({
   // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
   const height = Math.max(1, termRows - (compact ? 3 : 5) - (error ? 1 : 0));
 
+  const pageSize = Math.max(1, height - 2);
+
   const handleNewSessionTextChange = (draft: string) => {
     setNav((prev) => ({ ...prev, draft }));
-  };
-
-  // Enter on the composer: a /command runs through the app's slash handler with the
-  // view closed so its output lands in the transcript; a plain prompt starts a
-  // session for it with the view open — that is the orchestrator's purpose.
-  const handleNewSessionSubmit = (text: string) => {
-    const trimmed = text.trim();
-
-    if (!trimmed) {
-      return;
-    }
-
-    setNav((prev) => ({ ...prev, draft: "", focus: "input" }));
-
-    if (trimmed.startsWith("/")) {
-      onCommand(trimmed);
-
-      return;
-    }
-
-    onNewPrompt(trimmed);
   };
 
   useEffect(() => {
@@ -424,31 +418,10 @@ export function AgentViewPane({
     return () => clearInterval(timer);
   }, [working]);
 
-  useInput((ch, key) => {
-    const r = reduceViewKey(
-      nav,
-      rows,
-      {
-        ch,
-        ctrl: key.ctrl,
-        down: key.downArrow,
-        end: key.end,
-        escape: key.escape,
-        home: key.home,
-        left: key.leftArrow,
-        meta: key.meta,
-        pageDown: key.pageDown,
-        pageUp: key.pageUp,
-        return: key.return,
-        right: key.rightArrow,
-        tab: key.tab,
-        up: key.upArrow,
-      },
-      Math.max(1, height - 2),
-    );
-
+  const apply = (r: ReturnType<typeof reduceViewKey>) => {
     // The composer's TextInput owns the draft (its onChange/onSubmit run before this handler on the same key); only an
-    // explicit change by the reducer (Esc clearing it) replaces it, so a stale copy never restores a submitted draft.
+    // explicit change by the reducer (Esc clearing it, a key typed on the list) replaces it, so a stale copy never
+    // restores a submitted draft.
     setNav((prev) => ({
       ...r.nav,
       draft: r.nav.draft !== nav.draft ? r.nav.draft : prev.draft,
@@ -464,6 +437,71 @@ export function AgentViewPane({
       case "close":
         return onClose();
     }
+  };
+
+  // Enter on the composer: a /command runs through the app's slash handler with the
+  // view closed so its output lands in the transcript; a plain prompt starts a
+  // session for it with the view open — that is the orchestrator's purpose. An
+  // empty composer opens the selected row, as ⏎ on the list would; decided here,
+  // not in the key reducer, because only the submit sees the TextInput's real text.
+  const handleNewSessionSubmit = (text: string) => {
+    const trimmed = text.trim();
+
+    if (!text) {
+      const r = reduceViewKey(
+        { ...nav, focus: "list" },
+        rows,
+        { return: true },
+        pageSize,
+      );
+
+      return apply({ ...r, nav: { ...r.nav, focus: "input" } });
+    }
+
+    if (!trimmed) {
+      return;
+    }
+
+    setNav((prev) => ({ ...prev, draft: "", focus: "input" }));
+
+    if (trimmed.startsWith("/")) {
+      onCommand(trimmed);
+
+      return;
+    }
+
+    onNewPrompt(trimmed);
+  };
+
+  useInput((ch, key) => {
+    // ⏎ in the composer is its submit's (above); a second update from here would undo what that one set.
+    if (nav.focus === "input" && key.return) {
+      return;
+    }
+
+    apply(
+      reduceViewKey(
+        nav,
+        rows,
+        {
+          ch,
+          ctrl: key.ctrl,
+          down: key.downArrow,
+          end: key.end,
+          escape: key.escape,
+          home: key.home,
+          left: key.leftArrow,
+          meta: key.meta,
+          pageDown: key.pageDown,
+          pageUp: key.pageUp,
+          return: key.return,
+          right: key.rightArrow,
+          tab: key.tab,
+          up: key.upArrow,
+        },
+        pageSize,
+      ),
+    );
   });
 
   return (

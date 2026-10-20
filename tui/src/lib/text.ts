@@ -53,6 +53,14 @@ export const compactPreview = (s: string, max: number) => {
   return !one ? "" : one.length > max ? one.slice(0, max - 1) + "…" : one;
 };
 
+/** C0/C1 control characters (and DEL) as spaces; a terminal would act on them instead of drawing them. */
+export const stripControl = (s: string) =>
+  Array.from(s, (c) => {
+    const n = c.codePointAt(0)!;
+
+    return n < 0x20 || (n >= 0x7f && n < 0xa0) ? " " : c;
+  }).join("");
+
 export const estimateTokensRough = (text: string) =>
   !text ? 0 : (text.length + 3) >> 2;
 
