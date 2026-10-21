@@ -241,6 +241,15 @@ describe("AgentViewView", () => {
     }
   });
 
+  it("keeps its own height when not pinned (inline mode): the footer follows the list", () => {
+    const lines = dump([row(1)], { height: 12, pin: false }).split("\n");
+
+    // header, spacer, Working header, the row, spacer, composer, hint
+    expect(lines).toHaveLength(7);
+    expect(lines.at(-2)).toContain("❯");
+    expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
+  });
+
   it("highlights nothing as a row while a header holds the selection", () => {
     const out = dump(
       [row(1), row(2)],
@@ -667,6 +676,134 @@ describe("AgentViewPane", () => {
       } finally {
         pane.done();
       }
+    }
+  });
+
+  it("inline mode is not pinned and stays a row short of the terminal, so the frame never scrolls", async () => {
+    // At 20 rows the inline list area is 14 lines: 13 sessions plus the Working header fill it exactly, and 14 are one
+    // too many for it (a list area sized for a pinned frame would make 20 lines here).
+    // A short list keeps its own height (8 lines), not the screen's.
+    for (const [count, maxLines] of [
+      [2, 10],
+      [13, 19],
+      [14, 19],
+      [40, 19],
+    ] as const) {
+      resetUiState();
+      patchUiState({ sid: "cur" });
+      $stripSessions.set(
+        Array.from({ length: count }, (_, i) => ({
+          id: `s${i}`,
+          status: "waiting" as const,
+          title: `task ${i}`,
+        })),
+      );
+
+      const pane = mountPane(90, 20, { inline: true });
+
+      try {
+        await waitFor(() => {
+          expect(pane.lastFrame()).toContain("task 0");
+          expect(pane.lastFrame()).toContain("⏎ start");
+        });
+
+        const lines = pane.lastFrame().split("\n");
+
+        // Never as tall as the terminal (that scrolls a row into scrollback), and the footer still ends it.
+        expect(lines.length).toBeLessThanOrEqual(maxLines);
+        expect(lines.at(-2)).toContain("❯");
+        expect(lines.at(-1)).toContain("⏎ start");
+      } finally {
+        pane.done();
+      }
+    }
+  });
+
+  it("a header whose group disappears does not take the selection back when the group returns", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+
+    const alpha = { id: "a", status: "waiting" as const, title: "alpha" };
+    const mine = {
+      current: true,
+      id: "cur",
+      status: "waiting" as const,
+      title: "this one",
+    };
+
+    $stripSessions.set([alpha, mine]);
+
+    const pane = mountPane(90, 30);
+    const settle = () => new Promise((r) => setTimeout(r, 80));
+
+    try {
+      await waitFor(() => expect(pane.lastFrame()).toContain("› ● this one"));
+      pane.press("\x1b[A"); // the list takes the keyboard from the composer
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      pane.press("\x1b[A"); // onto the Needs input header
+      await settle();
+      expect(pane.lastFrame()).not.toContain("›");
+
+      // Both sessions leave that group (answered elsewhere): the header's rows are gone and a row is highlighted.
+      $stripSessions.set([
+        { current: true, id: "cur", status: "working", title: "this one" },
+      ]);
+      await waitFor(() => {
+        expect(pane.lastFrame()).not.toContain("alpha");
+        expect(pane.lastFrame()).toContain("› ◐ this one");
+      });
+      await settle();
+
+      // A session needs input again: the group returns, the highlighted row stays highlighted.
+      $stripSessions.set([
+        alpha,
+        { current: true, id: "cur", status: "working", title: "this one" },
+      ]);
+      await waitFor(() => expect(pane.lastFrame()).toContain("alpha"));
+      await settle();
+      expect(pane.lastFrame()).toMatch(/^\s*› /m);
+    } finally {
+      pane.done();
+    }
+  });
+
+  it("⏎ on an empty composer opens the selected row but does not fold a header the list last stopped on", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { id: "a", status: "waiting", title: "alpha" },
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+
+    const onActivate = vi.fn();
+    const onClose = vi.fn();
+    const pane = mountPane(90, 30, { onActivate, onClose });
+    const settle = () => new Promise((r) => setTimeout(r, 80));
+
+    try {
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain("› ◐ this one (this session)"),
+      );
+      pane.press("\x1b[A"); // composer → list
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      pane.press("\x1b[A"); // onto the Working header
+      await settle();
+      pane.press("\t"); // back to the composer, empty
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain(AGENT_VIEW_INPUT_HINT),
+      );
+      await settle();
+
+      pane.press("\r");
+      await settle();
+      await settle();
+
+      expect(pane.lastFrame()).toContain("▾ Working");
+      expect(pane.lastFrame()).toContain("this one (this session)");
+      expect(onActivate).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      pane.done();
     }
   });
 
