@@ -355,6 +355,11 @@ class LiveSession:
             self.prompt_frozen.pop(slot, None)
 
     @property
+    def unattended(self) -> bool:
+        """A run nobody watches (background, cron/loop/automation task, goal continuation): it asks nobody anything."""
+        return bool(self.background or self.task_kind or self.goal_continuation)
+
+    @property
     def turn_in_flight(self) -> bool:
         """A turn owns this session: it streams, or its task still runs (scope gate, compaction, the goal judge, the
         goal check, the advisor: ``streaming`` is False there). Anything that starts a turn, or evicts or idles the
@@ -1941,7 +1946,7 @@ class GatewayServer:
         ``auto_continue_max_turns`` judged turns. A plain question gets no goal; a prompt the scope gate rates trivial
         ends after its first turn (see ``_run_turn_locked``).
         """
-        if session.background or session.task_kind or session.goal_continuation:
+        if session.unattended:
             return
         state = mgr.state
         if state is not None and not state.implicit and state.status in ("active", "paused"):

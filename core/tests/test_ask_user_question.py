@@ -10,6 +10,7 @@ import pytest
 
 from k3code import ask_user
 from k3code.ask_user import NAME, decode_answers, parse_questions
+from k3code.gateway.server import LiveSession
 from k3code.permissions import decide
 from k3code.tools import build_registry
 from test_autonomy_gateway import call, events, make, start
@@ -153,13 +154,46 @@ async def test_unattended_is_refused_at_call_time_without_asking(tmp_path, monke
     assert second == {"error": ask_user.UNATTENDED}
 
 
+async def test_interrupting_the_turn_cancels_the_open_request_and_is_not_a_tool_result(tmp_path, monkeypatch) -> None:
+    server = await gateway(tmp_path, monkeypatch, [q()])
+    await call(server, "prompt.submit", {"text": "set it up"})
+    task = server.session.turn_task
+    for _ in range(1000):  # until the clarify request is open
+        if any(f.get("method") == "clarify" for f in frames(server)):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("no clarify request was sent")
+    assert (await call(server, "session.interrupt", {}))["interrupted"] is True
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (cancel,) = [f for f in frames(server) if f.get("method") == "request.cancel"]
+    assert cancel["params"]["reason"] == "interrupted" and cancel["params"]["method"] == "clarify"
+    assert task.cancelled() and server.session.user_stopped  # ended interrupted: a cancelled turn, not a finished one
+    assert not server.session.streaming and not events(server, "message.complete")
+    assert results(server) == []  # the handler let the cancellation through: nothing answered the model
+
+
+async def test_two_calls_in_one_reply_never_run_concurrently(tmp_path, monkeypatch) -> None:
+    server = await gateway(tmp_path, monkeypatch, [q()], calls=2)
+    open_at_answer: list[int] = []
+
+    def answer(params):
+        open_at_answer.append(len(server._open_requests))  # requests open while this one is answered
+        return {"result": {"answers": {"q1": "SQLite"}}}
+
+    seen = await turn(server, "set it up", answer)
+    assert len(seen) == 2 and open_at_answer == [1, 1]  # the second request opens only after the first was answered
+
+
 @pytest.mark.parametrize(
     "flags", [{"background": True}, {"task_kind": "cron_job"}, {"task_kind": "loop_tick"}, {"goal_continuation": True}]
 )
 def test_every_unattended_kind_counts(flags) -> None:
     base = {"background": False, "task_kind": "", "goal_continuation": False}
-    assert ask_user.unattended(SimpleNamespace(**{**base, **flags}))
-    assert not ask_user.unattended(SimpleNamespace(**base))
+    unattended = LiveSession.unattended.fget  # the one predicate, read off the property so no live session is needed
+    assert unattended(SimpleNamespace(**{**base, **flags}))
+    assert not unattended(SimpleNamespace(**base))
 
 
 # ── permissions and where the tool exists ──
@@ -235,7 +269,10 @@ def test_cancel_is_a_dismissal(result) -> None:
 
 def test_a_lone_legacy_answer_answers_the_first_question() -> None:
     out = decode_answers(questions(*TWO), {"answer": "Postgres"})
-    assert out == {"answers": [{"header": "Database", "question": "Which db?", "answer": "Postgres", "custom": False}]}
+    assert out == {
+        "answers": [{"header": "Database", "question": "Which db?", "answer": "Postgres", "custom": False}],
+        "unanswered": ["Extras"],
+    }
 
 
 # ── validation ──
@@ -259,7 +296,7 @@ def test_a_lone_legacy_answer_answers_the_first_question() -> None:
 async def test_invalid_questions_are_rejected_before_anyone_is_asked(qs, needle) -> None:
     asked: list = []
     server = SimpleNamespace(_ask_client=lambda *a: asked.append(a), approval_timeout_s=5.0)
-    session = SimpleNamespace(background=False, task_kind="", goal_continuation=False, session_id="s")
+    session = SimpleNamespace(unattended=False, session_id="s")
     reg = SimpleNamespace(register=lambda spec, handler: setattr(reg, "handler", handler))
     ask_user.register(reg, server, session)
     out = await reg.handler({"questions": qs})
@@ -268,3 +305,88 @@ async def test_invalid_questions_are_rejected_before_anyone_is_asked(qs, needle)
 
 def test_a_header_of_twelve_characters_is_accepted() -> None:
     assert questions(q(header="Twelve chars"))[0]["header"] == "Twelve chars"
+
+
+# ── input hardening ──
+
+
+def rejected(**kw) -> str:
+    out = parse_questions({"questions": [q(**kw)]})
+    assert isinstance(out, str), out
+    return out
+
+
+@pytest.mark.parametrize(
+    "bad", ["\x1b[31m", "a\x07b", "a\x00b", "tab\there", "a\x7fb", "a\x85b", "a\u202eb", "a\u2066b"]
+)
+def test_control_and_bidi_characters_are_rejected_in_every_field(bad) -> None:
+    assert "question 1: question contains a control character" in rejected(question=f"Which {bad}?")
+    assert "question 1: header contains a control character" in rejected(header=f"H{bad}")
+    assert "question 1: option label contains a control character" in rejected(labels=(f"A{bad}", "B"))
+    opts = [{"label": "A", "description": f"d{bad}"}, {"label": "B", "description": ""}]
+    out = parse_questions({"questions": [{**q(), "options": opts}]})
+    assert isinstance(out, str) and "question 1: option description contains a control character" in out
+
+
+def test_esc_in_a_label_is_rejected() -> None:
+    assert "option label contains a control character (U+001B)" in rejected(labels=("\x1b[2JPostgres", "SQLite"))
+
+
+def test_a_newline_is_allowed_in_question_and_description_only() -> None:
+    opts = [{"label": "A", "description": "line one\nline two"}, {"label": "B", "description": ""}]
+    out = parse_questions({"questions": [{**q(question="Which?\nBe brief."), "options": opts}]})
+    assert isinstance(out, list) and out[0]["question"] == "Which?\nBe brief."
+    assert out[0]["descriptions"][0] == "line one\nline two"
+    assert "option label contains a control character" in rejected(labels=("A\nB", "C"))
+    assert "header contains a control character" in rejected(header="A\nB")
+
+
+def test_length_caps_in_characters() -> None:
+    assert "question 1: question is 1001 characters; use at most 1000" in rejected(question="x" * 1001)
+    assert "question 1: option label is 81 characters; use at most 80" in rejected(labels=("x" * 81, "B"))
+    opts = [{"label": "A", "description": "x" * 301}, {"label": "B", "description": ""}]
+    out = parse_questions({"questions": [{**q(), "options": opts}]})
+    assert isinstance(out, str) and "question 1: option description is 301 characters; use at most 300" in out
+    at_cap = [{"label": "x" * 80, "description": "y" * 300}, {"label": "B", "description": ""}]
+    assert isinstance(parse_questions({"questions": [{**q(question="z" * 1000), "options": at_cap}]}), list)
+
+
+def test_the_error_names_the_question_number() -> None:
+    out = parse_questions({"questions": [q(), q(question="x" * 1001)]})
+    assert isinstance(out, str) and out.startswith("question 2:")
+
+
+def test_header_counts_display_cells() -> None:
+    assert "14 display cells" in rejected(header="データベース設")  # 7 characters, 2 cells each
+    assert questions(q(header="データベース"))[0]["header"] == "データベース"  # 6 wide characters: exactly 12 cells
+    assert questions(q(header="ABCDEFGHIJKL"))[0]["header"] == "ABCDEFGHIJKL"  # 12 ASCII
+    assert "13 display cells" in rejected(header="ABCDEFGHIJKLM")
+    assert questions(q(header="e\u0301" * 12))  # combining marks take no cell
+
+
+@pytest.mark.parametrize("bad", ["true", 1, 0, None, "false", []])
+def test_multi_select_that_is_not_a_bool_is_an_error(bad) -> None:
+    out = parse_questions({"questions": [{**q(), "multiSelect": bad}]})
+    assert isinstance(out, str) and out.startswith("question 1: multiSelect must be true or false")
+
+
+def test_multi_select_absent_means_single_select() -> None:
+    raw = q()
+    del raw["multiSelect"]
+    assert questions(raw)[0]["multi_select"] is False
+
+
+def test_unanswered_questions_are_listed_by_header() -> None:
+    qs = questions(*TWO, q("Which os?", "OS"))
+    out = decode_answers(qs, {"answers": {"q2": json.dumps(["Auth"])}})
+    assert out["unanswered"] == ["Database", "OS"]
+    lone = decode_answers(qs, {"answer": "Postgres"})  # an older TUI answers q1 only
+    assert lone["unanswered"] == ["Extras", "OS"]
+    chat = decode_answers(qs, {"answers": {"q1": "Postgres"}, "chat": True})
+    assert chat["unanswered"] == ["Extras", "OS"] and chat["user_chose_to_chat"] is True
+    empty_pick = decode_answers(qs, {"answers": {"q1": "Postgres", "q2": "[]"}})
+    assert empty_pick["unanswered"] == ["Extras", "OS"]
+
+
+def test_no_unanswered_key_when_everything_was_answered() -> None:
+    assert "unanswered" not in decode_answers(questions(q()), {"answers": {"q1": "SQLite"}})
