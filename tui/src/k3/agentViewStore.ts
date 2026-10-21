@@ -183,7 +183,8 @@ export type ViewKey = {
 
 export type ViewEffect =
   | { row: ViewRow; type: "activate" | "archive" | "stop" | "unarchive" }
-  | { type: "close" };
+  // The archive proposal banner: archive every listed session, or keep them all and stop asking.
+  | { type: "archive_suggested" | "close" | "decline_suggested" };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -301,12 +302,16 @@ export const isArchivable = (row: ViewRow) =>
 /** Letters the list acts on while it has the keyboard: a archive, c collapse, n new (compose), u restore, x stop. */
 const LIST_HOTKEYS = ["a", "c", "n", "u", "x"];
 
-/** Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. */
+/**
+ * Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. `suggesting`: the archive
+ * proposal banner is showing, so Alt+Y archives its sessions and Alt+N keeps them.
+ */
 export function reduceViewKey(
   nav: ViewNav,
   rows: readonly ViewRow[],
   key: ViewKey,
   pageSize: number,
+  suggesting = false,
 ): { consumed: true; effect: null | ViewEffect; nav: ViewNav } {
   const last = rows.length - 1;
   const index = Math.max(0, Math.min(nav.index, last));
@@ -317,6 +322,15 @@ export function reduceViewKey(
     effect,
     nav: { ...nav, confirmKey: null, index, ...next },
   });
+  // The banner's chords are the main view's proposal-card ones. Being chords, they work whichever half has the
+  // keyboard: the view opens with the composer focused, where a bare letter would be typed.
+  const chord = suggesting && key.meta && !key.ctrl ? key.ch : undefined;
+  const suggestion: null | ViewEffect =
+    chord === "y"
+      ? { type: "archive_suggested" }
+      : chord === "n"
+        ? { type: "decline_suggested" }
+        : null;
 
   // The composer owns editing keys through its own useInput; only the chords it
   // hands up reach the reducer here. Esc clears the draft first, so leaving the
@@ -334,7 +348,7 @@ export function reduceViewKey(
     if ((key.up || key.down) && !nav.draft && rows.length) {
       return done(null, { focus: "list" });
     }
-    return done(null);
+    return done(suggestion);
   }
 
   // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops (→ cancels like any
@@ -348,6 +362,10 @@ export function reduceViewKey(
         ? { row: target, type: "stop" }
         : null,
     );
+  }
+
+  if (suggestion) {
+    return done(suggestion);
   }
 
   if (key.escape || key.left) {

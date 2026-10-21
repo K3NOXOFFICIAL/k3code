@@ -1111,6 +1111,161 @@ describe("AgentViewPane", () => {
       }
     });
 
+    describe("the archive proposal banner", () => {
+      const ITEMS = [
+        { id: "o1", idle_days: 21, message_count: 4, title: "foo" },
+        { id: "o2", idle_days: 18, message_count: 4, title: "bar" },
+        { id: "o3", idle_days: 15, message_count: 4, title: "baz" },
+        { id: "o4", idle_days: 15, message_count: 4, title: "qux" },
+      ];
+      const proposal = (items = ITEMS, days = 14) => ({
+        days,
+        items,
+        total: items.length,
+      });
+
+      it("asks with the count, the first titles and their ages; singular for one; none without items", () => {
+        const out = dump(mixed(), { suggestions: proposal() });
+
+        expect(out).toContain(
+          "Archive 4 sessions unused for 14+ days?  alt+y archive · alt+n keep",
+        );
+        expect(out).toContain("foo (21d) · bar (18d) · baz (15d) +1 more");
+        // Between the counts line and the list.
+        expect(out.indexOf("Archive 4")).toBeLessThan(
+          out.indexOf("Needs input"),
+        );
+
+        expect(
+          dump(mixed(), { suggestions: proposal(ITEMS.slice(0, 1)) }),
+        ).toContain("Archive 1 session unused for 14+ days?");
+        expect(dump(mixed(), { suggestions: proposal([]) })).not.toContain(
+          "Archive",
+        );
+        expect(dump(mixed(), { suggestions: proposal([], 0) })).not.toContain(
+          "Archive",
+        );
+      });
+
+      it("sanitises titles and stays inside a narrow pane", () => {
+        const items = [
+          { ...ITEMS[0]!, title: "evil\x1b[2Jtitle\x07 that goes on and on" },
+          ...ITEMS.slice(1),
+        ];
+        const out = dump([], { cols: 30, suggestions: proposal(items) });
+
+        expect(out).not.toContain("\x1b");
+        expect(out).not.toContain("\x07");
+        expect(out).toContain("Archive 4 idle sessions?");
+        for (const line of out.split("\n")) {
+          expect(line.length).toBeLessThanOrEqual(30);
+        }
+      });
+
+      /** The archive gateway, plus `session.archive_suggestions` (proposing ITEMS once) and `session.archive_decline`. */
+      const proposingGateway = ({ fail = false } = {}) => {
+        const base = archiveGateway();
+        let proposed = false;
+
+        return vi.fn((method: string, params: Record<string, unknown> = {}) => {
+          if (method === "session.archive_suggestions") {
+            if (fail) {
+              return Promise.reject(new Error("unknown method"));
+            }
+
+            const first = !proposed;
+
+            proposed = true;
+
+            return Promise.resolve(proposal(first ? ITEMS : []));
+          }
+
+          if (method === "session.archive_decline") {
+            return Promise.resolve({
+              declined: (params.session_ids as string[]).length,
+            });
+          }
+
+          return base(method, params);
+        });
+      };
+
+      it("alt+y in the composer archives exactly the listed sessions, refetches and the banner goes", async () => {
+        const request = proposingGateway();
+        const pane = mountPane(request as ReturnType<typeof archiveGateway>);
+
+        try {
+          await waitFor(() =>
+            expect(pane.lastFrame()).toContain("Archive 4 sessions"),
+          );
+          expect(request).toHaveBeenCalledWith("session.archive_suggestions", {
+            cwd: CWD,
+          });
+          expect(pane.lastFrame()).toContain(AGENT_VIEW_INPUT_HINT);
+
+          pane.stdin.write("\x1by");
+          await waitFor(() =>
+            expect(pane.lastFrame()).not.toContain("Archive 4"),
+          );
+          expect(request).toHaveBeenCalledWith("session.archive", {
+            archived: true,
+            session_ids: ["o1", "o2", "o3", "o4"],
+          });
+          expect(
+            request.mock.calls.filter(
+              ([m]) => m === "session.archive_suggestions",
+            ),
+          ).toHaveLength(2);
+          // The chord was the view's: nothing was typed into the composer.
+          expect(pane.lastFrame()).not.toMatch(/❯ y/);
+          expect(pane.lastFrame()).toContain(AGENT_VIEW_INPUT_HINT);
+        } finally {
+          pane.close();
+        }
+      });
+
+      it("alt+n on the list keeps them: session.archive_decline with those ids, and the banner goes", async () => {
+        const request = proposingGateway();
+        const pane = mountPane(request as ReturnType<typeof archiveGateway>);
+
+        try {
+          await waitFor(() =>
+            expect(pane.lastFrame()).toContain("Archive 4 sessions"),
+          );
+          pane.stdin.write("\x1b[A");
+          await waitFor(() =>
+            expect(pane.lastFrame()).toContain(AGENT_VIEW_ARCHIVE_HINT),
+          );
+          pane.stdin.write("\x1bn");
+          await waitFor(() =>
+            expect(pane.lastFrame()).not.toContain("Archive 4"),
+          );
+          expect(request).toHaveBeenCalledWith("session.archive_decline", {
+            session_ids: ["o1", "o2", "o3", "o4"],
+          });
+          expect(request).not.toHaveBeenCalledWith(
+            "session.archive",
+            expect.anything(),
+          );
+        } finally {
+          pane.close();
+        }
+      });
+
+      it("shows no banner when the request fails (an older core); the lists still load", async () => {
+        const request = proposingGateway({ fail: true });
+        const pane = mountPane(request as ReturnType<typeof archiveGateway>);
+
+        try {
+          await waitFor(() => expect(pane.lastFrame()).toContain("first work"));
+          expect(pane.lastFrame()).not.toContain("alt+y");
+          expect(pane.lastFrame()).not.toContain("unknown method");
+        } finally {
+          pane.close();
+        }
+      });
+    });
+
     it("counts no row as archived without an archived_at (an older core that ignores the param)", async () => {
       const request = vi.fn(() =>
         Promise.resolve({ sessions: STORED.slice(0, 1) }),

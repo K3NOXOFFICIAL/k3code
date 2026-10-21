@@ -11,12 +11,14 @@ import { listRowStyle } from "../components/overlayPrimitives.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import type {
   SessionArchiveParams,
+  SessionArchiveDeclineParams,
   SessionArchiveResponse,
+  SessionArchiveSuggestionsResponse,
   SessionListFilter,
 } from "../gatewayTypes.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { fmtDuration } from "../lib/subagentTree.js";
-import { compactPreview } from "../lib/text.js";
+import { compactPreview, stripControl } from "../lib/text.js";
 import type { Theme } from "../theme.js";
 
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
@@ -66,6 +68,53 @@ const COUNT_LABEL: Record<ViewGroup, string> = {
   working: "working",
 };
 
+/** Longest a title gets in the archive banner, so three of them share one line. */
+const BANNER_TITLE_MAX = 24;
+const BANNER_KEYS = "  alt+y archive · alt+n keep";
+const BANNER_KEYS_SHORT = "  alt+y · alt+n";
+/** The banner's chords, kept from the composer while it shows. */
+const BANNER_CHORDS = ["n", "y"];
+
+/**
+ * The archive banner's first line: the question and its keys, or a shorter one on a narrow pane. The count is the
+ * listed sessions, the ones Alt+Y archives; after that the refetch proposes the next batch, if there is one.
+ */
+const bannerQuestion = (s: SessionArchiveSuggestionsResponse, cols: number) => {
+  const n = s.items.length;
+  const noun = n === 1 ? "session" : "sessions";
+  const long = `Archive ${n} ${noun} unused for ${s.days}+ days?`;
+
+  return long.length + BANNER_KEYS.length <= cols
+    ? { keys: BANNER_KEYS, text: long }
+    : { keys: BANNER_KEYS_SHORT, text: `Archive ${n} idle ${noun}?` };
+};
+
+/** The second line: as many of the first three titles, with their idle ages, as fit; the rest are counted. */
+const bannerNames = (s: SessionArchiveSuggestionsResponse, cols: number) => {
+  // Titles are stored session text: control characters would act on the terminal instead of being drawn.
+  const names = s.items.map(
+    (it) =>
+      `${compactPreview(stripControl(it.title || it.preview || it.id.slice(0, 8)), BANNER_TITLE_MAX)} (${it.idle_days}d)`,
+  );
+  const line = (shown: number) =>
+    names.slice(0, shown).join(" · ") +
+    (names.length > shown ? ` +${names.length - shown} more` : "");
+
+  for (let shown = Math.min(3, names.length); shown > 1; shown--) {
+    if (line(shown).length <= cols) {
+      return line(shown);
+    }
+  }
+
+  return line(1);
+};
+
+/** Lines the archive banner takes: none without proposals, only the question on a short terminal. */
+const bannerHeight = (
+  s: null | SessionArchiveSuggestionsResponse,
+  compact: boolean,
+) => (s?.items.length ? (compact ? 1 : 2) : 0);
+
 const CURRENT_TAG = " (this session)";
 const CONFIRM_TAG = "  stop? y/n";
 const MODEL_MAX = 24;
@@ -91,6 +140,8 @@ export interface AgentViewViewProps {
   /** A click on a group header collapses or expands it. */
   onToggleGroup?: (group: ViewGroup) => void;
   rows: readonly ViewRow[];
+  /** `session.archive_suggestions`: with any items, a banner proposes archiving them. */
+  suggestions?: null | SessionArchiveSuggestionsResponse;
   t: Theme;
 }
 
@@ -106,10 +157,12 @@ export function AgentViewView({
   onNewSessionSubmit = () => {},
   onToggleGroup = () => {},
   rows,
+  suggestions = null,
   t,
 }: AgentViewViewProps) {
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
   const lines = buildLines(rows, nav.collapsedGroups);
+  const banner = suggestions?.items.length ? suggestions : null;
 
   const header = selectedHeader(nav, rows);
   const selLine = lines.findIndex((l) =>
@@ -257,11 +310,32 @@ export function AgentViewView({
           onSubmit={onNewSessionSubmit}
           placeholder={placeholder}
           placeholderColor={t.color.muted}
+          // While the banner asks, its Alt+Y/Alt+N belong to the view, not to the draft.
+          reservedMetaKeys={banner ? BANNER_CHORDS : undefined}
           value={nav.draft ?? ""}
         />
       </Box>
     </Box>
   );
+
+  // Coloured like the main view's proposal cards: the proposal in the accent, the keys after it muted.
+  const renderBanner = (s: SessionArchiveSuggestionsResponse) => {
+    const q = bannerQuestion(s, cols);
+
+    return (
+      <Box flexDirection="column">
+        <Text wrap="truncate-end">
+          <Text color={t.color.accent}>{q.text}</Text>
+          <Text color={t.color.muted}>{q.keys}</Text>
+        </Text>
+        {compact ? null : (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {bannerNames(s, cols)}
+          </Text>
+        )}
+      </Box>
+    );
+  };
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -277,6 +351,7 @@ export function AgentViewView({
           {error}
         </Text>
       ) : null}
+      {banner ? renderBanner(banner) : null}
       {compact ? null : <Text> </Text>}
       {!rows.length ? (
         <Text color={t.color.muted} wrap="truncate-end">
@@ -348,6 +423,9 @@ export function AgentViewPane({
     archived: PastSessionRow[];
     past: PastSessionRow[];
   }>({ archived: [], past: [] });
+  // The archive proposal; null when there is none or the core cannot make one.
+  const [suggestions, setSuggestions] =
+    useState<null | SessionArchiveSuggestionsResponse>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   // The composer has the keyboard from the start: the view opens ready to type a prompt; ↑ reaches the list.
@@ -367,9 +445,15 @@ export function AgentViewPane({
   const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
   // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
   const compact = termRows < 8;
-  // header, composer, spacer, spacer, hint (+ the error line); compact: header, composer and hint only.
-  // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
-  const height = Math.max(1, termRows - (compact ? 3 : 5) - (error ? 1 : 0));
+  // header, composer, spacer, spacer, hint (+ the error line and the archive banner); compact: header, composer and
+  // hint only. The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
+  const height = Math.max(
+    1,
+    termRows -
+      (compact ? 3 : 5) -
+      (error ? 1 : 0) -
+      bannerHeight(suggestions, compact),
+  );
 
   const pageSize = Math.max(1, height - 2);
 
@@ -388,7 +472,8 @@ export function AgentViewPane({
     [],
   );
 
-  // On open and again after an archive or a restore: the earlier sessions and the archived ones, fetched together.
+  // On open and again after an archive, a restore or an answer to the banner: the earlier sessions, the archived ones
+  // and the archive proposal, fetched together.
   const loadLists = useCallback(() => {
     const seq = ++loadSeq.current;
     const current = () => !closed.current && seq === loadSeq.current;
@@ -408,8 +493,17 @@ export function AgentViewPane({
           archived: true,
         })
         .catch(() => null),
+      // A core without archive proposals rejects the method: no banner, the view works as before.
+      currentCwd
+        ? gw
+            .request<SessionArchiveSuggestionsResponse>(
+              "session.archive_suggestions",
+              { cwd: currentCwd },
+            )
+            .catch(() => null)
+        : null,
     ])
-      .then(([raw, rawArchived]) => {
+      .then(([raw, rawArchived, rawSuggestions]) => {
         if (!current()) {
           return;
         }
@@ -425,10 +519,18 @@ export function AgentViewPane({
         const archived = (asRpcResult<SessionListResult>(rawArchived)
           ?.sessions ?? []) as PastSessionRow[];
 
+        const proposal =
+          asRpcResult<SessionArchiveSuggestionsResponse>(rawSuggestions);
+
         setLists({
           archived: archived.filter((h) => h.archived_at != null),
           past: r.sessions ?? [],
         });
+        setSuggestions(
+          Array.isArray(proposal?.items) && proposal.items.length
+            ? proposal
+            : null,
+        );
       })
       .catch((e: unknown) => {
         if (current()) {
@@ -506,6 +608,41 @@ export function AgentViewPane({
       });
   };
 
+  // The banner's answer, for exactly the sessions it lists: archive them all in one call, or keep them and stop asking.
+  // The refetch then drops the banner or proposes the next batch. Leaving the view without answering persists nothing.
+  const answerSuggestions = (accept: boolean) => {
+    const ids = suggestions?.items.map((it) => it.id) ?? [];
+
+    if (!ids.length) {
+      return;
+    }
+
+    const archive: SessionArchiveParams = { archived: true, session_ids: ids };
+    const decline: SessionArchiveDeclineParams = { session_ids: ids };
+    const request = accept
+      ? gw.request<SessionArchiveResponse>("session.archive", { ...archive })
+      : gw.request<unknown>("session.archive_decline", { ...decline });
+
+    request
+      .then((raw) => {
+        if (closed.current) {
+          return;
+        }
+
+        const skipped = accept
+          ? asRpcResult<SessionArchiveResponse>(raw)?.skipped?.[0]
+          : undefined;
+
+        setError(skipped ? `not archived: ${skipped.reason}` : null);
+        loadLists();
+      })
+      .catch((e: unknown) => {
+        if (!closed.current) {
+          setError(rpcErrorMessage(e));
+        }
+      });
+  };
+
   const apply = (r: ReturnType<typeof reduceViewKey>) => {
     // The composer's TextInput owns the draft (its onChange/onSubmit run before this handler on the same key); only an
     // explicit change by the reducer (Esc clearing it, a key typed on the list) replaces it, so a stale copy never
@@ -526,6 +663,10 @@ export function AgentViewPane({
         return setArchived(r.effect.row, true);
       case "unarchive":
         return setArchived(r.effect.row, false);
+      case "archive_suggested":
+        return answerSuggestions(true);
+      case "decline_suggested":
+        return answerSuggestions(false);
       case "close":
         return onClose();
     }
@@ -592,6 +733,7 @@ export function AgentViewPane({
           up: key.upArrow,
         },
         pageSize,
+        !!suggestions,
       ),
     );
   });
@@ -613,6 +755,7 @@ export function AgentViewPane({
         setSelKey(rows[next.index]?.key ?? null);
       }}
       rows={rows}
+      suggestions={suggestions}
       t={theme}
     />
   );

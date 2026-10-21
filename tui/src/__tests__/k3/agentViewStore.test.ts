@@ -972,3 +972,53 @@ describe("visibleWindow", () => {
     expect(visibleWindow(5, 4, 0)).toEqual({ end: 5, start: 4 });
   });
 });
+
+describe("reduceViewKey: the archive proposal banner", () => {
+  const suggest = (nav: ViewNav, key: ViewKey, suggesting = true) =>
+    reduceViewKey(nav, ROWS, key, 2, suggesting);
+  const ALT_Y: ViewKey = { ch: "y", meta: true };
+  const ALT_N: ViewKey = { ch: "n", meta: true };
+
+  it("Alt+Y archives and Alt+N keeps the proposed sessions, in both focuses", () => {
+    for (const focus of ["input", "list"] as const) {
+      const nav = { ...at(1), focus };
+
+      expect(suggest(nav, ALT_Y).effect).toEqual({
+        type: "archive_suggested",
+      });
+      expect(suggest(nav, ALT_N).effect).toEqual({
+        type: "decline_suggested",
+      });
+      // The chord neither moves the selection nor takes the keyboard from either half.
+      expect(suggest(nav, ALT_Y).nav).toEqual(nav);
+    }
+  });
+
+  it("does nothing without a banner, and bare or Ctrl letters are not the chords", () => {
+    for (const focus of ["input", "list"] as const) {
+      const nav = { ...at(1), focus };
+
+      expect(suggest(nav, ALT_Y, false).effect).toBeNull();
+      expect(suggest(nav, ALT_N, false).effect).toBeNull();
+      expect(suggest(nav, ALT_N, false).nav).toEqual(nav);
+      expect(
+        suggest(nav, { ch: "y", ctrl: true, meta: true }).effect,
+      ).toBeNull();
+    }
+    expect(suggest(at(1), { ch: "y" }).effect).toBeNull();
+    expect(suggest(at(1), { ch: "n" }).nav.focus).toBe("input");
+  });
+
+  it("a pending stop confirmation is cancelled by either chord: nothing stops, nothing is archived", () => {
+    const armed = press(at(1), { ch: "x" }).nav;
+
+    expect(armed.confirmKey).toBe(ROWS[1]!.key);
+
+    for (const chord of [ALT_Y, ALT_N]) {
+      const r = suggest(armed, chord);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav.confirmKey).toBeNull();
+    }
+  });
+});

@@ -308,6 +308,29 @@ export interface SessionArchiveResponse {
   skipped: { id: string; reason: string }[];
 }
 
+/** `session.archive_suggestions {cwd}`: the project's sessions idle for `days` or more, proposed for archiving. */
+export interface SessionArchiveSuggestion {
+  id: string;
+  idle_days: number;
+  message_count: number;
+  preview?: null | string;
+  title?: null | string;
+}
+
+export interface SessionArchiveSuggestionsResponse {
+  /** `retention.session_archive_days`; 0 = proposals off (and no items). */
+  days: number;
+  /** Oldest idle first, at most 20. */
+  items: SessionArchiveSuggestion[];
+  /** Every idle session, `items` being the first of them. */
+  total: number;
+}
+
+/** `session.archive_decline`: keep these sessions and stop proposing them until they are used and idle again. */
+export interface SessionArchiveDeclineParams {
+  session_ids: string[];
+}
+
 export interface SessionMostRecentResponse {
   session_id?: null | string;
   source?: string;
