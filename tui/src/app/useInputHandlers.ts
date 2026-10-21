@@ -486,8 +486,14 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       hideEscInterruptHint();
     }
 
-    // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.
-    if (key.escape && !pairEsc && !overlay.agentView) {
+    // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft. So
+    // does the question picker (Esc leaves its text field, then cancels the set): neither Esc may wipe the draft.
+    if (
+      key.escape &&
+      !pairEsc &&
+      !overlay.agentView &&
+      !overlay.clarify?.questions?.length
+    ) {
       const now = Date.now();
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 

@@ -472,60 +472,6 @@ export function ClarifyPrompt({
   );
 }
 
-/**
- * Stand-in for a batch clarify (`questions[]`, the `ask_user_question` tool)
- * until the tabbed picker lands: the questions are listed read-only and the
- * only action is cancel (Esc here; Ctrl+C via the app-level handler), so the
- * request is never left unanswerable.
- */
-export function ClarifyBatchFallback({
-  onCancel,
-  req,
-  t,
-}: ClarifyBatchFallbackProps) {
-  const questions = req.questions ?? [];
-
-  useInput((_ch, key) => {
-    if (key.escape) {
-      onCancel();
-    }
-  });
-
-  return (
-    <Box flexDirection="column">
-      <Text bold>
-        <Text color={t.color.accent}>ask</Text>
-        <Text color={t.color.text}>
-          {" "}
-          {questions.length} question{questions.length === 1 ? "" : "s"}
-        </Text>
-      </Text>
-
-      {questions.map((q, i) => (
-        <Box flexDirection="column" key={q.qid}>
-          <Text color={t.color.text}>
-            {i + 1}. {q.header ? `[${visibleControls(q.header)}] ` : ""}
-            {visibleControls(q.question)}
-          </Text>
-
-          {(q.choices ?? []).map((c, ci) => (
-            <Text color={t.color.muted} key={ci}>
-              {"   "}- {visibleControls(c)}
-              {q.descriptions?.[ci]
-                ? ` (${visibleControls(q.descriptions[ci])})`
-                : ""}
-            </Text>
-          ))}
-        </Box>
-      ))}
-
-      <Text color={t.color.muted}>
-        this client cannot answer these questions yet · Esc/Ctrl+C cancel
-      </Text>
-    </Box>
-  );
-}
-
 export function ConfirmPrompt({
   onCancel,
   onConfirm,
@@ -619,12 +565,6 @@ interface ApprovalPromptProps {
 interface ClarifyPromptProps {
   cols?: number;
   onAnswer: (s: string) => void;
-  onCancel: () => void;
-  req: ClarifyReq;
-  t: Theme;
-}
-
-interface ClarifyBatchFallbackProps {
   onCancel: () => void;
   req: ClarifyReq;
   t: Theme;

@@ -17,14 +17,10 @@ import { MaskedPrompt } from "./maskedPrompt.js";
 import { ModelPicker } from "./modelPicker.js";
 import { OverlayHint } from "./overlayControls.js";
 import { listRowStyle } from "./overlayPrimitives.js";
-import {
-  ApprovalPrompt,
-  ClarifyBatchFallback,
-  ClarifyPrompt,
-  ConfirmPrompt,
-} from "./prompts.js";
+import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
 import { PermissionsPicker } from "./permissionsPicker.js";
 import { ProviderPicker } from "./providerPicker.js";
+import { QuestionPicker } from "./questionPicker.js";
 import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
@@ -129,8 +125,10 @@ export function PromptZone({
     // Batch clarify (`ask_user_question`): answered in one frame through onClarifyBatch.
     return (
       <PromptCell cols={cols} id="clarify">
-        <ClarifyBatchFallback
-          onCancel={() => onClarifyBatch(null)}
+        <QuestionPicker
+          cols={cols}
+          key={overlay.clarify.requestId}
+          onClarifyBatch={onClarifyBatch}
           req={overlay.clarify}
           t={theme}
         />

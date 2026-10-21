@@ -1,4 +1,5 @@
 export const TOOL_VERBS: Record<string, string> = {
+  ask_user_question: "asking",
   browser: "browsing",
   clarify: "asking",
   create_file: "creating",

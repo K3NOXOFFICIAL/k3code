@@ -4,11 +4,8 @@ import { renderSync } from "@k3code/ink";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 
-import {
-  ApprovalPrompt,
-  ClarifyBatchFallback,
-  ClarifyPrompt,
-} from "../components/prompts.js";
+import { ApprovalPrompt, ClarifyPrompt } from "../components/prompts.js";
+import { QuestionPicker } from "../components/questionPicker.js";
 import { visibleControls } from "../lib/text.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { ApprovalReq, ClarifyReq } from "../types.js";
@@ -92,10 +89,15 @@ const paintClarify = (req: ClarifyReq) =>
     />,
   );
 
-// Batch requests (`questions[]`) render through the batch fallback, not ClarifyPrompt.
+// Batch requests (`questions[]`) render through the question picker, not ClarifyPrompt.
 const paintClarifyBatch = (req: ClarifyReq) =>
   paintRaw(
-    <ClarifyBatchFallback onCancel={() => {}} req={req} t={DEFAULT_THEME} />,
+    <QuestionPicker
+      cols={100}
+      onClarifyBatch={() => {}}
+      req={req}
+      t={DEFAULT_THEME}
+    />,
   );
 
 describe("visibleControls", () => {
@@ -182,6 +184,24 @@ describe("clarify prompt does not paint request escape sequences", () => {
 
     expectNoRequestEscapes(raw);
     expect(stripAnsi(raw)).toContain("MARK␛]0;TITLE␇");
+  });
+
+  it("neutralizes replayed answers on the Submit review", () => {
+    // Every question answered: the picker opens on the Submit review.
+    const raw = paintClarifyBatch({
+      answers: { q1: ATTACK, q2: ATTACK },
+      choices: null,
+      question: "",
+      questions: [
+        { choices: ["a"], header: "One", qid: "q1", question: "first?" },
+        { choices: null, header: "Two", qid: "q2", question: "second?" },
+      ],
+      requestId: "c-3",
+    });
+
+    expectNoRequestEscapes(raw);
+    expect(stripAnsi(raw)).toContain("Review your answers");
+    expect(stripAnsi(raw)).toContain("→ MARK␛]0;TITLE␇");
   });
 });
 

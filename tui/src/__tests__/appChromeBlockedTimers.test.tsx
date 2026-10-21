@@ -1219,6 +1219,60 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
   });
 });
 
+describe("useInputHandlers: Escs the question picker consumes do not count toward double-Esc", () => {
+  it("Esc out of the text field, then Esc to cancel, keeps the composer draft", async () => {
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const answerClarifyBatch = vi.fn();
+    const layout = mountLayout(
+      {
+        clarify: {
+          choices: null,
+          question: "",
+          questions: [
+            { choices: ["red", "blue"], qid: "q1", question: "Colour?" },
+            { choices: ["s", "m"], qid: "q2", question: "Size?" },
+          ],
+          requestId: "batch-1",
+        },
+      },
+      { busy: false },
+      { answerClarifyBatch },
+      {
+        beside: (
+          <>
+            <InputHarness initialInput="keep me" probe={probe} />
+            <SentinelProbe hits={hits} />
+          </>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("Type something"));
+
+    // ↓ ↓ to "Type something", Enter opens the field.
+    await pressThenSentinel(layout, hits, DOWN);
+    await pressThenSentinel(layout, hits, DOWN);
+    await pressThenSentinel(layout, hits, "\r");
+    await waitFor(() => expect(layout.output()).toContain("Enter save"));
+
+    // Date.now is pinned to T0, so both Escs sit well inside DOUBLE_ESC_MS. A lone Esc is only emitted after Ink's
+    // 50 ms escape-sequence flush; the sentinel must follow after that.
+    for (let esc = 0; esc < 2; esc++) {
+      layout.press(ESC);
+      await flush();
+      await flush();
+      await flush();
+      await pressThenSentinel(layout, hits, "");
+    }
+
+    await waitFor(() => expect(answerClarifyBatch).toHaveBeenCalledWith(null));
+    expect(answerClarifyBatch).toHaveBeenCalledTimes(1);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+});
+
 describe("useInputHandlers: a double Esc interrupts a running turn", () => {
   afterEach(() => {
     $stripSessions.set([]);
