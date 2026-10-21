@@ -289,7 +289,8 @@ class Settings(BaseModel):
     # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
     hooks: dict[str, Any] = Field(default_factory=dict)
     # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
-    # see retention()
+    # see retention(). Also session_archive_days: 14 (idle days before archiving is offered, 0 = off; see
+    # session_archive_days())
     retention: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("providers")
@@ -363,6 +364,20 @@ def retention(config: Any) -> dict[str, int]:
         if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
             out[key] = int(value)
     return out
+
+
+#: Days a worked-in session sits untouched before the agent view offers to archive it.
+SESSION_ARCHIVE_DAYS = 14
+
+
+def session_archive_days(config: Any) -> int:
+    """``retention.session_archive_days``: 0 turns the archive proposals off; a value that is not a number of zero or
+    more keeps :data:`SESSION_ARCHIVE_DAYS`. Not in :data:`RETENTION_DEFAULTS`: :func:`retention` maps 0 to default."""
+    raw = getattr(config, "retention", None) or {}
+    value = raw.get("session_archive_days")
+    if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return SESSION_ARCHIVE_DAYS
 
 
 def _current_home() -> Path:
