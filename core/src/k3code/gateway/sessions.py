@@ -61,6 +61,7 @@ class SessionSummary:
     updated_at: float = 0.0
     message_count: int = 0
     preview: str = ""
+    archived_at: float | None = None
 
 
 PREVIEW_CHARS = 120
@@ -94,6 +95,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 )
 """
 
+#: A session someone worked in: at least one message, no automation origin. The ``sessions_worked_in`` index's WHERE
+#: and the queries it serves share this text verbatim, or the planner cannot use the partial index.
+_WORKED_IN = "messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+
 
 class SessionStore:
     """Tiny sqlite session store. One connection, used from the event loop thread."""
@@ -112,13 +117,20 @@ class SessionStore:
             self._db.execute("ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT -1")
         with contextlib.suppress(sqlite3.OperationalError):
             self._db.execute("ALTER TABLE sessions ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+        # Columns, not meta keys: save() writes meta whole, so a flag kept there would be lost to a stale snapshot.
+        # Only set_archived/decline_archive write them (never save or checkpoint), and neither touches updated_at:
+        # that is the idle clock the archive suggestions read.
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN archived_at REAL")
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN archive_declined_at REAL")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
         # Matches worked_in()'s WHERE clause verbatim so the planner can use it instead of walking every
         # automation-origin row (the agent view's session loader was stalling on this: a fleet of background
         # jobs means automation rows now vastly outnumber human ones in the recent window).
+        self._db.execute(f"CREATE INDEX IF NOT EXISTS sessions_worked_in ON sessions (updated_at) WHERE {_WORKED_IN}")
         self._db.execute(
-            "CREATE INDEX IF NOT EXISTS sessions_worked_in ON sessions (updated_at)"
-            " WHERE messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+            "CREATE INDEX IF NOT EXISTS sessions_archived ON sessions (updated_at) WHERE archived_at IS NOT NULL"
         )
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
@@ -214,11 +226,20 @@ class SessionStore:
         ).fetchall()
         return [s for s in (self.get(row[0]) for row in ids) if s is not None]
 
-    _SUMMARY_COLUMNS = "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview"
+    _SUMMARY_COLUMNS = (
+        "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview, archived_at"
+    )
 
-    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[SessionSummary]:
-        """The newest sessions as summaries. Reads columns only: a transcript can be huge and is never parsed."""
-        where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+    def list(
+        self, *, limit: int = 50, include_automation: bool = True, offset: int = 0, archived: bool | None = False
+    ) -> list[SessionSummary]:
+        """The newest sessions as summaries. Reads columns only: a transcript can be huge and is never parsed.
+
+        ``archived``: False (default) leaves archived sessions out, True lists only them, None both."""
+        terms = [] if include_automation else ["COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"]
+        if archived is not None:
+            terms.append("archived_at IS NOT NULL" if archived else "archived_at IS NULL")
+        where = " WHERE " + " AND ".join(terms) if terms else ""
         rows = self._db.execute(
             f"SELECT {self._SUMMARY_COLUMNS} FROM sessions{where}"  # noqa: S608
             " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
@@ -257,6 +278,7 @@ class SessionStore:
             updated_at=row[6],
             message_count=count,
             preview=preview,
+            archived_at=row[9],
         )
 
     def _backfill_summary(self, session_id: str) -> tuple[int, str]:
@@ -271,18 +293,76 @@ class SessionStore:
             )
         return count, preview
 
-    def worked_in(self, *, limit: int) -> list[tuple[str, str]]:
+    def worked_in(self, *, limit: int, archived: bool | None = False) -> list[tuple[str, str]]:
         """``(session_id, cwd)`` of the newest ``limit`` sessions with at least one message and no automation origin.
 
         Decided in SQL, so no transcript is parsed or copied into Python: every write path stores an empty
-        transcript as exactly ``'[]'``.
+        transcript as exactly ``'[]'``. ``archived`` as in :meth:`list`: an extra conjunct after the
+        ``sessions_worked_in`` index's own terms, so the planner can still use that index.
         """
+        archived_term = "" if archived is None else f" AND archived_at IS {'NOT ' if archived else ''}NULL"
         return self._db.execute(
-            "SELECT session_id, cwd FROM sessions"
-            " WHERE messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+            f"SELECT session_id, cwd FROM sessions WHERE {_WORKED_IN}{archived_term}"  # noqa: S608
             " ORDER BY updated_at DESC LIMIT ?",
             (max(1, limit),),
         ).fetchall()
+
+    def idle_candidates(self, idle_before: float) -> list[tuple[str, str]]:
+        """``(session_id, cwd)`` of the worked-in sessions (as :meth:`worked_in`) not archived and last saved before
+        ``idle_before``, oldest first; one declined since its last save is left out ("keep, stop asking" holds until
+        the session is used again). Unlimited: the caller keeps one project's, and a cap on the oldest rows of every
+        project would let sessions nobody opens crowd that project out for good."""
+        return self._db.execute(
+            f"SELECT session_id, cwd FROM sessions WHERE {_WORKED_IN}"  # noqa: S608
+            " AND archived_at IS NULL AND updated_at < ?"
+            " AND (archive_declined_at IS NULL OR archive_declined_at < updated_at)"
+            " ORDER BY updated_at ASC",
+            (idle_before,),
+        ).fetchall()
+
+    def existing(self, ids: list[str]) -> set[str]:
+        """Which of ``ids`` have a row (ids only: nothing is backfilled)."""
+        if not ids:
+            return set()
+        marks = ",".join("?" * len(ids))
+        rows = self._db.execute(f"SELECT session_id FROM sessions WHERE session_id IN ({marks})", ids)  # noqa: S608
+        return {row[0] for row in rows}
+
+    def set_archived(self, ids: list[str], at: float | None) -> int:
+        """Archive ``ids`` at ``at``, or restore them with None; returns how many rows changed (one already in that
+        state is not). Never touches ``updated_at``.
+
+        A restore counts as "keep": the row is stamped as declined, because its idle clock did not move and the next
+        proposal would otherwise offer the session straight back."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._db:
+            if at is None:
+                cur = self._db.execute(
+                    "UPDATE sessions SET archived_at = NULL, archive_declined_at = ?"  # noqa: S608
+                    f" WHERE archived_at IS NOT NULL AND session_id IN ({marks})",
+                    (time.time(), *ids),
+                )
+            else:
+                cur = self._db.execute(
+                    "UPDATE sessions SET archived_at = ?"  # noqa: S608
+                    f" WHERE archived_at IS NULL AND session_id IN ({marks})",
+                    (at, *ids),
+                )
+        return cur.rowcount
+
+    def decline_archive(self, ids: list[str], at: float) -> int:
+        """Mark ``ids`` "keep, stop asking" at ``at`` (see :meth:`idle_candidates`); returns how many rows exist."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._db:
+            cur = self._db.execute(
+                f"UPDATE sessions SET archive_declined_at = ? WHERE session_id IN ({marks})",  # noqa: S608
+                (at, *ids),
+            )
+        return cur.rowcount
 
     def save(self, sess: StoredSession) -> None:
         """Update the row; a missing row stays missing (deleted sessions are not resurrected), unless the start

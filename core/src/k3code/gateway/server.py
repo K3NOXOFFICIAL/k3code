@@ -59,7 +59,7 @@ from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
-from k3code.config import Settings, default_project_dir, load_config, retention
+from k3code.config import Settings, default_project_dir, load_config, retention, session_archive_days
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens, router_window
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -151,6 +151,7 @@ OPEN_METHODS = frozenset(
         "settings.get",
         "config.get",
         "session.list",
+        "session.archive_suggestions",
         "session.active_list",
         "session.most_recent",
         "session.status",
@@ -976,7 +977,7 @@ class GatewayServer:
     async def reap_orphan_worktrees(self) -> None:
         """Reap what fan-out and sub-agent workers left behind when their process died (``worktree.reap``), in each
         repository these sessions worked in: nothing else removes a dead worker's checkout and branch."""
-        cwds = dict.fromkeys(cwd for _, cwd in self.store.worked_in(limit=self.REAP_SESSIONS) if cwd)
+        cwds = dict.fromkeys(cwd for _, cwd in self.store.worked_in(limit=self.REAP_SESSIONS, archived=None) if cwd)
         for cwd in cwds:
             if not Path(cwd).is_dir():
                 continue
@@ -3716,11 +3717,12 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
-    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
+def _project_sessions(server: GatewayServer, cwd: str, limit: int, *, archived: bool = False) -> list[SessionSummary]:
+    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised);
+    archived ones only with ``archived``, else none of them."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
-    for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP):
+    for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP, archived=archived):
         if stored_cwd not in spelled:
             spelled[stored_cwd] = _norm_cwd(stored_cwd)
         if spelled[stored_cwd] == cwd:
@@ -3732,10 +3734,15 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Sessi
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
-    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all."""
+    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all.
+    Archived sessions are left out, unless ``archived`` is true: then only they are listed."""
     limit = int(params.get("limit") or 50)
     cwd = _norm_cwd(params.get("cwd"))
-    sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
+    archived = bool(params.get("archived"))
+    if cwd:
+        sessions = _project_sessions(server, cwd, max(1, limit), archived=archived)
+    else:
+        sessions = server.store.list(limit=limit, archived=archived)
     rows = []
     for s in sessions:
         preview = s.preview
@@ -3747,6 +3754,8 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "title": s.title or preview or "Session",
                 "preview": preview,
                 "started_at": s.created_at,
+                "updated_at": s.updated_at,
+                "archived_at": s.archived_at,
                 "message_count": s.message_count,
                 "status": state,
                 "state": state,
@@ -3754,6 +3763,74 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
             }
         )
     return {"sessions": rows}
+
+
+#: Most rows one ``session.archive_suggestions`` reply carries (``total`` counts them all).
+_ARCHIVE_SUGGESTIONS_MAX = 20
+
+
+def _session_ids(params: dict[str, Any]) -> list[str]:
+    raw = params.get("session_ids")
+    if not isinstance(raw, list) or not all(isinstance(sid, str) for sid in raw):
+        raise _InvalidParams("session_ids must be a list of session ids")
+    return list(dict.fromkeys(raw))
+
+
+async def _session_archive(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Archive stored sessions (``archived`` false: restore them). A live session is skipped either way: it is in
+    use (attaching to it already took it out of the archive). Neither direction touches ``updated_at``;
+    ``archived`` counts the rows that changed."""
+    ids = _session_ids(params)
+    archive = params.get("archived", True)
+    if not isinstance(archive, bool):
+        raise _InvalidParams("archived must be true or false")
+    known = server.store.existing(ids)
+    skipped: list[dict[str, str]] = []
+    todo: list[str] = []
+    for sid in ids:
+        if sid not in known:
+            skipped.append({"id": sid, "reason": "unknown"})
+        elif sid in server.live:
+            skipped.append({"id": sid, "reason": "live"})
+        else:
+            todo.append(sid)
+    changed = server.store.set_archived(todo, time.time() if archive else None)
+    return {"archived": changed, "skipped": skipped}
+
+
+async def _session_archive_decline(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Mark sessions "keep, stop asking": ``session.archive_suggestions`` leaves each out until it is saved again."""
+    return {"declined": server.store.decline_archive(_session_ids(params), time.time())}
+
+
+async def _session_archive_suggestions(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The project's worked-in sessions untouched for ``retention.session_archive_days`` (oldest first, at most
+    ``_ARCHIVE_SUGGESTIONS_MAX``; ``total`` is the full count). Never one the sweep would keep: live, current, a
+    client's, or one a loop or automation points at; without the automation engine that cannot be told, so none."""
+    cwd = _norm_cwd(str(_require(params, "cwd")))
+    days = session_archive_days(server.config)
+    keep = server._sweep_keep()
+    if days == 0 or keep is None:
+        return {"days": days, "total": 0, "items": []}
+    now = time.time()
+    spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling, as in _project_sessions
+    ids: list[str] = []
+    for sid, stored_cwd in server.store.idle_candidates(now - days * 86400):
+        if stored_cwd not in spelled:
+            spelled[stored_cwd] = _norm_cwd(stored_cwd)
+        if spelled[stored_cwd] == cwd and not keep(sid):
+            ids.append(sid)
+    items = [
+        {
+            "id": s.session_id,
+            "title": s.title or s.preview or "Session",
+            "preview": s.preview,
+            "idle_days": int((now - s.updated_at) // 86400),
+            "message_count": s.message_count,
+        }
+        for s in server.store.summaries(ids[:_ARCHIVE_SUGGESTIONS_MAX])
+    ]
+    return {"days": days, "total": len(ids), "items": items}
 
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3798,6 +3875,8 @@ async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
+    # in use again: out of the archive, and not proposed again until saved
+    server.store.set_archived([stored.session_id], None)
     live = server.live_for(stored)  # a background session keeps its running state
     server.live[live.session_id] = live
     server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
@@ -3819,6 +3898,7 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
+    server.store.set_archived([stored.session_id], None)  # as session.resume
     live = server.live_for(stored)
     server.live[live.session_id] = live
     server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
@@ -5112,6 +5192,9 @@ _HANDLERS: dict[str, Any] = {
     "session.activate": _session_activate,
     "session.close": _session_close,
     "session.delete": _session_delete,
+    "session.archive": _session_archive,
+    "session.archive_decline": _session_archive_decline,
+    "session.archive_suggestions": _session_archive_suggestions,
     "session.title": _session_title,
     "session.interrupt": _session_interrupt,
     "session.steer": _session_steer,

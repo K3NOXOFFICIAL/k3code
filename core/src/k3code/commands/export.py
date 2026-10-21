@@ -25,7 +25,7 @@ def run_export(
     config: Any = None,
 ) -> tuple[Path, dict[str, Any]]:
     if all_sessions:
-        ids = [s.session_id for s in store.list(limit=100_000)]
+        ids = [s.session_id for s in store.list(limit=100_000, archived=None)]  # archived ones too
     elif session:
         ids = [session]
     elif current:

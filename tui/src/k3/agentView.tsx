@@ -2,7 +2,7 @@ import { Box, Text, useInput, useStdout } from "@k3code/ink";
 import { TextInput } from "../components/textInput.js";
 import type { SessionListResult } from "@k3code/shared/gateway-events";
 import { useStore } from "@nanostores/react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentRoster } from "../app/agentRoster.js";
 import { $uiState } from "../app/uiStore.js";
@@ -10,9 +10,16 @@ import { relativeSessionAge } from "../components/activeSessionSwitcher.js";
 import { listRowStyle } from "../components/overlayPrimitives.js";
 import { INLINE_MODE } from "../config/env.js";
 import type { GatewayClient } from "../gatewayClient.js";
+import type {
+  SessionArchiveParams,
+  SessionArchiveDeclineParams,
+  SessionArchiveResponse,
+  SessionArchiveSuggestionsResponse,
+  SessionListFilter,
+} from "../gatewayTypes.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { fmtDuration } from "../lib/subagentTree.js";
-import { compactPreview } from "../lib/text.js";
+import { compactPreview, stripControl } from "../lib/text.js";
 import type { Theme } from "../theme.js";
 
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
@@ -21,6 +28,7 @@ import {
   buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
+  isArchivable,
   type PastSessionRow,
   reduceViewKey,
   selectedHeader,
@@ -34,21 +42,87 @@ import {
   visibleWindow,
 } from "./agentViewStore.js";
 
-/** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
-export const AGENT_VIEW_HINT =
-  "↑↓ move · ⏎/→ open · space/c collapse · x stop · tab/type compose · ←/esc back";
+/**
+ * What each list hint names for the selection: x stops a live row, a archives an earlier session, u restores an
+ * archived one. One slot rather than all three keeps the full hint short; the two longer actions also write ⏎
+ * without its → alias, so every full hint fits the 79 columns an 80-column terminal leaves.
+ */
+const ROW_ACTIONS = {
+  archive: { label: "a archive", open: "⏎" },
+  restore: { label: "u restore", open: "⏎" },
+  stop: { label: "x stop", open: "⏎/→" },
+} as const;
+type RowAction = keyof typeof ROW_ACTIONS;
+
+const listHint = (action: RowAction) =>
+  `↑↓ move · ${ROW_ACTIONS[action].open} open · space/c collapse · ${ROW_ACTIONS[action].label} · tab/type compose · ←/esc back`;
 /** The list hint on a pane too narrow for the full one. */
-export const AGENT_VIEW_HINT_SHORT =
-  "↑↓ ⏎ open · space/c collapse · x stop · tab compose · esc back";
+const listHintShort = (action: RowAction) =>
+  `↑↓ ⏎ open · space/c collapse · ${ROW_ACTIONS[action].label} · tab compose · esc back`;
+
+/** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
+export const AGENT_VIEW_HINT = listHint("stop");
+export const AGENT_VIEW_HINT_SHORT = listHintShort("stop");
+/** The list hint on an earlier session, and on an archived one. */
+export const AGENT_VIEW_ARCHIVE_HINT = listHint("archive");
+export const AGENT_VIEW_RESTORE_HINT = listHint("restore");
 /** Shown while the bottom composer owns the keyboard: the view opens this way. */
 export const AGENT_VIEW_INPUT_HINT =
   "⏎ start (empty: open) · ↑ list · esc clear/back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
+  archived: "archived",
   completed: "completed",
   input: "need input",
   working: "working",
 };
+
+/** Longest a title gets in the archive banner, so three of them share one line. */
+const BANNER_TITLE_MAX = 24;
+const BANNER_KEYS = "  alt+y archive · alt+n keep";
+const BANNER_KEYS_SHORT = "  alt+y · alt+n";
+/** The banner's chords, kept from the composer while it shows. */
+const BANNER_CHORDS = ["n", "y"];
+
+/**
+ * The archive banner's first line: the question and its keys, or a shorter one on a narrow pane. The count is the
+ * listed sessions, the ones Alt+Y archives; after that the refetch proposes the next batch, if there is one.
+ */
+const bannerQuestion = (s: SessionArchiveSuggestionsResponse, cols: number) => {
+  const n = s.items.length;
+  const noun = n === 1 ? "session" : "sessions";
+  const long = `Archive ${n} ${noun} unused for ${s.days}+ days?`;
+
+  return long.length + BANNER_KEYS.length <= cols
+    ? { keys: BANNER_KEYS, text: long }
+    : { keys: BANNER_KEYS_SHORT, text: `Archive ${n} idle ${noun}?` };
+};
+
+/** The second line: as many of the first three titles, with their idle ages, as fit; the rest are counted. */
+const bannerNames = (s: SessionArchiveSuggestionsResponse, cols: number) => {
+  // Titles are stored session text: control characters would act on the terminal instead of being drawn.
+  const names = s.items.map(
+    (it) =>
+      `${compactPreview(stripControl(it.title || it.preview || it.id.slice(0, 8)), BANNER_TITLE_MAX)} (${it.idle_days}d)`,
+  );
+  const line = (shown: number) =>
+    names.slice(0, shown).join(" · ") +
+    (names.length > shown ? ` +${names.length - shown} more` : "");
+
+  for (let shown = Math.min(3, names.length); shown > 1; shown--) {
+    if (line(shown).length <= cols) {
+      return line(shown);
+    }
+  }
+
+  return line(1);
+};
+
+/** Lines the archive banner takes: none without proposals, only the question on a short terminal. */
+const bannerHeight = (
+  s: null | SessionArchiveSuggestionsResponse,
+  compact: boolean,
+) => (s?.items.length ? (compact ? 1 : 2) : 0);
 
 const CURRENT_TAG = " (this session)";
 const CONFIRM_TAG = "  stop? y/n";
@@ -81,6 +155,8 @@ export interface AgentViewViewProps {
    */
   pin?: boolean;
   rows: readonly ViewRow[];
+  /** `session.archive_suggestions`: with any items, a banner proposes archiving them. */
+  suggestions?: null | SessionArchiveSuggestionsResponse;
   t: Theme;
 }
 
@@ -97,10 +173,12 @@ export function AgentViewView({
   onToggleGroup = () => {},
   pin = true,
   rows,
+  suggestions = null,
   t,
 }: AgentViewViewProps) {
   const index = Math.max(0, Math.min(nav.index, rows.length - 1));
   const lines = buildLines(rows, nav.collapsedGroups);
+  const banner = suggestions?.items.length ? suggestions : null;
 
   const header = selectedHeader(nav, rows);
   const selLine = lines.findIndex((l) =>
@@ -212,6 +290,17 @@ export function AgentViewView({
     );
   };
 
+  // The hint's row action follows the selection; on a header it keeps the live rows' x stop.
+  const selRow = header ? undefined : rows[index];
+  const action: RowAction =
+    selRow?.group === "archived"
+      ? "restore"
+      : selRow && isArchivable(selRow)
+        ? "archive"
+        : "stop";
+  const hint =
+    cols >= listHint(action).length ? listHint(action) : listHintShort(action);
+
   // The bottom composer, like the one in the main view: starts a session, runs a
   // /command. Focus state lives in `nav.focus`, not in the input: the composer has
   // it on open, ↑ hands it to the list, tab or typing hands it back.
@@ -236,11 +325,32 @@ export function AgentViewView({
           onSubmit={onNewSessionSubmit}
           placeholder={placeholder}
           placeholderColor={t.color.muted}
+          // While the banner asks, its Alt+Y/Alt+N belong to the view, not to the draft.
+          reservedMetaKeys={banner ? BANNER_CHORDS : undefined}
           value={nav.draft ?? ""}
         />
       </Box>
     </Box>
   );
+
+  // Coloured like the main view's proposal cards: the proposal in the accent, the keys after it muted.
+  const renderBanner = (s: SessionArchiveSuggestionsResponse) => {
+    const q = bannerQuestion(s, cols);
+
+    return (
+      <Box flexDirection="column">
+        <Text wrap="truncate-end">
+          <Text color={t.color.accent}>{q.text}</Text>
+          <Text color={t.color.muted}>{q.keys}</Text>
+        </Text>
+        {compact ? null : (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {bannerNames(s, cols)}
+          </Text>
+        )}
+      </Box>
+    );
+  };
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -257,6 +367,7 @@ export function AgentViewView({
             {error}
           </Text>
         ) : null}
+        {banner ? renderBanner(banner) : null}
         {compact ? null : <Text> </Text>}
       </Box>
       {/* The list area always takes its full `height`, however few rows there are: that pushes the composer and the hint
@@ -305,11 +416,7 @@ export function AgentViewView({
         {compact ? null : <Text> </Text>}
         {renderNewPrompt()}
         <Text color={t.color.muted} wrap="truncate-end">
-          {nav.focus === "input"
-            ? AGENT_VIEW_INPUT_HINT
-            : cols >= AGENT_VIEW_HINT.length
-              ? AGENT_VIEW_HINT
-              : AGENT_VIEW_HINT_SHORT}
+          {nav.focus === "input" ? AGENT_VIEW_INPUT_HINT : hint}
         </Text>
       </Box>
     </Box>
@@ -343,7 +450,14 @@ export function AgentViewPane({
   const { info, sid, theme } = useStore($uiState);
   const sessions = useStore($stripSessions);
   const subagents = useAgentRoster();
-  const [past, setPast] = useState<PastSessionRow[]>([]);
+  // Both lists land together, so no frame shows a just-archived row in neither group or in both.
+  const [lists, setLists] = useState<{
+    archived: PastSessionRow[];
+    past: PastSessionRow[];
+  }>({ archived: [], past: [] });
+  // The archive proposal; null when there is none or the core cannot make one.
+  const [suggestions, setSuggestions] =
+    useState<null | SessionArchiveSuggestionsResponse>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   // The composer has the keyboard from the start: the view opens ready to type a prompt; ↑ reaches the list.
@@ -396,14 +510,18 @@ export function AgentViewPane({
   const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
   // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
   const compact = termRows < 8;
-  // header, spacer, spacer, composer, hint (+ the error line); compact: header, composer and hint only. With the list
-  // area at exactly `height` the frame is exactly `termRows` tall, so the composer and hint sit on the last two rows.
-  // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
-  // Inline there is no alternate screen to fill: the frame stays one row short of the terminal (a full-height frame
-  // scrolls one row into scrollback) and is not pinned.
+  // header, spacer, spacer, composer, hint (+ the error line and the archive banner); compact: header, composer and
+  // hint only. With the list area at exactly `height` the frame is exactly `termRows` tall, so the composer and hint
+  // sit on the last two rows. The composer shrinks the list, not the other way: a session started from here needs
+  // somewhere to type. Inline there is no alternate screen to fill: the frame stays one row short of the terminal (a
+  // full-height frame scrolls one row into scrollback) and is not pinned.
   const height = Math.max(
     1,
-    termRows - (compact ? 3 : 5) - (error ? 1 : 0) - (inline ? 1 : 0),
+    termRows -
+      (compact ? 3 : 5) -
+      (error ? 1 : 0) -
+      (inline ? 1 : 0) -
+      bannerHeight(suggestions, compact),
   );
 
   const pageSize = Math.max(1, height - 2);
@@ -412,54 +530,105 @@ export function AgentViewPane({
     setNav((prev) => ({ ...prev, draft }));
   };
 
-  useEffect(() => {
-    let stopped = false;
+  // Each load gets a number; only the latest one's answer is applied, and none after the view has closed.
+  const loadSeq = useRef(0);
+  const closed = useRef(false);
 
+  useEffect(
+    () => () => {
+      closed.current = true;
+    },
+    [],
+  );
+
+  // On open and again after an archive, a restore or an answer to the banner: the earlier sessions, the archived ones
+  // and the archive proposal, fetched together.
+  const loadLists = useCallback(() => {
+    const seq = ++loadSeq.current;
+    const current = () => !closed.current && seq === loadSeq.current;
     // The gateway filters by project (`cwd`) before applying the limit; buildViewRows re-checks it.
-    gw.request<SessionListResult>("session.list", {
+    const params: SessionListFilter = {
       ...(currentCwd ? { cwd: currentCwd } : {}),
       limit: 50,
-    })
-      .then((raw) => {
-        if (stopped) {
+    };
+
+    void Promise.all([
+      gw.request<SessionListResult>("session.list", { ...params }),
+      // An older core rejects `archived`, or ignores it and answers with the unarchived list again: either way the view
+      // keeps working with no Archived group (only rows that carry an `archived_at` count as archived).
+      gw
+        .request<SessionListResult>("session.list", {
+          ...params,
+          archived: true,
+        })
+        .catch(() => null),
+      // A core without archive proposals rejects the method: no banner, the view works as before.
+      currentCwd
+        ? gw
+            .request<SessionArchiveSuggestionsResponse>(
+              "session.archive_suggestions",
+              { cwd: currentCwd },
+            )
+            .catch(() => null)
+        : null,
+    ])
+      .then(([raw, rawArchived, rawSuggestions]) => {
+        if (!current()) {
           return;
         }
 
         const r = asRpcResult<SessionListResult>(raw);
 
-        if (r) {
-          setPast(r.sessions ?? []);
-        } else {
+        if (!r) {
           setError("invalid response: session.list");
+
+          return;
         }
+
+        const archived = (asRpcResult<SessionListResult>(rawArchived)
+          ?.sessions ?? []) as PastSessionRow[];
+
+        const proposal =
+          asRpcResult<SessionArchiveSuggestionsResponse>(rawSuggestions);
+
+        setLists({
+          archived: archived.filter((h) => h.archived_at != null),
+          past: r.sessions ?? [],
+        });
+        setSuggestions(
+          Array.isArray(proposal?.items) && proposal.items.length
+            ? proposal
+            : null,
+        );
       })
       .catch((e: unknown) => {
-        if (!stopped) {
+        if (current()) {
           setError(rpcErrorMessage(e));
         }
       })
       .finally(() => {
-        if (!stopped) {
+        if (current()) {
           setLoading(false);
         }
       });
-
-    return () => {
-      stopped = true;
-    };
   }, [currentCwd, gw]);
+
+  useEffect(() => {
+    loadLists();
+  }, [loadLists]);
 
   const rows = useMemo(
     () =>
       buildViewRows({
+        archived: lists.archived,
         currentCwd,
         currentSid: sid,
         nowMs: now,
-        past,
+        past: lists.past,
         sessions,
         subagents,
       }),
-    [currentCwd, now, past, sessions, sid, subagents],
+    [currentCwd, lists, now, sessions, sid, subagents],
   );
   // A header whose group has lost all its rows holds nothing, and must not take the selection back when the group
   // returns (a ⏎ meant for the highlighted row would fold the group): it is dropped from the state too, not just here.
@@ -493,6 +662,68 @@ export function AgentViewPane({
     return () => clearInterval(timer);
   }, [working]);
 
+  // Archive (or restore) one stored session, then reload both lists so the row shows up in its new group. A session the
+  // gateway skips says why instead of the key doing nothing.
+  const setArchived = (row: ViewRow, archived: boolean) => {
+    const params: SessionArchiveParams = { archived, session_ids: [row.id] };
+
+    gw.request<SessionArchiveResponse>("session.archive", { ...params })
+      .then((raw) => {
+        if (closed.current) {
+          return;
+        }
+
+        const skipped = asRpcResult<SessionArchiveResponse>(raw)?.skipped?.[0];
+
+        setError(
+          skipped
+            ? `${archived ? "not archived" : "not restored"}: ${skipped.reason}`
+            : null,
+        );
+        loadLists();
+      })
+      .catch((e: unknown) => {
+        if (!closed.current) {
+          setError(rpcErrorMessage(e));
+        }
+      });
+  };
+
+  // The banner's answer, for exactly the sessions it lists: archive them all in one call, or keep them and stop asking.
+  // The refetch then drops the banner or proposes the next batch. Leaving the view without answering persists nothing.
+  const answerSuggestions = (accept: boolean) => {
+    const ids = suggestions?.items.map((it) => it.id) ?? [];
+
+    if (!ids.length) {
+      return;
+    }
+
+    const archive: SessionArchiveParams = { archived: true, session_ids: ids };
+    const decline: SessionArchiveDeclineParams = { session_ids: ids };
+    const request = accept
+      ? gw.request<SessionArchiveResponse>("session.archive", { ...archive })
+      : gw.request<unknown>("session.archive_decline", { ...decline });
+
+    request
+      .then((raw) => {
+        if (closed.current) {
+          return;
+        }
+
+        const skipped = accept
+          ? asRpcResult<SessionArchiveResponse>(raw)?.skipped?.[0]
+          : undefined;
+
+        setError(skipped ? `not archived: ${skipped.reason}` : null);
+        loadLists();
+      })
+      .catch((e: unknown) => {
+        if (!closed.current) {
+          setError(rpcErrorMessage(e));
+        }
+      });
+  };
+
   const apply = (r: ReturnType<typeof reduceViewKey>) => {
     // The composer's TextInput owns the draft (its onChange/onSubmit run before this handler on the same key); only an
     // explicit change by the reducer (Esc clearing it, a key typed on the list) replaces it, so a stale copy never
@@ -509,6 +740,14 @@ export function AgentViewPane({
         return onActivate(r.effect.row);
       case "stop":
         return onStop(r.effect.row);
+      case "archive":
+        return setArchived(r.effect.row, true);
+      case "unarchive":
+        return setArchived(r.effect.row, false);
+      case "archive_suggested":
+        return answerSuggestions(true);
+      case "decline_suggested":
+        return answerSuggestions(false);
       case "close":
         return onClose();
     }
@@ -580,6 +819,7 @@ export function AgentViewPane({
           up: key.upArrow,
         },
         pageSize,
+        !!suggestions,
       ),
     );
   });
@@ -602,6 +842,7 @@ export function AgentViewPane({
       }}
       pin={!inline}
       rows={rows}
+      suggestions={suggestions}
       t={theme}
     />
   );

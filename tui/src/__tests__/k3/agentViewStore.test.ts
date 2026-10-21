@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
   navItems,
@@ -322,6 +323,71 @@ describe("buildViewRows", () => {
 
     expect(rows.map((r) => r.key)).toEqual(["session:w1", "past:p1"]);
   });
+
+  it("puts archived sessions in the Archived group, last, newest first, through the same filters", () => {
+    const rows = build({
+      archived: [
+        past("a-old", 100),
+        past("a-new", 300),
+        past("a-other", 400, "/work/elsewhere"),
+        { ...past("a-empty", 500), message_count: 0 },
+        past("w1", 600),
+      ],
+      past: [past("p1", 50)],
+      sessions: [{ id: "w1", status: "working" }],
+    });
+
+    expect(rows.map((r) => [r.key, r.group])).toEqual([
+      ["session:w1", "working"],
+      ["past:p1", "completed"],
+      ["past:a-new", "archived"],
+      ["past:a-old", "archived"],
+    ]);
+    expect(rows.at(-1)).toMatchObject({
+      current: false,
+      kind: "past",
+      state: "done",
+      title: "past a-old",
+    });
+  });
+
+  it("shows the Archived header only when there are archived rows", () => {
+    const headers = (rows: ViewRow[]) =>
+      buildLines(rows, IDLE_VIEW_NAV.collapsedGroups)
+        .filter((l) => l.type === "header")
+        .map((l) => (l.type === "header" ? l.group : null));
+
+    expect(headers(build({ past: [past("p1", 1)] }))).toEqual(["completed"]);
+    expect(
+      headers(build({ archived: [past("a1", 1)], past: [past("p1", 1)] })),
+    ).toEqual(["completed", "archived"]);
+  });
+
+  it("dates a past row by its last activity (updated_at), falling back to its creation", () => {
+    const rows = build({
+      archived: [{ ...past("a1", 100), updated_at: 900 }],
+      past: [{ ...past("p1", 200), updated_at: 800 }, past("p2", 150)],
+    });
+
+    expect(rows.map((r) => [r.id, r.lastActive])).toEqual([
+      ["p1", 800],
+      ["p2", 150],
+      ["a1", 900],
+    ]);
+  });
+
+  it("orders past rows by last activity, so the ages they show run newest to oldest", () => {
+    // p1 was created last but p2 was used last.
+    const rows = build({
+      past: [
+        { ...past("p1", 300), updated_at: 310 },
+        { ...past("p2", 100), updated_at: 900 },
+        past("p3", 500),
+      ],
+    });
+
+    expect(rows.map((r) => r.id)).toEqual(["p2", "p3", "p1"]);
+  });
 });
 
 const vrow = (id: string, over: Partial<ViewRow> = {}): ViewRow => ({
@@ -362,6 +428,13 @@ describe("collapsible groups", () => {
     vrow("w2"),
     vrow("c1", { group: "completed", state: "done" }),
   ];
+  // Nothing collapsed to start with, so each test sees only the collapsing it does itself (IDLE_VIEW_NAV opens with
+  // Archived collapsed).
+  const at = (index: number): ViewNav => ({
+    ...IDLE_VIEW_NAV,
+    collapsedGroups: [],
+    index,
+  });
   const onHeader: ViewNav = {
     ...IDLE_VIEW_NAV,
     collapsedGroups: ["working"],
@@ -525,6 +598,142 @@ describe("collapsible groups", () => {
       draft: " ",
       focus: "input",
     });
+  });
+});
+
+describe("archive and restore", () => {
+  // Working: cur, s1 · Completed: p1, p2 (earlier sessions) · Archived: x1, x2
+  const pastRow = (id: string, group: "archived" | "completed") =>
+    vrow(id, { group, key: `past:${id}`, kind: "past", state: "done" });
+  const A: ViewRow[] = [
+    vrow("cur", { current: true }),
+    vrow("s1"),
+    pastRow("p1", "completed"),
+    pastRow("p2", "completed"),
+    pastRow("x1", "archived"),
+    pastRow("x2", "archived"),
+  ];
+  // The Archived group opened, so its rows can be selected.
+  const open = (index: number): ViewNav => ({
+    ...IDLE_VIEW_NAV,
+    collapsedGroups: [],
+    index,
+  });
+
+  it("starts with Archived collapsed: its rows hidden, its header selectable, c expands it", () => {
+    expect(IDLE_VIEW_NAV.collapsedGroups).toEqual(["archived"]);
+
+    const lines = buildLines(A, IDLE_VIEW_NAV.collapsedGroups);
+
+    expect(lines.at(-1)).toEqual({ group: "archived", type: "header" });
+    expect(
+      lines.some((l) => l.type === "row" && l.row.group === "archived"),
+    ).toBe(false);
+    expect(navItems(A, IDLE_VIEW_NAV.collapsedGroups).at(-1)).toEqual({
+      group: "archived",
+      type: "header",
+    });
+
+    const onHeader = press(at(3), { down: true }, A).nav;
+
+    expect(onHeader).toMatchObject({ header: "archived", index: 4 });
+    // Expanding from the header leaves the selection on it.
+    expect(press(onHeader, { ch: "c" }, A).nav).toMatchObject({
+      collapsedGroups: [],
+      header: "archived",
+      index: 4,
+    });
+  });
+
+  it("a archives an earlier session and u restores an archived one, the cursor stepping to a neighbour", () => {
+    // The next row of the same group, else the item above: never the row that is leaving.
+    for (const [nav, ch, row, type, index] of [
+      [open(2), "a", A[2], "archive", 3],
+      [open(3), "a", A[3], "archive", 2],
+      [at(3), "a", A[3], "archive", 2],
+      [open(4), "u", A[4], "unarchive", 5],
+      [open(5), "u", A[5], "unarchive", 4],
+    ] as const) {
+      const r = press(nav, { ch }, A);
+
+      expect(r.effect).toEqual({ row, type });
+      expect(r.nav).toEqual({ ...nav, header: null, index });
+    }
+
+    // On the only row there is nowhere to step to: the cursor stays.
+    const lone = [A[2]!];
+
+    expect(press(open(0), { ch: "a" }, lone)).toEqual({
+      consumed: true,
+      effect: { row: A[2], type: "archive" },
+      nav: open(0),
+    });
+
+    // The last row of its group: the group's header leaves with it, so the cursor steps over the header to the item
+    // above rather than onto a header that is about to disappear.
+    const stacked = [A[1]!, A[2]!];
+    const last = press(open(1), { ch: "a" }, stacked);
+
+    expect(last.effect).toEqual({ row: A[2], type: "archive" });
+    expect(last.nav).toEqual({ ...open(1), header: null, index: 0 });
+  });
+
+  it("a and u are plain typing on rows they do not apply to and on a header; a pending stop eats them", () => {
+    const onHeader: ViewNav = { ...at(4), header: "archived" };
+
+    for (const [nav, ch] of [
+      [open(0), "a"], // this session
+      [open(1), "a"], // a live session
+      [open(4), "a"], // already archived
+      [open(1), "u"], // a live session
+      [open(2), "u"], // an earlier session that is not archived
+      [onHeader, "a"],
+      [onHeader, "u"],
+    ] as const) {
+      const r = press(nav, { ch }, A);
+
+      // Typed into the composer like any other letter: nothing is archived and the letter is not lost.
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual({ ...nav, draft: ch, focus: "input" });
+    }
+
+    const agentRows = [vrow("a1", { key: "agent:a1", kind: "agent" })];
+
+    expect(press(open(0), { ch: "a" }, agentRows).effect).toBeNull();
+
+    // A pending stop is cancelled by a and u, like by any other key, and nothing is archived.
+    const ask = press(open(1), { ch: "x" }, A).nav;
+
+    for (const ch of ["a", "u"]) {
+      const r = press(ask, { ch }, A);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual(open(1));
+    }
+  });
+
+  it("a and u are list commands where they apply: they are not typed into the composer", () => {
+    for (const [nav, ch] of [
+      [open(2), "a"],
+      [open(3), "a"],
+      [open(4), "u"],
+      [open(5), "u"],
+    ] as const) {
+      const r = press(nav, { ch }, A);
+
+      expect(r.nav.focus).toBe("list");
+      expect(r.nav.draft).toBe("");
+    }
+  });
+
+  it("starting a prompt with a or u on a row they do not archive or restore keeps the letter", () => {
+    // "add tests" typed on a live session, and "use" on an earlier one: the first letter reaches the composer.
+    const a = press(open(1), { ch: "a" }, A);
+    const u = press(open(2), { ch: "u" }, A);
+
+    expect([a.effect, u.effect]).toEqual([null, null]);
+    expect([a.nav.draft, u.nav.draft]).toEqual(["a", "u"]);
+    expect([a.nav.focus, u.nav.focus]).toEqual(["input", "input"]);
   });
 });
 
@@ -913,5 +1122,55 @@ describe("visibleWindow", () => {
     expect(visibleWindow(10, -3, 4, 3)).toEqual({ end: 4, start: 0 });
     expect(visibleWindow(10, 2, 4, 99)).toEqual({ end: 6, start: 2 });
     expect(visibleWindow(5, 4, 0)).toEqual({ end: 5, start: 4 });
+  });
+});
+
+describe("reduceViewKey: the archive proposal banner", () => {
+  const suggest = (nav: ViewNav, key: ViewKey, suggesting = true) =>
+    reduceViewKey(nav, ROWS, key, 2, suggesting);
+  const ALT_Y: ViewKey = { ch: "y", meta: true };
+  const ALT_N: ViewKey = { ch: "n", meta: true };
+
+  it("Alt+Y archives and Alt+N keeps the proposed sessions, in both focuses", () => {
+    for (const focus of ["input", "list"] as const) {
+      const nav = { ...at(1), focus };
+
+      expect(suggest(nav, ALT_Y).effect).toEqual({
+        type: "archive_suggested",
+      });
+      expect(suggest(nav, ALT_N).effect).toEqual({
+        type: "decline_suggested",
+      });
+      // The chord neither moves the selection nor takes the keyboard from either half.
+      expect(suggest(nav, ALT_Y).nav).toEqual(nav);
+    }
+  });
+
+  it("does nothing without a banner, and bare or Ctrl letters are not the chords", () => {
+    for (const focus of ["input", "list"] as const) {
+      const nav = { ...at(1), focus };
+
+      expect(suggest(nav, ALT_Y, false).effect).toBeNull();
+      expect(suggest(nav, ALT_N, false).effect).toBeNull();
+      expect(suggest(nav, ALT_N, false).nav).toEqual(nav);
+      expect(
+        suggest(nav, { ch: "y", ctrl: true, meta: true }).effect,
+      ).toBeNull();
+    }
+    expect(suggest(at(1), { ch: "y" }).effect).toBeNull();
+    expect(suggest(at(1), { ch: "n" }).nav.focus).toBe("input");
+  });
+
+  it("a pending stop confirmation is cancelled by either chord: nothing stops, nothing is archived", () => {
+    const armed = press(at(1), { ch: "x" }).nav;
+
+    expect(armed.confirmKey).toBe(ROWS[1]!.key);
+
+    for (const chord of [ALT_Y, ALT_N]) {
+      const r = suggest(armed, chord);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav.confirmKey).toBeNull();
+    }
   });
 });

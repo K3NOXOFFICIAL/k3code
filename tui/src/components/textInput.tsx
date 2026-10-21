@@ -894,6 +894,7 @@ export function TextInput({
   mouseApiRef,
   cursorSnapshotRef,
   ignoreVerticalArrows = false,
+  reservedMetaKeys,
   placeholder = "",
   placeholderColor,
   accentColor,
@@ -1583,6 +1584,13 @@ export function TextInput({
         return;
       }
 
+      // An Alt+letter the owner acts on: the field would otherwise type the letter (or, on macOS, run an Option chord).
+      if (k.meta && !k.ctrl && reservedMetaKeys?.includes(inp)) {
+        flushKeyBurst();
+
+        return;
+      }
+
       if (
         eventRaw === "\x1bv" ||
         eventRaw === "\x1bV" ||
@@ -2082,6 +2090,8 @@ interface TextInputProps {
   highlightContext?: HighlightContext;
   /** Leave ↑/↓ to the owner: a form that moves field focus with them owns the key, not the field. */
   ignoreVerticalArrows?: boolean;
+  /** Alt+<letter> chords the owner handles (the agent view's Alt+Y/Alt+N): the field neither types nor acts on them. */
+  reservedMetaKeys?: readonly string[];
   mask?: string;
   mouseApiRef?: MutableRefObject<null | TextInputMouseApi>;
   onChange: (v: string) => void;
