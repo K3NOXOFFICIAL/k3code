@@ -1273,6 +1273,69 @@ describe("useInputHandlers: Escs the question picker consumes do not count towar
   });
 });
 
+describe("AppLayout question picker fits a short terminal", () => {
+  const original = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+
+  afterEach(() => {
+    if (original) {
+      Object.defineProperty(process.stdout, "rows", original);
+    } else {
+      delete (process.stdout as { rows?: number }).rows;
+    }
+  });
+
+  it.each([14, 16, 20, 24])(
+    "at %i rows the hint, Chat about this and the status rule stay on screen",
+    async (rows) => {
+      // The vendored Ink's useStdout() reads process.stdout, not the fake stdout.
+      Object.defineProperty(process.stdout, "rows", {
+        configurable: true,
+        value: rows,
+        writable: true,
+      });
+
+      const layout = mountLayout(
+        {
+          clarify: {
+            choices: null,
+            question: "",
+            questions: [
+              {
+                choices: ["one", "two", "three", "four"],
+                descriptions: ["one", "two", "three", "four"].map((name) =>
+                  `A long description of option ${name} `.repeat(8),
+                ),
+                header: "Many",
+                multiSelect: true,
+                qid: "q1",
+                question: "Pick any?",
+              },
+            ],
+            requestId: "batch-1",
+          },
+        },
+        {},
+        {},
+        { columns: 80, rows },
+      );
+
+      await waitFor(() => expect(layout.output()).toContain("Pick any?"));
+      await flush();
+
+      // Nothing was pressed, so the output is the first full paint: rows past the screen are never drawn.
+      const screen = layout.output();
+
+      expect(screen.replace(/\n+$/, "").split("\n").length).toBeLessThanOrEqual(
+        rows,
+      );
+
+      expect(screen).toContain("Chat about this");
+      expect(screen).toContain("Esc cancel");
+      expect(screen).toContain("~/repo");
+    },
+  );
+});
+
 describe("useInputHandlers: a double Esc interrupts a running turn", () => {
   afterEach(() => {
     $stripSessions.set([]);

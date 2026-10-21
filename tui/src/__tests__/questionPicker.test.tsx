@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
-import { renderSync } from "@k3code/ink";
+import { renderSync, stringWidth } from "@k3code/ink";
 import React from "react";
 import stripAnsi from "strip-ansi";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -91,7 +91,7 @@ const TOPPINGS: ClarifyBatchQuestion = {
   question: "Which toppings?",
 };
 
-function mount(request: ClarifyReq) {
+function mount(request: ClarifyReq, cols = 100) {
   const stdin = new FakeInput();
   const stdout = new PassThrough();
   let output = "";
@@ -105,7 +105,7 @@ function mount(request: ClarifyReq) {
 
   const instance = renderSync(
     <QuestionPicker
-      cols={100}
+      cols={cols}
       onClarifyBatch={onClarifyBatch}
       req={request}
       t={DEFAULT_THEME}
@@ -143,8 +143,8 @@ function mount(request: ClarifyReq) {
 }
 
 const mounted: { stop: () => void }[] = [];
-const open = (request: ClarifyReq) => {
-  const view = mount(request);
+const open = (request: ClarifyReq, cols?: number) => {
+  const view = mount(request, cols);
 
   mounted.push(view);
 
@@ -382,7 +382,7 @@ describe("QuestionPicker in a short terminal", () => {
     }
   });
 
-  it("windows the options at 14 rows and keeps Next, Type something, Chat and the hint", async () => {
+  it("windows the options at 14 rows (app chrome included) and keeps Next, Type something, Chat and the hint", async () => {
     // The vendored Ink's useStdout() reads process.stdout, not the fake stdout.
     Object.defineProperty(process.stdout, "rows", {
       configurable: true,
@@ -413,14 +413,108 @@ describe("QuestionPicker in a short terminal", () => {
     expect(view.frame()).toContain("Type something");
     expect(view.frame()).toContain("Chat about this");
     expect(view.frame()).toContain("Esc cancel");
-    expect(view.frame()).toContain("1-3 of 8");
-    expect(view.frame()).toContain("option 3");
-    expect(view.frame()).not.toContain("option 4");
+    expect(view.frame()).toContain("1-1 of 8");
+    expect(view.frame()).toContain("option 1");
+    expect(view.frame()).not.toContain("option 2");
     // Each description is cut to one line, marked with an ellipsis.
     const descs = lines.filter((line) => line.includes("A long description"));
 
-    expect(descs).toHaveLength(3);
+    expect(descs).toHaveLength(1);
     descs.forEach((line) => expect(line.trimEnd()).toMatch(/…$/));
+  });
+});
+
+describe("QuestionPicker layout", () => {
+  const HEADED = [
+    "Alpha header",
+    "Bravo header",
+    "Charl header",
+    "Delta header",
+  ].map((header, i): ClarifyBatchQuestion => ({
+    choices: ["yes", "no"],
+    header,
+    qid: `h${i}`,
+    question: `Question ${i}?`,
+  }));
+
+  it("shows a long question whole instead of cutting it to two lines", async () => {
+    const long = `Should we ${"really carefully consider ".repeat(10)}the final step?`;
+    const view = open(req([{ ...COLOUR, question: long }, SIZE]));
+
+    await waitFor(() => expect(view.frame()).toContain("the final step?"));
+    expect(view.frame()).not.toContain("…");
+  });
+
+  it.each([80, 60])(
+    "fits the tab strip into %i columns, keeping the active tab and Submit",
+    async (cols) => {
+      const view = open(req(HEADED), cols);
+
+      await waitFor(() => expect(view.frame()).toContain("Question 0?"));
+
+      const strip = view
+        .frame()
+        .split("\n")
+        .find((line) => line.includes("←"))!;
+
+      expect(strip).toContain("Alpha header");
+      expect(strip).toMatch(/✓ Submit +→/);
+      expect(stringWidth(strip.trimEnd())).toBeLessThanOrEqual(cols);
+    },
+  );
+
+  it("digit 1 on the Submit tab submits, 2 cancels", async () => {
+    const view = open(req([COLOUR, SIZE]));
+
+    await waitFor(() => expect(view.frame()).toContain("Which colour?"));
+    await view.press("1", "2");
+    await waitFor(() => expect(view.frame()).toContain("Review your answers"));
+    await view.press("1");
+    await waitFor(() =>
+      expect(view.onClarifyBatch).toHaveBeenCalledWith({
+        answers: { q1: "red", q2: "medium" },
+      }),
+    );
+
+    const cancel = open(req([COLOUR, SIZE]));
+
+    await waitFor(() => expect(cancel.frame()).toContain("Which colour?"));
+    await cancel.press(TAB, TAB, "2");
+    await waitFor(() =>
+      expect(cancel.onClarifyBatch).toHaveBeenCalledWith(null),
+    );
+  });
+
+  it("cuts emoji and CJK descriptions by display width on grapheme boundaries", async () => {
+    const view = open(
+      req([
+        {
+          choices: ["emoji", "cjk"],
+          descriptions: [
+            `a${"🎉👍".repeat(60)}`,
+            `a${"漢字テスト".repeat(30)}`,
+          ],
+          header: "Wide",
+          qid: "w1",
+          question: "Wide?",
+        },
+      ]),
+      60,
+    );
+
+    await waitFor(() => expect(view.frame()).toContain("Wide?"));
+
+    const descs = view
+      .frame()
+      .split("\n")
+      .filter((line) => /[🎉漢]/u.test(line));
+
+    expect(descs.length).toBeGreaterThan(0);
+    descs.forEach((line) => {
+      expect(stringWidth(line.trimEnd())).toBeLessThanOrEqual(60 - 8);
+      // No lone surrogate: the cut never splits an emoji.
+      expect(line).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    });
   });
 });
 

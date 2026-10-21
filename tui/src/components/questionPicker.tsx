@@ -1,4 +1,11 @@
-import { Box, Text, useInput, useStdout, wrapAnsi } from "@k3code/ink";
+import {
+  Box,
+  stringWidth,
+  Text,
+  useInput,
+  useStdout,
+  wrapAnsi,
+} from "@k3code/ink";
 import { useRef, useState } from "react";
 
 import {
@@ -17,6 +24,7 @@ import type {
   ClarifyReq,
 } from "../types.js";
 
+import { PROMPT_CHROME_ROWS } from "./appOverlays.js";
 import { chipRowProps } from "./overlayPrimitives.js";
 import { TextInput } from "./textInput.js";
 
@@ -324,8 +332,11 @@ export const pickerKey = (
       };
     }
 
-    if (key.return) {
-      return s.submitCursor === 0
+    // Enter on the cursor row, or the row's painted number (1 Submit, 2 Cancel).
+    const picked = key.return ? s.submitCursor : ["1", "2"].indexOf(ch);
+
+    if (picked >= 0) {
+      return picked === 0
         ? finish(s, { answers: collectAnswers(questions, s.qs) })
         : finish(s, null);
     }
@@ -419,6 +430,24 @@ export function optionWindow(
   return { end, start };
 }
 
+/** The longest prefix of `line` on grapheme boundaries that fits `cells` display columns. */
+const cutToWidth = (line: string, cells: number) => {
+  let out = "";
+  let used = 0;
+
+  for (const { segment } of new Intl.Segmenter().segment(line)) {
+    used += stringWidth(segment);
+
+    if (used > cells) {
+      break;
+    }
+
+    out += segment;
+  }
+
+  return out;
+};
+
 /** `text` wrapped to `width`, at most `max` lines, the last one marked `…` when cut. */
 const clampLines = (text: string, width: number, max: number): string[] => {
   const lines = wrapAnsi(text, width, { hard: true, trim: true })
@@ -431,8 +460,51 @@ const clampLines = (text: string, width: number, max: number): string[] => {
 
   return [
     ...lines.slice(0, max - 1),
-    `${lines[max - 1]!.slice(0, Math.max(1, width - 1))}…`,
+    `${cutToWidth(lines[max - 1]!, Math.max(1, width - 1))}…`,
   ];
+};
+
+/** Fixed picker lines besides the question: strip, Type something, rule, Chat, hint (+ Next for multi-select). */
+const fixedLines = (q: ClarifyBatchQuestion) => (q.multiSelect ? 6 : 5);
+
+/** The option window never shrinks below one option plus its one-line description. */
+const MIN_WINDOW = 2;
+
+/**
+ * Tab labels that fit `avail` cells: the non-active labels are ellipsized
+ * (longest first, never below 3 cells) so the active tab and Submit stay visible.
+ */
+const fitTabLabels = (
+  full: readonly string[],
+  active: number,
+  avail: number,
+  submitTab: boolean,
+) => {
+  const labels = full.map((label) => compactPreview(label, 16));
+  const caps = labels.map((label) => stringWidth(label));
+  // "← " + " →", each tab's " ☐ " + " " chrome, the "  " gaps, and "  ✓ Submit ".
+  const chrome =
+    4 + full.length * 4 + (full.length - 1) * 2 + (submitTab ? 12 : 0);
+  const total = () => chrome + labels.reduce((n, l) => n + stringWidth(l), 0);
+
+  while (total() > avail) {
+    let widest = -1;
+
+    caps.forEach((cap, i) => {
+      if (i !== active && cap > 3 && (widest < 0 || cap > caps[widest]!)) {
+        widest = i;
+      }
+    });
+
+    if (widest < 0) {
+      break;
+    }
+
+    caps[widest]!--;
+    labels[widest] = compactPreview(full[widest]!, caps[widest]!);
+  }
+
+  return labels;
 };
 
 export function QuestionPicker({
@@ -470,20 +542,41 @@ export function QuestionPicker({
   });
 
   const width = Math.max(20, cols - 8);
-  const budget = Math.max(6, Math.min(16, (stdout?.rows ?? 24) - 10));
-  const descMax = budget >= 12 ? 2 : 1;
   const answers = collectAnswers(questions, view.qs);
   const submitTab = hasSubmitTab(questions);
   const q = questions[view.tab];
+  // The rows left for the question and the option window once the app's chrome and the fixed rows are painted.
+  const room =
+    (stdout?.rows ?? 24) - PROMPT_CHROME_ROWS - (q ? fixedLines(q) : 0);
+  const questionAll = q
+    ? clampLines(visibleControls(q.question), width, Infinity)
+    : [];
+  // The whole question, unless it would squeeze the window below MIN_WINDOW: then it gets the rows that remain.
+  const questionLines =
+    questionAll.length <= room - MIN_WINDOW
+      ? questionAll
+      : clampLines(
+          visibleControls(q!.question),
+          width,
+          Math.max(1, room - MIN_WINDOW),
+        );
+  const budget = Math.max(
+    MIN_WINDOW,
+    Math.min(16, room - questionLines.length),
+  );
+  const descMax = budget >= 12 ? 2 : 1;
+  const tabLabels = fitTabLabels(
+    questions.map((item) => visibleControls(item.header || item.question)),
+    view.tab,
+    cols - 2,
+    submitTab,
+  );
 
   const strip = (
     <Text wrap="truncate-end">
       <Text color={t.color.muted}>← </Text>
       {questions.map((item, i) => {
-        const label = compactPreview(
-          visibleControls(item.header || item.question),
-          16,
-        );
+        const label = tabLabels[i]!;
         const active = view.tab === i;
 
         return (
@@ -611,7 +704,7 @@ export function QuestionPicker({
   return (
     <Box flexDirection="column">
       {strip}
-      {clampLines(visibleControls(q.question), width, 2).map((line, i) => (
+      {questionLines.map((line, i) => (
         <Text bold color={t.color.text} key={`q-${i}`}>
           {line}
         </Text>
