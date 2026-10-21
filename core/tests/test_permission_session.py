@@ -260,6 +260,62 @@ async def test_auto_mode_at_home_still_asks_for_a_tree_walker(tmp_path, monkeypa
     assert len(asked) == 1 and "home directory" in asked[0] and built == []
 
 
+def _record_bash(loop) -> list:
+    """Swap the home loop's bash handler for one that records the sandbox argv it is handed (None = unsandboxed)."""
+    spec, _ = loop.tools.get("bash")
+    seen: list = []
+
+    async def ran(args, **kw):
+        seen.append(kw.get("sandbox", "missing"))
+        return {"ok": True}
+
+    loop.tools._tools["bash"] = (spec, ran)
+    return seen
+
+
+@pytest.mark.parametrize("command", ["touch x", "echo hi > note.txt", "rg KEY", "git diff"])
+async def test_yolo_at_home_runs_every_command_unsandboxed_without_asking(command: str, tmp_path, monkeypatch) -> None:
+    # yolo is the no-prompt mode (README): no sandbox can contain $HOME, so it runs on the host like it does when
+    # bwrap is unusable, instead of asking per command as auto does
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "yolo")
+    seen = _record_bash(loop)
+    out = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": command}))
+    assert out.get("ok") is True and "error" not in out, (command, out)
+    assert asked == [] and built == [] and seen == [None], (command, asked, built, seen)
+
+
+async def test_auto_at_home_still_asks_where_yolo_runs(tmp_path, monkeypatch) -> None:
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
+    seen = _record_bash(loop)
+    out = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch x"}))
+    assert len(asked) == 1 and "home directory" in asked[0], asked
+    assert "User denied" in out.get("error", "") and seen == [], (out, seen)
+
+
+async def test_yolo_at_home_still_refuses_the_hardline_list(tmp_path, monkeypatch) -> None:
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "yolo")
+    seen = _record_bash(loop)
+    out = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "rm -rf ~"}))
+    assert "error" in out and asked == [] and seen == [], (out, asked, seen)
+
+
+async def test_unattended_yolo_at_home_is_still_refused(tmp_path, monkeypatch) -> None:
+    # nobody is there to see an unsandboxed run: bash at $HOME stays refused for background/sub-agent work
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "yolo")
+    loop.unattended = True
+    seen = _record_bash(loop)
+    out = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch x"}))
+    assert "bash refused" in out.get("error", "") and asked == [] and seen == [], (out, asked, seen)
+
+
 @pytest.mark.parametrize("command", ["git show HEAD", "git diff", "git log -p", "git log --patch"])
 async def test_auto_mode_at_home_asks_for_git_commands_that_print_file_contents(
     command: str, tmp_path, monkeypatch

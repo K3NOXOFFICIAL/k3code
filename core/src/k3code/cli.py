@@ -111,7 +111,10 @@ def _warn_unsandboxed(mode: str) -> None:
 
 def _warn_home_started() -> None:
     """A run whose cwd is $HOME: said once on stderr (see AgentLoop._tell_home_started)."""
-    sys.stderr.write("[k3code] k3code started in your home directory: start it inside a project for full auto mode\n")
+    sys.stderr.write(
+        "[k3code] k3code started in your home directory: no sandbox here (auto asks before each command, yolo runs"
+        " them all). Start it inside a project for full auto mode\n"
+    )
 
 
 def _build_reliability(config: Any, session: str) -> Reliability:

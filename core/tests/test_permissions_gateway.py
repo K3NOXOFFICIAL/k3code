@@ -215,11 +215,21 @@ async def test_hardline_never_prompts(tmp_path, monkeypatch):
 async def test_mode_cycle_and_set(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     await call(server, "session.create", {"cwd": str(tmp_path)})
-    modes = [(await call(server, "session.mode.cycle"))["mode"] for _ in range(4)]
-    assert modes == ["accept-edits", "plan", "auto", "default"]
+    modes = [(await call(server, "session.mode.cycle"))["mode"] for _ in range(5)]
+    assert modes == ["accept-edits", "plan", "auto", "yolo", "default"]  # Shift+Tab reaches yolo, then wraps
     assert (await call(server, "session.mode.set", {"mode": "yolo"}))["mode"] == "yolo"
     infos = [json.loads(x) for x in server._frames if '"session.info"' in x]  # type: ignore[attr-defined]
     assert infos[-1]["params"]["payload"]["mode"] == "yolo"
+
+
+def test_mode_cycle_names_follow_the_cycle_and_yolo_wraps_to_default(tmp_path):
+    from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode
+    from k3code.permissions.state import MODE_CYCLE, PermissionState
+
+    assert [m.value for m in MODE_CYCLE] == MODE_CYCLE_NAMES  # the /permissions list and Shift+Tab never drift
+    st = PermissionState(mode=PermissionMode.YOLO, cwd=tmp_path)
+    assert st.cycle_mode() is PermissionMode.DEFAULT
+    assert st.cycle_mode() is PermissionMode.ACCEPT_EDITS
 
 
 async def test_plan_mode_refuses_then_exit_plan_switches(tmp_path, monkeypatch):

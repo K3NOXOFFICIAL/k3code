@@ -19,7 +19,13 @@ from k3code.paths import ensure_private_dir, ensure_state_dir
 from .engine import Decision, PermissionMode, decide
 from .rules import Rule, from_config
 
-MODE_CYCLE = [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.PLAN, PermissionMode.AUTO]
+MODE_CYCLE = [
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.PLAN,
+    PermissionMode.AUTO,
+    PermissionMode.YOLO,
+]
 logger = logging.getLogger(__name__)
 
 
@@ -251,7 +257,8 @@ class PermissionState:
         )
 
     def cycle_mode(self) -> PermissionMode:
-        """default → accept-edits → plan → auto → default (yolo is never cycled into)."""
+        """default → accept-edits → plan → auto → yolo → default (yolo last, so a Shift+Tab from default reaches it
+        only after the three sandboxed or prompting modes)."""
         try:
             nxt = MODE_CYCLE[(MODE_CYCLE.index(self.mode) + 1) % len(MODE_CYCLE)]
         except ValueError:

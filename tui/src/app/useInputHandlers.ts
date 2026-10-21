@@ -930,7 +930,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       });
     }
 
-    // shift-tab cycles the permission mode: default → accept-edits → plan → auto
+    // shift-tab cycles the permission mode: default → accept-edits → plan → auto → yolo
     // (the gateway answers with the new mode and emits session.info for the status line).
     if (key.shift && key.tab && !cState.completions.length) {
       if (!live.sid) {
