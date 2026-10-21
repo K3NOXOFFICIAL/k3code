@@ -41,7 +41,6 @@ import type {
 } from "../gatewayTypes.js";
 import type {
   AnyGatewayEvent,
-  ClarifyLockResponse,
   ConfigSetResponse,
   SessionActiveListResponse,
   SessionCloseResponse,
@@ -64,18 +63,25 @@ import { terminalParityHints } from "../lib/terminalParity.js";
 import {
   buildToolTrailLine,
   formatAbandonedClarify,
-  formatAbandonedClarifyBatch,
-  sameToolTrailGroup,
   toolTrailLabel,
 } from "../lib/text.js";
 import { estimatedMsgHeight, messageHeightKey } from "../lib/virtualHeights.js";
 import { onUserWidgets } from "../sdk/userWidgets.js";
-import type { Msg, PanelSection, SlashCatalog } from "../types.js";
+import type {
+  ClarifyBatchResult,
+  Msg,
+  PanelSection,
+  SlashCatalog,
+} from "../types.js";
 
 import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
 import { clearProposals, setProposalHandlers } from "../k3/proposalsStore.js";
 
 import { applyAgentSnapshot } from "./agentRoster.js";
+import {
+  answerClarifyBatchRequest,
+  dropClarifyToolTrail,
+} from "./clarifyBatch.js";
 import { createGatewayEventHandler } from "./createGatewayEventHandler.js";
 import { createServerRequestHandler } from "./createServerRequestHandler.js";
 import { createSlashHandler } from "./createSlashHandler.js";
@@ -984,6 +990,21 @@ export function useMainApp(gw: GatewayClient) {
     };
   }, [rpc, stdout, ui.sid]);
 
+  // Batch clarify (`questions[]`, the `ask_user_question` tool): the picker
+  // submits the whole set as one frame; null is cancel.
+  const answerClarifyBatch = useCallback(
+    (result: ClarifyBatchResult | null) => {
+      const clarify = overlay.clarify;
+
+      if (!clarify?.questions?.length) {
+        return;
+      }
+
+      answerClarifyBatchRequest(clarify, result, appendMessage);
+    },
+    [appendMessage, overlay.clarify],
+  );
+
   const answerClarify = useCallback(
     (answer: string) => {
       const clarify = overlay.clarify;
@@ -992,12 +1013,16 @@ export function useMainApp(gw: GatewayClient) {
         return;
       }
 
+      if (clarify.questions?.length) {
+        // Ctrl+C reaches here for every clarify: a batch only ever cancels.
+        answerClarifyBatchRequest(clarify, null, appendMessage);
+
+        return;
+      }
+
       const label = toolTrailLabel("clarify");
 
-      turnController.turnTools = turnController.turnTools.filter(
-        (line) => !sameToolTrailGroup(label, line),
-      );
-      patchTurnState({ turnTrail: turnController.turnTools });
+      dropClarifyToolTrail();
 
       if (!respondToServerRequest(clarify.requestId, { answer })) {
         // The request already expired (request.cancel raced the keystroke): nothing to answer.
@@ -1023,17 +1048,11 @@ export function useMainApp(gw: GatewayClient) {
           // survives on screen as standard output, matching the timeout path.
           appendMessage({
             role: "system",
-            text: clarify.questions?.length
-              ? formatAbandonedClarifyBatch(
-                  clarify.questions,
-                  clarify.answers ?? {},
-                  "cancelled",
-                )
-              : formatAbandonedClarify(
-                  clarify.question,
-                  clarify.choices,
-                  "cancelled",
-                ),
+            text: formatAbandonedClarify(
+              clarify.question,
+              clarify.choices,
+              "cancelled",
+            ),
           });
         }
 
@@ -1041,80 +1060,6 @@ export function useMainApp(gw: GatewayClient) {
       }
     },
     [appendMessage, overlay.clarify],
-  );
-
-  // Lock one answer of a batch clarify (`clarify.lock` RPC). The overlay stays
-  // up until the server reports no remaining questions — the final lock
-  // resolves the server request and the turn continues.
-  const answerClarifyQuestion = useCallback(
-    (qid: string, answer: string) => {
-      const clarify = overlay.clarify;
-
-      if (!clarify?.questions?.length) {
-        return;
-      }
-
-      rpc<ClarifyLockResponse>("clarify.lock", {
-        answer,
-        question_id: qid,
-        request_id: clarify.requestId,
-      }).then((r) => {
-        if (!r) {
-          // No `clarify.lock` on this backend (#170: the gateway answers single-question clarifies via the
-          // server request itself). Answer the pending request directly so the turn continues instead of hanging.
-          respondToServerRequest(clarify.requestId, { answer });
-          patchOverlayState({ clarify: null });
-          return;
-        }
-
-        const answers = { ...(clarify.answers ?? {}), [qid]: answer };
-
-        if (r.status === "expired") {
-          patchOverlayState({ clarify: null });
-
-          return;
-        }
-
-        if ((r.remaining ?? []).length > 0) {
-          patchOverlayState({ clarify: { ...clarify, answers } });
-
-          return;
-        }
-
-        // Batch complete: persist the whole Q&A set as one user-visible
-        // block (mirrors the single-question trail + answer lines).
-        const label = toolTrailLabel("clarify");
-
-        turnController.turnTools = turnController.turnTools.filter(
-          (line) => !sameToolTrailGroup(label, line),
-        );
-        patchTurnState({ turnTrail: turnController.turnTools });
-        turnController.persistedToolLabels.add(label);
-        appendMessage({
-          kind: "trail",
-          role: "system",
-          text: "",
-          tools: [
-            buildToolTrailLine(
-              "clarify",
-              `${clarify.questions!.length} questions`,
-            ),
-          ],
-        });
-        appendMessage({
-          role: "user",
-          text: clarify
-            .questions!.map(
-              (q) =>
-                `${q.question} → ${answers[q.qid]?.trim() ? answers[q.qid] : "(skipped)"}`,
-            )
-            .join("\n"),
-        });
-        patchUiState({ status: "running…" });
-        patchOverlayState({ clarify: null });
-      });
-    },
-    [appendMessage, overlay.clarify, rpc],
   );
 
   sysRef.current = sys;
@@ -1662,7 +1607,7 @@ export function useMainApp(gw: GatewayClient) {
       closeLiveSession,
       answerApproval,
       answerClarify,
-      answerClarifyQuestion,
+      answerClarifyBatch,
       answerSecret,
       answerSudo,
       clearSelection,
@@ -1691,7 +1636,7 @@ export function useMainApp(gw: GatewayClient) {
     [
       answerApproval,
       answerClarify,
-      answerClarifyQuestion,
+      answerClarifyBatch,
       answerSecret,
       answerSudo,
       clearSelection,

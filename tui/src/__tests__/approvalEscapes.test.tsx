@@ -4,7 +4,11 @@ import { renderSync } from "@k3code/ink";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 
-import { ApprovalPrompt, ClarifyPrompt } from "../components/prompts.js";
+import {
+  ApprovalPrompt,
+  ClarifyBatchFallback,
+  ClarifyPrompt,
+} from "../components/prompts.js";
 import { visibleControls } from "../lib/text.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { ApprovalReq, ClarifyReq } from "../types.js";
@@ -88,6 +92,12 @@ const paintClarify = (req: ClarifyReq) =>
     />,
   );
 
+// Batch requests (`questions[]`) render through the batch fallback, not ClarifyPrompt.
+const paintClarifyBatch = (req: ClarifyReq) =>
+  paintRaw(
+    <ClarifyBatchFallback onCancel={() => {}} req={req} t={DEFAULT_THEME} />,
+  );
+
 describe("visibleControls", () => {
   it("shows escape and control bytes as visible symbols", () => {
     expect(visibleControls(`a${ESC}[2Kb`)).toBe("a␛[2Kb");
@@ -152,19 +162,26 @@ describe("clarify prompt does not paint request escape sequences", () => {
     );
   });
 
-  it("neutralizes batch questions, choices and locked answers", () => {
-    expectNoRequestEscapes(
-      paintClarify({
-        answers: { q2: ATTACK },
-        choices: null,
-        question: "",
-        questions: [
-          { choices: [ATTACK], qid: "q1", question: ATTACK },
-          { choices: null, qid: "q2", question: ATTACK },
-        ],
-        requestId: "c-2",
-      }),
-    );
+  it("neutralizes batch questions, headers, choices and descriptions", () => {
+    const raw = paintClarifyBatch({
+      answers: { q2: ATTACK },
+      choices: null,
+      question: "",
+      questions: [
+        {
+          choices: [ATTACK],
+          descriptions: [ATTACK],
+          header: ATTACK,
+          qid: "q1",
+          question: ATTACK,
+        },
+        { choices: null, qid: "q2", question: ATTACK },
+      ],
+      requestId: "c-2",
+    });
+
+    expectNoRequestEscapes(raw);
+    expect(stripAnsi(raw)).toContain("MARK␛]0;TITLE␇");
   });
 });
 

@@ -2353,6 +2353,53 @@ describe("createGatewayEventHandler", () => {
     expect(clarify?.answers).toEqual({});
   });
 
+  it("parses header and descriptions aligned to the choices", () => {
+    serverRequest(
+      "clarify",
+      {
+        question: "Scope?",
+        questions: [
+          {
+            choices: ["A", "B", "C"],
+            descriptions: ["descA", 7],
+            header: "  Scope  ",
+            multi_select: true,
+            qid: "q1",
+            question: "Scope?",
+          },
+          {
+            choices: ["X"],
+            descriptions: ["descX", "extra"],
+            qid: "q2",
+            question: "Pick?",
+          },
+          {
+            choices: null,
+            descriptions: ["orphan"],
+            qid: "q3",
+            question: "Free?",
+          },
+        ],
+      },
+      "req-meta",
+    );
+
+    const [q1, q2, q3] = getOverlayState().clarify?.questions ?? [];
+    expect(q1).toEqual({
+      choices: ["A", "B", "C"],
+      descriptions: ["descA", "", ""],
+      header: "Scope",
+      multiSelect: true,
+      qid: "q1",
+      question: "Scope?",
+    });
+    expect(q2?.descriptions).toEqual(["descX"]);
+    expect(q2?.header).toBeUndefined();
+    expect(q2?.multiSelect).toBe(false);
+    expect(q3?.choices).toBeNull();
+    expect(q3?.descriptions).toBeUndefined();
+  });
+
   it("seeds locked answers from a reconnect-replayed batch clarify request", () => {
     serverRequest(
       "clarify",
@@ -2418,6 +2465,45 @@ describe("createGatewayEventHandler", () => {
     expect(record).toBeDefined();
     expect(record?.text).toContain("alpha");
     expect(record?.text).toContain("Two?");
+    expect(getOverlayState().clarify).toBeNull();
+  });
+
+  it("flushes an abandoned ask_user_question batch on its tool.complete and clears the overlay", () => {
+    const appended: Msg[] = [];
+    const onEvent = createGatewayEventHandler(buildCtx(appended));
+
+    serverRequest(
+      "clarify",
+      {
+        question: "Scope?",
+        questions: [
+          {
+            choices: ["A", "B"],
+            multi_select: true,
+            qid: "q1",
+            question: "Scope?",
+          },
+          { choices: null, qid: "q2", question: "Branch?" },
+        ],
+      },
+      "req-auq-timeout",
+    );
+    expect(getOverlayState().clarify?.requestId).toBe("req-auq-timeout");
+
+    // The backend timed out: the tool completes with the overlay still live.
+    onEvent({
+      payload: { name: "ask_user_question", tool_id: "auq-1" },
+      type: "tool.complete",
+    } as any);
+
+    const records = appended.filter(
+      (msg) =>
+        msg.role === "system" && msg.text.startsWith("ask (2 questions)"),
+    );
+    expect(records).toHaveLength(1);
+    expect(records[0]?.text).toContain("· Scope? (no answer)");
+    expect(records[0]?.text).toContain("· Branch? (no answer)");
+    expect(records[0]?.text).toContain("(timed out)");
     expect(getOverlayState().clarify).toBeNull();
   });
 
