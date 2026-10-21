@@ -249,7 +249,7 @@ def _known_tools() -> frozenset[str]:
     """Every tool name the base prompt can mention: the registry's, plus the ones a loop registers on top of it."""
     from k3code.tools import build_registry
 
-    return frozenset(build_registry().names()) | {"skill", "task", "task_result", "advisor"}
+    return frozenset(build_registry().names()) | {"skill", "task", "task_result", "advisor", "ask_user_question"}
 
 
 def split_tool_use(base: str) -> tuple[str, str]:

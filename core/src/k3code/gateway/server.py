@@ -44,7 +44,7 @@ from typing import Any
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import confio, mcpjson, userhooks, wakewords
+from k3code import ask_user, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -353,6 +353,11 @@ class LiveSession:
             self.prompt_frozen.clear()
         for slot in slots:
             self.prompt_frozen.pop(slot, None)
+
+    @property
+    def unattended(self) -> bool:
+        """A run nobody watches (background, cron/loop/automation task, goal continuation): it asks nobody anything."""
+        return bool(self.background or self.task_kind or self.goal_continuation)
 
     @property
     def turn_in_flight(self) -> bool:
@@ -1941,7 +1946,7 @@ class GatewayServer:
         ``auto_continue_max_turns`` judged turns. A plain question gets no goal; a prompt the scope gate rates trivial
         ends after its first turn (see ``_run_turn_locked``).
         """
-        if session.background or session.task_kind or session.goal_continuation:
+        if session.unattended:
             return
         state = mgr.state
         if state is not None and not state.implicit and state.status in ("active", "paused"):
@@ -2180,6 +2185,7 @@ class GatewayServer:
         loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
+        ask_user.register(loop.tools, self, session)  # always: whether anyone can answer is decided per call
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         loop.tool_error_stop_message = not escalates
         decision = decision_settings(self.config)
