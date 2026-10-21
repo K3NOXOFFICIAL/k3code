@@ -8,6 +8,7 @@ import { useAgentRoster } from "../app/agentRoster.js";
 import { $uiState } from "../app/uiStore.js";
 import { relativeSessionAge } from "../components/activeSessionSwitcher.js";
 import { listRowStyle } from "../components/overlayPrimitives.js";
+import { INLINE_MODE } from "../config/env.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { fmtDuration } from "../lib/subagentTree.js";
@@ -35,10 +36,10 @@ import {
 
 /** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
 export const AGENT_VIEW_HINT =
-  "↑↓ select · ⏎/→ open · c collapse · x stop · tab/type compose · ←/esc back";
+  "↑↓ move · ⏎/→ open · space/c collapse · x stop · tab/type compose · ←/esc back";
 /** The list hint on a pane too narrow for the full one. */
 export const AGENT_VIEW_HINT_SHORT =
-  "↑↓ ⏎ open · c collapse · x stop · tab compose · esc back";
+  "↑↓ ⏎ open · space/c collapse · x stop · tab compose · esc back";
 /** Shown while the bottom composer owns the keyboard: the view opens this way. */
 export const AGENT_VIEW_INPUT_HINT =
   "⏎ start (empty: open) · ↑ list · esc clear/back";
@@ -73,6 +74,12 @@ export interface AgentViewViewProps {
   onNewSessionSubmit: (text: string) => void;
   /** A click on a group header collapses or expands it. */
   onToggleGroup?: (group: ViewGroup) => void;
+  /**
+   * The list area takes all of `height`, which pushes the composer and the hint to the bottom of the screen. Off in
+   * inline (primary-buffer) mode: a frame as tall as the terminal scrolls a row away there, so the view keeps its own
+   * height.
+   */
+  pin?: boolean;
   rows: readonly ViewRow[];
   t: Theme;
 }
@@ -88,6 +95,7 @@ export function AgentViewView({
   onNewSessionTextChange = () => {},
   onNewSessionSubmit = () => {},
   onToggleGroup = () => {},
+  pin = true,
   rows,
   t,
 }: AgentViewViewProps) {
@@ -186,7 +194,6 @@ export function AgentViewView({
     const isCollapsed = nav.collapsedGroups.includes(group);
     const count = rows.filter((r) => r.group === group).length;
     const arrow = isCollapsed ? "▸ " : "▾ ";
-    // Only a collapsed header takes the selection; it stands for its hidden rows.
     const style = listRowStyle(t, header === group);
 
     return (
@@ -237,60 +244,74 @@ export function AgentViewView({
 
   return (
     <Box flexDirection="column" width={cols}>
-      <Text wrap="truncate-end">
-        <Text bold color={t.color.accent}>
-          Agents
+      <Box flexDirection="column" flexShrink={0}>
+        <Text wrap="truncate-end">
+          <Text bold color={t.color.accent}>
+            Agents
+          </Text>
+          {counts ? <Text color={t.color.muted}>{`  ${counts}`}</Text> : null}
+          {loading ? <Text color={t.color.muted}> · loading…</Text> : null}
         </Text>
-        {counts ? <Text color={t.color.muted}>{`  ${counts}`}</Text> : null}
-        {loading ? <Text color={t.color.muted}> · loading…</Text> : null}
-      </Text>
-      {error ? (
-        <Text color={t.color.error} wrap="truncate-end">
-          {error}
-        </Text>
-      ) : null}
-      {compact ? null : <Text> </Text>}
-      {!rows.length ? (
+        {error ? (
+          <Text color={t.color.error} wrap="truncate-end">
+            {error}
+          </Text>
+        ) : null}
+        {compact ? null : <Text> </Text>}
+      </Box>
+      {/* The list area always takes its full `height`, however few rows there are: that pushes the composer and the hint
+          to the bottom rows of the terminal. It is also the only part that gives way, clipped, when the terminal turns
+          out shorter than `height` assumed (a resize not yet re-rendered): the composer is never squeezed out. */}
+      <Box
+        flexDirection="column"
+        flexShrink={1}
+        height={pin ? height : undefined}
+        minHeight={0}
+        overflow="hidden"
+      >
+        {!rows.length ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {loading
+              ? "Loading sessions…"
+              : "No sessions yet - type a prompt below to start one"}
+          </Text>
+        ) : (
+          <>
+            {above > 0 ? (
+              <Text color={t.color.muted} wrap="truncate-end">
+                {"  ↑ "}
+                {above}
+                {" more"}
+              </Text>
+            ) : null}
+            {lines
+              .slice(win.start, win.end)
+              .map((l) =>
+                l.type === "header"
+                  ? renderHeader(l.group)
+                  : renderRow(l.row, l.index),
+              )}
+            {below > 0 ? (
+              <Text color={t.color.muted} wrap="truncate-end">
+                {"  ↓ "}
+                {below}
+                {" more"}
+              </Text>
+            ) : null}
+          </>
+        )}
+      </Box>
+      <Box flexDirection="column" flexShrink={0}>
+        {compact ? null : <Text> </Text>}
+        {renderNewPrompt()}
         <Text color={t.color.muted} wrap="truncate-end">
-          {loading
-            ? "Loading sessions…"
-            : "No sessions yet - type a prompt below to start one"}
+          {nav.focus === "input"
+            ? AGENT_VIEW_INPUT_HINT
+            : cols >= AGENT_VIEW_HINT.length
+              ? AGENT_VIEW_HINT
+              : AGENT_VIEW_HINT_SHORT}
         </Text>
-      ) : (
-        <Box flexDirection="column">
-          {above > 0 ? (
-            <Text color={t.color.muted} wrap="truncate-end">
-              {"  ↑ "}
-              {above}
-              {" more"}
-            </Text>
-          ) : null}
-          {lines
-            .slice(win.start, win.end)
-            .map((l) =>
-              l.type === "header"
-                ? renderHeader(l.group)
-                : renderRow(l.row, l.index),
-            )}
-          {below > 0 ? (
-            <Text color={t.color.muted} wrap="truncate-end">
-              {"  ↓ "}
-              {below}
-              {" more"}
-            </Text>
-          ) : null}
-        </Box>
-      )}
-      {compact ? null : <Text> </Text>}
-      {renderNewPrompt()}
-      {compact ? null : <Text> </Text>}
-      <Text color={t.color.muted} wrap="truncate-end">
-        {nav.focus === "input"
-          ? AGENT_VIEW_INPUT_HINT
-          : cols >= AGENT_VIEW_HINT.length
-            ? AGENT_VIEW_HINT
-            : AGENT_VIEW_HINT_SHORT}
-      </Text>
+      </Box>
     </Box>
   );
 }
@@ -304,6 +325,8 @@ export interface AgentViewPaneProps {
   /** A plain prompt typed in the composer: starts a session for it; the view stays open. */
   onNewPrompt: (text: string) => void;
   onStop: (row: ViewRow) => void;
+  /** Inline (primary-buffer) rendering: the view is not pinned to the bottom and stays a row short of the terminal. */
+  inline?: boolean;
 }
 
 /** Connected full-screen agent view: live sessions and sub-agents plus this project's earlier sessions. */
@@ -314,6 +337,7 @@ export function AgentViewPane({
   onNewPrompt,
   onCommand,
   onStop,
+  inline = INLINE_MODE,
 }: AgentViewPaneProps) {
   const { stdout } = useStdout();
   const { info, sid, theme } = useStore($uiState);
@@ -334,14 +358,53 @@ export function AgentViewPane({
   // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
   const currentCwd = info?.cwd;
 
+  // The composer and hint sit on the terminal's last rows only while `termRows` is the real height: a resize re-renders.
+  const [, setResizes] = useState(0);
+
+  useEffect(() => {
+    if (!stdout) {
+      return;
+    }
+
+    const onResize = () => setResizes((n) => n + 1);
+
+    stdout.on("resize", onResize);
+
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
+
+  // The list has no text cursor, and the renderer parks the real one on the first cell of the last row, which is the
+  // hint's first glyph: hide it while the list has the keyboard. The composer hides or places it itself when it has it.
+  const listFocus = navState.focus === "list";
+
+  useEffect(() => {
+    if (!listFocus || !stdout?.isTTY) {
+      return;
+    }
+
+    stdout.write("\x1b[?25l");
+
+    return () => {
+      stdout.write("\x1b[?25h");
+    };
+  }, [listFocus, stdout]);
+
   const termRows = stdout?.rows ?? 24;
   // The real width, however narrow: a wider layout would wrap every line.
   const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
   // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
   const compact = termRows < 8;
-  // header, composer, spacer, spacer, hint (+ the error line); compact: header, composer and hint only.
+  // header, spacer, spacer, composer, hint (+ the error line); compact: header, composer and hint only. With the list
+  // area at exactly `height` the frame is exactly `termRows` tall, so the composer and hint sit on the last two rows.
   // The composer shrinks the list, not the other way: a session started from here needs somewhere to type.
-  const height = Math.max(1, termRows - (compact ? 3 : 5) - (error ? 1 : 0));
+  // Inline there is no alternate screen to fill: the frame stays one row short of the terminal (a full-height frame
+  // scrolls one row into scrollback) and is not pinned.
+  const height = Math.max(
+    1,
+    termRows - (compact ? 3 : 5) - (error ? 1 : 0) - (inline ? 1 : 0),
+  );
 
   const pageSize = Math.max(1, height - 2);
 
@@ -398,8 +461,20 @@ export function AgentViewPane({
       }),
     [currentCwd, now, past, sessions, sid, subagents],
   );
+  // A header whose group has lost all its rows holds nothing, and must not take the selection back when the group
+  // returns (a ⏎ meant for the highlighted row would fold the group): it is dropped from the state too, not just here.
+  const staleHeader =
+    navState.header !== null && selectedHeader(navState, rows) === null;
+
+  useEffect(() => {
+    if (staleHeader) {
+      setNav((prev) => ({ ...prev, header: null }));
+    }
+  }, [staleHeader]);
+
   const nav: ViewNav = {
     ...navState,
+    header: staleHeader ? null : navState.header,
     index: selectedIndex(
       rows,
       selKey ?? rows.find((r) => r.current)?.key ?? null,
@@ -454,6 +529,11 @@ export function AgentViewPane({
         { return: true },
         pageSize,
       );
+
+      // ⏎ on a category header folds it on the list; here it has nothing to open, so it does nothing.
+      if (!r.effect) {
+        return;
+      }
 
       return apply({ ...r, nav: { ...r.nav, focus: "input" } });
     }
@@ -520,6 +600,7 @@ export function AgentViewPane({
         setNav(next);
         setSelKey(rows[next.index]?.key ?? null);
       }}
+      pin={!inline}
       rows={rows}
       t={theme}
     />
