@@ -16,6 +16,7 @@ import type { ActiveWidget } from "../sdk/types.js";
 import type { Theme } from "../theme.js";
 import type {
   ApprovalReq,
+  ClarifyBatchResult,
   ClarifyReq,
   ConfirmReq,
   DetailsMode,
@@ -437,7 +438,7 @@ export interface SlashHandlerContext {
 export interface AppLayoutActions {
   answerApproval: (choice: string) => void;
   answerClarify: (answer: string) => void;
-  answerClarifyQuestion: (qid: string, answer: string) => void;
+  answerClarifyBatch: (result: ClarifyBatchResult | null) => void;
   answerSecret: (value: string) => void;
   answerSudo: (pw: string) => void;
   clearSelection: () => void;
@@ -526,7 +527,8 @@ export interface AppOverlaysProps {
   completions: CompletionItem[];
   onApprovalChoice: (choice: string) => void;
   onClarifyAnswer: (value: string) => void;
-  onClarifyQuestionAnswer: (qid: string, value: string) => void;
+  /** Batch clarify (`questions[]`): submit the whole set in one frame; null = cancel. */
+  onClarifyBatch: (result: ClarifyBatchResult | null) => void;
   onActiveSessionSelect: (sessionId: string) => void;
   onActiveSessionClose: (
     sessionId: string,

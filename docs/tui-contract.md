@@ -240,7 +240,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 
 | Request | Params | Result | TUI Handles | Classification |
 |---------|--------|--------|-------------|----------------|
-| `clarify` | `{question, choices?, multi_select?, questions?, answers?}` | `{answer?, answers?}` | ✅ | M1-core |
+| `clarify` | `{question, choices?, multi_select?, questions?: [{qid, question, header?, choices?, descriptions?, multi_select?}], answers?}` | `{answer?, answers?, chat?}` (batch: one `{answers}` frame on Submit, multi-select values a JSON array string; `chat: true` = "Chat about this"; `{answer: ""}` = cancel) | ✅ | M1-core |
 | `approval` | `{request_id, command, description, preview?, choices[], allow_permanent?, allow_session?, smart_denied?, tool_name?, session_id_hint?, ...}` | `{choice, all?}` | ✅ | M1-core |
 | `sudo` | `{command}` | `{value}` | | M1-core |
 | `secret` | `{env_var, prompt, metadata?}` | `{value}` | | M1-core |

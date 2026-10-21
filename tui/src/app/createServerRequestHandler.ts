@@ -75,12 +75,26 @@ export function createServerRequestHandler(
               : {},
           )
           .filter((q) => str(q.qid) && str(q.question).trim())
-          .map((q) => ({
-            choices: strList(q.choices),
-            multiSelect: q.multi_select === true,
-            qid: str(q.qid),
-            question: str(q.question).trim(),
-          }));
+          .map((q) => {
+            const choices = strList(q.choices);
+            const header = str(q.header).trim();
+            // Parallel to choices: element-wise ("" for a missing or non-string
+            // entry), padded/truncated to the choice count so indices line up.
+            const rawDescriptions = Array.isArray(q.descriptions)
+              ? (q.descriptions as unknown[])
+              : [];
+
+            return {
+              choices,
+              ...(choices && {
+                descriptions: choices.map((_, i) => str(rawDescriptions[i])),
+              }),
+              ...(header && { header }),
+              multiSelect: q.multi_select === true,
+              qid: str(q.qid),
+              question: str(q.question).trim(),
+            };
+          });
 
         const answers =
           p.answers && typeof p.answers === "object"

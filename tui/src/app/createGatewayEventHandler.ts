@@ -53,6 +53,7 @@ import {
 } from "../theme.js";
 import type { Msg, SessionInfo, SubagentProgress } from "../types.js";
 
+import { CLARIFY_TOOL_NAMES } from "./clarifyBatch.js";
 import {
   applyDelegationStatus,
   getDelegationState,
@@ -1320,7 +1321,7 @@ export function createGatewayEventHandler(
 
         return;
       case "tool.complete": {
-        // The clarify tool finishing with its overlay still live means it was
+        // A clarify tool (`clarify` / `ask_user_question`) finishing with its overlay still live means it was
         // abandoned (backend _block timed out, empty answer). A real answer
         // clears the overlay in answerClarify() before this fires, so this
         // no-ops there. Persist the question + options so they don't vanish.
@@ -1328,7 +1329,7 @@ export function createGatewayEventHandler(
           return;
         }
 
-        if (ev.payload.name === "clarify") {
+        if (CLARIFY_TOOL_NAMES.includes(ev.payload.name)) {
           flushAbandonedClarify();
         }
 
