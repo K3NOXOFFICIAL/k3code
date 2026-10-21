@@ -3771,8 +3771,9 @@ def _session_ids(params: dict[str, Any]) -> list[str]:
 
 
 async def _session_archive(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """Archive stored sessions (``archived`` false: restore them). A live session is not archived: it is in use.
-    Neither direction touches ``updated_at``; ``archived`` counts the rows that changed."""
+    """Archive stored sessions (``archived`` false: restore them). A live session is skipped either way: it is in
+    use (attaching to it already took it out of the archive). Neither direction touches ``updated_at``;
+    ``archived`` counts the rows that changed."""
     ids = _session_ids(params)
     archive = params.get("archived", True)
     if not isinstance(archive, bool):
@@ -3783,7 +3784,7 @@ async def _session_archive(server: GatewayServer, params: dict[str, Any]) -> dic
     for sid in ids:
         if sid not in known:
             skipped.append({"id": sid, "reason": "unknown"})
-        elif archive and sid in server.live:
+        elif sid in server.live:
             skipped.append({"id": sid, "reason": "live"})
         else:
             todo.append(sid)

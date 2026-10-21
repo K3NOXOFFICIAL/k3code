@@ -129,8 +129,8 @@ async def test_session_archive_skips_live_and_unknown_ids_and_restores(tmp_path,
     assert archived_at is not None
     assert (await m1.rpc(server, "session.list", {"cwd": str(tmp_path)}))["result"]["sessions"] == []
 
-    res = (await m1.rpc(server, "session.archive", {"session_ids": [idle], "archived": False}))["result"]
-    assert res == {"archived": 1, "skipped": []}
+    res = (await m1.rpc(server, "session.archive", {"session_ids": [idle, live], "archived": False}))["result"]
+    assert res == {"archived": 1, "skipped": [{"id": live, "reason": "live"}]}
     restored = (await m1.rpc(server, "session.list", {"cwd": str(tmp_path)}))["result"]["sessions"]
     assert [r["id"] for r in restored] == [idle]
     bad = await m1.rpc(server, "session.archive", {"session_ids": idle})
