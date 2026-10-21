@@ -553,7 +553,7 @@ describe("archive and restore", () => {
     });
   });
 
-  it("a and u do nothing on rows they do not apply to, on a header, or with a stop pending", () => {
+  it("a and u are plain typing on rows they do not apply to and on a header; a pending stop eats them", () => {
     const onHeader: ViewNav = { ...at(4), header: "archived" };
 
     for (const [nav, ch] of [
@@ -567,8 +567,9 @@ describe("archive and restore", () => {
     ] as const) {
       const r = press(nav, { ch }, A);
 
+      // Typed into the composer like any other letter: nothing is archived and the letter is not lost.
       expect(r.effect).toBeNull();
-      expect(r.nav).toEqual(nav);
+      expect(r.nav).toEqual({ ...nav, draft: ch, focus: "input" });
     }
 
     const agentRows = [vrow("a1", { key: "agent:a1", kind: "agent" })];
@@ -586,15 +587,28 @@ describe("archive and restore", () => {
     }
   });
 
-  it("a and u are list commands: they are not typed into the composer", () => {
-    for (const ch of ["a", "u"]) {
-      for (const index of [1, 2, 4]) {
-        const r = press(open(index), { ch }, A);
+  it("a and u are list commands where they apply: they are not typed into the composer", () => {
+    for (const [nav, ch] of [
+      [open(2), "a"],
+      [open(3), "a"],
+      [open(4), "u"],
+      [open(5), "u"],
+    ] as const) {
+      const r = press(nav, { ch }, A);
 
-        expect(r.nav.focus).toBe("list");
-        expect(r.nav.draft).toBe("");
-      }
+      expect(r.nav.focus).toBe("list");
+      expect(r.nav.draft).toBe("");
     }
+  });
+
+  it("starting a prompt with a or u on a row they do not archive or restore keeps the letter", () => {
+    // "add tests" typed on a live session, and "use" on an earlier one: the first letter reaches the composer.
+    const a = press(open(1), { ch: "a" }, A);
+    const u = press(open(2), { ch: "u" }, A);
+
+    expect([a.effect, u.effect]).toEqual([null, null]);
+    expect([a.nav.draft, u.nav.draft]).toEqual(["a", "u"]);
+    expect([a.nav.focus, u.nav.focus]).toEqual(["input", "input"]);
   });
 });
 

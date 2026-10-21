@@ -299,8 +299,11 @@ export const isStoppable = (row: ViewRow) =>
 export const isArchivable = (row: ViewRow) =>
   row.kind === "past" && row.group !== "archived";
 
-/** Letters the list acts on while it has the keyboard: a archive, c collapse, n new (compose), u restore, x stop. */
-const LIST_HOTKEYS = ["a", "c", "n", "u", "x"];
+/**
+ * Letters the list always acts on while it has the keyboard: c collapse, n new (compose), x stop. a (archive) and u
+ * (restore) act only on a row they apply to, so `reduceViewKey` decides those per selection.
+ */
+const LIST_HOTKEYS = ["c", "n", "x"];
 
 /**
  * Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. `suggesting`: the archive
@@ -377,10 +380,28 @@ export function reduceViewKey(
     return done(null, { focus: "input" });
   }
 
+  // Navs built before groups could collapse (older callers, tests) may carry no list.
+  const collapsed: readonly ViewGroup[] = nav.collapsedGroups ?? [];
+  // A selected row its group's collapse has hidden stands on that group's header.
+  const header =
+    selectedHeader(nav, rows) ??
+    (rows[index] && collapsed.includes(rows[index].group)
+      ? rows[index].group
+      : null);
+  const selected = header ? undefined : rows[index];
+  // a and u are list commands only where they apply (an earlier session; an archived one). Anywhere else they are
+  // plain typing, like every letter that is not a list command, so starting a prompt with one loses nothing.
+  const isListHotkey = (c: string) =>
+    c === "a"
+      ? !!selected && isArchivable(selected)
+      : c === "u"
+        ? selected?.group === "archived"
+        : LIST_HOTKEYS.includes(c);
+
   // Any other typed text is meant for the composer: it takes the keyboard and the text, so no letter is lost.
   if (
     ch &&
-    !LIST_HOTKEYS.includes(ch) &&
+    !isListHotkey(ch) &&
     !key.return &&
     stripControl(key.ch ?? "") === key.ch
   ) {
@@ -392,13 +413,7 @@ export function reduceViewKey(
   }
 
   const step = Math.max(1, pageSize);
-  // Navs built before groups could collapse (older callers, tests) may carry no list.
-  const collapsed: readonly ViewGroup[] = nav.collapsedGroups ?? [];
   const items = navItems(rows, collapsed);
-  // A selected row its group's collapse has hidden stands on that group's header.
-  const header =
-    selectedHeader(nav, rows) ??
-    (collapsed.includes(rows[index]!.group) ? rows[index]!.group : null);
   const at = Math.max(
     0,
     items.findIndex((it) =>
