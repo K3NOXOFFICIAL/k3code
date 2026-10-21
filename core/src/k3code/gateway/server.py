@@ -44,7 +44,7 @@ from typing import Any
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import confio, mcpjson, userhooks, wakewords
+from k3code import ask_user, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -2180,6 +2180,7 @@ class GatewayServer:
         loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
+        ask_user.register(loop.tools, self, session)  # always: whether anyone can answer is decided per call
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         loop.tool_error_stop_message = not escalates
         decision = decision_settings(self.config)
