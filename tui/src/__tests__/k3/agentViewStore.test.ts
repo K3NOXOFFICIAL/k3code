@@ -375,6 +375,19 @@ describe("buildViewRows", () => {
       ["a1", 900],
     ]);
   });
+
+  it("orders past rows by last activity, so the ages they show run newest to oldest", () => {
+    // p1 was created last but p2 was used last.
+    const rows = build({
+      past: [
+        { ...past("p1", 300), updated_at: 310 },
+        { ...past("p2", 100), updated_at: 900 },
+        past("p3", 500),
+      ],
+    });
+
+    expect(rows.map((r) => r.id)).toEqual(["p2", "p3", "p1"]);
+  });
 });
 
 const vrow = (id: string, over: Partial<ViewRow> = {}): ViewRow => ({

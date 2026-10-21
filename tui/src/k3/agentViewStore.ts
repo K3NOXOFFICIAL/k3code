@@ -111,8 +111,11 @@ export function buildViewRows({
       .filter((h) => h.message_count !== 0)
       .filter((h) => !!h.cwd && h.cwd === currentCwd)
       .map((h, i) => ({ h, i }))
+      // Newest by last use, the order the rows' ages read in (a session resumed today is not filed under its creation).
       .sort(
-        (a, b) => (b.h.started_at ?? 0) - (a.h.started_at ?? 0) || a.i - b.i,
+        (a, b) =>
+          (b.h.updated_at ?? b.h.started_at ?? 0) -
+            (a.h.updated_at ?? a.h.started_at ?? 0) || a.i - b.i,
       )
       .map(({ h }) => ({
         activity: h.preview?.trim() ?? "",
