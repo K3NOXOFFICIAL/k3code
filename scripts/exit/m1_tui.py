@@ -95,7 +95,8 @@ def wait_cs(t: Tui, pattern: str, timeout: float = 10) -> bool:
     return False
 
 
-VIEW_FOOTER = r"⏎/→ open"
+# The agent view's footer in either focus state: the composer's ("↑ list", how the view opens) or the list's.
+VIEW_FOOTER = r"↑ list|⏎/→ open"
 VIEW_GROUP = r"\b(Needs input|Working|Completed)\b"
 STRIP_MARKER = r"›\s*[◐●✓✗○]"
 STRIP_ROW = r"^\s*[◐●✓✗○] {}.* · (working|needs input|idle|completed|failed)\b"  # a strip row by title
@@ -404,7 +405,10 @@ def needs_input() -> str:
         )
         t.key("left")
         need(wait_cs(t, r"Needs input", 10), "agent view did not show the Needs input group\n" + tail_screen(t))
-        # The view opens on the current session's row (in Completed); Home selects the first row, the waiting session.
+        # The view opens with the composer focused on the current session's row (in Completed); ↑ hands the keyboard
+        # to the list and Home selects the first row, the waiting session.
+        t.key("up")
+        t.pump(0.5)
         t.key("home")
         t.pump(0.5)
         t.key("right")
@@ -457,11 +461,16 @@ def agent_view_keys() -> str:
         need(not re.search(STRIP_MARKER, t.text()), "↓ put a selection marker in the strip\n" + tail_screen(t))
 
         t.key("left")
-        need(wait_cs(t, VIEW_FOOTER, 10), "agent view footer '⏎/→ open' not shown\n" + tail_screen(t))
+        need(wait_cs(t, r"↑ list", 10), "agent view composer footer '↑ list' not shown\n" + tail_screen(t))
         need(wait_cs(t, VIEW_GROUP, 5), "no Needs input/Working/Completed group header\n" + tail_screen(t))
         groups = sorted(set(re.findall(VIEW_GROUP, t.text())))
         start = marker_line(t)
         need(start and "run slowjob" not in start, "view did not open on the current session's row\n" + t.text())
+
+        # The view opens with the composer focused; ↑ hands the keyboard to the list, the selection where it was.
+        t.key("up")
+        need(wait_cs(t, r"⏎/→ open", 5), "↑ did not hand the keyboard to the list\n" + tail_screen(t))
+        need(marker_line(t) == start, "↑ from the composer moved the selection\n" + t.text())
 
         # Working sits above Completed, so ↑ from the current row selects the bg session and ↓ goes back.
         t.key("up")

@@ -81,7 +81,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary, summarize_messages
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, TurnEvidence, make_judge, turn_evidence
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning import optimizer
@@ -559,6 +559,15 @@ _TOOL_GROUPS = {
 
 def _first_model_id(spec: str | list[str]) -> str:
     return (spec[0] if spec else "") if isinstance(spec, list) else spec
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: str, limit: int) -> str:
+    """``text`` on one line for a list row: control characters (an escape sequence pasted into a prompt) and runs of
+    whitespace become one space, cut at ``limit``."""
+    return " ".join(_CONTROL_CHARS.sub(" ", text).split())[:limit]
 
 
 def _model_label(config: Any, key: str, provider: str = "") -> str:
@@ -1259,14 +1268,17 @@ class GatewayServer:
     def _active_rows(self, current: str | None) -> list[dict[str, Any]]:
         rows = []
         for s in sorted(self.live.values(), key=lambda x: x.stored.updated_at, reverse=True):
+            # a session without a generated title is called by the start of its first prompt, not "Session" for all
+            first_prompt = _one_line(summarize_messages(s.stored.messages)[1], 120)
             rows.append(
                 {
                     "current": s.session_id == current,
                     "id": s.session_id,
                     "last_active": s.stored.updated_at,
                     "message_count": len(s.stored.messages),
-                    "model": s.stored.model,
-                    "preview": (s.stored.title or "")[:120],
+                    # the model id the user recognises (as session.info shows it), not the config key "default"
+                    "model": _model_label(self.config, s.stored.model or self.config.default_model, s.stored.provider),
+                    "preview": (s.stored.title or first_prompt)[:120],
                     "session_key": s.session_id,
                     "started_at": s.stored.created_at,  # when the stored session was created: age and sorting only
                     # Elapsed time of the turn in flight (also while paused or waiting on an approval); None between
@@ -1278,7 +1290,7 @@ class GatewayServer:
                     "offline_protection": not s.offline_protection_error,
                     "background": s.background,
                     "origin": s.stored.meta.get("origin", ""),
-                    "title": s.stored.title or "Session",
+                    "title": s.stored.title or first_prompt[:80] or "Session",
                 }
             )
         for h in self.subagents.handles.values():  # sub-agent / fan-out children share the strip

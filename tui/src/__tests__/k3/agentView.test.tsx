@@ -120,7 +120,7 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · ⏎/→ open · c collapse · x stop · tab compose · ←/esc back",
+      "↑↓ select · ⏎/→ open · c collapse · x stop · tab/type compose · ←/esc back",
     );
     // a permanent composer row sits between the list and the hint; while the
     // list has focus the composer only shows its placeholder
@@ -181,7 +181,7 @@ describe("AgentViewView", () => {
   it("has an empty state", () => {
     const out = dump([]);
 
-    expect(out).toContain("No sessions yet - press n to start one");
+    expect(out).toContain("No sessions yet - type a prompt below to start one");
     expect(out).toContain(AGENT_VIEW_HINT);
   });
 
@@ -310,7 +310,12 @@ describe("AgentViewPane", () => {
         expect(output).toContain("› ◐ this one (this session)"),
       );
       expect(output).not.toContain("› ● alpha");
-      expect(output).toContain(AGENT_VIEW_HINT);
+      // The composer has the keyboard on open; ↑ hands it to the list without moving the selection.
+      expect(output).toContain(AGENT_VIEW_INPUT_HINT);
+      output = "";
+      stdin.write("\x1b[A");
+      await waitFor(() => expect(output).toContain(AGENT_VIEW_HINT));
+      expect(output).toContain("› ◐ this one (this session)");
 
       stdin.write("\x1b[C"); // → on this session
       await waitFor(() => expect(onClose).toHaveBeenCalled());
@@ -379,6 +384,8 @@ describe("AgentViewPane", () => {
 
     try {
       await waitFor(() => expect(output).toContain("› ◐ alpha"));
+      stdin.write("\x1b[A"); // the list takes the keyboard from the composer
+      await waitFor(() => expect(output).toContain(AGENT_VIEW_HINT));
       output = "";
       stdin.write("\x1b[B"); // ↓ onto bravo
       await waitFor(() => expect(output).toContain("› ◐ bravo"));
@@ -468,7 +475,7 @@ describe("AgentViewPane", () => {
 
       // A positive marker: the list and the footer are painted (the loading text never shows at this width).
       await waitFor(() => {
-        expect(lastFrame()).toContain("↑↓ select");
+        expect(lastFrame()).toContain("⏎ start");
         expect(lastFrame()).toContain("bravo");
       });
 
@@ -484,7 +491,7 @@ describe("AgentViewPane", () => {
       expect(lines[3]).toContain("(this session)");
       expect(out).not.toMatch(/more/);
       expect(lines.at(-2)).toContain("❯");
-      expect(lines.at(-1)).toContain("↑↓ select");
+      expect(lines.at(-1)).toContain("⏎ start");
 
       for (const line of lines) {
         expect(line.length).toBeLessThanOrEqual(29);
@@ -559,11 +566,22 @@ describe("AgentViewPane", () => {
     );
     try {
       await waitFor(() => expect(output).toContain("› ◐ alpha"));
+      // The chords are list keys: the list takes the keyboard from the composer first.
+      stdin.write("\x1b[A");
+      await waitFor(() => expect(output).toContain(AGENT_VIEW_HINT));
 
       stdin.write("\x0e"); // Ctrl+N
       stdin.write("\x1bn"); // Alt+N
       stdin.write("\x18"); // Ctrl+X
+      // With no stop armed, y is plain text: it goes to the composer (Esc clears it, ↑ is the list again).
+      fresh = "";
       stdin.write("y");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_INPUT_HINT));
+      stdin.write("\x1b");
+      await new Promise((r) => setTimeout(r, 100));
+      fresh = "";
+      stdin.write("\x1b[A");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_HINT));
 
       // Sentinel: ↓ then ↑, each waited for on output captured after it was sent.
       fresh = "";
@@ -660,7 +678,7 @@ describe("AgentViewPane", () => {
 
     try {
       await waitFor(() => expect(fresh).toContain("◐ alpha"));
-      stdin.write("\t");
+      // The composer has the keyboard as soon as the view opens.
       await waitFor(() => expect(fresh).toContain(AGENT_VIEW_INPUT_HINT));
       await new Promise((r) => setTimeout(r, 30));
 
@@ -683,6 +701,95 @@ describe("AgentViewPane", () => {
 
       stdin.write("\x1b");
       await waitFor(() => expect(onClose).toHaveBeenCalled());
+    } finally {
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
+  it("focus: the composer types on open, ⏎ on it empty opens the row, ↑ reaches the list, typing comes back", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { id: "a", status: "working", title: "alpha" },
+      { id: "b", status: "working", title: "bravo" },
+    ]);
+
+    const onActivate = vi.fn();
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    let fresh = "";
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+
+    stdout.on("data", (c) => {
+      fresh += stripAnsi(c.toString());
+    });
+
+    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const composer = () => fresh.split("❯").at(-1) ?? "";
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={onActivate}
+        onClose={() => {}}
+        onNewPrompt={() => {}}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await waitFor(() => expect(fresh).toContain("› ◐ alpha"));
+      expect(fresh).toContain(AGENT_VIEW_INPUT_HINT);
+      await pause(30);
+
+      // ⏎ on the empty composer opens the selected row, as ⏎ on the list does.
+      stdin.write("\r");
+      await waitFor(() => expect(onActivate).toHaveBeenCalled());
+      expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "a" });
+
+      // ↑ hands the keyboard to the list; there c collapses the group onto its header.
+      fresh = "";
+      stdin.write("\x1b[A");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_HINT));
+      stdin.write("c");
+      await waitFor(() => expect(fresh).toContain("▸ Working"));
+
+      // A typed letter goes back to the composer, and there c is just a letter: the group stays collapsed.
+      fresh = "";
+      stdin.write("h");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_INPUT_HINT));
+      await pause(30);
+      stdin.write("c");
+      await waitFor(() => expect(composer()).toContain("hc"));
+      expect(fresh).not.toContain("▾ Working");
+
+      // Tab is the way back to the list, where c expands the group again.
+      fresh = "";
+      stdin.write("\t");
+      await waitFor(() => expect(fresh).toContain(AGENT_VIEW_HINT));
+      stdin.write("c");
+      await waitFor(() => expect(fresh).toContain("▾ Working"));
+      expect(onActivate).toHaveBeenCalledTimes(1);
     } finally {
       view.unmount();
       view.cleanup();

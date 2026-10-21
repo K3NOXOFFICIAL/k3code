@@ -34,7 +34,7 @@ import { AppLayout } from "../components/appLayout.js";
 import { ESC_INTERRUPT_HINT } from "../components/workingLine.js";
 import { DOUBLE_ESC_MS } from "../config/timing.js";
 import type { GatewayClient } from "../gatewayClient.js";
-import { AGENT_VIEW_HINT } from "../k3/agentView.js";
+import { AGENT_VIEW_INPUT_HINT } from "../k3/agentView.js";
 import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { SubagentProgress } from "../types.js";
@@ -603,7 +603,7 @@ describe("AppLayout status-rule visibility", () => {
 
     await flush();
 
-    expect(layout.output()).toContain(AGENT_VIEW_HINT);
+    expect(layout.output()).toContain(AGENT_VIEW_INPUT_HINT);
     // the composer (and the status rule inside it) unmounts with the view up
     expect(layout.output()).not.toContain("~/repo");
     expect(clockTimers(timeoutSpy)).toBe(0);
@@ -652,15 +652,17 @@ describe("AppLayout agent view: leaving the startup session", () => {
       ]);
       await waitFor(() => expect(layout.output()).toContain("busy one"));
 
-      // The view rests on this session's row (s1); s2 (working) is listed above it, so ↑ selects it for ⏎ to attach.
+      // The view rests on this session's row (s1); s2 (working) is listed above it. The first ↑ hands the keyboard
+      // from the composer to the list, the second selects s2 for ⏎ to attach.
       if (key === "\r") {
         layout.press("\x1b[A");
+        await flush();
+        layout.press("\x1b[A");
         await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+        layout.press(key);
       }
 
-      layout.press(key);
-
-      // For "n": it focuses the composer; type the session name and press Enter.
+      // For "n": the composer has the keyboard on open; type the session name and press Enter.
       if (key === "n") {
         await waitFor(() =>
           expect(layout.output()).toContain("start a new session"),
@@ -830,9 +832,8 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     const { layout, request } = mountWithLifecycle("s1");
 
     await waitFor(() =>
-      expect(layout.output()).toContain("No sessions yet - press n"),
+      expect(layout.output()).toContain("No sessions yet - type a prompt"),
     );
-    layout.press("n");
     await waitFor(() =>
       expect(layout.output()).toContain("start a new session"),
     );
@@ -897,9 +898,8 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     const { layout, request, rpc } = mountWithLifecycle(null);
 
     await waitFor(() =>
-      expect(layout.output()).toContain("No sessions yet - press n"),
+      expect(layout.output()).toContain("No sessions yet - type a prompt"),
     );
-    layout.press("n");
     await waitFor(() =>
       expect(layout.output()).toContain("start a new session"),
     );
@@ -1082,7 +1082,9 @@ describe("useInputHandlers: ← opens the agent view from an idle, empty prompt"
     layout.press(LEFT);
 
     await waitFor(() => expect(getOverlayState().agentView).toBe(true));
-    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await waitFor(() =>
+      expect(layout.output()).toContain(AGENT_VIEW_INPUT_HINT),
+    );
   });
 
   it.each<
@@ -1192,7 +1194,9 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
       },
     );
 
-    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await waitFor(() =>
+      expect(layout.output()).toContain(AGENT_VIEW_INPUT_HINT),
+    );
 
     // Date.now is pinned to T0, so both presses sit well inside DOUBLE_ESC_MS.
     layout.press(ESC);
@@ -1513,7 +1517,9 @@ describe("useInputHandlers: a double Esc interrupts a running turn", () => {
       overlay: { agentView: true },
     });
 
-    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await waitFor(() =>
+      expect(layout.output()).toContain(AGENT_VIEW_INPUT_HINT),
+    );
     await escThenSentinel();
     await waitFor(() => expect(getOverlayState().agentView).toBe(false));
     await escThenSentinel();
