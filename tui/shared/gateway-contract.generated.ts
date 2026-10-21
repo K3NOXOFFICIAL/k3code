@@ -4148,11 +4148,14 @@ export interface ClarifyQuestion {
   question: string
   choices?: string[] | null
   multi_select?: boolean
+  header?: string | null
+  descriptions?: string[] | null
 }
-/** Single: ``{answer}`` ('' = skip). Batch: ``{answers}`` for the whole set (early locks go through the ``clarify.lock`` RPC); a response with neither is cancel-all. */
+/** Single: ``{answer}`` ('' = skip). Batch: ``{answers}`` for the whole set in one frame (multi-select answers are a JSON array string); ``chat: true`` = "Chat about this" (answers may be partial); a response with neither is cancel-all. */
 export interface ClarifyResult {
   answer?: string | null
   answers?: Record<string, string> | null
+  chat?: boolean | null
 }
 /** ``tui_gateway/server.py::_approval_request_payload`` — the command is redacted server-side. */
 export interface ApprovalRequestParams {

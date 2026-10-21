@@ -360,6 +360,8 @@ PURE_TOOLS = frozenset(
         "bash_output",
         "bash_kill",
         "advisor",
+        # asks the user (ask_user.py) and changes nothing: a prompt to approve asking a question would be a second one
+        "ask_user_question",
         # reads the web through SearXNG, DuckDuckGo or a connected MCP search tool and changes nothing: no prompt in
         # any mode, plan included (a user/project/session rule still decides, see _builtin_defaults_cached)
         "web_search",

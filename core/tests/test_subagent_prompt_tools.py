@@ -16,7 +16,7 @@ from test_subagents import final, task_call
 
 TYPES = ["explorer", "planner", "reviewer", "worker"]
 #: every tool name that exists somewhere in k3code: the ones a child may be told about only if it has them
-EXTRA_TOOLS = {"skill", "task", "task_result", "advisor", "mcp_tool_search", "mcp__demo__lookup"}
+EXTRA_TOOLS = {"skill", "task", "task_result", "advisor", "ask_user_question", "mcp_tool_search", "mcp__demo__lookup"}
 
 
 def named_tools(text: str) -> set[str]:

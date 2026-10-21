@@ -428,12 +428,6 @@ export interface BackgroundStartResponse {
   task_id?: string;
 }
 
-/** `clarify.lock` — one batch-clarify answer locked; `expired` when the request already ended. */
-export interface ClarifyLockResponse {
-  remaining?: string[];
-  status: "expired" | "ok";
-}
-
 // ── Shell / clipboard / input ────────────────────────────────────────
 
 export interface ShellExecResponse {

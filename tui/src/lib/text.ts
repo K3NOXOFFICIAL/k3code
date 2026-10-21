@@ -10,7 +10,7 @@ import {
   VERBOSE_TRAIL_MAX_LINES,
 } from "../config/limits.js";
 import { VERBS } from "../content/verbs.js";
-import type { ThinkingMode } from "../types.js";
+import type { ClarifyBatchQuestion, ThinkingMode } from "../types.js";
 
 const WS_RE = /\s+/g;
 
@@ -432,6 +432,38 @@ export const estimateRows = (text: string, w: number, compact = false) => {
   return Math.max(1, rows);
 };
 
+/** A multi-select batch-clarify answer on the wire: a JSON array string of labels and/or typed text. */
+export const encodeMultiAnswer = (items: string[]): string =>
+  JSON.stringify(items);
+
+/** Inverse of `encodeMultiAnswer`; anything that is not a JSON list of strings comes back as `[raw]`. */
+export const decodeMultiAnswer = (raw: string): string[] => {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((item) => typeof item === "string")
+    ) {
+      return parsed;
+    }
+  } catch {
+    // not JSON: fall through
+  }
+
+  return [raw];
+};
+
+/**
+ * A batch-clarify answer as the transcript shows it. Decodes ONLY for a
+ * multi-select question: a typed single-select answer may itself look like
+ * `["x"]` and must stay verbatim.
+ */
+export const clarifyAnswerDisplay = (
+  q: Pick<ClarifyBatchQuestion, "multiSelect">,
+  raw: string,
+): string => (q.multiSelect ? decodeMultiAnswer(raw).join(", ") : raw);
+
 /**
  * Render an unanswered clarify prompt (timed out, or cancelled with Esc/Ctrl+C)
  * as a persistent transcript block.  The live `ClarifyPrompt` overlay is torn
@@ -458,12 +490,12 @@ export const formatAbandonedClarify = (
  * timeout server-side, so the record must show what was actually sent).
  */
 export const formatAbandonedClarifyBatch = (
-  questions: { qid: string; question: string }[],
+  questions: Pick<ClarifyBatchQuestion, "multiSelect" | "qid" | "question">[],
   answers: Record<string, string>,
   reason: string,
 ) => {
   const lines = questions.map((q) => {
-    const answer = answers[q.qid];
+    const answer = clarifyAnswerDisplay(q, answers[q.qid] ?? "");
 
     return answer
       ? `  ✓ ${q.question} → ${answer}`

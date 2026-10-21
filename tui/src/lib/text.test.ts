@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  clarifyAnswerDisplay,
   clarifyBatchRevisitState,
+  decodeMultiAnswer,
+  encodeMultiAnswer,
   formatAbandonedClarify,
   formatAbandonedClarifyBatch,
   stripTrailingPasteNewlines,
@@ -85,6 +88,28 @@ describe("formatAbandonedClarifyBatch", () => {
     );
   });
 
+  it("shows a multi-select answer decoded, a single-select one verbatim", () => {
+    const out = formatAbandonedClarifyBatch(
+      [
+        { multiSelect: true, qid: "q0", question: "Many?" },
+        { qid: "q1", question: "One?" },
+        { multiSelect: true, qid: "q2", question: "None?" },
+      ],
+      { q0: '["a","b"]', q1: '["x"]', q2: "[]" },
+      "timed out",
+    );
+
+    expect(out).toBe(
+      [
+        "ask (3 questions)",
+        "  ✓ Many? → a, b",
+        '  ✓ One? → ["x"]',
+        "  · None? (no answer)",
+        "  (timed out)",
+      ].join("\n"),
+    );
+  });
+
   it("treats an empty locked answer as unanswered in the record", () => {
     const out = formatAbandonedClarifyBatch(
       [{ qid: "q0", question: "One?" }],
@@ -93,6 +118,39 @@ describe("formatAbandonedClarifyBatch", () => {
     );
 
     expect(out).toContain("· One? (no answer)");
+  });
+});
+
+describe("multi-select answer encoding", () => {
+  it("round-trips labels and typed text through a JSON array string", () => {
+    const raw = encodeMultiAnswer(["a", "typed, with comma", '"q"']);
+
+    expect(raw).toBe('["a","typed, with comma","\\"q\\""]');
+    expect(decodeMultiAnswer(raw)).toEqual(["a", "typed, with comma", '"q"']);
+  });
+
+  it("decodes anything that is not a JSON list of strings as [raw]", () => {
+    expect(decodeMultiAnswer("plain")).toEqual(["plain"]);
+    expect(decodeMultiAnswer("[1,2]")).toEqual(["[1,2]"]);
+    expect(decodeMultiAnswer('{"a":1}')).toEqual(['{"a":1}']);
+    expect(decodeMultiAnswer("[")).toEqual(["["]);
+  });
+});
+
+describe("clarifyAnswerDisplay", () => {
+  it("joins a multi-select answer's items", () => {
+    expect(clarifyAnswerDisplay({ multiSelect: true }, '["a","b"]')).toBe(
+      "a, b",
+    );
+  });
+
+  it("keeps a typed single-select answer verbatim even when it looks like JSON", () => {
+    expect(clarifyAnswerDisplay({ multiSelect: false }, '["x"]')).toBe('["x"]');
+    expect(clarifyAnswerDisplay({}, '["x"]')).toBe('["x"]');
+  });
+
+  it("shows an empty multi-select answer as empty", () => {
+    expect(clarifyAnswerDisplay({ multiSelect: true }, "[]")).toBe("");
   });
 });
 

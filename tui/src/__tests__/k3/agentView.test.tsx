@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 
-import { renderSync } from "@k3code/ink";
+import { AlternateScreen, renderSync } from "@k3code/ink";
 import React from "react";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it, vi } from "vitest";
@@ -122,8 +122,10 @@ describe("AgentViewView", () => {
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
     expect(out).toContain(
-      "↑↓ select · ⏎/→ open · c collapse · x stop · tab/type compose · ←/esc back",
+      "↑↓ move · ⏎/→ open · space/c collapse · x stop · tab/type compose · ←/esc back",
     );
+    // The pane keeps one column free, so the full hint must fit the 79 a default 80-column terminal leaves.
+    expect(AGENT_VIEW_HINT.length).toBeLessThanOrEqual(79);
     // a permanent composer row sits between the list and the hint; while the
     // list has focus the composer only shows its placeholder
     expect(out).toContain("❯ ");
@@ -264,7 +266,7 @@ describe("AgentViewView", () => {
             l.trim() &&
             !/(↑|↓) \d+ more/.test(l) &&
             !l.includes("❯") &&
-            !l.includes("↑↓ select") &&
+            !l.includes("↑↓ move") &&
             !l.includes("Agents"),
         );
 
@@ -287,6 +289,37 @@ describe("AgentViewView", () => {
     expect(bottom).toContain("↑ 24 more");
     expect(bottom).not.toMatch(/↓ \d+ more/);
     expect(listLines(bottom).length).toBeLessThanOrEqual(height);
+  });
+
+  it("gives the list its whole `height`, so the composer and the hint end the frame however few rows there are", () => {
+    for (const rows of [[row(1)], []]) {
+      const lines = dump(rows, { height: 12 }).split("\n");
+
+      // header, spacer, the 12 list lines, spacer, composer, hint
+      expect(lines).toHaveLength(1 + 1 + 12 + 1 + 1 + 1);
+      expect(lines.at(-2)).toContain("❯");
+      expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
+    }
+  });
+
+  it("keeps its own height when not pinned (inline mode): the footer follows the list", () => {
+    const lines = dump([row(1)], { height: 12, pin: false }).split("\n");
+
+    // header, spacer, Working header, the row, spacer, composer, hint
+    expect(lines).toHaveLength(7);
+    expect(lines.at(-2)).toContain("❯");
+    expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
+  });
+
+  it("highlights nothing as a row while a header holds the selection", () => {
+    const out = dump(
+      [row(1), row(2)],
+      {},
+      { ...IDLE_VIEW_NAV, header: "working", index: 0 },
+    );
+
+    expect(out).toContain("▾ Working");
+    expect(out).not.toMatch(/›/);
   });
 });
 
@@ -383,7 +416,10 @@ describe("AgentViewPane", () => {
       expect(onActivate).not.toHaveBeenCalled();
 
       output = "";
-      stdin.write("\x1b[A"); // ↑ onto alpha
+      stdin.write("\x1b[A"); // ↑ stops on the Working header first (a header is a stop of its own)
+      await new Promise((r) => setTimeout(r, 50));
+      expect(output).not.toContain("› ● alpha");
+      stdin.write("\x1b[A"); // ↑ onto alpha, the last row of the group above
       await waitFor(() => expect(output).toContain("› ● alpha"));
       stdin.write("\x1b[C");
       await waitFor(() => expect(onActivate).toHaveBeenCalled());
@@ -570,6 +606,441 @@ describe("AgentViewPane", () => {
       view.cleanup();
       $stripSessions.set([]);
       resetUiState();
+    }
+  });
+
+  // Mounts the connected pane in a `cols`x`rows` terminal. The pane sizes itself from useStdout(), which is always
+  // process.stdout, so that gets the size too (restored by `done`).
+  // `paneRows` is the height process.stdout reports (what the pane believes); `rows` is the real, rendered terminal,
+  // which only differs while a resize has not reached the pane. `altScreen` wraps the pane in the full-screen shell the
+  // app puts it in, which pins the frame to the terminal's height.
+  const mountPane = (
+    cols: number,
+    rows: number,
+    over: Partial<React.ComponentProps<typeof AgentViewPane>> = {},
+    { altScreen = false, paneRows = rows } = {},
+  ) => {
+    const stdout = Object.assign(new PassThrough(), {
+      columns: cols,
+      isTTY: false,
+      rows,
+    });
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    const frames: string[] = [];
+    const saved = ["columns", "rows"].map(
+      (k) => [k, Object.getOwnPropertyDescriptor(process.stdout, k)] as const,
+    );
+
+    Object.defineProperty(process.stdout, "columns", {
+      configurable: true,
+      value: cols,
+    });
+    Object.defineProperty(process.stdout, "rows", {
+      configurable: true,
+      value: paneRows,
+    });
+    stdout.on("data", (c) => frames.push(stripAnsi(c.toString())));
+
+    const pane = (
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={() => {}}
+        onClose={() => {}}
+        onCommand={() => {}}
+        onNewPrompt={() => {}}
+        onStop={() => {}}
+        {...over}
+      />
+    );
+    const view = renderSync(
+      altScreen ? <AlternateScreen>{pane}</AlternateScreen> : pane,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    return {
+      done: () => {
+        for (const [k, d] of saved) {
+          if (d) {
+            Object.defineProperty(process.stdout, k, d);
+          } else {
+            delete (process.stdout as unknown as Record<string, unknown>)[k];
+          }
+        }
+
+        view.unmount();
+        view.cleanup();
+        $stripSessions.set([]);
+        resetUiState();
+      },
+      // Frames only: the renderer also writes terminal queries, which strip down to stray text such as "0q".
+      lastFrame: () =>
+        (frames.filter((f) => f.includes("Agents")).at(-1) ?? "").trimEnd(),
+      press: (keys: string) => stdin.write(keys),
+      /**
+       * The terminal changes height as the pane reads it: process.stdout.rows, then 'resize' on process.stdout. The
+       * rendering stdout is left alone so only the pane's own listener can refresh it (Ink's would re-render it too).
+       */
+      resize: (toRows: number) => {
+        Object.defineProperty(process.stdout, "rows", {
+          configurable: true,
+          value: toRows,
+        });
+        process.stdout.emit("resize");
+      },
+    };
+  };
+
+  it("pins the composer and the hint to the last two rows of the terminal, for a short, an exactly fitting and a long list", async () => {
+    // At 20 rows the list area is 15 lines: 14 sessions plus the Working header fill it exactly, which used to push the
+    // frame one line past the terminal.
+    for (const count of [2, 14, 40]) {
+      resetUiState();
+      patchUiState({ sid: "cur" });
+      $stripSessions.set(
+        Array.from({ length: count }, (_, i) => ({
+          id: `s${i}`,
+          status: "working" as const,
+          title: `task ${i}`,
+        })),
+      );
+
+      const pane = mountPane(90, 20);
+
+      try {
+        await waitFor(() => {
+          expect(pane.lastFrame()).toContain("task 0");
+          expect(pane.lastFrame()).toContain("⏎ start");
+        });
+
+        const lines = pane.lastFrame().split("\n");
+
+        // The frame is exactly as tall as the terminal: nothing scrolls off the top, and the composer is not left
+        // hanging under the list.
+        expect(lines).toHaveLength(20);
+        expect(lines[0]).toContain("Agents");
+        expect(lines.at(-2)).toContain("❯");
+        expect(lines.at(-1)).toContain("⏎ start");
+      } finally {
+        pane.done();
+      }
+    }
+  });
+
+  it("inline mode is not pinned and stays a row short of the terminal, so the frame never scrolls", async () => {
+    // At 20 rows the inline list area is 14 lines: 13 sessions plus the Working header fill it exactly, and 14 are one
+    // too many for it (a list area sized for a pinned frame would make 20 lines here).
+    // A short list keeps its own height (8 lines), not the screen's.
+    for (const [count, maxLines] of [
+      [2, 10],
+      [13, 19],
+      [14, 19],
+      [40, 19],
+    ] as const) {
+      resetUiState();
+      patchUiState({ sid: "cur" });
+      $stripSessions.set(
+        Array.from({ length: count }, (_, i) => ({
+          id: `s${i}`,
+          status: "waiting" as const,
+          title: `task ${i}`,
+        })),
+      );
+
+      const pane = mountPane(90, 20, { inline: true });
+
+      try {
+        await waitFor(() => {
+          expect(pane.lastFrame()).toContain("task 0");
+          expect(pane.lastFrame()).toContain("⏎ start");
+        });
+
+        const lines = pane.lastFrame().split("\n");
+
+        // Never as tall as the terminal (that scrolls a row into scrollback), and the footer still ends it.
+        expect(lines.length).toBeLessThanOrEqual(maxLines);
+        expect(lines.at(-2)).toContain("❯");
+        expect(lines.at(-1)).toContain("⏎ start");
+      } finally {
+        pane.done();
+      }
+    }
+  });
+
+  it("a header whose group disappears does not take the selection back when the group returns", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+
+    const alpha = { id: "a", status: "waiting" as const, title: "alpha" };
+    const mine = {
+      current: true,
+      id: "cur",
+      status: "waiting" as const,
+      title: "this one",
+    };
+
+    $stripSessions.set([alpha, mine]);
+
+    const pane = mountPane(90, 30);
+    const settle = () => new Promise((r) => setTimeout(r, 80));
+
+    try {
+      await waitFor(() => expect(pane.lastFrame()).toContain("› ● this one"));
+      pane.press("\x1b[A"); // the list takes the keyboard from the composer
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      pane.press("\x1b[A"); // onto the Needs input header
+      await settle();
+      expect(pane.lastFrame()).not.toContain("›");
+
+      // Both sessions leave that group (answered elsewhere): the header's rows are gone and a row is highlighted.
+      $stripSessions.set([
+        { current: true, id: "cur", status: "working", title: "this one" },
+      ]);
+      await waitFor(() => {
+        expect(pane.lastFrame()).not.toContain("alpha");
+        expect(pane.lastFrame()).toContain("› ◐ this one");
+      });
+      await settle();
+
+      // A session needs input again: the group returns, the highlighted row stays highlighted.
+      $stripSessions.set([
+        alpha,
+        { current: true, id: "cur", status: "working", title: "this one" },
+      ]);
+      await waitFor(() => expect(pane.lastFrame()).toContain("alpha"));
+      await settle();
+      expect(pane.lastFrame()).toMatch(/^\s*› /m);
+    } finally {
+      pane.done();
+    }
+  });
+
+  it("⏎ on an empty composer opens the selected row but does not fold a header the list last stopped on", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { id: "a", status: "waiting", title: "alpha" },
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+
+    const onActivate = vi.fn();
+    const onClose = vi.fn();
+    const pane = mountPane(90, 30, { onActivate, onClose });
+    const settle = () => new Promise((r) => setTimeout(r, 80));
+
+    try {
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain("› ◐ this one (this session)"),
+      );
+      pane.press("\x1b[A"); // composer → list
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      pane.press("\x1b[A"); // onto the Working header
+      await settle();
+      pane.press("\t"); // back to the composer, empty
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain(AGENT_VIEW_INPUT_HINT),
+      );
+      await settle();
+
+      pane.press("\r");
+      await settle();
+      await settle();
+
+      expect(pane.lastFrame()).toContain("▾ Working");
+      expect(pane.lastFrame()).toContain("this one (this session)");
+      expect(onActivate).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      pane.done();
+    }
+  });
+
+  it("keeps the composer and the hint when the terminal is shorter than the pane assumed", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set(
+      Array.from({ length: 6 }, (_, i) => ({
+        id: `s${i}`,
+        status: "waiting" as const,
+        title: `task ${i}`,
+      })),
+    );
+
+    // The pane still believes in 24 rows (a resize it has not seen) while the screen has 12.
+    const pane = mountPane(90, 12, {}, { altScreen: true, paneRows: 24 });
+
+    try {
+      await waitFor(() => expect(pane.lastFrame()).toContain("task 0"));
+
+      const lines = pane.lastFrame().split("\n");
+
+      // The list area gives way, clipped, instead of the composer being squeezed out of the frame.
+      expect(lines).toHaveLength(12);
+      expect(lines[0]).toContain("Agents");
+      expect(lines.at(-2)).toContain("❯");
+      expect(lines.at(-1)).toContain("⏎ start");
+    } finally {
+      pane.done();
+    }
+  });
+
+  it("moves the composer and the hint to the new last rows when the terminal is resized", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    // Waiting sessions only: nothing ticks, so the resize is the only thing that can re-render the pane.
+    $stripSessions.set([
+      { id: "a", status: "waiting", title: "alpha" },
+      { id: "b", status: "waiting", title: "bravo" },
+    ]);
+
+    // No full-screen shell here: a bare mount repaints whole frames, which the test can read.
+    const pane = mountPane(90, 12);
+
+    try {
+      // Loaded and settled: the session poll's own re-render must not be what picks up the new height.
+      await waitFor(() => {
+        expect(pane.lastFrame()).toContain("alpha");
+        expect(pane.lastFrame()).not.toContain("loading…");
+        expect(pane.lastFrame().split("\n")).toHaveLength(12);
+      });
+      await new Promise((r) => setTimeout(r, 100));
+
+      pane.resize(20);
+      await waitFor(() => {
+        const lines = pane.lastFrame().split("\n");
+
+        expect(lines).toHaveLength(20);
+        expect(lines.at(-2)).toContain("❯");
+        expect(lines.at(-1)).toContain("⏎ start");
+      });
+    } finally {
+      pane.done();
+    }
+  });
+
+  it("hides the parked hardware cursor while the list has the keyboard and shows it again for typed text", async () => {
+    const HIDE = "\x1b[?25l";
+    const SHOW = "\x1b[?25h";
+
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([{ id: "a", status: "waiting", title: "alpha" }]);
+
+    // The cursor escapes go to process.stdout only on a TTY; the pane's frames go to its own stream.
+    const isTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const writes: string[] = [];
+    const spy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: unknown) => {
+        writes.push(String(chunk));
+
+        return true;
+      });
+
+    Object.defineProperty(process.stdout, "isTTY", {
+      configurable: true,
+      value: true,
+    });
+
+    const pane = mountPane(90, 20);
+    const lastCursor = () =>
+      writes.filter((w) => w === HIDE || w === SHOW).at(-1);
+
+    try {
+      await waitFor(() => expect(pane.lastFrame()).toContain("alpha"));
+      writes.length = 0;
+      pane.press("\x1b[A"); // composer → list
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      // The renderer parks the cursor on the hint's first cell, so it stays hidden (the composer's own cleanup shows it).
+      expect(lastCursor()).toBe(HIDE);
+
+      pane.press("\t"); // list → composer
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain(AGENT_VIEW_INPUT_HINT),
+      );
+      // give React a frame to (re)subscribe the now-focused TextInput before typing
+      await new Promise((r) => setTimeout(r, 50));
+      writes.length = 0;
+      pane.press("h");
+      await waitFor(() => expect(lastCursor()).toBe(SHOW));
+    } finally {
+      pane.done();
+      spy.mockRestore();
+
+      if (isTTY) {
+        Object.defineProperty(process.stdout, "isTTY", isTTY);
+      } else {
+        delete (process.stdout as unknown as Record<string, unknown>).isTTY;
+      }
+    }
+  });
+
+  it("space, ⏎ and c on a header collapse and expand its group; ⏎ there attaches nothing", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { id: "a", status: "waiting", title: "alpha" },
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+
+    const onActivate = vi.fn();
+    const onClose = vi.fn();
+    const pane = mountPane(90, 30, { onActivate, onClose });
+    const settle = () => new Promise((r) => setTimeout(r, 80));
+
+    try {
+      await waitFor(() =>
+        expect(pane.lastFrame()).toContain("› ◐ this one (this session)"),
+      );
+      pane.press("\x1b[A"); // the list takes the keyboard from the composer
+      await waitFor(() => expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT));
+      pane.press("\x1b[A"); // onto the Working header (open: it is a stop all the same)
+      await settle();
+      expect(pane.lastFrame()).toContain("▾ Working");
+
+      pane.press(" ");
+      await waitFor(() => {
+        expect(pane.lastFrame()).toContain("▸ Working");
+        expect(pane.lastFrame()).not.toContain("this one");
+      });
+      // The other group is untouched, and nothing was typed into the composer.
+      expect(pane.lastFrame()).toContain("▾ Needs input");
+      expect(pane.lastFrame()).toContain("alpha");
+      expect(pane.lastFrame()).toContain(AGENT_VIEW_HINT);
+
+      await settle();
+      pane.press(" ");
+      await waitFor(() => {
+        expect(pane.lastFrame()).toContain("▾ Working");
+        expect(pane.lastFrame()).toContain("this one (this session)");
+      });
+
+      for (const key of ["\r", "c"]) {
+        await settle();
+        pane.press(key);
+        await waitFor(() => expect(pane.lastFrame()).toContain("▸ Working"));
+        await settle();
+        pane.press(key);
+        await waitFor(() => expect(pane.lastFrame()).toContain("▾ Working"));
+      }
+
+      expect(onActivate).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      pane.done();
     }
   });
 
@@ -1048,7 +1519,7 @@ describe("AgentViewPane", () => {
         expect(pane.lastFrame()).not.toContain("first work");
         expect(pane.lastFrame()).toContain("› · second work");
 
-        // ↓ onto the Archived header, c opens it onto its first (newest) row.
+        // ↓ onto the Archived header, c opens it (the header keeps the selection), ↓ enters its first (newest) row.
         pane.stdin.write("\x1b[B");
         await waitFor(() =>
           expect(pane.lastFrame()).not.toContain("› · second work"),
@@ -1056,6 +1527,10 @@ describe("AgentViewPane", () => {
         pane.stdin.write("c");
         await waitFor(() =>
           expect(pane.lastFrame()).toMatch(/▾ Archived {2}2/),
+        );
+        pane.stdin.write("\x1b[B");
+        await waitFor(() =>
+          expect(pane.lastFrame()).toContain("› · first work"),
         );
 
         const opened = pane.lastFrame();

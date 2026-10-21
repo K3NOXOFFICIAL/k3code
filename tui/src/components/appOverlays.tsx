@@ -20,6 +20,7 @@ import { listRowStyle } from "./overlayPrimitives.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
 import { PermissionsPicker } from "./permissionsPicker.js";
 import { ProviderPicker } from "./providerPicker.js";
+import { QuestionPicker } from "./questionPicker.js";
 import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
@@ -70,7 +71,7 @@ export function PromptZone({
   cols,
   onApprovalChoice,
   onClarifyAnswer,
-  onClarifyQuestionAnswer,
+  onClarifyBatch,
   onSecretSubmit,
   onSudoSubmit,
 }: Pick<
@@ -78,7 +79,7 @@ export function PromptZone({
   | "cols"
   | "onApprovalChoice"
   | "onClarifyAnswer"
-  | "onClarifyQuestionAnswer"
+  | "onClarifyBatch"
   | "onSecretSubmit"
   | "onSudoSubmit"
 >) {
@@ -120,6 +121,21 @@ export function PromptZone({
     );
   }
 
+  if (overlay.clarify?.questions?.length) {
+    // Batch clarify (`ask_user_question`): answered in one frame through onClarifyBatch.
+    return (
+      <PromptCell cols={cols} id="clarify">
+        <QuestionPicker
+          cols={cols}
+          key={overlay.clarify.requestId}
+          onClarifyBatch={onClarifyBatch}
+          req={overlay.clarify}
+          t={theme}
+        />
+      </PromptCell>
+    );
+  }
+
   if (overlay.clarify) {
     return (
       <PromptCell cols={cols} id="clarify">
@@ -127,7 +143,6 @@ export function PromptZone({
           cols={cols}
           onAnswer={onClarifyAnswer}
           onCancel={() => onClarifyAnswer("")}
-          onQuestionAnswer={onClarifyQuestionAnswer}
           req={overlay.clarify}
           t={theme}
         />

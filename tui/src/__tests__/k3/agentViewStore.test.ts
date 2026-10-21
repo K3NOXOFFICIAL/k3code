@@ -428,6 +428,13 @@ describe("collapsible groups", () => {
     vrow("w2"),
     vrow("c1", { group: "completed", state: "done" }),
   ];
+  // Nothing collapsed to start with, so each test sees only the collapsing it does itself (IDLE_VIEW_NAV opens with
+  // Archived collapsed).
+  const at = (index: number): ViewNav => ({
+    ...IDLE_VIEW_NAV,
+    collapsedGroups: [],
+    index,
+  });
   const onHeader: ViewNav = {
     ...IDLE_VIEW_NAV,
     collapsedGroups: ["working"],
@@ -440,7 +447,7 @@ describe("collapsible groups", () => {
 
     expect(r.effect).toBeNull();
     expect(r.nav).toMatchObject({
-      collapsedGroups: ["archived", "working"],
+      collapsedGroups: ["working"],
       header: "working",
     });
   });
@@ -448,7 +455,12 @@ describe("collapsible groups", () => {
   it("↑↓ stop on a collapsed group's header and never on its hidden rows", () => {
     const down = reduceViewKey(onHeader, G, { down: true }, 2).nav;
 
-    expect(down).toMatchObject({ header: null, index: 3 });
+    // The next group's header is a stop of its own, ahead of its rows.
+    expect(down).toMatchObject({ header: "completed", index: 3 });
+    expect(reduceViewKey(down, G, { down: true }, 2).nav).toMatchObject({
+      header: null,
+      index: 3,
+    });
     expect(reduceViewKey(down, G, { up: true }, 2).nav).toMatchObject({
       header: "working",
     });
@@ -458,14 +470,19 @@ describe("collapsible groups", () => {
     });
   });
 
-  it("⏎, → and c on a collapsed header expand it onto its first row, attaching nothing", () => {
-    for (const key of [{ return: true }, { right: true }, { ch: "c" }]) {
+  it("⏎, →, space and c on a collapsed header expand it and keep it selected, attaching nothing", () => {
+    for (const key of [
+      { return: true },
+      { right: true },
+      { ch: " " },
+      { ch: "c" },
+    ]) {
       const r = reduceViewKey(onHeader, G, key, 2);
 
       expect(r.effect).toBeNull();
       expect(r.nav).toMatchObject({
         collapsedGroups: [],
-        header: null,
+        header: "working",
         index: 1,
       });
     }
@@ -473,14 +490,113 @@ describe("collapsible groups", () => {
 
   it("a header click collapses another group without moving the selection", () => {
     expect(toggleGroup(at(0), G, "working")).toMatchObject({
-      collapsedGroups: ["archived", "working"],
+      collapsedGroups: ["working"],
       header: null,
       index: 0,
     });
+    // On its own header the click expands it and the header keeps the selection.
     expect(toggleGroup(onHeader, G, "working")).toMatchObject({
       collapsedGroups: [],
+      header: "working",
+      index: 1,
+    });
+  });
+
+  it("navItems lists each group's header, then its rows while the group is open", () => {
+    expect(navItems(G, [])).toEqual([
+      { group: "input", type: "header" },
+      { index: 0, type: "row" },
+      { group: "working", type: "header" },
+      { index: 1, type: "row" },
+      { index: 2, type: "row" },
+      { group: "completed", type: "header" },
+      { index: 3, type: "row" },
+    ]);
+    expect(navItems(G, ["working"])).toEqual([
+      { group: "input", type: "header" },
+      { index: 0, type: "row" },
+      { group: "working", type: "header" },
+      { group: "completed", type: "header" },
+      { index: 3, type: "row" },
+    ]);
+  });
+
+  it("↑ from an open group's first row lands on its header, ↓ from there enters the row", () => {
+    const up = reduceViewKey(at(1), G, { up: true }, 2).nav;
+
+    expect(up).toMatchObject({
+      collapsedGroups: [],
+      header: "working",
+      index: 1,
+    });
+    expect(reduceViewKey(up, G, { down: true }, 2).nav).toMatchObject({
       header: null,
       index: 1,
+    });
+    // From the row before it (another group's last row) ↓ stops on the header too.
+    expect(reduceViewKey(at(0), G, { down: true }, 2).nav).toMatchObject({
+      header: "working",
+      index: 1,
+    });
+  });
+
+  it("space on an open header collapses it, space again expands it, the header keeping the selection", () => {
+    const open: ViewNav = { ...at(1), header: "working" };
+    const closed = reduceViewKey(open, G, { ch: " " }, 2);
+
+    expect(closed.effect).toBeNull();
+    expect(closed.nav).toMatchObject({
+      collapsedGroups: ["working"],
+      draft: "",
+      focus: "list",
+      header: "working",
+      index: 1,
+    });
+
+    const reopened = reduceViewKey(closed.nav, G, { ch: " " }, 2);
+
+    expect(reopened.effect).toBeNull();
+    expect(reopened.nav).toMatchObject({
+      collapsedGroups: [],
+      draft: "",
+      focus: "list",
+      header: "working",
+      index: 1,
+    });
+  });
+
+  it("⏎ and c on an open header collapse it; → and x on one do nothing", () => {
+    const open: ViewNav = { ...at(1), header: "working" };
+
+    for (const key of [{ return: true }, { ch: "c" }]) {
+      const r = reduceViewKey(open, G, key, 2);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toMatchObject({
+        collapsedGroups: ["working"],
+        header: "working",
+      });
+    }
+
+    for (const key of [{ right: true }, { ch: "x" }]) {
+      const r = reduceViewKey(open, G, key, 2);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual(open);
+    }
+  });
+
+  it("on a header other typed text still goes to the composer; space on a row does too", () => {
+    const open: ViewNav = { ...at(1), header: "working" };
+
+    expect(reduceViewKey(open, G, { ch: "q" }, 2).nav).toMatchObject({
+      draft: "q",
+      focus: "input",
+    });
+    expect(reduceViewKey(at(1), G, { ch: " " }, 2).nav).toMatchObject({
+      collapsedGroups: [],
+      draft: " ",
+      focus: "input",
     });
   });
 });
@@ -521,9 +637,10 @@ describe("archive and restore", () => {
     const onHeader = press(at(3), { down: true }, A).nav;
 
     expect(onHeader).toMatchObject({ header: "archived", index: 4 });
+    // Expanding from the header leaves the selection on it.
     expect(press(onHeader, { ch: "c" }, A).nav).toMatchObject({
       collapsedGroups: [],
-      header: null,
+      header: "archived",
       index: 4,
     });
   });
@@ -551,6 +668,14 @@ describe("archive and restore", () => {
       effect: { row: A[2], type: "archive" },
       nav: open(0),
     });
+
+    // The last row of its group: the group's header leaves with it, so the cursor steps over the header to the item
+    // above rather than onto a header that is about to disappear.
+    const stacked = [A[1]!, A[2]!];
+    const last = press(open(1), { ch: "a" }, stacked);
+
+    expect(last.effect).toEqual({ row: A[2], type: "archive" });
+    expect(last.nav).toEqual({ ...open(1), header: null, index: 0 });
   });
 
   it("a and u are plain typing on rows they do not apply to and on a header; a pending stop eats them", () => {
@@ -613,20 +738,33 @@ describe("archive and restore", () => {
 });
 
 describe("reduceViewKey", () => {
-  it("moves with ↑/↓ and clamps at both ends without wrapping", () => {
-    expect(press(at(0), { up: true }).nav).toEqual(at(0));
-    expect(press(at(0), { down: true }).nav).toEqual(at(1));
-    expect(press(at(4), { down: true }).nav).toEqual(at(4));
-    expect(press(at(3), { up: true }).nav).toEqual(at(2));
+  // ROWS lists a header stop ahead of the first row of each group: [Working, cur, s1, a1, Completed, p1, s2].
+  const head = (header: "completed" | "working", index: number): ViewNav => ({
+    ...IDLE_VIEW_NAV,
+    header,
+    index,
   });
 
-  it("jumps with home/end and pages by pageSize, clamped", () => {
-    expect(press(at(3), { home: true }).nav.index).toBe(0);
+  it("moves with ↑/↓ through headers and rows and clamps at both ends without wrapping", () => {
+    expect(press(at(0), { up: true }).nav).toEqual(head("working", 0));
+    expect(press(head("working", 0), { up: true }).nav).toEqual(
+      head("working", 0),
+    );
+    expect(press(head("working", 0), { down: true }).nav).toEqual(at(0));
+    expect(press(at(0), { down: true }).nav).toEqual(at(1));
+    expect(press(at(4), { down: true }).nav).toEqual(at(4));
+    expect(press(at(3), { up: true }).nav).toEqual(head("completed", 3));
+    expect(press(head("completed", 3), { up: true }).nav).toEqual(at(2));
+  });
+
+  it("jumps with home/end and pages by pageSize over those stops, clamped", () => {
+    expect(press(at(3), { home: true }).nav).toEqual(head("working", 0));
     expect(press(at(1), { end: true }).nav.index).toBe(4);
     expect(press(at(0), { pageDown: true }).nav.index).toBe(2);
     expect(press(at(3), { pageDown: true }).nav.index).toBe(4);
-    expect(press(at(3), { pageUp: true }).nav.index).toBe(1);
-    expect(press(at(1), { pageUp: true }).nav.index).toBe(0);
+    // The Completed header sits between a1 and p1, so two stops up from p1 is a1.
+    expect(press(at(3), { pageUp: true }).nav.index).toBe(2);
+    expect(press(at(1), { pageUp: true }).nav).toEqual(head("working", 0));
     expect(press(at(0), { pageDown: true }, ROWS, 0).nav.index).toBe(1);
   });
 

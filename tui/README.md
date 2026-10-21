@@ -200,6 +200,7 @@ Notes:
 | clarify prompt with choices | `Up/Down`, `Enter`  | Move and confirm the selected choice              |
 | clarify prompt with choices | single-digit number | Quick-pick the matching numbered choice           |
 | clarify prompt with choices | `Enter` on "Other"  | Switch into free-text entry                       |
+| clarify prompt              | `Esc`, `Ctrl+C`     | Cancel (multi-question: cancel the whole set)     |
 | clarify free-text mode      | `Enter`             | Submit typed answer                               |
 | sudo / secret prompt        | `Enter`             | Submit typed value                                |
 | sudo / secret prompt        | `Ctrl+C`            | Cancel by sending an empty response               |
@@ -216,7 +217,8 @@ Notes:
 
 - Clarify free-text mode and masked prompts use `ink-text-input`, so text editing there follows the library's default bindings rather than `components/textInput.tsx`.
 - When a blocking prompt is open, the main chat input hotkeys are suspended.
-- Clarify mode has no dedicated cancel shortcut in the current client. Sudo and secret prompts only expose `Ctrl+C` cancellation from the app-level blocked handler.
+- Clarify prompts cancel with `Esc` (or `Esc` back out of free-text entry first) and `Ctrl+C`. Sudo and secret prompts only expose `Ctrl+C` cancellation from the app-level blocked handler.
+- A multi-question clarify (the `ask_user_question` tool) is answered as a whole: `Tab`/`Shift+Tab` or `←`/`→` move between questions, `Enter` picks (or `Space` toggles on a multi-select question), digits quick-pick, and the set goes back in one Submit; `Esc`/`Ctrl+C` cancels all. A request with one single-select question goes back on the pick, without a Submit tab. `Type something` takes a typed answer (on a multi-select question, an extra checked entry; `Esc` leaves the field, `Enter` or `Tab` keeps the text), and `Chat about this` hands back what is answered so far.
 
 ### Interaction rules
 
@@ -249,7 +251,7 @@ The Python gateway can pause the main loop and ask the client a question. These 
 `createServerRequestHandler.ts`), not events:
 
 - `approval`: allow once, allow for session, allow always, or deny → `{ choice }`
-- `clarify`: pick from choices or type a custom answer → `{ answer }` (batch: `{ answers }`)
+- `clarify`: pick from choices or type a custom answer → `{ answer }` (batch `questions[]`: one `{ answers }` frame on Submit, multi-select values as a JSON array string; `{ answers, chat: true }` for "Chat about this"; `{ answer: "" }` cancels)
 - `sudo`: masked password entry → `{ value }`
 - `secret`: masked value entry for a named env var → `{ value }`
 - `session.list`: used by `SessionPicker` for `/resume`

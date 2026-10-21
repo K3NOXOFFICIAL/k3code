@@ -189,7 +189,7 @@ const layoutProps: AppLayoutProps = {
     activateLiveSession: () => {},
     answerApproval: () => {},
     answerClarify: () => {},
-    answerClarifyQuestion: () => {},
+    answerClarifyBatch: () => {},
     answerSecret: () => {},
     answerSudo: () => {},
     clearSelection: () => {},
@@ -652,9 +652,12 @@ describe("AppLayout agent view: leaving the startup session", () => {
       ]);
       await waitFor(() => expect(layout.output()).toContain("busy one"));
 
-      // The view rests on this session's row (s1); s2 (working) is listed above it. The first ↑ hands the keyboard
-      // from the composer to the list, the second selects s2 for ⏎ to attach.
+      // The view rests on this session's row (s1); s2 (working) is listed above it, past s1's group header. The first ↑
+      // hands the keyboard from the composer to the list, the second stops on the Completed header, the third selects
+      // s2 for ⏎ to attach.
       if (key === "\r") {
+        layout.press("\x1b[A");
+        await flush();
         layout.press("\x1b[A");
         await flush();
         layout.press("\x1b[A");
@@ -1214,6 +1217,123 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
     expect(probe.clearIn).not.toHaveBeenCalled();
     expect(probe.input).toBe("keep me");
   });
+});
+
+describe("useInputHandlers: Escs the question picker consumes do not count toward double-Esc", () => {
+  it("Esc out of the text field, then Esc to cancel, keeps the composer draft", async () => {
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const answerClarifyBatch = vi.fn();
+    const layout = mountLayout(
+      {
+        clarify: {
+          choices: null,
+          question: "",
+          questions: [
+            { choices: ["red", "blue"], qid: "q1", question: "Colour?" },
+            { choices: ["s", "m"], qid: "q2", question: "Size?" },
+          ],
+          requestId: "batch-1",
+        },
+      },
+      { busy: false },
+      { answerClarifyBatch },
+      {
+        beside: (
+          <>
+            <InputHarness initialInput="keep me" probe={probe} />
+            <SentinelProbe hits={hits} />
+          </>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("Type something"));
+
+    // ↓ ↓ to "Type something", Enter opens the field.
+    await pressThenSentinel(layout, hits, DOWN);
+    await pressThenSentinel(layout, hits, DOWN);
+    await pressThenSentinel(layout, hits, "\r");
+    await waitFor(() => expect(layout.output()).toContain("Enter save"));
+
+    // Date.now is pinned to T0, so both Escs sit well inside DOUBLE_ESC_MS. A lone Esc is only emitted after Ink's
+    // 50 ms escape-sequence flush; the sentinel must follow after that.
+    for (let esc = 0; esc < 2; esc++) {
+      layout.press(ESC);
+      await flush();
+      await flush();
+      await flush();
+      await pressThenSentinel(layout, hits, "");
+    }
+
+    await waitFor(() => expect(answerClarifyBatch).toHaveBeenCalledWith(null));
+    expect(answerClarifyBatch).toHaveBeenCalledTimes(1);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+});
+
+describe("AppLayout question picker fits a short terminal", () => {
+  const original = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+
+  afterEach(() => {
+    if (original) {
+      Object.defineProperty(process.stdout, "rows", original);
+    } else {
+      delete (process.stdout as { rows?: number }).rows;
+    }
+  });
+
+  it.each([14, 16, 20, 24])(
+    "at %i rows the hint, Chat about this and the status rule stay on screen",
+    async (rows) => {
+      // The vendored Ink's useStdout() reads process.stdout, not the fake stdout.
+      Object.defineProperty(process.stdout, "rows", {
+        configurable: true,
+        value: rows,
+        writable: true,
+      });
+
+      const layout = mountLayout(
+        {
+          clarify: {
+            choices: null,
+            question: "",
+            questions: [
+              {
+                choices: ["one", "two", "three", "four"],
+                descriptions: ["one", "two", "three", "four"].map((name) =>
+                  `A long description of option ${name} `.repeat(8),
+                ),
+                header: "Many",
+                multiSelect: true,
+                qid: "q1",
+                question: "Pick any?",
+              },
+            ],
+            requestId: "batch-1",
+          },
+        },
+        {},
+        {},
+        { columns: 80, rows },
+      );
+
+      await waitFor(() => expect(layout.output()).toContain("Pick any?"));
+      await flush();
+
+      // Nothing was pressed, so the output is the first full paint: rows past the screen are never drawn.
+      const screen = layout.output();
+
+      expect(screen.replace(/\n+$/, "").split("\n").length).toBeLessThanOrEqual(
+        rows,
+      );
+
+      expect(screen).toContain("Chat about this");
+      expect(screen).toContain("Esc cancel");
+      expect(screen).toContain("~/repo");
+    },
+  );
 });
 
 describe("useInputHandlers: a double Esc interrupts a running turn", () => {

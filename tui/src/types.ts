@@ -128,10 +128,23 @@ export interface ConfirmReq {
 
 export interface ClarifyBatchQuestion {
   choices: string[] | null;
+  /** Per-choice explanation, parallel to `choices` ("" = none); absent when `choices` is null. */
+  descriptions?: string[];
+  /** Short tab label (<= 12 chars) for the picker. */
+  header?: string;
   multiSelect?: boolean;
   qid: string;
   question: string;
 }
+
+/**
+ * What the batch picker submits, as ONE response frame: `answers` maps qid to
+ * the label or typed text (multi-select: `encodeMultiAnswer` JSON array
+ * string); `chat` marks "Chat about this" (answers may then be partial).
+ */
+export type ClarifyBatchResult =
+  | { answers: Record<string, string> }
+  | { answers: Record<string, string>; chat: true };
 
 export interface ClarifyReq {
   choices: string[] | null;
