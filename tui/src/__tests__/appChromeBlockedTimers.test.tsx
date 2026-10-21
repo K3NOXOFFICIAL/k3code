@@ -652,9 +652,12 @@ describe("AppLayout agent view: leaving the startup session", () => {
       ]);
       await waitFor(() => expect(layout.output()).toContain("busy one"));
 
-      // The view rests on this session's row (s1); s2 (working) is listed above it. The first ↑ hands the keyboard
-      // from the composer to the list, the second selects s2 for ⏎ to attach.
+      // The view rests on this session's row (s1); s2 (working) is listed above it, past s1's group header. The first ↑
+      // hands the keyboard from the composer to the list, the second stops on the Completed header, the third selects
+      // s2 for ⏎ to attach.
       if (key === "\r") {
+        layout.press("\x1b[A");
+        await flush();
         layout.press("\x1b[A");
         await flush();
         layout.press("\x1b[A");
