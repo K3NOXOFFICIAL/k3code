@@ -69,6 +69,7 @@ import { estimatedMsgHeight, messageHeightKey } from "../lib/virtualHeights.js";
 import { onUserWidgets } from "../sdk/userWidgets.js";
 import type {
   ClarifyBatchResult,
+  ClarifyReq,
   Msg,
   PanelSection,
   SlashCatalog,
@@ -173,6 +174,59 @@ export function applyProposalAccept(
   if (note) {
     sys(note);
   }
+}
+
+/**
+ * Answer the open clarify with `answer` ("" is Esc / Ctrl+C cancel). Ctrl+C
+ * reaches here for every clarify: a batch (`questions[]`) only ever cancels.
+ */
+export function answerClarifyRequest(
+  clarify: ClarifyReq,
+  answer: string,
+  appendMessage: (msg: Msg) => void,
+): void {
+  if (clarify.questions?.length) {
+    answerClarifyBatchRequest(clarify, null, appendMessage);
+
+    return;
+  }
+
+  const label = toolTrailLabel("clarify");
+
+  dropClarifyToolTrail();
+
+  if (!respondToServerRequest(clarify.requestId, { answer })) {
+    // The request already expired (request.cancel raced the keystroke): nothing to answer.
+    patchOverlayState({ clarify: null });
+
+    return;
+  }
+
+  if (answer) {
+    turnController.persistedToolLabels.add(label);
+    appendMessage({
+      kind: "trail",
+      role: "system",
+      text: "",
+      tools: [buildToolTrailLine("clarify", clarify.question)],
+    });
+    appendMessage({ role: "user", text: answer });
+    patchUiState({ status: "running…" });
+  } else {
+    // Esc / Ctrl+C cancel: persist the question + options as a system
+    // line (not a transient "prompt cancelled" flash) so the prompt
+    // survives on screen as standard output, matching the timeout path.
+    appendMessage({
+      role: "system",
+      text: formatAbandonedClarify(
+        clarify.question,
+        clarify.choices,
+        "cancelled",
+      ),
+    });
+  }
+
+  patchOverlayState({ clarify: null });
 }
 
 export interface PromptLiveSessionOptions {
@@ -1007,56 +1061,8 @@ export function useMainApp(gw: GatewayClient) {
 
   const answerClarify = useCallback(
     (answer: string) => {
-      const clarify = overlay.clarify;
-
-      if (!clarify) {
-        return;
-      }
-
-      if (clarify.questions?.length) {
-        // Ctrl+C reaches here for every clarify: a batch only ever cancels.
-        answerClarifyBatchRequest(clarify, null, appendMessage);
-
-        return;
-      }
-
-      const label = toolTrailLabel("clarify");
-
-      dropClarifyToolTrail();
-
-      if (!respondToServerRequest(clarify.requestId, { answer })) {
-        // The request already expired (request.cancel raced the keystroke): nothing to answer.
-        patchOverlayState({ clarify: null });
-
-        return;
-      }
-
-      {
-        if (answer) {
-          turnController.persistedToolLabels.add(label);
-          appendMessage({
-            kind: "trail",
-            role: "system",
-            text: "",
-            tools: [buildToolTrailLine("clarify", clarify.question)],
-          });
-          appendMessage({ role: "user", text: answer });
-          patchUiState({ status: "running…" });
-        } else {
-          // Esc / Ctrl+C cancel: persist the question + options as a system
-          // line (not a transient "prompt cancelled" flash) so the prompt
-          // survives on screen as standard output, matching the timeout path.
-          appendMessage({
-            role: "system",
-            text: formatAbandonedClarify(
-              clarify.question,
-              clarify.choices,
-              "cancelled",
-            ),
-          });
-        }
-
-        patchOverlayState({ clarify: null });
+      if (overlay.clarify) {
+        answerClarifyRequest(overlay.clarify, answer, appendMessage);
       }
     },
     [appendMessage, overlay.clarify],

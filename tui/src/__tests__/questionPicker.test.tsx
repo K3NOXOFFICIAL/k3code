@@ -6,7 +6,11 @@ import React from "react";
 import stripAnsi from "strip-ansi";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { optionWindow, QuestionPicker } from "../components/questionPicker.js";
+import {
+  clampLines,
+  optionWindow,
+  QuestionPicker,
+} from "../components/questionPicker.js";
 import { encodeMultiAnswer } from "../lib/text.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type {
@@ -369,6 +373,57 @@ describe("QuestionPicker", () => {
       answers: { q1: '["x"]', q2: '["y"]' },
     });
   });
+
+  it("Tab in the text field commits the typed text as the answer and switches tab; going back shows it", async () => {
+    const view = open(req([COLOUR, SIZE]));
+
+    await waitFor(() => expect(view.frame()).toContain("Which colour?"));
+    await view.press(DOWN, DOWN, ENTER);
+    await waitFor(() => expect(view.frame()).toContain("Enter save"));
+    await view.press("a", "b", "c", TAB);
+    await waitFor(() => expect(view.frame()).toContain("Which size?"));
+    expect(view.frame()).toMatch(/☑ Colour +☐ Size/);
+
+    // "abc ✓" on the Type something row is only painted once Colour is shown again.
+    await view.press(SHIFT_TAB);
+    await waitFor(() => expect(view.frame()).toContain("▸ abc ✓"));
+
+    const at = view.mark();
+
+    await view.press(TAB, TAB);
+    await waitFor(() => expect(view.since(at)).toContain("Colour → abc"));
+    expect(view.onClarifyBatch).not.toHaveBeenCalled();
+  });
+
+  it("committing empty text in the multi-select typed entry drops it from the answer", async () => {
+    const view = open(
+      req([TOPPINGS], { q3: encodeMultiAnswer(["ham", "extra spicy"]) }),
+    );
+
+    // Everything is answered, so it opens on the Submit review.
+    await waitFor(() => expect(view.frame()).toContain("Review your answers"));
+    await view.press(SHIFT_TAB);
+    await waitFor(() => expect(view.frame()).toContain("[x] extra spicy"));
+    // cheese, ham, olives, Next, then Type something holding "extra spicy".
+    await view.press(DOWN, DOWN, DOWN, DOWN, ENTER);
+    await waitFor(() => expect(view.frame()).toContain("Enter save"));
+    await view.press(..."extra spicy".split("").map(() => "\u007f"), ENTER);
+    await waitFor(() => expect(view.frame()).toContain("[ ] Type something"));
+
+    const at = view.mark();
+
+    await view.press(UP, ENTER);
+    await waitFor(() =>
+      expect(view.since(at)).toContain("Review your answers"),
+    );
+    expect(view.since(at)).toContain("Toppings → ham");
+    expect(view.since(at)).not.toContain("extra spicy");
+    await view.press(ENTER);
+    await waitFor(() => expect(view.onClarifyBatch).toHaveBeenCalledTimes(1));
+    expect(view.onClarifyBatch).toHaveBeenCalledWith({
+      answers: { q3: encodeMultiAnswer(["ham"]) },
+    });
+  });
 });
 
 describe("QuestionPicker in a short terminal", () => {
@@ -421,6 +476,57 @@ describe("QuestionPicker in a short terminal", () => {
 
     expect(descs).toHaveLength(1);
     descs.forEach((line) => expect(line.trimEnd()).toMatch(/…$/));
+  });
+
+  it("scrolls the option window as the cursor moves, keeping the cursor row on screen", async () => {
+    Object.defineProperty(process.stdout, "rows", {
+      configurable: true,
+      value: 14,
+      writable: true,
+    });
+
+    const names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+    const view = open(
+      req([{ choices: names, header: "Six", qid: "q1", question: "Pick?" }]),
+    );
+
+    await waitFor(() => expect(view.frame()).toContain("1-3 of 6"));
+    await settle(60);
+
+    const painted: number[][] = [];
+
+    for (let step = 1; step <= 6; step++) {
+      const at = view.mark();
+
+      await view.press(DOWN);
+      await waitFor(() => expect(view.since(at)).toContain("of 6 · "));
+
+      // Off a TTY every paint is the whole frame.
+      const lines = view.since(at).replace(/\n+$/, "").split("\n");
+
+      expect(lines.length).toBeLessThanOrEqual(14);
+      expect(lines).toContain(
+        step < names.length
+          ? `▸ ${step + 1}. ${names[step]}`
+          : "▸ Type something",
+      );
+      painted.push(
+        lines.flatMap((line) => {
+          const m = /^[▸ ] (\d)\. /.exec(line);
+
+          return m ? [Number(m[1])] : [];
+        }),
+      );
+    }
+
+    expect(painted).toEqual([
+      [1, 2, 3],
+      [1, 2, 3],
+      [2, 3, 4],
+      [3, 4, 5],
+      [4, 5, 6],
+      [4, 5, 6],
+    ]);
   });
 });
 
@@ -529,4 +635,25 @@ describe("optionWindow", () => {
     expect(optionWindow(heights, 6, 4, 0)).toEqual({ end: 5, start: 2 });
     expect(optionWindow([], 6, 0, 0)).toEqual({ end: 0, start: 0 });
   });
+});
+
+describe("clampLines", () => {
+  const LONE_SURROGATE =
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  // A code-unit cut at width-1 would end inside the 4th emoji (emoji) or keep 10 cells plus the ellipsis (CJK).
+  it.each([
+    ["emoji", "aaaa😀😀😀😀 tail", 12],
+    ["CJK", "漢字テスト漢字テスト", 10],
+  ])(
+    "cuts the last kept line by display width on grapheme boundaries (%s)",
+    (_kind, text, width) => {
+      const lines = clampLines(text, width, 1);
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/…$/);
+      expect(lines[0]).not.toMatch(LONE_SURROGATE);
+      expect(stringWidth(lines[0]!)).toBeLessThanOrEqual(width);
+    },
+  );
 });

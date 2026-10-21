@@ -13,6 +13,7 @@ import {
 import { turnController } from "../app/turnController.js";
 import { resetTurnState } from "../app/turnStore.js";
 import { resetUiState } from "../app/uiStore.js";
+import { answerClarifyRequest } from "../app/useMainApp.js";
 import type { ClarifyReq, Msg } from "../types.js";
 
 const REQ: ClarifyReq = {
@@ -131,6 +132,32 @@ describe("answerClarifyBatchRequest", () => {
     );
 
     expect(appended).toHaveLength(0);
+    expect(getOverlayState().clarify).toBeNull();
+  });
+});
+
+describe("answerClarifyRequest", () => {
+  beforeEach(() => {
+    resetOverlayState();
+    resetServerRequestsForTests();
+    resetTurnState();
+    resetUiState();
+    turnController.turnTools = [];
+  });
+
+  it("hands Ctrl+C's empty answer on a batch to the batch cancel", () => {
+    const respond = open();
+    const appended: Msg[] = [];
+
+    answerClarifyRequest(REQ, "", (m) => appended.push(m));
+
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith({ answer: "" });
+    expect(appended).toHaveLength(1);
+    expect(appended[0]?.role).toBe("system");
+    expect(appended[0]?.text).toMatch(/^ask \(3 questions\)/);
+    expect(appended[0]?.text).toContain("Which checks?");
+    expect(appended[0]?.text).toContain("(cancelled)");
     expect(getOverlayState().clarify).toBeNull();
   });
 });

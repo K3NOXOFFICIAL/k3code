@@ -8,6 +8,7 @@ import {
 } from "@k3code/ink";
 import { useRef, useState } from "react";
 
+import { PROMPT_CHROME_ROWS } from "../lib/promptChrome.js";
 import {
   clarifyAnswerDisplay,
   clarifyBatchRevisitState,
@@ -24,7 +25,6 @@ import type {
   ClarifyReq,
 } from "../types.js";
 
-import { PROMPT_CHROME_ROWS } from "./appOverlays.js";
 import { chipRowProps } from "./overlayPrimitives.js";
 import { TextInput } from "./textInput.js";
 
@@ -448,8 +448,12 @@ const cutToWidth = (line: string, cells: number) => {
   return out;
 };
 
-/** `text` wrapped to `width`, at most `max` lines, the last one marked `…` when cut. */
-const clampLines = (text: string, width: number, max: number): string[] => {
+/** `text` wrapped to `width`, at most `max` lines, the last one marked `…` when cut (exported for tests). */
+export const clampLines = (
+  text: string,
+  width: number,
+  max: number,
+): string[] => {
   const lines = wrapAnsi(text, width, { hard: true, trim: true })
     .split("\n")
     .filter((line) => line.trim());

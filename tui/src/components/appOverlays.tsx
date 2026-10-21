@@ -28,14 +28,6 @@ import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
 const COMPLETION_WINDOW = 16;
 
 /**
- * Lines the app paints around a PromptCell's content while a prompt is open,
- * measured in the real AppLayout (default top status bar): the cell's
- * `paddingY` above and below (2), the composer's spacer row (1), and the
- * status rule with its top margin (2).
- */
-export const PROMPT_CHROME_ROWS = 5;
-
-/**
  * A prompt hosted in a single-cell WidgetGrid with the classic 1-cell padding.
  * The inner full-width column restores the horizontal stretch the old plain
  * padded Box gave its child, so rendering is identical; routing through the
