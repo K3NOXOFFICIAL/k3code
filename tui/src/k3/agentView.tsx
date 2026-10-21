@@ -2,13 +2,18 @@ import { Box, Text, useInput, useStdout } from "@k3code/ink";
 import { TextInput } from "../components/textInput.js";
 import type { SessionListResult } from "@k3code/shared/gateway-events";
 import { useStore } from "@nanostores/react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentRoster } from "../app/agentRoster.js";
 import { $uiState } from "../app/uiStore.js";
 import { relativeSessionAge } from "../components/activeSessionSwitcher.js";
 import { listRowStyle } from "../components/overlayPrimitives.js";
 import type { GatewayClient } from "../gatewayClient.js";
+import type {
+  SessionArchiveParams,
+  SessionArchiveResponse,
+  SessionListFilter,
+} from "../gatewayTypes.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { fmtDuration } from "../lib/subagentTree.js";
 import { compactPreview } from "../lib/text.js";
@@ -20,6 +25,7 @@ import {
   buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
+  isArchivable,
   type PastSessionRow,
   reduceViewKey,
   selectedHeader,
@@ -33,17 +39,28 @@ import {
   visibleWindow,
 } from "./agentViewStore.js";
 
-/** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
-export const AGENT_VIEW_HINT =
-  "↑↓ select · ⏎/→ open · c collapse · x stop · tab/type compose · ←/esc back";
+/**
+ * The list hint names the one row action that applies to the selection: x stops a live row, a archives an earlier
+ * session, u restores an archived one. One slot rather than all three keeps the full hint inside 80 columns.
+ */
+const listHint = (action: string) =>
+  `↑↓ select · ⏎/→ open · c collapse · ${action} · tab/type compose · ←/esc back`;
 /** The list hint on a pane too narrow for the full one. */
-export const AGENT_VIEW_HINT_SHORT =
-  "↑↓ ⏎ open · c collapse · x stop · tab compose · esc back";
+const listHintShort = (action: string) =>
+  `↑↓ ⏎ open · c collapse · ${action} · tab compose · esc back`;
+
+/** Shown while the session list owns the keyboard (after ↑ from the composer); typed text goes back to the composer. */
+export const AGENT_VIEW_HINT = listHint("x stop");
+export const AGENT_VIEW_HINT_SHORT = listHintShort("x stop");
+/** The list hint on an earlier session, and on an archived one. */
+export const AGENT_VIEW_ARCHIVE_HINT = listHint("a archive");
+export const AGENT_VIEW_RESTORE_HINT = listHint("u restore");
 /** Shown while the bottom composer owns the keyboard: the view opens this way. */
 export const AGENT_VIEW_INPUT_HINT =
   "⏎ start (empty: open) · ↑ list · esc clear/back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
+  archived: "archived",
   completed: "completed",
   input: "need input",
   working: "working",
@@ -205,6 +222,17 @@ export function AgentViewView({
     );
   };
 
+  // The hint's row action follows the selection; on a header it keeps the live rows' x stop.
+  const selRow = header ? undefined : rows[index];
+  const action =
+    selRow?.group === "archived"
+      ? "u restore"
+      : selRow && isArchivable(selRow)
+        ? "a archive"
+        : "x stop";
+  const hint =
+    cols >= listHint(action).length ? listHint(action) : listHintShort(action);
+
   // The bottom composer, like the one in the main view: starts a session, runs a
   // /command. Focus state lives in `nav.focus`, not in the input: the composer has
   // it on open, ↑ hands it to the list, tab or typing hands it back.
@@ -285,11 +313,7 @@ export function AgentViewView({
       {renderNewPrompt()}
       {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
-        {nav.focus === "input"
-          ? AGENT_VIEW_INPUT_HINT
-          : cols >= AGENT_VIEW_HINT.length
-            ? AGENT_VIEW_HINT
-            : AGENT_VIEW_HINT_SHORT}
+        {nav.focus === "input" ? AGENT_VIEW_INPUT_HINT : hint}
       </Text>
     </Box>
   );
@@ -319,7 +343,11 @@ export function AgentViewPane({
   const { info, sid, theme } = useStore($uiState);
   const sessions = useStore($stripSessions);
   const subagents = useAgentRoster();
-  const [past, setPast] = useState<PastSessionRow[]>([]);
+  // Both lists land together, so no frame shows a just-archived row in neither group or in both.
+  const [lists, setLists] = useState<{
+    archived: PastSessionRow[];
+    past: PastSessionRow[];
+  }>({ archived: [], past: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   // The composer has the keyboard from the start: the view opens ready to type a prompt; ↑ reaches the list.
@@ -349,54 +377,87 @@ export function AgentViewPane({
     setNav((prev) => ({ ...prev, draft }));
   };
 
-  useEffect(() => {
-    let stopped = false;
+  // Each load gets a number; only the latest one's answer is applied, and none after the view has closed.
+  const loadSeq = useRef(0);
+  const closed = useRef(false);
 
+  useEffect(
+    () => () => {
+      closed.current = true;
+    },
+    [],
+  );
+
+  // On open and again after an archive or a restore: the earlier sessions and the archived ones, fetched together.
+  const loadLists = useCallback(() => {
+    const seq = ++loadSeq.current;
+    const current = () => !closed.current && seq === loadSeq.current;
     // The gateway filters by project (`cwd`) before applying the limit; buildViewRows re-checks it.
-    gw.request<SessionListResult>("session.list", {
+    const params: SessionListFilter = {
       ...(currentCwd ? { cwd: currentCwd } : {}),
       limit: 50,
-    })
-      .then((raw) => {
-        if (stopped) {
+    };
+
+    void Promise.all([
+      gw.request<SessionListResult>("session.list", { ...params }),
+      // An older core rejects `archived`, or ignores it and answers with the unarchived list again: either way the view
+      // keeps working with no Archived group (only rows that carry an `archived_at` count as archived).
+      gw
+        .request<SessionListResult>("session.list", {
+          ...params,
+          archived: true,
+        })
+        .catch(() => null),
+    ])
+      .then(([raw, rawArchived]) => {
+        if (!current()) {
           return;
         }
 
         const r = asRpcResult<SessionListResult>(raw);
 
-        if (r) {
-          setPast(r.sessions ?? []);
-        } else {
+        if (!r) {
           setError("invalid response: session.list");
+
+          return;
         }
+
+        const archived = (asRpcResult<SessionListResult>(rawArchived)
+          ?.sessions ?? []) as PastSessionRow[];
+
+        setLists({
+          archived: archived.filter((h) => h.archived_at != null),
+          past: r.sessions ?? [],
+        });
       })
       .catch((e: unknown) => {
-        if (!stopped) {
+        if (current()) {
           setError(rpcErrorMessage(e));
         }
       })
       .finally(() => {
-        if (!stopped) {
+        if (current()) {
           setLoading(false);
         }
       });
-
-    return () => {
-      stopped = true;
-    };
   }, [currentCwd, gw]);
+
+  useEffect(() => {
+    loadLists();
+  }, [loadLists]);
 
   const rows = useMemo(
     () =>
       buildViewRows({
+        archived: lists.archived,
         currentCwd,
         currentSid: sid,
         nowMs: now,
-        past,
+        past: lists.past,
         sessions,
         subagents,
       }),
-    [currentCwd, now, past, sessions, sid, subagents],
+    [currentCwd, lists, now, sessions, sid, subagents],
   );
   const nav: ViewNav = {
     ...navState,
@@ -418,6 +479,33 @@ export function AgentViewPane({
     return () => clearInterval(timer);
   }, [working]);
 
+  // Archive (or restore) one stored session, then reload both lists so the row shows up in its new group. A session the
+  // gateway skips says why instead of the key doing nothing.
+  const setArchived = (row: ViewRow, archived: boolean) => {
+    const params: SessionArchiveParams = { archived, session_ids: [row.id] };
+
+    gw.request<SessionArchiveResponse>("session.archive", { ...params })
+      .then((raw) => {
+        if (closed.current) {
+          return;
+        }
+
+        const skipped = asRpcResult<SessionArchiveResponse>(raw)?.skipped?.[0];
+
+        setError(
+          skipped
+            ? `${archived ? "not archived" : "not restored"}: ${skipped.reason}`
+            : null,
+        );
+        loadLists();
+      })
+      .catch((e: unknown) => {
+        if (!closed.current) {
+          setError(rpcErrorMessage(e));
+        }
+      });
+  };
+
   const apply = (r: ReturnType<typeof reduceViewKey>) => {
     // The composer's TextInput owns the draft (its onChange/onSubmit run before this handler on the same key); only an
     // explicit change by the reducer (Esc clearing it, a key typed on the list) replaces it, so a stale copy never
@@ -434,6 +522,10 @@ export function AgentViewPane({
         return onActivate(r.effect.row);
       case "stop":
         return onStop(r.effect.row);
+      case "archive":
+        return setArchived(r.effect.row, true);
+      case "unarchive":
+        return setArchived(r.effect.row, false);
       case "close":
         return onClose();
     }

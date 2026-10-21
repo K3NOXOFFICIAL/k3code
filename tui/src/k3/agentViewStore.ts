@@ -8,15 +8,18 @@ import type { SubagentProgress } from "../types.js";
 import { buildStripRows, sessionRow } from "./agentStrip.js";
 import type { StripRow, StripState } from "./agentStripStore.js";
 
-export type ViewGroup = "completed" | "input" | "working";
+export type ViewGroup = "archived" | "completed" | "input" | "working";
 
+/** Archived comes last: it is put-away history, below everything the user may still act on. */
 export const VIEW_GROUPS: readonly ViewGroup[] = [
   "input",
   "working",
   "completed",
+  "archived",
 ];
 
 export const VIEW_GROUP_LABEL: Record<ViewGroup, string> = {
+  archived: "Archived",
   completed: "Completed",
   input: "Needs input",
   working: "Working",
@@ -30,8 +33,16 @@ export interface ViewRow extends Omit<StripRow, "kind"> {
   model?: string;
 }
 
-/** `session.list` row. The k3code gateway adds `cwd` (null when unknown); the generated Hermes contract lacks it. */
-export type PastSessionRow = SessionListRow & { cwd?: null | string };
+/**
+ * `session.list` row. The k3code gateway adds `cwd` (null when unknown), `updated_at` (last activity, epoch s) and
+ * `archived_at` (epoch s, null when not archived); the generated Hermes contract lacks them, and an older core omits the
+ * last two.
+ */
+export type PastSessionRow = SessionListRow & {
+  archived_at?: null | number;
+  cwd?: null | string;
+  updated_at?: number;
+};
 
 /** Idle, done and failed all land in Completed; each row keeps its own glyph. */
 const groupOf = (state: StripState): ViewGroup =>
@@ -45,6 +56,7 @@ const noTurnYet = (status: string, messageCount: number | undefined) =>
   (status === "idle" || status === "new") && messageCount === 0;
 
 export function buildViewRows({
+  archived = [],
   currentCwd,
   currentSid,
   nowMs,
@@ -52,6 +64,8 @@ export function buildViewRows({
   sessions,
   subagents,
 }: {
+  /** Archived stored sessions (`session.list` with `archived: true`); they fill the Archived group. */
+  archived?: readonly PastSessionRow[];
   currentCwd?: string;
   currentSid: null | string;
   nowMs: number;
@@ -87,31 +101,38 @@ export function buildViewRows({
   const liveRows = cur ? [live(sessionRow(cur, nowMs), true), ...strip] : strip;
 
   // A past session only belongs here when it ran in this project; rows without a cwd cannot be placed, so they stay out.
-  const pastRows: ViewRow[] = (
-    resumableHistory(past, sessions) as PastSessionRow[]
-  )
-    // An empty stored session (opened, never used) is noise, not history.
-    .filter((h) => h.message_count !== 0)
-    .filter((h) => !!h.cwd && h.cwd === currentCwd)
-    .map((h, i) => ({ h, i }))
-    .sort((a, b) => (b.h.started_at ?? 0) - (a.h.started_at ?? 0) || a.i - b.i)
-    .map(({ h }) => ({
-      activity: h.preview?.trim() ?? "",
-      current: false,
-      elapsedSeconds: null,
-      group: "completed",
-      id: h.id,
-      key: `past:${h.id}`,
-      kind: "past",
-      lastActive: h.started_at ?? null,
-      state: "done",
-      title: h.title?.trim() || h.preview?.trim() || h.id.slice(0, 8),
-    }));
+  // Archived ones go through the same filters; only their group differs (archived is not a state, so not `groupOf`).
+  const pastRows = (
+    list: readonly PastSessionRow[],
+    group: ViewGroup,
+  ): ViewRow[] =>
+    (resumableHistory(list, sessions) as PastSessionRow[])
+      // An empty stored session (opened, never used) is noise, not history.
+      .filter((h) => h.message_count !== 0)
+      .filter((h) => !!h.cwd && h.cwd === currentCwd)
+      .map((h, i) => ({ h, i }))
+      .sort(
+        (a, b) => (b.h.started_at ?? 0) - (a.h.started_at ?? 0) || a.i - b.i,
+      )
+      .map(({ h }) => ({
+        activity: h.preview?.trim() ?? "",
+        current: false,
+        elapsedSeconds: null,
+        group,
+        id: h.id,
+        key: `past:${h.id}`,
+        kind: "past",
+        // When it was last used, not when it was created: a session resumed today is not "3d ago".
+        lastActive: h.updated_at ?? h.started_at ?? null,
+        state: "done",
+        title: h.title?.trim() || h.preview?.trim() || h.id.slice(0, 8),
+      }));
 
-  // Earlier sessions close the Completed group, after the live rows.
+  // Earlier sessions close the Completed group, after the live rows; the archived ones follow in their own group.
   return [
     ...VIEW_GROUPS.flatMap((g) => liveRows.filter((r) => r.group === g)),
-    ...pastRows,
+    ...pastRows(past, "completed"),
+    ...pastRows(archived, "archived"),
   ];
 }
 
@@ -130,8 +151,9 @@ export interface ViewNav {
   header: null | ViewGroup;
 }
 
+// Archived starts collapsed on every open: its header says how many there are, its rows stay out of the way.
 export const IDLE_VIEW_NAV: ViewNav = {
-  collapsedGroups: [],
+  collapsedGroups: ["archived"],
   confirmKey: null,
   draft: "",
   focus: "list",
@@ -157,7 +179,8 @@ export type ViewKey = {
 };
 
 export type ViewEffect =
-  { row: ViewRow; type: "activate" | "stop" } | { type: "close" };
+  | { row: ViewRow; type: "activate" | "archive" | "stop" | "unarchive" }
+  | { type: "close" };
 
 /**
  * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
@@ -268,8 +291,12 @@ export function toggleGroup(
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);
 
-/** Letters the list acts on while it has the keyboard: c collapse, x stop, n new (compose). */
-const LIST_HOTKEYS = ["c", "n", "x"];
+/** An earlier session can be archived; one in the Archived group can be restored. Live rows can be neither. */
+export const isArchivable = (row: ViewRow) =>
+  row.kind === "past" && row.group !== "archived";
+
+/** Letters the list acts on while it has the keyboard: a archive, c collapse, n new (compose), u restore, x stop. */
+const LIST_HOTKEYS = ["a", "c", "n", "u", "x"];
 
 /** Pure key reducer for the full-screen view; it owns the screen, so every key is consumed. */
 export function reduceViewKey(
@@ -359,12 +386,12 @@ export function reduceViewKey(
         : !header && it.index === index,
     ),
   );
-  const move = (to: number) => {
+  const move = (to: number, effect: null | ViewEffect = null) => {
     const it = items[Math.max(0, Math.min(items.length - 1, to))]!;
 
     return it.type === "row"
-      ? done(null, { header: null, index: it.index })
-      : done(null, {
+      ? done(effect, { header: null, index: it.index })
+      : done(effect, {
           header: it.group,
           index: rows.findIndex((r) => r.group === it.group),
         });
@@ -409,6 +436,28 @@ export function reduceViewKey(
 
   if (ch === "x" && isStoppable(row)) {
     return done(null, { confirmKey: row.key });
+  }
+
+  // a and u move the row to the other group once the list is refetched. The cursor steps off it now, so it does not
+  // follow the row into a collapsed group where nothing shows it: onto the next row of the same group, else the item
+  // above. Reversible, so no confirmation.
+  if (
+    (ch === "a" && isArchivable(row)) ||
+    (ch === "u" && row.group === "archived")
+  ) {
+    const effect: ViewEffect = {
+      row,
+      type: ch === "a" ? "archive" : "unarchive",
+    };
+    const next = items[at + 1];
+    const to =
+      next?.type === "row" && rows[next.index]!.group === row.group
+        ? at + 1
+        : at > 0
+          ? at - 1
+          : at + 1;
+
+    return items[to] ? move(to, effect) : done(effect);
   }
 
   // c collapses the selected row's group; the selection moves to its header.

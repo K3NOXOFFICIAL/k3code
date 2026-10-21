@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildLines,
   buildViewRows,
   IDLE_VIEW_NAV,
+  navItems,
   type PastSessionRow,
   reduceViewKey,
   selectedIndex,
@@ -321,6 +323,58 @@ describe("buildViewRows", () => {
 
     expect(rows.map((r) => r.key)).toEqual(["session:w1", "past:p1"]);
   });
+
+  it("puts archived sessions in the Archived group, last, newest first, through the same filters", () => {
+    const rows = build({
+      archived: [
+        past("a-old", 100),
+        past("a-new", 300),
+        past("a-other", 400, "/work/elsewhere"),
+        { ...past("a-empty", 500), message_count: 0 },
+        past("w1", 600),
+      ],
+      past: [past("p1", 50)],
+      sessions: [{ id: "w1", status: "working" }],
+    });
+
+    expect(rows.map((r) => [r.key, r.group])).toEqual([
+      ["session:w1", "working"],
+      ["past:p1", "completed"],
+      ["past:a-new", "archived"],
+      ["past:a-old", "archived"],
+    ]);
+    expect(rows.at(-1)).toMatchObject({
+      current: false,
+      kind: "past",
+      state: "done",
+      title: "past a-old",
+    });
+  });
+
+  it("shows the Archived header only when there are archived rows", () => {
+    const headers = (rows: ViewRow[]) =>
+      buildLines(rows, IDLE_VIEW_NAV.collapsedGroups)
+        .filter((l) => l.type === "header")
+        .map((l) => (l.type === "header" ? l.group : null));
+
+    expect(headers(build({ past: [past("p1", 1)] }))).toEqual(["completed"]);
+    expect(
+      headers(build({ archived: [past("a1", 1)], past: [past("p1", 1)] })),
+    ).toEqual(["completed", "archived"]);
+  });
+
+  it("dates a past row by its last activity (updated_at), falling back to its creation", () => {
+    const rows = build({
+      archived: [{ ...past("a1", 100), updated_at: 900 }],
+      past: [{ ...past("p1", 200), updated_at: 800 }, past("p2", 150)],
+    });
+
+    expect(rows.map((r) => [r.id, r.lastActive])).toEqual([
+      ["p1", 800],
+      ["p2", 150],
+      ["a1", 900],
+    ]);
+  });
 });
 
 const vrow = (id: string, over: Partial<ViewRow> = {}): ViewRow => ({
@@ -373,7 +427,7 @@ describe("collapsible groups", () => {
 
     expect(r.effect).toBeNull();
     expect(r.nav).toMatchObject({
-      collapsedGroups: ["working"],
+      collapsedGroups: ["archived", "working"],
       header: "working",
     });
   });
@@ -406,7 +460,7 @@ describe("collapsible groups", () => {
 
   it("a header click collapses another group without moving the selection", () => {
     expect(toggleGroup(at(0), G, "working")).toMatchObject({
-      collapsedGroups: ["working"],
+      collapsedGroups: ["archived", "working"],
       header: null,
       index: 0,
     });
@@ -415,6 +469,119 @@ describe("collapsible groups", () => {
       header: null,
       index: 1,
     });
+  });
+});
+
+describe("archive and restore", () => {
+  // Working: cur, s1 · Completed: p1, p2 (earlier sessions) · Archived: x1, x2
+  const pastRow = (id: string, group: "archived" | "completed") =>
+    vrow(id, { group, key: `past:${id}`, kind: "past", state: "done" });
+  const A: ViewRow[] = [
+    vrow("cur", { current: true }),
+    vrow("s1"),
+    pastRow("p1", "completed"),
+    pastRow("p2", "completed"),
+    pastRow("x1", "archived"),
+    pastRow("x2", "archived"),
+  ];
+  // The Archived group opened, so its rows can be selected.
+  const open = (index: number): ViewNav => ({
+    ...IDLE_VIEW_NAV,
+    collapsedGroups: [],
+    index,
+  });
+
+  it("starts with Archived collapsed: its rows hidden, its header selectable, c expands it", () => {
+    expect(IDLE_VIEW_NAV.collapsedGroups).toEqual(["archived"]);
+
+    const lines = buildLines(A, IDLE_VIEW_NAV.collapsedGroups);
+
+    expect(lines.at(-1)).toEqual({ group: "archived", type: "header" });
+    expect(
+      lines.some((l) => l.type === "row" && l.row.group === "archived"),
+    ).toBe(false);
+    expect(navItems(A, IDLE_VIEW_NAV.collapsedGroups).at(-1)).toEqual({
+      group: "archived",
+      type: "header",
+    });
+
+    const onHeader = press(at(3), { down: true }, A).nav;
+
+    expect(onHeader).toMatchObject({ header: "archived", index: 4 });
+    expect(press(onHeader, { ch: "c" }, A).nav).toMatchObject({
+      collapsedGroups: [],
+      header: null,
+      index: 4,
+    });
+  });
+
+  it("a archives an earlier session and u restores an archived one, the cursor stepping to a neighbour", () => {
+    // The next row of the same group, else the item above: never the row that is leaving.
+    for (const [nav, ch, row, type, index] of [
+      [open(2), "a", A[2], "archive", 3],
+      [open(3), "a", A[3], "archive", 2],
+      [at(3), "a", A[3], "archive", 2],
+      [open(4), "u", A[4], "unarchive", 5],
+      [open(5), "u", A[5], "unarchive", 4],
+    ] as const) {
+      const r = press(nav, { ch }, A);
+
+      expect(r.effect).toEqual({ row, type });
+      expect(r.nav).toEqual({ ...nav, header: null, index });
+    }
+
+    // On the only row there is nowhere to step to: the cursor stays.
+    const lone = [A[2]!];
+
+    expect(press(open(0), { ch: "a" }, lone)).toEqual({
+      consumed: true,
+      effect: { row: A[2], type: "archive" },
+      nav: open(0),
+    });
+  });
+
+  it("a and u do nothing on rows they do not apply to, on a header, or with a stop pending", () => {
+    const onHeader: ViewNav = { ...at(4), header: "archived" };
+
+    for (const [nav, ch] of [
+      [open(0), "a"], // this session
+      [open(1), "a"], // a live session
+      [open(4), "a"], // already archived
+      [open(1), "u"], // a live session
+      [open(2), "u"], // an earlier session that is not archived
+      [onHeader, "a"],
+      [onHeader, "u"],
+    ] as const) {
+      const r = press(nav, { ch }, A);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual(nav);
+    }
+
+    const agentRows = [vrow("a1", { key: "agent:a1", kind: "agent" })];
+
+    expect(press(open(0), { ch: "a" }, agentRows).effect).toBeNull();
+
+    // A pending stop is cancelled by a and u, like by any other key, and nothing is archived.
+    const ask = press(open(1), { ch: "x" }, A).nav;
+
+    for (const ch of ["a", "u"]) {
+      const r = press(ask, { ch }, A);
+
+      expect(r.effect).toBeNull();
+      expect(r.nav).toEqual(open(1));
+    }
+  });
+
+  it("a and u are list commands: they are not typed into the composer", () => {
+    for (const ch of ["a", "u"]) {
+      for (const index of [1, 2, 4]) {
+        const r = press(open(index), { ch }, A);
+
+        expect(r.nav.focus).toBe("list");
+        expect(r.nav.draft).toBe("");
+      }
+    }
   });
 });
 

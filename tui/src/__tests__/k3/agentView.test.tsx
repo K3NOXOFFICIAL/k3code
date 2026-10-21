@@ -8,8 +8,10 @@ import { describe, expect, it, vi } from "vitest";
 import { patchUiState, resetUiState } from "../../app/uiStore.js";
 import type { GatewayClient } from "../../gatewayClient.js";
 import {
+  AGENT_VIEW_ARCHIVE_HINT,
   AGENT_VIEW_HINT,
   AGENT_VIEW_INPUT_HINT,
+  AGENT_VIEW_RESTORE_HINT,
   AgentViewPane,
   AgentViewView,
 } from "../../k3/agentView.js";
@@ -190,6 +192,65 @@ describe("AgentViewView", () => {
     expect(dump([row(1)], { error: "could not load" })).toContain(
       "could not load",
     );
+  });
+
+  it("shows Archived collapsed by default: ▸, its count and no rows; opened, its rows follow the header", () => {
+    const archivedRow = (n: number, title: string) =>
+      row(n, {
+        elapsedSeconds: null,
+        group: "archived",
+        key: `past:id${n}`,
+        kind: "past",
+        state: "done",
+        title,
+      });
+    const rows = [
+      ...mixed(),
+      archivedRow(7, "put away"),
+      archivedRow(8, "old"),
+    ];
+
+    const shut = dump(rows, {}, { ...IDLE_VIEW_NAV, index: 1 });
+
+    expect(shut.split("\n")[0]).toContain(
+      "1 need input · 2 working · 3 completed · 2 archived",
+    );
+    expect(shut).toMatch(/▸ Archived {2}2/);
+    expect(shut).not.toContain("put away");
+    expect(shut.indexOf("· older work")).toBeLessThan(shut.indexOf("Archived"));
+
+    const opened = dump(rows, {}, { ...IDLE_VIEW_NAV, collapsedGroups: [] });
+
+    expect(opened).toMatch(/▾ Archived {2}2/);
+    expect(opened.indexOf("Archived")).toBeLessThan(
+      opened.indexOf("· put away"),
+    );
+  });
+
+  it("names the row action that applies in the hint, each inside 80 columns", () => {
+    const rows = [
+      row(1),
+      row(2, { group: "completed", key: "past:id2", kind: "past" }),
+      row(3, { group: "archived", key: "past:id3", kind: "past" }),
+    ];
+    const hint = (index: number) =>
+      dump(rows, { cols: 79 }, { ...IDLE_VIEW_NAV, collapsedGroups: [], index })
+        .split("\n")
+        .at(-1);
+
+    expect(hint(0)).toBe(AGENT_VIEW_HINT);
+    expect(hint(1)).toBe(AGENT_VIEW_ARCHIVE_HINT);
+    expect(hint(2)).toBe(AGENT_VIEW_RESTORE_HINT);
+    expect(AGENT_VIEW_ARCHIVE_HINT).toContain("a archive");
+    expect(AGENT_VIEW_RESTORE_HINT).toContain("u restore");
+
+    for (const h of [
+      AGENT_VIEW_HINT,
+      AGENT_VIEW_ARCHIVE_HINT,
+      AGENT_VIEW_RESTORE_HINT,
+    ]) {
+      expect(h.length).toBeLessThanOrEqual(79);
+    }
   });
 
   it("scrolls long lists inside `height`, keeping the selection visible", () => {
@@ -843,5 +904,225 @@ describe("AgentViewPane", () => {
       view.cleanup();
       resetUiState();
     }
+  });
+
+  describe("archiving", () => {
+    const CWD = "/work/proj";
+    const nowS = Date.now() / 1000;
+    const STORED = [
+      { id: "p1", started_at: nowS - DAY, title: "first work" },
+      { id: "p2", started_at: nowS - 2 * DAY, title: "second work" },
+      { id: "x1", started_at: nowS - 3 * DAY, title: "put away" },
+    ].map((s) => ({ ...s, cwd: CWD, message_count: 3 }));
+
+    /** A gateway that keeps the archived set, answering `session.list` and `session.archive` by the contract. */
+    const archiveGateway = ({ failArchived = false } = {}) => {
+      const archivedIds = new Set(["x1"]);
+
+      return vi.fn((method: string, params: Record<string, unknown> = {}) => {
+        if (method === "session.list") {
+          if (params.archived && failArchived) {
+            return Promise.reject(new Error("unknown param: archived"));
+          }
+
+          return Promise.resolve({
+            sessions: STORED.filter(
+              (s) => archivedIds.has(s.id) === !!params.archived,
+            ).map((s) => ({
+              ...s,
+              archived_at: archivedIds.has(s.id) ? nowS : null,
+            })),
+          });
+        }
+
+        if (method === "session.archive") {
+          for (const id of params.session_ids as string[]) {
+            if (params.archived === false) {
+              archivedIds.delete(id);
+            } else {
+              archivedIds.add(id);
+            }
+          }
+
+          return Promise.resolve({
+            archived: (params.session_ids as string[]).length,
+            skipped: [],
+          });
+        }
+
+        return Promise.resolve(null);
+      });
+    };
+
+    const mountPane = (request: ReturnType<typeof archiveGateway>) => {
+      resetUiState();
+      patchUiState({
+        info: { cwd: CWD, model: "test", skills: {}, tools: {} },
+        sid: "cur",
+      });
+
+      const stdin = Object.assign(new PassThrough(), {
+        isTTY: true,
+        ref: () => {},
+        setRawMode: () => {},
+        unref: () => {},
+      });
+      const stdout = Object.assign(new PassThrough(), {
+        columns: 90,
+        isTTY: false,
+        rows: 30,
+      });
+      const frames: string[] = [];
+
+      stdout.on("data", (c) => frames.push(stripAnsi(c.toString())));
+
+      const view = renderSync(
+        <AgentViewPane
+          gw={{ request } as unknown as GatewayClient}
+          onActivate={() => {}}
+          onClose={() => {}}
+          onNewPrompt={() => {}}
+          onStop={() => {}}
+        />,
+        {
+          patchConsole: false,
+          stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+          stdin: stdin as unknown as NodeJS.ReadStream,
+          stdout: stdout as unknown as NodeJS.WriteStream,
+        },
+      );
+
+      return {
+        close: () => {
+          view.unmount();
+          view.cleanup();
+          resetUiState();
+        },
+        // A whole frame starts with the view's header; other writes are terminal control (cursor shape and the like).
+        lastFrame: () =>
+          frames.filter((f) => f.includes("Agents")).at(-1) ?? "",
+        stdin,
+      };
+    };
+
+    const listCalls = (request: ReturnType<typeof archiveGateway>) =>
+      request.mock.calls.filter(([m]) => m === "session.list");
+
+    it("a archives the selected earlier session, refetches both lists and the row moves under Archived; u restores it", async () => {
+      const request = archiveGateway();
+      const pane = mountPane(request);
+
+      try {
+        await waitFor(() => {
+          expect(pane.lastFrame()).toContain("› · first work");
+          expect(pane.lastFrame()).toMatch(/▸ Archived {2}1/);
+        });
+        expect(pane.lastFrame()).not.toContain("put away");
+        expect(listCalls(request).map(([, p]) => p)).toEqual([
+          { cwd: CWD, limit: 50 },
+          { archived: true, cwd: CWD, limit: 50 },
+        ]);
+
+        pane.stdin.write("\x1b[A"); // the list takes the keyboard
+        await waitFor(() =>
+          expect(pane.lastFrame()).toContain(AGENT_VIEW_ARCHIVE_HINT),
+        );
+        pane.stdin.write("a");
+        await waitFor(() =>
+          expect(pane.lastFrame()).toMatch(/▸ Archived {2}2/),
+        );
+        expect(request).toHaveBeenCalledWith("session.archive", {
+          archived: true,
+          session_ids: ["p1"],
+        });
+        expect(listCalls(request)).toHaveLength(4);
+        expect(
+          listCalls(request)
+            .slice(2)
+            .map(([, p]) => p),
+        ).toEqual([
+          { cwd: CWD, limit: 50 },
+          { archived: true, cwd: CWD, limit: 50 },
+        ]);
+        // The cursor stayed in view, on the row that was next to the archived one.
+        expect(pane.lastFrame()).not.toContain("first work");
+        expect(pane.lastFrame()).toContain("› · second work");
+
+        // ↓ onto the Archived header, c opens it onto its first (newest) row.
+        pane.stdin.write("\x1b[B");
+        await waitFor(() =>
+          expect(pane.lastFrame()).not.toContain("› · second work"),
+        );
+        pane.stdin.write("c");
+        await waitFor(() =>
+          expect(pane.lastFrame()).toMatch(/▾ Archived {2}2/),
+        );
+
+        const opened = pane.lastFrame();
+
+        expect(opened).toContain("› · first work");
+        expect(opened.indexOf("Archived")).toBeLessThan(
+          opened.indexOf("first work"),
+        );
+        expect(opened.indexOf("first work")).toBeLessThan(
+          opened.indexOf("put away"),
+        );
+        expect(opened).toContain(AGENT_VIEW_RESTORE_HINT);
+
+        pane.stdin.write("u");
+        await waitFor(() =>
+          expect(pane.lastFrame()).toMatch(/▾ Archived {2}1/),
+        );
+        expect(request).toHaveBeenCalledWith("session.archive", {
+          archived: false,
+          session_ids: ["p1"],
+        });
+        expect(listCalls(request)).toHaveLength(6);
+
+        const restored = pane.lastFrame();
+
+        expect(restored.indexOf("first work")).toBeLessThan(
+          restored.indexOf("Archived"),
+        );
+        expect(restored).toContain("› · put away");
+      } finally {
+        pane.close();
+      }
+    });
+
+    it("still lists the earlier sessions when the archived request fails (an older core)", async () => {
+      const request = archiveGateway({ failArchived: true });
+      const pane = mountPane(request);
+
+      try {
+        await waitFor(() => {
+          expect(pane.lastFrame()).toContain("first work");
+          expect(pane.lastFrame()).toContain("second work");
+        });
+        expect(listCalls(request)).toHaveLength(2);
+
+        const out = pane.lastFrame();
+
+        expect(out).not.toContain("Archived");
+        expect(out).not.toContain("unknown param");
+        expect(out).not.toContain("loading");
+      } finally {
+        pane.close();
+      }
+    });
+
+    it("counts no row as archived without an archived_at (an older core that ignores the param)", async () => {
+      const request = vi.fn(() =>
+        Promise.resolve({ sessions: STORED.slice(0, 1) }),
+      );
+      const pane = mountPane(request as ReturnType<typeof archiveGateway>);
+
+      try {
+        await waitFor(() => expect(pane.lastFrame()).toContain("first work"));
+        expect(pane.lastFrame()).not.toContain("Archived");
+      } finally {
+        pane.close();
+      }
+    });
   });
 });
