@@ -11,6 +11,7 @@ import {
 
 const snap: SettingsSnapshot = {
   agentsView: false,
+  archiveDays: 14,
   busy: "queue",
   compact: false,
   details: "collapsed",
@@ -151,5 +152,81 @@ describe("settings panel theme row", () => {
     );
 
     expect(theme?.options).toEqual(["auto", "light", "dark"]);
+  });
+});
+
+describe("settings panel archive row", () => {
+  const local = {
+    agentsView: false,
+    busy: "queue",
+    compact: false,
+    details: "expanded",
+    indicator: "kaomoji",
+    indicators: ["kaomoji"],
+    mouse: true,
+    retryForever: false,
+    showReasoning: false,
+    statusBar: "top",
+  };
+  const row = (s: SettingsSnapshot) =>
+    buildSettingsItems(s).find((i) => i.id === "archive_days")!;
+
+  it("shows core's 14 days until a threshold is saved", () => {
+    expect(row(snap).value).toBe("14 days");
+    expect(settingsSnapshot({}, local).archiveDays).toBe(14);
+    expect(
+      settingsSnapshot({}, { ...local, archiveDays: 30 }).archiveDays,
+    ).toBe(30);
+    expect(
+      settingsSnapshot({}, { ...local, archiveDays: -1 }).archiveDays,
+    ).toBe(14);
+    expect(
+      settingsSnapshot({}, { ...local, archiveDays: Number.NaN }).archiveDays,
+    ).toBe(14);
+  });
+
+  it("reads 0 as off and keeps a hand-set value selectable", () => {
+    expect(row({ ...snap, archiveDays: 0 }).value).toBe("off");
+    expect(row({ ...snap, archiveDays: 1 }).value).toBe("1 day");
+
+    const odd = row({ ...snap, archiveDays: 21 });
+
+    expect(odd.value).toBe("21 days");
+    expect(odd.options).toContain("21 days");
+  });
+
+  it("sets the retention key core reads, 0 for off", () => {
+    const item = row(snap);
+
+    expect(item.options).toEqual([
+      "off",
+      "7 days",
+      "14 days",
+      "30 days",
+      "90 days",
+    ]);
+    expect(item.command("30 days")).toBe(
+      "/config set retention.session_archive_days 30",
+    );
+    expect(item.command("off")).toBe(
+      "/config set retention.session_archive_days 0",
+    );
+  });
+
+  it("cycles from the panel to the next threshold", () => {
+    let s = initSettingsState(snap);
+
+    for (const ch of ["/", "a", "r", "c", "h", "i", "v", "e"]) {
+      s = settingsKey(s, ch, {}).state;
+    }
+
+    s = settingsKey(s, "", { return: true }).state;
+
+    expect(settingsKey(s, "", { rightArrow: true }).action).toEqual({
+      command: "/config set retention.session_archive_days 30",
+      id: "archive_days",
+      type: "apply",
+      value: "30 days",
+    });
   });
 });

@@ -65,6 +65,13 @@ export function SettingsPanel({
       .request<{ value?: unknown }>("config.get", { key: "theme" })
       .then((r) => String(asRpcResult(r)?.value ?? ""))
       .catch(() => "");
+    // Unset (null) or unreadable shows core's default: the row never blocks the panel either.
+    const archive = gw
+      .request<{ value?: unknown }>("config.get", {
+        key: "retention.session_archive_days",
+      })
+      .then((r) => asRpcResult(r)?.value)
+      .catch(() => undefined);
 
     Promise.all([
       gw.request<unknown>(
@@ -72,14 +79,16 @@ export function SettingsPanel({
         sessionId ? { session_id: sessionId } : {},
       ),
       pin,
+      archive,
     ])
-      .then(([raw, theme]) => {
+      .then(([raw, theme, days]) => {
         if (!current) {
           return;
         }
 
         const snap: SettingsSnapshot = settingsSnapshot(asRpcResult(raw), {
           ...localRef.current,
+          ...(typeof days === "number" ? { archiveDays: days } : {}),
           theme,
         });
 

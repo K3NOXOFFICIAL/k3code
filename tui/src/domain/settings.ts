@@ -28,6 +28,8 @@ export interface SettingItem {
 export interface SettingsSnapshot {
   /** "Start k3code in agent view" (display.tui_start_agents_view). */
   agentsView: boolean;
+  /** Days untouched before the agent view proposes archiving a session (retention.session_archive_days); 0 = never. */
+  archiveDays: number;
   busy: string;
   compact: boolean;
   details: string;
@@ -56,6 +58,16 @@ const uniq = (xs: string[], cur: string) =>
   xs.includes(cur) ? xs : [...xs, cur].filter(Boolean);
 
 const onoff = (b: boolean) => (b ? "on" : "off");
+
+/** What core uses while `retention.session_archive_days` is unset. */
+export const ARCHIVE_DAYS_DEFAULT = 14;
+const ARCHIVE_AFTER = ["off", "7 days", "14 days", "30 days", "90 days"];
+
+const archiveLabel = (days: number) =>
+  days > 0 ? `${days} day${days === 1 ? "" : "s"}` : "off";
+
+/** "30 days" -> 30; "off" -> 0, which core reads as "never propose". */
+const archiveDays = (label: string) => Number.parseInt(label, 10) || 0;
 
 export function buildSettingsItems(s: SettingsSnapshot): SettingItem[] {
   const item = (
@@ -209,6 +221,15 @@ export function buildSettingsItems(s: SettingsSnapshot): SettingItem[] {
       (v) => `/config set reliability.retry_forever ${v}`,
       "Don't stop until goal verified: on error fail over then retry forever",
       "bool",
+    ),
+    item(
+      "Sessions",
+      "archive_days",
+      "Archive idle sessions after",
+      archiveLabel(s.archiveDays),
+      ARCHIVE_AFTER,
+      (v) => `/config set retention.session_archive_days ${archiveDays(v)}`,
+      "The agent view offers to archive sessions left untouched this long",
     ),
   ];
 }
@@ -459,6 +480,8 @@ export function settingsSnapshot(
     | "showReasoning"
     | "statusBar"
   > & {
+    /** The saved `retention.session_archive_days` (config.get); absent or unreadable = core's default. */
+    archiveDays?: number;
     effort?: string;
     /** The saved `display.tui_theme` pin (config.get "theme"); empty = auto. */
     theme?: string;
@@ -472,6 +495,10 @@ export function settingsSnapshot(
 
   return {
     ...local,
+    archiveDays:
+      typeof local.archiveDays === "number" && local.archiveDays >= 0
+        ? Math.floor(local.archiveDays)
+        : ARCHIVE_DAYS_DEFAULT,
     retryForever: !!local.retryForever,
     effort: str(v.effort, local.effort ?? "default"),
     model: str(v.model_key),
