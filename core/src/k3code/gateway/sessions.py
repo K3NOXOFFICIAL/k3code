@@ -307,16 +307,17 @@ class SessionStore:
             (max(1, limit),),
         ).fetchall()
 
-    def idle_candidates(self, idle_before: float, limit: int) -> list[tuple[str, str]]:
-        """``(session_id, cwd)`` of up to ``limit`` worked-in sessions (as :meth:`worked_in`), not archived, last
-        saved before ``idle_before``, oldest first; one declined since its last save is left out ("keep, stop
-        asking" holds until the session is used again)."""
+    def idle_candidates(self, idle_before: float) -> list[tuple[str, str]]:
+        """``(session_id, cwd)`` of the worked-in sessions (as :meth:`worked_in`) not archived and last saved before
+        ``idle_before``, oldest first; one declined since its last save is left out ("keep, stop asking" holds until
+        the session is used again). Unlimited: the caller keeps one project's, and a cap on the oldest rows of every
+        project would let sessions nobody opens crowd that project out for good."""
         return self._db.execute(
             f"SELECT session_id, cwd FROM sessions WHERE {_WORKED_IN}"  # noqa: S608
             " AND archived_at IS NULL AND updated_at < ?"
             " AND (archive_declined_at IS NULL OR archive_declined_at < updated_at)"
-            " ORDER BY updated_at ASC LIMIT ?",
-            (idle_before, max(1, limit)),
+            " ORDER BY updated_at ASC",
+            (idle_before,),
         ).fetchall()
 
     def existing(self, ids: list[str]) -> set[str]:
@@ -328,17 +329,20 @@ class SessionStore:
         return {row[0] for row in rows}
 
     def set_archived(self, ids: list[str], at: float | None) -> int:
-        """Archive ``ids`` at ``at``, or restore them with None (which also forgets a declined proposal); returns how
-        many rows changed (one already in that state is not). Never touches ``updated_at``."""
+        """Archive ``ids`` at ``at``, or restore them with None; returns how many rows changed (one already in that
+        state is not). Never touches ``updated_at``.
+
+        A restore counts as "keep": the row is stamped as declined, because its idle clock did not move and the next
+        proposal would otherwise offer the session straight back."""
         if not ids:
             return 0
         marks = ",".join("?" * len(ids))
         with self._db:
             if at is None:
                 cur = self._db.execute(
-                    "UPDATE sessions SET archived_at = NULL, archive_declined_at = NULL"  # noqa: S608
-                    f" WHERE (archived_at IS NOT NULL OR archive_declined_at IS NOT NULL) AND session_id IN ({marks})",
-                    ids,
+                    "UPDATE sessions SET archived_at = NULL, archive_declined_at = ?"  # noqa: S608
+                    f" WHERE archived_at IS NOT NULL AND session_id IN ({marks})",
+                    (time.time(), *ids),
                 )
             else:
                 cur = self._db.execute(

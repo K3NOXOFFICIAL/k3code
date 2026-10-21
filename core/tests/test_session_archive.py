@@ -13,6 +13,7 @@ import m1cmd_helpers as m1
 from k3code import confio
 from k3code.automation.engine import AutomationEngine
 from k3code.config import RETENTION_DEFAULTS, retention, session_archive_days
+from k3code.gateway.server import _SESSION_LIST_SCAN_CAP
 from k3code.gateway.sessions import SessionStore
 
 DAY = 24 * 3600.0
@@ -60,10 +61,10 @@ def test_archiving_keeps_updated_at_and_a_later_save_keeps_the_flag(tmp_path):
     assert _flags(store, sid)[0] == now
     assert store.summaries([sid])[0].archived_at == now
 
-    store.decline_archive([sid], now)
     assert store.set_archived([sid], None) == 1
-    assert _flags(store, sid)[:2] == (None, None)  # a restore also forgets the declined proposal
-    assert store.set_archived([sid], None) == 0
+    restored, kept, updated_at = _flags(store, sid)
+    assert restored is None and kept is not None and kept > updated_at  # a restore counts as "keep"
+    assert store.set_archived([sid], None) == 0  # no longer archived: nothing to restore
     store.close()
 
 
@@ -147,7 +148,8 @@ async def test_attaching_to_an_archived_session_takes_it_out_of_the_archive(tmp_
     server.store.decline_archive([sid], time.time())
     server.store.set_archived([sid], time.time())
     assert "result" in await m1.rpc(server, method, {"session_id": sid})
-    assert _flags(server.store, sid)[:2] == (None, None)
+    archived_at, kept, updated_at = _flags(server.store, sid)
+    assert archived_at is None and kept is not None and kept > updated_at  # opened = in use: not proposed again
     await server.close()
 
 
@@ -245,6 +247,43 @@ async def test_a_declined_proposal_stays_declined_until_the_session_is_saved_aga
     assert (await _suggest(server, tmp_path))["total"] == 0
     _age(store, sid, now - 20 * DAY)  # used again after the decline, then left idle: asked about again
     assert [i["id"] for i in (await _suggest(server, tmp_path))["items"]] == [sid]
+    await server.close()
+
+
+async def test_a_restored_session_is_not_offered_for_archiving_again(tmp_path, monkeypatch):
+    now = time.time()
+    server = await _suggesting_server(tmp_path, monkeypatch)
+    store = server.store
+    sid = _worked(store, tmp_path, now - 40 * DAY)
+    assert (await m1.rpc(server, "session.archive", {"session_ids": [sid]}))["result"]["archived"] == 1
+    assert (await _suggest(server, tmp_path))["total"] == 0
+    restored = await m1.rpc(server, "session.archive", {"session_ids": [sid], "archived": False})
+    assert restored["result"]["archived"] == 1
+    # Restoring is the answer "keep this", and the idle clock did not move: else it is back in the very next proposal.
+    assert (await _suggest(server, tmp_path))["total"] == 0
+    assert _flags(store, sid)[2] == now - 40 * DAY
+    await server.close()
+
+
+async def test_other_projects_idle_sessions_do_not_crowd_this_one_out_of_the_proposals(tmp_path, monkeypatch):
+    now = time.time()
+    server = await _suggesting_server(tmp_path, monkeypatch)
+    store = server.store
+    mine = _worked(store, tmp_path, now - 20 * DAY)
+    # Older than mine and more of them than the list scan window: a cap on the oldest rows of all projects would
+    # fill with these (a project nobody opens never gets proposals acted on, so they stay the oldest).
+    rows = [
+        (f"other-{n}", "/elsewhere", '[{"role": "user", "content": "x"}]', now - 60 * DAY, now - 60 * DAY, "{}", 1, "x")
+        for n in range(_SESSION_LIST_SCAN_CAP + 100)
+    ]
+    with store._db:
+        store._db.executemany(
+            "INSERT INTO sessions (session_id, cwd, messages, created_at, updated_at, meta, message_count, preview)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    res = await _suggest(server, tmp_path)
+    assert [i["id"] for i in res["items"]] == [mine] and res["total"] == 1
     await server.close()
 
 

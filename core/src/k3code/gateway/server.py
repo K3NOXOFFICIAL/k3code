@@ -3809,7 +3809,7 @@ async def _session_archive_suggestions(server: GatewayServer, params: dict[str, 
     now = time.time()
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling, as in _project_sessions
     ids: list[str] = []
-    for sid, stored_cwd in server.store.idle_candidates(now - days * 86400, _SESSION_LIST_SCAN_CAP):
+    for sid, stored_cwd in server.store.idle_candidates(now - days * 86400):
         if stored_cwd not in spelled:
             spelled[stored_cwd] = _norm_cwd(stored_cwd)
         if spelled[stored_cwd] == cwd and not keep(sid):
@@ -3869,7 +3869,8 @@ async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
-    server.store.set_archived([stored.session_id], None)  # in use again: out of the archive, proposals reset
+    # in use again: out of the archive, and not proposed again until saved
+    server.store.set_archived([stored.session_id], None)
     live = server.live_for(stored)  # a background session keeps its running state
     server.live[live.session_id] = live
     server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
