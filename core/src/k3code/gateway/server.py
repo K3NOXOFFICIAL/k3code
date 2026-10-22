@@ -430,7 +430,10 @@ class LiveSession:
         self.emit(
             "notification.show",
             {
-                "text": f"⚠ No sandbox: bubblewrap is unusable here, so {what}. See /doctor.",
+                "text": (
+                    "⚠ No sandbox here (bubblewrap is unusable, or the session's root is your home directory or "
+                    f"above), so {what}. See /doctor."
+                ),
                 "level": "warn",
                 "kind": "sticky",
                 "key": self.UNSANDBOXED_KEY,

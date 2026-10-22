@@ -286,6 +286,28 @@ async def test_yolo_at_home_runs_every_command_unsandboxed_without_asking(comman
     assert asked == [] and built == [] and seen == [None], (command, asked, built, seen)
 
 
+async def test_yolo_at_home_tells_the_session_once_that_it_has_no_sandbox(tmp_path, monkeypatch) -> None:
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "yolo")
+    _record_bash(loop)
+    told: list[int] = []
+    loop.on_unsandboxed = lambda: told.append(1)
+    for n in range(2):
+        await loop._execute_tool(ToolCall(id=f"c{n}", name="bash", arguments={"command": "touch x"}))
+    assert told == [1]
+
+
+async def test_auto_at_home_does_not_claim_no_sandbox_for_a_sandboxed_reader(tmp_path, monkeypatch) -> None:
+    from k3code.providers.types import ToolCall
+
+    loop, built, asked = _home_loop(tmp_path, monkeypatch, "auto")
+    told: list[int] = []
+    loop.on_unsandboxed = lambda: told.append(1)
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "pwd"}))
+    assert built == ["ro-home"] and asked == [] and told == []  # sandboxed read-only: nothing to warn about
+
+
 async def test_auto_at_home_still_asks_where_yolo_runs(tmp_path, monkeypatch) -> None:
     from k3code.providers.types import ToolCall
 
