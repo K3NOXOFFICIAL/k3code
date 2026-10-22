@@ -999,8 +999,9 @@ async def test_escape_bash_with_home_as_cwd_cannot_write_into_home(tmp_path, mon
     result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": touch}))
     assert "bash refused" in result.get("error", "") and "project directory" in result["error"]
     assert not (home / "escaped.txt").exists(), "sandboxed bash with cwd $HOME wrote into $HOME"
-    # interactive without a prompter: the command needs approval, which nobody gave
-    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo")  # type: ignore[arg-type]
+    # interactive auto without a prompter: the command needs approval, which nobody gave (yolo is the no-prompt mode:
+    # it runs unsandboxed at $HOME, see test_permission_session.py)
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="auto")  # type: ignore[arg-type]
     result = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": touch}))
     assert "requires approval" in result.get("error", "")
     assert not (home / "escaped.txt").exists(), "bash at $HOME ran without approval"

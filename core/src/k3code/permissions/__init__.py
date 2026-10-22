@@ -36,7 +36,7 @@ from .rules import evaluate as evaluate
 from .rules import from_config as from_config
 from .rules import merge as merge
 
-MODE_CYCLE_NAMES = ["default", "accept-edits", "plan", "auto"]
+MODE_CYCLE_NAMES = ["default", "accept-edits", "plan", "auto", "yolo"]  # state.MODE_CYCLE, by value
 
 __all__ = [
     "MODE_CYCLE_NAMES",

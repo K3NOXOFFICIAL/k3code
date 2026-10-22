@@ -403,7 +403,10 @@ class LiveSession:
 
     #: Notification key of the "started in your home directory" notice (see notify_home_started).
     HOME_KEY = "k3.session.home"
-    HOME_NOTICE = "k3code started in your home directory: start it inside a project for full auto mode"
+    HOME_NOTICE = (
+        "k3code started in your home directory: no sandbox here (auto asks before each command, yolo runs them all). "
+        "Start it inside a project for full auto mode"
+    )
 
     def notify_home_started(self) -> None:
         """Tell the clients, once per session, that its cwd is $HOME (bash there asks unless a rule allows it)."""
@@ -427,7 +430,10 @@ class LiveSession:
         self.emit(
             "notification.show",
             {
-                "text": f"⚠ No sandbox: bubblewrap is unusable here, so {what}. See /doctor.",
+                "text": (
+                    "⚠ No sandbox here (bubblewrap is unusable, or the session's root is your home directory or "
+                    f"above), so {what}. See /doctor."
+                ),
                 "level": "warn",
                 "kind": "sticky",
                 "key": self.UNSANDBOXED_KEY,
@@ -4630,7 +4636,7 @@ async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> di
     try:
         mode = PermissionMode(raw)
     except ValueError:
-        raise _InvalidParams(f"unknown mode: {raw} (one of {', '.join(MODE_CYCLE_NAMES)}, yolo)") from None
+        raise _InvalidParams(f"unknown mode: {raw} (one of {', '.join(MODE_CYCLE_NAMES)})") from None
     session.set_mode(mode)
     return {"mode": mode.value, "info": session.live_info()}
 

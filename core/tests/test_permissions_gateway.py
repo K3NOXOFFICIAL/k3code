@@ -215,11 +215,49 @@ async def test_hardline_never_prompts(tmp_path, monkeypatch):
 async def test_mode_cycle_and_set(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     await call(server, "session.create", {"cwd": str(tmp_path)})
-    modes = [(await call(server, "session.mode.cycle"))["mode"] for _ in range(4)]
-    assert modes == ["accept-edits", "plan", "auto", "default"]
+    modes = [(await call(server, "session.mode.cycle"))["mode"] for _ in range(5)]
+    assert modes == ["accept-edits", "plan", "auto", "yolo", "default"]  # Shift+Tab reaches yolo, then wraps
     assert (await call(server, "session.mode.set", {"mode": "yolo"}))["mode"] == "yolo"
     infos = [json.loads(x) for x in server._frames if '"session.info"' in x]  # type: ignore[attr-defined]
     assert infos[-1]["params"]["payload"]["mode"] == "yolo"
+
+
+async def test_shift_tab_to_yolo_at_home_runs_bash_with_no_approval(tmp_path, monkeypatch):
+    # the whole path a user takes: a session started in $HOME, Shift+Tab until yolo, then a shell command. The sandbox
+    # cannot bind $HOME, which used to turn every bash call into an approval that outranked yolo.
+    from k3code.reliability import sandbox
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sandbox, "usable", lambda: True)  # bwrap present: the home-root branch, on any CI host
+    server, _ = make_server(tmp_path, [bash("touch ran.txt"), "ok"], monkeypatch)
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    assert [(await call(server, "session.mode.cycle"))["mode"] for _ in range(4)][-1] == "yolo"
+    seen = await run_turn(server, "go", [])
+    assert seen == [], "yolo asked for approval at $HOME"
+    assert (tmp_path / "ran.txt").exists() and "error" not in last_tool_result(server).lower()
+
+
+async def test_auto_at_home_still_sends_an_approval_frame(tmp_path, monkeypatch):
+    from k3code.reliability import sandbox
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    server, _ = make_server(
+        tmp_path, [bash("touch ran.txt"), "ok"], monkeypatch, mode="auto", autonomy={"plan_first": False}
+    )
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [])  # unanswered approvals are denied
+    assert len(seen) == 1 and not (tmp_path / "ran.txt").exists(), last_tool_result(server)
+
+
+def test_mode_cycle_names_follow_the_cycle_and_yolo_wraps_to_default(tmp_path):
+    from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode
+    from k3code.permissions.state import MODE_CYCLE, PermissionState
+
+    assert [m.value for m in MODE_CYCLE] == MODE_CYCLE_NAMES  # the /permissions list and Shift+Tab never drift
+    st = PermissionState(mode=PermissionMode.YOLO, cwd=tmp_path)
+    assert st.cycle_mode() is PermissionMode.DEFAULT
+    assert st.cycle_mode() is PermissionMode.ACCEPT_EDITS
 
 
 async def test_plan_mode_refuses_then_exit_plan_switches(tmp_path, monkeypatch):

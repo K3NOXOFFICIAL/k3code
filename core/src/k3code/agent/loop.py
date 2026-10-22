@@ -597,9 +597,11 @@ class AgentLoop:
                 why = "no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host"
             # no_bwrap (auto/yolo, bwrap unusable): running on the host is a human-only call, as for auto_allowed below
             decision = replace(decision, action="ask", sandbox_only=False, needs_human=no_bwrap, message=why)
-        if home_rooted and not readonly_home:
+        if home_rooted and not readonly_home and self.permissions.mode is not PermissionMode.YOLO:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
+            # yolo is the explicit no-prompt mode, as for no_bwrap below: it keeps the engine's allow and runs
+            # unsandboxed (the hardline list still applies) and the session is told once, below.
             decision = replace(
                 decision,
                 action="ask",
@@ -620,6 +622,8 @@ class AgentLoop:
                     auto_allowed=False,
                     message="no sandbox here (bubblewrap is unusable): approve to run this on the host, see /doctor",
                 )
+        elif home_rooted and not readonly_home:
+            self._tell_unsandboxed()  # yolo (the first branch took the rest) at a refused root: runs on the host, told
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
