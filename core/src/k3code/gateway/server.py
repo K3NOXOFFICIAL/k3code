@@ -315,6 +315,8 @@ class LiveSession:
         self.needs_input = False
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
+        #: the turn's answering entry and the entries its calls passed over (router ``route``), for message.complete
+        self.turn_route: dict[str, Any] = {}
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
         self.last_tier = "main"
         self.current_kind = "interactive_turn"
@@ -2318,6 +2320,7 @@ class GatewayServer:
         tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
+        session.turn_route = {}
         session.user_stopped, session.turn_denials = False, 0
         # where this turn's messages start in the stored conversation: an /undo that cuts there removes this turn
         msg_start = len(session.stored.messages)
@@ -2595,6 +2598,9 @@ class GatewayServer:
                 "error": error,
                 "error_surface": _error_surface(session.last_exc) if status == "error" else None,
                 "state": session.state,
+                "provider": session.turn_route.get("provider", ""),
+                "model": session.turn_route.get("model", ""),
+                "hops": session.turn_route.get("hops", []),
             },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
@@ -2846,6 +2852,9 @@ class GatewayServer:
                 session.emit("tool.complete", payload)
             elif msg.role == "assistant":
                 provider, model = session.last_entry
+                if event.route:  # the latest call's answering entry; hops add up over the turn's calls
+                    hops = [*session.turn_route.get("hops", []), *event.route.get("hops", [])]
+                    session.turn_route = {**event.route, "hops": hops}
                 u = msg.usage
                 self.usage.record(
                     "call",

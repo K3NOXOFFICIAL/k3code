@@ -170,7 +170,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `reasoning.available` | `{text, rendered?, verbose?}` | ✅ | Non-stream reasoning |
 | `thinking.delta` | `{text, rendered?, verbose?}` | | Legacy thinking |
 | `message.interim` | `{text, already_streamed}` | ✅ | Interim assistant text |
-| `message.complete` | `{text, usage, status, reasoning, warning, billing, error, ...}` | ✅ | Turn complete (`usage` as in `session.usage`) |
+| `message.complete` | `{text, usage, status, reasoning, warning, billing, error, provider, model, hops, ...}` | ✅ | Turn complete (`usage` as in `session.usage`). `provider`/`model`: the fallback-chain entry that gave the turn's last answer ("" when none did); `hops`: the entries the turn's calls passed over, in order, as `{provider, model, reason}` (`reason`: rate_limit, server, context_overflow, content_filter, ...) |
 | `status.update` | `{kind, text}` | ✅ | Status line |
 | `tool.start` | `{tool_id, name, context?, args?, args_text?, preview?, labels?}` | ✅ | Tool call start |
 | `tool.complete` | `{tool_id, name, args?, duration_s, result, summary, result_text, inline_diff?, todos?, revision?, labels?}` | ✅ | Tool call done |
