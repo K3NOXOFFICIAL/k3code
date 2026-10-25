@@ -129,6 +129,8 @@ async def _housekeeping(server: Any, home: Path) -> None:
             maybe_auto_clear(server, home)
         with contextlib.suppress(Exception):
             await server.watchdog_tick()
+        with contextlib.suppress(Exception):
+            await server.learning.optimizer_tick()
 
 
 async def _sweep_empty_sessions(server: Any) -> None:

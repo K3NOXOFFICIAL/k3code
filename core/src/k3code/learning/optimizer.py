@@ -78,6 +78,26 @@ TIER_DOWN_MIN_CALLS = 10
 #: Cost term: a change must buy this many quality points (as a fraction: 0.005 = half a point) per percent of extra
 #: tokens. +1 point for +30% tokens is rejected (0.01 < 0.15); +10 points for +5% tokens is kept (0.10 >= 0.025).
 COST_WEIGHT = 0.5
+#: An experiment still active after this many days is rolled back as ``expired``: its A/B window never filled, and
+#: it must not block every later experiment (one runs at a time).
+EXPERIMENT_MAX_DAYS = 14.0
+
+
+def call_cost(row: dict[str, Any], prices: dict[str, Any] | None) -> float | None:
+    """USD cost of one call row: what the provider reported, else priced from ``prices``
+    (``learning.optimizer.prices``: ``{model: {"in": USD per 1M input tokens, "out": ..., "cache_read": ...}}``,
+    ``cache_read`` optional); None when neither is known. There is no built-in price table: a model nobody priced is
+    compared by tokens."""
+    if row.get("cost_usd") is not None:
+        return float(row["cost_usd"])
+    price = (prices or {}).get(row.get("model") or "")
+    if not isinstance(price, dict) or "in" not in price or "out" not in price:
+        return None
+    tokens_in, tokens_out = int(row.get("tokens_in") or 0), int(row.get("tokens_out") or 0)
+    cached = min(int(row.get("cache_read") or 0), tokens_in)  # prompt tokens include the cached ones
+    cache_rate = float(price.get("cache_read", price["in"]))
+    return ((tokens_in - cached) * float(price["in"]) + cached * cache_rate + tokens_out * float(price["out"])) / 1e6
+
 
 #: What the optimizer may change: an allowlist of settings it tunes. Every config overlay must stay inside it.
 TUNABLE_PATHS = (
@@ -139,8 +159,10 @@ def collect(
     *,
     since: float = 0.0,
     until: float | None = None,
+    prices: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate raw rows in [since, until) into rates. ``usage_rows`` are dicts with the usage ``events`` columns."""
+    """Aggregate raw rows in [since, until) into rates. ``usage_rows`` are dicts with the usage ``events`` columns;
+    ``prices`` is ``learning.optimizer.prices`` (see :func:`call_cost`)."""
     until = until if until is not None else float("inf")
     ev = [r for r in usage_rows if since <= r["ts"] < until]
     outcomes = _turn_outcomes(log, since, until)
@@ -180,6 +202,9 @@ def collect(
         if r.get("turn"):
             turns.add(r["turn"])
     call_tokens = sum(tokens_by_tier.values())
+    costs = [call_cost(r, prices) for r in calls]
+    # dollars only when every call is priced: a partly priced total would make the unpriced model look free
+    cost = sum(c for c in costs if c is not None) if calls and None not in costs else None
     props = [d for d in log.query("proposal", since=since) if d["ts"] < until]
     acc = sum(1 for d in props if d["choice"] == "accept")
     verdicts: dict[str, dict[str, Any]] = {}
@@ -199,6 +224,8 @@ def collect(
         "escalation_rate": round(sum(1 for r in ev if r["kind"] == "escalated") / total_calls, 3),
         "failure_rate": round(sum(1 for r in ev if r["kind"] in ("failover",)) / total_calls, 3),
         "approval_prompts_per_session": round(sum(1 for r in ev if r["kind"] == "approval") / n_sess, 2),
+        # GOAL D2 reads this one: prompts per turn, whose fall (>= 40 %) after learned rules were accepted is the goal
+        "approvals_per_turn": round(sum(1 for r in ev if r["kind"] == "approval") / len(turns), 3) if turns else None,
         "loop_guard_per_session": round(sum(1 for r in ev if r["kind"] == "loop_guard") / n_sess, 3),
         "waits_per_session": round(sum(1 for r in ev if r["kind"] in ("retry", "pause")) / n_sess, 2),
         "proposals_decided": len(props),
@@ -214,10 +241,13 @@ def collect(
         "tokens": call_tokens,
         "turns": len(turns),
         "tokens_per_turn": round(call_tokens / len(turns), 1) if turns else None,
+        "cost_usd": round(cost, 6) if cost is not None else None,
+        "cost_per_turn": round(cost / len(turns), 6) if cost is not None and turns else None,
+        "cost_basis": "usd" if cost is not None else "tokens",
         "tokens_by_tier": tokens_by_tier,
         "tokens_by_kind": tokens_by_kind,
         "kind_tier": kind_tier,
-        "per_session": _per_session(ev, outcomes),
+        "per_session": _per_session(ev, outcomes, prices),
     }
 
 
@@ -271,10 +301,13 @@ def _session_row() -> dict[str, int]:
     return dict.fromkeys(("calls", "escalated", "loop_guard", "approvals", "tokens", "turns", "scored", "passed"), 0)
 
 
-def _per_session(ev: list[dict[str, Any]], outcomes: list[dict[str, Any]] | None = None) -> dict[str, dict[str, int]]:
+def _per_session(
+    ev: list[dict[str, Any]], outcomes: list[dict[str, Any]] | None = None, prices: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
     """Counts per session id (the A/B samples): calls, escalations, loop guards, approvals, call tokens, turns, and the
-    scored turns (``scored``) of which ``passed`` succeeded."""
-    out: dict[str, dict[str, int]] = {}
+    scored turns (``scored``) of which ``passed`` succeeded. A session whose calls have a known USD cost also gets
+    ``cost`` (the sum) and ``priced`` (how many calls had one); both are absent when nothing is priced."""
+    out: dict[str, dict[str, Any]] = {}
     turns: dict[str, set[str]] = {}
     for r in ev:
         if not r["session"]:
@@ -283,6 +316,9 @@ def _per_session(ev: list[dict[str, Any]], outcomes: list[dict[str, Any]] | None
         if r["kind"] == "call":
             s["calls"] += 1
             s["tokens"] += int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
+            if (c := call_cost(r, prices)) is not None:
+                s["cost"] = s.get("cost", 0.0) + c
+                s["priced"] = s.get("priced", 0) + 1
             if r.get("turn"):
                 turns.setdefault(r["session"], set()).add(r["turn"])
         elif r["kind"] == "escalated":
@@ -333,7 +369,10 @@ def score(m: dict[str, Any], baseline: dict[str, Any] | None = None) -> float:
     for every 100% they shrank; without a baseline (or without token data) the score is quality alone.
     """
     s = quality(m)
-    if baseline is not None and m.get("tokens_per_turn") and baseline.get("tokens_per_turn"):
+    if baseline is not None and m.get("cost_per_turn") and baseline.get("cost_per_turn"):
+        # dollars when both sides are fully priced: a cheaper tier with more tokens can still be the cheaper run
+        s -= COST_WEIGHT * (m["cost_per_turn"] / baseline["cost_per_turn"] - 1.0)
+    elif baseline is not None and m.get("tokens_per_turn") and baseline.get("tokens_per_turn"):
         growth = m["tokens_per_turn"] / baseline["tokens_per_turn"] - 1.0
         s -= COST_WEIGHT * growth
     return round(s, 4)
@@ -354,7 +393,22 @@ def _tokens_per_turn(stats: list[dict[str, int]]) -> float | None:
     return tokens / turns if turns and tokens else None
 
 
-def session_score(s: dict[str, int], ref_tokens_per_turn: float | None) -> float:
+def _cost_per_turn(stats: list[dict[str, Any]]) -> float | None:
+    turns = sum(s["turns"] for s in stats)
+    cost = sum(s.get("cost", 0.0) for s in stats if s["turns"])
+    return cost / turns if turns and cost else None
+
+
+def arms_priced(treatment: list[dict[str, Any]], control: list[dict[str, Any]]) -> bool:
+    """Both arms' sessions have a USD cost for every call, so the cost term can be dollars; if any call is unpriced the
+    whole comparison stays in tokens (a model nobody priced must not look free)."""
+    sessions = [s for s in (*treatment, *control) if s["calls"]]
+    return bool(treatment and control) and all(s.get("priced", 0) == s["calls"] and s.get("cost") for s in sessions)
+
+
+def session_score(
+    s: dict[str, Any], ref_tokens_per_turn: float | None, ref_cost_per_turn: float | None = None
+) -> float:
     """One session's score (higher is better): the per-session part of :func:`quality` (its turn failure rate, when
     it has scored turns, and its escalations, loop guards and approvals), minus ``COST_WEIGHT`` per 100% its tokens
     per turn lie above ``ref_tokens_per_turn`` (plus the same credit below it, capped at +100%).
@@ -367,7 +421,9 @@ def session_score(s: dict[str, int], ref_tokens_per_turn: float | None) -> float
     if s.get("scored"):
         q -= SUCCESS_WEIGHT * (1.0 - s.get("passed", 0) / s["scored"])
     q -= 0.02 * min(10.0, s["approvals"])
-    if ref_tokens_per_turn and s["turns"] and s["tokens"]:
+    if ref_cost_per_turn and s["turns"] and s.get("cost"):  # the caller checked both arms are fully priced
+        q -= COST_WEIGHT * min(1.0, s["cost"] / s["turns"] / ref_cost_per_turn - 1.0)
+    elif ref_tokens_per_turn and s["turns"] and s["tokens"]:
         q -= COST_WEIGHT * min(1.0, s["tokens"] / s["turns"] / ref_tokens_per_turn - 1.0)
     return q
 
@@ -391,7 +447,8 @@ def arm_scores(treatment: list[dict[str, int]], control: list[dict[str, int]]) -
         treatment = [{**s, "scored": 0} for s in treatment]
         control = [{**s, "scored": 0} for s in control]
     ref = _tokens_per_turn(control)
-    return [session_score(s, ref) for s in treatment], [session_score(s, ref) for s in control]
+    ref_cost = _cost_per_turn(control) if arms_priced(treatment, control) else None
+    return [session_score(s, ref, ref_cost) for s in treatment], [session_score(s, ref, ref_cost) for s in control]
 
 
 def bootstrap_ci(
@@ -561,6 +618,8 @@ def _describe(result: dict[str, Any]) -> str:
     success = result.get("success")
     if success:
         arms += f"; turn success {_pct(success.get('treatment'))} vs {_pct(success.get('control'))}"
+    if result.get("cost_basis") == "usd":
+        arms += "; cost in USD"
     if "ci" not in result:
         return f"too few sessions to judge ({arms}; {MIN_SESSIONS_PER_ARM} per arm needed)"
     lo, hi = result["ci"]
@@ -614,6 +673,8 @@ class Experiments:
         self.overlays = self.home / "overlays"
         self.clock = clock
         self.live = live
+        #: an active experiment older than this many days is rolled back as ``expired`` (see :meth:`expire_stale`)
+        self.max_age_days = EXPERIMENT_MAX_DAYS
         #: called with the experiment after a config rollback rewrote the file (the hub syncs the live config)
         self.on_config_rollback: Callable[[dict[str, Any]], None] | None = None
 
@@ -633,6 +694,13 @@ class Experiments:
     def active(self) -> list[dict[str, Any]]:
         return [x for x in self.all() if x["status"] == "active"]
 
+    def expire_stale(self, config_path: Path | None = None) -> list[dict[str, Any]]:
+        """Roll back every active experiment older than ``max_age_days`` as ``expired``: its A/B window never filled
+        (too few sessions), and one experiment at a time means it would otherwise block every later one. The old
+        value comes back through :meth:`rollback`. Returns the experiments expired."""
+        stale = [x for x in self.active() if self.clock() - x["started"] > self.max_age_days * 86400.0]
+        return [x for x in stale if self.rollback(x["id"], status="expired", config_path=config_path)]
+
     def start(
         self, overlay: dict[str, Any], baseline: dict[str, Any], *, sessions: int = 20, config_path: Path | None = None
     ) -> dict[str, Any]:
@@ -640,8 +708,9 @@ class Experiments:
 
         ``overlay["auto"]`` marks a change the optimizer made by itself (replay gate); it is logged and rolled back
         like any experiment when the A/B window says it made things worse. Refused (:class:`ExperimentBusy`) while
-        another experiment is active: one at a time.
+        another experiment is active: one at a time (an expired one is rolled back first, see :meth:`expire_stale`).
         """
+        self.expire_stale(config_path)
         items = self.all()
         if busy := [x["id"] for x in items if x["status"] == "active"]:
             raise ExperimentBusy(
@@ -743,6 +812,12 @@ class Experiments:
     ) -> list[dict[str, Any]]:
         """Count one finished session for every active experiment (or only ``ids``); judge the ones that reached
         their target (see the module docstring). Returns the experiments that were decided."""
+        for x in self.expire_stale(config_path):
+            if notify:
+                notify(
+                    f"Optimizer experiment {x['id']} ({x['title']}) expired after {self.max_age_days:g} days without "
+                    f"enough sessions to judge it; the old value is restored."
+                )
         items = self.all()
         due = []
         for x in items:
@@ -772,6 +847,7 @@ class Experiments:
             t_scores, c_scores = arm_scores(treatment, control)
             result = decide(t_scores, c_scores, seed=zlib.crc32(x["id"].encode()))
             result["success"] = {"treatment": success_rate(treatment), "control": success_rate(control)}
+            result["cost_basis"] = "usd" if arms_priced(treatment, control) else "tokens"
             if result["decision"] is None:
                 if x["sessions_done"] < MAX_WINDOW_FACTOR * x["target_sessions"]:
                     continue  # too few sessions in an arm yet: keep collecting
