@@ -6,7 +6,7 @@ import pytest
 
 from k3code.errors import ContextOverflow
 from k3code.providers.base import ProviderError
-from k3code.providers.types import Message, StreamEvent
+from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.router import CooldownStore, FailoverReason, Router, RouterEvent, build_chain
 
 
@@ -268,3 +268,125 @@ async def test_the_last_entrys_refusal_is_passed_through():
     router, _ = make([a], [["m-a"]])
     msg = await router.complete(prompt(10), [])
     assert msg.content == "I can't help with that." and msg.stop_reason == "refusal"
+
+
+# ── a three-entry chain, observability ──────────────────────────────────
+
+
+class Partial:
+    """A step that streams some text and a tool call, then fails with ``exc`` (a mid-stream failure)."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+class StallingStub(Stub):
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        step = self.script[0] if self.script else None
+        if isinstance(step, Partial):
+            self.script.pop(0)
+            self.calls.append({"model": model, "max_tokens": max_tokens})
+            yield StreamEvent(type="text_delta", text="half an ans")
+            yield StreamEvent(type="tool_call", tool_call=ToolCall(id="call_1", name="bash", arguments={"c": "rm x"}))
+            raise step.exc
+        async for event in super().stream(messages, tools, model, max_tokens=max_tokens, temperature=temperature):
+            yield event
+
+
+async def test_a_three_entry_chain_answers_from_the_third_and_names_each_hop():
+    """Entry 1 rate-limited (429, Retry-After), entry 2 (a second model on the same provider) failing with 5xx,
+    entry 3 (another provider) answers; the done event names the answering entry and both hops."""
+    p1 = Stub("p1", [rate_limited(120), *[ProviderError("upstream down", status_code=503)] * 3])
+    p2 = Stub("p2")
+    router, events = make([p1, p2], [["m1", "m2"], ["m3"]])
+    seen = [e async for e in router.stream(prompt(10), [])]
+    done = seen[-1]
+    assert done.type == "done" and done.message.content == "answer from p2"
+    assert [c["model"] for c in p1.calls] == ["m1", "m2", "m2", "m2"]
+    assert [c["model"] for c in p2.calls] == ["m3"]
+    assert done.route == {
+        "provider": "p2",
+        "model": "m3",
+        "hops": [
+            {"provider": "p1", "model": "m1", "reason": "rate_limit"},
+            {"provider": "p1", "model": "m2", "reason": "server"},
+        ],
+    }
+    assert [(e.provider, e.reason) for e in events if e.kind == "router.failover"] == [
+        ("p1", "rate_limit"),
+        ("p1", "server"),
+    ]
+
+
+async def test_a_cooled_entry_shows_as_a_hop_on_the_next_call():
+    p1, p2 = Stub("p1", [rate_limited(600)]), Stub("p2")
+    router, _ = make([p1, p2], [["m1"], ["m2"]])
+    await router.complete(prompt(10), [])
+    done = [e async for e in router.stream(prompt(10), [])][-1]
+    assert done.route["hops"] == [{"provider": "p1", "model": "m1", "reason": "rate_limit"}]
+    assert len(p1.calls) == 1
+
+
+async def test_a_mid_stream_stall_resets_and_the_backup_answers_without_a_duplicated_tool_call():
+    from k3code.providers.stall import StreamStalled
+
+    a = StallingStub("a", [Partial(StreamStalled("stalled")), Partial(StreamStalled("stalled"))])
+    b = Stub("b")
+    router, _ = make([a, b], [["m-a"], ["m-b"]])
+    seen = [e async for e in router.stream(prompt(10), [])]
+    types = [e.type for e in seen]
+    # STALL_RETRIES: one retry on the same entry, each partial attempt dropped with a reset
+    assert types == [*["text_delta", "tool_call", "reset"] * 2, "text_delta", "done"]
+    last_reset = len(types) - 1 - types[::-1].index("reset")
+    assert "tool_call" not in types[last_reset:]
+    assert seen[-1].message.content == "answer from b" and seen[-1].message.tool_calls == []
+    assert seen[-1].route["hops"] == [{"provider": "a", "model": "m-a", "reason": "timeout"}]
+
+
+async def test_escalate_false_never_moves_up_a_tier_on_chain_exhausted():
+    from types import SimpleNamespace
+
+    from k3code.errors import ChainExhausted
+    from k3code.routing.caller import ModelCaller
+    from k3code.routing.tiers import TaskKind, tier_for
+
+    asked: list = []
+
+    class Down:
+        async def complete(self, messages, tools, *, max_tokens=2048):
+            raise ChainExhausted("all provider entries failed", last_reason="server")
+
+    class Routers:
+        def get(self, tier):
+            asked.append(tier)
+            return Down()
+
+    caller = ModelCaller(lambda: Routers(), SimpleNamespace(task_tiers=None), None)
+    with pytest.raises(ChainExhausted):
+        await caller.complete(TaskKind.TITLE, prompt(10), escalate=False)
+    assert asked == [tier_for(TaskKind.TITLE)]
+    asked.clear()
+    with pytest.raises(ChainExhausted):
+        await caller.complete(TaskKind.TITLE, prompt(10))
+    assert len(asked) > 1  # with escalation the same failure does climb
+
+
+async def test_the_turns_message_complete_names_the_answering_model_and_its_hops(tmp_path, monkeypatch):
+    from m1cmd_helpers import frames_of, make_server, new_session
+
+    a, b = Stub("a", [ProviderError("upstream down", status_code=500)]), Stub("b")
+    server, _ = make_server(tmp_path, monkeypatch, ["unused"])
+    server.router = Router(build_chain([a, b], [["m-a"], ["m-b"]]), max_retries=0, sleep=_no_sleep)
+    server._oneshot_routers = {"default": server.router}  # type: ignore[attr-defined]
+    server._tiers = None
+    sid = await new_session(server, tmp_path)
+    status, _ = await server._run_turn(server.live[sid], "hi")
+    assert status == "done"
+    complete = [
+        f["params"]["payload"]
+        for f in frames_of(server)
+        if f.get("method") == "event" and f["params"].get("type") == "message.complete"
+    ][-1]
+    assert (complete["provider"], complete["model"]) == ("b", "m-b")
+    assert complete["hops"] == [{"provider": "a", "model": "m-a", "reason": "server"}]
+    await server.close()

@@ -31,11 +31,15 @@ schemas come in M1+):
   after a backoff delay.
 - ``router.failover``: the walk is moving on to the *next* entry.
 - ``router.exhausted``: every entry in the chain has failed.
+
+The ``done`` stream event the walk yields carries ``route``: the provider and model that answered and the ``hops``
+(entries passed over, with their reason) on the way.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
@@ -260,7 +264,16 @@ class Router:
         estimate = message_tokens(messages) + overhead_tokens("", tools)  # the prompt, for the window checks
         overflowed = 0  # largest window that overflowed in this walk: only a larger one is worth trying
         overflow_detail = ""
+        hops: list[dict[str, str]] = []  # entries passed over, in order, and why: the "done" event carries them
         chain_index = self._first_entry(model, tried)  # first try stays chain order; health picks failover targets
+        for i in range(chain_index or 0):  # earlier entries are cooling down: the first try passed over them
+            target = self._target_model(i, model)
+            entry = self.chain[i]
+            fp = entry.key_fingerprint
+            cooled = self.cooldowns.reason_of(
+                provider=entry.provider_name, model=target, base_url=entry.base_url, account=fp, fingerprint=fp
+            )
+            hops.append(_hop(entry, target, cooled.value if cooled else "cooldown"))
         while chain_index is not None:
             entry = self.chain[chain_index]
             target_model = model if chain_index == 0 and model else entry.model
@@ -285,6 +298,7 @@ class Router:
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
+                hops.append(_hop(entry, target_model, cooled.value if cooled else "cooldown"))
                 tried.add(chain_index)
                 chain_index = self._next_target(model, tried)
                 continue
@@ -301,6 +315,7 @@ class Router:
                         reason=FailoverReason.context_overflow.value,
                         detail=f"~{estimate} prompt tokens do not fit the {window or 'unknown'}-token window",
                     )
+                    hops.append(_hop(entry, target_model, FailoverReason.context_overflow.value))
                     tried.add(chain_index)
                     chain_index = self._next_target(model, tried)
                     continue
@@ -328,6 +343,8 @@ class Router:
                                 base_url=entry.base_url,
                                 account=entry.key_fingerprint,
                             )
+                            route = {"provider": entry.provider_name, "model": target_model, "hops": hops}
+                            event = dataclasses.replace(event, route=route)
                         yield event
                     # The provider yields its "done" event then closes normally.
                     return
@@ -382,6 +399,7 @@ class Router:
                         or classified.reason is FailoverReason.context_overflow
                         or (classified.immediate_failover and not self._honor_inline(classified))
                     ):
+                        hops.append(_hop(entry, target_model, classified.reason.value))
                         self._failover(
                             entry,
                             target_model,
@@ -412,6 +430,7 @@ class Router:
                     else:
                         retries = self.max_retries
                     if attempt >= retries:
+                        hops.append(_hop(entry, target_model, classified.reason.value))
                         self._failover(
                             entry,
                             target_model,
@@ -774,6 +793,11 @@ class Router:
             self.on_event(event)
         except Exception:  # noqa: BLE001 - a sink that fails (a client gone mid-turn) must not abort the walk (#148)
             logger.warning("router event sink failed on %s", kind, exc_info=True)
+
+
+def _hop(entry: ChainEntry, model: str, reason: str) -> dict[str, str]:
+    """One entry the walk passed over, as the "done" event's ``route.hops`` lists it."""
+    return {"provider": entry.provider_name, "model": model, "reason": reason}
 
 
 class ProviderStreamError(Exception):
