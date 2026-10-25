@@ -432,7 +432,7 @@ def describe(text: str) -> list[str]:
 def _permission_rules(perms: dict[str, Any]) -> list[tuple[str, str, str]]:
     rules: list[tuple[str, str, str]] = []
     for tool, entry in perms.items():
-        if tool == "hardline":
+        if tool in ("hardline", "classifier"):
             continue
         if isinstance(entry, dict):
             rules.extend((str(action), str(tool), str(pattern)) for pattern, action in entry.items())

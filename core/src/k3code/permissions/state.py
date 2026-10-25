@@ -96,6 +96,7 @@ def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str
     if not isinstance(section, dict):
         return _unreadable("permissions: is not a mapping")
     section = dict(section)
+    section.pop("classifier", None)  # auto mode's classifier settings (permissions.classifier), not a tool's rules
     problems: list[str] = []
     hard = _hardline(section.pop("hardline", None), problems)
     return from_config(section, problems), hard, problems
@@ -205,6 +206,11 @@ class PermissionState:
     #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
     #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
     loaded: bool = field(default=False, init=False, repr=False)
+    #: Auto mode's classifier verdicts for this session (permissions.classifier.classify): the gateway builds a loop
+    #: per turn and tier, the session's state outlives them.
+    classifier_cache: dict[tuple[str, str, str, str], tuple[str, str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""

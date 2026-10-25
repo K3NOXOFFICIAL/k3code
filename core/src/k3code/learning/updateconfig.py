@@ -74,6 +74,9 @@ def check_patch(patch: dict[str, Any], current: dict[str, Any]) -> None:
             new = perms["hardline"]
             if not isinstance(new, list) or not old <= set(map(str, new)):
                 raise PatchRejected("permissions.hardline may only be extended, never reduced")
+        classifier = perms.get("classifier")
+        if classifier is False or (isinstance(classifier, dict) and classifier.get("enabled") is False):
+            raise PatchRejected("turning off auto mode's permission classifier would relax the safety rules")
         bash = perms.get("bash")
         if bash == "allow" or (isinstance(bash, dict) and bash.get("*") == "allow"):
             raise PatchRejected("allowing every bash command would relax the safety rules")
