@@ -109,6 +109,14 @@ _WRAPPERS = [
     lambda c: f"if true; then {c}; fi",
 ]
 _FLOOR = _of("hardline", "needs_human", "stop")
+#: Indexes in _WRAPPERS of the ones that prefix only the first command of a line (sudo, env, nice): an assignment they
+#: wrap is not an assignment of the shell any more.
+_PREFIX_WRAPPERS = frozenset({0, 1, 3})
+
+
+def _starts_with_assignment(cmd: str) -> bool:
+    first = cmd.split(None, 1)[0] if cmd.strip() else ""
+    return "=" in first and first.split("=", 1)[0].isidentifier()
 
 
 @pytest.mark.parametrize(("n", "row"), _FLOOR, ids=_ids(_FLOOR))
@@ -116,8 +124,11 @@ def test_a_wrapper_never_lowers_the_decision(project: Path, n: int, row: dict) -
     rng = random.Random(n)  # a fixed order per row: a failure names the same wrapper every run
     wrappers = list(enumerate(_WRAPPERS))
     rng.shuffle(wrappers)
+    assigns_first = _starts_with_assignment(row["cmd"])
     for mode in ("default", "auto"):
         bare = _RANK[_decide(row["cmd"], mode, project).action]
         for w, wrap in wrappers:
+            if assigns_first and w in _PREFIX_WRAPPERS:
+                continue  # `sudo X=/; rm -rf $X` never sets X for the rm: a different, harmless-looking line
             got = _RANK[_decide(wrap(row["cmd"]), mode, project).action]
             assert got >= bare, f"row {n} {mode} wrapper {w}: {got} < {bare}"
