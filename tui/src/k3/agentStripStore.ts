@@ -25,11 +25,31 @@ export const $stripSessions = atom<SessionActiveItem[]>([]);
 const snapshotKey = (rows: readonly SessionActiveItem[]) =>
   JSON.stringify(rows.map(({ current: _current, ...row }) => row));
 
-/** Store a poll reply or pushed snapshot; an unchanged one sets nothing, so the idle TUI does not re-render. */
-export function applyStripSessions(rows: SessionActiveItem[]) {
-  if (snapshotKey($stripSessions.get()) !== snapshotKey(rows)) {
-    $stripSessions.set(rows);
+/**
+ * Store a poll reply or pushed snapshot; an unchanged one sets nothing, so the idle TUI does not re-render. A pushed
+ * snapshot marks no row current: its rows take the mark from `currentSid` (the TUI's own session) when known, else from
+ * the stored copy, since the poll that would bring the mark back is deduped against them.
+ */
+export function applyStripSessions(
+  rows: SessionActiveItem[],
+  currentSid: null | string = null,
+) {
+  const stored = $stripSessions.get();
+
+  if (snapshotKey(stored) === snapshotKey(rows)) {
+    return;
   }
+
+  const wasCurrent = new Set(stored.filter((s) => s.current).map((s) => s.id));
+
+  $stripSessions.set(
+    rows.map((s) =>
+      s.current === undefined &&
+      (currentSid != null ? s.id === currentSid : wasCurrent.has(s.id))
+        ? { ...s, current: true }
+        : s,
+    ),
+  );
 }
 
 /** Row actions the agent view calls (attach a session or open an agent, stop a row); registered by useMainApp. */

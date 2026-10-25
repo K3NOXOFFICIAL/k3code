@@ -971,7 +971,7 @@ export function createGatewayEventHandler(
       // fallback (and the only source on a core that does not push).
       case "session.active_list":
         if (Array.isArray(ev.payload?.sessions)) {
-          applyStripSessions(ev.payload.sessions as SessionActiveItem[]);
+          applyStripSessions(ev.payload.sessions as SessionActiveItem[], sid);
         }
 
         return;

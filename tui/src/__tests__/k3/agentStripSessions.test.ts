@@ -57,6 +57,49 @@ describe("strip sessions", () => {
     off();
   });
 
+  it("a pushed change keeps the poll's current mark, so the next (deduped) poll does not leave the store without it", () => {
+    applyStripSessions([row({ current: true, id: "mine" }), row()]);
+    // pushed: no row is marked current, and the background row changed
+    applyStripSessions([row({ id: "mine" }), row({ status: "needs_input" })]);
+    // the poll's copy of the same state is deduped, so whatever the push stored stays
+    applyStripSessions([
+      row({ current: true, id: "mine" }),
+      row({ status: "needs_input" }),
+    ]);
+
+    expect($stripSessions.get()).toEqual([
+      row({ current: true, id: "mine" }),
+      row({ status: "needs_input" }),
+    ]);
+  });
+
+  it("a pushed event marks the TUI's own session current when nothing was stored for it yet", () => {
+    patchUiState({ sid: "mine" });
+    const onEvent = createGatewayEventHandler(ctx());
+
+    onEvent({
+      payload: { sessions: [row({ id: "mine" }), row()] },
+      type: "session.active_list",
+    } as any);
+
+    expect($stripSessions.get()).toEqual([
+      row({ current: true, id: "mine" }),
+      row(),
+    ]);
+
+    // after a switch to bg-1 the stored mark on "mine" is out of date: the known own session wins
+    patchUiState({ sid: "bg-1" });
+    onEvent({
+      payload: { sessions: [row({ id: "mine" }), row({ status: "idle" })] },
+      type: "session.active_list",
+    } as any);
+
+    expect($stripSessions.get()).toEqual([
+      row({ id: "mine" }),
+      row({ current: true, status: "idle" }),
+    ]);
+  });
+
   it("a pushed session.active_list event updates the strip without waiting for the poll", () => {
     patchUiState({ sid: "mine" });
     const onEvent = createGatewayEventHandler(ctx());
