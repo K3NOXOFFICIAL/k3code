@@ -55,6 +55,7 @@ from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
 from k3code.autonomy.ultra import Ultra, ultra_cfg
 from k3code.blockers import BlockerStore
+from k3code.cache_watch import CacheWatch
 from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
@@ -330,6 +331,8 @@ class LiveSession:
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
+        #: Warns once when the provider's prompt cache stops hitting (see k3code.cache_watch).
+        self.cache_watch = CacheWatch()
         #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
         #: compaction or an /undo): the size of the context as the provider counted it.
         self.last_prompt_tokens = 0
@@ -363,6 +366,7 @@ class LiveSession:
         those (/output-style, /reload-skills, /mcp reload, /reload)."""
         if not slots:
             self.prompt_frozen.clear()
+            self.cache_watch.reset()  # a rewritten conversation is a new cache prefix: its first call is a miss
         for slot in slots:
             self.prompt_frozen.pop(slot, None)
 
@@ -2871,6 +2875,23 @@ class GatewayServer:
         session.emit("tool.generating", {"name": tc.name})
         session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
 
+    def _watch_cache(self, session: LiveSession, u: Usage) -> None:
+        """One notice per cache-hit collapse (``context.cache_warning: false`` silences it); never raises."""
+        if not (getattr(self.config, "context", None) or {}).get("cache_warning", True):
+            return
+        try:
+            note = session.cache_watch.observe(u.prompt_tokens, u.cache_read_tokens, time.monotonic())
+        except Exception:  # noqa: BLE001 - a watcher must never break a turn
+            logger.exception("cache watch failed")
+            return
+        if note:
+            self.usage.record("cache_regression", session=session.session_id, detail=note[:200])
+            session.emit(
+                "notification.show",
+                {"text": note, "level": "warn", "kind": "cache", "key": "k3.cache_regression"},
+                importance="essential",
+            )
+
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
             self._announce_tool(session, event.tool_call)
@@ -2921,6 +2942,7 @@ class GatewayServer:
                 if u:
                     session.last_prompt_tokens = max(0, u.prompt_tokens)
                     session.emit("session.usage", {"usage": _usage_payload(u, self._context_max(session))})
+                    self._watch_cache(session, u)
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
                 for tc in msg.tool_calls:
                     self._announce_tool(session, tc)
