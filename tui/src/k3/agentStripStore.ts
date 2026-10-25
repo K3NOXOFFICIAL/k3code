@@ -52,6 +52,23 @@ export function applyStripSessions(
   );
 }
 
+/** Bumped when the gateway is ready again after a drop: what the agent view loaded before it is no longer known. */
+export const $gatewayEpoch = atom(0);
+
+/**
+ * The gateway dropped: the rows cannot be told from stale ones (a session that died with it would show "working" for
+ * good), so the strip empties until the next snapshot after the reconnect brings the real ones.
+ */
+export function stripOffline() {
+  if ($stripSessions.get().length) {
+    $stripSessions.set([]);
+  }
+}
+
+export function stripBackOnline() {
+  $gatewayEpoch.set($gatewayEpoch.get() + 1);
+}
+
 /** Row actions the agent view calls (attach a session or open an agent, stop a row); registered by useMainApp. */
 export interface StripHandlers {
   activate: (row: StripRow) => void;

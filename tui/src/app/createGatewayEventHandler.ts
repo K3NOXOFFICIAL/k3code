@@ -68,7 +68,11 @@ import {
   settleOutput,
 } from "./outputTokensStore.js";
 import { flashGoodVibes } from "./petFlashStore.js";
-import { applyStripSessions } from "../k3/agentStripStore.js";
+import {
+  applyStripSessions,
+  stripBackOnline,
+  stripOffline,
+} from "../k3/agentStripStore.js";
 import { addProposal } from "../k3/proposalsStore.js";
 import {
   forgetAllServerRequests,
@@ -963,6 +967,7 @@ export function createGatewayEventHandler(
 
     switch (ev.type) {
       case "gateway.ready":
+        stripBackOnline();
         handleReady(ev.payload?.skin);
 
         return;
@@ -1181,6 +1186,7 @@ export function createGatewayEventHandler(
       case "gateway.reconnecting": {
         const { attempt, delay_ms: delayMs } = ev.payload ?? {};
 
+        stripOffline();
         setStatus(backendReconnecting(attempt, delayMs));
 
         return;

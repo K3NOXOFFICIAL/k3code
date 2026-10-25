@@ -869,6 +869,8 @@ export function useMainApp(gw: GatewayClient) {
         .catch(() => {});
       gw.request<SessionActiveListResponse>("session.active_list", {
         current_session_id: getUiState().sid,
+        // this project only; the gateway keeps the scope for the snapshots it pushes to this client
+        cwd: getUiState().info?.cwd,
       })
         .then((raw) => {
           const result = asRpcResult<SessionActiveListResponse>(raw);
