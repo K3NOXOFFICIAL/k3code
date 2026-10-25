@@ -645,6 +645,12 @@ def _socket_is_live(path: Path) -> bool:
         probe.close()
 
 
+#: A finished (completed/failed) live session stays in the active list this many seconds, and at most this many of
+#: them do (newest first). Neither deletes anything: the session is still live and stored, it just leaves the strip.
+_COMPLETED_LIVE_TTL_S = 1800.0
+_COMPLETED_LIVE_MAX = 20
+
+
 class Client:
     """One attached JSON-RPC peer (the stdio pipe, or one Unix-socket connection)."""
 
@@ -652,6 +658,8 @@ class Client:
         self.send = send
         self.name = name
         self.session_id: str | None = None
+        #: The project (normalised cwd) this client last asked ``session.active_list`` for; scopes its pushed snapshots.
+        self.cwd: str | None = None
         self.closed = False
         self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
         self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
@@ -943,8 +951,23 @@ class GatewayServer:
             if not client.closed:
                 self._send(client, line)
 
+    def _client_cwd(self, client: Client) -> str | None:
+        """The project a client's strip is scoped to: the cwd it last asked for, else its session's, else none."""
+        if client.cwd:
+            return client.cwd
+        live = self.live.get(client.session_id) if client.session_id else None
+        return _norm_cwd(live.stored.cwd) if live is not None else None
+
     def broadcast_active_list(self) -> None:
-        self.broadcast("session.active_list", {"sessions": self._active_rows(None)})
+        """Push every client its own snapshot: scoped to its project, with its own session marked ``current``."""
+        lines: dict[tuple[str | None, str | None], str] = {}
+        for client in self.clients:
+            if client.closed:
+                continue
+            key = (client.session_id, self._client_cwd(client))
+            if key not in lines:
+                lines[key] = encode_event("session.active_list", {"sessions": self._active_rows(*key)}, None)
+            self._send(client, lines[key])
 
     async def ensure_automation(self) -> Any:
         """The automation engine, started on first use (the daemon starts it eagerly)."""
@@ -1288,9 +1311,26 @@ class GatewayServer:
         except Exception:
             logger.exception("unhandled error processing frame")
 
-    def _active_rows(self, current: str | None) -> list[dict[str, Any]]:
+    def _active_rows(
+        self, current: str | None, cwd: str | None = None, now: float | None = None
+    ) -> list[dict[str, Any]]:
+        """The strip's rows. ``cwd`` (normalised) keeps only that project's sessions and their sub-agents. A finished
+        (completed/failed) session stays listed for ``_COMPLETED_LIVE_TTL_S`` and at most ``_COMPLETED_LIVE_MAX`` of
+        them, newest first: it is still live and resumable, it just stops crowding the strip and the agent view."""
+        now = time.time() if now is None else now
         rows = []
+        scope_ids: set[str] = set()
+        finished = 0
         for s in sorted(self.live.values(), key=lambda x: x.stored.updated_at, reverse=True):
+            if cwd is not None:
+                if _norm_cwd(s.stored.cwd) != cwd:
+                    continue
+                scope_ids.add(s.session_id)
+            state = s.state
+            if state in ("completed", "failed"):
+                if now - s.stored.updated_at > _COMPLETED_LIVE_TTL_S or finished >= _COMPLETED_LIVE_MAX:
+                    continue
+                finished += 1
             # a session without a generated title is called by the start of its first prompt, not "Session" for all
             first_prompt = _one_line(summarize_messages(s.stored.messages)[1], 120)
             rows.append(
@@ -1318,6 +1358,8 @@ class GatewayServer:
             )
         for h in self.subagents.handles.values():  # sub-agent / fan-out children share the strip
             if h.status not in ("queued", "running"):
+                continue
+            if cwd is not None and h.parent_sid not in scope_ids:
                 continue
             rows.append(
                 {
@@ -3758,9 +3800,9 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int, *, archived: bool = False) -> list[SessionSummary]:
-    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised);
-    archived ones only with ``archived``, else none of them."""
+def _project_session_ids(server: GatewayServer, cwd: str, *, archived: bool = False) -> list[str]:
+    """Ids of the newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised), newest
+    first, out of the newest ``_SESSION_LIST_SCAN_CAP``; archived ones only with ``archived``, else none of them."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
     for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP, archived=archived):
@@ -3768,22 +3810,47 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int, *, archived: 
             spelled[stored_cwd] = _norm_cwd(stored_cwd)
         if spelled[stored_cwd] == cwd:
             ids.append(sid)
-            if len(ids) >= limit:
-                break
-    return server.store.summaries(ids)
+    return ids
+
+
+def _project_sessions(
+    server: GatewayServer, cwd: str, limit: int, *, archived: bool = False, offset: int = 0
+) -> list[SessionSummary]:
+    """The ``limit`` sessions of :func:`_project_session_ids` after the first ``offset``."""
+    return server.store.summaries(_project_session_ids(server, cwd, archived=archived)[offset : offset + limit])
+
+
+def _bool_param(params: dict[str, Any], key: str) -> bool:
+    """A boolean parameter, absent or null meaning false. ``"false"`` is false, not a non-empty string."""
+    value = params.get(key)
+    if value is None:
+        return False
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise _InvalidParams(f"{key} must be true or false")
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
     message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all.
+    ``offset`` skips that many rows first (page with the number of rows already fetched); ``total`` counts every
+    matching row, out of the newest ``_SESSION_LIST_SCAN_CAP`` when ``cwd`` is given.
     Archived sessions are left out, unless ``archived`` is true: then only they are listed."""
     limit = int(params.get("limit") or 50)
+    offset = max(0, int(params.get("offset") or 0))
     cwd = _norm_cwd(params.get("cwd"))
-    archived = bool(params.get("archived"))
+    archived = _bool_param(params, "archived")
     if cwd:
-        sessions = _project_sessions(server, cwd, max(1, limit), archived=archived)
+        ids = _project_session_ids(server, cwd, archived=archived)
+        total = len(ids)
+        sessions = server.store.summaries(ids[offset : offset + max(1, limit)])
     else:
-        sessions = server.store.list(limit=limit, archived=archived)
+        total = server.store.count(archived=archived)
+        sessions = server.store.list(limit=limit, offset=offset, archived=archived)
     rows = []
     for s in sessions:
         preview = s.preview
@@ -3803,7 +3870,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "cwd": _norm_cwd(s.cwd),
             }
         )
-    return {"sessions": rows}
+    return {"sessions": rows, "total": total, "offset": offset}
 
 
 #: Most rows one ``session.archive_suggestions`` reply carries (``total`` counts them all).
@@ -3875,8 +3942,16 @@ async def _session_archive_suggestions(server: GatewayServer, params: dict[str, 
 
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``cwd`` (optional) scopes the rows to that project; the client's later pushed snapshots keep that scope."""
+    raw_cwd = params.get("cwd")
+    if raw_cwd is not None and not isinstance(raw_cwd, str):
+        raise _InvalidParams("cwd must be a string")
+    cwd = _norm_cwd(raw_cwd)
+    client = _ctx_client.get()
+    if client is not None and cwd:
+        client.cwd = cwd
     current = server.session
-    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None)}
+    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None, cwd)}
     if server.automation is not None:
         counts = server.automation.counts()
         out["automation"] = {**counts, "active": sum(counts.values())}
