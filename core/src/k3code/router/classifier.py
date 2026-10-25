@@ -101,6 +101,11 @@ class ClassifiedError:
     #: What the user can do about this failure (empty when nothing specific applies).
     hint: str = ""
     error_context: dict[str, Any] = field(default_factory=dict)
+    #: context_overflow only, parsed from the error text when it names them: the entry's window, the prompt's
+    #: tokens, and the total (prompt + max_tokens) the request asked for. The router clamps max_tokens with them.
+    context_limit: int | None = None
+    prompt_tokens: int | None = None
+    requested_tokens: int | None = None
 
     @property
     def retryable(self) -> bool:
@@ -272,6 +277,19 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 _OUTPUT_CAP_PATTERNS = ("max_tokens", "max_completion_tokens", "output tokens", "output token limit")
 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded", "max_tokens_exceeded"})
+
+# Prompt plus the requested output over the window: "input length and `max_tokens` exceed context limit: 150000 +
+# 64000 > 200000" (Anthropic). It names max_tokens, but a smaller max_tokens is the fix when the prompt itself fits.
+_INPUT_PLUS_OUTPUT_PATTERNS = ("exceed context limit",)
+_N = r"(\d[\d,_]*)"
+_LIMIT_RES = (
+    re.compile(rf"exceed context limit:\s*{_N}\s*\+\s*{_N}\s*>\s*{_N}"),  # prompt, max_tokens, window
+    re.compile(rf"prompt is too long:\s*{_N}\s*tokens\s*>\s*{_N}"),  # prompt, window
+)
+_WINDOW_RE = re.compile(rf"maximum context length is\s*{_N}")
+_REQUESTED_RE = re.compile(rf"you requested\s*{_N}")
+_COMPLETION_RE = re.compile(rf"{_N}\s*in the completion")
+_INPUT_RE = re.compile(rf"(?:your request has|you requested)\s*{_N}\s*input tokens")
 
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model",
@@ -593,6 +611,8 @@ def _status_400(c: _Ctx) -> FailoverReason:
         return _R.bad_request
     if code in {"unknown_parameter", "unsupported_parameter"}:
         return _R.bad_request
+    if any(p in msg for p in _INPUT_PLUS_OUTPUT_PATTERNS):
+        return _R.context_overflow
     if code not in _CONTEXT_OVERFLOW_ERROR_CODES and any(p in msg for p in _OUTPUT_CAP_PATTERNS):
         return _R.bad_request
     # A malformed message array is not overflow: the input can be tiny and
@@ -754,6 +774,7 @@ def classify_api_error(
     retry_after = None
     if reason in (_R.rate_limit, _R.quota, _R.server):
         retry_after = _reset_seconds(c)
+    limit, prompt, requested = _context_numbers(c.msg) if reason is _R.context_overflow else (None, None, None)
     return ClassifiedError(
         reason=reason,
         status_code=status_code,
@@ -762,7 +783,28 @@ def classify_api_error(
         message=_extract_message(error, body),
         retry_after=retry_after,
         hint=_hint_for(reason, c),
+        context_limit=limit,
+        prompt_tokens=prompt,
+        requested_tokens=requested,
     )
+
+
+def _context_numbers(msg: str) -> tuple[int | None, int | None, int | None]:
+    """(window, prompt tokens, requested total) named by an overflow message; None for each one it does not name."""
+
+    def num(match: re.Match[str] | None, group: int = 1) -> int | None:
+        return int(match.group(group).replace(",", "").replace("_", "")) if match else None
+
+    for rx in _LIMIT_RES:
+        if m := rx.search(msg):
+            prompt, last = num(m, 1), m.lastindex or 1
+            requested = (prompt or 0) + (num(m, 2) or 0) if last == 3 else None
+            return num(m, last), prompt, requested
+    limit, requested = num(_WINDOW_RE.search(msg)), num(_REQUESTED_RE.search(msg))
+    prompt = num(_INPUT_RE.search(msg))
+    if prompt is None and requested is not None and (completion := num(_COMPLETION_RE.search(msg))) is not None:
+        prompt = requested - completion  # "(130000 in the messages, 10000 in the completion)"
+    return limit, prompt, requested
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
