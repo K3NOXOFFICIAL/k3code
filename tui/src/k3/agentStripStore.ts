@@ -21,6 +21,17 @@ export const STRIP_MAX_ROWS = 6;
 /** Background sessions from the `session.active_list` poll (current session excluded). */
 export const $stripSessions = atom<SessionActiveItem[]>([]);
 
+// `current` is left out: the poll marks the TUI's own session, the pushed `session.active_list` event marks none.
+const snapshotKey = (rows: readonly SessionActiveItem[]) =>
+  JSON.stringify(rows.map(({ current: _current, ...row }) => row));
+
+/** Store a poll reply or pushed snapshot; an unchanged one sets nothing, so the idle TUI does not re-render. */
+export function applyStripSessions(rows: SessionActiveItem[]) {
+  if (snapshotKey($stripSessions.get()) !== snapshotKey(rows)) {
+    $stripSessions.set(rows);
+  }
+}
+
 /** Row actions the agent view calls (attach a session or open an agent, stop a row); registered by useMainApp. */
 export interface StripHandlers {
   activate: (row: StripRow) => void;

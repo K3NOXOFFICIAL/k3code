@@ -25,6 +25,7 @@ import type {
   ConfigFullResponse,
   DelegationStatusResponse,
   GatewaySkin,
+  SessionActiveItem,
   SessionMostRecentResponse,
 } from "../gatewayTypes.js";
 import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
@@ -67,6 +68,7 @@ import {
   settleOutput,
 } from "./outputTokensStore.js";
 import { flashGoodVibes } from "./petFlashStore.js";
+import { applyStripSessions } from "../k3/agentStripStore.js";
 import { addProposal } from "../k3/proposalsStore.js";
 import {
   forgetAllServerRequests,
@@ -962,6 +964,15 @@ export function createGatewayEventHandler(
     switch (ev.type) {
       case "gateway.ready":
         handleReady(ev.payload?.skin);
+
+        return;
+
+      // The core pushes this on attach and whenever a session or sub-agent changes state; the 1.5 s poll stays the
+      // fallback (and the only source on a core that does not push).
+      case "session.active_list":
+        if (Array.isArray(ev.payload?.sessions)) {
+          applyStripSessions(ev.payload.sessions as SessionActiveItem[]);
+        }
 
         return;
 

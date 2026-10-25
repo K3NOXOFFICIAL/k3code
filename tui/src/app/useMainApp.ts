@@ -75,7 +75,7 @@ import type {
   SlashCatalog,
 } from "../types.js";
 
-import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
+import { applyStripSessions, setStripHandlers } from "../k3/agentStripStore.js";
 import { clearProposals, setProposalHandlers } from "../k3/proposalsStore.js";
 
 import { applyAgentSnapshot } from "./agentRoster.js";
@@ -876,7 +876,7 @@ export function useMainApp(gw: GatewayClient) {
           if (!stopped && result?.sessions) {
             const liveSessionCount = result.sessions.length;
 
-            $stripSessions.set(result.sessions);
+            applyStripSessions(result.sessions);
 
             // Surface the current session's (auto-)title for the terminal
             // titlebar. The active_list poll already carries it, so no extra
