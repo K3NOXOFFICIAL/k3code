@@ -68,7 +68,13 @@ from k3code.config import (
     retention,
     session_archive_days,
 )
-from k3code.context_budget import compact_threshold, context_window, overhead_tokens, router_window
+from k3code.context_budget import (
+    TokenCalibration,
+    compact_threshold,
+    context_window,
+    overhead_tokens,
+    router_window,
+)
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -333,6 +339,8 @@ class LiveSession:
         self.overhead_tokens = 0
         #: Warns once when the provider's prompt cache stops hitting (see k3code.cache_watch).
         self.cache_watch = CacheWatch()
+        #: Real tokens per estimated token, learned from this session's provider reports (shared by its loops).
+        self.calibration = TokenCalibration()
         #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
         #: compaction or an /undo): the size of the context as the provider counted it.
         self.last_prompt_tokens = 0
@@ -2247,6 +2255,7 @@ class GatewayServer:
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
+        loop.calibration = session.calibration
         # write/edit checkpoints for /undo, keyed by where this turn's messages start (where an /undo cuts)
         loop.checkpoint = checkpoints.Turn(session.session_id, len(session.stored.messages))
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
@@ -2807,7 +2816,9 @@ class GatewayServer:
         own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
         messages = session.stored.messages
-        if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
+        # compared in the provider's units: the estimate is bytes/4, which the session's own reports have corrected
+        estimate = session.calibration.correct(self._request_tokens(session))
+        if not force and estimate < compact_threshold(self.config, self._active_model(session)):
             return 0
         try:
             new, folded = await compact_messages(

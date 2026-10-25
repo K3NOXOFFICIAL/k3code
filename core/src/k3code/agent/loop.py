@@ -129,6 +129,10 @@ class AgentLoop:
         self.classify_call: Callable[..., Awaitable[Any]] | None = None
         #: share of the context window past which old tool results are elided
         self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
+        #: real tokens per estimated token, learned from the provider's reports; the gateway shares a session's own
+        self.calibration = context_budget.TokenCalibration()
+        self._last_estimate = 0  # estimated size of the request last sent (paired with the provider's count of it)
+        self._max_tokens = 8192
         self._reads: dict[tuple[Any, ...], tuple[int, str, int, int, int]] = {}  # (step, call id, first, last, wanted)
         self._step = 0
         #: What this loop's model has seen of each file; write and edit refuse one it has not, or that changed since.
@@ -267,6 +271,7 @@ class AgentLoop:
         self.reliability.begin_turn()
         self._tell_home_started()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
+        self._max_tokens = max_tokens
         self._notes, self._notes_at = {}, {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
@@ -878,12 +883,18 @@ class AgentLoop:
             else wire
         )
         overhead = context_budget.overhead_tokens(self.system_prompt, specs)
-        threshold = self.context_window * self.elide_at_ratio
+        # the estimate runs `ratio` times under (or over) what the provider counts: compare in the provider's units by
+        # moving the threshold, so the decision model's budget below stays in estimated tokens
+        threshold = (
+            context_budget.elide_threshold(self.context_window, self.elide_at_ratio, self._max_tokens)
+            / self.calibration.ratio
+        )
         if overhead + context_budget.message_tokens(view) > threshold:
             keep = set(self._pinned)
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
             view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
+        self._last_estimate = overhead + context_budget.message_tokens(view)
         for m in view:
             if m.tool_call_id in self._notes and "Still relevant:" in (m.content or ""):
                 self._notes_at[m.tool_call_id] = self._step
@@ -1035,6 +1046,8 @@ class AgentLoop:
     def _record_usage(self, event: StreamEvent) -> None:
         msg = event.message
         self.reliability.record_usage(msg.usage if msg is not None else None)
+        if msg is not None and msg.usage is not None and self._last_estimate:
+            self.calibration.observe(msg.usage.prompt_tokens, self._last_estimate)
 
     def _drain_steer(self, messages: list[Message]) -> bool:
         """Append steering messages (never between an assistant tool_calls message and its results)."""
