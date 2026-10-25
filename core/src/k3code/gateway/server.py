@@ -44,7 +44,7 @@ from typing import Any
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import ask_user, confio, mcpjson, userhooks, wakewords
+from k3code import ask_user, checkpoints, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -2201,6 +2201,8 @@ class GatewayServer:
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
+        # write/edit checkpoints for /undo, keyed by where this turn's messages start (where an /undo cuts)
+        loop.checkpoint = checkpoints.Turn(session.session_id, len(session.stored.messages))
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         ask_user.register(loop.tools, self, session)  # always: whether anyone can answer is decided per call
@@ -2776,8 +2778,9 @@ class GatewayServer:
             session.stored.messages = new
             session.last_prompt_tokens = 0  # the reported size described the history before it was folded
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
-            # be matched to its turn, so their outcomes stop waiting for one
+            # be matched to its turn, so their outcomes stop waiting for one, and their file checkpoints are dropped
             self.learning.settle_turns(session.session_id)
+            await asyncio.to_thread(checkpoints.drop, session.session_id)
             session.refresh_prompt_inputs()  # the old prefix is no longer cached anyway: show what was learned
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
@@ -5016,7 +5019,11 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     The goal's continuation prompts are no user messages here: after an auto-continued (or /goal) run, /undo drops
     the whole run back to the prompt the user sent, as the TUI's transcript does (it never showed the continuations).
     It used to drop only the last continuation turn, so the run's earlier turns stayed in the conversation the next
-    prompt (and /retry) went on from. ``removed``: the number of messages dropped."""
+    prompt (and /retry) went on from. ``removed``: the number of messages dropped.
+
+    The files the dropped turns' write/edit calls changed are rewound too (k3code.checkpoints): when there was any,
+    or a shell command ran in them (its changes are not rewound), the result also lists the files and has a ``note``
+    to show. /rewind is the same command."""
     session = server._session_for(params.get("session_id"))
     if session is None:
         raise _InvalidParams("no active session")
@@ -5036,10 +5043,20 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     # the turns these messages came from (each turn of an auto-continued run) were rejected: their outcomes are
     # failures, not "finished" (issue #140)
     server.learning.turn_undone(session, last_user)
+    # a turn's checkpoints are filed under where its messages start: the first one's with the system prompt
+    start = last_user
+    while start > 0 and messages[start - 1].get("role") == "system":
+        start -= 1
+    roots = [str(session.stored.cwd or session.perms.cwd), *session.perms.add_dirs]
+    rewind = await asyncio.to_thread(checkpoints.restore, session.session_id, start, roots)
+    shell = any(c.get("name") == "bash" for m in messages[last_user:] for c in m.get("tool_calls") or [])
     session.messages = messages[:last_user]
     session.last_prompt_tokens = 0
     server.store.save(session.stored)
-    return {"removed": len(messages) - last_user}
+    out: dict[str, Any] = {"removed": len(messages) - last_user}
+    if rewind or shell:
+        out.update(rewind.report(shell=shell))
+    return out
 
 
 async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

@@ -11,6 +11,10 @@ from typing import Any
 
 import pytest
 
+from test_autonomy_gateway import call, make, run_turn, start
+
+NO_GATE = {"autonomy": {"plan_first": False, "proposals": False}}
+
 
 @pytest.fixture(autouse=True)
 def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -225,3 +229,97 @@ def test_a_session_id_is_never_a_path(tmp_path: Path, _home: Path) -> None:
     _agent_write(checkpoints.Turn("../escape", 0), f, b"agent\n")
     assert not (_home / "escape").exists() and not (_home / "checkpoints").exists()
     assert not checkpoints.restore("../escape", 0, [str(project)])
+
+
+# ── wired: the loop records, session.undo rewinds ──────────────────────────────────────────────────────────
+
+
+def _write_then_answer(path: str, content: str) -> list[dict]:
+    return [
+        {
+            "type": "tool_call",
+            "when": "turn_first",
+            "id": "w1",
+            "name": "write",
+            "arguments": {"path": path, "content": content},
+        },
+        {"type": "text", "when": "turn_after_tool", "text": "written"},
+    ]
+
+
+async def test_undo_removes_the_file_the_turn_wrote_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = make(tmp_path, monkeypatch, _write_then_answer("made.txt", "hi\n"), mode="yolo", **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "make a file")
+    made = tmp_path / "made.txt"
+    assert made.read_text() == "hi\n"
+    res = await call(server, "session.undo", {})
+    assert res["removed"] >= 2
+    assert not made.exists()
+    assert res["deleted"] == [str(made)]
+    assert str(made) in res["note"]
+
+
+async def test_undo_rewinds_only_the_undone_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    steps = [  # the first turn writes the file; the second only answers
+        {
+            "type": "tool_call",
+            "when": "first",
+            "id": "w1",
+            "name": "write",
+            "arguments": {"path": "a.txt", "content": "a"},
+        },
+        {"type": "text", "when": "after_tool", "text": "ok"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "write it")
+    await run_turn(server, "and now?")
+    made = tmp_path / "a.txt"
+    assert await call(server, "session.undo", {}) == {"removed": 2}
+    assert made.read_text() == "a"
+    res = await call(server, "session.undo", {})
+    assert not made.exists() and res["deleted"] == [str(made)]
+
+
+async def test_undo_restores_a_file_the_turn_overwrote(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"before\r\n")
+    server = make(tmp_path, monkeypatch, _write_then_answer("f.txt", "after\n"), mode="yolo", **NO_GATE)
+    await start(server, tmp_path)
+    server.session.file_stamps.record(f)  # as if the model had read it
+    await run_turn(server, "overwrite it")
+    assert f.read_bytes() == b"after\n"
+    res = await call(server, "session.undo", {})
+    assert f.read_bytes() == b"before\r\n"
+    assert res["restored"] == [str(f)]
+
+
+async def test_undo_without_checkpoints_only_truncates_the_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = make(tmp_path, monkeypatch, [{"type": "text", "text": "hello back"}], **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "hi")
+    assert await call(server, "session.undo", {}) == {"removed": 2}
+
+
+async def test_undo_of_a_turn_that_ran_bash_says_shell_changes_stay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
+    steps = [
+        {"type": "tool_call", "when": "turn_first", "id": "b1", "name": "bash", "arguments": {"command": "echo hi"}},
+        {"type": "text", "when": "turn_after_tool", "text": "ran it"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "run something")
+    res = await call(server, "session.undo", {})
+    assert res["removed"] >= 2
+    assert "shell commands ran" in res["note"] and "not restored" in res["note"]
+    assert res["restored"] == [] and res["deleted"] == []

@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from k3code import context_budget
+from k3code import checkpoints, context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.engine import home_read_only
@@ -187,6 +187,8 @@ class AgentLoop:
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
         self.on_checkpoint: Callable[[], None] | None = None
+        #: the gateway's turn: write/edit keep what a file held before they change it, for /undo (k3code.checkpoints)
+        self.checkpoint: checkpoints.Turn | None = None
         #: awaited once the user's prompt joined the conversation, before the first model call (the gateway persists)
         self.on_turn_start: Callable[[], Awaitable[None]] | None = None
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
@@ -722,6 +724,7 @@ class AgentLoop:
             return {"error": stale}
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
+        checkpoint_note = None
         try:
             if tool_call.name == "bash":
                 # A background job outlives this call: the handler returns as soon as the job has started, so the
@@ -759,10 +762,20 @@ class AgentLoop:
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
+                # what write/edit is about to change, kept for /undo once the change is made
+                prior = None
+                if (
+                    self.checkpoint is not None
+                    and tool_call.name in FILE_TOOLS
+                    and (target := self._tool_path(args)) is not None
+                ):
+                    prior = await asyncio.to_thread(checkpoints.capture, target)
                 # grep and glob judge a search outside the roots by the session's roots (see search_withheld)
                 roots = [str(self.cwd), *self.permissions.add_dirs]
                 with file_guard(self._file_guard(tool_call.name, args, decision)), search_roots(roots):
                     result = await handler(args, cwd=self.cwd)
+                if prior is not None and self.checkpoint is not None and result.get("ok"):
+                    checkpoint_note = await asyncio.to_thread(self.checkpoint.record, prior)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": self._bash_refusal(exc)}
         except Exception as e:
@@ -791,6 +804,8 @@ class AgentLoop:
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
         if feedback:  # the tool already ran: the hook's word joins its result for the model
             result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
+        if checkpoint_note:  # never silent: this change is one /undo cannot take back
+            result = {**result, "content": f"{format_tool_result(result)}\n\n[checkpoint] {checkpoint_note}"}
         return result
 
     def _file_guard(self, tool: str, args: dict[str, Any], decision: Decision) -> Guard | None:
