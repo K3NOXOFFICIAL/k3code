@@ -39,6 +39,7 @@ class FailoverReason(enum.Enum):
     bad_request = "bad_request"  # malformed request/model — fail over, no retry
     ssl_cert = "ssl_cert"  # certificate does not verify (missing CA, proxy) — fail over, never park
     unknown = "unknown"  # unclassifiable — retry with backoff, then fail over
+    content_filter = "content_filter"  # the answer was filtered or refused — try the next entry, no cooldown
 
 
 #: Reasons for which the router retries the same entry before failing over.
@@ -58,7 +59,13 @@ RETRYABLE_REASONS = frozenset(
 #: rather than aborting the walk. ``ssl_cert`` is the same: another entry may not
 #: sit behind the proxy or CA bundle that broke this one.
 IMMEDIATE_FAILOVER_REASONS = frozenset(
-    {FailoverReason.auth, FailoverReason.quota, FailoverReason.bad_request, FailoverReason.ssl_cert}
+    {
+        FailoverReason.auth,
+        FailoverReason.quota,
+        FailoverReason.bad_request,
+        FailoverReason.ssl_cert,
+        FailoverReason.content_filter,
+    }
 )
 
 #: What the user can do about a certificate failure; carried on :attr:`ClassifiedError.hint`.
@@ -106,6 +113,8 @@ class ClassifiedError:
     context_limit: int | None = None
     prompt_tokens: int | None = None
     requested_tokens: int | None = None
+    #: bad_request only: the endpoint has no model under this id (the router cools that model down)
+    model_missing: bool = False
 
     @property
     def retryable(self) -> bool:
@@ -786,7 +795,15 @@ def classify_api_error(
         context_limit=limit,
         prompt_tokens=prompt,
         requested_tokens=requested,
+        model_missing=reason is _R.bad_request and _model_missing(c),
     )
+
+
+def _model_missing(c: _Ctx) -> bool:
+    """Whether a bad_request says the model id is unknown (not that the request was malformed). "No endpoints that
+    support tool use" is left out: the same model still answers a call without tools."""
+    patterns = (*_MODEL_NOT_FOUND_PATTERNS, *_UNKNOWN_MODEL_VENDOR_PATTERNS)
+    return c.code in _MODEL_NOT_FOUND_ERROR_CODES or any(p in c.msg for p in patterns if "tool use" not in p)
 
 
 def _context_numbers(msg: str) -> tuple[int | None, int | None, int | None]:

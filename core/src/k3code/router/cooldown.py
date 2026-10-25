@@ -23,7 +23,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,10 @@ _COOLDOWN_REASONS = (
     frozenset({FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network, FailoverReason.auth})
     | BREAKER_REASONS
 )
+
+#: A model id the endpoint does not know (a bad_request armed with ``model_missing``): the next calls skip it instead
+#: of paying a request for the same 404 first, and a model added upstream is tried again soon.
+_MODEL_MISSING_COOLDOWN_SECONDS = 300.0
 
 # Breaker ladder: 15 s → 30 s → 60 s → 2 min. The cap bounds how long a one-entry chain (the common single-gateway
 # config) parks an interactive turn between half-open probes; a declared Retry-After (503/529) seeds the window.
@@ -147,31 +151,48 @@ class CooldownStore:
 
     # ── persistence ──
 
-    def _load(self) -> None:
+    def _read(self) -> tuple[list[tuple[_Key, dict[str, Any]]], _Key | None]:
+        """The file's (key, row) cooldown rows and its ``last_good``; nothing when it is missing or unreadable."""
         assert self.path is not None
         try:
             raw = json.loads(self.path.read_text())
         except (OSError, ValueError):
-            return
-        now_wall, now_mono = self.wall(), time.monotonic()
-        for row in raw.get("entries", []) if isinstance(raw, dict) else []:
+            return [], None
+        if not isinstance(raw, dict):
+            return [], None
+        rows = []
+        for row in raw.get("entries", []):
             try:
                 key = _identity(row["provider"], row["model"], row.get("base_url", ""), str(row.get("account", "")))
-                until_wall = float(row["until"])
-                reason = FailoverReason(row["reason"])
-                fingerprint = str(row.get("fingerprint", ""))
-            except (KeyError, TypeError, ValueError):
+                float(row["until"]), FailoverReason(row["reason"])
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue
+            rows.append((key, row))
+        good = raw.get("last_good")
+        last_good = _identity(*map(str, good)) if isinstance(good, list) and len(good) == 4 else None
+        return rows, last_good
+
+    def _load(self) -> None:
+        rows, self.last_good = self._read()
+        now_wall, now_mono = self.wall(), time.monotonic()
+        for key, row in rows:
+            until_wall = float(row["until"])
             remaining = until_wall - now_wall
             if remaining > 0:
+                reason, fingerprint = FailoverReason(row["reason"]), str(row.get("fingerprint", ""))
                 self.entries[key] = EntryCooldown(now_mono + remaining, remaining, reason, until_wall, fingerprint)
 
-    def _save(self) -> None:
+    def _save(self, dropped: Collection[_Key] = ()) -> None:
+        """Write the persisted cooldowns merged with the file's: other k3code processes (a second session, the
+        daemon) write the same file, so their entries are kept, the later reset winning per entry. ``dropped`` are
+        entries this store has just cleared on purpose: they leave the file too."""
         if self.path is None:
             return
+        from k3code.confio import locked  # here: confio pulls in the config schema
+
         now_wall, now_mono = self.wall(), time.monotonic()
-        rows = [
-            {"provider": k[0], "model": k[1], "base_url": k[2], "reason": e.reason.value, "until": e.until_wall}
+        rows = {
+            k: {"provider": k[0], "model": k[1], "base_url": k[2], "reason": e.reason.value, "until": e.until_wall}
             | ({"account": k[3]} if k[3] else {})
             | ({"fingerprint": e.fingerprint} if e.fingerprint else {})
             for k, e in self.entries.items()
@@ -179,12 +200,22 @@ class CooldownStore:
             and e.reason not in BREAKER_REASONS
             and e.until > now_mono
             and e.until_wall > now_wall
-        ]
+        }
         try:
             ensure_private_dir(self.path.parent)  # $K3CODE_HOME: 0700 whatever the umask (issue #163)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"entries": rows}))
-            tmp.replace(self.path)
+            with locked(self.path):
+                theirs, their_good = self._read()
+                for key, row in theirs:
+                    if key in dropped or float(row["until"]) <= now_wall:
+                        continue
+                    if key not in rows or float(row["until"]) > float(rows[key]["until"]):
+                        rows[key] = row
+                data: dict[str, Any] = {"entries": list(rows.values())}
+                if (good := self.last_good or their_good) is not None:
+                    data["last_good"] = list(good)
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data))
+                tmp.replace(self.path)
         except (OSError, RuntimeError) as e:  # RuntimeError: another user's directory
             logger.warning("could not persist cooldowns to %s: %s", self.path, e)
 
@@ -202,6 +233,7 @@ class CooldownStore:
         now: float | None = None,
         fingerprint: str = "",
         keyless: bool = False,
+        model_missing: bool = False,
     ) -> float | None:
         """Put an entry into cooldown until its reset window. Returns the armed seconds.
 
@@ -213,8 +245,9 @@ class CooldownStore:
         The first auth rejection in a row only counts; the second arms the cooldown (returns None before that).
         A ``keyless`` entry (claude-cli: logged in with ``claude /login``, no key in the config) never arms an auth
         cooldown: nothing would clear it once the login is fixed.
+        A ``bad_request`` only arms with ``model_missing`` (the endpoint has no such model id): a flat 300 s.
         """
-        if reason not in _COOLDOWN_REASONS:
+        if reason not in _COOLDOWN_REASONS and not (reason is FailoverReason.bad_request and model_missing):
             return None
         key = _identity(provider, model, base_url, account)
         auth_step = breaker_step = 0
@@ -229,7 +262,7 @@ class CooldownStore:
         elif reason in BREAKER_REASONS:
             breaker_step = self.breaker_strikes.get(key, 0)
             self.breaker_strikes[key] = breaker_step + 1
-        elif reason is not FailoverReason.network:
+        elif reason not in (FailoverReason.network, FailoverReason.bad_request):
             if backoff_count is None:
                 backoff_count = self.strikes.get(key, 0)
             self.strikes[key] = backoff_count + 1
@@ -240,6 +273,8 @@ class CooldownStore:
             seconds = math.ceil(window)
         elif reason is FailoverReason.auth:
             seconds = min(_AUTH_BASE_COOLDOWN_SECONDS * (2 ** min(auth_step, 16)), _AUTH_MAX_COOLDOWN_SECONDS)
+        elif reason is FailoverReason.bad_request:
+            seconds = _MODEL_MISSING_COOLDOWN_SECONDS
         elif reason in BREAKER_REASONS and not _provider_reset_delay(retry_after):
             seconds = min(_BREAKER_BASE_COOLDOWN_SECONDS * (2 ** min(breaker_step, 16)), _BREAKER_MAX_COOLDOWN_SECONDS)
         elif provider_delta := _provider_reset_delay(retry_after):
@@ -269,7 +304,7 @@ class CooldownStore:
             # The key was replaced since the rejection: try it at once, and restart the ladder.
             self.entries.pop(key, None)
             self.auth_strikes.pop(key, None)
-            self._save()
+            self._save(dropped=[key])
             return None
         return entry
 
@@ -327,7 +362,9 @@ class CooldownStore:
         self.breaker_strikes.pop(key, None)
         self.consecutive_failures.pop(key, None)
         self.last_success[key] = self.wall()
-        self.last_good = key
+        if self.last_good != key:  # persisted, so the failover order survives a restart
+            self.last_good = key
+            self._save()
 
     def record_failure(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> int:
         """Count one failed call for an entry; returns its consecutive-failure count."""
@@ -350,8 +387,9 @@ class CooldownStore:
         return self.breaker_strikes.get(_identity(provider, model, base_url, account), 0) > 0
 
     def clear(self, *, provider: str, model: str, base_url: str = "", account: str = "") -> None:
-        self.entries.pop(_identity(provider, model, base_url, account), None)
-        self._save()
+        key = _identity(provider, model, base_url, account)
+        self.entries.pop(key, None)
+        self._save(dropped=[key])
 
     def clear_reason(self, reason: FailoverReason, *, provider: str | None = None) -> int:
         """Drop every cooldown armed for ``reason`` (e.g. network ones once connectivity is back), optionally
@@ -363,7 +401,7 @@ class CooldownStore:
             if reason is FailoverReason.auth:
                 self.auth_strikes.pop(k, None)
         if keys:
-            self._save()
+            self._save(dropped=keys)
         return len(keys)
 
     def only_network_cooling(self) -> bool:

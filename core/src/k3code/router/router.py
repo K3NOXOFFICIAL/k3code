@@ -5,7 +5,9 @@ Rules (from the M0 task spec):
   jittered backoff (max ``max_retries``), then fail over to the next entry.
 - auth, quota or bad_request: no retries, fail over immediately to the next
   entry (a bad request/unknown model is entry-specific; a different
-  model/provider may still work).
+  model/provider may still work). An unknown model id also cools that model down for 5 min (persisted), so the
+  next calls do not pay for the same 404 first.
+- content_filter: an answer stopped as filtered/refused is dropped (``reset``) and the next entry tried, no cooldown.
 - A Retry-After longer than ``max_inline_wait`` (default 20 s) never sleeps inline: the entry goes
   into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
   ``quota_cooldown`` (default 1 h) when the provider declares no reset.
@@ -47,6 +49,7 @@ from k3code.providers.retry_utils import jittered_backoff
 from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
+    ClassifiedError,
     FailoverReason,
     classify_api_error,
     summarize,
@@ -61,6 +64,9 @@ STALL_RETRIES = 1
 CONTEXT_MARGIN = 1024
 #: the smallest max_tokens a clamp sends: less room than this means the prompt itself does not fit
 MIN_OUTPUT_TOKENS = 1024
+#: stop reasons of an answer the provider filtered (openai_compat finish_reason) or the model refused (anthropic):
+#: the next entry is tried, without a cooldown; the last entry's answer is passed through as it is
+FILTERED_STOP_REASONS = frozenset({"content_filter", "refusal"})
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -313,6 +319,9 @@ class Router:
                     ):
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
+                            stop = event.message.stop_reason if event.message is not None else None
+                            if stop in FILTERED_STOP_REASONS and self._next_target(model, tried) is not None:
+                                raise AnswerFiltered(f"the answer stopped with stop reason {stop!r}")
                             self.cooldowns.record_success(
                                 provider=entry.provider_name,
                                 model=target_model,
@@ -323,7 +332,12 @@ class Router:
                     # The provider yields its "done" event then closes normally.
                     return
                 except Exception as exc:  # noqa: BLE001 - classified below
-                    classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
+                    if isinstance(exc, AnswerFiltered):
+                        classified = ClassifiedError(
+                            FailoverReason.content_filter, provider=entry.provider_name, model=target_model
+                        )
+                    else:
+                        classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)
                     self.cooldowns.record_failure(
@@ -378,6 +392,7 @@ class Router:
                             retry_after=cooldown,
                             model_override=model,
                             tried=tried,
+                            model_missing=classified.model_missing,
                         )
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
@@ -531,6 +546,8 @@ class Router:
                 account=fp,
                 fingerprint=fp,
             )
+            if cooled is FailoverReason.bad_request:
+                continue  # an unknown model id: it does not come back by waiting, and must not make the call wait
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
             return None
@@ -680,6 +697,7 @@ class Router:
         retry_after: float | None = None,
         model_override: str | None = None,
         tried: Collection[int] | None = None,
+        model_missing: bool = False,
     ) -> None:
         # Without a declared long window jittered_backoff already separated the retries; the cooldown
         # then uses its own ladder.
@@ -692,8 +710,9 @@ class Router:
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
+            model_missing=model_missing,
         )
-        if armed and (retry_after is not None or reason in BREAKER_REASONS):
+        if armed and (retry_after is not None or reason in BREAKER_REASONS or reason is FailoverReason.bad_request):
             self._emit(
                 "router.cooldown",
                 entry,
@@ -759,3 +778,7 @@ class Router:
 
 class ProviderStreamError(Exception):
     """A provider surfaced a mid-stream failure as an error event."""
+
+
+class AnswerFiltered(Exception):
+    """The entry answered with a filtered or refused completion while another entry is left to try."""

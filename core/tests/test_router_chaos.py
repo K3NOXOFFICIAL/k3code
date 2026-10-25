@@ -7,12 +7,12 @@ import pytest
 from k3code.errors import ContextOverflow
 from k3code.providers.base import ProviderError
 from k3code.providers.types import Message, StreamEvent
-from k3code.router import CooldownStore, Router, RouterEvent, build_chain
+from k3code.router import CooldownStore, FailoverReason, Router, RouterEvent, build_chain
 
 
 class Stub:
-    """A provider that plays one scripted step per ``stream()`` call: an exception is raised, a string is the answer.
-    Every call records the model and the max_tokens it was sent."""
+    """A provider that plays one scripted step per ``stream()`` call: an exception is raised, a string or a Message is
+    the answer. Every call records the model and the max_tokens it was sent."""
 
     def __init__(self, name: str, script: list | None = None) -> None:
         self.name = name
@@ -26,8 +26,9 @@ class Stub:
         step = self.script.pop(0) if self.script else f"answer from {self.name}"
         if isinstance(step, BaseException):
             raise step
-        yield StreamEvent(type="text_delta", text=step)
-        yield StreamEvent(type="done", message=Message(role="assistant", content=step))
+        message = step if isinstance(step, Message) else Message(role="assistant", content=step)
+        yield StreamEvent(type="text_delta", text=message.content)
+        yield StreamEvent(type="done", message=message)
 
 
 def prompt(tokens: int) -> list[Message]:
@@ -160,3 +161,110 @@ async def test_max_tokens_is_clamped_to_the_room_each_known_window_leaves():
     await router.complete(prompt(150_000), [], max_tokens=64_000)
     assert {c["max_tokens"] for c in a.calls} == {200_000 - 150_000 - 1024}
     assert [c["max_tokens"] for c in b.calls] == [64_000]  # unknown window: the request's own max_tokens
+
+
+# ── cooldowns ───────────────────────────────────────────────────────────
+
+
+def model_not_found() -> ProviderError:
+    return ProviderError(
+        "The model `gone-1` does not exist", status_code=404, body={"error": {"code": "model_not_found"}}
+    )
+
+
+async def test_an_unknown_model_id_is_skipped_first_on_the_next_call():
+    """A dead model id was the first entry tried on every call: each one paid a 404 before the backup answered."""
+    a, b = Stub("a", [model_not_found()]), Stub("b")
+    router, events = make([a, b], [["gone-1"], ["live-1"]])
+    assert (await router.complete(prompt(10), [])).content == "answer from b"
+    assert (await router.complete(prompt(10), [])).content == "answer from b"
+    assert len(a.calls) == 1
+    assert [e.reason for e in events if e.kind == "router.cooldown"] == ["bad_request"]
+
+
+async def test_a_dead_model_alone_fails_at_once_instead_of_waiting_for_its_cooldown():
+    from k3code.errors import ChainExhausted
+
+    a = Stub("a", [model_not_found()])
+    router, _ = make([a], [["gone-1"]])
+    with pytest.raises(ChainExhausted):
+        await router.complete(prompt(10), [])
+    with pytest.raises(ChainExhausted) as caught:
+        await router.complete(prompt(10), [])
+    assert caught.value.retry_after is None and caught.value.last_reason == "bad_request"
+    assert len(a.calls) == 1
+
+
+async def test_a_malformed_request_arms_no_cooldown():
+    a = Stub("a", [ProviderError("unknown parameter: frobnicate", status_code=400), "fixed"])
+    b = Stub("b")
+    router, _ = make([a, b], [["m-a"], ["m-b"]])
+    await router.complete(prompt(10), [])
+    assert (await router.complete(prompt(10), [])).content == "fixed"
+
+
+def rate_limited(seconds: int = 120) -> ProviderError:
+    return ProviderError(
+        "rate limited",
+        status_code=429,
+        headers={"Retry-After": str(seconds)},
+        body={"error": {"message": "rate limited"}},
+    )
+
+
+async def test_two_routers_writing_one_cooldown_file_keep_each_others_entries(tmp_path):
+    """Each process rewrote cooldowns.json from its own memory: the last writer dropped the other's cooldowns."""
+    path = tmp_path / "cooldowns.json"
+    store1, store2 = CooldownStore(path=path), CooldownStore(path=path)  # two processes, loaded before any write
+    a, b, c, d = Stub("a", [rate_limited()]), Stub("b"), Stub("c", [model_not_found()]), Stub("d")
+    r1, _ = make([a, b], [["m-a"], ["m-b"]], cooldowns=store1)
+    r2, _ = make([c, d], [["m-c"], ["m-d"]], cooldowns=store2)
+    await r1.complete(prompt(10), [])
+    await r2.complete(prompt(10), [])
+    reborn = CooldownStore(path=path)
+    assert reborn.reason_of(provider="a", model="m-a", base_url="stub://a", account=r1.chain[0].key_fingerprint) == (
+        FailoverReason.rate_limit
+    )
+    assert reborn.reason_of(provider="c", model="m-c", base_url="stub://c", account=r2.chain[0].key_fingerprint) == (
+        FailoverReason.bad_request
+    )
+
+
+def test_a_cooldown_cleared_on_purpose_is_not_merged_back(tmp_path):
+    path = tmp_path / "cooldowns.json"
+    CooldownStore(path=path).arm(FailoverReason.quota, provider="a", model="m", retry_after=5000)
+    CooldownStore(path=path).arm(FailoverReason.quota, provider="b", model="m", retry_after=5000)
+    assert CooldownStore(path=path).clear_reason(FailoverReason.quota, provider="a") == 1
+    reborn = CooldownStore(path=path)
+    assert not reborn.in_cooldown(provider="a", model="m")
+    assert reborn.in_cooldown(provider="b", model="m")
+
+
+async def test_the_last_good_entry_survives_a_restart(tmp_path):
+    path = tmp_path / "cooldowns.json"
+    a, b = Stub("a", [ProviderError("upstream down", status_code=500)] * 3), Stub("b")
+    router, _ = make([a, b], [["m-a"], ["m-b"]], cooldowns=CooldownStore(path=path))
+    await router.complete(prompt(10), [])
+    assert CooldownStore(path=path).last_good == router.chain[1].key
+
+
+# ── filtered answers ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("stop", ["content_filter", "refusal"])
+async def test_a_filtered_answer_fails_over_to_the_next_entry(stop):
+    a = Stub("a", [Message(role="assistant", content="[filtered]", stop_reason=stop)])
+    b = Stub("b")
+    router, events = make([a, b], [["m-a"], ["m-b"]])
+    seen = [e async for e in router.stream(prompt(10), [])]
+    assert [e.type for e in seen] == ["text_delta", "reset", "text_delta", "done"]
+    assert seen[-1].message.content == "answer from b"
+    assert [(e.provider, e.reason) for e in events if e.kind == "router.failover"] == [("a", "content_filter")]
+    assert not [e for e in events if e.kind == "router.cooldown"]
+
+
+async def test_the_last_entrys_refusal_is_passed_through():
+    a = Stub("a", [Message(role="assistant", content="I can't help with that.", stop_reason="refusal")])
+    router, _ = make([a], [["m-a"]])
+    msg = await router.complete(prompt(10), [])
+    assert msg.content == "I can't help with that." and msg.stop_reason == "refusal"
