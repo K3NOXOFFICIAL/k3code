@@ -2216,7 +2216,11 @@ class GatewayServer:
                 router=self._decision_router(decision),
             )
         # auto mode's classifier: settings from the user's own config only (a project must not turn the check off)
-        classifier = classifier_settings(self.config, load_user_section("permissions") or {})
+        try:
+            user_permissions = load_user_section("permissions") or {}
+        except Exception:  # noqa: BLE001 - a config.yaml broken mid-session keeps the default, never fails the turn
+            user_permissions = {}
+        classifier = classifier_settings(self.config, user_permissions)
         if classifier.enabled:
             loop.classify_call = lambda call, history, *, cwd, interactive: classify_permission(
                 self.model_caller,

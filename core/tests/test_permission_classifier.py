@@ -565,6 +565,18 @@ async def test_the_users_config_turns_the_classifier_off(tmp_path, monkeypatch) 
     assert _permission_checks(caller) == [] and "never touches" not in tools[-1]
 
 
+async def test_an_unreadable_user_section_keeps_the_default_and_the_turn(tmp_path, monkeypatch) -> None:
+    from k3code.gateway import server as gateway
+
+    def unreadable(name: str):
+        raise AttributeError("'list' object has no attribute 'get'")  # what a config.yaml that is a list gives
+
+    monkeypatch.setattr(gateway, "load_user_section", unreadable)
+    caller = FakeCaller(BLOCK)
+    tools, said = await _gateway_turn(tmp_path, monkeypatch, caller, tiers={"cheap": ["c"]})
+    assert len(_permission_checks(caller)) == 1 and "never touches" in tools[-1] and said[-1] == "ok"
+
+
 async def test_a_raising_permission_check_denies_and_the_turn_goes_on(tmp_path, monkeypatch) -> None:
     from k3code.permissions.state import PermissionState
 
