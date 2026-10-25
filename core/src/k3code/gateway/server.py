@@ -59,7 +59,14 @@ from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
-from k3code.config import Settings, default_project_dir, load_config, retention, session_archive_days
+from k3code.config import (
+    Settings,
+    default_project_dir,
+    load_config,
+    load_user_section,
+    retention,
+    session_archive_days,
+)
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens, router_window
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -91,6 +98,8 @@ from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, Rule, permission_mode_from_config, suggest_rules
+from k3code.permissions.classifier import classifier_settings
+from k3code.permissions.classifier import classify as classify_permission
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
@@ -2205,6 +2214,23 @@ class GatewayServer:
                 decision,
                 session_id=session.session_id,
                 router=self._decision_router(decision),
+            )
+        # auto mode's classifier: settings from the user's own config only (a project must not turn the check off)
+        try:
+            user_permissions = load_user_section("permissions") or {}
+        except Exception:  # noqa: BLE001 - a config.yaml broken mid-session keeps the default, never fails the turn
+            user_permissions = {}
+        classifier = classifier_settings(self.config, user_permissions)
+        if classifier.enabled:
+            loop.classify_call = lambda call, history, *, cwd, interactive: classify_permission(
+                self.model_caller,
+                call,
+                history,
+                cwd=cwd,
+                session_id=session.session_id,
+                interactive=interactive,
+                timeout_s=classifier.timeout_s,
+                cache=session.perms.classifier_cache,
             )
         loop.on_tool_outcome = lambda call, result, failure, **kw: self.learning.tool_outcome(
             session, call, result, failure, **kw

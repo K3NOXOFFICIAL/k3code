@@ -194,7 +194,7 @@ def _validate_permissions(perms: Any) -> None:
 
     if not isinstance(perms, dict):
         raise ConfigError("permissions: must be a mapping")
-    body = {k: v for k, v in perms.items() if k != "hardline"}
+    body = {k: v for k, v in perms.items() if k not in ("hardline", "classifier")}
     for tool, value in body.items():
         entries = {"*": value} if isinstance(value, str) else value
         if not isinstance(entries, dict):
@@ -205,6 +205,15 @@ def _validate_permissions(perms: Any) -> None:
     from_config(body)
     if "hardline" in perms and not isinstance(perms["hardline"], list):
         raise ConfigError("permissions.hardline: must be a list of regexes")
+    classifier = perms.get("classifier")
+    if classifier is not None and not isinstance(classifier, (bool, dict)):
+        raise ConfigError("permissions.classifier: must be true/false or {enabled: true/false, timeout_s: seconds}")
+    if isinstance(classifier, dict):
+        if not isinstance(classifier.get("enabled", True), bool):
+            raise ConfigError("permissions.classifier.enabled: must be true/false")
+        timeout = classifier.get("timeout_s", 8)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ConfigError("permissions.classifier.timeout_s: must be a positive number of seconds")
 
 
 def parse_value(raw: str) -> Any:
