@@ -434,7 +434,13 @@ def _permission_rules(perms: dict[str, Any]) -> list[tuple[str, str, str]]:
     for tool, entry in perms.items():
         if tool in ("hardline", "classifier"):
             continue
-        if isinstance(entry, dict):
+        if tool in ("allow", "ask", "deny") and isinstance(entry, list):
+            from k3code.permissions.rules import parse_specifier
+
+            for spec in entry:
+                parsed = parse_specifier(spec) if isinstance(spec, str) else None
+                rules.append((tool, *(parsed or ("?", str(spec)))))
+        elif isinstance(entry, dict):
             rules.extend((str(action), str(tool), str(pattern)) for pattern, action in entry.items())
         elif entry is not None:
             rules.append((str(entry), str(tool), "*"))

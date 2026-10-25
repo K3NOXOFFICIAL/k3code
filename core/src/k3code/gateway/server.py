@@ -826,6 +826,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        self.fire_hook_soon(live, "SessionEnd", {"reason": "closed"})
         self.learning.settle_turns(sid)  # the session ended: its last turn can no longer be undone
         await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
@@ -2820,6 +2821,7 @@ class GatewayServer:
         estimate = session.calibration.correct(self._request_tokens(session))
         if not force and estimate < compact_threshold(self.config, self._active_model(session)):
             return 0
+        await self.fire_hook(session, "PreCompact", {"trigger": "auto"})
         try:
             new, folded = await compact_messages(
                 self.model_caller,
@@ -2959,6 +2961,22 @@ class GatewayServer:
                     self._announce_tool(session, tc)
                 session.announced_tools.clear()
 
+    async def fire_hook(self, session: LiveSession, event: str, payload: dict[str, Any] | None = None) -> None:
+        """Run the user's hooks for a lifecycle event (PreCompact, Notification, SessionEnd), for their side effects.
+        Never raises; each hook is bounded by its own timeout."""
+        try:
+            hooks = userhooks.load(session.perms.cwd, session.session_id)
+            if hooks:
+                await hooks.run(event, payload)
+        except Exception:  # noqa: BLE001 - a hook is the user's own script
+            logger.exception("%s hook failed", event)
+
+    def fire_hook_soon(self, session: LiveSession, event: str, payload: dict[str, Any] | None = None) -> None:
+        """:meth:`fire_hook` as a side task, for events the caller must not wait on (the user's hook may be slow)."""
+        task = asyncio.get_running_loop().create_task(self.fire_hook(session, event, payload))
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(
             tool_name: str, arguments: dict[str, Any], decision: Any = None, *, perms: Any = None
@@ -2970,6 +2988,9 @@ class GatewayServer:
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
+            self.fire_hook_soon(
+                session, "Notification", {"message": f"k3code needs your permission to use {tool_name}"}
+            )
             preview = await _change_preview(tool_name, arguments, where.cwd)
             try:
                 result = await self._ask_client(

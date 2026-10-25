@@ -14,8 +14,13 @@ An entry with ``project: /abs/path`` (what an accepted project recipe writes) ru
 
 The command gets the event as JSON on stdin (``session_id``, ``cwd``, ``hook_event_name``, plus ``tool_name`` and
 ``tool_input`` for tool events, ``tool_response`` for PostToolUse, ``prompt`` for UserPromptSubmit). Exit 0 is fine;
-its stdout may be JSON ``{"decision": "block"|"approve", "reason", "additionalContext"}``. Exit 2 blocks, and stderr
-is the reason the model sees. Any other exit status is an error that is logged and blocks nothing. A hook that runs
+its stdout may be JSON ``{"decision": "block"|"approve", "reason", "additionalContext"}``; a PreToolUse hook may also
+answer with ``{"hookSpecificOutput": {"permissionDecision": "allow"|"deny"|"ask", "permissionDecisionReason"}}``
+(deny blocks, allow answers a prompt but never one only a person may answer, ask makes a person approve the call even
+where the mode would allow it; a hardline or a deny rule is never lifted). Exit 2 blocks, and stderr is the reason the
+model sees. The events are PreToolUse, PostToolUse, UserPromptSubmit, SessionStart, Stop, SubagentStop (a sub-agent
+finished), PreCompact (before a compaction, ``trigger`` auto or manual), Notification (an approval is waiting) and
+SessionEnd. Any other exit status is an error that is logged and blocks nothing. A hook that runs
 longer than its timeout (default 60 s) is killed and counts as such an error.
 
 Hooks run as the user, outside the sandbox, with the same scrubbed environment as every child process (no provider
@@ -36,7 +41,17 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart", "Stop")
+EVENTS = (
+    "PreToolUse",
+    "PostToolUse",
+    "UserPromptSubmit",
+    "SessionStart",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "Notification",
+    "SessionEnd",
+)
 TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 #: events whose plain (non-JSON) stdout is added to the model's context, as in Claude Code
 CONTEXT_EVENTS = frozenset({"UserPromptSubmit", "SessionStart"})
@@ -76,6 +91,8 @@ class Hook:
 class HookOutcome:
     blocked: bool = False
     approved: bool = False
+    #: a PreToolUse hook answered ``ask``: a person must approve the call even where the mode would allow it
+    ask: bool = False
     reason: str = ""
     context: list[str] = field(default_factory=list)
 
@@ -177,6 +194,8 @@ class HookRunner:
             self._read_stdout(event, out, outcome)
             if outcome.blocked:
                 break
+        if outcome.ask:  # one hook asking outweighs another's allow: a person decides
+            outcome.approved = False
         return outcome
 
     @staticmethod
@@ -194,11 +213,21 @@ class HookRunner:
             return
         decision = str(parsed.get("decision") or "").lower()
         reason = str(parsed.get("reason") or "")
+        specific = parsed.get("hookSpecificOutput")
+        if event == "PreToolUse" and isinstance(specific, dict):
+            # Claude Code's per-hook permission decision: allow answers the prompt, deny blocks, ask forces one
+            chosen = str(specific.get("permissionDecision") or "").lower()
+            why = str(specific.get("permissionDecisionReason") or reason)
+            if chosen == "deny":
+                outcome.blocked, outcome.reason = True, why or f"blocked by the {event} hook"
+            elif chosen == "allow":
+                outcome.approved = True
+            elif chosen == "ask":
+                outcome.ask = True
         if decision == "block":
             outcome.blocked, outcome.reason = True, reason or f"blocked by the {event} hook"
         elif decision == "approve":
             outcome.approved = True
-        specific = parsed.get("hookSpecificOutput")
         extra = parsed.get("additionalContext") or (
             specific.get("additionalContext") if isinstance(specific, dict) else None
         )

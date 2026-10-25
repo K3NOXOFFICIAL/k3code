@@ -196,6 +196,8 @@ def _validate_permissions(perms: Any) -> None:
         raise ConfigError("permissions: must be a mapping")
     body = {k: v for k, v in perms.items() if k not in ("hardline", "classifier")}
     for tool, value in body.items():
+        if tool in ("allow", "ask", "deny") and isinstance(value, list):
+            continue  # Claude Code's rule lists: from_config below reads and checks every specifier
         entries = {"*": value} if isinstance(value, str) else value
         if not isinstance(entries, dict):
             raise ConfigError(f"permissions.{tool}: must be an action or a pattern→action mapping")

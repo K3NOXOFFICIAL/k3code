@@ -682,6 +682,12 @@ class AgentLoop:
             error = f"Blocked by a PreToolUse hook: {pre.reason}"
             self._audit(tool_call.name, args, "deny", "hook", error)
             return {"error": error}
+        if pre.ask and decision.action == "allow":
+            # a hook asked for a person: even where the mode, a rule or the classifier would have let the call run
+            decision = replace(
+                decision, action="ask", auto_allowed=False, message="a PreToolUse hook asked for your approval"
+            )
+            verdict = None
         # a hook's "approve" answers the prompt, but never one only a human may answer
         if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:

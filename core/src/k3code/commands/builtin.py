@@ -224,6 +224,7 @@ class _CompactCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would overwrite the summary
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
+        await ctx.fire_hook(live, "PreCompact", {"trigger": "manual", "custom_instructions": arg.strip()})
         try:
             messages, folded = await compact_messages(
                 ctx.model_caller, list(live.messages), session_id=live.session_id, focus=arg.strip()

@@ -363,6 +363,10 @@ class SubagentManager:
                 text=(h.result or h.error)[:2000],
             )
             self._record_usage(h)
+            with contextlib.suppress(Exception):  # a hook is the user's own script: it must not break the parent
+                await userhooks.load(parent.perms.cwd, h.id).run(
+                    "SubagentStop", {"stop_hook_active": False, "subagent_status": h.status, "subagent_id": h.id}
+                )
             rel = getattr(parent, "reliability", None)
             if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
                 rel.governor.charge(h.tokens_in, h.tokens_out)
