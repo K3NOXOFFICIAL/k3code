@@ -59,6 +59,7 @@ class CacheWatch:
         if self._in_episode:
             if hit >= self._baseline - self.drop_points / 2:  # back near where it was
                 self._in_episode = False
+                self._low_run = 0  # the next miss is a first one again
                 self._recent.append(hit)
             return None
         if len(self._recent) >= MIN_SAMPLES:
@@ -68,6 +69,7 @@ class CacheWatch:
                 if self._low_run < CONFIRM:
                     return None  # one miss: wait for the next call before saying anything
                 self._in_episode = True
+                self._low_run = 0
                 self._baseline = baseline
                 return (
                     f"The prompt cache stopped hitting: {hit:.0f}% of this request was served from it, against "

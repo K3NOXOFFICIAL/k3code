@@ -75,11 +75,24 @@ def check_patch(patch: dict[str, Any], current: dict[str, Any]) -> None:
             if not isinstance(new, list) or not old <= set(map(str, new)):
                 raise PatchRejected("permissions.hardline may only be extended, never reduced")
         classifier = perms.get("classifier")
-        if classifier is False or (isinstance(classifier, dict) and classifier.get("enabled") is False):
+        was = (current.get("permissions") or {}).get("classifier")
+        if (
+            classifier is False
+            or (isinstance(classifier, dict) and classifier.get("enabled") is False)
+            or ("classifier" in perms and classifier is None and was not in (None, False))  # a merge-patch null deletes
+        ):
             raise PatchRejected("turning off auto mode's permission classifier would relax the safety rules")
         bash = perms.get("bash")
         if bash == "allow" or (isinstance(bash, dict) and bash.get("*") == "allow"):
             raise PatchRejected("allowing every bash command would relax the safety rules")
+        allowed = perms.get("allow")
+        if isinstance(allowed, list):  # Claude Code's list form of the same rule: `Bash`, `Bash(*)`, `Bash(:*)`
+            from k3code.permissions.rules import parse_specifier
+
+            for spec in allowed:
+                parsed = parse_specifier(spec) if isinstance(spec, str) else None
+                if parsed == ("bash", "*"):
+                    raise PatchRejected("allowing every bash command would relax the safety rules")
     auto = patch.get("autonomy")
     if isinstance(auto, dict) and auto.get("gate_modes") == []:
         raise PatchRejected("autonomy.gate_modes may not be emptied (disables the scope gate)")

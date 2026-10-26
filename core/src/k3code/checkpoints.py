@@ -22,6 +22,8 @@ import os
 import re
 import shutil
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,8 @@ class Turn:
             skipped = self._record(prior)
         except OSError as e:
             skipped = f"the checkpoint could not be written ({e.strerror or e})"
+        except Exception as e:  # noqa: BLE001 - a path that is not UTF-8, a directory owned by someone else ...
+            skipped = f"the checkpoint could not be written ({type(e).__name__})"
         if skipped:
             return f"{prior.path} is not checkpointed ({skipped}): /undo will not restore it"
         return None
@@ -259,7 +263,8 @@ def _salvage(root: Path, key: str, entry: dict[str, Any], path: str) -> str | No
     blob = entry.get("blob")
     if not blob:
         return None
-    dest = root / "unrestored" / f"{os.path.basename(path)}.{key}.bin"
+    where = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:8]  # same-named files in two folders
+    dest = root / "unrestored" / f"{os.path.basename(path)}.{where}.{key}.bin"
     try:
         paths.ensure_private_dir(dest.parent)
         _private_write(dest, (root / key / str(blob)).read_bytes())
@@ -307,6 +312,28 @@ def restore(session_id: str, index: int, roots: list[str]) -> Rewind:
             _evict(root, stored, key)
         _save(root, stored)
     return out
+
+
+def prune(keep: Callable[[str], bool], max_age_s: float, now: float | None = None) -> int:
+    """Remove the checkpoints of sessions that ``keep`` does not name (the live ones) and that were last written more
+    than ``max_age_s`` seconds ago: a stored session that nobody resumed in that long is not going to be undone. Returns
+    how many sessions' checkpoints went."""
+    base = paths.home() / "checkpoints"
+    if not base.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    removed = 0
+    for d in base.iterdir():
+        if d.is_symlink() or not d.is_dir() or keep(d.name):
+            continue
+        try:
+            written = (d / _INDEX).stat().st_mtime if (d / _INDEX).exists() else d.stat().st_mtime
+        except OSError:
+            continue
+        if now - written > max_age_s:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 def drop(session_id: str) -> None:

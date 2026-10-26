@@ -264,7 +264,7 @@ class PermissionState:
     loaded: bool = field(default=False, init=False, repr=False)
     #: Auto mode's classifier verdicts for this session (permissions.classifier.classify): the gateway builds a loop
     #: per turn and tier, the session's state outlives them.
-    classifier_cache: dict[tuple[str, str, str, str], tuple[str, str]] = field(
+    classifier_cache: dict[tuple[str, str, str, str, str], tuple[str, str]] = field(
         default_factory=dict, init=False, repr=False
     )
 

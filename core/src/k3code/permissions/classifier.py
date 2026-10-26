@@ -150,20 +150,32 @@ def user_messages(history: Sequence[Message]) -> list[str]:
     return kept[::-1]
 
 
-def call_text(call: ToolCall) -> str:
+def _call_body(call: ToolCall) -> str:
+    """The call as the model is shown it, before any clipping (JSON arguments unless the call is just a command)."""
     args = call.arguments
     if call.name == "bash" and set(args) <= {"command"}:
-        body = str(args.get("command", ""))
-    else:
-        body = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
-    return _clip_middle(body, CALL_CHARS)
+        return str(args.get("command", ""))
+    return json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def call_text(call: ToolCall) -> str:
+    return _clip_middle(_call_body(call), CALL_CHARS)
+
+
+def _strip_tags(text: str) -> str:
+    """``text`` without our delimiter tags, until none is left: ``</pend</pending_call>ing_call>`` closes the block once
+    the inner tag is gone, so one pass is not enough."""
+    previous = None
+    while previous != text:
+        previous, text = text, _TAG_RE.sub("", text)
+    return text
 
 
 def classifier_messages(call: ToolCall, history: Sequence[Message], cwd: Path | str) -> list[Message]:
-    said = "\n\n".join(f"- {_TAG_RE.sub('', t)}" for t in user_messages(history)) or "(none)"
+    said = "\n\n".join(f"- {_strip_tags(t)}" for t in user_messages(history)) or "(none)"
     body = (
         f"{CLASSIFY_LEAD}\n\n<user_messages>\n{said}\n</user_messages>\n\n"
-        f"<pending_call>\ntool: {call.name}\ncwd: {cwd}\narguments:\n{_TAG_RE.sub('', call_text(call))}\n"
+        f"<pending_call>\ntool: {call.name}\ncwd: {cwd}\narguments:\n{_strip_tags(call_text(call))}\n"
         "</pending_call>\n"
     )
     return [Message(role="system", content=CLASSIFIER_SYSTEM), Message(role="user", content=body)]
@@ -187,12 +199,17 @@ def parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict, reason.strip()[:500]
 
 
-def cache_key(call: ToolCall, cwd: Path | str, session_id: str) -> tuple[str, str, str, str]:
+def cache_key(
+    call: ToolCall, cwd: Path | str, session_id: str, history: Sequence[Message] = ()
+) -> tuple[str, str, str, str, str]:
+    """What a verdict depends on: the call, where it runs, and what the user has said so far (a call blocked for a
+    task you then changed, or allowed for one you then dropped, is judged again)."""
     args = dict(call.arguments)
     if call.name == "bash" and isinstance(args.get("command"), str):
         args["command"] = args["command"].strip()
     digest = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()
-    return (session_id, str(cwd), call.name, digest)
+    said = hashlib.sha256("\x00".join(user_messages(history)).encode("utf-8", "replace")).hexdigest()[:16]
+    return (session_id, str(cwd), call.name, digest, said)
 
 
 def _no_verdict(why: str, interactive: bool) -> ClassifierVerdict:
@@ -212,14 +229,14 @@ async def classify(
     session_id: str = "",
     interactive: bool = True,
     timeout_s: float = DEFAULT_TIMEOUT_S,
-    cache: dict[tuple[str, str, str, str], tuple[str, str]] | None = None,
+    cache: dict[tuple[str, str, str, str, str], tuple[str, str]] | None = None,
 ) -> ClassifierVerdict:
     """The verdict on ``call``, which only auto mode allowed. Never raises: no verdict asks a person when
     ``interactive``, else denies. Only model verdicts are cached, never a failure."""
-    key = cache_key(call, cwd, session_id)
+    key = cache_key(call, cwd, session_id, history)
     if cache is not None and (hit := cache.get(key)) is not None:
         return _verdict(*hit, cached=True)
-    if call.name == "bash" and len(str((call.arguments or {}).get("command", ""))) > CALL_CHARS:
+    if call.name == "bash" and len(_call_body(call)) > CALL_CHARS:  # as shown (JSON-escaped when it has other keys)
         # the model would see a clipped command: padding must not hide the part that does the harm
         return _no_verdict("the command is too long to judge", interactive)
     try:

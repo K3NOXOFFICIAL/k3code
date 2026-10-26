@@ -339,6 +339,8 @@ class LiveSession:
         self.overhead_tokens = 0
         #: Warns once when the provider's prompt cache stops hitting (see k3code.cache_watch).
         self.cache_watch = CacheWatch()
+        #: The file checkpoints of the turn in flight, shared by every loop the turn builds (see _run_turn).
+        self.checkpoint_turn: checkpoints.Turn | None = None
         #: Real tokens per estimated token, learned from this session's provider reports (shared by its loops).
         self.calibration = TokenCalibration()
         #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
@@ -624,20 +626,30 @@ CONTEXT_DEFAULTS: dict[str, Any] = {"keep_messages": 8, "compact_input_chars": 6
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Rough size of what a conversation sends (~4 characters per token), tool calls included.
+    """Rough size of what a conversation sends (~4 bytes per token), tool calls included.
+
+    Counted in UTF-8 bytes like ``context_budget.message_tokens``, which the loop pairs with the provider's own count:
+    the calibration ratio learned there is applied here, so the two must measure the same way (CJK text is 3 bytes a
+    character, and 3-4 times more tokens than a character count says).
 
     Tool results are counted as the model receives them (head+tail clip), so the stored full text does not trigger
     compaction early; everything else is counted as stored.
     """
-    chars = 0
+    nbytes = 0
     for m in messages:
         c = m.get("content")
         if m.get("role") == "tool" and isinstance(c, str):
             c = clip_for_model(m.get("name"), c)
-        chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
+        nbytes += (
+            len(c.encode("utf-8"))
+            if isinstance(c, str)
+            else len(json.dumps(c, ensure_ascii=False).encode())
+            if c
+            else 0
+        )
         if m.get("tool_calls"):
-            chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))
-    return chars // 4
+            nbytes += len(json.dumps(m["tool_calls"], ensure_ascii=False).encode("utf-8"))
+    return nbytes // 4
 
 
 def _socket_is_live(path: Path) -> bool:
@@ -2258,7 +2270,7 @@ class GatewayServer:
         loop.file_stamps = session.file_stamps
         loop.calibration = session.calibration
         # write/edit checkpoints for /undo, keyed by where this turn's messages start (where an /undo cuts)
-        loop.checkpoint = checkpoints.Turn(session.session_id, len(session.stored.messages))
+        loop.checkpoint = session.checkpoint_turn or checkpoints.Turn(session.session_id, len(session.stored.messages))
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         ask_user.register(loop.tools, self, session)  # always: whether anyone can answer is decided per call
@@ -2382,6 +2394,9 @@ class GatewayServer:
         session.user_stopped, session.turn_denials = False, 0
         # where this turn's messages start in the stored conversation: an /undo that cuts there removes this turn
         msg_start = len(session.stored.messages)
+        # one checkpoint turn for every loop of this turn (a stall escalates to a second loop, built after more messages
+        # exist): all their edits are filed under where the turn starts, which is where /undo cuts
+        session.checkpoint_turn = checkpoints.Turn(session.session_id, msg_start)
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -2621,6 +2636,7 @@ class GatewayServer:
                 session.turn_id,
                 history_len=len(history),
             )
+            session.checkpoint_turn = None  # a job's loop that follows files its own turn
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
@@ -3321,6 +3337,7 @@ class GatewayServer:
             return
         home = self._home()
         delete_session_journal(home, sid)
+        checkpoints.drop(sid)  # copies of the files the agent changed: gone with the session
         pastes = home / PASTES_DIR / sid
         if pastes.is_dir() and not pastes.is_symlink():
             shutil.rmtree(pastes, ignore_errors=True)
@@ -3339,7 +3356,9 @@ class GatewayServer:
             now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
-        return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+        # file checkpoints follow the journal's age limit: nobody resumes a session after that long to undo it
+        cps = checkpoints.prune(lambda sid: sid in self.live, keep["journal_days"] * 86400, now=now)
+        return {"usage_rows": rows, "journal_files": files, "decisions": decisions, "checkpoints": cps}
 
     def compact_storage(self) -> int:
         """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""

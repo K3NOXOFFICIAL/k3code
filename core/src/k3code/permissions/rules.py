@@ -83,6 +83,8 @@ def parse_specifier(spec: str) -> tuple[str, str] | None:
     if not m:
         return None
     name, arg = m.group(1), (m.group(2) or "").strip()
+    if m.group(2) is not None and not arg:
+        return None  # `Bash()` names nothing: not "every command"
     if name.startswith("mcp__"):
         tool = name if name.count("__") > 1 else name + "__*"
     else:
@@ -101,13 +103,15 @@ def _anchored(tool: str, pattern: str, action: str) -> str | None:
     ``/src/**``, which is relative to the settings file there) is relative to a project. A project cannot be pinned
     here, so an ask or deny matches such a pattern in any directory (stricter, never looser) and an allow is refused
     (None): it would open the same name everywhere."""
-    if tool not in _PATH_TOOLS or pattern.startswith(("~", "$", "*")):
+    if tool not in _PATH_TOOLS or pattern.startswith(("~", "$")):
         return pattern
     if pattern.startswith("//"):
         return pattern[1:]
+    if pattern in ("*", "**"):
+        return "*"  # the whole tool (`Read`, `Edit(*)`): an allow of it is meant
     if action == "allow":
-        return None
-    return "*/" + pattern.lstrip("/").removeprefix("./")
+        return None  # also a pattern that starts with `*` (`**/*.py`): it would open that name in every directory
+    return pattern if pattern.startswith("*") else "*/" + pattern.lstrip("/").removeprefix("./")
 
 
 def from_config(permissions: dict[str, Any], problems: list[str] | None = None) -> list[Rule]:
@@ -140,6 +144,15 @@ def from_config(permissions: dict[str, Any], problems: list[str] | None = None) 
                 anchored = _anchored(parsed[0], parsed[1], tool) if parsed else None  # before ~ becomes a path
                 if parsed is not None and anchored is not None:
                     ruleset.append(Rule(tool=parsed[0], pattern=expand(anchored), action=cast(Action, tool)))
+                    if (
+                        tool != "allow"
+                        and parsed[0] in _PATH_TOOLS
+                        and not re.search(r"[*?\[]", anchored.rsplit("/", 1)[-1])
+                    ):
+                        # a name that is a directory (`Read(secrets)`) stops what is inside it too, as in gitignore
+                        ruleset.append(
+                            Rule(tool=parsed[0], pattern=expand(anchored).rstrip("/") + "/*", action=cast(Action, tool))
+                        )
                 elif tool == "allow":
                     why = "not a Tool(argument) rule, or a path rule that is not absolute (use //abs, ~/ or $HOME/)"
                     if problems is None:

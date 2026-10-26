@@ -313,6 +313,8 @@ _MODEL_NOT_FOUND_PATTERNS = (
 )
 
 _MODEL_NOT_FOUND_ERROR_CODES = frozenset({"model_not_found", "model_not_available", "invalid_model"})
+#: Phrases of _MODEL_NOT_FOUND_PATTERNS that name a model only in context (see _model_missing).
+_BROAD_NOT_FOUND = ("does not exist", "invalid model")
 
 # Deterministic rejections of the request shape: identical on every retry.
 _REQUEST_VALIDATION_PATTERNS = (
@@ -802,8 +804,20 @@ def classify_api_error(
 def _model_missing(c: _Ctx) -> bool:
     """Whether a bad_request says the model id is unknown (not that the request was malformed). "No endpoints that
     support tool use" is left out: the same model still answers a call without tools."""
-    patterns = (*_MODEL_NOT_FOUND_PATTERNS, *_UNKNOWN_MODEL_VENDOR_PATTERNS)
-    return c.code in _MODEL_NOT_FOUND_ERROR_CODES or any(p in c.msg for p in patterns if "tool use" not in p)
+    if c.code in _MODEL_NOT_FOUND_ERROR_CODES:
+        return True
+    specific = (*_MODEL_NOT_FOUND_PATTERNS, *_UNKNOWN_MODEL_VENDOR_PATTERNS)
+    if any(p in c.msg for p in specific if "tool use" not in p and p not in _BROAD_NOT_FOUND):
+        return True
+    # "does not exist" and "invalid model" also begin errors about a file id, a tool call id, a parameter or an account:
+    # they name a missing model only on a 404, or when the sentence says the model (or this model id) does not exist
+    if not any(p in c.msg for p in _BROAD_NOT_FOUND):
+        return False
+    return (
+        c.status_code == 404
+        or bool(re.search(r"\bmodel\b[^.\n]{0,60}\bdoes not exist\b|\bdoes not exist\b[^.\n]{0,60}\bmodel\b", c.msg))
+        or bool(c.model and c.model.lower() in c.msg and "does not exist" in c.msg)
+    )
 
 
 def _context_numbers(msg: str) -> tuple[int | None, int | None, int | None]:

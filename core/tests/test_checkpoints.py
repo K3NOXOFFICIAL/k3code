@@ -367,6 +367,87 @@ def test_a_rewritten_conversation_drops_the_checkpoints(tmp_path: Path, _home: P
     assert not rewind and f.read_bytes() == b"after\n"
 
 
+async def test_every_loop_of_a_turn_files_its_edits_under_where_the_turn_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stall escalates to a second loop, built after more messages exist: it must not file its edits under that later
+    index, or the first /undo (which cuts where the turn starts) leaves them on disk."""
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
+    same = {"type": "tool_call", "model": "m-cheap", "id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+    steps = [same, {"type": "text", "model": "m-main", "text": "recovered"}]
+    server = make(tmp_path, monkeypatch, steps)
+    await start(server, tmp_path)
+    built: list[Any] = []
+    real = server._build_loop
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        loop = real(*args, **kwargs)
+        built.append(loop)
+        return loop
+
+    monkeypatch.setattr(server, "_build_loop", spy)
+    await run_turn(server, "do the thing", background=True)
+    assert len(built) >= 2  # the cheap attempt and the escalated one
+    assert all(b.checkpoint is built[0].checkpoint for b in built)  # one Turn, filed where the turn starts
+    assert server.session.checkpoint_turn is None  # and it does not outlive the turn
+
+
+def test_deleting_a_session_removes_its_checkpoints(tmp_path: Path, _home: Path) -> None:
+    from k3code import checkpoints
+    from test_gateway import make_server
+
+    project = _project(tmp_path)
+    f = project / "a.txt"
+    f.write_bytes(b"secret before\n")
+    _agent_write(checkpoints.Turn("s-del", 0), f, b"after\n")
+    assert (_home / "checkpoints" / "s-del").is_dir()
+    make_server().remove_session_files("s-del")
+    assert not (_home / "checkpoints" / "s-del").exists()
+
+
+def test_pruning_removes_old_checkpoints_of_sessions_that_are_not_live(tmp_path: Path, _home: Path) -> None:
+    import time
+
+    from k3code import checkpoints
+
+    project = _project(tmp_path)
+    f = project / "a.txt"
+    f.write_bytes(b"x\n")
+    for sid in ("old", "live", "fresh"):
+        _agent_write(checkpoints.Turn(sid, 0), f, b"y\n")
+    day = 86400.0
+    for sid, age in (("old", 40 * day), ("live", 40 * day)):
+        index = _home / "checkpoints" / sid / "index.json"
+        os.utime(index, (time.time() - age, time.time() - age))
+    removed = checkpoints.prune(lambda sid: sid == "live", 30 * day)
+    assert removed == 1
+    assert not (_home / "checkpoints" / "old").exists()
+    assert (_home / "checkpoints" / "live").is_dir() and (_home / "checkpoints" / "fresh").is_dir()
+
+
+def test_a_path_that_cannot_be_encoded_is_a_notice_not_an_error(tmp_path: Path, _home: Path) -> None:
+    from k3code import checkpoints
+
+    turn = checkpoints.Turn("s1", 0)
+    prior = checkpoints.Prior(path="/proj/\udcff.txt", data=b"x", skipped="")
+    note = turn.record(prior)  # a lone surrogate (a byte that is not UTF-8) cannot be encoded: it must not raise
+    assert note is None or "not checkpointed" in note
+
+
+def test_two_same_named_files_do_not_share_a_salvage_copy(tmp_path: Path) -> None:
+    from k3code import checkpoints
+
+    root = tmp_path / "s"
+    for key, folder, data in (("0", "a", b"A"), ("0", "b", b"B")):
+        (root / key).mkdir(parents=True, exist_ok=True)
+        (root / key / f"{folder}.bin").write_bytes(data)
+    first = checkpoints._salvage(root, "0", {"blob": "a.bin"}, "/p/a/x.txt")
+    second = checkpoints._salvage(root, "0", {"blob": "b.bin"}, "/p/b/x.txt")
+    assert first != second and Path(str(first)).read_bytes() == b"A" and Path(str(second)).read_bytes() == b"B"
+
+
 def test_the_report_says_when_sub_agents_ran_because_their_edits_are_not_checkpointed() -> None:
     from k3code import checkpoints
 

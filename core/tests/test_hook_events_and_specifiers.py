@@ -54,6 +54,7 @@ def test_the_lists_become_rules_in_order() -> None:
         ("read", "*", "allow"),
         ("bash", "git push *", "ask"),
         ("edit", "*/.env", "deny"),  # relative: matched in any directory, the engine matches absolute paths
+        ("edit", "*/.env/*", "deny"),  # and what is inside it, if the name is a directory
     ]
 
 
@@ -118,7 +119,7 @@ def test_a_relative_path_rule_is_matched_in_any_directory_and_never_allowed() ->
 def test_a_double_slash_is_the_absolute_path_as_in_claude_code() -> None:
     """`Read(//etc/hostname)` is /etc/hostname; a single slash (`/src/**`) is relative to the settings file there."""
     deny = from_config({"deny": ["Read(//etc/hostname)", "Read(/secrets/**)"]})
-    assert [r.pattern for r in deny] == ["/etc/hostname", "*/secrets/**"]
+    assert [r.pattern for r in deny] == ["/etc/hostname", "/etc/hostname/*", "*/secrets/**"]
     assert evaluate("read", "/etc/hostname", deny).action == "deny"
     assert evaluate("read", "/proj/secrets/a", deny).action == "deny"
 
@@ -133,6 +134,30 @@ def test_a_server_wide_mcp_entry_in_every_spelling_is_a_rule_not_a_deny_of_every
 
 def test_a_bare_prefix_rule_is_every_command() -> None:
     assert parse_specifier("Bash(:*)") == ("bash", "*")
+
+
+def test_empty_parentheses_name_nothing_so_they_are_not_every_command() -> None:
+    assert parse_specifier("Bash()") is None and parse_specifier("Read( )") is None
+    problems: list[str] = []
+    assert from_config({"allow": ["Bash()"]}, problems) == [] and problems  # dropped: an allow of nothing opens nothing
+    assert from_config({"deny": ["Bash()"]}, []) == [Rule("*", "*", "deny")]  # a deny that cannot be read fails closed
+
+
+def test_a_path_allow_that_starts_with_a_star_is_refused_like_the_other_relative_forms() -> None:
+    """`Edit(**/*.py)` would open every .py file in every directory (and /etc/cron.d)."""
+    for spec in ("Edit(**/*.py)", "Edit(*.py)", "Read(*/secrets/*)"):
+        problems: list[str] = []
+        assert from_config({"allow": [spec]}, problems) == [] and "allow entry 1" in problems[0], spec
+    assert [r.pattern for r in from_config({"allow": ["Read", "Edit(*)"]})] == ["*", "*"]  # the whole tool is meant
+    assert [r.pattern for r in from_config({"deny": ["Edit(**/*.py)"]})] == ["**/*.py"]  # a deny of it is fine as is
+
+
+def test_a_deny_of_a_directory_name_covers_what_is_inside_it() -> None:
+    deny = from_config({"deny": ["Read(secrets)", "Edit(//etc/ssh)"]})
+    assert evaluate("read", "/proj/secrets", deny).action == "deny"
+    assert evaluate("read", "/proj/secrets/a.txt", deny).action == "deny"
+    assert evaluate("edit", "/etc/ssh/sshd_config", deny).action == "deny"
+    assert evaluate("read", "/proj/secrets-old/a.txt", deny).action != "deny"  # a different name is not covered
 
 
 def test_grep_and_glob_rules_reach_the_read_decision_and_web_rules_the_web_tools(tmp_path) -> None:

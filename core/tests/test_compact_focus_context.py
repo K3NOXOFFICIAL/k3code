@@ -99,6 +99,12 @@ def test_one_missed_call_is_not_a_regression() -> None:
     assert not any(_feed(CacheWatch(), [80, 82, 10, 81, 83, 5, 80]))
 
 
+def test_after_a_recovery_one_miss_is_a_first_miss_again() -> None:
+    """The count of low calls in a row starts over when an episode ends: a single miss after it says nothing."""
+    got = _feed(CacheWatch(), [80, 82, 10, 5, 78, 80, 6, 81, 82])
+    assert [i for i, g in enumerate(got) if g] == [3]
+
+
 def test_it_arms_again_after_a_recovery() -> None:
     watch = CacheWatch()
     got = _feed(watch, [80, 82, 10, 5, 78, 80, 6, 4])

@@ -528,7 +528,14 @@ class AgentLoop:
         norm = normalize_arguments(tc.name, spec.parameters, tc.arguments)  # decided as _execute_tool decides it
         if norm.error is not None or invalid_arguments(tc.name, spec.parameters, norm.args) is not None:
             return True  # answered with an error before any permission check
-        return self._decide(tc.name, norm.args).action == "allow"
+        decision = self._decide(tc.name, norm.args)
+        if decision.action != "allow":
+            return False
+        # a call that may still be asked about (the classifier's no-verdict, a PreToolUse hook's `ask`) must not run
+        # in a parallel batch: each would raise its own approval prompt and the screen holds one
+        if decision.auto_allowed and self.classify_call is not None:
+            return False
+        return not (self.hooks and self.hooks.for_event("PreToolUse", tc.name))
 
     def _decide(self, tool: str, args: dict[str, Any]) -> Decision:
         """The permission engine's decision; a check that raises is a deny (fail closed), never a crash or an allow."""
