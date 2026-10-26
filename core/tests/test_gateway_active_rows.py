@@ -100,6 +100,18 @@ def test_finished_sessions_expire_but_unfinished_ones_never_do() -> None:
     assert stale_done.session_id in server.live  # dropped from the strip only, still live
 
 
+def test_the_asking_clients_own_session_never_expires_from_its_list() -> None:
+    """`run_result` stays "completed" after every normal turn: 30 minutes after the last one the client's own session
+    would drop out of its own list (no current row: the title bar goes blank, the view loses it)."""
+    server = make_server()
+    now = 10_000.0
+    mine = _live(server, "/p", updated_at=now - server_mod._COMPLETED_LIVE_TTL_S - 1, run_result="completed")
+    other = _live(server, "/p", updated_at=now - server_mod._COMPLETED_LIVE_TTL_S - 1, run_result="completed")
+    rows = {r["id"]: r for r in server._active_rows(mine.session_id, now=now)}
+    assert set(rows) == {mine.session_id} and rows[mine.session_id]["current"]
+    assert other.session_id not in rows
+
+
 def test_only_the_newest_finished_sessions_stay_listed(monkeypatch) -> None:
     monkeypatch.setattr(server_mod, "_COMPLETED_LIVE_MAX", 3)
     server = make_server()
@@ -190,6 +202,12 @@ async def test_archived_is_parsed_as_a_boolean_not_as_truthiness(value, lists_ar
     gone = _stored(server, "/p", updated_at=1, archived=True)
     res = await rpc(server, "session.list", {"archived": value, "limit": 10})
     assert [r["id"] for r in res["result"]["sessions"]] == [gone if lists_archived else kept]
+
+
+@pytest.mark.parametrize("params", [{"offset": "x"}, {"limit": "many"}, {"offset": [1]}])
+async def test_a_page_size_or_offset_that_is_not_a_number_is_an_invalid_param(params) -> None:
+    res = await rpc(make_server(), "session.list", params)
+    assert "error" in res and res["error"]["code"] == -32602
 
 
 @pytest.mark.parametrize("value", ["yes", 2, [], {}, 1.5])

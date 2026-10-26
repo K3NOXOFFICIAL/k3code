@@ -83,6 +83,19 @@ async def test_no_estimate_yet_means_no_learning(tmp_path) -> None:
     assert loop.calibration.samples == 0
 
 
+async def test_the_estimate_paired_with_the_providers_count_counts_the_system_prompt_once(tmp_path) -> None:
+    """The system prompt is part of the request twice over in the loop's list (as a message and in the overhead): the
+    ratio is learned on one count and applied by the gateway to one count (`_request_tokens`)."""
+    loop = make_loop(tmp_path, Recorder([text_reply("ok")]), window=1_000_000)
+    loop.system_prompt = "S" * 40_000  # about 10k tokens
+    async for _ in loop.run("hello"):
+        pass
+    overhead = context_budget.overhead_tokens(loop.system_prompt, loop.tool_specs())
+    once = overhead + context_budget.message_tokens([Message(role="user", content="hello")])
+    assert abs(loop._last_estimate - once) <= once * 0.01
+    assert loop._last_estimate < overhead + 10_000 * 1.5  # not another 10k for the same prompt
+
+
 def _any_elided(provider: Recorder) -> bool:
     return any((m.content or "").startswith("[earlier") for m in provider.requests[-1][0] if m.role == "tool")
 

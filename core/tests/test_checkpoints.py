@@ -323,3 +323,76 @@ async def test_undo_of_a_turn_that_ran_bash_says_shell_changes_stay(
     assert res["removed"] >= 2
     assert "shell commands ran" in res["note"] and "not restored" in res["note"]
     assert res["restored"] == [] and res["deleted"] == []
+
+
+async def test_undo_after_clear_does_not_rewind_a_file_the_user_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After /clear the turn indexes start over: an /undo that found the old turn's key would silently put back a file
+    the user kept."""
+    steps = [
+        {
+            "type": "tool_call",
+            "when": "first",
+            "id": "w1",
+            "name": "write",
+            "arguments": {"path": "kept.txt", "content": "k"},
+        },
+        {"type": "text", "when": "after_tool", "text": "ok"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "make a file")
+    kept = tmp_path / "kept.txt"
+    assert kept.read_text() == "k"
+    await server.dispatch_command("clear", "", server.session.session_id)
+    await run_turn(server, "and now?")  # a turn that edits nothing, at the same message index as the first
+    await call(server, "session.undo", {})
+    assert kept.read_text() == "k"
+
+
+def test_a_rewritten_conversation_drops_the_checkpoints(tmp_path: Path, _home: Path) -> None:
+    """/compact and /clear both settle the turns through one helper: the checkpoints go with them."""
+    from types import SimpleNamespace
+
+    from k3code import checkpoints
+    from k3code.commands.builtin import _settle_turns
+
+    project = _project(tmp_path)
+    f = project / "a.txt"
+    f.write_bytes(b"before\n")
+    _agent_write(checkpoints.Turn("s1", 10), f, b"after\n")
+    _settle_turns(SimpleNamespace(learning=None), SimpleNamespace(session_id="s1"))
+    rewind = checkpoints.restore("s1", 0, [str(project)])
+    assert not rewind and f.read_bytes() == b"after\n"
+
+
+def test_the_report_says_when_sub_agents_ran_because_their_edits_are_not_checkpointed() -> None:
+    from k3code import checkpoints
+
+    note = checkpoints.Rewind().report(delegated=True)["note"]
+    assert "sub-agents ran" in note and "not restored" in note
+    assert "sub-agents" not in checkpoints.Rewind().report(shell=True)["note"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+def test_a_restore_that_cannot_write_keeps_the_earlier_bytes(tmp_path: Path, _home: Path) -> None:
+    from k3code import checkpoints
+
+    project = _project(tmp_path)
+    f = project / "a.txt"
+    f.write_bytes(b"original\n")
+    _agent_write(checkpoints.Turn("s1", 0), f, b"changed\n")
+    f.chmod(0o444)
+    project.chmod(0o555)  # neither a temporary file beside it nor the file itself can be written
+    try:
+        rewind = checkpoints.restore("s1", 0, [str(project)])
+    finally:
+        project.chmod(0o755)
+        f.chmod(0o644)
+    assert f.read_bytes() == b"changed\n" and not rewind.restored
+    ((path, why),) = rewind.conflicts
+    kept = Path(why.rsplit(" ", 1)[-1])
+    assert path == str(f) and "earlier version is kept at" in why
+    assert kept.read_bytes() == b"original\n"  # the checkpoints are gone, this copy is not
+    assert stat.S_IMODE(kept.stat().st_mode) == 0o600

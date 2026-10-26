@@ -251,6 +251,23 @@ async def test_the_tick_expires_a_stale_experiment_and_says_so() -> None:
     await server.close()
 
 
+async def test_an_expired_experiment_is_not_applied_again_next_week() -> None:
+    """A quiet project never fills the window: without the latch the same patch would be applied, expire and be applied
+    again forever, never judged."""
+    clock = FakeClock()
+    server, hub, _ = _hub(clock)
+    cfg = hub.home / "config.yaml"
+    cfg.write_text("max_turns: 7\n")
+    base = optimizer.collect([_call(f"b{k}", i, "m", 100) for k in range(12) for i in range(2)], NO_LOG, [], since=0)
+    patch = {"task_tiers": {"classification": "main"}}
+    hub.experiments.start({"title": "t", "patch": patch}, base, sessions=3, config_path=cfg)
+    assert not hub._rolled_back_before(patch)
+    clock.advance(hub.experiments.max_age_days * DAY + 1)
+    hub.experiments.expire_stale(cfg)
+    assert hub._rolled_back_before(patch)
+    await server.close()
+
+
 def test_the_defaults_name_the_new_options() -> None:
     from k3code.learning import learning_cfg
 

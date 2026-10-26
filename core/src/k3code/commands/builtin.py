@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from k3code import chain_config
+from k3code import chain_config, checkpoints
 from k3code.commands import CommandDef, CommandRegistry, tune
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
@@ -184,6 +184,9 @@ def _settle_turns(ctx: Any, live: Any) -> None:
     hub = getattr(ctx, "learning", None)
     if hub is not None:
         hub.settle_turns(live.session_id)
+    # the file checkpoints are keyed by message index, which a rewritten conversation no longer matches: an /undo
+    # that found an old key would put back a file the user kept
+    checkpoints.drop(live.session_id)
 
 
 class _ClearCommand(CommandDef):

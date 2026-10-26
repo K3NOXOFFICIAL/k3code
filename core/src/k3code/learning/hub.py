@@ -675,9 +675,11 @@ class LearningHub:
         return made
 
     def _rolled_back_before(self, patch: dict[str, Any]) -> bool:
-        """Judged worse, or not shown to be no worse (inconclusive): either way not auto-applied again."""
+        """Judged worse, not shown to be no worse (inconclusive), or never judged at all (expired: on a quiet project
+        the window does not fill): in every case not auto-applied again, or the same change would flip in and out of the
+        config every week."""
         return any(
-            x["patch"] == patch and x["status"] in ("rolled_back", "inconclusive")
+            x["patch"] == patch and x["status"] in ("rolled_back", "inconclusive", "expired")
             for x in self.experiments.all()
             if x.get("kind") == "config"
         )

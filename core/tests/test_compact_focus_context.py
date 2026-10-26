@@ -86,17 +86,23 @@ def _feed(watch: CacheWatch, rates: list[int], gap: float = 10.0, start: float =
     return out
 
 
-def test_a_collapse_warns_exactly_once() -> None:
-    got = _feed(CacheWatch(), [80, 82, 10])
-    assert got[:2] == [None, None] and got[2] and "stopped hitting" in got[2]
-    assert "10%" in got[2] and "81%" in got[2]  # what it fell to, and the median of the 80 and 82 it was
+def test_a_collapse_warns_exactly_once_on_the_second_low_call() -> None:
+    got = _feed(CacheWatch(), [80, 82, 10, 5])
+    assert got[:3] == [None, None, None] and got[3] and "stopped hitting" in got[3]
+    assert "5%" in got[3] and "81%" in got[3]  # what it fell to, and the median of the 80 and 82 it was
     assert _feed(CacheWatch(), [80, 82, 10, 5, 8, 3]).count(None) == 5  # the rest of the episode is quiet
+
+
+def test_one_missed_call_is_not_a_regression() -> None:
+    """A failover to another entry, a tier escalation, a batch of elided tool results or a fresh process each cost one
+    miss; the next call hits again."""
+    assert not any(_feed(CacheWatch(), [80, 82, 10, 81, 83, 5, 80]))
 
 
 def test_it_arms_again_after_a_recovery() -> None:
     watch = CacheWatch()
-    got = _feed(watch, [80, 82, 10, 5, 78, 80, 6])
-    assert [i for i, g in enumerate(got) if g] == [2, 6]
+    got = _feed(watch, [80, 82, 10, 5, 78, 80, 6, 4])
+    assert [i for i, g in enumerate(got) if g] == [3, 7]
 
 
 def test_a_gentle_drift_is_not_a_regression() -> None:
@@ -122,8 +128,8 @@ def test_reset_forgets_the_baseline_for_a_rewritten_prompt() -> None:
 
 
 def test_the_drop_size_is_configurable() -> None:
-    assert any(_feed(CacheWatch(drop_points=10), [80, 82, 60]))
-    assert not any(_feed(CacheWatch(), [80, 82, 60]))
+    assert any(_feed(CacheWatch(drop_points=10), [80, 82, 60, 55]))
+    assert not any(_feed(CacheWatch(), [80, 82, 60, 55]))
 
 
 async def test_the_gateway_notifies_and_records_a_regression(tmp_path, monkeypatch) -> None:
@@ -134,15 +140,16 @@ async def test_the_gateway_notifies_and_records_a_regression(tmp_path, monkeypat
     live = server.sessions.get(sid)
     for rate in (800, 820):
         server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=rate))
+    server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=50))  # one miss: nothing yet
     n = len(frames_of(server))
-    server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=50))
+    server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=40))
     notes = [
         f["params"]["payload"] for f in frames_of(server)[n:] if f.get("params", {}).get("type") == "notification.show"
     ]
     assert len(notes) == 1 and notes[0]["key"] == "k3.cache_regression" and notes[0]["level"] == "warn"
     row = server.usage._db.execute("SELECT detail FROM events WHERE kind='cache_regression'").fetchall()
     assert len(row) == 1 and "stopped hitting" in row[0][0]
-    server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=40))  # same episode: no second notice
+    server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=30))  # same episode: no second notice
     assert server.usage._db.execute("SELECT COUNT(*) FROM events WHERE kind='cache_regression'").fetchone()[0] == 1
     await server.close()
 
@@ -154,7 +161,7 @@ async def test_the_warning_can_be_switched_off(tmp_path, monkeypatch) -> None:
     sid = await new_session(server, tmp_path)
     live = server.sessions.get(sid)
     server.config.context = {"cache_warning": False}
-    for rate in (800, 820, 10):
+    for rate in (800, 820, 10, 5):
         server._watch_cache(live, Usage(prompt_tokens=1000, cache_read_tokens=rate))
     assert server.usage._db.execute("SELECT COUNT(*) FROM events WHERE kind='cache_regression'").fetchone()[0] == 0
     await server.close()

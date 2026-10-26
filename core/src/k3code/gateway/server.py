@@ -1340,7 +1340,7 @@ class GatewayServer:
                     continue
                 scope_ids.add(s.session_id)
             state = s.state
-            if state in ("completed", "failed"):
+            if state in ("completed", "failed") and s.session_id != current:  # the asking client's own never expires
                 if now - s.stored.updated_at > _COMPLETED_LIVE_TTL_S or finished >= _COMPLETED_LIVE_MAX:
                     continue
                 finished += 1
@@ -3897,8 +3897,11 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     ``offset`` skips that many rows first (page with the number of rows already fetched); ``total`` counts every
     matching row, out of the newest ``_SESSION_LIST_SCAN_CAP`` when ``cwd`` is given.
     Archived sessions are left out, unless ``archived`` is true: then only they are listed."""
-    limit = int(params.get("limit") or 50)
-    offset = max(0, int(params.get("offset") or 0))
+    try:
+        limit = int(params.get("limit") or 50)
+        offset = max(0, int(params.get("offset") or 0))
+    except (TypeError, ValueError) as e:
+        raise _InvalidParams("limit and offset must be whole numbers") from e
     cwd = _norm_cwd(params.get("cwd"))
     archived = _bool_param(params, "archived")
     if cwd:
@@ -5178,13 +5181,14 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
         start -= 1
     roots = [str(session.stored.cwd or session.perms.cwd), *session.perms.add_dirs]
     rewind = await asyncio.to_thread(checkpoints.restore, session.session_id, start, roots)
-    shell = any(c.get("name") == "bash" for m in messages[last_user:] for c in m.get("tool_calls") or [])
+    called = {c.get("name") for m in messages[last_user:] for c in m.get("tool_calls") or []}
+    shell, delegated = "bash" in called, "task" in called  # neither's changes on disk are checkpointed
     session.messages = messages[:last_user]
     session.last_prompt_tokens = 0
     server.store.save(session.stored)
     out: dict[str, Any] = {"removed": len(messages) - last_user}
-    if rewind or shell:
-        out.update(rewind.report(shell=shell))
+    if rewind or shell or delegated:
+        out.update(rewind.report(shell=shell, delegated=delegated))
     return out
 
 

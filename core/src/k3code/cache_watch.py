@@ -18,18 +18,23 @@ MIN_SAMPLES = 2
 #: A pause this long lets the provider's cache expire by design (the 5 minute TTL): the first call after it is a
 #: miss that says nothing about the prompt.
 IDLE_S = 300.0
+#: Low calls in a row before it counts. A failover to another entry, a tier escalation, a batch of elided tool results
+#: or a fresh claude-cli process each cost one miss and hit again on the next call; a prompt that really changes
+#: between calls misses on every one.
+CONFIRM = 2
 
 
 class CacheWatch:
-    """One warning per episode: the rate falls ``drop_points`` under its recent median, stays there without further
-    notice, and arms again once it climbs back. The baseline is frozen during an episode, so the low calls do not
-    become the new normal."""
+    """One warning per episode: the rate stays ``drop_points`` under its recent median for ``CONFIRM`` calls in a row,
+    stays there without further notice, and arms again once it climbs back. The baseline is frozen during an episode
+    (and by the low calls before it), so the low calls do not become the new normal."""
 
     def __init__(self, *, drop_points: float = DROP_POINTS, idle_s: float = IDLE_S) -> None:
         self.drop_points = drop_points
         self.idle_s = idle_s
         self._recent: deque[float] = deque(maxlen=WINDOW)
         self._in_episode = False
+        self._low_run = 0
         self._baseline = 0.0
         self._last_at: float | None = None
 
@@ -37,6 +42,7 @@ class CacheWatch:
         """The prompt prefix changed on purpose (compaction, /clear, a model switch): start over."""
         self._recent.clear()
         self._in_episode = False
+        self._low_run = 0
         self._last_at = None
 
     def observe(self, prompt_tokens: int, cache_read_tokens: int, now: float) -> str | None:
@@ -58,12 +64,16 @@ class CacheWatch:
         if len(self._recent) >= MIN_SAMPLES:
             baseline = statistics.median(self._recent)
             if baseline - hit >= self.drop_points:
+                self._low_run += 1
+                if self._low_run < CONFIRM:
+                    return None  # one miss: wait for the next call before saying anything
                 self._in_episode = True
                 self._baseline = baseline
                 return (
                     f"The prompt cache stopped hitting: {hit:.0f}% of this request was served from it, against "
-                    f"about {baseline:.0f}% before. Something in the prompt changed between calls, so each call "
-                    "now pays for the whole context again."
+                    f"about {baseline:.0f}% before, and the call before it missed too. Something in the prompt "
+                    "changes between calls, so each call now pays for the whole context again."
                 )
+        self._low_run = 0
         self._recent.append(hit)
         return None

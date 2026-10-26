@@ -900,7 +900,10 @@ class AgentLoop:
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
             view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
-        self._last_estimate = overhead + context_budget.message_tokens(view)
+        # what the gateway's compaction check measures (`_request_tokens`): the system prompt is in `overhead`, so the
+        # system messages of `view` are not counted again (a ratio learned on a double count would be applied to a
+        # single one)
+        self._last_estimate = overhead + context_budget.message_tokens([m for m in view if m.role != "system"])
         for m in view:
             if m.tool_call_id in self._notes and "Still relevant:" in (m.content or ""):
                 self._notes_at[m.tool_call_id] = self._step

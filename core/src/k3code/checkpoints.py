@@ -59,7 +59,7 @@ class Rewind:
     def __bool__(self) -> bool:
         return bool(self.restored or self.deleted or self.conflicts or self.skipped)
 
-    def report(self, *, shell: bool = False) -> dict[str, Any]:
+    def report(self, *, shell: bool = False, delegated: bool = False) -> dict[str, Any]:
         """The /undo result's file fields, ``note`` the text the client shows."""
         lines: list[str] = []
         if self.restored:
@@ -75,6 +75,8 @@ class Rewind:
             lines += [f"not restored {len(self.skipped)} file(s):", *(f"  {p}: {why}" for p, why in self.skipped)]
         if shell:
             lines.append("shell commands ran in the undone turn(s): what they changed on disk was not restored")
+        if delegated:
+            lines.append("sub-agents ran in the undone turn(s): the files they changed were not restored")
         return {
             "restored": list(self.restored),
             "deleted": list(self.deleted),
@@ -251,6 +253,21 @@ def _rewind_file(path: str, first: dict[str, Any], after: str | None, blobs: Pat
     return "restored"
 
 
+def _salvage(root: Path, key: str, entry: dict[str, Any], path: str) -> str | None:
+    """Copy the recorded earlier bytes of ``path`` to ``<session dir>/unrestored/`` when writing them back failed
+    (permissions, a full disk); the path of the copy, or None when there is nothing to keep."""
+    blob = entry.get("blob")
+    if not blob:
+        return None
+    dest = root / "unrestored" / f"{os.path.basename(path)}.{key}.bin"
+    try:
+        paths.ensure_private_dir(dest.parent)
+        _private_write(dest, (root / key / str(blob)).read_bytes())
+    except OSError:
+        return None
+    return str(dest)
+
+
 def restore(session_id: str, index: int, roots: list[str]) -> Rewind:
     """Rewind every file the session's turns from ``index`` on changed, inside ``roots`` (the session's cwd and
     add-dirs); those turns' checkpoints are gone afterwards (their messages are)."""
@@ -277,7 +294,10 @@ def restore(session_id: str, index: int, roots: list[str]) -> Rewind:
                 out.conflicts.append((path, str(e)))
                 continue
             except OSError as e:
-                out.conflicts.append((path, e.strerror or str(e)))
+                # the turn's checkpoints go next, and with them the only copy of the earlier bytes: keep that one
+                kept = _salvage(root, key, entry, path)
+                why = e.strerror or str(e)
+                out.conflicts.append((path, f"{why}; its earlier version is kept at {kept}" if kept else why))
                 continue
             if done == "restored":
                 out.restored.append(path)
