@@ -94,6 +94,9 @@ class StreamEvent:
     tool_call: ToolCall | None = None
     message: Message | None = None  # set on "done": the full assistant message
     usage: Usage | None = None
+    #: set on "done" by the router: ``{"provider", "model", "hops"}`` of the entry that answered; ``hops`` lists the
+    #: entries passed over on the way, in order, as ``{"provider", "model", "reason"}`` (a FailoverReason value)
+    route: dict[str, Any] | None = None
 
 
 ContentPart = str | None

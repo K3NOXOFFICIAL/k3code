@@ -5,14 +5,21 @@ Rules (from the M0 task spec):
   jittered backoff (max ``max_retries``), then fail over to the next entry.
 - auth, quota or bad_request: no retries, fail over immediately to the next
   entry (a bad request/unknown model is entry-specific; a different
-  model/provider may still work).
+  model/provider may still work). An unknown model id also cools that model down for 5 min (persisted), so the
+  next calls do not pay for the same 404 first.
+- content_filter: an answer stopped as filtered/refused is dropped (``reset``) and the next entry tried, no cooldown.
 - A Retry-After longer than ``max_inline_wait`` (default 20 s) never sleeps inline: the entry goes
   into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
   ``quota_cooldown`` (default 1 h) when the provider declares no reset.
 - A second auth failure in a row also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the
   rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing):
   later calls skip the dead entry at once, and a replaced key is tried immediately.
-- context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
+- context_overflow: when the error says the prompt fits and only prompt + max_tokens does not, retry the same entry
+  once with max_tokens clamped to the room left; else fail over to an entry with a strictly larger known window, and
+  raise :class:`ContextOverflow` (the loop compacts later) when none is left.
+- Before an entry is tried, its known window (``models.<id>.context_window`` or the model family's) is checked against
+  the estimated prompt: an entry that cannot hold it is passed over while a larger window is left, and max_tokens is
+  clamped to the room the window leaves.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
   every failure was a network error, otherwise :class:`ChainExhausted` (carrying
   ``retry_after``/``until`` when every entry is cooling down).
@@ -24,23 +31,29 @@ schemas come in M1+):
   after a backoff delay.
 - ``router.failover``: the walk is moving on to the *next* entry.
 - ``router.exhausted``: every entry in the chain has failed.
+
+The ``done`` stream event the walk yields carries ``route``: the provider and model that answered and the ``hops``
+(entries passed over, with their reason) on the way.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from k3code.context_budget import family_window, message_tokens, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.providers.base import Provider, ProviderDeadline
 from k3code.providers.retry_utils import jittered_backoff
 from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
+    ClassifiedError,
     FailoverReason,
     classify_api_error,
     summarize,
@@ -51,6 +64,13 @@ logger = logging.getLogger(__name__)
 
 #: retries of the same entry after a stream stalled (see providers/stall.py)
 STALL_RETRIES = 1
+#: tokens a window keeps free besides the prompt when max_tokens is clamped to it (the prompt is an estimate)
+CONTEXT_MARGIN = 1024
+#: the smallest max_tokens a clamp sends: less room than this means the prompt itself does not fit
+MIN_OUTPUT_TOKENS = 1024
+#: stop reasons of an answer the provider filtered (openai_compat finish_reason) or the model refused (anthropic):
+#: the next entry is tried, without a cooldown; the last entry's answer is passed through as it is
+FILTERED_STOP_REASONS = frozenset({"content_filter", "refusal"})
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -161,8 +181,11 @@ class Router:
         tier: str = "main",
         max_inline_wait: float = 20.0,
         quota_cooldown: float = 3600.0,
+        context_windows: Mapping[str, int] | None = None,
     ) -> None:
         self.chain = list(chain)
+        #: ``models.<id>.context_window`` from config; ids without one use their family's window (or none is known)
+        self.context_windows = dict(context_windows or {})
         #: longest Retry-After (seconds) worth sleeping on; longer ones cool the entry down and fail over
         self.max_inline_wait = max_inline_wait
         #: cooldown for quota errors that declare no reset
@@ -238,7 +261,19 @@ class Router:
         auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
         skipped = False  # an entry was passed over for a cooldown armed before this walk
         tried: set[int] = set()  # chain indices already attempted this walk (failover never repeats one)
+        estimate = message_tokens(messages) + overhead_tokens("", tools)  # the prompt, for the window checks
+        overflowed = 0  # largest window that overflowed in this walk: only a larger one is worth trying
+        overflow_detail = ""
+        hops: list[dict[str, str]] = []  # entries passed over, in order, and why: the "done" event carries them
         chain_index = self._first_entry(model, tried)  # first try stays chain order; health picks failover targets
+        for i in range(chain_index or 0):  # earlier entries are cooling down: the first try passed over them
+            target = self._target_model(i, model)
+            entry = self.chain[i]
+            fp = entry.key_fingerprint
+            cooled = self.cooldowns.reason_of(
+                provider=entry.provider_name, model=target, base_url=entry.base_url, account=fp, fingerprint=fp
+            )
+            hops.append(_hop(entry, target, cooled.value if cooled else "cooldown"))
         while chain_index is not None:
             entry = self.chain[chain_index]
             target_model = model if chain_index == 0 and model else entry.model
@@ -263,9 +298,31 @@ class Router:
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
+                hops.append(_hop(entry, target_model, cooled.value if cooled else "cooldown"))
                 tried.add(chain_index)
                 chain_index = self._next_target(model, tried)
                 continue
+            window = self._window(chain_index, model)
+            if overflowed:  # an entry overflowed: only a strictly larger known window can hold this prompt
+                too_small = (window or 0) <= overflowed
+            else:
+                too_small = bool(window) and estimate + CONTEXT_MARGIN > (window or 0)
+            if too_small:
+                if self._larger_left(model, tried | {chain_index}, max(window or 0, overflowed)):
+                    self._emit(
+                        "router.failover",
+                        entry,
+                        reason=FailoverReason.context_overflow.value,
+                        detail=f"~{estimate} prompt tokens do not fit the {window or 'unknown'}-token window",
+                    )
+                    hops.append(_hop(entry, target_model, FailoverReason.context_overflow.value))
+                    tried.add(chain_index)
+                    chain_index = self._next_target(model, tried)
+                    continue
+                if overflowed:  # no larger window is left: only compaction helps
+                    raise ContextOverflow(overflow_detail)
+            entry_max = self._entry_max_tokens(window, max_tokens, estimate)
+            clamped = False  # the one overflow retry with a smaller max_tokens is spent
             tried.add(chain_index)
             attempt = 0
             while True:
@@ -273,21 +330,31 @@ class Router:
                 streamed = False  # this attempt already yielded output the consumer has collected
                 try:
                     async for event in entry.provider.stream(
-                        messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
+                        messages, tools, target_model, max_tokens=entry_max, temperature=temperature
                     ):
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
+                            stop = event.message.stop_reason if event.message is not None else None
+                            if stop in FILTERED_STOP_REASONS and self._next_target(model, tried) is not None:
+                                raise AnswerFiltered(f"the answer stopped with stop reason {stop!r}")
                             self.cooldowns.record_success(
                                 provider=entry.provider_name,
                                 model=target_model,
                                 base_url=entry.base_url,
                                 account=entry.key_fingerprint,
                             )
+                            route = {"provider": entry.provider_name, "model": target_model, "hops": hops}
+                            event = dataclasses.replace(event, route=route)
                         yield event
                     # The provider yields its "done" event then closes normally.
                     return
                 except Exception as exc:  # noqa: BLE001 - classified below
-                    classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
+                    if isinstance(exc, AnswerFiltered):
+                        classified = ClassifiedError(
+                            FailoverReason.content_filter, provider=entry.provider_name, model=target_model
+                        )
+                    else:
+                        classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)
                     self.cooldowns.record_failure(
@@ -302,14 +369,37 @@ class Router:
                     if classified.reason is FailoverReason.auth:
                         auth_failed.add(chain_index)
                     if classified.reason is FailoverReason.context_overflow:
-                        raise ContextOverflow(summarize(exc, limit=500)) from exc
+                        room = None if clamped else self._overflow_room(classified, window, entry_max)
+                        if room is not None:  # the prompt fits: the same entry answers with less output room
+                            clamped, entry_max = True, room
+                            if streamed:
+                                yield StreamEvent(type="reset")
+                            self._emit(
+                                "router.retry",
+                                entry,
+                                attempt=attempt + 1,
+                                reason=classified.reason.value,
+                                detail=f"retrying with max_tokens={room}: {summarize(exc)}",
+                                extra={"delay": 0.0, "max_tokens": room},
+                            )
+                            continue
+                        failed_window = classified.context_limit or window
+                        if not failed_window or not self._larger_left(model, tried, failed_window):
+                            raise ContextOverflow(summarize(exc, limit=500)) from exc
+                        overflowed = max(overflowed, failed_window)
+                        overflow_detail = summarize(exc, limit=500)
                     if streamed:
                         # The next attempt (same entry or the next one) streams the answer from the start: tell the
                         # consumer to drop what it has, or it would see "Hello Hello world".
                         streamed = False
                         yield StreamEvent(type="reset")
                     cooldown = self._cooldown_seconds(classified)
-                    if cooldown is not None or (classified.immediate_failover and not self._honor_inline(classified)):
+                    if (
+                        cooldown is not None
+                        or classified.reason is FailoverReason.context_overflow
+                        or (classified.immediate_failover and not self._honor_inline(classified))
+                    ):
+                        hops.append(_hop(entry, target_model, classified.reason.value))
                         self._failover(
                             entry,
                             target_model,
@@ -320,6 +410,7 @@ class Router:
                             retry_after=cooldown,
                             model_override=model,
                             tried=tried,
+                            model_missing=classified.model_missing,
                         )
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
@@ -339,6 +430,7 @@ class Router:
                     else:
                         retries = self.max_retries
                     if attempt >= retries:
+                        hops.append(_hop(entry, target_model, classified.reason.value))
                         self._failover(
                             entry,
                             target_model,
@@ -373,6 +465,8 @@ class Router:
                     await self._sleep(delay)
             chain_index = self._next_target(model, tried)
         # every entry exhausted
+        if overflowed:  # the larger windows failed for other reasons: compaction lets the smaller ones answer
+            raise ContextOverflow(overflow_detail)
         self._emit_exhausted(last_reason, last_detail)
         if all_network and last_reason is not None:
             raise AllProvidersUnreachable(
@@ -471,6 +565,8 @@ class Router:
                 account=fp,
                 fingerprint=fp,
             )
+            if cooled is FailoverReason.bad_request:
+                continue  # an unknown model id: it does not come back by waiting, and must not make the call wait
             (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
         if not (remaining or auth_remaining):
             return None
@@ -506,6 +602,38 @@ class Router:
         """Model the walk uses for chain entry ``index`` (an explicit override wins on the first entry)."""
         entry = self.chain[index]
         return model if index == 0 and model else entry.model
+
+    def _window(self, index: int, model: str | None) -> int | None:
+        """Known context window of chain entry ``index``: config, else the model family's; None when only guessed."""
+        target = self._target_model(index, model)
+        return self.context_windows.get(target) or family_window(target)
+
+    def _larger_left(self, model: str | None, tried: Collection[int], window: int) -> bool:
+        """Whether an untried, non-cooling entry has a known window strictly larger than ``window``."""
+        return any(
+            i not in tried and not self._cooling(i, model) and (self._window(i, model) or 0) > window
+            for i in range(len(self.chain))
+        )
+
+    @staticmethod
+    def _entry_max_tokens(window: int | None, requested: int, estimate: int) -> int:
+        """max_tokens for an entry: the request's, clamped to the room its known window leaves next to the prompt."""
+        if not window:
+            return requested
+        return min(requested, max(window - estimate - CONTEXT_MARGIN, MIN_OUTPUT_TOKENS))
+
+    @staticmethod
+    def _overflow_room(classified, window: int | None, sent: int) -> int | None:
+        """max_tokens that fits the window an overflow error names next to its prompt, or None when the prompt
+        itself does not fit (or the error does not say how large it is)."""
+        limit = classified.context_limit or window
+        prompt = classified.prompt_tokens
+        if prompt is None and classified.requested_tokens is not None:
+            prompt = classified.requested_tokens - sent  # "you requested N tokens": the prompt plus max_tokens
+        if not limit or prompt is None or prompt <= 0:
+            return None
+        room = limit - prompt - CONTEXT_MARGIN
+        return room if MIN_OUTPUT_TOKENS <= room < sent else None
 
     def _entry_health(self, index: int, model: str | None) -> tuple[int, int, float, int]:
         """Failover-target sort key: last-known-good first, then fewest consecutive failures,
@@ -588,6 +716,7 @@ class Router:
         retry_after: float | None = None,
         model_override: str | None = None,
         tried: Collection[int] | None = None,
+        model_missing: bool = False,
     ) -> None:
         # Without a declared long window jittered_backoff already separated the retries; the cooldown
         # then uses its own ladder.
@@ -600,8 +729,9 @@ class Router:
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
+            model_missing=model_missing,
         )
-        if armed and (retry_after is not None or reason in BREAKER_REASONS):
+        if armed and (retry_after is not None or reason in BREAKER_REASONS or reason is FailoverReason.bad_request):
             self._emit(
                 "router.cooldown",
                 entry,
@@ -665,5 +795,14 @@ class Router:
             logger.warning("router event sink failed on %s", kind, exc_info=True)
 
 
+def _hop(entry: ChainEntry, model: str, reason: str) -> dict[str, str]:
+    """One entry the walk passed over, as the "done" event's ``route.hops`` lists it."""
+    return {"provider": entry.provider_name, "model": model, "reason": reason}
+
+
 class ProviderStreamError(Exception):
     """A provider surfaced a mid-stream failure as an error event."""
+
+
+class AnswerFiltered(Exception):
+    """The entry answered with a filtered or refused completion while another entry is left to try."""

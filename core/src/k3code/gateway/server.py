@@ -44,7 +44,7 @@ from typing import Any
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import ask_user, confio, mcpjson, userhooks, wakewords
+from k3code import ask_user, checkpoints, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -55,12 +55,26 @@ from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
 from k3code.autonomy.ultra import Ultra, ultra_cfg
 from k3code.blockers import BlockerStore
+from k3code.cache_watch import CacheWatch
 from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
-from k3code.config import Settings, default_project_dir, load_config, retention, session_archive_days
-from k3code.context_budget import compact_threshold, context_window, overhead_tokens, router_window
+from k3code.config import (
+    Settings,
+    default_project_dir,
+    load_config,
+    load_user_section,
+    retention,
+    session_archive_days,
+)
+from k3code.context_budget import (
+    TokenCalibration,
+    compact_threshold,
+    context_window,
+    overhead_tokens,
+    router_window,
+)
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -91,6 +105,8 @@ from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, Rule, permission_mode_from_config, suggest_rules
+from k3code.permissions.classifier import classifier_settings
+from k3code.permissions.classifier import classify as classify_permission
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import base_prompt, build_system_prompt
 from k3code.providers import effort as effort_mod
@@ -306,6 +322,8 @@ class LiveSession:
         self.needs_input = False
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
+        #: the turn's answering entry and the entries its calls passed over (router ``route``), for message.complete
+        self.turn_route: dict[str, Any] = {}
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
         self.last_tier = "main"
         self.current_kind = "interactive_turn"
@@ -319,6 +337,12 @@ class LiveSession:
         self.scope_override: str | None = None
         #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
         self.overhead_tokens = 0
+        #: Warns once when the provider's prompt cache stops hitting (see k3code.cache_watch).
+        self.cache_watch = CacheWatch()
+        #: The file checkpoints of the turn in flight, shared by every loop the turn builds (see _run_turn).
+        self.checkpoint_turn: checkpoints.Turn | None = None
+        #: Real tokens per estimated token, learned from this session's provider reports (shared by its loops).
+        self.calibration = TokenCalibration()
         #: Provider-reported prompt tokens of the session's last model request (0 = none yet, or stale after a
         #: compaction or an /undo): the size of the context as the provider counted it.
         self.last_prompt_tokens = 0
@@ -352,6 +376,7 @@ class LiveSession:
         those (/output-style, /reload-skills, /mcp reload, /reload)."""
         if not slots:
             self.prompt_frozen.clear()
+            self.cache_watch.reset()  # a rewritten conversation is a new cache prefix: its first call is a miss
         for slot in slots:
             self.prompt_frozen.pop(slot, None)
 
@@ -601,20 +626,30 @@ CONTEXT_DEFAULTS: dict[str, Any] = {"keep_messages": 8, "compact_input_chars": 6
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Rough size of what a conversation sends (~4 characters per token), tool calls included.
+    """Rough size of what a conversation sends (~4 bytes per token), tool calls included.
+
+    Counted in UTF-8 bytes like ``context_budget.message_tokens``, which the loop pairs with the provider's own count:
+    the calibration ratio learned there is applied here, so the two must measure the same way (CJK text is 3 bytes a
+    character, and 3-4 times more tokens than a character count says).
 
     Tool results are counted as the model receives them (head+tail clip), so the stored full text does not trigger
     compaction early; everything else is counted as stored.
     """
-    chars = 0
+    nbytes = 0
     for m in messages:
         c = m.get("content")
         if m.get("role") == "tool" and isinstance(c, str):
             c = clip_for_model(m.get("name"), c)
-        chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
+        nbytes += (
+            len(c.encode("utf-8"))
+            if isinstance(c, str)
+            else len(json.dumps(c, ensure_ascii=False).encode())
+            if c
+            else 0
+        )
         if m.get("tool_calls"):
-            chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))
-    return chars // 4
+            nbytes += len(json.dumps(m["tool_calls"], ensure_ascii=False).encode("utf-8"))
+    return nbytes // 4
 
 
 def _socket_is_live(path: Path) -> bool:
@@ -634,6 +669,12 @@ def _socket_is_live(path: Path) -> bool:
         probe.close()
 
 
+#: A finished (completed/failed) live session stays in the active list this many seconds, and at most this many of
+#: them do (newest first). Neither deletes anything: the session is still live and stored, it just leaves the strip.
+_COMPLETED_LIVE_TTL_S = 1800.0
+_COMPLETED_LIVE_MAX = 20
+
+
 class Client:
     """One attached JSON-RPC peer (the stdio pipe, or one Unix-socket connection)."""
 
@@ -641,6 +682,8 @@ class Client:
         self.send = send
         self.name = name
         self.session_id: str | None = None
+        #: The project (normalised cwd) this client last asked ``session.active_list`` for; scopes its pushed snapshots.
+        self.cwd: str | None = None
         self.closed = False
         self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
         self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
@@ -795,6 +838,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        self.fire_hook_soon(live, "SessionEnd", {"reason": "closed"})
         self.learning.settle_turns(sid)  # the session ended: its last turn can no longer be undone
         await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
@@ -932,8 +976,23 @@ class GatewayServer:
             if not client.closed:
                 self._send(client, line)
 
+    def _client_cwd(self, client: Client) -> str | None:
+        """The project a client's strip is scoped to: the cwd it last asked for, else its session's, else none."""
+        if client.cwd:
+            return client.cwd
+        live = self.live.get(client.session_id) if client.session_id else None
+        return _norm_cwd(live.stored.cwd) if live is not None else None
+
     def broadcast_active_list(self) -> None:
-        self.broadcast("session.active_list", {"sessions": self._active_rows(None)})
+        """Push every client its own snapshot: scoped to its project, with its own session marked ``current``."""
+        lines: dict[tuple[str | None, str | None], str] = {}
+        for client in self.clients:
+            if client.closed:
+                continue
+            key = (client.session_id, self._client_cwd(client))
+            if key not in lines:
+                lines[key] = encode_event("session.active_list", {"sessions": self._active_rows(*key)}, None)
+            self._send(client, lines[key])
 
     async def ensure_automation(self) -> Any:
         """The automation engine, started on first use (the daemon starts it eagerly)."""
@@ -1277,9 +1336,26 @@ class GatewayServer:
         except Exception:
             logger.exception("unhandled error processing frame")
 
-    def _active_rows(self, current: str | None) -> list[dict[str, Any]]:
+    def _active_rows(
+        self, current: str | None, cwd: str | None = None, now: float | None = None
+    ) -> list[dict[str, Any]]:
+        """The strip's rows. ``cwd`` (normalised) keeps only that project's sessions and their sub-agents. A finished
+        (completed/failed) session stays listed for ``_COMPLETED_LIVE_TTL_S`` and at most ``_COMPLETED_LIVE_MAX`` of
+        them, newest first: it is still live and resumable, it just stops crowding the strip and the agent view."""
+        now = time.time() if now is None else now
         rows = []
+        scope_ids: set[str] = set()
+        finished = 0
         for s in sorted(self.live.values(), key=lambda x: x.stored.updated_at, reverse=True):
+            if cwd is not None:
+                if _norm_cwd(s.stored.cwd) != cwd:
+                    continue
+                scope_ids.add(s.session_id)
+            state = s.state
+            if state in ("completed", "failed") and s.session_id != current:  # the asking client's own never expires
+                if now - s.stored.updated_at > _COMPLETED_LIVE_TTL_S or finished >= _COMPLETED_LIVE_MAX:
+                    continue
+                finished += 1
             # a session without a generated title is called by the start of its first prompt, not "Session" for all
             first_prompt = _one_line(summarize_messages(s.stored.messages)[1], 120)
             rows.append(
@@ -1307,6 +1383,8 @@ class GatewayServer:
             )
         for h in self.subagents.handles.values():  # sub-agent / fan-out children share the strip
             if h.status not in ("queued", "running"):
+                continue
+            if cwd is not None and h.parent_sid not in scope_ids:
                 continue
             rows.append(
                 {
@@ -2190,6 +2268,9 @@ class GatewayServer:
         loop.on_turn_start = lambda: self._checkpoint_turn_start(session)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         loop.file_stamps = session.file_stamps
+        loop.calibration = session.calibration
+        # write/edit checkpoints for /undo, keyed by where this turn's messages start (where an /undo cuts)
+        loop.checkpoint = session.checkpoint_turn or checkpoints.Turn(session.session_id, len(session.stored.messages))
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         ask_user.register(loop.tools, self, session)  # always: whether anyone can answer is decided per call
@@ -2205,6 +2286,23 @@ class GatewayServer:
                 decision,
                 session_id=session.session_id,
                 router=self._decision_router(decision),
+            )
+        # auto mode's classifier: settings from the user's own config only (a project must not turn the check off)
+        try:
+            user_permissions = load_user_section("permissions") or {}
+        except Exception:  # noqa: BLE001 - a config.yaml broken mid-session keeps the default, never fails the turn
+            user_permissions = {}
+        classifier = classifier_settings(self.config, user_permissions)
+        if classifier.enabled:
+            loop.classify_call = lambda call, history, *, cwd, interactive: classify_permission(
+                self.model_caller,
+                call,
+                history,
+                cwd=cwd,
+                session_id=session.session_id,
+                interactive=interactive,
+                timeout_s=classifier.timeout_s,
+                cache=session.perms.classifier_cache,
             )
         loop.on_tool_outcome = lambda call, result, failure, **kw: self.learning.tool_outcome(
             session, call, result, failure, **kw
@@ -2292,9 +2390,13 @@ class GatewayServer:
         tiers = self._ensure_router(session.stored.model or None, session.stored.provider)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
+        session.turn_route = {}
         session.user_stopped, session.turn_denials = False, 0
         # where this turn's messages start in the stored conversation: an /undo that cuts there removes this turn
         msg_start = len(session.stored.messages)
+        # one checkpoint turn for every loop of this turn (a stall escalates to a second loop, built after more messages
+        # exist): all their edits are filed under where the turn starts, which is where /undo cuts
+        session.checkpoint_turn = checkpoints.Turn(session.session_id, msg_start)
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -2534,6 +2636,7 @@ class GatewayServer:
                 session.turn_id,
                 history_len=len(history),
             )
+            session.checkpoint_turn = None  # a job's loop that follows files its own turn
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
@@ -2569,6 +2672,9 @@ class GatewayServer:
                 "error": error,
                 "error_surface": _error_surface(session.last_exc) if status == "error" else None,
                 "state": session.state,
+                "provider": session.turn_route.get("provider", ""),
+                "model": session.turn_route.get("model", ""),
+                "hops": session.turn_route.get("hops", []),
             },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
@@ -2727,8 +2833,11 @@ class GatewayServer:
         own = optimizer.session_settings(self.config, session.session_id)  # a treatment arm's compact_input_chars
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(own, "context", None) or {})}
         messages = session.stored.messages
-        if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
+        # compared in the provider's units: the estimate is bytes/4, which the session's own reports have corrected
+        estimate = session.calibration.correct(self._request_tokens(session))
+        if not force and estimate < compact_threshold(self.config, self._active_model(session)):
             return 0
+        await self.fire_hook(session, "PreCompact", {"trigger": "auto"})
         try:
             new, folded = await compact_messages(
                 self.model_caller,
@@ -2744,8 +2853,9 @@ class GatewayServer:
             session.stored.messages = new
             session.last_prompt_tokens = 0  # the reported size described the history before it was folded
             # the pending turns' message ranges point into the list that was just rewritten: an /undo could no longer
-            # be matched to its turn, so their outcomes stop waiting for one
+            # be matched to its turn, so their outcomes stop waiting for one, and their file checkpoints are dropped
             self.learning.settle_turns(session.session_id)
+            await asyncio.to_thread(checkpoints.drop, session.session_id)
             session.refresh_prompt_inputs()  # the old prefix is no longer cached anyway: show what was learned
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
@@ -2794,6 +2904,23 @@ class GatewayServer:
         session.emit("tool.generating", {"name": tc.name})
         session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
 
+    def _watch_cache(self, session: LiveSession, u: Usage) -> None:
+        """One notice per cache-hit collapse (``context.cache_warning: false`` silences it); never raises."""
+        if not (getattr(self.config, "context", None) or {}).get("cache_warning", True):
+            return
+        try:
+            note = session.cache_watch.observe(u.prompt_tokens, u.cache_read_tokens, time.monotonic())
+        except Exception:  # noqa: BLE001 - a watcher must never break a turn
+            logger.exception("cache watch failed")
+            return
+        if note:
+            self.usage.record("cache_regression", session=session.session_id, detail=note[:200])
+            session.emit(
+                "notification.show",
+                {"text": note, "level": "warn", "kind": "cache", "key": "k3.cache_regression"},
+                importance="essential",
+            )
+
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
             self._announce_tool(session, event.tool_call)
@@ -2820,6 +2947,9 @@ class GatewayServer:
                 session.emit("tool.complete", payload)
             elif msg.role == "assistant":
                 provider, model = session.last_entry
+                if event.route:  # the latest call's answering entry; hops add up over the turn's calls
+                    hops = [*session.turn_route.get("hops", []), *event.route.get("hops", [])]
+                    session.turn_route = {**event.route, "hops": hops}
                 u = msg.usage
                 self.usage.record(
                     "call",
@@ -2841,10 +2971,27 @@ class GatewayServer:
                 if u:
                     session.last_prompt_tokens = max(0, u.prompt_tokens)
                     session.emit("session.usage", {"usage": _usage_payload(u, self._context_max(session))})
+                    self._watch_cache(session, u)
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
                 for tc in msg.tool_calls:
                     self._announce_tool(session, tc)
                 session.announced_tools.clear()
+
+    async def fire_hook(self, session: LiveSession, event: str, payload: dict[str, Any] | None = None) -> None:
+        """Run the user's hooks for a lifecycle event (PreCompact, Notification, SessionEnd), for their side effects.
+        Never raises; each hook is bounded by its own timeout."""
+        try:
+            hooks = userhooks.load(session.perms.cwd, session.session_id)
+            if hooks:
+                await hooks.run(event, payload)
+        except Exception:  # noqa: BLE001 - a hook is the user's own script
+            logger.exception("%s hook failed", event)
+
+    def fire_hook_soon(self, session: LiveSession, event: str, payload: dict[str, Any] | None = None) -> None:
+        """:meth:`fire_hook` as a side task, for events the caller must not wait on (the user's hook may be slow)."""
+        task = asyncio.get_running_loop().create_task(self.fire_hook(session, event, payload))
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(
@@ -2857,6 +3004,9 @@ class GatewayServer:
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
+            self.fire_hook_soon(
+                session, "Notification", {"message": f"k3code needs your permission to use {tool_name}"}
+            )
             preview = await _change_preview(tool_name, arguments, where.cwd)
             try:
                 result = await self._ask_client(
@@ -3187,6 +3337,7 @@ class GatewayServer:
             return
         home = self._home()
         delete_session_journal(home, sid)
+        checkpoints.drop(sid)  # copies of the files the agent changed: gone with the session
         pastes = home / PASTES_DIR / sid
         if pastes.is_dir() and not pastes.is_symlink():
             shutil.rmtree(pastes, ignore_errors=True)
@@ -3205,7 +3356,9 @@ class GatewayServer:
             now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
-        return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+        # file checkpoints follow the journal's age limit: nobody resumes a session after that long to undo it
+        cps = checkpoints.prune(lambda sid: sid in self.live, keep["journal_days"] * 86400, now=now)
+        return {"usage_rows": rows, "journal_files": files, "decisions": decisions, "checkpoints": cps}
 
     def compact_storage(self) -> int:
         """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
@@ -3723,9 +3876,9 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int, *, archived: bool = False) -> list[SessionSummary]:
-    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised);
-    archived ones only with ``archived``, else none of them."""
+def _project_session_ids(server: GatewayServer, cwd: str, *, archived: bool = False) -> list[str]:
+    """Ids of the newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised), newest
+    first, out of the newest ``_SESSION_LIST_SCAN_CAP``; archived ones only with ``archived``, else none of them."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
     for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP, archived=archived):
@@ -3733,22 +3886,50 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int, *, archived: 
             spelled[stored_cwd] = _norm_cwd(stored_cwd)
         if spelled[stored_cwd] == cwd:
             ids.append(sid)
-            if len(ids) >= limit:
-                break
-    return server.store.summaries(ids)
+    return ids
+
+
+def _project_sessions(
+    server: GatewayServer, cwd: str, limit: int, *, archived: bool = False, offset: int = 0
+) -> list[SessionSummary]:
+    """The ``limit`` sessions of :func:`_project_session_ids` after the first ``offset``."""
+    return server.store.summaries(_project_session_ids(server, cwd, archived=archived)[offset : offset + limit])
+
+
+def _bool_param(params: dict[str, Any], key: str) -> bool:
+    """A boolean parameter, absent or null meaning false. ``"false"`` is false, not a non-empty string."""
+    value = params.get(key)
+    if value is None:
+        return False
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise _InvalidParams(f"{key} must be true or false")
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
     message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all.
+    ``offset`` skips that many rows first (page with the number of rows already fetched); ``total`` counts every
+    matching row, out of the newest ``_SESSION_LIST_SCAN_CAP`` when ``cwd`` is given.
     Archived sessions are left out, unless ``archived`` is true: then only they are listed."""
-    limit = int(params.get("limit") or 50)
+    try:
+        limit = int(params.get("limit") or 50)
+        offset = max(0, int(params.get("offset") or 0))
+    except (TypeError, ValueError) as e:
+        raise _InvalidParams("limit and offset must be whole numbers") from e
     cwd = _norm_cwd(params.get("cwd"))
-    archived = bool(params.get("archived"))
+    archived = _bool_param(params, "archived")
     if cwd:
-        sessions = _project_sessions(server, cwd, max(1, limit), archived=archived)
+        ids = _project_session_ids(server, cwd, archived=archived)
+        total = len(ids)
+        sessions = server.store.summaries(ids[offset : offset + max(1, limit)])
     else:
-        sessions = server.store.list(limit=limit, archived=archived)
+        total = server.store.count(archived=archived)
+        sessions = server.store.list(limit=limit, offset=offset, archived=archived)
     rows = []
     for s in sessions:
         preview = s.preview
@@ -3768,7 +3949,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "cwd": _norm_cwd(s.cwd),
             }
         )
-    return {"sessions": rows}
+    return {"sessions": rows, "total": total, "offset": offset}
 
 
 #: Most rows one ``session.archive_suggestions`` reply carries (``total`` counts them all).
@@ -3840,8 +4021,16 @@ async def _session_archive_suggestions(server: GatewayServer, params: dict[str, 
 
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``cwd`` (optional) scopes the rows to that project; the client's later pushed snapshots keep that scope."""
+    raw_cwd = params.get("cwd")
+    if raw_cwd is not None and not isinstance(raw_cwd, str):
+        raise _InvalidParams("cwd must be a string")
+    cwd = _norm_cwd(raw_cwd)
+    client = _ctx_client.get()
+    if client is not None and cwd:
+        client.cwd = cwd
     current = server.session
-    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None)}
+    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None, cwd)}
     if server.automation is not None:
         counts = server.automation.counts()
         out["automation"] = {**counts, "active": sum(counts.values())}
@@ -4981,7 +5170,11 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     The goal's continuation prompts are no user messages here: after an auto-continued (or /goal) run, /undo drops
     the whole run back to the prompt the user sent, as the TUI's transcript does (it never showed the continuations).
     It used to drop only the last continuation turn, so the run's earlier turns stayed in the conversation the next
-    prompt (and /retry) went on from. ``removed``: the number of messages dropped."""
+    prompt (and /retry) went on from. ``removed``: the number of messages dropped.
+
+    The files the dropped turns' write/edit calls changed are rewound too (k3code.checkpoints): when there was any,
+    or a shell command ran in them (its changes are not rewound), the result also lists the files and has a ``note``
+    to show. /rewind is the same command."""
     session = server._session_for(params.get("session_id"))
     if session is None:
         raise _InvalidParams("no active session")
@@ -5001,10 +5194,21 @@ async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[s
     # the turns these messages came from (each turn of an auto-continued run) were rejected: their outcomes are
     # failures, not "finished" (issue #140)
     server.learning.turn_undone(session, last_user)
+    # a turn's checkpoints are filed under where its messages start: the first one's with the system prompt
+    start = last_user
+    while start > 0 and messages[start - 1].get("role") == "system":
+        start -= 1
+    roots = [str(session.stored.cwd or session.perms.cwd), *session.perms.add_dirs]
+    rewind = await asyncio.to_thread(checkpoints.restore, session.session_id, start, roots)
+    called = {c.get("name") for m in messages[last_user:] for c in m.get("tool_calls") or []}
+    shell, delegated = "bash" in called, "task" in called  # neither's changes on disk are checkpointed
     session.messages = messages[:last_user]
     session.last_prompt_tokens = 0
     server.store.save(session.stored)
-    return {"removed": len(messages) - last_user}
+    out: dict[str, Any] = {"removed": len(messages) - last_user}
+    if rewind or shell or delegated:
+        out.update(rewind.report(shell=shell, delegated=delegated))
+    return out
 
 
 async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

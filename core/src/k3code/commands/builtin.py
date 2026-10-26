@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from k3code import chain_config
+from k3code import chain_config, checkpoints
 from k3code.commands import CommandDef, CommandRegistry, tune
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
@@ -184,6 +184,9 @@ def _settle_turns(ctx: Any, live: Any) -> None:
     hub = getattr(ctx, "learning", None)
     if hub is not None:
         hub.settle_turns(live.session_id)
+    # the file checkpoints are keyed by message index, which a rewritten conversation no longer matches: an /undo
+    # that found an old key would put back a file the user kept
+    checkpoints.drop(live.session_id)
 
 
 class _ClearCommand(CommandDef):
@@ -211,7 +214,11 @@ class _ClearCommand(CommandDef):
 
 class _CompactCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="compact", help="Summarize the older transcript to free context", aliases=["compress"])
+        super().__init__(
+            name="compact",
+            help="Summarize the older transcript to free context; /compact <focus> keeps that in detail",
+            aliases=["compress"],
+        )
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = ctx.sessions.get(session_id) if session_id else None
@@ -220,8 +227,11 @@ class _CompactCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would overwrite the summary
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
+        await ctx.fire_hook(live, "PreCompact", {"trigger": "manual", "custom_instructions": arg.strip()})
         try:
-            messages, folded = await compact_messages(ctx.model_caller, list(live.messages), session_id=live.session_id)
+            messages, folded = await compact_messages(
+                ctx.model_caller, list(live.messages), session_id=live.session_id, focus=arg.strip()
+            )
         except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
             return {"type": "message", "message": f"Compact failed: {e}"}
         if not folded:
@@ -330,6 +340,7 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.bg import BgCommand
     from k3code.commands.branch import BranchCommand
     from k3code.commands.config_cmd import ConfigCommand
+    from k3code.commands.context_cmd import ContextCommand
     from k3code.commands.export import ExportCommand
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
@@ -379,6 +390,7 @@ def build_registry() -> CommandRegistry:
         UltraResearchCommand(),
         PermissionsCommand(),
         FocusCommand(),
+        ContextCommand(),
         UpdateConfigCommand(),
         OptimizerCommand(),
         SelfImproveCommand(),

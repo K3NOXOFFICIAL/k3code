@@ -23,7 +23,7 @@ import { compactPreview, stripControl } from "../lib/text.js";
 import type { Theme } from "../theme.js";
 
 import { GLYPH, LABEL, stateColor } from "./agentStrip.js";
-import { $stripSessions } from "./agentStripStore.js";
+import { $gatewayEpoch, $stripSessions } from "./agentStripStore.js";
 import {
   buildLines,
   buildViewRows,
@@ -533,6 +533,8 @@ export function AgentViewPane({
   // Each load gets a number; only the latest one's answer is applied, and none after the view has closed.
   const loadSeq = useRef(0);
   const closed = useRef(false);
+  // a reconnected gateway may know other sessions than the lists loaded before the drop
+  const gatewayEpoch = useStore($gatewayEpoch);
 
   useEffect(
     () => () => {
@@ -615,7 +617,7 @@ export function AgentViewPane({
 
   useEffect(() => {
     loadLists();
-  }, [loadLists]);
+  }, [loadLists, gatewayEpoch]);
 
   const rows = useMemo(
     () =>

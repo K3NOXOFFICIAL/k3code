@@ -51,7 +51,19 @@ CREATE INDEX IF NOT EXISTS events_session ON events(session);
 #: Event kinds written to the table (every ``record`` call uses one of these; a test greps the sources for it).
 #: ``escalated`` = a quality escalation (the attempt stalled); ``outage`` = a tier moved on because its providers
 #: were all unreachable (not a quality signal); ``loop_guard`` = the loop guard fired on any tier.
-KINDS = ("call", "failover", "retry", "pause", "tool", "approval", "escalated", "outage", "loop_guard", "subagent")
+KINDS = (
+    "call",
+    "failover",
+    "retry",
+    "pause",
+    "tool",
+    "approval",
+    "escalated",
+    "outage",
+    "loop_guard",
+    "subagent",
+    "cache_regression",
+)
 
 
 class UsageDB:

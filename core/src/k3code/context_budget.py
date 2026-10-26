@@ -169,3 +169,42 @@ def elide_old_results(
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         out.append(m)
     return out
+
+
+#: How much a new provider report moves the calibration, and the range it may take (a report far outside it is a
+#: different tokenizer or an image, not a trend).
+CALIBRATION_ALPHA = 0.3
+CALIBRATION_MIN, CALIBRATION_MAX = 0.5, 2.0
+#: Tokens kept free for the reply on top of ``max_tokens`` (see elide_threshold).
+RESERVE_MARGIN = 1024
+
+
+class TokenCalibration:
+    """Real tokens per estimated token. The estimate is bytes/4, which is off by a lot for code, JSON or non-English
+    text; every provider reply carries the real prompt size, so the first report sets the ratio and later ones move it
+    (an exponential moving average, clamped). A session shares one across its turns and tiers."""
+
+    def __init__(self) -> None:
+        self.ratio = 1.0
+        self.samples = 0
+
+    def observe(self, real_tokens: int, estimate: int) -> None:
+        """One request: the provider counted ``real_tokens`` where the estimate said ``estimate``."""
+        if real_tokens <= 0 or estimate <= 0:
+            return
+        r = min(CALIBRATION_MAX, max(CALIBRATION_MIN, real_tokens / estimate))
+        self.ratio = r if self.samples == 0 else (1 - CALIBRATION_ALPHA) * self.ratio + CALIBRATION_ALPHA * r
+        self.samples += 1
+
+    def correct(self, estimate: int) -> int:
+        """``estimate`` as the provider would count it."""
+        return round(estimate * self.ratio)
+
+
+def elide_threshold(window: int, ratio: float, max_tokens: int) -> float:
+    """Estimated request size past which old tool results are elided: ``ratio`` of the window, or less when the reply
+    needs room: a request must leave ``max_tokens`` (plus RESERVE_MARGIN) free, which on a small window is more than the
+    share the ratio leaves. A window the reply alone would fill keeps the plain share."""
+    limit = window - max_tokens - RESERVE_MARGIN
+    plain = window * ratio
+    return min(plain, limit) if limit > 0 else plain
