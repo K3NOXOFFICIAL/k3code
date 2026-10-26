@@ -73,6 +73,27 @@ describe("strip sessions", () => {
     ]);
   });
 
+  it("the current mark moving to another session is a change, not a duplicate", () => {
+    // the TUI switched from session A to B: the rows are the same but for who is current
+    applyStripSessions([
+      row({ current: true, id: "a" }),
+      row({ current: false, id: "b" }),
+    ]);
+    const sets = vi.fn();
+    const off = $stripSessions.listen(sets);
+
+    applyStripSessions([
+      row({ current: false, id: "a" }),
+      row({ current: true, id: "b" }),
+    ]);
+    expect(sets).toHaveBeenCalledTimes(1);
+    expect($stripSessions.get().map((s) => [s.id, s.current])).toEqual([
+      ["a", false],
+      ["b", true],
+    ]);
+    off();
+  });
+
   it("a pushed event marks the TUI's own session current when nothing was stored for it yet", () => {
     patchUiState({ sid: "mine" });
     const onEvent = createGatewayEventHandler(ctx());

@@ -21,9 +21,29 @@ export const STRIP_MAX_ROWS = 6;
 /** Background sessions from the `session.active_list` poll (current session excluded). */
 export const $stripSessions = atom<SessionActiveItem[]>([]);
 
-// `current` is left out: the poll marks the TUI's own session, the pushed `session.active_list` event marks none.
-const snapshotKey = (rows: readonly SessionActiveItem[]) =>
-  JSON.stringify(rows.map(({ current: _current, ...row }) => row));
+const withoutCurrent = ({ current: _current, ...row }: SessionActiveItem) =>
+  JSON.stringify(row);
+
+/**
+ * Whether two snapshots say the same. `current` counts only where both sides state it: a core that does not mark it per
+ * client pushes rows with none while the poll marks the TUI's own session, and that alone changes nothing; the mark
+ * moving from one session to another (the TUI switched) does.
+ */
+const sameSnapshot = (
+  a: readonly SessionActiveItem[],
+  b: readonly SessionActiveItem[],
+) =>
+  a.length === b.length &&
+  a.every((row, i) => {
+    const other = b[i] as SessionActiveItem;
+
+    return (
+      withoutCurrent(row) === withoutCurrent(other) &&
+      (row.current === undefined ||
+        other.current === undefined ||
+        row.current === other.current)
+    );
+  });
 
 /**
  * Store a poll reply or pushed snapshot; an unchanged one sets nothing, so the idle TUI does not re-render. A pushed
@@ -36,7 +56,7 @@ export function applyStripSessions(
 ) {
   const stored = $stripSessions.get();
 
-  if (snapshotKey(stored) === snapshotKey(rows)) {
+  if (sameSnapshot(stored, rows)) {
     return;
   }
 
