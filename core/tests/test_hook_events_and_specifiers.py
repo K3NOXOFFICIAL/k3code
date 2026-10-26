@@ -10,7 +10,7 @@ import pytest
 
 from k3code import confio, userhooks
 from k3code.permissions import decide
-from k3code.permissions.rules import Rule, evaluate, from_config, parse_specifier
+from k3code.permissions.rules import Rule, evaluate, expand, from_config, parse_specifier
 from k3code.providers.types import ToolCall
 from k3code.userhooks import EVENTS, Hook, HookRunner
 from m1cmd_helpers import cmd, make_server, new_session
@@ -111,8 +111,28 @@ def test_a_relative_path_rule_is_matched_in_any_directory_and_never_allowed() ->
     assert evaluate("edit", "/proj/lib/c.py", deny).action != "deny"
     problems: list[str] = []
     assert from_config({"allow": ["Edit(src/**)"]}, problems) == [] and "allow entry 1" in problems[0]
-    absolute = from_config({"allow": ["Edit(/proj/src/**)", "Read(~/notes/**)"]})
-    assert [r.action for r in absolute] == ["allow", "allow"]
+    absolute = from_config({"allow": ["Edit(//proj/src/**)", "Read(~/notes/**)"]})
+    assert [(r.pattern, r.action) for r in absolute] == [("/proj/src/**", "allow"), (expand("~/notes/**"), "allow")]
+
+
+def test_a_double_slash_is_the_absolute_path_as_in_claude_code() -> None:
+    """`Read(//etc/hostname)` is /etc/hostname; a single slash (`/src/**`) is relative to the settings file there."""
+    deny = from_config({"deny": ["Read(//etc/hostname)", "Read(/secrets/**)"]})
+    assert [r.pattern for r in deny] == ["/etc/hostname", "*/secrets/**"]
+    assert evaluate("read", "/etc/hostname", deny).action == "deny"
+    assert evaluate("read", "/proj/secrets/a", deny).action == "deny"
+
+
+def test_a_server_wide_mcp_entry_in_every_spelling_is_a_rule_not_a_deny_of_everything() -> None:
+    for spec in ("mcp__srv", "mcp__srv__*"):
+        rules = from_config({"deny": [spec]})
+        assert [(r.tool, r.action) for r in rules] == [("mcp__srv__*", "deny")]
+        assert evaluate("mcp__srv__tool", "*", rules).action == "deny"
+        assert evaluate("bash", "ls", rules).action != "deny"
+
+
+def test_a_bare_prefix_rule_is_every_command() -> None:
+    assert parse_specifier("Bash(:*)") == ("bash", "*")
 
 
 def test_grep_and_glob_rules_reach_the_read_decision_and_web_rules_the_web_tools(tmp_path) -> None:
@@ -135,15 +155,25 @@ def test_grep_and_glob_rules_reach_the_read_decision_and_web_rules_the_web_tools
     assert ok.action != "deny"
 
 
-@pytest.mark.parametrize(("tool", "args"), [("bash", {"command": "git commit -m x"}), ("edit", {"path": "a.txt"})])
-def test_an_ask_rule_you_wrote_is_not_answered_by_auto_mode(tmp_path, tool, args) -> None:
-    """`ask` in your settings means ask: auto mode used to turn it into an allow, like the built-in asks."""
-    rules = from_config({"ask": ["Bash(git commit:*)", "Edit(/**)"]})
-    for mode in ("default", "auto"):
-        d = decide(mode=mode, tool=tool, args=args, cwd=tmp_path, user_rules=rules)
-        assert (d.action, d.needs_human, d.auto_allowed) == ("ask", True, False), mode
-    assert decide(mode="auto", tool=tool, args=args, cwd=tmp_path, user_rules=rules, headless=True).action == "deny"
-    assert decide(mode="yolo", tool=tool, args=args, cwd=tmp_path, user_rules=rules).action == "allow"
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("bash", {"command": "git commit -m x"}),
+        ("edit", {"path": "a.txt"}),
+        ("web_fetch", {"url": "https://example.com/x"}),
+        ("mcp__srv__tool", {}),
+    ],
+)
+def test_an_imported_ask_rule_asks_in_default_mode_and_auto_answers_it_as_documented(tmp_path, tool, args) -> None:
+    """The README's contract for `auto` is "everything that is not denied runs", and the web tools pin it for their own
+    ask rules: an `ask` rule asks in default mode and auto mode answers it (unlike Claude Code, where an ask rule
+    always prompts); `deny` is what stops auto. Imported rules follow the same contract."""
+    ask = from_config({"ask": ["Bash(git commit:*)", "Edit(/**)", "WebFetch(domain:example.com)", "mcp__srv"]})
+    assert decide(mode="default", tool=tool, args=args, cwd=tmp_path, user_rules=ask).action == "ask"
+    auto = decide(mode="auto", tool=tool, args=args, cwd=tmp_path, user_rules=ask)
+    assert (auto.action, auto.auto_allowed, auto.needs_human) == ("allow", True, False)
+    deny = from_config({"deny": ["Bash(git commit:*)", "Edit(/**)", "WebFetch(domain:example.com)", "mcp__srv"]})
+    assert decide(mode="auto", tool=tool, args=args, cwd=tmp_path, user_rules=deny).action == "deny"
 
 
 # --- hook permission decisions

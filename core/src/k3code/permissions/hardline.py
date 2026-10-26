@@ -471,13 +471,13 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
             or _git_push_check(argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
-            or _destroy_check(argv, words, home)
+            or _destroy_check(argv, sub, home)
             or _download_run_check(argv, fetched)
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
         )
         if hit:
             return hit
-        fetched.update(_download_targets(argv, words))
+        fetched.update(_download_targets(argv, sub))
         dirs.follow(argv, sub)
     hit = _pipeline_check(parsed.pipelines) or _xargs_rm_check(parsed.pipelines, dirs, home)
     if hit:
@@ -1288,7 +1288,9 @@ def _xargs_runs_input_as_code(words: list[str]) -> bool:
             if flag is None:
                 return False
             script = tail[flag + 1] if flag + 1 < len(tail) else None
-            return script is None or script in placeholders  # no script of its own: the input is the program
+            # no script of its own, or one that runs the input (`{}`, `eval {}`, `$0`): the input is the program.
+            # (This only runs for a pipeline that downloaded: `ls | xargs -I{} sh -c 'mv {} {}.bak'` never gets here.)
+            return script is None or any(p in script for p in placeholders) or bool(re.search(r"\$0\b", script))
     return False
 
 
@@ -1877,21 +1879,48 @@ _DISK_TOOLS: dict[str, frozenset[str]] = {
     "sgdisk": frozenset({"-p", "--print", "-l", "--load-backup", "-E", "--end-of-largest", "-v", "--verify"}),
 }
 _PARTED_WRITES = frozenset({"mklabel", "mktable", "mkpart", "mkpartfs", "rm", "resizepart", "resize", "move", "name"})
-#: ``>``, ``>>``, ``>|``, ``<>``, ``&>``, ``2>``, ``>&``: an output redirect, wherever in a word it sits (``cat x>f``).
-_OUT_REDIRECT = re.compile(r"&>>?|\d*>>?\|?|<>|>&")
+#: The word after a redirect operator: quoted pieces and plain characters up to a space or an operator.
+_REDIRECT_WORD_TEXT = re.compile(r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s;&|<>()'"\\])+""")
 
 
-def _out_redirect_targets(words: list[str]) -> list[str]:
-    """The words the output redirects of a simple command write to: what follows the operator in its word
-    (``>/dev/sda``, ``x>/dev/sda``) or, when the operator ends the word, the next word."""
+def _out_redirect_targets(sub: str) -> list[str]:
+    """The words the output redirects of the simple command ``sub`` write to (``>``, ``>>``, ``>|``, ``>&``, ``&>``,
+    ``2>``, ``<>``), read from its text so that a ``>`` inside quotes (an ``echo`` or a commit message) is text, and one
+    glued to the word before it (``cat x>/dev/sda``) is still a redirect."""
     out: list[str] = []
-    for i, w in enumerate(words):
-        for m in _OUT_REDIRECT.finditer(w):
-            tail = w[m.end() :]
-            if tail:
-                out.append(tail)
-            elif m.end() == len(w) and i + 1 < len(words):
-                out.append(words[i + 1])
+    i, n, quote = 0, len(sub), ""
+    while i < n:
+        c = sub[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == ">" or (c == "<" and sub[i + 1 : i + 2] == ">"):
+            j = i + (2 if c == "<" else 1)
+            if j < n and sub[j] in ">|&":
+                j += 1
+            while j < n and sub[j] in " \t":
+                j += 1
+            if m := _REDIRECT_WORD_TEXT.match(sub, j):
+                try:
+                    pieces = shlex.split(m.group(0))
+                except ValueError:
+                    pieces = [m.group(0)]
+                out.extend(pieces[:1])
+                i = m.end()
+                continue
+        i += 1
     return out
 
 
@@ -1900,10 +1929,10 @@ _WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
 _WRITES_LAST = frozenset({"cp", "mv", "install"})
 
 
-def _block_device_check(argv: list[str], words: list[str]) -> str | None:
-    """Output redirected onto a disk, or a program that wipes, relabels or copies onto one. ``words`` are the simple
-    command's words with the redirections still in (``argv`` is its normalised program and arguments)."""
-    for target in _out_redirect_targets(words):
+def _block_device_check(argv: list[str], sub: str) -> str | None:
+    """Output redirected onto a disk, or a program that wipes, relabels or copies onto one. ``sub`` is the simple
+    command's text with the redirections still in (``argv`` is its normalised program and arguments)."""
+    for target in _out_redirect_targets(sub):
         if _BLOCK_DEVICE.match(target):
             return "block-device-write"
     if not argv:
@@ -1927,9 +1956,9 @@ def _block_device_check(argv: list[str], words: list[str]) -> str | None:
     return None
 
 
-def _destroy_check(argv: list[str], words: list[str], home: str) -> str | None:
+def _destroy_check(argv: list[str], sub: str, home: str) -> str | None:
     """Recursive chmod/chown/chgrp on /, ~ or $HOME, ``rsync --delete`` into one of them, and writes onto a disk."""
-    hit = _block_device_check(argv, words)
+    hit = _block_device_check(argv, sub)
     if hit or not argv:
         return hit
     name, args = os.path.basename(argv[0]), _without_redirects(argv[1:])
@@ -1950,9 +1979,10 @@ def _destroy_check(argv: list[str], words: list[str], home: str) -> str | None:
     return None
 
 
-def _download_targets(argv: list[str], words: list[str]) -> list[str]:
-    """The files a download command line writes: ``curl -o F``, ``wget -O F`` (also in a cluster, ``-qO F``) and a
-    redirect (``curl x > F``)."""
+def _download_targets(argv: list[str], sub: str) -> list[str]:
+    """The files a download command line writes: ``curl -o F`` / ``-oF``, ``wget -O F`` (also in a cluster, ``-qO F``),
+    the url's own file name for ``curl -O`` and for ``wget`` without ``-O`` (under ``--output-dir`` / ``-P`` when given)
+    and a redirect (``curl x > F``)."""
     name = os.path.basename(argv[0]) if argv else ""
     if name not in _FETCHERS:
         return []
@@ -1960,24 +1990,35 @@ def _download_targets(argv: list[str], words: list[str]) -> list[str]:
     letter = {"curl": "o", "wget": "O"}.get(name, "")
     args = argv[1:]
     named = remote_name = False
+    prefix = ""
     for i, a in enumerate(args):
+        nxt = args[i + 1] if i + 1 < len(args) else ""
         if a.startswith("--"):
             key, eq, value = a.partition("=")
             if key in ("--output", "--output-document"):
                 named = True
-                out.append(value if eq else (args[i + 1] if i + 1 < len(args) else ""))
+                out.append(value if eq else nxt)
             elif key in ("--remote-name", "--remote-name-all"):
                 remote_name = True
-        elif letter and a.startswith("-") and len(a) > 1 and a.endswith(letter) and i + 1 < len(args):
+            elif key in ("--output-dir", "--directory-prefix"):
+                prefix = value if eq else nxt
+        elif a == "-P" and name == "wget":
+            prefix = nxt
+        elif letter and a.startswith("-") and len(a) > 1 and a.endswith(letter) and nxt:
             named = True
-            out.append(args[i + 1])
+            out.append(nxt)
+        elif letter and a.startswith("-") and len(a) > 2 and (at := a.find(letter, 1)) > 0:
+            named = True  # the name glued to the flag: -oFILE, -qOFILE
+            out.append(a[at + 1 :])
         elif name == "curl" and a.startswith("-") and len(a) > 1 and a.endswith("O"):
             remote_name = True  # -O, -LO, -fsSLO: saved under the url's file name
     if not named and (remote_name or name == "wget"):  # wget always saves under it; curl only with -O
         for a in args:
             if "://" in a and not a.startswith("-"):
                 out.append(urlsplit(a).path.rstrip("/").rsplit("/", 1)[-1] or "index.html")
-    out += _out_redirect_targets(words)
+    if prefix:
+        out = [t if t.startswith("/") else os.path.join(prefix, t) for t in out]
+    out += _out_redirect_targets(sub)
     return [t for t in out if t and t != "-" and not t.startswith("&")]
 
 
@@ -2013,11 +2054,16 @@ _WHOLE_VAR = re.compile(r"^\$\{?(\w+)\}?(/.*)?$")
 _KNOWN_VALUE = re.compile(r"^(?:[^$`]*|\$\{?(?:HOME|PWD)\}?(?:/.*)?)$")
 
 
-#: ``${X:-default}`` / ``${X-default}``: X's value, or the default when X is unset (or empty).
-_DEFAULTED_VAR = re.compile(r"^\$\{(\w+):?-([^}]*)\}(/.*)?$")
-#: Commands that may set any variable in ways this does not follow (the input they read, the code they run): after
-#: one, no variable of the line is known.
-_VAR_WRITERS = frozenset({"read", "mapfile", "readarray", "eval", "let", "unset", "source", ".", "getopts"})
+#: ``${X:-d}`` / ``${X-d}`` / ``${X:=d}`` / ``${X=d}``: X's value, or d when X is unset (or empty); ``${X:+d}`` /
+#: ``${X+d}``: d when X is set; ``${X:?msg}`` stops the script when X is unset (no default).
+_DEFAULTED_VAR = re.compile(r"^\$\{(\w+)(:?[-=+?])([^}]*)\}(/.*)?$")
+#: What a variable may hold besides the literals the line gave it: something this does not follow.
+_UNKNOWN = "\0?"
+#: Commands whose operands (or flags) name the variables they set.
+_NAMED_WRITERS = frozenset({"read", "mapfile", "readarray", "unset", "getopts", "let"})
+#: Commands that may set any variable: the code they run is not followed, so every known variable may also hold
+#: something else afterwards (what it held stays possible).
+_ANY_WRITERS = frozenset({"eval", "source", "."})
 
 
 def _merge_known(snapshots: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple[str, ...]]:
@@ -2033,20 +2079,40 @@ def _merge_known(snapshots: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple
 def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[str]) -> None:
     """Record what the simple command ``tokens`` assigns, so a later delete of ``$X`` is read as what it holds:
     ``X=/``, ``Y=$X`` (a copy of a known one), ``export X=/``, ``for X in a b``. A value the shell computes
-    (``X=$(..)``, ``for X in *``) is forgotten, and so is everything once a command runs that may set any variable
-    (``read X``, ``eval``, ``printf -v``, ``declare -n``, ``source``)."""
+    (``X=$(..)``, ``for X in *``) is forgotten. ``read X``, ``unset X``, ``printf -v X``, ``let X=..`` and
+    ``declare -n`` forget the names they write and leave the others as they were; ``eval`` and ``source`` may write
+    any, so each known variable may now also hold something unknown."""
     words = _past_reserved(tokens)
     while words and words[0] in ("time", "-p"):  # `time X=/` still sets X
         words = words[1:]
     name0 = os.path.basename(argv[0]) if argv else ""
+    first = os.path.basename(words[0]) if words else ""  # `eval` is unwrapped out of argv
+    operands = [a for a in argv[1:] if not a.startswith("-")]
     flags = [a for a in argv[1:] if a.startswith("-")]
-    if (
-        name0 in _VAR_WRITERS
-        or (words and os.path.basename(words[0]) in _VAR_WRITERS)  # `eval` is unwrapped out of argv
-        or (name0 == "printf" and "-v" in argv)
-        or (name0 in ("declare", "typeset", "local") and any("n" in f for f in flags if not f.startswith("--")))
-    ):
-        known.clear()
+    if name0 in _ANY_WRITERS or first in _ANY_WRITERS:
+        for n, values in known.items():
+            if _UNKNOWN not in values:
+                known[n] = (*values, _UNKNOWN)
+        return
+    if name0 in _NAMED_WRITERS or first in _NAMED_WRITERS:
+        written = [a.partition("=")[0] for a in operands if a.partition("=")[0].isidentifier()]
+        if name0 == "let":  # `let X=1 Y+=2`
+            written = [m.group(1) for a in operands if (m := re.match(r"^(\w+)(?:[-+*/%&|^]|<<|>>)?=", a))]
+        elif name0 == "read" and not written:
+            written = ["REPLY"]
+        elif name0 == "getopts":
+            written += ["OPTARG", "OPTIND"]
+        for n in written:
+            known.pop(n, None)
+        return
+    if name0 == "printf" and "-v" in argv:
+        i = argv.index("-v")
+        if i + 1 < len(argv):
+            known.pop(argv[i + 1].partition("[")[0], None)
+        return
+    if name0 in ("declare", "typeset", "local") and any("n" in f for f in flags if not f.startswith("--")):
+        for a in operands:  # a nameref: what it names is no longer what it was set to
+            known.pop(a.partition("=")[0], None)
         return
     for w in words:
         if m := re.match(r"^(\w+)\+=", w):  # `X+=more` changes X to something this does not follow
@@ -2059,8 +2125,11 @@ def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[
     for w in assigns:
         name, _, value = w.partition("=")
         values = _resolve_target(value, known)
-        if all(_KNOWN_VALUE.match(v) for v in values):
+        good = [v for v in values if _KNOWN_VALUE.match(v)]
+        if good and len(good) == len(values):
             known[name] = tuple(values)
+        elif good:  # a copy of a variable that may also hold something unknown
+            known[name] = (*good, _UNKNOWN)
         else:
             known.pop(name, None)
     if tokens[:1] == ["for"] and len(tokens) > 3 and tokens[2] == "in" and tokens[1].isidentifier():
@@ -2075,20 +2144,34 @@ def _resolve_target(t: str, known: dict[str, tuple[str, ...]]) -> list[str]:
     """``t`` with a variable it starts with replaced by every value it may hold: the known ones, and for
     ``${X:-default}`` the default as well (X may be unset); unchanged when it is not known."""
     if m := _DEFAULTED_VAR.match(t):
-        rest = m.group(3) or ""
-        return [m.group(2) + rest, *(v + rest for v in known.get(m.group(1), ()))]
+        name, op, default, rest = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        out = [default + rest] if "?" not in op else []  # `${X:?}` stops the script instead of falling back
+        if "+" not in op:  # `${X:+d}` is d or nothing, never X's own value
+            out += [v + rest for v in known.get(name, ()) if v != _UNKNOWN]
+        return out or [t]
     m = _WHOLE_VAR.match(t)
     if m and m.group(1) in known:
-        return [value + (m.group(2) or "") for value in known[m.group(1)]]
+        values, rest = known[m.group(1)], m.group(2) or ""
+        out = [v + rest for v in values if v != _UNKNOWN]
+        if _UNKNOWN in values:
+            out.append(t)  # it may also hold something unknown: the word itself, as a variable nobody knows
+        return out
     return [t]
 
 
 #: A whole word that is one expansion other than $HOME / $PWD (``$X``, ``${X}``, ``${A[0]}``) or a command
 #: substitution, alone or followed by ``/`` or ``/*``: whatever it holds, and the root if it holds nothing.
-_BARE_EXPANSION = re.compile(r"^(?:\$\{(?!(?:HOME|PWD)\})[^}]*\}|\$(?!(?:HOME|PWD)\b)\w+|\$\(.*|`.*)(?:/\*?)?$")
-#: A variable named for a credential, by whole words of its name (``GITHUB_TOKEN``, ``AWS_SECRET_ACCESS_KEY``), not by
-#: a substring (``MONKEY``, ``TOKENIZER``).
-_SECRET_VAR = re.compile(r"(?i)(?:^|_)(?:API_?KEYS?|KEYS?|SECRETS?|TOKENS?|PASSWORD|PASSWD|CREDENTIALS?)(?:_|$)")
+#: ``${X:?msg}`` is left out: it stops the script when X is unset, the guard shellcheck recommends before ``/*``.
+_BARE_EXPANSION = re.compile(
+    r"^(?:\$\{(?!(?:HOME|PWD)\})(?!\w+:?\?)[^}]*\}|\$(?!(?:HOME|PWD)\b)\w+|\$\(.*|`.*)(?:/\*?)?$"
+)
+#: A variable named for a credential: a whole word of its name (``GITHUB_TOKEN``, ``AWS_SECRET_ACCESS_KEY``, ``KEY_ID``)
+#: or a name that ends in one of the long words (``PGPASSWORD``, ``GITHUBTOKEN``, ``AWSSECRETKEY``), not a substring
+#: (``MONKEY``, ``TOKENIZER``).
+_SECRET_VAR = re.compile(
+    r"(?i)(?:^|_)(?:API_?KEYS?|KEYS?|SECRETS?|TOKENS?|PASSWORD|PASSWD|CREDENTIALS?)(?:_|$)"
+    r"|(?:PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN|APIKEY|SECRETKEY|ACCESSKEY|PRIVATEKEY|CREDENTIALS?)$"
+)
 _VAR_REF = re.compile(r"\$(?:\{(\w+)[^}]*\}|(\w+))")
 _ENV_READ = re.compile(r"environ|process\.env|\bENV\b|getenv")
 _INTERPRETER_CODE_FLAG = re.compile(r"^-[A-Za-z]*[ceEpr]$")

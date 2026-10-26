@@ -67,7 +67,7 @@ _CLAUDE_TOOLS = {
 }
 #: Tools whose rules match absolute paths.
 _PATH_TOOLS = frozenset({"read", "edit"})
-_SPECIFIER = re.compile(r"^\s*([A-Za-z_][\w.-]*)\s*(?:\((.*)\))?\s*$", re.DOTALL)
+_SPECIFIER = re.compile(r"^\s*([A-Za-z_][\w.*-]*)\s*(?:\((.*)\))?\s*$", re.DOTALL)
 #: Claude Code's rule lists in a ``permissions:`` mapping.
 RULE_LISTS = ("allow", "ask", "deny")
 
@@ -88,21 +88,26 @@ def parse_specifier(spec: str) -> tuple[str, str] | None:
     else:
         tool = _CLAUDE_TOOLS.get(name.lower(), name.lower())
     if tool == "bash" and arg.endswith(":*"):
-        arg = arg[:-2].rstrip() + " *"
+        prefix = arg[:-2].rstrip()
+        arg = prefix + " *" if prefix else "*"
     elif tool == "web_fetch" and arg.lower().startswith("domain:"):
         arg = arg[len("domain:") :].strip()
     return tool, arg or "*"
 
 
 def _anchored(tool: str, pattern: str, action: str) -> str | None:
-    """A path rule as the engine matches it, against absolute paths. A relative pattern (``src/**``, ``.env``) is
-    relative to the project in Claude Code; here it cannot be pinned to one, so an ask or deny matches it in any
-    directory (stricter, never looser) and an allow is refused (None): it would open the same name everywhere."""
-    if tool not in _PATH_TOOLS or pattern.startswith(("/", "~", "$", "*")):
+    """A path rule as the engine matches it, against absolute paths, read as Claude Code reads it: ``//path`` is the
+    absolute ``/path``, ``~/x`` and ``$HOME/x`` are the home, and anything else (``src/**``, ``.env``, ``./x``, and
+    ``/src/**``, which is relative to the settings file there) is relative to a project. A project cannot be pinned
+    here, so an ask or deny matches such a pattern in any directory (stricter, never looser) and an allow is refused
+    (None): it would open the same name everywhere."""
+    if tool not in _PATH_TOOLS or pattern.startswith(("~", "$", "*")):
         return pattern
+    if pattern.startswith("//"):
+        return pattern[1:]
     if action == "allow":
         return None
-    return "*/" + pattern.removeprefix("./")
+    return "*/" + pattern.lstrip("/").removeprefix("./")
 
 
 def from_config(permissions: dict[str, Any], problems: list[str] | None = None) -> list[Rule]:
@@ -132,11 +137,11 @@ def from_config(permissions: dict[str, Any], problems: list[str] | None = None) 
         if tool in RULE_LISTS and isinstance(value, list):
             for n, spec in enumerate(value, 1):
                 parsed = parse_specifier(spec) if isinstance(spec, str) else None
-                anchored = _anchored(parsed[0], expand(parsed[1]), tool) if parsed else None
+                anchored = _anchored(parsed[0], parsed[1], tool) if parsed else None  # before ~ becomes a path
                 if parsed is not None and anchored is not None:
-                    ruleset.append(Rule(tool=parsed[0], pattern=anchored, action=cast(Action, tool)))
+                    ruleset.append(Rule(tool=parsed[0], pattern=expand(anchored), action=cast(Action, tool)))
                 elif tool == "allow":
-                    why = "not a Tool(argument) rule, or a path rule that is not absolute (use /abs, ~/ or $HOME/)"
+                    why = "not a Tool(argument) rule, or a path rule that is not absolute (use //abs, ~/ or $HOME/)"
                     if problems is None:
                         raise ValueError(f"permissions.allow entry {n}: {why}")
                     problems.append(f"permissions.allow entry {n}: {why}; ignored")

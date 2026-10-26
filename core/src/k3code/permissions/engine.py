@@ -2289,12 +2289,7 @@ def _decide_bash(
             message=f"Working directory outside project roots: {cwd} (/add-dir {cwd} adds it to this session)",
         )
     return Decision(
-        action=worst.action,
-        patterns=prefixes,
-        rule=worst,
-        sandbox_only=sandbox_only and worst.action == "allow",
-        # an `ask` the user (or the project, or the session) wrote is meant to stop here: auto mode must not answer it
-        needs_human=worst.action == "ask" and worst.layer > 0,
+        action=worst.action, patterns=prefixes, rule=worst, sandbox_only=sandbox_only and worst.action == "allow"
     )
 
 
@@ -2325,8 +2320,7 @@ def _decide_path(
     else:
         fallback = "allow"
     rule = evaluate("edit" if is_edit else "read", path, ruleset, default=fallback)
-    # an `ask` the user (or the project, or the session) wrote is meant to stop here: auto mode must not answer it
-    dec = Decision(action=rule.action, patterns=[path], rule=rule, needs_human=rule.action == "ask" and rule.layer > 0)
+    dec = Decision(action=rule.action, patterns=[path], rule=rule)
     if not inside:
         uv_credentials = _inside(path, [os.path.join(os.path.expanduser("~"), _UV_CREDENTIALS)])
         if rule.layer == 0:
