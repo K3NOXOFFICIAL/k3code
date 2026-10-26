@@ -121,6 +121,14 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n…[{len(text) - limit} more chars]"
 
 
+def _clip_middle(text: str, limit: int) -> str:
+    """The start and the end of ``text`` with the cut named between them: a long argument hides nothing at its end."""
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return f"{text[:half]}\n…[{len(text) - 2 * half} chars omitted]…\n{text[-half:]}"
+
+
 def user_messages(history: Sequence[Message]) -> list[str]:
     """What the user wrote, oldest first, within :data:`USER_CHARS`. Only ``user`` messages the user typed: tool
     results, assistant text, a compaction summary (written from tool output) and a goal continuation (it carries the
@@ -148,7 +156,7 @@ def call_text(call: ToolCall) -> str:
         body = str(args.get("command", ""))
     else:
         body = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
-    return _clip(body, CALL_CHARS)
+    return _clip_middle(body, CALL_CHARS)
 
 
 def classifier_messages(call: ToolCall, history: Sequence[Message], cwd: Path | str) -> list[Message]:
@@ -211,6 +219,9 @@ async def classify(
     key = cache_key(call, cwd, session_id)
     if cache is not None and (hit := cache.get(key)) is not None:
         return _verdict(*hit, cached=True)
+    if call.name == "bash" and len(str((call.arguments or {}).get("command", ""))) > CALL_CHARS:
+        # the model would see a clipped command: padding must not hide the part that does the harm
+        return _no_verdict("the command is too long to judge", interactive)
     try:
         res = await asyncio.wait_for(
             caller.complete(

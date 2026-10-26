@@ -167,9 +167,22 @@ async def test_long_user_text_and_arguments_are_clipped(tmp_path) -> None:
 
     history = [Message(role="user", content="x" * 50_000) for _ in range(10)]
     caller = FakeCaller(ALLOW)
-    await classifier.classify(caller, _bash("echo " + "y" * 50_000), history, cwd=tmp_path)
+    write = ToolCall(id="c1", name="write", arguments={"path": "notes.txt", "content": "y" * 50_000})
+    await classifier.classify(caller, write, history, cwd=tmp_path)
     body = caller.calls[0][1][-1].content or ""
     assert len(body) < classifier.USER_CHARS + classifier.CALL_CHARS + 2000
+    # the cut sits in the middle and is named: the end of a long argument (here the path, last in sorted order) shows
+    assert "chars omitted" in body and "notes.txt" in body
+
+
+@pytest.mark.parametrize(("interactive", "action"), [(True, "ask"), (False, "deny")])
+async def test_an_over_long_command_is_not_judged_from_a_clipped_view(tmp_path, interactive, action) -> None:
+    from k3code.permissions import classifier
+
+    caller = FakeCaller(ALLOW)
+    padded = "echo " + "y" * (classifier.CALL_CHARS + 1) + "; the part that does the harm"
+    verdict = await classifier.classify(caller, _bash(padded), _history(), cwd=tmp_path, interactive=interactive)
+    assert caller.calls == [] and verdict.action == action and verdict.failed  # no model call, no allow
 
 
 async def test_the_call_goes_to_the_cheap_tier_without_escalation(tmp_path) -> None:

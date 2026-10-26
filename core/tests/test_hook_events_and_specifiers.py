@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from k3code import confio, userhooks
+from k3code.permissions import decide
 from k3code.permissions.rules import Rule, evaluate, from_config, parse_specifier
 from k3code.providers.types import ToolCall
 from k3code.userhooks import EVENTS, Hook, HookRunner
@@ -31,7 +32,12 @@ from test_session_ai import _long_transcript
         ("Edit(src/**)", ("edit", "src/**")),
         ("mcp__github__create_issue", ("mcp__github__create_issue", "*")),
         ("  bash( ls :* )  ", ("bash", "ls *")),
-        ("Frobnicate(x)", None),
+        ("Grep(/src/**)", ("read", "/src/**")),  # the engine decides every read-only file tool as `read`
+        ("WebFetch(domain:example.com)", ("web_fetch", "example.com")),
+        ("WebSearch", ("web_search", "*")),
+        ("mcp__github", ("mcp__github__*", "*")),  # the whole server
+        ("Task", ("task", "*")),  # a tool that does not exist here keeps its own name: harmless, not a deny of all
+        ("Frobnicate(x)", ("frobnicate", "x")),
         ("", None),
         ("Bash(", None),
         ("(git push)", None),
@@ -47,7 +53,7 @@ def test_the_lists_become_rules_in_order() -> None:
         ("bash", "git status *", "allow"),
         ("read", "*", "allow"),
         ("bash", "git push *", "ask"),
-        ("edit", ".env", "deny"),
+        ("edit", "*/.env", "deny"),  # relative: matched in any directory, the engine matches absolute paths
     ]
 
 
@@ -64,28 +70,80 @@ def test_the_longer_pattern_wins_as_ever() -> None:
 
 def test_an_allow_that_cannot_be_read_is_dropped_and_reported() -> None:
     problems: list[str] = []
-    rules = from_config({"allow": ["Bash(ls:*)", "Frobnicate(x)"]}, problems)
+    rules = from_config({"allow": ["Bash(ls:*)", "(git push)"]}, problems)
     assert [(r.pattern, r.action) for r in rules] == [("ls *", "allow")]  # a dropped allow opens nothing
-    assert len(problems) == 1 and "allow entry 2" in problems[0] and "Frobnicate" not in problems[0]
+    assert len(problems) == 1 and "allow entry 2" in problems[0] and "git push" not in problems[0]
 
 
 @pytest.mark.parametrize("action", ["ask", "deny"])
 def test_an_ask_or_deny_that_cannot_be_read_stops_everything(action: str) -> None:
     problems: list[str] = []
-    rules = from_config({action: ["Frobnicate(x)"]}, problems)
+    rules = from_config({action: ["(git push)"]}, problems)
     assert rules == [Rule("*", "*", "deny")] and problems  # what it meant to stop is unknown: fail closed
     assert evaluate("bash", "ls", rules).action == "deny"
 
 
 def test_without_a_problem_list_an_unreadable_entry_raises() -> None:
     with pytest.raises(ValueError, match="allow entry 1"):
-        from_config({"allow": ["Frobnicate(x)"]})
+        from_config({"allow": ["(git push)"]})
 
 
 def test_config_validation_accepts_the_lists_and_rejects_a_bad_one() -> None:
     confio.validate({"permissions": {"allow": ["Bash(ls:*)"], "deny": ["Read(.env)"]}})
     with pytest.raises(ValueError):
-        confio.validate({"permissions": {"deny": ["Frobnicate(x)"]}})
+        confio.validate({"permissions": {"deny": ["(git push)"]}})
+
+
+def test_a_tool_that_does_not_exist_here_does_not_deny_everything() -> None:
+    """A Claude Code settings file denies `Task` or `TodoWrite`; that must not brick every read and command."""
+    rules = from_config({"deny": ["Task", "TodoWrite", "Agent(reviewer)"]})
+    assert evaluate("bash", "ls", rules).action != "deny" and evaluate("read", "/p/a.py", rules).action != "deny"
+    assert evaluate("task", "x", rules).action == "deny"
+
+
+def test_a_relative_path_rule_is_matched_in_any_directory_and_never_allowed() -> None:
+    deny = from_config({"deny": ["Edit(src/**)", "Read(.env)"]})
+    assert evaluate("edit", "/proj/src/a.py", deny).action == "deny"
+    assert (
+        evaluate("edit", "/elsewhere/src/b.py", deny).action == "deny"
+    )  # stricter than the project root, never looser
+    assert evaluate("read", "/proj/.env", deny).action == "deny"
+    assert evaluate("edit", "/proj/lib/c.py", deny).action != "deny"
+    problems: list[str] = []
+    assert from_config({"allow": ["Edit(src/**)"]}, problems) == [] and "allow entry 1" in problems[0]
+    absolute = from_config({"allow": ["Edit(/proj/src/**)", "Read(~/notes/**)"]})
+    assert [r.action for r in absolute] == ["allow", "allow"]
+
+
+def test_grep_and_glob_rules_reach_the_read_decision_and_web_rules_the_web_tools(tmp_path) -> None:
+    """The engine decides grep/glob as `read` and the web tools as `web_fetch` / `web_search`: a deny written for the
+    Claude Code name must meet a call of that tool."""
+    rules = from_config({"deny": ["Grep(/secret/**)", "WebFetch(domain:evil.example)"]})
+    assert (
+        decide(
+            mode="default", tool="grep", args={"pattern": "x", "path": "/secret/a"}, cwd=tmp_path, user_rules=rules
+        ).action
+        == "deny"
+    )
+    web = decide(
+        mode="default", tool="web_fetch", args={"url": "https://evil.example/x"}, cwd=tmp_path, user_rules=rules
+    )
+    assert web.action == "deny"
+    ok = decide(
+        mode="default", tool="web_fetch", args={"url": "https://good.example/x"}, cwd=tmp_path, user_rules=rules
+    )
+    assert ok.action != "deny"
+
+
+@pytest.mark.parametrize(("tool", "args"), [("bash", {"command": "git commit -m x"}), ("edit", {"path": "a.txt"})])
+def test_an_ask_rule_you_wrote_is_not_answered_by_auto_mode(tmp_path, tool, args) -> None:
+    """`ask` in your settings means ask: auto mode used to turn it into an allow, like the built-in asks."""
+    rules = from_config({"ask": ["Bash(git commit:*)", "Edit(/**)"]})
+    for mode in ("default", "auto"):
+        d = decide(mode=mode, tool=tool, args=args, cwd=tmp_path, user_rules=rules)
+        assert (d.action, d.needs_human, d.auto_allowed) == ("ask", True, False), mode
+    assert decide(mode="auto", tool=tool, args=args, cwd=tmp_path, user_rules=rules, headless=True).action == "deny"
+    assert decide(mode="yolo", tool=tool, args=args, cwd=tmp_path, user_rules=rules).action == "allow"
 
 
 # --- hook permission decisions

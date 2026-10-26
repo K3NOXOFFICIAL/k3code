@@ -56,15 +56,17 @@ def expand(pattern: str) -> str:
 _CLAUDE_TOOLS = {
     "bash": "bash",
     "read": "read",
+    "grep": "read",  # the engine decides every read-only file tool as `read`
+    "glob": "read",
     "edit": "edit",
     "write": "edit",
     "multiedit": "edit",
     "notebookedit": "edit",
-    "grep": "grep",
-    "glob": "glob",
-    "webfetch": "webfetch",
-    "websearch": "websearch",
+    "webfetch": "web_fetch",
+    "websearch": "web_search",
 }
+#: Tools whose rules match absolute paths.
+_PATH_TOOLS = frozenset({"read", "edit"})
 _SPECIFIER = re.compile(r"^\s*([A-Za-z_][\w.-]*)\s*(?:\((.*)\))?\s*$", re.DOTALL)
 #: Claude Code's rule lists in a ``permissions:`` mapping.
 RULE_LISTS = ("allow", "ask", "deny")
@@ -73,19 +75,34 @@ RULE_LISTS = ("allow", "ask", "deny")
 def parse_specifier(spec: str) -> tuple[str, str] | None:
     """Claude Code's ``Tool(argument)`` as ``(tool, pattern)``: ``Bash(git push:*)`` is ``bash`` with ``git push *``
     (the ``:*`` suffix is a prefix match), ``Bash(npm run test)`` that exact command, ``Bash`` or ``Bash(*)`` every
-    command, ``Read(~/.zshrc)`` / ``Edit(src/**)`` the path pattern, and ``mcp__server__tool`` that tool. None when it
-    names a tool this does not know or is not a specifier."""
+    command, ``Read(~/.zshrc)`` / ``Edit(src/**)`` the path pattern, ``WebFetch(domain:example.com)`` that host,
+    ``mcp__server__tool`` that tool and ``mcp__server`` all of the server's. A tool this does not know (``Task``,
+    ``TodoWrite``) keeps its own lower-cased name: a rule for a tool that does not exist here is harmless, and the
+    same rule would otherwise be a deny of everything. None when it is not a specifier at all."""
     m = _SPECIFIER.match(spec)
     if not m:
         return None
-    name, arg = m.group(1), m.group(2)
-    tool = name if name.startswith("mcp__") else _CLAUDE_TOOLS.get(name.lower())
-    if tool is None:
-        return None
-    arg = (arg or "").strip()
+    name, arg = m.group(1), (m.group(2) or "").strip()
+    if name.startswith("mcp__"):
+        tool = name if name.count("__") > 1 else name + "__*"
+    else:
+        tool = _CLAUDE_TOOLS.get(name.lower(), name.lower())
     if tool == "bash" and arg.endswith(":*"):
         arg = arg[:-2].rstrip() + " *"
+    elif tool == "web_fetch" and arg.lower().startswith("domain:"):
+        arg = arg[len("domain:") :].strip()
     return tool, arg or "*"
+
+
+def _anchored(tool: str, pattern: str, action: str) -> str | None:
+    """A path rule as the engine matches it, against absolute paths. A relative pattern (``src/**``, ``.env``) is
+    relative to the project in Claude Code; here it cannot be pinned to one, so an ask or deny matches it in any
+    directory (stricter, never looser) and an allow is refused (None): it would open the same name everywhere."""
+    if tool not in _PATH_TOOLS or pattern.startswith(("/", "~", "$", "*")):
+        return pattern
+    if action == "allow":
+        return None
+    return "*/" + pattern.removeprefix("./")
 
 
 def from_config(permissions: dict[str, Any], problems: list[str] | None = None) -> list[Rule]:
@@ -115,14 +132,16 @@ def from_config(permissions: dict[str, Any], problems: list[str] | None = None) 
         if tool in RULE_LISTS and isinstance(value, list):
             for n, spec in enumerate(value, 1):
                 parsed = parse_specifier(spec) if isinstance(spec, str) else None
-                if parsed is not None:
-                    ruleset.append(Rule(tool=parsed[0], pattern=expand(parsed[1]), action=cast(Action, tool)))
+                anchored = _anchored(parsed[0], expand(parsed[1]), tool) if parsed else None
+                if parsed is not None and anchored is not None:
+                    ruleset.append(Rule(tool=parsed[0], pattern=anchored, action=cast(Action, tool)))
                 elif tool == "allow":
+                    why = "not a Tool(argument) rule, or a path rule that is not absolute (use /abs, ~/ or $HOME/)"
                     if problems is None:
-                        raise ValueError(f"permissions.allow entry {n}: not a Tool(argument) rule of a known tool")
-                    problems.append(f"permissions.allow entry {n}: not a Tool(argument) rule; ignored")
+                        raise ValueError(f"permissions.allow entry {n}: {why}")
+                    problems.append(f"permissions.allow entry {n}: {why}; ignored")
                 else:
-                    invalid("*", "*", f"{tool} entry {n}", "not a Tool(argument) rule of a known tool")
+                    invalid("*", "*", f"{tool} entry {n}", "not a Tool(argument) rule")
             continue
         entries = {"*": value} if isinstance(value, str) else value
         if not isinstance(entries, dict):
