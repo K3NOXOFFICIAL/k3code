@@ -75,6 +75,20 @@ async def test_extending_hardline_is_allowed(tmp_path):
     assert "updated" in await uc.run(ctx, "s", "block bar", path)
 
 
+@pytest.mark.parametrize("spec", ["Bash", "Bash(*)", "Bash(:*)", "bash"])
+def test_the_list_form_of_allow_every_command_is_refused_like_the_mapping_form(spec):
+    with pytest.raises(uc.PatchRejected, match="every bash command"):
+        uc.check_patch({"permissions": {"allow": ["Read", spec]}}, {})
+    uc.check_patch({"permissions": {"allow": ["Bash(git status:*)", "Read(//tmp/x)"]}}, {})  # a narrow one is fine
+
+
+def test_a_merge_patch_null_cannot_remove_the_classifier_setting():
+    for was in (True, {"enabled": True}):
+        with pytest.raises(uc.PatchRejected, match="classifier"):
+            uc.check_patch({"permissions": {"classifier": None}}, {"permissions": {"classifier": was}})
+    uc.check_patch({"permissions": {"classifier": None}}, {})  # nothing to remove
+
+
 async def test_invalid_value_and_garbage_reply(tmp_path):
     path = tmp_path / "config.yaml"
     assert "invalid" in await uc.run(Ctx('{"max_turns": "lots"}'), "s", "x", path)

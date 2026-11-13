@@ -14,7 +14,11 @@ DEFAULTS: dict[str, Any] = {
     "stale_days": 30,
     "skill_cards_per_week": 3,  # new skill-save cards a project gets per week from session reviews
     "auto_gotchas": True,  # a recurring tool failure whose retry worked is learned as a gotcha without a card
-    "optimizer": {"enabled": False, "ab_sessions": 20, "min_sessions": 5},
+    # enabled: gate-approved candidates are applied by themselves as A/B experiments; off, they are only proposed
+    # (the weekly analysis runs either way). experiment_max_days: an experiment still active after that long is rolled
+    # back as expired. prices: {model: {"in": USD per 1M input tokens, "out": ..., "cache_read": ...}} so the A/B can
+    # judge cost in dollars (a model without a price keeps the comparison in tokens)
+    "optimizer": {"enabled": False, "ab_sessions": 20, "min_sessions": 5, "experiment_max_days": 14, "prices": {}},
 }
 
 

@@ -349,6 +349,8 @@ export interface SessionSaveResponse {
 }
 
 export interface SessionUndoResponse {
+  // the files the undone turns changed and were rewound, and anything left alone (core k3code.checkpoints)
+  note?: string;
   removed?: number;
 }
 

@@ -39,6 +39,7 @@ class FailoverReason(enum.Enum):
     bad_request = "bad_request"  # malformed request/model — fail over, no retry
     ssl_cert = "ssl_cert"  # certificate does not verify (missing CA, proxy) — fail over, never park
     unknown = "unknown"  # unclassifiable — retry with backoff, then fail over
+    content_filter = "content_filter"  # the answer was filtered or refused — try the next entry, no cooldown
 
 
 #: Reasons for which the router retries the same entry before failing over.
@@ -58,7 +59,13 @@ RETRYABLE_REASONS = frozenset(
 #: rather than aborting the walk. ``ssl_cert`` is the same: another entry may not
 #: sit behind the proxy or CA bundle that broke this one.
 IMMEDIATE_FAILOVER_REASONS = frozenset(
-    {FailoverReason.auth, FailoverReason.quota, FailoverReason.bad_request, FailoverReason.ssl_cert}
+    {
+        FailoverReason.auth,
+        FailoverReason.quota,
+        FailoverReason.bad_request,
+        FailoverReason.ssl_cert,
+        FailoverReason.content_filter,
+    }
 )
 
 #: What the user can do about a certificate failure; carried on :attr:`ClassifiedError.hint`.
@@ -101,6 +108,13 @@ class ClassifiedError:
     #: What the user can do about this failure (empty when nothing specific applies).
     hint: str = ""
     error_context: dict[str, Any] = field(default_factory=dict)
+    #: context_overflow only, parsed from the error text when it names them: the entry's window, the prompt's
+    #: tokens, and the total (prompt + max_tokens) the request asked for. The router clamps max_tokens with them.
+    context_limit: int | None = None
+    prompt_tokens: int | None = None
+    requested_tokens: int | None = None
+    #: bad_request only: the endpoint has no model under this id (the router cools that model down)
+    model_missing: bool = False
 
     @property
     def retryable(self) -> bool:
@@ -273,6 +287,19 @@ _OUTPUT_CAP_PATTERNS = ("max_tokens", "max_completion_tokens", "output tokens", 
 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded", "max_tokens_exceeded"})
 
+# Prompt plus the requested output over the window: "input length and `max_tokens` exceed context limit: 150000 +
+# 64000 > 200000" (Anthropic). It names max_tokens, but a smaller max_tokens is the fix when the prompt itself fits.
+_INPUT_PLUS_OUTPUT_PATTERNS = ("exceed context limit",)
+_N = r"(\d[\d,_]*)"
+_LIMIT_RES = (
+    re.compile(rf"exceed context limit:\s*{_N}\s*\+\s*{_N}\s*>\s*{_N}"),  # prompt, max_tokens, window
+    re.compile(rf"prompt is too long:\s*{_N}\s*tokens\s*>\s*{_N}"),  # prompt, window
+)
+_WINDOW_RE = re.compile(rf"maximum context length is\s*{_N}")
+_REQUESTED_RE = re.compile(rf"you requested\s*{_N}")
+_COMPLETION_RE = re.compile(rf"{_N}\s*in the completion")
+_INPUT_RE = re.compile(rf"(?:your request has|you requested)\s*{_N}\s*input tokens")
+
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model",
     "invalid model",
@@ -286,6 +313,8 @@ _MODEL_NOT_FOUND_PATTERNS = (
 )
 
 _MODEL_NOT_FOUND_ERROR_CODES = frozenset({"model_not_found", "model_not_available", "invalid_model"})
+#: Phrases of _MODEL_NOT_FOUND_PATTERNS that name a model only in context (see _model_missing).
+_BROAD_NOT_FOUND = ("does not exist", "invalid model")
 
 # Deterministic rejections of the request shape: identical on every retry.
 _REQUEST_VALIDATION_PATTERNS = (
@@ -593,6 +622,8 @@ def _status_400(c: _Ctx) -> FailoverReason:
         return _R.bad_request
     if code in {"unknown_parameter", "unsupported_parameter"}:
         return _R.bad_request
+    if any(p in msg for p in _INPUT_PLUS_OUTPUT_PATTERNS):
+        return _R.context_overflow
     if code not in _CONTEXT_OVERFLOW_ERROR_CODES and any(p in msg for p in _OUTPUT_CAP_PATTERNS):
         return _R.bad_request
     # A malformed message array is not overflow: the input can be tiny and
@@ -754,6 +785,7 @@ def classify_api_error(
     retry_after = None
     if reason in (_R.rate_limit, _R.quota, _R.server):
         retry_after = _reset_seconds(c)
+    limit, prompt, requested = _context_numbers(c.msg) if reason is _R.context_overflow else (None, None, None)
     return ClassifiedError(
         reason=reason,
         status_code=status_code,
@@ -762,7 +794,48 @@ def classify_api_error(
         message=_extract_message(error, body),
         retry_after=retry_after,
         hint=_hint_for(reason, c),
+        context_limit=limit,
+        prompt_tokens=prompt,
+        requested_tokens=requested,
+        model_missing=reason is _R.bad_request and _model_missing(c),
     )
+
+
+def _model_missing(c: _Ctx) -> bool:
+    """Whether a bad_request says the model id is unknown (not that the request was malformed). "No endpoints that
+    support tool use" is left out: the same model still answers a call without tools."""
+    if c.code in _MODEL_NOT_FOUND_ERROR_CODES:
+        return True
+    specific = (*_MODEL_NOT_FOUND_PATTERNS, *_UNKNOWN_MODEL_VENDOR_PATTERNS)
+    if any(p in c.msg for p in specific if "tool use" not in p and p not in _BROAD_NOT_FOUND):
+        return True
+    # "does not exist" and "invalid model" also begin errors about a file id, a tool call id, a parameter or an account:
+    # they name a missing model only on a 404, or when the sentence says the model (or this model id) does not exist
+    if not any(p in c.msg for p in _BROAD_NOT_FOUND):
+        return False
+    return (
+        c.status_code == 404
+        or bool(re.search(r"\bmodel\b[^.\n]{0,60}\bdoes not exist\b|\bdoes not exist\b[^.\n]{0,60}\bmodel\b", c.msg))
+        or bool(c.model and c.model.lower() in c.msg and "does not exist" in c.msg)
+    )
+
+
+def _context_numbers(msg: str) -> tuple[int | None, int | None, int | None]:
+    """(window, prompt tokens, requested total) named by an overflow message; None for each one it does not name."""
+
+    def num(match: re.Match[str] | None, group: int = 1) -> int | None:
+        return int(match.group(group).replace(",", "").replace("_", "")) if match else None
+
+    for rx in _LIMIT_RES:
+        if m := rx.search(msg):
+            prompt, last = num(m, 1), m.lastindex or 1
+            requested = (prompt or 0) + (num(m, 2) or 0) if last == 3 else None
+            return num(m, last), prompt, requested
+    limit, requested = num(_WINDOW_RE.search(msg)), num(_REQUESTED_RE.search(msg))
+    prompt = num(_INPUT_RE.search(msg))
+    if prompt is None and requested is not None and (completion := num(_COMPLETION_RE.search(msg))) is not None:
+        prompt = requested - completion  # "(130000 in the messages, 10000 in the completion)"
+    return limit, prompt, requested
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

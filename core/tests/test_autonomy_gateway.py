@@ -84,6 +84,11 @@ def k3home(tmp: Path) -> Path:
 
 def make(tmp: Path, monkeypatch, steps: list[dict], mode: str = "auto", **cfg: Any):
     monkeypatch.setenv("K3CODE_HOME", str(k3home(tmp)))
+    # The scripts answer the turn's own model calls. Auto mode's permission classifier (on whenever a cheap tier is
+    # configured, as here) would add one more call per command and read its verdict from the script; it has its own
+    # tests (test_permission_classifier.py).
+    k3home(tmp).mkdir(parents=True, exist_ok=True)
+    (k3home(tmp) / "config.yaml").write_text("permissions:\n  classifier: false\n")
     script = tmp / "script.json"
     script.write_text(json.dumps(steps))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))

@@ -84,6 +84,16 @@ def task_anchor(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
+def _focus_note(focus: str) -> str:
+    focus = " ".join(focus.split())[:300]
+    if not focus:
+        return ""
+    return (
+        f"\n\nThe user asked for this summary to focus on: {focus}\n"
+        "Keep what bears on that in detail (exact paths, names, decisions); compress the rest harder."
+    )
+
+
 async def compact_messages(
     caller: Any,
     messages: list[dict[str, Any]],
@@ -91,11 +101,13 @@ async def compact_messages(
     keep: int = 6,
     session_id: str = "",
     max_input_chars: int = COMPACT_INPUT_CHARS,
+    focus: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
     """Summarize the old part of the transcript. Returns (new messages, number of messages folded).
 
     The summary model reads the head and the tail of the folded part (it used to read only the last characters, so
-    the task statement was lost), and the first task statement is kept verbatim ahead of the summary.
+    the task statement was lost), and the first task statement is kept verbatim ahead of the summary. ``focus`` (the
+    text after ``/compact``) names what the summary should keep in detail; empty leaves the prompt as it was.
     """
     cut = split_for_compaction(messages, keep)
     old = [m for m in messages[:cut] if m.get("role") != "system"]
@@ -107,7 +119,7 @@ async def compact_messages(
     res = await caller.complete(
         TaskKind.COMPACTION,
         [
-            Message(role="system", content=SUMMARY_SYSTEM),
+            Message(role="system", content=SUMMARY_SYSTEM + _focus_note(focus)),
             Message(role="user", content=text),
         ],
         session_id=session_id,

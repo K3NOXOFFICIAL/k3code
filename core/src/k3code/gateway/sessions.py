@@ -230,16 +230,25 @@ class SessionStore:
         "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview, archived_at"
     )
 
+    @staticmethod
+    def _list_where(include_automation: bool, archived: bool | None) -> str:
+        terms = [] if include_automation else ["COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"]
+        if archived is not None:
+            terms.append("archived_at IS NOT NULL" if archived else "archived_at IS NULL")
+        return " WHERE " + " AND ".join(terms) if terms else ""
+
+    def count(self, *, include_automation: bool = True, archived: bool | None = False) -> int:
+        """How many sessions :meth:`list` with the same filters walks through."""
+        where = self._list_where(include_automation, archived)
+        return self._db.execute(f"SELECT COUNT(*) FROM sessions{where}").fetchone()[0]  # noqa: S608
+
     def list(
         self, *, limit: int = 50, include_automation: bool = True, offset: int = 0, archived: bool | None = False
     ) -> list[SessionSummary]:
         """The newest sessions as summaries. Reads columns only: a transcript can be huge and is never parsed.
 
         ``archived``: False (default) leaves archived sessions out, True lists only them, None both."""
-        terms = [] if include_automation else ["COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"]
-        if archived is not None:
-            terms.append("archived_at IS NOT NULL" if archived else "archived_at IS NULL")
-        where = " WHERE " + " AND ".join(terms) if terms else ""
+        where = self._list_where(include_automation, archived)
         rows = self._db.execute(
             f"SELECT {self._SUMMARY_COLUMNS} FROM sessions{where}"  # noqa: S608
             " ORDER BY updated_at DESC LIMIT ? OFFSET ?",

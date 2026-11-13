@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from k3code import trust
-from k3code.paths import ensure_private_dir, ensure_state_dir
+from k3code.paths import ensure_private_dir, ensure_state_dir, private_file
 
 from .engine import Decision, PermissionMode, decide
 from .rules import Rule, from_config
@@ -96,6 +96,7 @@ def parse_permissions(text: str | None) -> tuple[list[Rule], list[str], list[str
     if not isinstance(section, dict):
         return _unreadable("permissions: is not a mapping")
     section = dict(section)
+    section.pop("classifier", None)  # auto mode's classifier settings (permissions.classifier), not a tool's rules
     problems: list[str] = []
     hard = _hardline(section.pop("hardline", None), problems)
     return from_config(section, problems), hard, problems
@@ -180,6 +181,62 @@ def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+#: Where an audit row's decision came from (see log_audit)
+AUDIT_SOURCES = frozenset({"engine", "rule", "hardline", "classifier", "hook", "fail_closed", "approval"})
+_AUDIT_ARGS_CHARS = 200
+_AUDIT_REASON_CHARS = 300
+
+
+def _args_summary(tool: str, args: dict[str, Any]) -> str:
+    if tool == "bash":
+        text = str(args.get("command", ""))
+    elif "path" in args:
+        text = str(args.get("path", ""))
+    elif "url" in args:
+        text = str(args.get("url", ""))
+    else:
+        text = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+    return text[:_AUDIT_ARGS_CHARS]
+
+
+def log_audit(
+    *,
+    session: str,
+    tool: str,
+    mode: str,
+    action: str,
+    source: str,
+    reason: str,
+    args: dict[str, Any],
+    home: Path | None = None,
+) -> None:
+    """Append one permission outcome of a tool call to ``$K3CODE_HOME/permission_audit.jsonl``: what was decided,
+    by what (:data:`AUDIT_SOURCES`) and why, with a short summary of the arguments. Credentials in the summary and the
+    reason are masked (redact.scrub_text). Never raises: the audit trail must not fail the call it records."""
+    try:
+        from k3code.redact import scrub_text
+
+        path = (home or _home()) / "permission_audit.jsonl"
+        ensure_private_dir(path.parent)
+        if path.is_file() and path.stat().st_size > _DECISIONS_MAX_BYTES:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            path.write_text("\n".join(lines[len(lines) // 2 :]) + "\n", encoding="utf-8")
+        row = {
+            "ts": time.time(),
+            "session": session,
+            "tool": tool,
+            "mode": mode,
+            "action": action,
+            "source": source,
+            "reason": scrub_text(reason or "", opaque=True)[:_AUDIT_REASON_CHARS],
+            "args": scrub_text(_args_summary(tool, args), opaque=True),
+        }
+        with private_file(path).open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.debug("permission audit row not written", exc_info=True)
+
+
 #: session_rules is append-only (every "always"/"session" approval adds one); past this many rules every
 #: permission decision pays a longer linear scan, so exact duplicates go and the oldest overflow is dropped.
 _SESSION_RULES_MAX = 200
@@ -205,6 +262,11 @@ class PermissionState:
     #: Set by reload(). decide() reloads first while it is unset: a loop built without a reload (`k3code -p`, the
     #: REPL, a sub-agent) applied none of the configured deny rules and hardline patterns.
     loaded: bool = field(default=False, init=False, repr=False)
+    #: Auto mode's classifier verdicts for this session (permissions.classifier.classify): the gateway builds a loop
+    #: per turn and tier, the session's state outlives them.
+    classifier_cache: dict[tuple[str, str, str, str, str], tuple[str, str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""

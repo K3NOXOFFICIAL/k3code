@@ -234,7 +234,11 @@ class Settings(BaseModel):
     # retry_forever: never abort on transient/infra errors; park with capped
     # backoff and retry forever (forces max_wait=None).
     reliability: dict[str, Any] = Field(default_factory=dict)
-    # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex]}
+    # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex],
+    #               classifier: {enabled: bool, timeout_s: 8}}
+    # classifier: in auto mode a cheap-tier model judges each call only the mode allowed (k3code.permissions.
+    # classifier); on by default when a provider names a cheap model (tiers.cheap / models.cheap), read from the
+    # user's config only (a project cannot turn it off). No verdict in timeout_s: ask a person, or deny unattended.
     permissions: dict[str, Any] = Field(default_factory=dict)
     output_style: str = "default"
     display: DisplayConfig = Field(default_factory=DisplayConfig)

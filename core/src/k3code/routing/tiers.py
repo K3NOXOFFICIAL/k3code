@@ -118,10 +118,18 @@ def active_provider(config: Any, chosen: str = "") -> str:
     return names[0] if names else ""
 
 
-def router_options(config: Any) -> dict[str, float]:
-    """``router:`` settings (max_inline_wait, quota_cooldown) as Router keyword arguments."""
+def router_options(config: Any) -> dict[str, Any]:
+    """``router:`` settings (max_inline_wait, quota_cooldown) and the ``models.<id>.context_window`` entries as
+    Router keyword arguments."""
     raw = getattr(config, "router", None) or {}
-    return {k: float(raw[k]) for k in ("max_inline_wait", "quota_cooldown") if k in raw}
+    options: dict[str, Any] = {k: float(raw[k]) for k in ("max_inline_wait", "quota_cooldown") if k in raw}
+    models = getattr(config, "models", None) or {}
+    windows = {
+        m: int(e["context_window"]) for m, e in models.items() if isinstance(e, dict) and e.get("context_window")
+    }
+    if windows:
+        options["context_windows"] = windows
+    return options
 
 
 class TierRouters:

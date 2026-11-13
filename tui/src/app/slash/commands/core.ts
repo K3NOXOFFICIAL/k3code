@@ -879,7 +879,8 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: "undo last exchange",
+    aliases: ["rewind"],
+    help: "undo last exchange and the agent's file edits in it",
     name: "undo",
     run: (_arg, ctx) => {
       if (!ctx.sid) {
@@ -895,6 +896,10 @@ export const coreCommands: SlashCommand[] = [
                 ctx.transcript.trimLastExchange(prev),
               );
               ctx.transcript.sys(`undid ${r.removed} messages`);
+
+              if (r.note) {
+                ctx.transcript.sys(r.note);
+              }
             } else {
               ctx.transcript.sys("nothing to undo");
             }
@@ -928,6 +933,11 @@ export const coreCommands: SlashCommand[] = [
             ctx.transcript.setHistoryItems((prev: Msg[]) =>
               ctx.transcript.trimLastExchange(prev),
             );
+
+            if (r.note) {
+              ctx.transcript.sys(r.note);
+            }
+
             ctx.transcript.resend(last);
           }),
         );

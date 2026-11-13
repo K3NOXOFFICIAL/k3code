@@ -10,11 +10,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from k3code import context_budget
+from k3code import checkpoints, context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.engine import home_read_only
-from k3code.permissions.state import PermissionState
+from k3code.permissions.state import PermissionState, log_audit
 from k3code.providers.types import INVALID_TOOL_CALL, SYSTEM_CACHE_KEY, Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
@@ -47,6 +47,8 @@ UNATTENDED_BWRAP_REFUSAL = "bubblewrap is unusable here: unattended bash is refu
 PROJECT_ROOT_HINT = (
     "Unattended work needs a project directory as its root: start it there; read, glob and grep still work here"
 )
+#: Heads the deny a permission check that raised gives (fail closed: never a crash of the turn, never an allow)
+PERMISSION_CHECK_FAILED = "Permission check failed"
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +124,15 @@ class AgentLoop:
         #: The decision model (k3code.context_select), when one is configured: (request, candidates) → {tool call id:
         #: "keep" | note}. It is asked before a batch of old results is elided; None = plain elision.
         self.decide_context: Callable[[list[Message], list[Message]], Awaitable[dict[str, str]]] | None = None
+        #: Auto mode's permission classifier (k3code.permissions.classifier), when one is configured: (call, history,
+        #: cwd=, interactive=) → verdict on a call only auto mode allowed. None = auto mode allows it, as before.
+        self.classify_call: Callable[..., Awaitable[Any]] | None = None
         #: share of the context window past which old tool results are elided
         self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
+        #: real tokens per estimated token, learned from the provider's reports; the gateway shares a session's own
+        self.calibration = context_budget.TokenCalibration()
+        self._last_estimate = 0  # estimated size of the request last sent (paired with the provider's count of it)
+        self._max_tokens = 8192
         self._reads: dict[tuple[Any, ...], tuple[int, str, int, int, int]] = {}  # (step, call id, first, last, wanted)
         self._step = 0
         #: What this loop's model has seen of each file; write and edit refuse one it has not, or that changed since.
@@ -182,6 +191,8 @@ class AgentLoop:
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
         self.on_checkpoint: Callable[[], None] | None = None
+        #: the gateway's turn: write/edit keep what a file held before they change it, for /undo (k3code.checkpoints)
+        self.checkpoint: checkpoints.Turn | None = None
         #: awaited once the user's prompt joined the conversation, before the first model call (the gateway persists)
         self.on_turn_start: Callable[[], Awaitable[None]] | None = None
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
@@ -260,6 +271,7 @@ class AgentLoop:
         self.reliability.begin_turn()
         self._tell_home_started()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
+        self._max_tokens = max_tokens
         self._notes, self._notes_at = {}, {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
@@ -516,7 +528,34 @@ class AgentLoop:
         norm = normalize_arguments(tc.name, spec.parameters, tc.arguments)  # decided as _execute_tool decides it
         if norm.error is not None or invalid_arguments(tc.name, spec.parameters, norm.args) is not None:
             return True  # answered with an error before any permission check
-        return self.permissions.decide(tc.name, norm.args, headless=self.headless).action == "allow"
+        decision = self._decide(tc.name, norm.args)
+        if decision.action != "allow":
+            return False
+        # a call that may still be asked about (the classifier's no-verdict, a PreToolUse hook's `ask`) must not run
+        # in a parallel batch: each would raise its own approval prompt and the screen holds one
+        if decision.auto_allowed and self.classify_call is not None:
+            return False
+        return not (self.hooks and self.hooks.for_event("PreToolUse", tc.name))
+
+    def _decide(self, tool: str, args: dict[str, Any]) -> Decision:
+        """The permission engine's decision; a check that raises is a deny (fail closed), never a crash or an allow."""
+        try:
+            return self.permissions.decide(tool, args, headless=self.headless)
+        except Exception as e:  # noqa: BLE001 - see the docstring
+            logger.exception("permission check of %s failed", tool)
+            return Decision(action="deny", message=f"{PERMISSION_CHECK_FAILED}: {type(e).__name__}: {str(e)[:200]}")
+
+    def _audit(self, tool: str, args: dict[str, Any], action: str, source: str, reason: str | None = None) -> None:
+        """One permission_audit.jsonl row for this call's outcome (state.log_audit never raises)."""
+        log_audit(
+            session=self.session_id,
+            tool=tool,
+            mode=str(getattr(getattr(self.permissions, "mode", None), "value", "")),
+            action=action,
+            source=source,
+            reason=reason or "",
+            args=args,
+        )
 
     async def _execute_tool(self, tool_call: ToolCall, *, step: int | None = None) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
@@ -551,16 +590,37 @@ class AgentLoop:
         if tool_call.name == "bash":
             # parsing a long command line takes a while (linear, about a second per 200 KB of simple commands): off the
             # event loop, so the daemon's other sessions, its socket and heartbeats keep running meanwhile (K3NOX-691)
-            decision = await asyncio.to_thread(self.permissions.decide, tool_call.name, args, headless=self.headless)
+            decision = await asyncio.to_thread(self._decide, tool_call.name, args)
         else:
-            decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
+            decision = self._decide(tool_call.name, args)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
-            return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+            error = decision.message or f"Permission denied: {tool_call.name}"
+            self._audit(tool_call.name, args, "deny", _source(decision), error)
+            return {"error": error}
         if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
-            return {"error": f"Permission denied (unattended run): {decision.message}"}
+            error = f"Permission denied (unattended run): {decision.message}"
+            self._audit(tool_call.name, args, "deny", _source(decision), error)
+            return {"error": error}
+        # Only what auto mode alone allowed goes to the classifier: it lets the call run, blocks it, or (no verdict)
+        # hands it to a person, whom no hook and no mode may answer for; with nobody there it is a deny.
+        verdict = None
+        if decision.auto_allowed and self.classify_call is not None:
+            verdict = await self.classify_call(
+                ToolCall(id=tool_call.id, name=tool_call.name, arguments=args),
+                self.turn_messages,
+                cwd=self.cwd,
+                interactive=not (self.headless or self.background or self.unattended),
+            )
+            if verdict.action == "deny":
+                self._audit(tool_call.name, args, "deny", "classifier", verdict.reason)
+                return {"error": verdict.reason}
+            if verdict.action == "ask":
+                decision = replace(decision, action="ask", needs_human=True, auto_allowed=False, message=verdict.reason)
         # before the prompt too: approving bash the sandbox refuses runs nothing (the probe runs a subprocess)
         if tool_call.name == "bash" and (refused := await asyncio.to_thread(self._unattended_refusal)) is not None:
-            return {"error": self._bash_refusal(refused)}
+            error = self._bash_refusal(refused)
+            self._audit(tool_call.name, args, "deny", "engine", error)
+            return {"error": error}
         # the bwrap probe behind _home_rooted/_bwrap_unusable runs a subprocess: off the event loop, like _sandbox_argv
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         no_bwrap = tool_call.name == "bash" and not home_rooted and await asyncio.to_thread(self._bwrap_unusable)
@@ -626,18 +686,39 @@ class AgentLoop:
             self._tell_unsandboxed()  # yolo (the first branch took the rest) at a refused root: runs on the host, told
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
-            return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
+            error = f"Blocked by a PreToolUse hook: {pre.reason}"
+            self._audit(tool_call.name, args, "deny", "hook", error)
+            return {"error": error}
+        if pre.ask and decision.action == "allow":
+            # a hook asked for a person: even where the mode, a rule or the classifier would have let the call run
+            decision = replace(
+                decision, action="ask", auto_allowed=False, message="a PreToolUse hook asked for your approval"
+            )
+            verdict = None
         # a hook's "approve" answers the prompt, but never one only a human may answer
         if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
                 why = f": {decision.message}" if decision.message else ""
-                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter){why}"}
+                error = f"Permission denied: {tool_call.name} requires approval (no prompter){why}"
+                self._audit(tool_call.name, args, "deny", _source(decision), error)
+                return {"error": error}
             answer = await self.approval_callback(tool_call.name, args, decision)
             if not answer.allowed:
                 what = _preview(tool_call.name, args)
-                return {"error": f"User denied: {what}" + (f" — {answer.reason}" if answer.reason else "")}
-        elif decision.auto_allowed and self.on_auto_allow is not None:
-            self.on_auto_allow(tool_call.name, args, decision)
+                error = f"User denied: {what}" + (f" — {answer.reason}" if answer.reason else "")
+                self._audit(tool_call.name, args, "deny", "approval", error)
+                return {"error": error}
+            self._audit(tool_call.name, args, "allow", "approval", f"approved ({getattr(answer, 'choice', 'once')})")
+        elif decision.action == "ask":
+            self._audit(tool_call.name, args, "allow", "hook", "approved by a PreToolUse hook")
+        else:
+            if verdict is not None:
+                self._audit(tool_call.name, args, "allow", "classifier", verdict.reason)
+            else:
+                why = "only auto mode allowed it" if decision.auto_allowed else decision.message
+                self._audit(tool_call.name, args, "allow", _source(decision), why)
+            if decision.auto_allowed and self.on_auto_allow is not None:
+                self.on_auto_allow(tool_call.name, args, decision)
 
         read_key = self._read_key(args) if tool_call.name == "read" else None
         if read_key is not None and (seen := self._reads.get(read_key)) and seen[1] not in self._elided:
@@ -661,6 +742,7 @@ class AgentLoop:
             return {"error": stale}
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
+        checkpoint_note = None
         try:
             if tool_call.name == "bash":
                 # A background job outlives this call: the handler returns as soon as the job has started, so the
@@ -698,10 +780,20 @@ class AgentLoop:
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
+                # what write/edit is about to change, kept for /undo once the change is made
+                prior = None
+                if (
+                    self.checkpoint is not None
+                    and tool_call.name in FILE_TOOLS
+                    and (target := self._tool_path(args)) is not None
+                ):
+                    prior = await asyncio.to_thread(checkpoints.capture, target)
                 # grep and glob judge a search outside the roots by the session's roots (see search_withheld)
                 roots = [str(self.cwd), *self.permissions.add_dirs]
                 with file_guard(self._file_guard(tool_call.name, args, decision)), search_roots(roots):
                     result = await handler(args, cwd=self.cwd)
+                if prior is not None and self.checkpoint is not None and result.get("ok"):
+                    checkpoint_note = await asyncio.to_thread(self.checkpoint.record, prior)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": self._bash_refusal(exc)}
         except Exception as e:
@@ -730,6 +822,8 @@ class AgentLoop:
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
         if feedback:  # the tool already ran: the hook's word joins its result for the model
             result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
+        if checkpoint_note:  # never silent: this change is one /undo cannot take back
+            result = {**result, "content": f"{format_tool_result(result)}\n\n[checkpoint] {checkpoint_note}"}
         return result
 
     def _file_guard(self, tool: str, args: dict[str, Any], decision: Decision) -> Guard | None:
@@ -742,7 +836,7 @@ class AgentLoop:
         approved = decision.action == "ask"
 
         def guard(real: str) -> bool:
-            now = self.permissions.decide(tool, {**args, "path": real}, headless=self.headless).action
+            now = self._decide(tool, {**args, "path": real}).action
             return now != "deny" if approved else now == "allow"
 
         return guard
@@ -802,12 +896,21 @@ class AgentLoop:
             else wire
         )
         overhead = context_budget.overhead_tokens(self.system_prompt, specs)
-        threshold = self.context_window * self.elide_at_ratio
+        # the estimate runs `ratio` times under (or over) what the provider counts: compare in the provider's units by
+        # moving the threshold, so the decision model's budget below stays in estimated tokens
+        threshold = (
+            context_budget.elide_threshold(self.context_window, self.elide_at_ratio, self._max_tokens)
+            / self.calibration.ratio
+        )
         if overhead + context_budget.message_tokens(view) > threshold:
             keep = set(self._pinned)
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
             view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
+        # what the gateway's compaction check measures (`_request_tokens`): the system prompt is in `overhead`, so the
+        # system messages of `view` are not counted again (a ratio learned on a double count would be applied to a
+        # single one)
+        self._last_estimate = overhead + context_budget.message_tokens([m for m in view if m.role != "system"])
         for m in view:
             if m.tool_call_id in self._notes and "Still relevant:" in (m.content or ""):
                 self._notes_at[m.tool_call_id] = self._step
@@ -959,6 +1062,8 @@ class AgentLoop:
     def _record_usage(self, event: StreamEvent) -> None:
         msg = event.message
         self.reliability.record_usage(msg.usage if msg is not None else None)
+        if msg is not None and msg.usage is not None and self._last_estimate:
+            self.calibration.observe(msg.usage.prompt_tokens, self._last_estimate)
 
     def _drain_steer(self, messages: list[Message]) -> bool:
         """Append steering messages (never between an assistant tool_calls message and its results)."""
@@ -1057,6 +1162,17 @@ class AgentLoop:
             return {"error": "User rejected the plan; revise it and call exit_plan again."}
         self.permissions.mode = PermissionMode(target)
         return {"content": f"Plan approved; mode is now {self.permissions.mode.value}. Implement it."}
+
+
+def _source(decision: Decision) -> str:
+    """What a permission_audit.jsonl row names as the decider of an engine decision."""
+    if decision.message and decision.message.startswith(PERMISSION_CHECK_FAILED):
+        return "fail_closed"
+    if decision.hardline is not None:
+        return "hardline"
+    if decision.rule is not None and decision.rule.layer > 0:  # the user's, the project's or the session's own
+        return "rule"
+    return "engine"
 
 
 def _noted(result: dict[str, Any], norm: Normalized) -> dict[str, Any]:

@@ -12,7 +12,10 @@
  * This module adds only what the wire does not carry: the client-local synthetic events the TUI
  * transport publishes into the same handler stream, and the `GatewayEvent` envelope.
  */
-import type { BackendGatewayEventMap } from "./gateway-contract.generated.js";
+import type {
+  BackendGatewayEventMap,
+  SessionActiveListResult,
+} from "./gateway-contract.generated.js";
 
 export * from "./gateway-contract.generated.js";
 
@@ -34,6 +37,8 @@ export interface ClientLocalGatewayEventMap {
 
 /** k3code autonomy events (M4a). The Python gateway is not the generated Hermes contract, so these are declared here. */
 export interface K3GatewayEventMap {
+  /** Every live session and running sub-agent, pushed on attach and when one changes state (rows as the RPC's). */
+  "session.active_list": { sessions?: SessionActiveListResult["sessions"] };
   "plan.show": {
     advisor?: string;
     auto_approved?: boolean;

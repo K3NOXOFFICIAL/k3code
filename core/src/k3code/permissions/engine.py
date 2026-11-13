@@ -2265,6 +2265,13 @@ def _decide_bash(
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
+    if worst.action != "deny" and (why := hardline.human_check(parsed)):
+        # force pushes, `git reset --hard`, an `rm -r` of a path only a variable names, a printed credential, an
+        # environment dump: legitimate work, so not a hardline, but no rule or auto mode answers for the person (yolo
+        # returned above and asks nobody)
+        return Decision(
+            action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
+        )
     if home_dot and worst.action != "deny":
         return Decision(
             action="ask",

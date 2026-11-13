@@ -104,7 +104,7 @@ async def test_daemon_start_prunes_old_journals_of_closed_sessions_and_old_usage
     server.learning.log.record("approval", subject="last year", choice="allow", ts=now - 400 * DAY)
     server.learning.log.record("approval", subject="this year", choice="allow", ts=now - 100 * DAY)
     pruned = server.prune_retention()
-    assert pruned == {"usage_rows": 1, "journal_files": 2, "decisions": 1}
+    assert pruned == {"usage_rows": 1, "journal_files": 2, "decisions": 1, "checkpoints": 0}
     assert not any(p.exists() for p in old_closed)
     assert all(p.exists() for p in new_closed + old_live) and (home / "journal" / "notes.txt").exists()
     assert [r["detail"] for r in server.usage.rows() if r["kind"] == "tool"] == ["recent"]
@@ -116,7 +116,7 @@ async def test_retention_knobs_come_from_the_config(tmp_path, monkeypatch):
     home = k3home(tmp_path)
     four_days = _journal(home, "closed", age_days=4)
     server.usage.record("tool", detail="eleven days", ts=time.time() - 11 * DAY)
-    assert server.prune_retention() == {"usage_rows": 1, "journal_files": 2, "decisions": 0}
+    assert server.prune_retention() == {"usage_rows": 1, "journal_files": 2, "decisions": 0, "checkpoints": 0}
     assert not any(p.exists() for p in four_days)
 
 

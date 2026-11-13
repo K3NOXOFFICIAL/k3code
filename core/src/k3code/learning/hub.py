@@ -50,6 +50,8 @@ class LearningHub:
         self.store = store
         self.experiments = optimizer.Experiments(self.home, clock, live=server.config)
         self.experiments.on_config_rollback = self._config_rolled_back
+        self.experiments.max_age_days = float(self.cfg["optimizer"]["experiment_max_days"])
+        self._optimizer_lock = asyncio.Lock()  # the daemon tick and a turn's maintenance must not both run the week
         # load() joins each record's real outcome from the decision log (issue #140)
         self.replays = replay.ReplayStore(self.home, outcomes=self.log.turn_outcomes)
         self._state_path = self.home / "learning" / "state.json"
@@ -421,7 +423,12 @@ class LearningHub:
 
     def metrics(self, since: float = 0.0, until: float | None = None) -> dict[str, Any]:
         return optimizer.collect(
-            self.server.usage.rows(since), self.log, self.server.autonomy.scope_log.read(), since=since, until=until
+            self.server.usage.rows(since),
+            self.log,
+            self.server.autonomy.scope_log.read(),
+            since=since,
+            until=until,
+            prices=self.cfg["optimizer"].get("prices") or None,
         )
 
     def record_turn_replay(
@@ -613,10 +620,34 @@ class LearningHub:
             if session is not None:
                 self.emit(session, r["proposals"])
             self._set_state(distilled=now)
-        if (force or now - st.get("optimized", 0) > WEEK) and self.cfg["optimizer"]["enabled"]:
-            done["optimizer"] = len(await self.run_optimizer(session))
-            self._set_state(optimized=now)
+        weekly = await self._weekly_optimizer(session, force=force)
+        if weekly is not None:
+            done["optimizer"] = weekly
         return done
+
+    async def _weekly_optimizer(self, session: Any = None, *, force: bool = False) -> int | None:
+        """The weekly analysis, once per ``WEEK`` (a persisted timestamp, so a restart does not repeat it): proposals
+        always; candidates are applied by themselves only while ``learning.optimizer.enabled`` (see run_optimizer).
+        Returns the number of proposals made, or None when it is not due."""
+        async with self._optimizer_lock:
+            now = self.clock()
+            if not force and now - self._state().get("optimized", 0) <= WEEK:
+                return None
+            made = len(await self.run_optimizer(session))
+            self._set_state(optimized=now)
+            return made
+
+    async def optimizer_tick(self) -> int | None:
+        """From the daemon's housekeeping loop: a week without a finished turn has nothing else to run the weekly
+        analysis. Also rolls back experiments whose A/B window never filled (``experiment_max_days``)."""
+        if not self.enabled:
+            return None
+        for x in self.experiments.expire_stale():
+            self._notify(
+                f"Optimizer experiment {x['id']} ({x['title']}) expired after {self.experiments.max_age_days:g} "
+                f"days without enough sessions to judge it; the old value is restored."
+            )
+        return await self._weekly_optimizer()
 
     async def run_optimizer(self, session: Any = None) -> list[Proposal]:
         """Analyse the week and propose changes. Only while ``learning.optimizer.enabled`` is on are gate-approved
@@ -644,9 +675,11 @@ class LearningHub:
         return made
 
     def _rolled_back_before(self, patch: dict[str, Any]) -> bool:
-        """Judged worse, or not shown to be no worse (inconclusive): either way not auto-applied again."""
+        """Judged worse, not shown to be no worse (inconclusive), or never judged at all (expired: on a quiet project
+        the window does not fill): in every case not auto-applied again, or the same change would flip in and out of the
+        config every week."""
         return any(
-            x["patch"] == patch and x["status"] in ("rolled_back", "inconclusive")
+            x["patch"] == patch and x["status"] in ("rolled_back", "inconclusive", "expired")
             for x in self.experiments.all()
             if x.get("kind") == "config"
         )
