@@ -6,7 +6,7 @@
 K3CI_CONTEXT=local-ci
 
 # The areas of check.sh, in the order it runs them.
-K3CI_AREAS="shell vendor secrets core panes tui"
+K3CI_AREAS="shell vendor secrets core panes rust tui"
 
 # merge-pr.sh runs the full check for a pull request above either size (changed files; added plus deleted lines).
 K3CI_FULL_FILES=${K3CODE_CI_FULL_FILES:-40}
@@ -31,6 +31,7 @@ install_hint() {
     uv) echo "install uv: curl -LsSf https://astral.sh/uv/install.sh | sh (or see https://docs.astral.sh/uv/)" ;;
     node | npm | npx) echo "install Node 22+ with npm: https://nodejs.org/ (or dnf install nodejs / apt install nodejs npm / brew install node)" ;;
     go) echo "install Go (the version in panes/go.mod): https://go.dev/dl/ (or dnf install golang / brew install go)" ;;
+    cargo | rustc | rustup) echo "install Rust with rustup: https://rustup.rs/ (then put ~/.cargo/bin on PATH)" ;;
     gitleaks) echo "install gitleaks 8.30.1 or newer: https://github.com/gitleaks/gitleaks/releases (or brew install gitleaks)" ;;
     shellcheck) echo "install shellcheck: dnf install ShellCheck / apt install shellcheck / brew install shellcheck" ;;
     timeout) echo "install GNU coreutils (it ships timeout): dnf install coreutils / apt install coreutils" ;;
@@ -95,6 +96,7 @@ areas_for_files() {
       scripts/ci/* | .githooks/*) areas="$areas core shell " ;;
       tui/*) areas="$areas tui vendor " ;;
       panes/*) areas="$areas panes vendor " ;;
+      rust/*) areas="$areas rust " ;;
       VENDOR.toml | NOTICE | LICENSE | LICENSES/* | scripts/vendor_check.py) areas="$areas vendor " ;;
     esac
     case $f in

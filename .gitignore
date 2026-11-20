@@ -12,3 +12,5 @@ tui/node_modules
 
 # built panes binary (install builds it from source)
 panes/k3
+# Rust workspace build output
+rust/target/

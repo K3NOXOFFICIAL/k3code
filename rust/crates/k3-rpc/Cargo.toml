@@ -1,0 +1,15 @@
+[package]
+name = "k3-rpc"
+description = "JSON-RPC 2.0 framing for the k3code gateway (twin of core/src/k3code/gateway/protocol.py)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@
 #   core     ruff check + ruff format --check (core/ and scripts/), pytest
 #   tui      npm ci, build:ink, build, typecheck, eslint, prettier --check, vitest (minus tui/.ci-test-excludes)
 #   panes    go build ./cmd/k3, go vet and go test on the packages k3 depends on (never `go test ./...`)
+#   rust     cargo fmt --check and clippy -D warnings in rust/; full: cargo test
 #   vendor   scripts/vendor_check.py (license bookkeeping); full: the core wheel ships LICENSE, NOTICE, LICENSES/
 #   secrets  gitleaks on the commits this branch adds over origin/Main, plus uncommitted and staged changes
 #   shell    shellcheck and a syntax check (sh -n / bash -n) of install/*.sh, scripts/**/*.sh and .githooks/*
@@ -247,6 +248,24 @@ area_panes() {
     # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default
     # 10 min package timeout then kills it mid-test (issue #52)
     step "go test input app" panes go test -timeout 30m ./internal/input/ ./internal/app/
+  fi
+}
+
+area_rust() {
+  # rustup installs into ~/.cargo/bin, which a non-interactive shell often lacks
+  have cargo || { [ -x "$HOME/.cargo/bin/cargo" ] && PATH="$HOME/.cargo/bin:$PATH"; }
+  need cargo
+  # Linking goes through `cc`. A `cc` on PATH that is not a C compiler (the Claude Code shim ~/.local/bin/cc) breaks it,
+  # so name gcc as the linker for the host target in that case.
+  if [ "$PLAN" = 0 ] && have cargo && ! cc --version 2>&1 | head -n 1 | grep -Eqi 'gcc|clang|apple'; then
+    if have gcc; then
+      export "CARGO_TARGET_$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')_LINKER=gcc"
+    fi
+  fi
+  step "cargo fmt --check" rust cargo fmt --check
+  step "cargo clippy" rust cargo clippy --all-targets -- -D warnings
+  if full; then
+    step "cargo test" rust cargo test
   fi
 }
 
