@@ -8,6 +8,7 @@ k3jobs lives next to the machine that runs the jobs; every call goes through its
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -51,13 +52,13 @@ def _remote_program(path: str) -> str:
 def build_call(cfg: Any, args: list[str]) -> tuple[list[str], dict[str, str] | None]:
     """argv (+ env) for one k3jobs invocation; argv list only, never a local shell."""
     if not cfg.ssh_host:
-        env = {**os.environ, "K3JOBS_ROOT": cfg.root} if cfg.root else None
+        env = {**os.environ, "K3JOBS_ROOT": str(Path(cfg.root).expanduser())} if cfg.root else None
         return [str(Path(cfg.bin).expanduser()), *args, "--json"], env
     if cfg.ssh_host.startswith("-"):
         raise ValueError(f"jobs.ssh_host {cfg.ssh_host!r} looks like an ssh option")
     parts = [_remote_program(cfg.bin), *(shlex.quote(a) for a in args), "--json"]
     if cfg.root:
-        parts = ["env", "K3JOBS_ROOT=" + shlex.quote(cfg.root), *parts]
+        parts = ["env", "K3JOBS_ROOT=" + _remote_program(cfg.root), *parts]
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", cfg.ssh_host, " ".join(parts)]
     return argv, None
 
@@ -67,7 +68,7 @@ async def run_k3jobs(cfg: Any, args: list[str]) -> tuple[int, str, str]:
     try:
         argv, env = build_call(cfg, args)
     except ValueError as e:
-        return 2, "", str(e)
+        return 126, "", str(e)  # bad jobs.* config: k3jobs never ran
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -81,7 +82,8 @@ async def run_k3jobs(cfg: Any, args: list[str]) -> tuple[int, str, str]:
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=cfg.timeout_s)
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):  # it may have exited while a child held the pipes open
+            proc.kill()
         await proc.wait()
         return 124, "", f"timed out after {cfg.timeout_s:g}s"
     code = proc.returncode if proc.returncode is not None else 1
@@ -113,7 +115,9 @@ def explain(c: Call, cfg: Any, what: str) -> str:
     if c.code == 5:
         return f"{what}: refused by k3jobs (KILL switch or policy); nothing changed. {msg}".strip()
     if c.code == 4:
-        return f"{what}: model probe failed, so it was not resumed. {msg}".strip()
+        return f"{what}: model probe failed. {msg}".strip()
+    if c.code == 126:
+        return f"{what}: invalid jobs config: {msg}".strip()
     if c.code == 3:
         return f"{what}: unknown job. {msg}".strip()
     if c.code == 2:
@@ -130,6 +134,14 @@ def explain(c: Call, cfg: Any, what: str) -> str:
 def _jobs_of(c: Call) -> list[dict[str, Any]]:
     jobs = (c.doc or {}).get("jobs")
     return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
+
+
+BAD_LIST = "k3jobs answered, but the output is not JSON with a jobs list (is jobs.bin the k3jobs CLI?)."
+
+
+def _bad_list(c: Call) -> bool:
+    """A `list` that exited 0 without a usable job list must never read as 'no jobs running'."""
+    return not isinstance((c.doc or {}).get("jobs"), list)
 
 
 def _rate(v: Any) -> str:
@@ -152,8 +164,8 @@ async def do_list(cfg: Any) -> str:
     c = await call(cfg, ["list"])
     if c.code != 0:
         return explain(c, cfg, "/jobs")
-    if c.doc is None:
-        return "/jobs: k3jobs answered, but the output is not JSON (is jobs.bin the k3jobs CLI?)."
+    if _bad_list(c):
+        return f"/jobs: {BAD_LIST}"
     return format_jobs(_jobs_of(c))
 
 
@@ -198,6 +210,8 @@ async def do_pause_all(cfg: Any) -> str:
     c = await call(cfg, ["list"])
     if c.code != 0:
         return explain(c, cfg, "/pause all")
+    if _bad_list(c):
+        return f"/pause all: {BAD_LIST} Nothing was paused."
     todo = [str(j["name"]) for j in _jobs_of(c) if isinstance(j.get("name"), str) and not j.get("paused")]
     if not todo:
         return "Nothing to pause: every job is already paused."
@@ -230,11 +244,16 @@ async def running_summary(cfg: Any) -> str:
     c = await call(cfg, ["list"])
     if c.code != 0:
         return explain(c, cfg, "/pause")
+    if _bad_list(c):
+        return f"/pause: {BAD_LIST}"
     names = [str(j.get("name")) for j in _jobs_of(c) if not j.get("paused")]
     return "Running jobs: " + (", ".join(names) if names else "none")
 
 
 class JobsCommand(CommandDef):
+    headless = True  # reads only ctx.config, so `k3code -p "/jobs"` works from a script or cron without a server
+    needs_server = False
+
     def __init__(self) -> None:
         super().__init__(name="jobs", help=USAGE)
 
@@ -256,6 +275,9 @@ class JobsCommand(CommandDef):
 
 class PauseCommand(CommandDef):
     """``/pause`` is its own command, not an alias: dispatch does not tell a handler which name was typed."""
+
+    headless = True
+    needs_server = False
 
     def __init__(self) -> None:
         super().__init__(name="pause", help="/pause <job|all>: pause a 24/7 job (resume with /jobs resume <job>)")

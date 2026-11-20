@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from types import SimpleNamespace
@@ -152,8 +153,8 @@ async def test_ssh_failure_and_timeout_name_the_cause(fake):
     fake.answers[("pause", "alpha")] = (255, None, "ssh: connect to host k3server port 22: Connection refused")
     out = await run("pause", "alpha", ssh_host="k3server")
     assert "could not reach k3server over ssh" in out
-    fake.answers[("pause", "alpha")] = (124, None, "timed out after 30s")
-    assert "timed out after 30s" in await run("pause", "alpha")
+    fake.answers[("pause", "alpha")] = (124, None, "")  # no stderr: the message must come from the 124 mapping itself
+    assert "timed out" in await run("pause", "alpha")
 
 
 async def test_unparseable_success_output_is_reported_not_hidden(monkeypatch):
@@ -189,7 +190,7 @@ async def test_ssh_host_that_looks_like_an_option_is_refused(monkeypatch):
 
     monkeypatch.setattr(jobs_mod.asyncio, "create_subprocess_exec", boom)
     out = await run("jobs", ssh_host="-oProxyCommand=evil")
-    assert "rejected the arguments" in out
+    assert "invalid jobs config" in out and "looks like an ssh option" in out
     assert spawned == []
 
 
@@ -206,3 +207,59 @@ async def test_real_subprocess_round_trip_and_timeout(tmp_path):
     assert slow[0] == 124 and "timed out" in slow[2]
     missing = await jobs_mod.run_k3jobs(make_ctx(bin=str(tmp_path / "nope")).config.jobs, ["list"])
     assert missing[0] == 127
+
+
+async def test_pause_all_never_reports_all_clear_on_an_unusable_list(monkeypatch):
+    calls = []
+
+    async def junk(cfg, args):
+        calls.append(list(args))
+        return 0, "Usage: not the k3jobs you wanted", ""
+
+    monkeypatch.setattr(jobs_mod, "run_k3jobs", junk)
+    for name, arg in (("pause", "all"), ("jobs", "pause all"), ("pause", "")):
+        out = await run(name, arg)
+        assert "not JSON with a jobs list" in out
+        assert "Nothing to pause" not in out and "Running jobs: none" not in out
+    assert all(c == ["list"] for c in calls)  # nothing was paused
+
+
+async def test_pause_all_skips_unexpected_names(fake):
+    fake.answers["list"] = (0, {"ok": True, "jobs": [{"name": "Bad_Name", "paused": False}, JOBS[0]]}, "")
+    out = await run("pause", "all")
+    assert fake.calls == [["list"], ["pause", "alpha"]]
+    assert "Bad_Name: skipped" in out and out.splitlines()[0] == "Paused 1 of 2 running jobs."
+
+
+def test_root_tilde_expands_locally_and_on_the_remote(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/someone")
+    _, env = jobs_mod.build_call(make_ctx(root="~/data/k3jobs").config.jobs, ["list"])
+    assert env is not None and env["K3JOBS_ROOT"] == "/home/someone/data/k3jobs"
+    argv, _ = jobs_mod.build_call(make_ctx(ssh_host="h", root="~/data/k3jobs").config.jobs, ["list"])
+    assert argv[7].startswith('env K3JOBS_ROOT="$HOME"/data/k3jobs ')
+
+
+async def test_timeout_survives_a_process_that_already_exited(monkeypatch):
+    class Proc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            raise ProcessLookupError
+
+        async def wait(self):
+            return 0
+
+    async def spawn(*a, **k):
+        return Proc()
+
+    monkeypatch.setattr(jobs_mod.asyncio, "create_subprocess_exec", spawn)
+    code, _, err = await jobs_mod.run_k3jobs(make_ctx(timeout_s=0.1).config.jobs, ["list"])
+    assert code == 124 and "timed out" in err
+
+
+def test_commands_run_headless_without_a_server():
+    for cmd in (jobs_mod.JobsCommand(), jobs_mod.PauseCommand()):
+        assert cmd.headless is True and cmd.needs_server is False
