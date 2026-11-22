@@ -83,16 +83,30 @@ def next_tier(tier: Tier | str) -> Tier | None:
     return LADDER[i + 1] if i + 1 < len(LADDER) else None
 
 
+def _skips_tier(provider: Any, tier: Tier) -> bool:
+    """True when the block's ``tiers`` lists ``tier`` as an empty list, which keeps the block out of that tier."""
+    tiers = getattr(provider, "tiers", {}) or {}
+    return tier.value in tiers and tiers[tier.value] == []
+
+
 def tier_model_specs(config: Any, tier: Tier | str, *, key: str | None = None) -> list[str | list[str]]:
     """Per-provider model specs for a tier.
 
     ``main`` honours the configured default model key (as before M4a), so a config without
     any ``tiers`` behaves exactly as it did. Other tiers: ``tiers[tier]`` → ``models[tier]``
-    → ``models.default`` → first model.
+    → ``models.default`` → first model. A block that skips the tier gets an empty spec; if every
+    block skips it, the tier falls back to the full list with a warning.
     """
     tier = Tier(tier)
+    skipped = [_skips_tier(p, tier) for p in config.providers]
+    if skipped and all(skipped):
+        logger.warning("every provider skips tier %s; ignoring the empty tier lists", tier.value)
+        skipped = [False] * len(skipped)
     resolved: list[str | list[str]] = []
-    for p in config.providers:
+    for p, skip in zip(config.providers, skipped, strict=True):
+        if skip:
+            resolved.append([])  # build_chain adds no entries for an empty list
+            continue
         own = (getattr(p, "tiers", {}) or {}).get(tier.value)
         if tier is Tier.MAIN:
             k = key or config.default_model
