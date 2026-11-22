@@ -392,6 +392,8 @@ class Decision:
     #: an allow that holds only inside the sandbox (BUILTIN_SANDBOXED_ALLOW): the caller runs the command sandboxed,
     #: or asks when the sandbox cannot contain it
     sandbox_only: bool = False
+    #: an allow that a user/project/session rule grants for every part of a bash command; ``rule`` names one part only
+    user_allowed: bool = False
 
 
 @functools.lru_cache(maxsize=8)
@@ -2219,6 +2221,7 @@ def _decide_bash(
     worst: Rule | None = None
     home_dot = False
     sandbox_only = False
+    user_parts: list[bool] = []  # per part: allowed by a user/project/session rule
     for k, sub in enumerate(subs):
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.layer == 0 and rule.pattern in _SANDBOXED:
@@ -2238,6 +2241,7 @@ def _decide_bash(
             rule = Rule(tool="bash", pattern="*", action="ask")
         if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
             unsafe = True  # the builtin read-only allowlist covers one-line commands only
+        user_parts.append(rule.action == "allow" and rule.layer > 0)
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
     # deny/ask rules also see through wrappers, absolute paths and nested commands (`/bin/rm x`, `bash -c 'rm x'`);
@@ -2289,7 +2293,12 @@ def _decide_bash(
             message=f"Working directory outside project roots: {cwd} (/add-dir {cwd} adds it to this session)",
         )
     return Decision(
-        action=worst.action, patterns=prefixes, rule=worst, sandbox_only=sandbox_only and worst.action == "allow"
+        action=worst.action,
+        patterns=prefixes,
+        rule=worst,
+        sandbox_only=sandbox_only and worst.action == "allow",
+        # the winning rule is the first allow when several parts tie: it vouches for its part, not for the others
+        user_allowed=worst.action == "allow" and bool(user_parts) and all(user_parts),
     )
 
 

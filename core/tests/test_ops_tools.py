@@ -729,6 +729,29 @@ async def test_auto_mode_at_home_runs_a_rule_allowed_command_as_default_mode_doe
     assert ran == [("make build", None)]
 
 
+async def test_a_user_allow_at_home_does_not_vouch_for_a_compound_part_it_does_not_name(tmp_path, monkeypatch):
+    """`make *` allows `make` only. The decision's rule is the first allow in the command, so it cannot speak for the
+    other part: at $HOME a person still answers, whichever part comes first."""
+    from k3code.permissions.rules import Rule
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "auto")
+    loop._home_rooted = lambda: True  # type: ignore[method-assign]
+    loop.permissions.session_rules.append(Rule(tool="bash", pattern="make *", action="allow"))
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    for i, command in enumerate(("make build; rg -uu token .", "rg -uu token .; make build")):
+        result = await loop._execute_tool(ToolCall(id=f"c{i}", name="bash", arguments={"command": command}))
+        assert "User denied" in result["error"], (command, result)
+    assert len(asked) == 2 and ran == []
+
+
 async def test_yolo_at_home_runs_without_a_prompt(tmp_path, monkeypatch):
     from k3code.providers.types import ToolCall
 

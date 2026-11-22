@@ -659,15 +659,15 @@ class AgentLoop:
         # The classifier stands in for the missing sandbox: what it allowed runs unsandboxed (the session is told once)
         # instead of becoming a human-only ask. No classifier: those asks stay (issue #135).
         classifier_allowed = verdict is not None and verdict.action == "allow"
-        # A user/project/session rule allow (never the builtin rules or a mode-only allow) runs at $HOME as it runs in
-        # default mode: the user chose that command, the sandbox added nothing to that choice.
+        # A user/project/session rule allow for every part of the command (never the builtin rules or a mode-only
+        # allow) runs at $HOME as in default mode: the user chose that command, the sandbox added nothing to it.
         rule_allowed = (
             decision.action == "allow"
             and not decision.auto_allowed
             and not decision.sandbox_only
             and decision.rule is not None
             and decision.rule.action == "allow"
-            and decision.rule.layer > 0
+            and decision.user_allowed
         )
         if decision.sandbox_only and decision.action == "allow" and not contained and not home_rooted:
             if await asyncio.to_thread(sandbox.usable):  # bwrap works; it is the root (e.g. $HOME) it refuses
