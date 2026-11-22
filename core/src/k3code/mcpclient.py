@@ -113,9 +113,8 @@ class _Runner:
 
                     http = httpx.AsyncClient(headers=request_headers(self.cfg) or None, timeout=CALL_TIMEOUT)
                     await stack.enter_async_context(http)
-                    read, write, _ = await stack.enter_async_context(
-                        streamable_http_client(self.cfg.url, http_client=http)
-                    )
+                    streams = await stack.enter_async_context(streamable_http_client(self.cfg.url, http_client=http))
+                    read, write = streams[0], streams[1]  # mcp 2.x yields (read, write); older SDKs add get_session_id
                 else:
                     from mcp import StdioServerParameters
                     from mcp.client.stdio import stdio_client
