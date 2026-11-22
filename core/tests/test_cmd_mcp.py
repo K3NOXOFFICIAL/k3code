@@ -7,6 +7,8 @@ import contextlib
 import sys
 from pathlib import Path
 
+import pytest
+
 from k3code.config import McpServerConfig
 from k3code.extratools import mcp_prompt, register_mcp_tools
 from k3code.mcpclient import McpManager, qualified_name
@@ -184,5 +186,29 @@ async def test_an_inflight_call_returns_when_the_server_is_reloaded():
         await mgr.reload()
         res = await asyncio.wait_for(slow, 5)
         assert "error" in res and "stopped" in res["error"]
+    finally:
+        await mgr.close()
+
+
+@pytest.mark.parametrize("extra", [(), (lambda: None,)], ids=["mcp2-pair", "legacy-triple"])
+async def test_http_server_connects_whatever_tuple_the_sdk_yields(monkeypatch, extra):
+    """mcp 2.x streamable_http_client yields (read, write); the 3-way unpack failed every HTTP server with
+    'not enough values to unpack (expected 3, got 2)'. Older SDKs add get_session_id as a third item."""
+    import mcp.client.streamable_http as sh
+    from mcp import StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    @contextlib.asynccontextmanager
+    async def fake_http_client(url, http_client=None):
+        async with stdio_client(StdioServerParameters(command=sys.executable, args=[FAKE])) as (read, write):
+            yield (read, write, *extra)
+
+    monkeypatch.setattr(sh, "streamable_http_client", fake_http_client)
+    mgr = McpManager({"fake": McpServerConfig(url="http://127.0.0.1:1/mcp")})
+    try:
+        await mgr.ensure_started()
+        (state,) = mgr.states()
+        assert state.status == "connected", state.error
+        assert await mgr.call("mcp__fake__echo", {"text": "hi"}) == {"content": "echo:hi"}
     finally:
         await mgr.close()
