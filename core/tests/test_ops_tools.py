@@ -604,6 +604,165 @@ async def test_headless_auto_refuses_bash_when_bwrap_is_unusable(tmp_path, monke
     assert ran == []
 
 
+def _classifier(loop, action: str) -> list[str]:
+    """Stub the auto-mode classifier with one fixed verdict; returns the commands it judged."""
+    from k3code.permissions.classifier import ClassifierVerdict
+
+    judged: list[str] = []
+
+    async def classify(call, history, *, cwd, interactive):
+        judged.append(call.arguments["command"])
+        return ClassifierVerdict(action, f"stub {action}", failed=action == "ask")  # type: ignore[arg-type]
+
+    loop.classify_call = classify
+    return judged
+
+
+async def _must_not_ask(name, args, decision):
+    raise AssertionError(f"must not prompt: {decision.message}")
+
+
+@pytest.mark.parametrize("where", ["no_bwrap", "home"])
+async def test_auto_mode_runs_what_the_classifier_allowed_without_a_sandbox(where, tmp_path, monkeypatch):
+    """The classifier stands in for the missing sandbox: its allow runs on the host, no prompt, told once."""
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: where == "home")
+    loop, ran, notices = _stub_bash_loop(tmp_path, "auto")
+    if where == "home":
+        loop._home_rooted = lambda: True  # type: ignore[method-assign]
+    judged = _classifier(loop, "allow")
+    loop.approval_callback = _must_not_ask
+    for i in range(2):
+        await loop._execute_tool(ToolCall(id=f"c{i}", name="bash", arguments={"command": "git push origin main"}))
+    assert judged == ["git push origin main"] * 2 and ran == [("git push origin main", None)] * 2
+    assert notices == ["auto"]
+
+
+@pytest.mark.parametrize("command", ["git push origin main", "make test"])  # auto-allowed, and a sandbox-only runner
+async def test_auto_mode_without_a_sandbox_denies_what_the_classifier_blocks(command, tmp_path, monkeypatch):
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "auto")
+    judged = _classifier(loop, "deny")
+    loop.approval_callback = _must_not_ask
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": command}))
+    assert judged == [command] and result["error"] == "stub deny" and ran == []
+
+
+async def test_auto_mode_without_a_sandbox_asks_a_person_when_the_classifier_gives_no_verdict(tmp_path, monkeypatch):
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "auto")
+    _classifier(loop, "ask")
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "git push origin main"}))
+    assert "User denied" in result["error"] and ran == [] and len(asked) == 1 and asked[0].needs_human
+
+
+@pytest.mark.parametrize("where", ["no_bwrap", "home"])
+async def test_auto_mode_sends_an_uncontainable_runner_to_the_classifier(where, tmp_path, monkeypatch):
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: where == "home")
+    loop, ran, notices = _stub_bash_loop(tmp_path, "auto")
+    if where == "home":
+        loop._home_rooted = lambda: True  # type: ignore[method-assign]
+        loop._can_contain = lambda: False  # type: ignore[method-assign]
+    dec = loop.permissions.decide("bash", {"command": "make test"})
+    assert dec.action == "allow" and dec.sandbox_only and not dec.auto_allowed  # the premise: a runner, sandbox only
+    judged = _classifier(loop, "allow")
+    loop.approval_callback = _must_not_ask
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "make test"}))
+    assert judged == ["make test"] and ran == [("make test", None)] and notices == ["auto"]
+
+
+async def test_accept_edits_never_sends_a_runner_to_the_classifier(tmp_path, monkeypatch):
+    """The classifier is auto mode's: a classify_call left over from a switch to accept-edits judges nothing."""
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "accept-edits")
+    judged = _classifier(loop, "allow")
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "make test"}))
+    assert judged == [] and len(asked) == 1 and ran == []
+
+
+async def test_auto_mode_at_home_runs_a_rule_allowed_command_as_default_mode_does(tmp_path, monkeypatch):
+    from k3code.permissions.rules import Rule
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    loop, ran, notices = _stub_bash_loop(tmp_path, "auto")
+    loop._home_rooted = lambda: True  # type: ignore[method-assign]
+    loop.permissions.session_rules.append(Rule(tool="bash", pattern="make *", action="allow"))
+    dec = loop.permissions.decide("bash", {"command": "make build"})
+    assert dec.action == "allow" and dec.rule is not None and dec.rule.layer > 0 and not dec.sandbox_only
+    loop.approval_callback = _must_not_ask
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "make build"}))
+    assert ran == [("make build", None)] and notices == ["auto"]
+    # what only auto mode allowed, with no classifier, still asks at home
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    result = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": "git push origin main"}))
+    assert "User denied" in result["error"] and len(asked) == 1 and "home directory" in (asked[0].message or "")
+    assert ran == [("make build", None)]
+
+
+async def test_a_user_allow_at_home_does_not_vouch_for_a_compound_part_it_does_not_name(tmp_path, monkeypatch):
+    """`make *` allows `make` only. The decision's rule is the first allow in the command, so it cannot speak for the
+    other part: at $HOME a person still answers, whichever part comes first."""
+    from k3code.permissions.rules import Rule
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    loop, ran, _ = _stub_bash_loop(tmp_path, "auto")
+    loop._home_rooted = lambda: True  # type: ignore[method-assign]
+    loop.permissions.session_rules.append(Rule(tool="bash", pattern="make *", action="allow"))
+    asked: list = []
+
+    async def deny(name, args, decision):
+        asked.append(decision)
+        return _Answer(False)
+
+    loop.approval_callback = deny
+    for i, command in enumerate(("make build; rg -uu token .", "rg -uu token .; make build")):
+        result = await loop._execute_tool(ToolCall(id=f"c{i}", name="bash", arguments={"command": command}))
+        assert "User denied" in result["error"], (command, result)
+    assert len(asked) == 2 and ran == []
+
+
+async def test_yolo_at_home_runs_without_a_prompt(tmp_path, monkeypatch):
+    from k3code.providers.types import ToolCall
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    loop, ran, notices = _stub_bash_loop(tmp_path, "yolo")
+    loop._home_rooted = lambda: True  # type: ignore[method-assign]
+    loop.approval_callback = _must_not_ask
+    await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "git push origin main"}))
+    assert ran == [("git push origin main", None)] and notices == ["yolo"]
+
+
 def test_cli_says_on_stderr_that_bash_has_no_sandbox(capsys):
     from k3code import cli
 

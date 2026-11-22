@@ -54,6 +54,8 @@ CACHE_MAX = 512
 DEFAULT_TIMEOUT_S = 8.0
 
 _TAG_RE = re.compile(r"</?(?:user_messages|pending_call)\s*>", re.IGNORECASE)
+#: A thinking model's one leading <think>...</think> block (to its first close tag), dropped before the reply is read
+_THINK_RE = re.compile(r"\A\s*<think>.*?</think>", re.DOTALL)
 #: The whole reply may be the object in one code fence (```json ... ```), nothing more
 _FENCE_RE = re.compile(r"\A```(?:json)?\s*\n?(.*?)\n?```\Z", re.DOTALL)
 
@@ -183,8 +185,9 @@ def classifier_messages(call: ToolCall, history: Sequence[Message], cwd: Path | 
 
 def parse_verdict(text: str) -> tuple[str, str] | None:
     """``(verdict, reason)`` of a reply that is exactly ``{"verdict": "allow"|"block", "reason": "..."}`` (whitespace
-    and one code fence around it aside); None for anything else."""
-    raw = (text or "").strip()
+    and one code fence around it aside, after one leading think block); None for anything else, also an object in
+    prose: the pending call's arguments could plant one there."""
+    raw = _THINK_RE.sub("", text or "", count=1).strip()
     if (m := _FENCE_RE.match(raw)) is not None:
         raw = m.group(1).strip()
     try:
@@ -245,7 +248,7 @@ async def classify(
                 TaskKind.CLASSIFICATION,
                 classifier_messages(call, history, cwd),
                 session_id=session_id,
-                max_tokens=200,
+                max_tokens=512,  # a thinking model's <think> block comes before the object
                 timeout=timeout_s,
                 escalate=False,
                 tier=Tier.CHEAP,

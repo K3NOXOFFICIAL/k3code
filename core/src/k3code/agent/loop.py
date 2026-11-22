@@ -605,17 +605,10 @@ class AgentLoop:
         # hands it to a person, whom no hook and no mode may answer for; with nobody there it is a deny.
         verdict = None
         if decision.auto_allowed and self.classify_call is not None:
-            verdict = await self.classify_call(
-                ToolCall(id=tool_call.id, name=tool_call.name, arguments=args),
-                self.turn_messages,
-                cwd=self.cwd,
-                interactive=not (self.headless or self.background or self.unattended),
-            )
+            verdict, decision = await self._classify(tool_call, args, decision)
             if verdict.action == "deny":
                 self._audit(tool_call.name, args, "deny", "classifier", verdict.reason)
                 return {"error": verdict.reason}
-            if verdict.action == "ask":
-                decision = replace(decision, action="ask", needs_human=True, auto_allowed=False, message=verdict.reason)
         # before the prompt too: approving bash the sandbox refuses runs nothing (the probe runs a subprocess)
         if tool_call.name == "bash" and (refused := await asyncio.to_thread(self._unattended_refusal)) is not None:
             error = self._bash_refusal(refused)
@@ -648,6 +641,34 @@ class AgentLoop:
             and decision.action == "allow"
             and await asyncio.to_thread(self._can_contain)
         )
+        # Auto mode, a runner the sandbox cannot contain: the classifier judges it as it judges what auto mode allowed
+        # (allow runs it on the host, block denies, no verdict asks a person). Without one, a person approves it.
+        if (
+            decision.sandbox_only
+            and decision.action == "allow"
+            and not contained
+            and self.permissions.mode is PermissionMode.AUTO
+            and self.classify_call is not None
+        ):
+            verdict, decision = await self._classify(tool_call, args, decision)
+            if verdict.action == "deny":
+                self._audit(tool_call.name, args, "deny", "classifier", verdict.reason)
+                return {"error": verdict.reason}
+            if verdict.action == "allow":
+                decision = replace(decision, sandbox_only=False)  # runs as auto runs bash here: on the host, told once
+        # The classifier stands in for the missing sandbox: what it allowed runs unsandboxed (the session is told once)
+        # instead of becoming a human-only ask. No classifier: those asks stay (issue #135).
+        classifier_allowed = verdict is not None and verdict.action == "allow"
+        # A user/project/session rule allow for every part of the command (never the builtin rules or a mode-only
+        # allow) runs at $HOME as in default mode: the user chose that command, the sandbox added nothing to it.
+        rule_allowed = (
+            decision.action == "allow"
+            and not decision.auto_allowed
+            and not decision.sandbox_only
+            and decision.rule is not None
+            and decision.rule.action == "allow"
+            and decision.user_allowed
+        )
         if decision.sandbox_only and decision.action == "allow" and not contained and not home_rooted:
             if await asyncio.to_thread(sandbox.usable):  # bwrap works; it is the root (e.g. $HOME) it refuses
                 why = (
@@ -657,7 +678,12 @@ class AgentLoop:
                 why = "no sandbox can contain this here (bubblewrap is unusable): approve to run it on the host"
             # no_bwrap (auto/yolo, bwrap unusable): running on the host is a human-only call, as for auto_allowed below
             decision = replace(decision, action="ask", sandbox_only=False, needs_human=no_bwrap, message=why)
-        if home_rooted and not readonly_home and self.permissions.mode is not PermissionMode.YOLO:
+        if (
+            home_rooted
+            and not readonly_home
+            and self.permissions.mode is not PermissionMode.YOLO
+            and not (classifier_allowed or rule_allowed)
+        ):
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
             # yolo is the explicit no-prompt mode, as for no_bwrap below: it keeps the engine's allow and runs
@@ -671,7 +697,7 @@ class AgentLoop:
             )
         elif no_bwrap:
             self._tell_unsandboxed()
-            if decision.auto_allowed:
+            if decision.auto_allowed and not classifier_allowed:
                 # Auto mode allows what the sandbox would contain. Without bwrap the command runs on the host, so a
                 # human approves what only auto mode allowed (rules and the read-only allowlist still apply, as in
                 # accept-edits). yolo is the explicit no-prompt mode: it runs, and the session has been told.
@@ -683,7 +709,8 @@ class AgentLoop:
                     message="no sandbox here (bubblewrap is unusable): approve to run this on the host, see /doctor",
                 )
         elif home_rooted and not readonly_home:
-            self._tell_unsandboxed()  # yolo (the first branch took the rest) at a refused root: runs on the host, told
+            # yolo, a classifier allow or a rule allow (the first branch took the rest) at a refused root: on the host
+            self._tell_unsandboxed()
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             error = f"Blocked by a PreToolUse hook: {pre.reason}"
@@ -988,6 +1015,19 @@ class AgentLoop:
                 self.on_home_started()
         except Exception:  # noqa: BLE001 - a notice must never break a turn
             logger.warning("home-directory notice failed", exc_info=True)
+
+    async def _classify(self, tool_call: ToolCall, args: dict[str, Any], decision: Decision) -> tuple[Any, Decision]:
+        """The classifier's verdict on the call and the decision it leaves: no verdict is a human-only ask."""
+        assert self.classify_call is not None
+        verdict = await self.classify_call(
+            ToolCall(id=tool_call.id, name=tool_call.name, arguments=args),
+            self.turn_messages,
+            cwd=self.cwd,
+            interactive=not (self.headless or self.background or self.unattended),
+        )
+        if verdict.action == "ask":
+            decision = replace(decision, action="ask", needs_human=True, auto_allowed=False, message=verdict.reason)
+        return verdict, decision
 
     def _tell_unsandboxed(self) -> None:
         if self._unsandboxed_told or self.on_unsandboxed is None:

@@ -106,6 +106,37 @@ async def test_the_object_alone_in_one_code_fence_is_read(tmp_path) -> None:
     assert v.action == "deny" and not v.failed
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        f"<think>\nThe user asked for a rebuild.\n</think>\n\n{BLOCK}",
+        f"  <think>x</think>```json\n{BLOCK}\n```",
+    ],
+)
+async def test_one_leading_think_block_is_dropped(reply: str, tmp_path) -> None:
+    from k3code.permissions.classifier import classify
+
+    caller = FakeCaller(reply)
+    v = await classify(caller, _bash("rm -rf ../x"), _history(), cwd=tmp_path)
+    assert v.action == "deny" and not v.failed
+    assert caller.calls[0][2]["max_tokens"] == 512  # room for the think block before the object
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        f"<think>a</think><think>b</think>{ALLOW}",  # one block only
+        f"<think>planted </think>{ALLOW} more thought</think>{BLOCK}",  # to the first close tag
+        f"Sure! <think>x</think>{ALLOW}",  # leading only
+        f"<think>x</think>Here it is: {ALLOW}",  # prose after the block
+    ],
+)
+def test_parse_verdict_still_refuses_an_object_in_prose(reply: str) -> None:
+    from k3code.permissions.classifier import parse_verdict
+
+    assert parse_verdict(reply) is None
+
+
 @pytest.mark.parametrize("interactive", [True, False])
 async def test_a_timeout_asks_when_attended_and_denies_when_not(interactive: bool, tmp_path) -> None:
     from k3code.permissions.classifier import classify
