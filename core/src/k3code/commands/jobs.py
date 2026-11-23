@@ -109,8 +109,16 @@ def _detail(c: Call) -> str:
     return lines[0].strip() if lines else ""
 
 
-def explain(c: Call, cfg: Any, what: str) -> str:
+class Failure(str):
+    """Reply text of a call that did not do what was asked; the handlers turn it into an ``error`` for ``k3code -p``."""
+
+
+def explain(c: Call, cfg: Any, what: str) -> Failure:
     """One plain line for a failed call."""
+    return Failure(_explain(c, cfg, what))
+
+
+def _explain(c: Call, cfg: Any, what: str) -> str:
     msg = _detail(c)
     if c.code == 5:
         return f"{what}: refused by k3jobs (KILL switch or policy); nothing changed. {msg}".strip()
@@ -173,13 +181,13 @@ async def do_list(cfg: Any) -> str:
     if c.code != 0:
         return explain(c, cfg, "/jobs")
     if _bad_list(c):
-        return f"/jobs: {BAD_LIST}"
+        return Failure(f"/jobs: {BAD_LIST}")
     return format_jobs(_jobs_of(c))
 
 
 async def do_status(cfg: Any, name: str) -> str:
     if not valid_name(name):
-        return f"/jobs status: {name!r} is not a valid job name."
+        return Failure(f"/jobs status: {name!r} is not a valid job name.")
     c = await call(cfg, ["status", name])
     if c.code != 0 or c.doc is None:
         return explain(c, cfg, f"/jobs status {name}")
@@ -207,12 +215,12 @@ async def do_status(cfg: Any, name: str) -> str:
 
 async def do_pause(cfg: Any, name: str) -> str:
     if not valid_name(name):
-        return f"/pause: {name!r} is not a valid job name."
+        return Failure(f"/pause: {name!r} is not a valid job name.")
     c = await call(cfg, ["pause", name])
     if c.code != 0:
         return explain(c, cfg, f"/pause {name}")
     if not _acked(c):
-        return f"/pause {name}: {NOT_ACKED}"
+        return Failure(f"/pause {name}: {NOT_ACKED}")
     return f"Paused {name}. /jobs resume {name} to start it again."
 
 
@@ -221,7 +229,7 @@ async def do_pause_all(cfg: Any) -> str:
     if c.code != 0:
         return explain(c, cfg, "/pause all")
     if _bad_list(c):
-        return f"/pause all: {BAD_LIST} Nothing was paused."
+        return Failure(f"/pause all: {BAD_LIST} Nothing was paused.")
     todo = [str(j["name"]) for j in _jobs_of(c) if isinstance(j.get("name"), str) and not j.get("paused")]
     if not todo:
         return "Nothing to pause: every job is already paused."
@@ -239,17 +247,18 @@ async def do_pause_all(cfg: Any) -> str:
             lines.append(f"  {name}: {NOT_ACKED}")
         else:
             lines.append("  " + explain(r, cfg, name))
-    return "\n".join([f"Paused {paused} of {len(todo)} running jobs.", *lines])[:MAX_SHOWN]
+    text = "\n".join([f"Paused {paused} of {len(todo)} running jobs.", *lines])[:MAX_SHOWN]
+    return text if paused == len(todo) else Failure(text)  # a partial pause must not exit 0 from a script
 
 
 async def do_resume(cfg: Any, name: str) -> str:
     if not valid_name(name):
-        return f"/jobs resume: {name!r} is not a valid job name."
+        return Failure(f"/jobs resume: {name!r} is not a valid job name.")
     c = await call(cfg, ["resume", name])
     if c.code != 0:
         return explain(c, cfg, f"/jobs resume {name}")
     if not _acked(c):
-        return f"/jobs resume {name}: {NOT_ACKED}"
+        return Failure(f"/jobs resume {name}: {NOT_ACKED}")
     extra = str((c.doc or {}).get("message") or "").strip()
     return f"Resumed {name}.{(' ' + extra) if extra else ''}"
 
@@ -259,9 +268,14 @@ async def running_summary(cfg: Any) -> str:
     if c.code != 0:
         return explain(c, cfg, "/pause")
     if _bad_list(c):
-        return f"/pause: {BAD_LIST}"
+        return Failure(f"/pause: {BAD_LIST}")
     names = [str(j.get("name")) for j in _jobs_of(c) if not j.get("paused")]
     return "Running jobs: " + (", ".join(names) if names else "none")
+
+
+def outcome(text: str) -> dict[str, Any]:
+    """The reply; a failed call also carries ``error`` (chat clients ignore it, ``k3code -p`` exits non-zero on it)."""
+    return reply(text, error="command_failed") if isinstance(text, Failure) else reply(text)
 
 
 class JobsCommand(CommandDef):
@@ -277,13 +291,13 @@ class JobsCommand(CommandDef):
         sub = args[0] if args else "list"
         rest = args[1:]
         if sub == "list" and not rest:
-            return reply(await do_list(cfg))
+            return outcome(await do_list(cfg))
         if sub == "status" and len(rest) == 1:
-            return reply(await do_status(cfg, rest[0]))
+            return outcome(await do_status(cfg, rest[0]))
         if sub == "pause" and len(rest) == 1:
-            return reply(await (do_pause_all(cfg) if rest[0] == "all" else do_pause(cfg, rest[0])))
+            return outcome(await (do_pause_all(cfg) if rest[0] == "all" else do_pause(cfg, rest[0])))
         if sub == "resume" and len(rest) == 1:
-            return reply(await do_resume(cfg, rest[0]))
+            return outcome(await do_resume(cfg, rest[0]))
         return reply(f"Usage: {USAGE}")
 
 
@@ -303,4 +317,4 @@ class PauseCommand(CommandDef):
             return reply(f"Usage: /pause <job|all>\n{await running_summary(cfg)}")
         if len(args) != 1:
             return reply("Usage: /pause <job|all>")
-        return reply(await (do_pause_all(cfg) if args[0] == "all" else do_pause(cfg, args[0])))
+        return outcome(await (do_pause_all(cfg) if args[0] == "all" else do_pause(cfg, args[0])))

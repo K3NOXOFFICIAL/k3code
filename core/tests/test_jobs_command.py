@@ -183,6 +183,30 @@ async def test_pause_all_does_not_count_an_unacknowledged_pause(fake):
     assert "alpha: k3jobs exited 0" in out and "beta: paused" in out
 
 
+async def test_failed_calls_set_error_and_successes_do_not(fake):
+    reg, ctx = build_registry(), make_ctx()
+    ok = await reg.dispatch(ctx, "pause", "alpha", None)
+    assert "error" not in ok
+    fake.answers[("pause", "alpha")] = (5, {"ok": False}, "")
+    fake.answers[("resume", "alpha")] = (255, None, "")
+    for name, arg in (("pause", "alpha"), ("jobs", "resume alpha"), ("pause", "Bad_Name"), ("jobs", "status Bad_Name")):
+        assert (await reg.dispatch(ctx, name, arg, None)).get("error") == "command_failed", (name, arg)
+    fake.answers[("pause", "beta")] = (5, {"ok": False}, "")  # a partial /pause all is a failure too
+    assert (await reg.dispatch(ctx, "pause", "all", None)).get("error") == "command_failed"
+    fake.answers["list"] = (0, {"ok": True, "jobs": [JOBS[0]]}, "")
+    fake.answers[("pause", "alpha")] = (0, {"ok": True}, "")
+    assert "error" not in await reg.dispatch(ctx, "pause", "all", None)
+
+
+async def test_headless_pause_all_fails_when_the_host_is_unreachable(fake):
+    from k3code.cli import _run_headless_slash
+
+    fake.answers["list"] = (255, None, "ssh: connect to host k3server port 22: Connection refused")
+    cmd = jobs_mod.PauseCommand()
+    result = await _run_headless_slash(cmd, "pause", "all", make_ctx(ssh_host="k3server").config)
+    assert result["error"] == "command_failed" and "could not reach" in result["message"]
+
+
 def test_local_argv_expands_tilde_and_appends_json(monkeypatch):
     monkeypatch.setenv("HOME", "/home/someone")
     argv, env = jobs_mod.build_call(make_ctx().config.jobs, ["pause", "alpha"])
