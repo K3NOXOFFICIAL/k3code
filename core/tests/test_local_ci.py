@@ -477,6 +477,7 @@ def _scope(
         (["core/src/k3code/doctor.py", "tui/shared/x.ts", "README.md"], "vendor,secrets,core,tui"),
         (["README.md", "docs/x.md"], "secrets"),
         (["panes/internal/app/a.go"], "vendor,secrets,panes"),
+        (["rust/crates/k3-rpc/src/lib.rs"], "secrets,rust"),
         (["scripts/dev/install-hooks.sh", ".githooks/pre-push"], "shell,secrets,core"),
         # what decides the wheel's license files also runs the vendor area, which builds the wheel and checks them
         (["core/hatch_build.py"], "vendor,secrets,core"),
