@@ -79,11 +79,13 @@ from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import auth as gw_auth
+from k3code.gateway import k3d as k3d_client
 from k3code.gateway import tui_display
 from k3code.gateway.protocol import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
+    K3D_UNAVAILABLE,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     TOO_MANY_REQUESTS,
@@ -1547,6 +1549,10 @@ class GatewayServer:
             reply = encode_response(req_id, result)  # inside the try: a result that does not encode still answers
         except _InvalidParams as e:
             self._reply(client, encode_error(req_id, INVALID_PARAMS, str(e)))
+        except k3d_client.K3dUnavailable as e:
+            logger.info("%s: %s", method, e)
+            data = {"code": k3d_client.UNAVAILABLE_CODE}
+            self._reply(client, encode_error(req_id, K3D_UNAVAILABLE, f"{k3d_client.UNAVAILABLE_CODE}: {e}", data))
         except Exception as e:  # noqa: BLE001 - one bad method must not kill the gateway
             logger.exception("method %s failed", method)
             self._reply(client, encode_error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}"))
@@ -4972,6 +4978,16 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
     }
 
 
+async def _k3d_ping(server: GatewayServer, params: dict[str, Any]) -> Any:
+    """Forward ``k3d.ping`` to the k3d sidecar and return its reply (``{ok: true}``); K3D_UNAVAILABLE without one."""
+    return await k3d_client.call("k3d.ping")
+
+
+async def _k3d_version(server: GatewayServer, params: dict[str, Any]) -> Any:
+    """Forward ``k3d.version`` to the k3d sidecar (``{name, version}``); K3D_UNAVAILABLE without a reply."""
+    return await k3d_client.call("k3d.version")
+
+
 async def _system_battery(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """Host battery, power profile and temperature for the TUI status bar (#413).
 
@@ -5449,6 +5465,8 @@ _HANDLERS: dict[str, Any] = {
     "config.set": _config_set,
     "setup.status": _setup_status,
     "system.battery": _system_battery,
+    "k3d.ping": _k3d_ping,
+    "k3d.version": _k3d_version,
     "browser.manage": _browser_manage,
     "commands.catalog": _commands_catalog,
     "shell.exec": _shell_exec,
