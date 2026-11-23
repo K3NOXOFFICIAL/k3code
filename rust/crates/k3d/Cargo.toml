@@ -1,0 +1,15 @@
+[package]
+name = "k3d"
+description = "k3code sidecar daemon: JSON-RPC over a unix socket with the gateway's token-file auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+k3-rpc = { path = "../k3-rpc" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

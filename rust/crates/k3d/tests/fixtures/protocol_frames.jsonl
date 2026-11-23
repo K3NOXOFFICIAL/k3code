@@ -1,0 +1,19 @@
+{"name": "response", "encoder": "response", "args": {"id": 3, "result": {"ok": true, "s": "ü"}}, "line": "{\"jsonrpc\": \"2.0\", \"id\": 3, \"result\": {\"ok\": true, \"s\": \"ü\"}}", "python_ok": true}
+{"name": "response with a string id", "encoder": "response", "args": {"id": "k3-9", "result": [1, null, "x\ny"]}, "line": "{\"jsonrpc\": \"2.0\", \"id\": \"k3-9\", \"result\": [1, null, \"x\\ny\"]}", "python_ok": true}
+{"name": "error with a null id", "encoder": "error", "args": {"id": null, "code": -32700, "message": "parse error", "data": null}, "line": "{\"jsonrpc\": \"2.0\", \"id\": null, \"error\": {\"code\": -32700, \"message\": \"parse error\"}}", "python_ok": true}
+{"name": "error with data", "encoder": "error", "args": {"id": 4, "code": -32601, "message": "no such method", "data": {"m": "x"}}, "line": "{\"jsonrpc\": \"2.0\", \"id\": 4, \"error\": {\"code\": -32601, \"message\": \"no such method\", \"data\": {\"m\": \"x\"}}}", "python_ok": true}
+{"name": "unauthorized error", "encoder": "error", "args": {"id": 5, "code": -32001, "message": "wrong or missing gateway token", "data": null}, "line": "{\"jsonrpc\": \"2.0\", \"id\": 5, \"error\": {\"code\": -32001, \"message\": \"wrong or missing gateway token\"}}", "python_ok": true}
+{"name": "event", "encoder": "event", "args": {"type": "message.delta", "payload": {"text": "hi"}, "importance": "high"}, "line": "{\"jsonrpc\": \"2.0\", \"method\": \"event\", \"params\": {\"type\": \"message.delta\", \"payload\": {\"text\": \"hi\"}, \"importance\": \"high\"}}", "python_ok": true}
+{"name": "event without payload or importance", "encoder": "event", "args": {"type": "x", "payload": null, "importance": ""}, "line": "{\"jsonrpc\": \"2.0\", \"method\": \"event\", \"params\": {\"type\": \"x\", \"payload\": {}}}", "python_ok": true}
+{"name": "server request", "encoder": "server_request", "args": {"id": "k3-1", "method": "approval", "params": {"session_id": "s"}}, "line": "{\"jsonrpc\": \"2.0\", \"id\": \"k3-1\", \"method\": \"approval\", \"params\": {\"session_id\": \"s\"}}", "python_ok": true}
+{"name": "auth frame", "encoder": "auth_frame", "args": {"token": "not-a-real-token"}, "line": "{\"jsonrpc\": \"2.0\", \"id\": \"k3-gateway-auth\", \"method\": \"gateway.auth\", \"params\": {\"token\": \"not-a-real-token\"}}\n", "python_ok": true}
+{"name": "notification", "line": "{\"jsonrpc\":\"2.0\",\"method\":\"k3d.ping\"}", "python_ok": true}
+{"name": "request", "line": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"k3d.ping\",\"params\":{}}", "python_ok": true}
+{"name": "not json", "line": "not json", "python_ok": false}
+{"name": "an array", "line": "[1,2]", "python_ok": false}
+{"name": "no jsonrpc member", "line": "{\"id\":1,\"method\":\"x\"}", "python_ok": false}
+{"name": "jsonrpc 1.0", "line": "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"x\"}", "python_ok": false}
+{"name": "a null request id", "line": "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}", "rust_differs": "a request id must not be null", "python_ok": true}
+{"name": "a float request id", "line": "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"x\"}", "rust_differs": "an id must be an integer or a string", "python_ok": true}
+{"name": "a non-string method", "line": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":5}", "rust_differs": "a method must be a string", "python_ok": true}
+{"name": "no method, result or error", "line": "{\"jsonrpc\":\"2.0\",\"id\":1}", "rust_differs": "a frame must be a request, response or error", "python_ok": true}
