@@ -773,6 +773,10 @@ def main(
     if not prompt and _is_interactive():
         _offer_project_trust(project_dir)
     config = load_config(project_dir=project_dir)
+    if prompt:  # -p and its slash commands run the agent in this process (the TUI's gateway child installs its own)
+        from k3code import bugcatch
+
+        bugcatch.install()
     if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
         click.echo(f"k3code: ignoring {trust.subject(project_dir)} (not trusted; `k3code trust` applies it)", err=True)
     # `-p "/project"` runs the command, as the TUI would, before the provider check: no model is involved
@@ -863,6 +867,9 @@ def _configure_service_logging() -> None:
         force=True,  # the import-time basicConfig above already installed a handler
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    from k3code import bugcatch
+
+    bugcatch.install()  # after basicConfig(force=True), which strips the root handler install adds
 
 
 def _run_gateway() -> None:

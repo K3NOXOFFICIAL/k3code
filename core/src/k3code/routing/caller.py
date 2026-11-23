@@ -34,6 +34,8 @@ class CallResult:
     provider: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    #: why the model stopped ("max_tokens" = cut off at the output limit), as the provider reported it
+    stop_reason: str | None = None
 
 
 class ModelCaller:
@@ -166,4 +168,4 @@ class ModelCaller:
                 turn=self._turn_of(session_id) if self._turn_of else "",
                 seconds=seconds,
             )
-        return CallResult(final.content or "", tier, model, provider, pt, ct)
+        return CallResult(final.content or "", tier, model, provider, pt, ct, final.stop_reason)

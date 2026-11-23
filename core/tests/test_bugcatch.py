@@ -214,3 +214,131 @@ def test_asyncio_failure_gives_one_row():
     finally:
         loop.close()
     assert [r["kind"] for r in _rows()] == ["asyncio"]
+
+
+# --- capture call sites --------------------------------------------------------------------------------------------
+
+
+class _Caller:
+    """A ModelCaller stand-in for the classifier: one reply (with its stop reason), an exception, or a delay."""
+
+    def __init__(self, text: str = "", *, stop: str | None = None, raises: Exception | None = None, delay: float = 0):
+        self.text, self.stop, self.raises, self.delay = text, stop, raises, delay
+
+    async def complete(self, kind, messages, **kw):
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.raises is not None:
+            raise self.raises
+        from k3code.routing.caller import CallResult
+        from k3code.routing.tiers import Tier
+
+        return CallResult(self.text, Tier.CHEAP, stop_reason=self.stop)
+
+
+async def _classify(caller, **kw):
+    from k3code.permissions.classifier import classify
+    from k3code.providers.types import Message, ToolCall
+
+    call = ToolCall(id="c1", name="bash", arguments={"command": "rm -rf build"})
+    history = [Message(role="user", content="clean the build")]
+    return await classify(caller, call, history, cwd="/tmp", session_id="s1", **kw)
+
+
+async def test_classifier_timeout_writes_a_row():
+    v = await _classify(_Caller(delay=2.0), timeout_s=0.05)
+    assert v.failed
+    (row,) = _rows()
+    assert row["kind"] == "classifier_timeout" and row["session"] == "s1" and row["ctx"]["timeout_s"] == 0.05
+
+
+async def test_classifier_provider_error_writes_a_row():
+    from k3code.providers.base import ProviderError
+
+    await _classify(_Caller(raises=ProviderError("upstream 502")))
+    (row,) = _rows()
+    assert row["kind"] == "classifier_error" and row["exc_type"] == "ProviderError" and row["session"] == "s1"
+
+
+async def test_classifier_chain_exhausted_row_carries_the_last_reason():
+    from k3code.errors import ChainExhausted
+
+    await _classify(_Caller(raises=ChainExhausted("all failed", "rate_limit")))
+    (row,) = _rows()
+    assert row["kind"] == "classifier_error" and row["exc_type"] == "ChainExhausted"
+    assert row["ctx"]["last_reason"] == "rate_limit"
+
+
+@pytest.mark.parametrize("stop", ["max_tokens", "length"])
+async def test_classifier_cut_off_reply_is_truncated_not_unreadable(stop):
+    await _classify(_Caller("<think>long thoughts", stop=stop))
+    (row,) = _rows()
+    assert row["kind"] == "classifier_truncated"
+
+
+async def test_classifier_garbage_is_unreadable_and_garbles_share_one_fp(_restore_hooks):
+    await _classify(_Caller("sure, allow it 123", stop="end_turn"))
+    _restore_hooks[0] += 61  # past the rate-limit window, so the second row is written
+    await _classify(_Caller("no idea, block maybe? " + "x" * 300))
+    first, second = _rows()
+    assert first["kind"] == second["kind"] == "classifier_unreadable"
+    assert first["fp"] == second["fp"]
+    assert first["ctx"]["reply_chars"] == 18 and first["ctx"]["reply_head"] == "sure, allow it 123"
+    assert len(second["ctx"]["reply_head"]) == 200
+
+
+async def test_classifier_too_long_command_writes_no_row():
+    from k3code.permissions.classifier import CALL_CHARS, classify
+    from k3code.providers.types import ToolCall
+
+    call = ToolCall(id="c1", name="bash", arguments={"command": "x" * (CALL_CHARS + 1)})
+    v = await classify(_Caller(), call, [], cwd="/tmp")
+    assert v.failed and _rows() == []
+
+
+async def test_model_caller_carries_the_stop_reason():
+    from k3code.config import Settings
+    from k3code.providers.types import Message
+    from k3code.routing.caller import ModelCaller
+
+    class _Router:
+        async def complete(self, messages, tools, *, max_tokens):
+            return Message(role="assistant", content="{", stop_reason="max_tokens")
+
+    class _Routers:
+        def get(self, tier):
+            return _Router()
+
+    res = await ModelCaller(lambda: _Routers(), Settings(providers=[]), None).complete("title", [], session_id="s")
+    assert res.stop_reason == "max_tokens"
+
+
+async def test_a_provider_error_turn_writes_turn_provider_error(tmp_path, monkeypatch):
+    import m1cmd_helpers as m1
+    from k3code.router import Router, build_chain
+
+    class _Down(m1.TextProvider):
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            raise RuntimeError("provider exploded")
+            yield  # makes this an async generator, like the real stream
+
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["done"])
+    provider = _Down(["done"])
+    server.providers = [provider]
+    server.router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    server._oneshot_routers["default"] = server.router
+    sid = await m1.new_session(server, tmp_path)
+    await m1.submit_and_wait(server, "hi")
+    rows = [r for r in _rows() if r["kind"] == "turn_provider_error"]
+    assert len(rows) == 1 and rows[0]["session"] == sid
+    assert rows[0]["exc_type"] == "ChainExhausted"  # max_retries=0: the one entry fails, the chain is spent
+
+
+def test_install_survives_service_logging_setup():
+    """The gateway and the daemon call basicConfig(force=True), which strips every root handler: install must run
+    after it, so the real setup is run here rather than install alone."""
+    from k3code import cli
+
+    bugcatch.install()
+    cli._configure_service_logging()
+    assert any(getattr(h, bugcatch._MARK, False) for h in logging.getLogger().handlers)

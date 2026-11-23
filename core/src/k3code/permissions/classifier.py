@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from k3code import bugcatch
+from k3code.errors import ChainExhausted
 from k3code.providers.types import Message, ToolCall
 from k3code.routing.tiers import TaskKind, Tier
 
@@ -257,11 +259,47 @@ async def classify(
         )
         parsed = parse_verdict(getattr(res, "text", "") or "")
     except TimeoutError:
+        bugcatch.record(
+            "classifier_timeout",
+            "permission classifier timed out",
+            session=session_id,
+            tool=call.name,
+            timeout_s=timeout_s,
+        )
         return _no_verdict("timed out", interactive)
     except Exception as e:  # noqa: BLE001 - a failed check must never crash the tool call or allow it
         logger.info("permission classifier failed: %s", type(e).__name__, exc_info=True)
+        extra = {"last_reason": e.last_reason} if isinstance(e, ChainExhausted) else {}
+        bugcatch.record(
+            "classifier_error",
+            f"permission classifier failed: {type(e).__name__}",
+            exc=e,
+            session=session_id,
+            tool=call.name,
+            **extra,
+        )
         return _no_verdict(f"{type(e).__name__}", interactive)
     if parsed is None:
+        stop = getattr(res, "stop_reason", None)
+        if stop in ("max_tokens", "length"):  # cut off at max_tokens: a budget problem, not a garbled reply
+            bugcatch.record(
+                "classifier_truncated",
+                "permission classifier reply cut off",
+                session=session_id,
+                tool=call.name,
+                stop_reason=stop,
+            )
+        else:
+            reply = getattr(res, "text", "") or ""
+            bugcatch.record(
+                "classifier_unreadable",
+                "permission classifier reply unreadable",
+                session=session_id,
+                tool=call.name,
+                stop_reason=stop,
+                reply_chars=len(reply),
+                reply_head=reply[:200],
+            )
         return _no_verdict("unreadable reply", interactive)
     if cache is not None:
         while len(cache) >= CACHE_MAX:

@@ -44,7 +44,7 @@ from typing import Any
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import ask_user, checkpoints, confio, mcpjson, userhooks, wakewords
+from k3code import ask_user, bugcatch, checkpoints, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -2604,6 +2604,14 @@ class GatewayServer:
             status = "error"
             error = str(e)
             session.last_exc = e  # message.complete carries it with error_surface; no separate error toast
+            bugcatch.record(
+                "turn_provider_error",
+                f"turn failed: {type(e).__name__}",
+                exc=e,
+                session=session.session_id,
+                model=session.stored.model,
+                provider=session.stored.provider,
+            )
         except BudgetExceeded as e:
             # The reliability event already told the client (error + needs_input).
             status = "needs_input"
