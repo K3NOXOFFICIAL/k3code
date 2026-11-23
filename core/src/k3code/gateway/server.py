@@ -5335,7 +5335,7 @@ HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     ("Orchestration", ("ultraplan", "ultracode", "ultraresearch", "artifacts")),
     ("Knowledge", ("memory", "skills", "mcp", "learn", "optimizer", "self-improve")),
-    ("System", ("help", "doctor", "update", "stats", "debug", "daemon")),
+    ("System", ("help", "doctor", "update", "stats", "bugs", "debug", "daemon")),
 )
 
 

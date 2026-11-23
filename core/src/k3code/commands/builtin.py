@@ -8,6 +8,7 @@ from typing import Any
 from k3code import chain_config, checkpoints
 from k3code.commands import CommandDef, CommandRegistry, tune
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
+from k3code.commands.bugs_cmd import BugsCommand
 from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
@@ -414,6 +415,7 @@ def build_registry() -> CommandRegistry:
         DoctorCommand(),
         UpdateCommand(),
         StatsCommand(),
+        BugsCommand(),
         DebugCommand(),
         DaemonCommand(),
         ScopeCommand(),

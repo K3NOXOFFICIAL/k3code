@@ -1748,5 +1748,65 @@ def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
 
 
 # Keep the guard last: every @cli.command / @cli.group above must be registered before cli() runs.
+def _bugs_since(_ctx: click.Context, _param: click.Parameter, value: str) -> float:
+    from k3code.commands.bugs_cmd import parse_since
+
+    try:
+        return parse_since(value)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+
+@cli.group("bugs", invoke_without_command=True)
+@click.option("--json", "as_json", is_flag=True)
+@click.option("--since", default="7d", show_default=True, callback=_bugs_since, help="Window in days, e.g. 7d")
+@click.pass_context
+def bugs_cmd(ctx: click.Context, as_json: bool, since: float) -> None:
+    """Open bug groups from $K3CODE_HOME/bugs.jsonl and the TUI crash log."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from k3code.commands.bugs_cmd import format_groups, groups_json, open_groups
+
+    found = open_groups(since)
+    click.echo(groups_json(found) if as_json else format_groups(found, since))
+
+
+@bugs_cmd.command("show")
+@click.argument("fp")
+def bugs_show_cmd(fp: str) -> None:
+    """The latest full record of one bug group."""
+    from k3code.commands.bugs_cmd import show_json
+
+    text = show_json(fp)
+    if text is None:
+        raise click.ClickException(f"Unknown bug group: {fp}")
+    click.echo(text)
+
+
+@bugs_cmd.command("export")
+@click.argument("path", required=False, type=click.Path(path_type=Path))
+@click.option("--since", default="7d", show_default=True, callback=_bugs_since, help="Window in days, e.g. 7d")
+def bugs_export_cmd(path: Path | None, since: float) -> None:
+    """Write a Markdown fix brief of the open groups (default $K3CODE_HOME/bugs/brief-<ts>.md)."""
+    from k3code import bugread
+
+    click.echo(f"Wrote the bug brief to {bugread.export(path.expanduser() if path else None, since)}")
+
+
+@bugs_cmd.command("resolve")
+@click.argument("fp", required=False)
+@click.option("--all", "every", is_flag=True, help="Resolve every open group")
+def bugs_resolve_cmd(fp: str | None, every: bool) -> None:
+    """Mark one bug group, or every open one, resolved."""
+    from k3code.commands.bugs_cmd import resolve_message
+
+    if (fp is None) == (not every):
+        raise click.UsageError("give a fingerprint or --all, not both")
+    ok, text = resolve_message(fp, every)
+    if not ok:
+        raise click.ClickException(text)
+    click.echo(text)
+
+
 if __name__ == "__main__":
     cli()

@@ -39,6 +39,7 @@ SKIP = "skip"
 #: Hosts that mean "this chain entry goes through OmniRoute".
 OMNIROUTE_MARKERS = ("omniroute", ":20128")
 MIN_FREE_GB = 5.0
+BUGS_DAYS = 7
 
 
 @dataclass
@@ -593,6 +594,26 @@ JOURNAL_MAX_FILES = 20
 JOURNAL_BUDGET_S = 2.0
 
 
+def check_bugs() -> Check:
+    """Open bug groups seen in the last ``BUGS_DAYS`` days. bugread reads ``$K3CODE_HOME``, not ``run_checks``' home."""
+    from k3code import bugread
+
+    cutoff = time.time() - BUGS_DAYS * bugread._DAY
+    try:
+        fps = [g.fp for g in bugread.groups() if g.last_seen >= cutoff]
+    except OSError as e:
+        return Check("bugs", WARN, f"cannot read the bug log: {e}")
+    if fps:
+        return Check(
+            "bugs",
+            WARN,
+            f"{len(fps)} open bug group(s) in {BUGS_DAYS} days, run k3code bugs",
+            "k3code bugs export writes a fix brief; k3code bugs resolve <fp> marks one fixed",
+            {"open": len(fps), "fps": fps},
+        )
+    return Check("bugs", OK, f"no open bug groups in {BUGS_DAYS} days", data={"open": 0})
+
+
 def _newest_journals(jdir: Path) -> list[Path]:
     stamped: list[tuple[float, Path]] = []
     for path in jdir.glob("*.jsonl") if jdir.is_dir() else []:
@@ -985,6 +1006,7 @@ async def run_checks(
         check_home(home),
         check_home_mode(home),
         check_journal(home),
+        check_bugs(),
         check_vendor(),
         # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
