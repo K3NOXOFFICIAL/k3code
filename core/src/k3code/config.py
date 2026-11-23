@@ -201,6 +201,15 @@ class SubagentsConfig(BaseModel):
     max_turns: int = 200
 
 
+class JobsConfig(BaseModel):
+    """/jobs and /pause: control the k3jobs 24/7 engine through its ``--json`` CLI."""
+
+    bin: str = "~/k3jobs/bin/k3jobs"  # the k3jobs executable, on this machine or on ``ssh_host``
+    ssh_host: str = ""  # empty = run ``bin`` on this machine; else ``ssh -o BatchMode=yes <host> <bin> ...``
+    root: str = ""  # exported as K3JOBS_ROOT for the call when set (default: k3jobs' own)
+    timeout_s: float = 30.0
+
+
 class AutomationConfig(BaseModel):
     """/loop, /schedule and automations."""
 
@@ -248,6 +257,7 @@ class Settings(BaseModel):
     goal: GoalConfig = Field(default_factory=GoalConfig)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
+    jobs: JobsConfig = Field(default_factory=JobsConfig)
 
     # router knobs: {max_inline_wait: 20, quota_cooldown: 3600}; see router.router.Router
     router: dict[str, Any] = Field(default_factory=dict)
