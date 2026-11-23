@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
-from k3code.providers.effort import openai_effort
+from k3code.providers.effort import NO_THINKING, openai_effort
 from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     Message,
@@ -162,6 +162,7 @@ class OpenAICompatProvider(Provider):
             usage = None
             complete = False  # [DONE] or a finish_reason arrived: the answer is whole
             finish_reason: str | None = None
+            guard = _StrayThinkGuard(active=not NO_THINKING.get())
             try:
                 async for line in watchdog.lines(response):
                     if not line.startswith("data:"):
@@ -186,7 +187,7 @@ class OpenAICompatProvider(Provider):
                             complete = True
                             finish_reason = choices[0]["finish_reason"]
                         delta = choices[0].get("delta") or {}
-                        if text := delta.get("content"):
+                        if text := guard.feed(delta.get("content") or ""):
                             content_parts.append(text)
                             yield StreamEvent(type="text_delta", text=text)
                         for tc in delta.get("tool_calls") or []:
@@ -210,6 +211,9 @@ class OpenAICompatProvider(Provider):
                                 slot["args"].append(args)
                     if chunk_usage := chunk.get("usage"):
                         usage = _parse_usage(chunk_usage)
+                    if guard.repeated and not tool_calls:  # a second stray </think>: the rest is one more repeat
+                        complete, finish_reason = True, finish_reason or "stop"
+                        break
             except httpx.HTTPError:
                 if not complete:
                     raise
@@ -224,6 +228,9 @@ class OpenAICompatProvider(Provider):
                     ),
                     kind="openai",
                 )
+            if held := guard.flush():  # a reply that ends on "<" or "</": not a tag after all
+                content_parts.append(held)
+                yield StreamEvent(type="text_delta", text=held)
             final_calls: list[ToolCall] = []
             for idx in sorted(tool_calls):
                 slot = tool_calls[idx]
@@ -244,6 +251,69 @@ class OpenAICompatProvider(Provider):
             raise to_provider_error(exc, kind="openai") from exc
         finally:
             await response.aclose()
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+class _StrayThinkGuard:
+    """Drops a stray ``</think>`` inside ``content`` and the repeated answer after it.
+
+    A local model (llama-server, Qwopus3.6) sometimes closes its reasoning a second time in the reply; the text after
+    that tag repeats the answer. Off for a no-thinking turn and once the content opens its own ``<think>`` (inline
+    reasoning is legitimate). A trailing prefix of the tag is held back, so a tag split across chunks is still seen.
+    """
+
+    def __init__(self, *, active: bool) -> None:
+        self.active = active
+        self.cut = False  # a stray tag arrived: the rest of the content is dropped, tool calls still count
+        self.repeated = False  # a second stray tag arrived: the stream can end
+        self._held = ""  # a trailing prefix of the tag, not shown yet
+        self._tail = ""  # the last characters shown, to see a <think> split across chunks
+        self._spoke = False  # non-whitespace content was shown
+
+    def feed(self, text: str) -> str:
+        """The part of ``text`` to show and store."""
+        if not self.active:
+            return text
+        buf, self._held = self._held + text, ""
+        close = buf.find(_THINK_CLOSE)
+        if self.cut:  # dropping the repeat: only watch for a second tag
+            self.repeated = self.repeated or close >= 0
+            if not self.repeated:
+                self._held = buf[len(buf) - _tag_prefix(buf) :]
+            return ""
+        opened = (self._tail + buf).find(_THINK_OPEN)
+        if opened >= 0 and (close < 0 or opened - len(self._tail) < close):
+            self.active = False  # the model reasons inline: its own </think> is part of the reply
+            return buf
+        if close < 0:
+            keep = len(buf) - _tag_prefix(buf)
+            self._held = buf[keep:]
+            return self._shown(buf[:keep])
+        before, rest = buf[:close], buf[close + len(_THINK_CLOSE) :]
+        if self._spoke or before.strip():  # a tag with only whitespace before it ends reasoning: drop just the tag
+            self.cut = True
+        return self._shown(before) + self.feed(rest)
+
+    def flush(self) -> str:
+        """The held-back text when the stream ends: a prefix that never became a tag."""
+        held, self._held = self._held, ""
+        return "" if self.cut else held
+
+    def _shown(self, text: str) -> str:
+        self._tail = (self._tail + text)[-(len(_THINK_OPEN) - 1) :]
+        self._spoke = self._spoke or bool(text.strip())
+        return text
+
+
+def _tag_prefix(text: str) -> int:
+    """Length of the longest end of ``text`` that begins ``</think>`` (at most 7 characters)."""
+    for size in range(min(len(text), len(_THINK_CLOSE) - 1), 0, -1):
+        if text.endswith(_THINK_CLOSE[:size]):
+            return size
+    return 0
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
