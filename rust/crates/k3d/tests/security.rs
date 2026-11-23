@@ -274,8 +274,9 @@ fn a_symlink_at_the_token_path_is_replaced_not_written_through() {
 fn a_live_socket_is_not_taken_over_and_a_stale_one_is_replaced() {
     let scratch = Scratch::new();
     let sock = scratch.sock();
-    let _server = serve(&sock, &scratch.run_dir());
-    let token = auth::read_token(&sock).unwrap();
+    // a server that holds no k3d instance lock (another k3d is stopped by the lock first)
+    let _live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let token = auth::write_token(&sock).unwrap();
     let err = Server::bind(&sock, &scratch.run_dir()).err().expect("refused");
     assert!(err.to_string().contains("served by another process"), "{err}");
     assert!(
@@ -302,4 +303,36 @@ fn dropping_the_server_removes_its_socket_and_token_but_not_a_newer_token() {
     auth::write_token(&sock).unwrap(); // a newer daemon's token
     drop(server);
     assert!(auth::read_token(&sock).is_some(), "a newer daemon's token stays");
+}
+
+#[test]
+fn a_second_k3d_on_the_same_socket_fails_and_leaves_the_first_ones_token() {
+    let scratch = Scratch::new();
+    let sock = scratch.sock();
+    let _first = Server::bind(&sock, &scratch.run_dir()).unwrap();
+    let token = fs::read(auth::token_path(&sock)).unwrap();
+    // the first k3d's socket is not connectable (before its bind, or unlinked): only the lock keeps a second out
+    fs::remove_file(&sock).unwrap();
+    let err = Server::bind(&sock, &scratch.run_dir())
+        .err()
+        .expect("a second k3d is refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+    assert!(err.to_string().contains("another k3d holds"), "{err}");
+    assert_eq!(
+        fs::read(auth::token_path(&sock)).unwrap(),
+        token,
+        "the first k3d keeps its token"
+    );
+    assert!(!sock.exists(), "the second k3d binds no socket");
+}
+
+#[test]
+fn the_instance_lock_is_released_when_the_server_drops() {
+    let scratch = Scratch::new();
+    let sock = scratch.sock();
+    let first = Server::bind(&sock, &scratch.run_dir()).unwrap();
+    assert_eq!(mode(&auth::lock_path(&sock)), 0o600);
+    drop(first);
+    let _second = Server::bind(&sock, &scratch.run_dir()).expect("the lock is free again");
+    assert!(UnixStream::connect(&sock).is_ok());
 }

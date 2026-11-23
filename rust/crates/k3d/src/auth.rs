@@ -53,6 +53,39 @@ pub fn token_path(sock: &Path) -> PathBuf {
     sock.with_extension("token")
 }
 
+/// The single-instance lock of the daemon serving `sock`: next to it, named after it (`k3d.sock` -> `k3d.lock`).
+pub fn lock_path(sock: &Path) -> PathBuf {
+    sock.with_extension("lock")
+}
+
+/// Take an exclusive, non-blocking flock on [`lock_path`] (`daemon.acquire_instance_lock`); keep the file to hold it.
+///
+/// Without it a second k3d on `sock` would pass the stale-socket check whenever the first one's socket is not
+/// connectable (before its bind, or after the file was unlinked) and overwrite the first one's token.
+pub fn acquire_instance_lock(sock: &Path) -> io::Result<File> {
+    let path = lock_path(sock);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("another k3d holds {}; not serving {}", path.display(), sock.display()),
+            ));
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(e),
+    }
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(file)
+}
+
 fn refused(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -177,6 +210,12 @@ mod tests {
     fn token_path_sits_next_to_the_socket() {
         assert_eq!(token_path(Path::new("/r/k3d.sock")), PathBuf::from("/r/k3d.token"));
         assert_eq!(token_path(Path::new("/r/k3d")), PathBuf::from("/r/k3d.token"));
+    }
+
+    #[test]
+    fn lock_path_sits_next_to_the_socket() {
+        assert_eq!(lock_path(Path::new("/r/k3d.sock")), PathBuf::from("/r/k3d.lock"));
+        assert_eq!(lock_path(Path::new("/r/k3d")), PathBuf::from("/r/k3d.lock"));
     }
 
     #[test]

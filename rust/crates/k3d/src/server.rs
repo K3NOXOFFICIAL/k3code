@@ -136,13 +136,19 @@ pub struct Server {
     sock: PathBuf,
     ino: u64,
     token: Arc<Token>,
+    /// The flock on `<socket>.lock`, held for the server's lifetime. Fields drop after `Drop::drop`, so the lock is
+    /// released only once the socket and token are cleaned up; the lock file stays, as the Python daemon's does.
+    _lock: fs::File,
 }
 
 impl Server {
-    /// Prepare the directory, write the token, then bind `sock` 0600. A socket another process still serves is
+    /// Prepare the directory, take the instance lock, write the token, then bind `sock` 0600. While another k3d
+    /// holds the lock this fails without touching its socket or token. A socket another process still serves is
     /// never taken over; a stale one (nothing answers) is replaced.
     pub fn bind(sock: &Path, private_run_dir: &Path) -> io::Result<Server> {
         auth::prepare_socket_dir(sock, private_run_dir)?;
+        // one k3d per socket: the lock comes before anything that could touch another instance's socket or token
+        let lock = auth::acquire_instance_lock(sock)?;
         if fs::symlink_metadata(sock).is_ok() {
             if UnixStream::connect(sock).is_ok() {
                 return Err(io::Error::new(
@@ -164,6 +170,7 @@ impl Server {
             sock: sock.to_path_buf(),
             ino,
             token: Arc::new(token),
+            _lock: lock,
         })
     }
 
