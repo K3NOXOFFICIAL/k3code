@@ -96,6 +96,7 @@ class OpenAICompatProvider(Provider):
             _add_cache_breakpoints(wire)
         # Reasoning models (gpt-5, o-series) on api.openai.com reject max_tokens (#171): send
         # max_completion_tokens instead, matching takes_effort (relay-prefixed ids like openai/gpt-5 covered).
+        from k3code.providers.effort import NO_THINKING
         from k3code.providers.effort import takes_effort as _takes_effort
 
         payload: dict[str, Any] = {
@@ -109,6 +110,9 @@ class OpenAICompatProvider(Provider):
             payload["temperature"] = temperature
         if effort := openai_effort(model):
             payload["reasoning_effort"] = effort
+        # a local server (llama.cpp) takes the template flag; a hosted API may reject a field it does not know
+        if NO_THINKING.get() and httpx.URL(self.base_url).host in ("127.0.0.1", "localhost", "::1"):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         if tools:
             payload["tools"] = [
                 {

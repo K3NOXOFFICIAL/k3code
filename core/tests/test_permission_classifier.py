@@ -302,6 +302,21 @@ async def test_the_verdict_has_room_for_a_thinking_models_reasoning(tmp_path) ->
     assert kw["max_tokens"] == MAX_TOKENS and MAX_TOKENS >= 4 * 512
 
 
+async def test_the_verdict_is_asked_without_a_reasoning_block(tmp_path) -> None:
+    from k3code.permissions.classifier import classify
+    from k3code.providers.effort import NO_THINKING
+
+    seen: list[bool] = []
+
+    class RecordingCaller(FakeCaller):
+        async def complete(self, kind: Any, messages: list[Message], **kw: Any) -> Any:
+            seen.append(NO_THINKING.get())
+            return await super().complete(kind, messages, **kw)
+
+    await classify(RecordingCaller(ALLOW), _bash("rm -rf build"), _history(), cwd=tmp_path)
+    assert seen == [True] and NO_THINKING.get() is False  # set for the model call, reset after
+
+
 async def test_an_identical_call_is_answered_from_the_cache(tmp_path) -> None:
     from k3code.permissions.classifier import classify
 

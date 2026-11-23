@@ -12,6 +12,8 @@ from contextvars import ContextVar
 LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 REASONING_EFFORT: ContextVar[str | None] = ContextVar("k3code_reasoning_effort", default=None)
+#: Set by the permission classifier: no reasoning block for a verdict (local servers only, see openai_compat)
+NO_THINKING: ContextVar[bool] = ContextVar("k3code_no_thinking", default=False)
 
 # Claude models that accept ``output_config.effort``: every 5-generation model, Opus 4.5+ and Sonnet 4.6.
 _ANTHROPIC_EFFORT = re.compile(r"claude-(?:[a-z]+-5(?:\b|-)|opus-4-[5-9]|sonnet-4-6)")

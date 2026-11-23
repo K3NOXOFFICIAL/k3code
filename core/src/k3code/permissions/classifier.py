@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from k3code.providers.effort import NO_THINKING
 from k3code.providers.types import Message, ToolCall
 from k3code.routing.tiers import TaskKind, Tier
 
@@ -244,6 +245,7 @@ async def classify(
     if call.name == "bash" and len(_call_body(call)) > CALL_CHARS:  # as shown (JSON-escaped when it has other keys)
         # the model would see a clipped command: padding must not hide the part that does the harm
         return _no_verdict("the command is too long to judge", interactive)
+    no_thinking = NO_THINKING.set(True)  # a verdict is a few tokens: a reasoning block only spends time and the cap
     try:
         res = await asyncio.wait_for(
             caller.complete(
@@ -263,6 +265,8 @@ async def classify(
     except Exception as e:  # noqa: BLE001 - a failed check must never crash the tool call or allow it
         logger.info("permission classifier failed: %s", type(e).__name__, exc_info=True)
         return _no_verdict(f"{type(e).__name__}", interactive)
+    finally:
+        NO_THINKING.reset(no_thinking)
     if parsed is None:
         return _no_verdict("unreadable reply", interactive)
     if cache is not None:
