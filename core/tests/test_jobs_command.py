@@ -165,6 +165,24 @@ async def test_unparseable_success_output_is_reported_not_hidden(monkeypatch):
     assert "not JSON" in await run("jobs")
 
 
+@pytest.mark.parametrize("output", ["not json", '{"ok": false}', "[]"])
+async def test_pause_and_resume_need_an_ok_json_answer(monkeypatch, output):
+    async def junk(cfg, args):
+        return 0, output, ""
+
+    monkeypatch.setattr(jobs_mod, "run_k3jobs", junk)
+    for name, arg in (("pause", "alpha"), ("jobs", "pause alpha"), ("jobs", "resume alpha")):
+        out = await run(name, arg)
+        assert not out.startswith(("Paused", "Resumed")) and "state unknown" in out
+
+
+async def test_pause_all_does_not_count_an_unacknowledged_pause(fake):
+    fake.answers[("pause", "alpha")] = (0, {"ok": False}, "")
+    out = await run("pause", "all")
+    assert out.splitlines()[0] == "Paused 1 of 2 running jobs."
+    assert "alpha: k3jobs exited 0" in out and "beta: paused" in out
+
+
 def test_local_argv_expands_tilde_and_appends_json(monkeypatch):
     monkeypatch.setenv("HOME", "/home/someone")
     argv, env = jobs_mod.build_call(make_ctx().config.jobs, ["pause", "alpha"])

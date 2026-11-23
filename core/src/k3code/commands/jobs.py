@@ -131,6 +131,14 @@ def explain(c: Call, cfg: Any, what: str) -> str:
     return f"{what}: k3jobs exited {c.code}. {msg}".strip()
 
 
+NOT_ACKED = "k3jobs exited 0 but did not answer with an ok JSON document (is jobs.bin the k3jobs CLI?); state unknown."
+
+
+def _acked(c: Call) -> bool:
+    """A state-changing call counts as done only when k3jobs said so: exit 0 and a JSON document that is not ok:false."""
+    return c.code == 0 and c.doc is not None and c.doc.get("ok") is not False
+
+
 def _jobs_of(c: Call) -> list[dict[str, Any]]:
     jobs = (c.doc or {}).get("jobs")
     return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
@@ -203,6 +211,8 @@ async def do_pause(cfg: Any, name: str) -> str:
     c = await call(cfg, ["pause", name])
     if c.code != 0:
         return explain(c, cfg, f"/pause {name}")
+    if not _acked(c):
+        return f"/pause {name}: {NOT_ACKED}"
     return f"Paused {name}. /jobs resume {name} to start it again."
 
 
@@ -222,9 +232,11 @@ async def do_pause_all(cfg: Any) -> str:
             lines.append(f"  {name}: skipped (unexpected job name)")
             continue
         r = await call(cfg, ["pause", name])
-        if r.code == 0:
+        if _acked(r):
             paused += 1
             lines.append(f"  {name}: paused")
+        elif r.code == 0:
+            lines.append(f"  {name}: {NOT_ACKED}")
         else:
             lines.append("  " + explain(r, cfg, name))
     return "\n".join([f"Paused {paused} of {len(todo)} running jobs.", *lines])[:MAX_SHOWN]
@@ -236,6 +248,8 @@ async def do_resume(cfg: Any, name: str) -> str:
     c = await call(cfg, ["resume", name])
     if c.code != 0:
         return explain(c, cfg, f"/jobs resume {name}")
+    if not _acked(c):
+        return f"/jobs resume {name}: {NOT_ACKED}"
     extra = str((c.doc or {}).get("message") or "").strip()
     return f"Resumed {name}.{(' ' + extra) if extra else ''}"
 
