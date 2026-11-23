@@ -2276,6 +2276,46 @@ def test_a_k3d_that_fails_to_build_or_start_keeps_the_active_versions_k3d(tmp_pa
     assert "v1" in (v2 / "bin" / "k3d").read_text() and os.access(v2 / "bin" / "k3d", os.X_OK)
 
 
+@pytest.mark.parametrize("first", ["no cargo", "fails to build", "an older installer"])
+def test_a_missing_k3d_is_built_when_the_same_version_is_installed_again(tmp_path: Path, first: str) -> None:
+    """The version was complete, so every later run for the same commit reused it as it was and k3d never came,
+    although doctor says `k3code update` builds it once cargo is there."""
+    src = _k3d_checkout(tmp_path)
+    install = src / "install" / "install.sh"
+    args = ("--from-source", "--minimal")
+    if first == "no cargo":
+        env = {"PATH": _path_without(tmp_path, "cargo")}
+        r = run(tmp_path, install, *args, env_extra=env, drop=("K3_SKIP_K3D",))
+    elif first == "fails to build":
+        r = run(tmp_path, install, *args, drop=("K3_SKIP_K3D",), path_front=_cargo(tmp_path / "fail", None))
+    else:  # K3_SKIP_K3D stands in for an installer from before k3d: no k3d and no marker
+        r = run(tmp_path, install, *args)
+    assert r.returncode == 0, r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".complete").is_file() and not (current / "bin" / "k3d").exists()
+    r = run(
+        tmp_path, install, *args, drop=("K3_SKIP_K3D",), path_front=_cargo(tmp_path / "good", _k3d_usage("retried"))
+    )
+    assert r.returncode == 0, r.stderr
+    assert "already installed" in r.stderr and (tmp_path / DATA_REL / "current").resolve() == current
+    assert "retried" in (current / "bin" / "k3d").read_text() and os.access(current / "bin" / "k3d", os.X_OK)
+    assert not (current / ".k3d-pending").exists()
+
+
+def test_a_k3d_that_hangs_when_probed_is_not_installed_and_does_not_hang_the_install(tmp_path: Path) -> None:
+    src = _k3d_checkout(tmp_path)
+    hangs = _cargo(tmp_path / "hang", "exec sleep 60")
+    started = time.monotonic()
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_K3D",), path_front=hangs
+    )
+    assert time.monotonic() - started < 30, "the k3d probe was not bounded"
+    assert r.returncode == 0, r.stderr
+    assert "the new k3d sidecar does not start" in r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert not (current / "bin" / "k3d").exists() and (current / ".k3d-pending").is_file()
+
+
 def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
     # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
     # (next test) must not promise an offline install

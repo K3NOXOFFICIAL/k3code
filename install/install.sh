@@ -1074,7 +1074,8 @@ retry_k3_build() {
 
 # k3d (rust/crates/k3d) is optional like k3: without it the gateway answers k3d.* with k3d_unavailable.
 k3d_starts() { # k3d_starts BIN: BIN runs. k3d has no --version: an unknown flag prints its usage and exits (no socket)
-  out=$("$1" --version 2>&1 </dev/null) || true
+  # a probe that never returns fails (and the previous k3d is kept) instead of hanging the install or the update
+  if have timeout; then out=$(timeout 5 "$1" --version 2>&1 </dev/null) || true; else out=$("$1" --version 2>&1 </dev/null) || true; fi
   case "$out" in "usage: k3d"* | "k3d "*) return 0 ;; esac
   return 1
 }
@@ -1083,6 +1084,7 @@ k3d_starts() { # k3d_starts BIN: BIN runs. k3d has no --version: an unknown flag
 # good two updates later. The active version's k3d goes into the new version instead (`k3code update --rollback`
 # still returns to the whole previous version).
 keep_previous_k3d() { # keep_previous_k3d WHY
+  printf 'k3d: %s\n' "$1" >"$VERDIR/.k3d-pending" # retry_k3d_build tries again on the next run for this version
   prev=$DATA/current/bin/k3d
   if [ -f "$prev" ] && k3d_starts "$prev"; then
     cp "$prev" "$VERDIR/bin/k3d.new" && chmod 755 "$VERDIR/bin/k3d.new" && mv -f "$VERDIR/bin/k3d.new" "$VERDIR/bin/k3d"
@@ -1097,6 +1099,7 @@ build_k3d() {
   if [ "${K3_SKIP_K3D:-0}" = 1 ] || [ ! -f "$SRC_ROOT/rust/crates/k3d/Cargo.toml" ]; then return 0; fi
   if ! find_cargo; then
     log "k3d sidecar skipped: cargo not found (optional; the gateway answers k3d.* with k3d_unavailable)"
+    printf 'k3d: cargo not found\n' >"$VERDIR/.k3d-pending" # retry_k3d_build tries again once cargo is there
     return 0
   fi
   log "building the k3d sidecar (cargo build --release; the first build takes a minute)"
@@ -1108,7 +1111,9 @@ build_k3d() {
   if (cd "$SRC_ROOT/rust" && PATH="$(dirname "$CARGO"):$PATH" CARGO_TARGET_DIR=$K3D_TMP \
     "$CARGO" build --release --locked -p k3d >&2) && [ -f "$built" ]; then
     if k3d_starts "$built"; then
-      cp "$built" "$VERDIR/bin/k3d" && chmod 755 "$VERDIR/bin/k3d"
+      # through a rename: on a retry the old binary may be running (cp onto it fails with "text file busy")
+      cp "$built" "$VERDIR/bin/k3d.new" && chmod 755 "$VERDIR/bin/k3d.new" && mv -f "$VERDIR/bin/k3d.new" "$VERDIR/bin/k3d"
+      rm -f "$VERDIR/.k3d-pending"
     else
       keep_previous_k3d "the new k3d sidecar does not start"
     fi
@@ -1117,6 +1122,19 @@ build_k3d() {
   fi
   rm -rf "$K3D_TMP"
   K3D_TMP=""
+  return 0
+}
+
+# A complete version is reused as it is by every later run for the same commit, so a k3d that was skipped (no cargo)
+# or did not build or start (.k3d-pending), or a version an older installer made without k3d, is built there. Without
+# cargo it stays as it is (doctor warns).
+retry_k3d_build() {
+  if [ "${K3_SKIP_K3D:-0}" = 1 ] || [ ! -f "$SRC_ROOT/rust/crates/k3d/Cargo.toml" ]; then return 0; fi
+  if [ -f "$VERDIR/bin/k3d" ] && [ ! -f "$VERDIR/.k3d-pending" ]; then return 0; fi
+  if ! find_cargo; then return 0; fi
+  log "the k3d sidecar of $VER was not built last time: trying again"
+  mkdir -p "$VERDIR/bin"
+  build_k3d
   return 0
 }
 
@@ -1172,6 +1190,7 @@ install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
     retry_k3_build
+    retry_k3d_build
     record_origin # the build is reused, but the ref, remote and checkout asked for now are what the install follows
     return 0
   fi
