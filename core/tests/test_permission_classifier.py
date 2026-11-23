@@ -114,12 +114,12 @@ async def test_the_object_alone_in_one_code_fence_is_read(tmp_path) -> None:
     ],
 )
 async def test_one_leading_think_block_is_dropped(reply: str, tmp_path) -> None:
-    from k3code.permissions.classifier import classify
+    from k3code.permissions.classifier import MAX_TOKENS, classify
 
     caller = FakeCaller(reply)
     v = await classify(caller, _bash("rm -rf ../x"), _history(), cwd=tmp_path)
     assert v.action == "deny" and not v.failed
-    assert caller.calls[0][2]["max_tokens"] == 512  # room for the think block before the object
+    assert caller.calls[0][2]["max_tokens"] == MAX_TOKENS  # room for the think block before the object
 
 
 @pytest.mark.parametrize(
@@ -291,6 +291,15 @@ async def test_the_call_goes_to_the_cheap_tier_without_escalation(tmp_path) -> N
     assert kind == TaskKind.CLASSIFICATION
     assert kw["tier"] == Tier.CHEAP and kw["escalate"] is False
     assert kw["timeout"] == 3.0 and kw["session_id"] == "s1"
+
+
+async def test_the_verdict_has_room_for_a_thinking_models_reasoning(tmp_path) -> None:
+    from k3code.permissions.classifier import MAX_TOKENS, classify
+
+    caller = FakeCaller(ALLOW)
+    await classify(caller, _bash("rm -rf build"), _history(), cwd=tmp_path, session_id="s1")
+    ((_, _, kw),) = caller.calls
+    assert kw["max_tokens"] == MAX_TOKENS and MAX_TOKENS >= 4 * 512
 
 
 async def test_an_identical_call_is_answered_from_the_cache(tmp_path) -> None:

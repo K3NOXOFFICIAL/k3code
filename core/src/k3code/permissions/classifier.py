@@ -52,6 +52,8 @@ CALL_CHARS = 4000
 #: Verdicts one session keeps; past this the oldest go
 CACHE_MAX = 512
 DEFAULT_TIMEOUT_S = 8.0
+#: Completion tokens per verdict: a thinking model's <think> block comes first, and at 512 it ran out before the object
+MAX_TOKENS = 2048
 
 _TAG_RE = re.compile(r"</?(?:user_messages|pending_call)\s*>", re.IGNORECASE)
 #: A thinking model's one leading <think>...</think> block (to its first close tag), dropped before the reply is read
@@ -248,7 +250,7 @@ async def classify(
                 TaskKind.CLASSIFICATION,
                 classifier_messages(call, history, cwd),
                 session_id=session_id,
-                max_tokens=512,  # a thinking model's <think> block comes before the object
+                max_tokens=MAX_TOKENS,
                 timeout=timeout_s,
                 escalate=False,
                 tier=Tier.CHEAP,
