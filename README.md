@@ -104,6 +104,10 @@ The full wizard has 13 steps: `welcome`, `about`, `system`, `usage`, `providers`
 
 ```sh
 k3code doctor                                    # health checks with fix hints
+k3code bugs                                      # open bug groups of the last 7 days (add --since 30d or --json)
+k3code bugs show <fp>                            # the latest full record of one bug group
+k3code bugs export [PATH] [--since 7d]           # Markdown fix brief for Claude (default $K3CODE_HOME/bugs/brief-<ts>.md)
+k3code bugs resolve <fp>|--all                   # mark one bug group, or every open one, resolved
 k3code setup --step providers                    # re-run one step (any step name above)
 k3code setup --restart                           # ignore saved progress and start over
 k3code setup --non-interactive --answers FILE    # unattended setup (add --no-probe to skip live provider tests; see install/answers.sample.yaml)
@@ -159,7 +163,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
 | **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/learned` (list what was learned; `/learned forget <id>`; `/learned purge [--all] --yes`) · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
-| **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
+| **Operations** | `/doctor` · `/bugs` (captured failures; `show`, `export` and `resolve` as in `k3code bugs`) · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
 
 ### Permission modes
