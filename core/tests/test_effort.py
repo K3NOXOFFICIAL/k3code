@@ -55,3 +55,22 @@ def test_openai_reasoning_effort_is_clamped() -> None:
         assert "reasoning_effort" not in _openai_payload("llama3.1")
     finally:
         effort.REASONING_EFFORT.reset(token)
+
+
+def _openai_payload_at(base_url: str) -> dict:
+    p = OpenAICompatProvider(name="o", base_url=base_url, api_key="k")
+    return p._payload([Message(role="user", content="hi")], [], "qwen3-35b", max_tokens=10, temperature=None)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "sent"),
+    [("http://127.0.0.1:1234/v1", True), ("http://localhost:8080/v1", True), ("https://api.k3nox.com/v1", False)],
+)
+def test_no_thinking_is_sent_to_a_local_server_only(base_url: str, sent: bool) -> None:
+    token = effort.NO_THINKING.set(True)
+    try:
+        payload = _openai_payload_at(base_url)
+    finally:
+        effort.NO_THINKING.reset(token)
+    assert payload.get("chat_template_kwargs") == ({"enable_thinking": False} if sent else None)
+    assert "chat_template_kwargs" not in _openai_payload_at("http://127.0.0.1:1234/v1")  # off unless asked
