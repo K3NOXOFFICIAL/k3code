@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import stat
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -299,15 +302,39 @@ def test_root_tilde_expands_locally_and_on_the_remote(monkeypatch):
     assert argv[7].startswith('env K3JOBS_ROOT="$HOME"/data/k3jobs ')
 
 
+async def test_timeout_bounds_the_wait_and_kills_the_childs_children(tmp_path):
+    pidfile = tmp_path / "child.pid"
+    script = tmp_path / "fake-k3jobs"
+    script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {pidfile}\nwait\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    start = time.monotonic()
+    code, _, err = await jobs_mod.run_k3jobs(make_ctx(bin=str(script), timeout_s=0.5).config.jobs, ["list"])
+    assert code == 124 and "timed out" in err
+    assert time.monotonic() - start < 5
+    child = int(pidfile.read_text())
+    for _ in range(50):  # the grandchild must die with the group, not linger holding the pipes
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        os.kill(child, signal.SIGKILL)
+        pytest.fail("the child's child survived the timeout")
+
+
 async def test_timeout_survives_a_process_that_already_exited(monkeypatch):
+    def gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(jobs_mod.os, "killpg", gone)
+
     class Proc:
         returncode = None
+        pid = 1
 
         async def communicate(self):
             await asyncio.sleep(10)
-
-        def kill(self):
-            raise ProcessLookupError
 
         async def wait(self):
             return 0

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -76,14 +77,16 @@ async def run_k3jobs(cfg: Any, args: list[str]) -> tuple[int, str, str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=True,  # own process group, so a timeout can kill k3jobs' children too
         )
     except FileNotFoundError:
         return 127, "", f"not found: {argv[0]}"
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=cfg.timeout_s)
     except TimeoutError:
+        # kill the whole group: a surviving child keeps the pipes open and wait() would block past timeout_s
         with contextlib.suppress(ProcessLookupError):  # it may have exited while a child held the pipes open
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
         await proc.wait()
         return 124, "", f"timed out after {cfg.timeout_s:g}s"
     code = proc.returncode if proc.returncode is not None else 1
