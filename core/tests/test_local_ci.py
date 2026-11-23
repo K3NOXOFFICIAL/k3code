@@ -28,7 +28,7 @@ MERGE_PR = REPO / "scripts" / "ci" / "merge-pr.sh"
 RELEASE = REPO / "scripts" / "release" / "release.sh"
 PRE_PUSH = REPO / ".githooks" / "pre-push"
 INSTALL_HOOKS = REPO / "scripts" / "dev" / "install-hooks.sh"
-AREAS = ["shell", "vendor", "secrets", "core", "panes", "tui"]
+AREAS = ["shell", "vendor", "secrets", "core", "panes", "rust", "tui"]
 ZERO = "0" * 40
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None or shutil.which("git") is None, reason="needs bash, git")
@@ -70,7 +70,7 @@ def _stub_bin(tmp: Path, fail: tuple[str, ...] = ()) -> Path:
     `npm ci`, which creates node_modules. gh records its arguments in gh.log."""
     bindir = tmp / "bin"
     bindir.mkdir()
-    for tool in ("uv", "node", "npx", "go", "gitleaks", "shellcheck", "bwrap", "python3", "cc"):
+    for tool in ("uv", "node", "npx", "go", "cargo", "rustc", "gitleaks", "shellcheck", "bwrap", "python3", "cc"):
         (bindir / tool).write_text(f"#!/bin/sh\nexit {1 if tool in fail else 0}\n")
     (bindir / "npm").write_text('#!/bin/sh\n[ "$1" = ci ] && mkdir -p node_modules\nexit 0\n')
     (bindir / "gh").write_text(
@@ -183,6 +183,7 @@ def _ci_repo(tmp: Path, env: dict[str, str]) -> Path:
             "tui/package-lock.json": "{}\n",
             "core/k": "",
             "panes/k": "",
+            "rust/k": "",
             "README.md": "x\n",
         },
     )
@@ -203,7 +204,7 @@ def test_post_sets_the_local_ci_status_after_a_full_run(tmp_path: Path) -> None:
     assert len(api) == 1
     assert f"repos/owner/repo/statuses/{sha}" in api[0]
     assert "state=success" in api[0] and "context=local-ci" in api[0]
-    assert "description=shell,vendor,secrets,core,panes,tui passed on" in api[0]
+    assert "description=shell,vendor,secrets,core,panes,rust,tui passed on" in api[0]
     assert (tmp_path / "logs" / "summary.txt").is_file()
 
 
@@ -354,7 +355,13 @@ def _pr_setup(tmp: Path, files: dict[str, str] | None = None, merges: int = 0) -
     repo = _repo(
         tmp,
         env,
-        {".gitignore": "node_modules/\n.k3dev/\n", "tui/package-lock.json": "{}\n", "core/k": "", "panes/k": ""},
+        {
+            ".gitignore": "node_modules/\n.k3dev/\n",
+            "tui/package-lock.json": "{}\n",
+            "core/k": "",
+            "panes/k": "",
+            "rust/k": "",
+        },
     )
     _git(repo, env, "remote", "add", "origin", str(origin))
     _git(repo, env, "push", "-q", "origin", "Main")
