@@ -266,6 +266,24 @@ async def test_pause_all_never_reports_all_clear_on_an_unusable_list(monkeypatch
     assert all(c == ["list"] for c in calls)  # nothing was paused
 
 
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        ["alpha", "beta"],
+        [{"id": "alpha", "paused": False}],
+        [{"name": "alpha", "paused": "false"}],
+        [{"name": "alpha"}],
+    ],
+)
+async def test_unreadable_job_entries_are_a_bad_list_not_an_all_clear(fake, jobs):
+    fake.answers["list"] = (0, {"ok": True, "jobs": jobs}, "")
+    for name, arg in (("pause", "all"), ("pause", ""), ("jobs", "")):
+        out = await run(name, arg)
+        assert "not JSON with a jobs list" in out
+        assert "Nothing to pause" not in out and "Running jobs: none" not in out
+    assert all(c == ["list"] for c in fake.calls)
+
+
 async def test_pause_all_skips_unexpected_names(fake):
     fake.answers["list"] = (0, {"ok": True, "jobs": [{"name": "Bad_Name", "paused": False}, JOBS[0]]}, "")
     out = await run("pause", "all")

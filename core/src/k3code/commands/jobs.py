@@ -143,7 +143,7 @@ NOT_ACKED = "k3jobs exited 0 but did not answer with an ok JSON document (is job
 
 
 def _acked(c: Call) -> bool:
-    """A state-changing call counts as done only when k3jobs said so: exit 0 and a JSON document that is not ok:false."""
+    """A state-changing call is done only when k3jobs said so: exit 0 and a JSON document that is not ok:false."""
     return c.code == 0 and c.doc is not None and c.doc.get("ok") is not False
 
 
@@ -157,7 +157,13 @@ BAD_LIST = "k3jobs answered, but the output is not JSON with a jobs list (is job
 
 def _bad_list(c: Call) -> bool:
     """A `list` that exited 0 without a usable job list must never read as 'no jobs running'."""
-    return not isinstance((c.doc or {}).get("jobs"), list)
+    jobs = (c.doc or {}).get("jobs")
+    if not isinstance(jobs, list):
+        return True
+    # an entry we cannot read (no string name, no bool paused) would be dropped and read as "nothing running"
+    return not all(
+        isinstance(j, dict) and isinstance(j.get("name"), str) and isinstance(j.get("paused"), bool) for j in jobs
+    )
 
 
 def _rate(v: Any) -> str:
