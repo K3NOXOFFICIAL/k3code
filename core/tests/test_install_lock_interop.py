@@ -41,6 +41,7 @@ def _hold_install_sh(tmp_path: Path) -> tuple[subprocess.Popen[bytes], Path]:
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
+        "K3_SKIP_K3D": "1",
         "K3_NO_DOWNLOAD": "1",
         "K3_NO_GH": "1",
     }

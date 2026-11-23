@@ -15,7 +15,10 @@
 #   PREFIX/share/k3code/current -> versions/<ver>           previous: a file with the name of the version before
 # Everything k3code needs is fetched into your home directory, without root: uv (and through it Python),
 # a private Node runtime (PREFIX/share/k3code/node, for the TUI) and a Go toolchain (PREFIX/share/k3code/go,
-# to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
+# to build the k3 pane binary) when they are not on PATH. k3d, the Rust sidecar (rust/crates/k3d), is built only when
+# cargo is on PATH or in ~/.cargo/bin: no Rust toolchain is fetched, and without one k3d is skipped (the gateway then
+# answers k3d.* with k3d_unavailable). A k3d that fails to build or to start keeps the active version's k3d in the new
+# version, so the binary is never lost to a bad build. bubblewrap is installed through the system package
 # manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches none of
 # these toolchains; the PyPI, npm and Go module packages the build needs still download. The installer never
 # runs onboarding; it ends by telling you to run `k3code onboard`.
@@ -23,7 +26,7 @@
 # prints a health subset. It never fails the install.
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium), K3_CONNECT_TIMEOUT=SECS (a download connection gives up after
 #   SECS seconds and is retried; default 15). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
-#   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
+#   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_SKIP_K3D, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
 # K3_REQUIRE_TUI=1 (set by `k3code update`): a TUI build that was tried and failed fails the run, so no version without
 # the TUI is staged for an update. Without it such a failure is a warning and k3code uses the line REPL.
@@ -38,6 +41,7 @@ BUILDING=""
 REQS=""
 UV_TMP=""
 TUI_TMP=""
+K3D_TMP=""
 GIT_ERR=""
 LOCK=""
 
@@ -68,6 +72,7 @@ Options:
 
 Fetched when missing (into PREFIX/share/k3code, no root): uv, Python 3.12+, Node 22 (the TUI), Go (the k3
 pane binary). bubblewrap (sandbox, Linux) is installed only when root or passwordless sudo is available.
+Never fetched: cargo. With it (on PATH or in ~/.cargo/bin) the k3d sidecar is built; without it k3d is skipped.
 
 Presetup (on by default, after the version is activated; never fails the install): checks the sandbox, installs
 Chromium for the browser tool (about 115 MiB; K3CODE_SKIP_CHROMIUM=1 skips only that) and prints a health subset.
@@ -100,6 +105,7 @@ cleanup() {
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
   if [ -n "$UV_TMP" ]; then rm -rf "$UV_TMP"; fi
   if [ -n "$TUI_TMP" ]; then rm -rf "$TUI_TMP"; fi
+  if [ -n "$K3D_TMP" ]; then rm -rf "$K3D_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
   if [ -n "$LOCK" ]; then
     rmdir "$DATA/tmp" 2>/dev/null || true # empty once the build dirs above are gone
@@ -407,6 +413,7 @@ hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourse
     bwrap:zypper) echo "sudo zypper install -y bubblewrap" ;;
     bwrap:apk) echo "sudo apk add bubblewrap" ;;
     bwrap:*) echo "install bubblewrap with your system package manager" ;;
+    cargo:*) echo "install Rust with rustup (https://rustup.rs, no root), then run k3code update" ;;
     *) echo "see the k3code README" ;;
   esac
 }
@@ -493,6 +500,10 @@ report() {
       item missing "go" "optional: builds the k3 pane binary"
       say "      $(hint_cmd go)"
     fi
+  fi
+  if find_cargo; then item ok "cargo" "$CARGO"; else
+    item missing "cargo" "optional: builds the k3d sidecar (never fetched; without it the gateway answers k3d_unavailable)"
+    say "      $(hint_cmd cargo)"
   fi
   if [ "$PLATFORM" = Linux ]; then
     if have bwrap; then item ok "bubblewrap"; else
@@ -603,6 +614,13 @@ find_go() {
     if [ -z "$GO" ]; then GO=$g GO_OLD=1; fi
   done
   [ -n "$GO" ]
+}
+
+# rustup installs into ~/.cargo/bin, which the shell `k3code update` runs in (the daemon, a service) often lacks
+find_cargo() { # sets CARGO; never fetched
+  CARGO=$(command -v cargo 2>/dev/null || true)
+  if [ -z "$CARGO" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then CARGO=$HOME/.cargo/bin/cargo; fi
+  [ -n "$CARGO" ]
 }
 
 ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against nodejs.org's SHASUMS256.txt
@@ -859,7 +877,7 @@ resolve_short_sha() {
 # shared one) is "dubious" to git, which then refuses every command: rev-parse failed silently, so each build was
 # named X.Y.Z-src and an update never left the first one. Its own install.sh runs anyway, so its config is trusted.
 # Both spellings of the path: git before 2.46 compares safe.directory with the symlink-free one.
-SRC_PATHS="VERSION core tui panes" # what an install reads from a checkout (fixed names without spaces)
+SRC_PATHS="VERSION core tui panes rust" # what an install reads from a checkout (fixed names without spaces)
 src_git() {
   gd=$(win_gitdir)
   if [ -n "$gd" ]; then
@@ -885,16 +903,16 @@ win_gitdir() {
 # already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
 # version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and a fixed
 # list of caches, dependencies and build outputs is skipped, so a test run or a TUI build does not change it.
-# Only what the install reads counts (VERSION, core, tui, panes): a Finder .DS_Store, editor state or an agent's
+# Only what the install reads counts (VERSION, core, tui, panes, rust): a Finder .DS_Store, editor state or an agent's
 # .claude directory elsewhere in the checkout must not turn an unchanged tree into a new version.
 tree_id() {
   if have sha256sum; then set -- sha256sum; else set -- shasum -a 256; fi
   roots=""
-  for r in VERSION core tui panes; do [ -e "$SRC_ROOT/$r" ] && roots="$roots ./$r"; done
+  for r in $SRC_PATHS; do [ -e "$SRC_ROOT/$r" ] && roots="$roots ./$r"; done
   # shellcheck disable=SC2086 # the roots are fixed names without spaces
   (cd "$SRC_ROOT" && LC_ALL=C find $roots \( -name .git -o -name .venv -o -name node_modules -o -name .k3dev \
     -o -name __pycache__ -o -name dist -o -name .pytest_cache -o -name .ruff_cache -o -name .k3code \
-    -o -name .DS_Store -o -path ./panes/k3 \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
+    -o -name .DS_Store -o -path ./panes/k3 -o -path ./rust/target \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
 }
 
 acquire_source() {
@@ -1054,6 +1072,54 @@ retry_k3_build() {
   return 0
 }
 
+# k3d (rust/crates/k3d) is optional like k3: without it the gateway answers k3d.* with k3d_unavailable.
+k3d_starts() { # k3d_starts BIN: BIN runs. k3d has no --version: an unknown flag prints its usage and exits (no socket)
+  out=$("$1" --version 2>&1 </dev/null) || true
+  case "$out" in "usage: k3d"* | "k3d "*) return 0 ;; esac
+  return 1
+}
+
+# Only the current and the previous version are kept, so a version without k3d after a failed build would lose it for
+# good two updates later. The active version's k3d goes into the new version instead (`k3code update --rollback`
+# still returns to the whole previous version).
+keep_previous_k3d() { # keep_previous_k3d WHY
+  prev=$DATA/current/bin/k3d
+  if [ -f "$prev" ] && k3d_starts "$prev"; then
+    cp "$prev" "$VERDIR/bin/k3d.new" && chmod 755 "$VERDIR/bin/k3d.new" && mv -f "$VERDIR/bin/k3d.new" "$VERDIR/bin/k3d"
+    log "WARNING: $1; keeping the k3d sidecar of $(basename "$(readlink "$DATA/current")")"
+  else
+    log "WARNING: $1; there is no k3d sidecar (the gateway answers k3d.* with k3d_unavailable)"
+  fi
+  return 0
+}
+
+build_k3d() {
+  if [ "${K3_SKIP_K3D:-0}" = 1 ] || [ ! -f "$SRC_ROOT/rust/crates/k3d/Cargo.toml" ]; then return 0; fi
+  if ! find_cargo; then
+    log "k3d sidecar skipped: cargo not found (optional; the gateway answers k3d.* with k3d_unavailable)"
+    return 0
+  fi
+  log "building the k3d sidecar (cargo build --release; the first build takes a minute)"
+  # the build writes its target dir: never into the user's checkout. cleanup removes it on exit; after a SIGKILL the
+  # run that takes over the lock removes DATA/tmp (clean_stage)
+  K3D_TMP=$(stage_dir cargo)
+  built=$K3D_TMP/release/k3d
+  # in rust/, so rustup reads rust-toolchain.toml; --locked builds the Cargo.lock set and never rewrites it
+  if (cd "$SRC_ROOT/rust" && PATH="$(dirname "$CARGO"):$PATH" CARGO_TARGET_DIR=$K3D_TMP \
+    "$CARGO" build --release --locked -p k3d >&2) && [ -f "$built" ]; then
+    if k3d_starts "$built"; then
+      cp "$built" "$VERDIR/bin/k3d" && chmod 755 "$VERDIR/bin/k3d"
+    else
+      keep_previous_k3d "the new k3d sidecar does not start"
+    fi
+  else
+    keep_previous_k3d "the k3d sidecar did not build (output above)"
+  fi
+  rm -rf "$K3D_TMP"
+  K3D_TMP=""
+  return 0
+}
+
 # The installed core is a regular copy (it must not depend on a checkout that can be switched or deleted).
 # Its runtime dependencies are the locked set from core/uv.lock without the dev group, so the install is the
 # set CI tested. --locked fails on a stale lock (a missing dependency) instead of installing the stale set.
@@ -1135,6 +1201,7 @@ install_version() {
   mkdir -p "$VERDIR/tui" "$VERDIR/bin"
   build_tui
   build_panes
+  build_k3d
   if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi

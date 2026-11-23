@@ -700,3 +700,24 @@ def test_readme_names_every_setup_step():
     readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
     names = ", ".join(f"`{n}`" for n in STEP_NAMES)
     assert f"The full wizard has {len(STEP_NAMES)} steps: {names}." in readme
+
+
+def test_k3d_check_reports_the_sidecar_present_or_absent(monkeypatch, tmp_path):
+    """Without cargo (k3server, the laptop, the Pi) the installer skips k3d: doctor warns and names rustup."""
+    from k3code import doctor, paths
+
+    root = tmp_path / "versions" / "1.0.0"
+    monkeypatch.setattr(paths, "install_roots", lambda: [root])
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.cargo/bin/cargo
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: None)
+    chk = doctor.check_k3d()
+    assert chk.status == doctor.WARN and chk.name == "k3d"
+    assert "absent" in chk.detail and "k3d_unavailable" in chk.detail and "rustup" in chk.fix
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: "/usr/bin/cargo" if name == "cargo" else None)
+    assert "rustup" not in doctor.check_k3d().fix and "k3code update" in doctor.check_k3d().fix
+    k3d = root / "bin" / "k3d"
+    k3d.parent.mkdir(parents=True)
+    k3d.write_text("#!/bin/sh\n")
+    k3d.chmod(0o755)
+    chk = doctor.check_k3d()
+    assert chk.status == doctor.OK and chk.data == {"path": str(k3d)} and "present" in chk.detail

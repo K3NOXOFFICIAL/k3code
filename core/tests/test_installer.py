@@ -36,6 +36,7 @@ def run(
         "K3_STUB_VENV": "1",  # fake core venv: no pip / network
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
+        "K3_SKIP_K3D": "1",
         "K3_NO_DOWNLOAD": "1",
         "K3_NO_GH": "1",
     }
@@ -252,6 +253,7 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
+        "K3_SKIP_K3D": "1",
         "K3_NO_DOWNLOAD": "1",
     }
 
@@ -325,7 +327,7 @@ def test_install_ps1_path_check_ignores_how_the_entry_is_spelled(user_path: str,
 
 def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_STUB_VENV": "1", "K3_SKIP_TUI": "1"}
-    env |= {"K3_SKIP_GO": "1", "K3_NO_DOWNLOAD": "1"}
+    env |= {"K3_SKIP_GO": "1", "K3_SKIP_K3D": "1", "K3_NO_DOWNLOAD": "1"}
     cmd = ["sh", str(INSTALL), "--from-source", "--prefix", "rel"]
     r = subprocess.run(cmd, env=env, cwd=tmp_path, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
@@ -1402,6 +1404,7 @@ def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
+        "K3_SKIP_K3D": "1",
         "K3_NO_GH": "1",
     }  # no K3_NO_DOWNLOAD: that means --no-install-deps, which never offers bubblewrap
     master, slave = os.openpty()
@@ -1466,6 +1469,7 @@ def test_bwrap_install_is_not_asked_when_stdout_and_stderr_are_redirected(tmp_pa
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
+        "K3_SKIP_K3D": "1",
         "K3_NO_GH": "1",
     }
     master, slave = os.openpty()
@@ -2170,6 +2174,106 @@ def test_a_failed_k3_build_is_retried_when_the_same_version_is_installed_again(t
     assert r.returncode == 0, r.stderr
     assert "already installed" in r.stderr
     assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+
+
+def _k3d_checkout(root: Path) -> Path:
+    """_mini_checkout with a rust/crates/k3d for the installer to build (uncommitted: an edit gives a new version)."""
+    src = _mini_checkout(root)
+    (src / "rust" / "crates" / "k3d").mkdir(parents=True)
+    (src / "rust" / "crates" / "k3d" / "Cargo.toml").write_text("[package]\nname = 'k3d'\n")
+    return src
+
+
+def _k3d_usage(tag: str) -> str:
+    """The body of a k3d stand-in that answers like k3d: an unknown flag prints the usage (TAG tells builds apart)."""
+    return f'echo "usage: k3d [--socket PATH] {tag}" >&2; exit 2'
+
+
+def _cargo(root: Path, k3d: str | None) -> Path:
+    """A stub cargo whose build writes a k3d running K3D into the target dir; None: the build fails."""
+    if k3d is None:
+        return stub_bin(root, "cargo", 'echo "error: could not compile `k3d`" >&2; exit 101\n')
+    body = (
+        't=${CARGO_TARGET_DIR:-target}/release; mkdir -p "$t"\n'
+        f"cat >\"$t/k3d\" <<'K3D'\n#!/bin/sh\n{k3d}\nK3D\n"
+        'chmod +x "$t/k3d"\n'
+    )
+    return stub_bin(root, "cargo", body)
+
+
+def test_k3d_is_built_into_the_version_outside_the_checkout(tmp_path: Path) -> None:
+    src = _k3d_checkout(tmp_path)
+    cargo = _cargo(tmp_path / "good", _k3d_usage("new"))
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_K3D",), path_front=cargo
+    )
+    assert r.returncode == 0, r.stderr
+    k3d = (tmp_path / DATA_REL / "current").resolve() / "bin" / "k3d"
+    assert "new" in k3d.read_text() and os.access(k3d, os.X_OK)
+    assert not (src / "rust" / "target").exists()  # the target dir was a stage dir in the install root
+    assert not (tmp_path / DATA_REL / "tmp").exists()  # and it is gone
+
+
+def test_without_cargo_the_install_skips_k3d_and_succeeds(tmp_path: Path) -> None:
+    """k3server, the laptop and the Pi have no cargo: no k3d, and the gateway answers k3d.* with k3d_unavailable."""
+    src = _k3d_checkout(tmp_path)
+    env = {"PATH": _path_without(tmp_path, "cargo")}
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", env_extra=env, drop=("K3_SKIP_K3D",)
+    )
+    assert r.returncode == 0, r.stderr
+    assert "k3d sidecar skipped: cargo not found" in r.stderr
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".complete").is_file() and not (current / "bin" / "k3d").exists()
+
+
+def test_without_cargo_k3code_update_still_stages_a_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code import update as upd
+
+    src = _k3d_checkout(tmp_path)
+    for k in [k for k in os.environ if k.startswith("GIT_") or k.startswith("K3_")]:
+        monkeypatch.delenv(k)
+    monkeypatch.delenv("K3CODE_DATA", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.cargo/bin/cargo either
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("PATH", _path_without(tmp_path, "cargo"))
+    for k in ("K3_STUB_VENV", "K3_SKIP_TUI", "K3_SKIP_GO", "K3_NO_DOWNLOAD", "K3_NO_GH"):
+        monkeypatch.setenv(k, "1")
+    lines: list[str] = []
+    ver = upd.update_from_source(src, pull=False, progress=lines.append)
+    assert ver.startswith("9.9.9-src")
+    assert any("k3d sidecar skipped: cargo not found" in line for line in lines)
+    vdir = tmp_path / DATA_REL / "versions" / ver
+    assert (vdir / ".complete").is_file() and not (vdir / "bin" / "k3d").exists()
+
+
+@pytest.mark.parametrize("new", ["fails to build", "does not start"])
+def test_a_k3d_that_fails_to_build_or_start_keeps_the_active_versions_k3d(tmp_path: Path, new: str) -> None:
+    """Only the current and the previous version are kept: without the copy, two bad k3d builds lose k3d for good."""
+    src = _k3d_checkout(tmp_path)
+    install = src / "install" / "install.sh"
+    args = ("--from-source", "--minimal")
+    current = tmp_path / DATA_REL / "current"
+    # the first build fails and there is no k3d to keep: a warning, the install goes on
+    r = run(tmp_path, install, *args, drop=("K3_SKIP_K3D",), path_front=_cargo(tmp_path / "fail", None))
+    assert r.returncode == 0, r.stderr
+    assert "the k3d sidecar did not build" in r.stderr and "there is no k3d sidecar" in r.stderr
+    assert not (current / "bin" / "k3d").exists()
+    # an edit under rust/ is a new version, and this one builds
+    manifest = src / "rust" / "crates" / "k3d" / "Cargo.toml"
+    manifest.write_text(manifest.read_text() + "# v1\n")
+    r = run(tmp_path, install, *args, drop=("K3_SKIP_K3D",), path_front=_cargo(tmp_path / "good", _k3d_usage("v1")))
+    assert r.returncode == 0, r.stderr
+    v1 = current.resolve()
+    assert "v1" in (v1 / "bin" / "k3d").read_text()
+    manifest.write_text(manifest.read_text() + "# v2\n")
+    bad = _cargo(tmp_path / "bad", None if new == "fails to build" else "exit 0")  # a k3d that prints no usage
+    r = run(tmp_path, install, *args, drop=("K3_SKIP_K3D",), path_front=bad)
+    assert r.returncode == 0, r.stderr
+    v2 = current.resolve()
+    assert v2 != v1
+    assert f"keeping the k3d sidecar of {v1.name}" in r.stderr
+    assert "v1" in (v2 / "bin" / "k3d").read_text() and os.access(v2 / "bin" / "k3d", os.X_OK)
 
 
 def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
