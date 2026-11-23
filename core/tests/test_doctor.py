@@ -702,18 +702,31 @@ def test_readme_names_every_setup_step():
     assert f"The full wizard has {len(STEP_NAMES)} steps: {names}." in readme
 
 
+def _k3d_install(tmp_path, monkeypatch, version: str, ref: str | None = None):
+    """versions/<version> made current in a data dir of the test's own, without bin/k3d."""
+    data = tmp_path / "data"
+    root = data / "versions" / version
+    root.mkdir(parents=True)
+    if ref is not None:
+        (root / ".ref").write_text(ref + "\n")
+    (data / "current").symlink_to(root)
+    monkeypatch.setenv("K3CODE_DATA", str(data))
+    return root
+
+
 def test_k3d_check_reports_the_sidecar_present_or_absent(monkeypatch, tmp_path):
     """Without cargo (k3server, the laptop, the Pi) the installer skips k3d: doctor warns and names rustup."""
     from k3code import doctor, paths
+    from k3code import update as upd
 
-    root = tmp_path / "versions" / "1.0.0"
+    root = _k3d_install(tmp_path, monkeypatch, "1.0.0-src.abc1234", ref="main")
     monkeypatch.setattr(paths, "install_roots", lambda: [root])
-    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.cargo/bin/cargo
-    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: None)
+    monkeypatch.setattr(upd, "has_cargo", lambda: False)
     chk = doctor.check_k3d()
     assert chk.status == doctor.WARN and chk.name == "k3d"
     assert "absent" in chk.detail and "k3d_unavailable" in chk.detail and "rustup" in chk.fix
-    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **kw: "/usr/bin/cargo" if name == "cargo" else None)
+    assert "k3code update" in chk.fix
+    monkeypatch.setattr(upd, "has_cargo", lambda: True)
     assert "rustup" not in doctor.check_k3d().fix and "k3code update" in doctor.check_k3d().fix
     k3d = root / "bin" / "k3d"
     k3d.parent.mkdir(parents=True)
@@ -721,3 +734,21 @@ def test_k3d_check_reports_the_sidecar_present_or_absent(monkeypatch, tmp_path):
     k3d.chmod(0o755)
     chk = doctor.check_k3d()
     assert chk.status == doctor.OK and chk.data == {"path": str(k3d)} and "present" in chk.detail
+
+
+def test_k3d_fix_fits_the_install_origin(monkeypatch, tmp_path):
+    """A git or source install builds k3d on `k3code update`; a release update never does, so it says to reinstall
+    from source instead."""
+    from k3code import doctor, paths
+    from k3code import update as upd
+
+    monkeypatch.setattr(upd, "has_cargo", lambda: True)
+    origins = {"git": ("1.0.0-src.abc1234", "main", True), "source": ("1.0.0-src.abc1234", None, True)}
+    origins["release"] = ("1.0.0", None, False)
+    for name, (version, ref, update) in origins.items():
+        root = _k3d_install(tmp_path / name, monkeypatch, version, ref)
+        monkeypatch.setattr(paths, "install_roots", lambda root=root: [root])
+        fix = doctor.check_k3d().fix
+        assert ("k3code update" in fix) is update, (name, fix)
+        from_source = "install/install.sh --from-source" in fix and "release installs never build k3d" in fix
+        assert from_source is not update, (name, fix)

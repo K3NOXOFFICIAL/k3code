@@ -176,6 +176,15 @@ def httpx_mock():
 
 
 @pytest.fixture(autouse=True)
+def _no_host_cargo(monkeypatch):
+    """The host's cargo (on PATH in CI's Rust job) is never seen: with it a git install without bin/k3d runs its
+    installer again (`update.k3d_retry_due`). A test about cargo sets ``update.has_cargo`` itself."""
+    from k3code import update
+
+    monkeypatch.setattr(update, "has_cargo", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_k3code_home(tmp_path_factory, monkeypatch):
     """Never let tests write decisions/sessions into the real ~/.k3code."""
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path_factory.mktemp("k3home")))

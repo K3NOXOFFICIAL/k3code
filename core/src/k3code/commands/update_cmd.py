@@ -20,15 +20,19 @@ async def _git_install(url: str, ref: str, cur: str, apply: bool, behind: str | 
         return f"{cur}\nCould not check {ref} of {url}: timed out"
     except Exception as e:  # noqa: BLE001
         return f"{cur}\nCould not check {ref} of {url}: {e}"
-    if upd.is_commit_sha(ref):
+    retry_k3d = upd.k3d_retry_due()  # `k3code update` runs the installer again to build it
+    if upd.is_commit_sha(ref) and not retry_k3d:
         return (
             f"{cur}\nThis install is pinned to commit {ref[:12]}: there is nothing to update. "
             f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
         )
     head_line = f"{cur}\nlatest:  {head[:7]} ({ref})"
     have = upd.installed_sha()
-    if have and head.startswith(have):
+    same = bool(have and head.startswith(have))
+    if same and not retry_k3d:
         return f"{head_line}\n{upd.up_to_date(behind, 'Already up to date.')}"
+    if not apply and same:
+        return f"{head_line}\nThe k3d sidecar of this version is not built: run `/update now` to build it."
     if not apply:
         return f"{head_line}\nRun `/update now` to install it (smoke-tested, auto-rollback; the daemon restarts)."
     return await asyncio.to_thread(upd.apply_detached)

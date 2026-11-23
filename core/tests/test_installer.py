@@ -2316,6 +2316,30 @@ def test_a_k3d_that_hangs_when_probed_is_not_installed_and_does_not_hang_the_ins
     assert not (current / "bin" / "k3d").exists() and (current / ".k3d-pending").is_file()
 
 
+def _k3d_starts_without_timeout(root: Path, k3d_body: str) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run install.sh's k3d_starts alone on a PATH without `timeout` (stock macOS); its result and how long it took."""
+    k3d = stub_bin(root / "k3d", "k3d", k3d_body) / "k3d"
+    tools = root / "tools"
+    tools.mkdir(parents=True)
+    for tool in ("cat", "chmod", "mkdir", "mktemp", "rm", "sleep"):
+        (tools / tool).symlink_to(shutil.which(tool) or f"/bin/{tool}")
+    text = INSTALL.read_text().splitlines()
+    body = [ln for name in ("have", "stage_dir", "k3d_starts") for ln in _shell_function(text, name)]
+    script = root / "probe.sh"
+    script.write_text("\n".join(["set -eu", f'DATA="{root / "data"}"', *body, 'k3d_starts "$1"', ""]))
+    started = time.monotonic()
+    r = subprocess.run(["/bin/sh", str(script), str(k3d)], env={"PATH": str(tools)}, capture_output=True, text=True)
+    return r, time.monotonic() - started
+
+
+def test_without_timeout_a_hanging_k3d_probe_is_killed_after_5_seconds(tmp_path: Path) -> None:
+    r, took = _k3d_starts_without_timeout(tmp_path / "hang", "exec sleep 60\n")
+    assert r.returncode == 1 and 4 <= took < 15, (r.returncode, took, r.stderr)
+    assert not any((tmp_path / "hang" / "data" / "tmp").iterdir())  # the probe's output file is removed
+    r, took = _k3d_starts_without_timeout(tmp_path / "ok", _k3d_usage("probe") + "\n")
+    assert r.returncode == 0 and took < 4, (r.returncode, took, r.stderr)
+
+
 def test_no_install_deps_still_runs_npm_ci(tmp_path: Path) -> None:
     # the flag skips toolchain downloads only: the TUI's npm packages still come from the registry, so the docs
     # (next test) must not promise an offline install

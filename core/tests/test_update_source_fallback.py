@@ -258,6 +258,20 @@ async def test_slash_update_on_an_up_to_date_git_install_says_so(git_install, mo
     assert applied == []
 
 
+async def test_slash_update_on_an_up_to_date_git_install_without_k3d_offers_and_runs_the_build(
+    git_install, monkeypatch
+):
+    """Same commit, no bin/k3d, cargo there: `/update now` runs `k3code update`, whose installer builds k3d."""
+    applied = git_install()
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: OLD)
+    monkeypatch.setattr(upd, "has_cargo", lambda: True)
+    out = await _slash("")
+    assert "k3d sidecar of this version is not built" in out and "/update now" in out
+    assert "Already up to date" not in out and applied == []
+    out = await _slash("now")
+    assert "Update started (test)." in out and applied == ["applied"]
+
+
 async def test_slash_update_on_a_git_install_with_a_newer_head_offers_and_applies_it(git_install, monkeypatch):
     applied = git_install()
     monkeypatch.setattr(upd, "remote_head", lambda url, ref: NEW)

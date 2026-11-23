@@ -1075,7 +1075,22 @@ retry_k3_build() {
 # k3d (rust/crates/k3d) is optional like k3: without it the gateway answers k3d.* with k3d_unavailable.
 k3d_starts() { # k3d_starts BIN: BIN runs. k3d has no --version: an unknown flag prints its usage and exits (no socket)
   # a probe that never returns fails (and the previous k3d is kept) instead of hanging the install or the update
-  if have timeout; then out=$(timeout 5 "$1" --version 2>&1 </dev/null) || true; else out=$("$1" --version 2>&1 </dev/null) || true; fi
+  if have timeout; then
+    out=$(timeout 5 "$1" --version 2>&1 </dev/null) || true
+  else # no timeout (stock macOS): the probe runs in the background and is killed by pid after 5 s
+    probe=$(stage_dir probe)
+    "$1" --version >"$probe/out" 2>&1 </dev/null &
+    probe_pid=$!
+    probe_secs=0
+    while kill -0 "$probe_pid" 2>/dev/null && [ "$probe_secs" -lt 5 ]; do
+      sleep 1
+      probe_secs=$((probe_secs + 1))
+    done
+    kill "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+    out=$(cat "$probe/out" 2>/dev/null) || true
+    rm -rf "$probe"
+  fi
   case "$out" in "usage: k3d"* | "k3d "*) return 0 ;; esac
   return 1
 }
