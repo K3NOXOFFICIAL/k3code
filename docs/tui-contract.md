@@ -450,3 +450,19 @@ gateway, so none of this applies there.
 pipeline's own phases are unchanged: `planning`, `judging`, `implementing`, `adversarial review`,
 `cross-checking findings`, `fixing`, `final tests` and `stopped`. A wake word on `ultraresearch` is followed by
 `research.progress` events as usual.
+
+## k3code k3d sidecar additions (Python gateway; not part of the Hermes contract)
+
+The gateway forwards two methods to k3d, the Rust sidecar daemon (`rust/crates/k3d`). Each request opens one
+connection to `$K3CODE_HOME/run/k3d.sock`, sends `gateway.auth` with the token from `k3d.token` next to it (the frame
+k3d expects), then the method, and returns k3d's result unchanged (`core/src/k3code/gateway/k3d.py`). Like every
+method not in `OPEN_METHODS`, both need the daemon token on a socket. The token is never logged.
+
+| Method | Params | Result | Notes |
+|--------|--------|--------|-------|
+| `k3d.ping` | `{}` | `{ok: true}` | k3d is up and accepts the gateway |
+| `k3d.version` | `{}` | `{name: "k3d", version}` | k3d's crate version |
+
+When k3d cannot answer (no socket, a stale one that refuses, no or a refused token, no reply within 5 s, a bad reply),
+the gateway answers a JSON-RPC error with code `-32003` (`K3D_UNAVAILABLE`), `data: {"code": "k3d_unavailable"}` and a
+message that starts with `k3d_unavailable:` and says why. The gateway keeps serving.

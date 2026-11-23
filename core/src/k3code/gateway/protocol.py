@@ -28,6 +28,9 @@ INTERNAL_ERROR = -32603
 UNAUTHORIZED = -32001
 #: Server-defined: this connection already has the maximum of concurrent long-running requests in flight.
 TOO_MANY_REQUESTS = -32002
+#: Server-defined: a ``k3d.*`` method could not be forwarded (k3d not running, refusing, or not answering); the
+#: error's ``data.code`` is ``"k3d_unavailable"``.
+K3D_UNAVAILABLE = -32003
 
 #: A frame longer than this is shrunk before it is sent: the TUI builds one JS string per line, V8 caps a string at
 #: ~512 MB, and an event that size (a huge tool result) made the TUI throw on every event that followed.
