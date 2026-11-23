@@ -118,6 +118,9 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
         "gitleaks detect --source . --config .gitleaks.toml",
         "--log-opts=origin/Main..HEAD",
         "(cd . && shell_lint)",
+        "(cd rust && cargo fmt --check)",
+        "(cd rust && cargo clippy --all-targets -- -D warnings)",
+        "(cd rust && cargo test)",
     ):
         assert cmd in out, cmd
     assert "go test ./..." not in out  # panes' upstream remote-sync tests recurse without bound
