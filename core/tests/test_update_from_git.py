@@ -154,6 +154,28 @@ def test_an_up_to_date_git_install_says_so_and_runs_no_installer(remote, data, n
     assert no_release == [] and not (remote["logs"] / "args").exists()
 
 
+def test_an_up_to_date_git_install_without_k3d_runs_the_installer_to_build_it(remote, data, no_release, monkeypatch):
+    """Same commit, no bin/k3d, cargo there: the installer reuses the version and its retry_k3d_build builds k3d."""
+    ver = _install(data, remote["head"])
+    monkeypatch.setattr(upd, "has_cargo", lambda: True)
+    monkeypatch.setenv("K3_STUB_VERSION", ver)  # the installer reuses the active version and prints its name
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert (remote["logs"] / "args").exists() and "could not fetch" not in r.output
+    assert f"Already up to date ({ver})." in r.output and "k3d sidecar still did not build" in r.output
+    assert no_release == []  # the active version is not switched to itself
+
+
+def test_an_up_to_date_git_install_with_k3d_runs_no_installer_even_with_cargo(remote, data, no_release, monkeypatch):
+    ver = _install(data, remote["head"])
+    (data / "versions" / ver / "bin").mkdir()
+    (data / "versions" / ver / "bin" / "k3d").write_text("")
+    monkeypatch.setattr(upd, "has_cargo", lambda: True)
+    monkeypatch.setattr(upd, "update_from_git", _no_update)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0 and "Already up to date." in r.output, r.output
+
+
 def test_an_unreachable_github_api_falls_back_to_the_git_ref(remote, data, no_release, monkeypatch):
     """#143: a proxy that blocks api.github.com (or a timeout, a 5xx) must not stop a git install from updating."""
     _install(data, remote["head"])

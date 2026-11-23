@@ -548,6 +548,28 @@ def check_tui() -> Check:
     return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
 
 
+def check_k3d() -> Check:
+    """k3d, the Rust sidecar, is optional: the installer builds it into ``bin/k3d`` only when cargo is there."""
+    from k3code import update as upd
+    from k3code.paths import install_roots
+
+    for root in install_roots():
+        k3d = root / "bin" / "k3d"
+        if k3d.is_file() and os.access(k3d, os.X_OK):
+            return Check("k3d", OK, f"k3d sidecar present: {k3d}", data={"path": str(k3d)})
+    rustup = "" if upd.has_cargo() else "install Rust with rustup (https://rustup.rs), then "
+    if upd.installed_sha():  # a git or source build (`X.Y.Z-src.<sha>`): its update runs the installer, which builds it
+        fix = f"{rustup}run `k3code update`" + ("" if rustup else ": it builds k3d with cargo")
+    elif upd.current_version():  # a release ships no k3d and its update never builds one
+        fix = (
+            f"release installs never build k3d: {rustup}reinstall from source with "
+            "`sh install/install.sh --from-source`"
+        )
+    else:  # no versioned install (a dev checkout)
+        fix = f"{rustup}install from source with `sh install/install.sh --from-source`"
+    return Check("k3d", WARN, "k3d sidecar absent: the gateway answers k3d.* with k3d_unavailable", fix)
+
+
 def check_home(home: Path) -> Check:
     try:
         if not home.is_dir():
@@ -982,6 +1004,7 @@ async def run_checks(
         check_env_file(),
         check_install_links(),
         check_tui(),
+        check_k3d(),
         check_home(home),
         check_home_mode(home),
         check_journal(home),

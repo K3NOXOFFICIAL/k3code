@@ -1159,6 +1159,24 @@ def installed_sha() -> str | None:
     return m.group(1) if m else None
 
 
+def has_cargo() -> bool:
+    """cargo where the installer looks for it (``find_cargo``): on PATH or in ``~/.cargo/bin``, where rustup puts it."""
+    return shutil.which("cargo") is not None or os.access(Path.home() / ".cargo" / "bin" / "cargo", os.X_OK)
+
+
+def k3d_retry_due() -> bool:
+    """The active version has no k3d sidecar, or its build is pending (``.k3d-pending``), and cargo is there.
+
+    The installer's ``retry_k3d_build`` builds it on a run for the same commit (the same test), so an update of a
+    version that is otherwise up to date still runs the installer."""
+    if os.environ.get("K3_SKIP_K3D") == "1" or current_version() is None:
+        return False
+    cur = current_link()
+    if (cur / "bin" / "k3d").is_file() and not (cur / ".k3d-pending").exists():
+        return False
+    return has_cargo()
+
+
 def _git(args: list[str], timeout: float, what: str) -> str:
     """Run git without a credential prompt and within ``timeout``; its stdout, or a SourceUpdateError with advice."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}

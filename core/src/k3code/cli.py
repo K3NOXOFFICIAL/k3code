@@ -1518,7 +1518,8 @@ def update_cmd(
             head = upd.remote_head(cfg["url"], git_ref)
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
-        if upd.is_commit_sha(git_ref):
+        retry_k3d = upd.k3d_retry_due()  # the installer builds a missing k3d into the version it reuses
+        if upd.is_commit_sha(git_ref) and not retry_k3d:
             click.echo(
                 f"{block}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
                 f"Reinstall with {upd.installer_command('--from-git --ref Main')} to follow a branch."
@@ -1528,15 +1529,23 @@ def update_cmd(
         if check:
             return
         have = upd.installed_sha()
-        if have and head.startswith(have):
+        same = bool(have and head.startswith(have))
+        if same and not retry_k3d:
             click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
+        if same:
+            click.echo("The k3d sidecar of this version is not built: running the installer again to build it.")
         if not yes:
-            click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
+            click.confirm(f"{'Rebuild' if same else 'Update to'} {head[:7]} ({git_ref})?", abort=True)
         try:
             ver = upd.update_from_git(cfg["url"], git_ref)
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
+        if ver == cur and same:  # the installer reused the active version and built k3d into it (no switch)
+            click.echo(upd.up_to_date(daemon_behind, f"Already up to date ({ver})."))
+            built = not upd.k3d_retry_due()
+            click.echo("The k3d sidecar is built." if built else "The k3d sidecar still did not build (see above).")
+            return
         if ver == cur:  # the installer's own fetch failed and it fell back to the installed build of the ref
             raise click.ClickException(
                 f"the installer could not fetch {git_ref} and kept the installed {ver}: nothing was changed. "
