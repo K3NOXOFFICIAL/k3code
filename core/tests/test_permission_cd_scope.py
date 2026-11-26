@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from k3code.permissions import decide
+from k3code.permissions import Rule, decide
 
 
 @pytest.fixture
@@ -720,3 +720,60 @@ def test_any_reader_argument_in_a_moved_home_asks_a_person(scoped_project: Path,
 def test_a_line_that_leaves_home_alone_is_judged_as_before(scoped_project: Path, cmd: str) -> None:
     dec = _decide(cmd, "auto", scoped_project)
     assert dec.action == "allow", (cmd, dec)
+
+
+#: User rules that allow ``echo`` and ``cd``: the redirect, not the program, decides where the line writes.
+_ECHO_CD = [Rule("bash", "echo *", "allow", layer=1), Rule("bash", "cd *", "allow", layer=1)]
+
+#: A redirect after a ``cd`` out of the project writes outside it; the ``echo *`` allow does not cover that.
+REDIRECT_AFTER_CD_OUT = [
+    "cd ~/.config/autostart && echo x > a.desktop",
+    "cd .. && echo x > a",
+    "cd /var/opt && echo x > a",
+    "cd .. && echo x >> a",
+    "cd .. && echo x 2> a",
+    "cd .. && echo x >| a",
+    "cd .. && echo x <> a",
+    "pushd /x && echo y > a",
+    "cd $X && echo x > a",  # unknown directory: could be anywhere
+    "(cd .. && echo x > a)",
+    "cd .. ; echo x > a",
+    "cd -- .. && echo x > a",
+    "echo <(cd .. && echo x > a)",
+    "cd .. && echo <(echo x > a)",
+]
+
+#: A ``cd`` that stays in the project keeps the allow.
+REDIRECT_AFTER_CD_IN = ["cd src && echo x > out.txt", "cd . && echo x > a", "echo x > a"]
+
+
+@pytest.fixture
+def home_project(scoped_project: Path) -> Path:
+    """A project inside the fake home (``cd ..`` leaves it for the home), with a ``src`` folder."""
+    proj = scoped_project.parent / "home" / "alice" / "work"
+    (proj / "src").mkdir(parents=True)
+    return proj
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", REDIRECT_AFTER_CD_OUT)
+def test_a_redirect_after_a_cd_out_of_the_project_is_not_allowed(home_project: Path, cmd: str, mode: str) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=home_project, user_rules=_ECHO_CD)
+    assert dec.action != "allow", (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", REDIRECT_AFTER_CD_IN)
+def test_a_redirect_after_a_cd_inside_the_project_stays_allowed(home_project: Path, cmd: str, mode: str) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=home_project, user_rules=_ECHO_CD)
+    assert dec.action == "allow", (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", ["cd /tmp && echo x > a", "echo x > /tmp/a"])
+def test_a_redirect_into_tmp_is_judged_the_same_with_or_without_a_cd(home_project: Path, cmd: str) -> None:
+    """Only auto mode's sandbox has a private ``/tmp``; unsandboxed modes ask for the host's, however it is spelled."""
+    actions = {
+        m: decide(mode=m, tool="bash", args={"command": cmd}, cwd=home_project, user_rules=_ECHO_CD).action
+        for m in ("default", "accept-edits", "auto")
+    }
+    assert actions == {"default": "ask", "accept-edits": "ask", "auto": "allow"}, (cmd, actions)

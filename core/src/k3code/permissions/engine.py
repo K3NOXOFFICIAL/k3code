@@ -958,21 +958,29 @@ def _line_writes_outside_roots(subs: list[str], roots: list[str], where: _Where)
     cwd and each directory a ``cd``/``pushd`` on it can reach, its symlinks resolved too: ``cd link && > ../x`` writes
     next to the link's target). A directory that cannot be worked out (``cd $DIR``) could be ``/``: a relative target
     then counts as outside."""
+    return any(_writes_outside_roots(sub, roots, d) for sub in subs for d in _where_dirs(where))
+
+
+def _where_dirs(where: _Where) -> list[str]:
+    """The directories a relative path on the line may be relative to (see _Where), each as written and with its
+    symlinks resolved; ``/`` stands in for one that cannot be worked out."""
     dirs = list(dict.fromkeys(d for w in where.dirs for d in (w, _real(w))))
     if where.unknown:
         dirs.append("/")
-    return any(_writes_outside_roots(sub, roots, d) for sub in subs for d in dirs)
+    return dirs
 
 
-def _redirects_ok(plain: str, mask: str, roots: list[str], cwd: str) -> bool:
-    """Every redirect target is a plain path inside the project roots and not a credential/startup file."""
+def _redirects_ok(plain: str, mask: str, roots: list[str], dirs: list[str]) -> bool:
+    """Every redirect target is a plain path inside the project roots and not a credential/startup file, from each of
+    the directories (``dirs``) the command may run in: ``cd .. && echo x > a`` writes outside the project."""
     for target in _operator_targets(_REDIRECT, plain, mask):
         target = target.strip("'\"")
         if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
             return False  # a variable or glob: unknown target
-        path = _abs(target, cwd)
-        if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, _real(path))):
-            return False
+        for cwd in dirs:
+            path = _abs(target, cwd)
+            if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, _real(path))):
+                return False
     return True
 
 
@@ -984,6 +992,7 @@ def _voids_allow(
     cwd: str,
     heredocs: list[hardline.Heredoc] | None = None,
     depth: int = 0,
+    where: _Where | None = None,
 ) -> bool:
     """A redirect or a substitution turns an allowed prefix into something else (``ls > ~/.bashrc``, ``git commit -m
     "$(evil)"``, ``ls <(rm -rf x)``). Builtin read-only allows never cover either. A rule the user approved (session /
@@ -992,7 +1001,8 @@ def _voids_allow(
     stays theirs. Before, an "always allow git commit" also
     allowed ``git commit > ~/.bashrc`` and ``git commit -m "$(evil)"``, and an "always allow echo" ``echo >(rm x)``.
     The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those on the command
-    line (``sub`` has no body)."""
+    line (``sub`` has no body). ``where``: the directories a ``cd`` on the line can move the command to (a redirect is
+    judged from each); without it, ``cwd`` alone."""
     # the shell expands `$X`, `${X:-y}`, `$IFS` and `{a,b}` after the rule matched the words as written: `cat a$x` and
     # `cat {x,/etc/passwd}` read what no rule saw, so no allow covers a word the shell expands (in double quotes too)
     if hardline.shell_expands(sub):
@@ -1012,7 +1022,7 @@ def _voids_allow(
             or (outside and not (depth == 0 and rule.pattern not in _SANDBOXED and _outside_reads_ok(sub, roots, cwd)))
             or not _readonly_argv_ok(hardline.tokens(sub))
         )
-    if has_redirect and not _redirects_ok(plain, mask, roots, cwd):
+    if has_redirect and not _redirects_ok(plain, mask, roots, _where_dirs(where) if where else [cwd]):
         return True
     # the output of `$(...)` or a backtick becomes words of the command: `cat $(echo /etc/passwd)` reads what no rule
     # saw, even when `echo` is allowed. Only `<(...)`, `>(...)` and heredoc bodies stay on the nested check
@@ -1022,14 +1032,16 @@ def _voids_allow(
         return False
     # nested is flat (`$(a $(b))` gives both); a substitution the parser did not take apart is vouched for by nobody
     nested = [*hardline.parse(sub).nested, *body_payloads]
-    return not nested or not all(_nested_allowed(n, ruleset, roots, cwd, depth + 1) for n in nested)
+    return not nested or not all(_nested_allowed(n, ruleset, roots, cwd, depth + 1, where) for n in nested)
 
 
 #: How deep :func:`_nested_allowed` follows commands inside commands (``$(a $(b $(c)))``); deeper asks.
 _NESTED_MAX_DEPTH = 4
 
 
-def _nested_allowed(command: str, ruleset: list[Rule], roots: list[str], cwd: str, depth: int) -> bool:
+def _nested_allowed(
+    command: str, ruleset: list[Rule], roots: list[str], cwd: str, depth: int, where: _Where | None = None
+) -> bool:
     """Every simple command of the nested ``command`` (a ``$(...)``/``<(...)``/``>(...)``/``bash -c`` payload) is
     allowed on its own: a rule allows it, nothing voids that allow (:func:`_voids_allow`, its own nested commands
     included), and it is no launcher, no heredoc program and no sandbox-only allow (the outer allow is not
@@ -1046,7 +1058,7 @@ def _nested_allowed(command: str, ruleset: list[Rule], roots: list[str], cwd: st
             or (rule.layer == 0 and rule.pattern in _SANDBOXED)
             or hardline.is_launcher(sub)
             or inner.code_heredoc[k]
-            or _voids_allow(sub, rule, ruleset, roots, cwd, inner.heredocs[k], depth)
+            or _voids_allow(sub, rule, ruleset, roots, cwd, inner.heredocs[k], depth, where)
         ):
             return False
     return True
@@ -2999,7 +3011,7 @@ def _decide_bash(
         # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
         # command line does not say what runs
         if rule.action == "allow" and (
-            parsed.code_heredoc[k] or _voids_allow(sub, rule, ruleset, roots, cwd, parsed.heredocs[k])
+            parsed.code_heredoc[k] or _voids_allow(sub, rule, ruleset, roots, cwd, parsed.heredocs[k], where=where)
         ):
             rule = Rule(tool="bash", pattern="*", action="ask")
         if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
