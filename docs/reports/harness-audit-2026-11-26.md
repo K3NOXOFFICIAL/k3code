@@ -34,27 +34,29 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `f0d2b57f`)
+## Verification (final tree `13cbc6ea`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto`: **11203 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed, 24 skipped).
-- `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes (the release personal-data scan flagged one comment; fixed).
-- `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81`.
-- Security review by a fresh reviewer ran three times on the permission work. All three returned FAIL; every finding was fixed with a test that fails without the fix. **The last fix round (outside-read allowlist, `systemctl` connection options, brace cap 4096) was not re-reviewed.**
+- `cd core && uv run pytest -p no:cacheprovider -n auto`: **12461 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed, 24 skipped).
+- `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
+- `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
+- Each permission fix ships with tests that fail without it (the fix is set aside as a patch, the new tests must fail, the fix is restored).
+- **Security review history (fresh read-only reviewer each time): rounds 1 to 6 all returned FAIL.** Every finding from rounds 1 to 6 was fixed with tests. Round 7's reviewer ran out of context before it probed anything, so there is no verdict; I probed its suspicions myself with `decide()` (script kept out of the repo), found two real classes (glued/clustered option values; launcher variants such as `flock --wa 5`, `tmux split`, `gdb -ex shell`, `npm exec`), and fixed both structurally. **That last fix round has not been re-reviewed by an independent reviewer.**
 
 ## NOT fixed, and why
 
-- Quoted literals such as `grep -rn "List<>" src` prompt again; the quote-mask fix is delicate (it must not reopen `bash -c '...'`, `eval "..."`, `awk '{print > "/x"}'`) and three builders ran out of context on it.
-- A `cd` earlier on the line is not followed when an expanded command is checked (`cd / && bash -c 'rm${IFS}-rf${IFS}*'` may slip through).
-- Auto mode allows `echo x > ../out.txt` (write outside the project; relies on the sandbox, same as plain `>`).
-- Allow rules written by the user (for example `sudo *`) skip the forced secret check.
-- Readers not on the builtin list (`less`, `base64`, `xxd`, `awk`, `sed`) reading secret paths get a plain ask, which auto mode's classifier answers.
-- `grep -r x ~` / `rg x ~` walk home dot folders with a plain ask.
-- A brace word with ~1200 single-value groups makes `decide()` raise `RecursionError`. The agent loop turns any exception into a deny; the gateway and server-runner callers of the hardline check were not checked.
-- Over-asking accepted: `/etc/krb5.conf`, files named `tokenize.py` / `secrets.py` under `/usr`, `/sys` reads, brace words over 4096.
-- Item 5: no date is given to the model; item 6: no text-JSON tool-call fallback for local models (not requested as required); item 4: cold-start ranking is alphabetical.
-- `test_sandbox_git.py::test_a_symlinked_worktrees_dir...` failed twice under `-n auto` and passed when re-run; looks flaky, not confirmed.
-- Git: git-in-another-repo (`git -C x log`) still asks outside the project because a foreign `.git/config` can run programs (`core.fsmonitor`).
+- **Docker/podman bind mounts**: `docker run -v ~/.ssh:/x` (and `--mount ...src=`) is not scanned for secret sources; the builder ran out of context.
+- `cd DIR && cat shadow`: names are resolved against the decide cwd, not the `cd` target (secret-name check on a bare relative name).
+- Auto mode: `cat src/$X` with `X=../../..` assigned on the same line allows (as on base); `cat $(...)` and backtick substitution words keep the old behaviour.
+- Readers not on the builtin list (`less`, `base64`, `xxd`, `awk`, `sed`) on secret paths get a plain ask, which auto mode answers.
+- Recursive listings (`ls -R ~`, `du -a ~`, `tree -a ~`, `find ~ -name id_rsa`, `grep -r x ~`) can reveal names under dot folders that `ls ~/.ssh` protects.
+- `busctl get-property ... Environment` and `systemd-analyze dump` leak unit environments (plain ask).
+- `_abs` resolves `link/../x` textually: `cd -P lnk/..; echo x > f` allows (write outside the project through a symlink).
+- Digit-suffixed secret names (`server.pem1`) are not matched by the name filter; `firejail dd if=/dev/sda` is exempt through `strict=False`; `xterm -e rm -rf ~` is not caught by the new scan (`-e` values are skipped to spare `grep -e`).
+- `nohup foo 'cd /; rm -rf *'`: a `cd /` inside a quoted payload is not followed (as on base).
+- Over-asking accepted: `/etc/krb5.conf`, `tokenize.py`/`secrets.py` under `/usr`, `/sys` reads; `git commit -m 'block /etc/shadow'`, `rg -n '/etc/shadow' src`, `git log -S/etc/shadow` and `docker run -v /var/run/docker.sock:/x` now force a human because the word scan sees a secret path; `ls ~/.cache`, `du -sh ~/.cargo`, `ls ~/.local/share` ask; `cd /tmp && echo x > a` asks in default and accept-edits (as the direct `> /tmp/a` does); `echo x > f; cd ..` over-asks; brace words over 4096; a glob budget can make a large harmless glob outside the project ask.
+- Item 6: no text-JSON tool-call fallback for local models (not required). Item 4: cold-start ranking is alphabetical.
+- Flaky tests, unexplained: `test_sandbox_git.py::test_a_symlinked_worktrees_dir...` and `test_panes.py::test_bg_pane_sends_start_agent` fail occasionally under `-n auto` and pass alone and on re-run; `test_cli_headless_output.py::test_a_headless_answer_ends_with_a_newline` failed once with `No module named 'k3code.providers.retry_utils'` (module present, passes alone). None touches the permission code; none was checked against the base commit.
 
 ## Residual risk
 
-The permission engine is a heuristic shell parser; three review rounds each found new bypasses, so more probably exist. Default and accept-edits modes run bash unsandboxed, so a parser miss there is an unprompted host action. Treat the new read-only allowances as a convenience, not a boundary, and prefer auto mode (bwrap) or a human prompt for anything sensitive. Commits carry the author `Claude <noreply@anthropic.com>` because the repo has no git identity configured.
+The permission engine is a heuristic shell parser, not a proof. Seven review rounds each found new ways around it, mostly wrapper programs and operator spellings nobody had listed; the last rounds replaced listing by structural scans (every argument word, every command run), which should shrink the tail but is not independently confirmed. Default and accept-edits modes run bash unsandboxed, so a parser miss there is an unprompted host action. Treat the new read-only allowances as a convenience, not a boundary: prefer auto mode (bwrap) or a human prompt for anything sensitive, and consider running bash in the sandbox in every mode. Commits carry the author `Claude <noreply@anthropic.com>` because the repo has no git identity configured.
