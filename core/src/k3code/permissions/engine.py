@@ -1651,7 +1651,11 @@ def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
     if any("files0-from" in t for t in argv[1:]):
         return False
     check = _shell_walk_ok if _content_walker(argv) else _shell_read_ok
-    return all(_literal_word(a) and check(_abs(a, cwd)) for a in _path_args(sub) if _arg_outside(a, roots, cwd))
+    return all(
+        _literal_word(a) and check(_abs(a, cwd)) and _outside_root_ok(_abs(a, cwd))
+        for a in _path_args(sub)
+        if _arg_outside(a, roots, cwd)
+    )
 
 
 def _runs_builtin_read(sub: str, ruleset: list[Rule]) -> bool:
@@ -2793,7 +2797,9 @@ def _decide_bash(
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     # a cwd outside the roots asks, unless every part is a builtin read-only command that may read there (not git, and
     # a content walker only in a tree _shell_walk_ok takes: `grep -r x` reads the cwd)
-    outside_cwd_ok = bool(cwd_parts) and all(cwd_parts) and _shell_read_ok(_abs(".", cwd))
+    outside_cwd_ok = (
+        bool(cwd_parts) and all(cwd_parts) and _shell_read_ok(_abs(".", cwd)) and _outside_root_ok(_abs(".", cwd))
+    )
     if worst.action == "allow" and not _inside(cwd, roots) and not outside_cwd_ok:
         return Decision(
             action="ask",
@@ -3108,9 +3114,40 @@ _ETC_SECRETS = (
     "/etc/ssl/private",
     "/etc/letsencrypt",
     "/etc/wireguard",
-    "/etc/NetworkManager/system-connections",
+    "/etc/NetworkManager",
     "/etc/security/opasswd",
+    "/etc/rancher",
+    "/etc/openvpn",
+    "/etc/libvirt",
+    "/etc/ppp",
+    "/etc/ipsec",
+    "/etc/krb5",
+    "/etc/systemd",
+    "/etc/sysconfig",
+    "/etc/default",
+    "/etc/cups",
 )
+#: Names a builtin read outside the roots never takes without a person, on any component below any root, ``$HOME`` too
+#: (a secret folder or file nobody listed: ``~/app/secrets/x``, ``~/vpn/client.ovpn``, ``/mnt/x/etc/shadow``). Wider
+#: than _CREDENTIAL_NAME, which other checks share: ``tokenize.py`` or ``secrets.py`` below /usr asks too. Not
+#: ``/etc/passwd`` itself (``passwd.bak`` is a name here). Matched case-insensitively on one component.
+_SECRET_NAME = re.compile(
+    r"(?:secret|password|credential|token|private|htpasswd|id_).*|passwd.+|\.htpasswd|\.env.*"
+    r"|.*\.(?:key|pem|p12|pfx|p8|gpg|age|asc|kdbx|keytab|ovpn|tfvars|tfstate|env|secrets)"
+    r"|.*(?:_rsa|_ed25519|-secrets)|.*shadow.*|(?:wp-)?config\.php|kubeconfig|\.netrc|\.npmrc|\.pypirc",
+    re.IGNORECASE,
+)
+#: The /proc files that hold no secret, matched on the path as written (the realpath of /proc/mounts is
+#: /proc/<pid>/mounts); not cmdline (a password on a command line) or any per-process file.
+_PROC_READABLE = frozenset(
+    "/proc/" + n
+    for n in (
+        "cpuinfo", "meminfo", "version", "loadavg", "uptime", "mounts", "partitions", "filesystems", "swaps", "stat",
+        "vmstat", "diskstats", "interrupts", "devices", "modules",
+    )
+)  # fmt: skip
+#: The trees outside the roots a builtin read-only command may read without a person (see _outside_root_ok).
+_OUTSIDE_READ_ROOTS = ("/usr", "/opt", "/etc", "/sys", "/var/log", "/tmp")
 #: The private-key folders below /etc/pki (Fedora/RHEL: ``/etc/pki/tls/private``, ``/etc/pki/libvirt/private``).
 _PKI_PRIVATE = re.compile(r"/etc/pki/(?:[^/]+/)*private(?:/|$)")
 #: Trees a content walk of which reaches a secret below /etc (see _shell_walk_ok): /etc/pki holds _PKI_PRIVATE.
@@ -3128,6 +3165,8 @@ def _shell_read_ok(path: str) -> bool:
     (_toolchain_read: ``~/.cargo/registry``, ``node_modules/.bin``), as for the read tool; credential names, the stores
     and the secret folders of ``$HOME`` (_secret_dirs) never are. Checked on the path as written and on its
     realpath."""
+    if _flat(path) in _PROC_READABLE:
+        return True
     homes = _home_prefixes()
     stores = _home_stores()
     spellings = _spellings(path)
@@ -3148,11 +3187,34 @@ def _shell_read_ok(path: str) -> bool:
         names = [c for c in p.split("/") if c]
         if any(_CREDENTIAL_NAME.fullmatch(c) or c.casefold().startswith(".env") for c in names):
             return False
+        home = next((h for h in homes if p.startswith(h)), "")  # a home such as /home/privateer is no secret name
+        if any(_SECRET_NAME.fullmatch(c) for c in p[len(home) :].split("/") if c):
+            return False
+        if _under(p, "/var/lib") and any(c.casefold().endswith(".state") for c in names):
+            return False
         if not dots_ok and (any(map(_risky_component, names)) or _below_home_dot(p, homes)):
             return False
         if _stores_holding([p], stores) or sensitive_path(p):
             return False
     return True
+
+
+def _outside_root_ok(path: str) -> bool:
+    """``path`` (absolute) outside the roots lies where a builtin read-only command may read without a person: a tree of
+    _OUTSIDE_READ_ROOTS, ``/dev/null``, a file of _PROC_READABLE, ``$HOME`` itself or below a folder of it whose name
+    has no dot in front, or a toolchain location (_toolchain_read). Elsewhere (``/srv``, ``/mnt``, ``/media``,
+    ``/var/lib``, ``/``, another user's home) a person is asked, as before outside reads were allowed: data folders hold
+    what no name reveals. Every spelling must pass (a symlink ``/tmp/x -> /srv/y`` asks)."""
+    if _flat(path) in _PROC_READABLE or _toolchain_read(path):
+        return True
+    homes = [h.rstrip("/") for h in _home_prefixes()]
+
+    def ok(p: str) -> bool:
+        if p == "/dev/null" or any(_under(p, r) for r in _OUTSIDE_READ_ROOTS):
+            return True
+        return any(p == h or (p.startswith(h + "/") and not p[len(h) + 1 :].startswith(".")) for h in homes)
+
+    return all(ok(p) for p in _spellings(path))
 
 
 def _shell_walk_ok(path: str) -> bool:
