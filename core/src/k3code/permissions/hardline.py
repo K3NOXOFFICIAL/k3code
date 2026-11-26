@@ -1563,11 +1563,52 @@ def _text_exec_values(argv: list[str]) -> list[str]:
     return out
 
 
-def _git_words(words: list[str]) -> list[str]:
-    """``words`` from the ``git`` word on when they run git, git's own options kept (_command_argv drops them)."""
-    if _command_argv(words)[:1] != ["git"]:
-        return []
-    return next((words[j:] for j, w in enumerate(words) if os.path.basename(w) == "git"), [])
+def _git_options(words: list[str]) -> list[tuple[str, str, bool]]:
+    """git's own ``-c``/``--config-env`` options (see _git_config_options) behind every word of ``words`` that names
+    git, whatever runs it (``/usr/bin/git``, ``sudo -u git git``, ``flock L git``, ``xargs git``): a word that is no
+    git run, such as the ``git`` of ``sudo -u git``, gives none or a key that runs nothing."""
+    return [o for j, w in enumerate(words) if os.path.basename(w) == "git" for o in _git_config_options(words[j:])]
+
+
+def _git_config_command(key: str, value: str) -> str | None:
+    """The command line git runs for the config ``key`` (lower case) set to ``value``: None for a key that runs
+    nothing (see _GIT_EXEC_KEYS) or a boolean value; the value with a leading ``!`` stripped, an ``alias.*`` value
+    without one is a git command line."""
+    if not _GIT_EXEC_KEYS.fullmatch(key) or value.lower() in _GIT_BOOL_VALUES:
+        return None
+    return "git " + value if key.startswith("alias.") and not value.startswith("!") else value.removeprefix("!")
+
+
+#: Environment variables whose value a program runs as a command line: git's ssh, diff, pager, editor and askpass
+#: programs, the pager of man and others, the editor of crontab and others, bash's PROMPT_COMMAND and the start-up
+#: file of a non-interactive bash or sh (BASH_ENV, ENV: expanded by the shell, so ``$(...)`` in it runs).
+_EXEC_ENV_VARS = frozenset(
+    {
+        *("GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"),
+        *("GIT_ASKPASS", "SSH_ASKPASS", "PAGER", "MANPAGER", "EDITOR", "VISUAL", "PROMPT_COMMAND", "BASH_ENV", "ENV"),
+    }
+)
+
+
+def exec_env_commands(words: list[str]) -> list[str]:
+    """The command lines in the environment assignments of ``words`` (``GIT_PAGER='rm -rf ~' git log``, ``env
+    EDITOR=... crontab -e``, ``export PAGER=...``): the value of an exec-capable variable (see _EXEC_ENV_VARS) and
+    the value of a ``GIT_CONFIG_VALUE_<n>`` whose ``GIT_CONFIG_KEY_<n>`` runs a command (see _git_config_command)."""
+    out: list[str] = []
+    keys: dict[str, str] = {}
+    values: dict[str, str] = {}
+    for w in words:
+        if not _is_assignment(w):
+            continue
+        name, _, value = w.partition("=")
+        if name in _EXEC_ENV_VARS and value:
+            out.append(value)
+        elif name.startswith("GIT_CONFIG_KEY_"):
+            keys[name.removeprefix("GIT_CONFIG_KEY_")] = value.lower()
+        elif name.startswith("GIT_CONFIG_VALUE_"):
+            values[name.removeprefix("GIT_CONFIG_VALUE_")] = value
+    commands = (_git_config_command(keys[n], v) for n, v in values.items() if n in keys)
+    return out + [c for c in commands if c]
 
 
 def exec_option_commands(words: list[str]) -> list[str]:
@@ -1577,20 +1618,15 @@ def exec_option_commands(words: list[str]) -> list[str]:
     argv = _command_argv(words)
     if argv[:1] == ["man"]:
         return [v for v in _text_exec_values(argv) if v]
-    out: list[str] = []
-    for key, value, env in _git_config_options(_git_words(words)):
-        if env or not _GIT_EXEC_KEYS.fullmatch(key) or value.lower() in _GIT_BOOL_VALUES:
-            continue
-        git_line = key.startswith("alias.") and not value.startswith("!")
-        out.append("git " + value if git_line else value.removeprefix("!"))
-    return out
+    commands = (_git_config_command(key, value) for key, value, env in _git_options(words) if not env)
+    return [c for c in commands if c]
 
 
 def _exec_option_check(words: list[str], argv: list[str]) -> str | None:
     """``git --config-env KEY=VAR`` with an exec-capable key (the command is in the environment, unread here) and
     ``rg --pre PROG``/``--hostname-bin PROG`` with PROG a program the run checks refuse, a shell or an interpreter
     (``rg --pre rm x ~`` deletes every file it searches, ``rg --pre sh`` runs each one as a script)."""
-    if any(env and _GIT_EXEC_KEYS.fullmatch(key) for key, _, env in _git_config_options(_git_words(words))):
+    if any(env and _GIT_EXEC_KEYS.fullmatch(key) for key, _, env in _git_options(words)):
         return "git-config-env-command"
     if argv[:1] != ["rg"]:
         return None
@@ -3705,6 +3741,7 @@ def _launcher_payloads(sub: str) -> list[str]:
             out += ssh_option_commands(real[0], real[1:])
             out += exec_option_commands(list(toks))  # git -c core.pager=..., man -P ... (see exec_option_commands)
             out += _windows_command_line(real[0], real[1:])
+        out += exec_env_commands(list(toks))  # GIT_PAGER='...' git log, EDITOR=... crontab -e (see exec_env_commands)
     return list(dict.fromkeys(out))
 
 

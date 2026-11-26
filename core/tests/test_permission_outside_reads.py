@@ -773,6 +773,11 @@ BIND_MOUNT_SECRETS = [
     "nerdctl run --pid=host img",
     "docker compose run --privileged svc",
     "docker run --privileged --pid=host img nsenter -t 1 -m sh",
+    # a volume whose driver option binds a host tree: a later ``-v v:/d`` mounts it
+    "docker volume create --opt device=/etc --opt o=bind v",
+    "docker volume create -o device=/home -o type=none -o o=bind v",
+    "docker volume create --opt=device=/etc --opt o=bind v",
+    "podman volume create --opt device=~/.ssh --opt o=bind v",  # guard: already forced before (secret path)
 ]
 
 
@@ -790,6 +795,9 @@ def test_a_container_bind_mount_of_a_secret_or_a_host_tree_asks_a_person(
 #: (command, decision under a ``docker *`` rule in default mode) for container commands that bind no secret
 BIND_MOUNT_PLAIN = [
     ("docker ps", "allow"),
+    ("docker volume create v", "allow"),
+    ("docker volume create -o size=1g v", "allow"),
+    ("docker volume ls", "allow"),
     ("docker build .", "allow"),
     ("docker run --rm img", "allow"),
     ("docker run -v ./src:/app img", "allow"),
