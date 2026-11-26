@@ -994,6 +994,8 @@ def _command_argv(tokens: list[str]) -> list[str]:
         argv = normalize_argv(_past_reserved(argv))
         if argv[:1] == ["busybox"] and len(argv) > 1 and not argv[1].startswith("-"):
             argv = argv[1:]
+        elif argv and (inner := _launched_argv(argv)):  # flock, screen, setpriv, ... (see _LAUNCH_SPECS)
+            argv = inner
         elif not argv or argv[0] not in _RESERVED_WORDS:
             return argv
     raise _TooDeep
@@ -1071,6 +1073,265 @@ SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": 
 #: ``-o Keyword=value`` / ``-o 'Keyword value'`` whose value is a command line (ProxyCommand, LocalCommand,
 #: RemoteCommand, KnownHostsCommand).
 _SSH_COMMAND_OPTION = re.compile(r"\s*[A-Za-z]*command(?:\s*=|\s)\s*(.*)", re.IGNORECASE | re.DOTALL)
+
+#: Programs that run the command in their arguments but are no _WRAPPER_SPECS wrapper, so the engine keeps them as the
+#: command (a rule decides ``flock /tmp/l make`` and ``screen -dm make`` as written): the hardline checks look at what
+#: they run (see :func:`_launched_argv`), so ``flock /tmp/l rm -rf ~`` is refused like ``nohup rm -rf ~``. Option
+#: arity as in _WRAPPER_SPECS: (short options taking a value, long options taking a value, positionals before the
+#: command).
+_LAUNCH_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
+    "flock": ("wEc", frozenset({"--wait", "--timeout", "--conflict-exit-code", "--command"}), 1),  # past the lock file
+    "setpriv": (
+        "",
+        frozenset(
+            {"--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits"}
+            | {"--pdeathsig", "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule"}
+            | {"--seccomp-filter", "--ruid", "--euid", "--rgid", "--egid"}
+        ),
+        0,
+    ),
+    "runuser": ("ugGcsw", frozenset({"--user", "--group", "--supp-group", "--command", "--shell"}), 0),
+    "systemd-run": (
+        "upEHMC",
+        frozenset(
+            {"--unit", "--property", "--setenv", "--host", "--machine", "--description", "--slice", "--uid", "--gid"}
+            | {"--nice", "--working-directory", "--service-type", "--on-active", "--on-boot", "--on-startup"}
+            | {"--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--path-property"}
+            | {"--socket-property", "--capsule", "--background", "--json"}
+        ),
+        0,
+    ),
+    "unshare": (
+        "SGRw",
+        frozenset({"--setuid", "--setgroups", "--root", "--wd", "--propagation", "--map-user", "--map-group"})
+        | frozenset({"--map-users", "--map-groups", "--monotonic", "--boottime"}),
+        0,
+    ),
+    "nsenter": ("tSG", frozenset({"--target", "--setuid", "--setgroups"}), 0),
+    "chroot": ("", frozenset({"--userspec", "--groups"}), 1),  # past the new root
+    "firejail": ("", frozenset(), 0),  # its options are --name=value
+    "torsocks": ("upaP", frozenset({"--user", "--pass", "--address", "--port"}), 0),
+    "proxychains": ("f", frozenset(), 0),
+    "proxychains4": ("f", frozenset(), 0),
+    "fakeroot": ("lsib", frozenset({"--lib", "--faked"}), 0),
+    "rlwrap": ("bCDefFgHlMOPqsStwz", frozenset(), 0),
+    "xvfb-run": (
+        "efnswp",
+        frozenset({"--error-file", "--auth-file", "--server-num", "--server-args", "--wait", "--xauth-protocol"}),
+        0,
+    ),
+    "dbus-run-session": ("", frozenset({"--config-file", "--dbus-daemon"}), 0),
+    "systemd-inhibit": ("", frozenset({"--what", "--who", "--why", "--mode"}), 0),
+    "ltrace": ("aADeFlnopsuwx", frozenset({"--align", "--output", "--library"}), 0),
+    "valgrind": ("", frozenset(), 0),  # its options are --name=value
+    "catchsegv": ("", frozenset(), 0),
+    "npx": ("pcw", frozenset({"--package", "--call", "--workspace"}), 0),
+}
+#: ``uv run`` options taking a value (uv's global ones included: ``uv --directory x run cmd``).
+_UV_RUN_SPEC = (
+    "pwCPf",
+    frozenset(
+        {"--with", "--with-editable", "--with-requirements", "--python", "--package", "--extra", "--group"}
+        | {"--only-group", "--no-group", "--env-file", "--index", "--default-index", "--index-url", "--find-links"}
+        | {"--extra-index-url", "--directory", "--project", "--config-file", "--cache-dir", "--color", "--resolution"}
+        | {
+            "--prerelease",
+            "--exclude-newer",
+            "--link-mode",
+            "--config-setting",
+            "--upgrade-package",
+            "--allow-insecure-host",
+        }
+        | {"--refresh-package", "--reinstall-package", "--python-platform", "--keyring-provider", "--index-strategy"}
+    ),
+    0,
+)
+#: screen's options taking a value (``-dmS name cmd``); ``-Logfile FILE`` is its one long-named one.
+_SCREEN_VALUE = "cehpSTts"
+#: bwrap options and how many words follow each (any other ``--name`` is a flag).
+_BWRAP_ARITY = {
+    **dict.fromkeys(
+        ("--bind", "--bind-try", "--dev-bind", "--dev-bind-try", "--ro-bind", "--ro-bind-try", "--symlink")
+        + ("--setenv", "--file", "--bind-data", "--ro-bind-data", "--chmod", "--bind-fd", "--ro-bind-fd"),
+        2,
+    ),
+    **dict.fromkeys(
+        ("--args", "--argv0", "--uid", "--gid", "--hostname", "--chdir", "--unsetenv", "--lock-file", "--sync-fd")
+        + ("--remount-ro", "--exec-label", "--file-label", "--proc", "--dev", "--tmpfs", "--mqueue", "--dir")
+        + ("--seccomp", "--add-seccomp-fd", "--block-fd", "--userns-block-fd", "--info-fd", "--json-status-fd")
+        + ("--userns", "--userns2", "--pidns", "--cap-add", "--cap-drop", "--perms", "--size", "--overlay-src")
+        + ("--tmp-overlay", "--ro-overlay"),
+        1,
+    ),
+    "--overlay": 3,
+}
+#: tmux commands whose trailing arguments are a shell command, with their options taking a value (aliases too).
+_TMUX_SHELL_COMMANDS = {
+    **dict.fromkeys(("new-session", "new"), "cefFnstxy"),
+    **dict.fromkeys(("new-window", "neww"), "ceFnt"),
+    **dict.fromkeys(("split-window", "splitw"), "celtF"),
+    **dict.fromkeys(("respawn-pane", "respawnp", "respawn-window", "respawnw"), "cet"),
+    **dict.fromkeys(("run-shell", "run"), "cdt"),
+    **dict.fromkeys(("display-popup", "popup"), "bcdehsStTwxy"),
+    **dict.fromkeys(("pipe-pane", "pipep"), "t"),
+    **dict.fromkeys(("if-shell", "if"), "t"),
+}
+#: tmux's global options taking a value; ``-c`` is a shell command.
+_TMUX_GLOBAL_VALUE = "cfLST"
+#: Shell-code options of the launchers: (short options, long options, other short options taking a value, other long
+#: options taking a value, options may follow the operands as GNU getopt allows).
+_CODE_OPTS: dict[str, tuple[str, frozenset[str], str, frozenset[str], bool]] = {
+    "flock": ("c", frozenset({"--command"}), "wE", frozenset({"--wait", "--timeout", "--conflict-exit-code"}), True),
+    "script": (
+        "c",
+        frozenset({"--command"}),
+        "EIOBTmo",
+        frozenset({"--echo", "--log-in", "--log-out", "--log-io", "--log-timing", "--logging-format"})
+        | frozenset({"--output-limit"}),
+        True,
+    ),
+    "runuser": (
+        "c",
+        frozenset({"--command", "--session-command"}),
+        "ugGsw",
+        frozenset({"--user", "--group", "--supp-group", "--shell", "--whitelist-environment"}),
+        True,
+    ),
+    "npx": ("c", frozenset({"--call"}), "pw", frozenset({"--package", "--workspace"}), False),
+}
+
+
+def _option_values(argv: list[str], spec: tuple[str, frozenset[str], str, frozenset[str], bool]) -> list[str]:
+    """The values ``argv`` (a launcher and its arguments) gives the options in ``spec`` (see _CODE_OPTS): ``-c CODE``,
+    ``-qc CODE``, ``-cCODE``, ``--command CODE``, ``--command=CODE``, up to ``--``."""
+    short, longs, value_short, value_long, permute = spec
+    out: list[str] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if (key in longs or key in value_long) and not eq:
+                i += 1
+                value = argv[i] if i < len(argv) else ""
+            if key in longs:
+                out.append(value)
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in short or ch in value_short:
+                    value = a[k + 1 :]
+                    if not value:
+                        i += 1
+                        value = argv[i] if i < len(argv) else ""
+                    if ch in short:
+                        out.append(value)
+                    break
+        elif not permute:
+            break
+        i += 1
+    return [v for v in out if v]
+
+
+def _short_options(args: list[str], start: int, value: str) -> tuple[int, str]:
+    """Where the operands start in ``args`` past the short options from ``start`` (``value`` lists those taking a
+    value, glued on or the next word), and the flags seen."""
+    i, flags = start, ""
+    while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+        if args[i] == "--":
+            return i + 1, flags
+        for k, ch in enumerate(args[i][1:], 1):
+            flags += ch
+            if ch in value:
+                i += 0 if args[i][k + 1 :] else 1
+                break
+        i += 1
+    return i, flags
+
+
+def _tmux_code(argv: list[str]) -> list[str]:
+    """The shell code ``tmux`` runs: ``-c CODE`` and the shell command of ``new``, ``new-window``, ``split-window``,
+    ``respawn-pane``, ``run-shell`` (not ``-C``), ``display-popup``, ``pipe-pane`` and ``if-shell`` (its first operand,
+    not with ``-F``); the words of a command given as several are joined, as the shell would run them."""
+    out = _option_values(argv, ("c", frozenset(), _TMUX_GLOBAL_VALUE.replace("c", ""), frozenset(), False))
+    i, _ = _short_options(argv, 1, _TMUX_GLOBAL_VALUE)
+    value = _TMUX_SHELL_COMMANDS.get(argv[i]) if i < len(argv) else None
+    if value is None:
+        return out
+    k, flags = _short_options(argv, i + 1, value)
+    rest = [w for w in argv[k:] if w not in (";", "\\;")]
+    if argv[i] in ("if-shell", "if"):
+        rest = [] if "F" in flags else rest[:1]
+    if argv[i] in ("run-shell", "run") and "C" in flags:
+        rest = []
+    return [*out, " ".join(rest)] if rest else out
+
+
+def _launch_code(argv: list[str]) -> list[str]:
+    """The shell code the launcher ``argv`` (its name a basename) runs with ``sh -c``: ``flock -c``, ``script -c``,
+    ``runuser -c``, ``npx -c``, ``sg GROUP [-c] CODE``, ``entr -s CODE`` and tmux (see _tmux_code)."""
+    if not argv:
+        return []
+    name = argv[0]
+    if name in _CODE_OPTS:
+        return _option_values(argv, _CODE_OPTS[name])
+    if name == "tmux":
+        return _tmux_code(argv)
+    if name == "sg":
+        rest = argv[2:] if argv[1:2] == ["-"] else argv[1:]
+        rest = rest[2:] if rest[1:2] == ["-c"] else rest[1:]
+        return [" ".join(rest)] if rest else []
+    if name == "entr":
+        i, flags = _short_options(argv, 1, "")
+        return argv[i : i + 1] if "s" in flags else []
+    return []
+
+
+def _launched_argv(argv: list[str]) -> list[str] | None:
+    """The command the launcher ``argv`` (its name a basename, see _LAUNCH_SPECS) runs from its arguments, or None
+    (not a launcher, nothing to run, or shell code: see _launch_code). ``screen [-dmS name] cmd``, ``bwrap --bind / /
+    cmd``, ``gdb --args cmd``, ``uv run cmd`` and ``entr cmd`` are read here too."""
+    if not argv:
+        return None
+    name, args = argv[0], argv
+    if _launch_code(argv):
+        return None
+    if name == "screen":
+        i = 1
+        while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+            a = args[i]
+            if a in ("-ls", "-list", "-wipe", "-Q", "-v", "--version", "--help") or a.startswith("-X"):
+                return None
+            if a == "--":
+                i += 1
+                break
+            k = next((j for j, ch in enumerate(a[1:], 1) if ch in _SCREEN_VALUE), 0)
+            i += 2 if a == "-Logfile" or (k and not a[k + 1 :]) else 1
+        return args[i:] or None
+    if name == "bwrap":
+        i = 1
+        while i < len(args) and args[i].startswith("--"):
+            if args[i] == "--":
+                i += 1
+                break
+            i += 1 + _BWRAP_ARITY.get(args[i], 0)
+        return args[i:] or None
+    if name == "gdb":
+        k = next((j for j, a in enumerate(args) if a in ("--args", "-args")), -1)
+        return (args[k + 1 :] or None) if k > 0 else None
+    if name == "entr":
+        return args[_short_options(args, 1, "")[0] :] or None
+    if name == "uv":
+        words, i = _skip_wrapper_options(name, args, 1, _UV_RUN_SPEC)
+        if words[i : i + 1] != ["run"]:
+            return None
+        args, name = words[i:], "uv-run"
+    spec = _UV_RUN_SPEC if name == "uv-run" else _LAUNCH_SPECS.get(name)
+    if spec is None:
+        return None
+    words, rest = _skip_wrapper_options(name, args, 1, spec)
+    return words[rest:] or None
 
 
 def ssh_command_value(value: str) -> str | None:
@@ -3211,6 +3472,7 @@ def _launcher_payloads(sub: str) -> list[str]:
             out += _shell_c_code(real)  # `bash -c env`: one word with nothing to split is code all the same
         if real and real[0] == "trap":
             out += _trap_actions(real[1:])
+        out += _launch_code(real)  # flock -c, script -c, tmux new ..., sg, runuser -c (see _launch_code)
         if real:
             out += ssh_option_commands(real[0], real[1:])
             out += _windows_command_line(real[0], real[1:])
