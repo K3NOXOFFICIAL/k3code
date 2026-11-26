@@ -114,6 +114,15 @@ BUILTIN_BASH_ALLOW = [
     "realpath *",
     "readlink *",
     "findmnt *",
+    "free *",
+    "uptime *",
+    "ps *",
+    "top *",
+    "lscpu *",
+    "lsusb *",
+    "lspci *",
+    "sensors *",
+    "hostname *",
     "git status *",
     "git diff *",
     "git log *",
@@ -1040,6 +1049,36 @@ _READONLY_OPTS: dict[str, _Opts] = {
         " submounts raw fstab uniq notruncate nofsroot verify verbose shell output-all",
         "direction mountpoint task options output source target types timeout",
     ),
+    # not -s/--seconds or -c/--count (repeat forever or N times)
+    "free": _opts(
+        "bkmghlLtvw",
+        longs="bytes kilo mega giga tera peta kibi mebi gibi tebi pebi human si lohi line total committed wide",
+    ),
+    "uptime": _opts("cprs", longs="container pretty raw since"),
+    # UNIX options only; the BSD ones (no dash) are checked by _ps_ok, which also asks on a glued value
+    "ps": _opts(
+        "AeadNFfHjlMPyLmTcVwZ",
+        "CGgpqstuUDOo",
+        "deselect forest context headers no-headers signames cumulative version",
+        "Group group pid ppid quick-pid sid tty user User format sort delimiter cols columns width rows lines",
+    ),
+    # batch mode only (-b -n N, see _sysinspect_ok); not -d (delay), -s, -S, -U, -i, -O
+    "top": _opts("bcH1", "nopuEew"),
+    # not -s/--sysroot (a directory it reads)
+    "lscpu": _opts(
+        "abBcJrxy",
+        longs="all online bytes offline json raw hex physical output-all",
+        longs_val="caches extended parse hierarchic",
+        glued="Cep",
+    ),
+    # not -D (opens the device file it names)
+    "lsusb": _opts("vt", "sd", "verbose tree"),
+    # display only: not -x (-xxx "dangerous"), -q/-Q (DNS, cache file), -i/-p/-F (files), -M/-H/-A/-O/-G (access)
+    "lspci": _opts("mtvkbDPn", "sd"),
+    # not -s/--set (writes the chips) or -c/--config-file
+    "sensors": _opts("fAujn", longs="fahrenheit no-adapter bus-list allow-no-sensors"),
+    # prints only: not -b/--boot or -F/--file (set the name); a name operand sets it (see _sysinspect_ok)
+    "hostname": _opts("aAdfiIsy", longs="domain fqdn long ip-address all-ip-addresses short"),
     "pwd": _opts("LP", longs="logical physical"),
     "which": _opts("as"),
     "type": _opts("aftpP"),
@@ -1232,6 +1271,92 @@ def _ref_list_ok(sub: str, args: list[str]) -> bool:
     return positional == 0 or listing
 
 
+#: The builtin process and hardware viewers besides ps, and whether they take operands: only the chip names of
+#: ``sensors``. ``hostname NAME`` sets the host name; for the others a word left over is a value nobody checked.
+_SYSINSPECT_OPERANDS = {
+    "free": False,
+    "uptime": False,
+    "top": False,
+    "lscpu": False,
+    "lsusb": False,
+    "lspci": False,
+    "hostname": False,
+    "sensors": True,
+}
+#: An option value or operand of a process or hardware viewer: a list, a field, a bus id (``pid,%cpu``, ``1:2``).
+_SYS_WORD = re.compile(r"[\w,.:+%=-]+")
+#: BSD-style ps options (no dash) that print only what ps prints anyway: not ``e``, which appends the environment of
+#: every process (tokens, keys: the reason ``env`` and ``printenv`` are not builtin). The value ones take the next word.
+_PS_BSD_FLAGS = "arTxfjlsuvXHmcnSLVwZ"
+_PS_BSD_VALUED = "pqtUOok"
+
+
+def _expands(args: list[str]) -> bool:
+    """An argument holds a glob, brace or substitution the shell may turn into other options (``ps ax ?`` with a file
+    ``e``, ``sensors *`` with a file ``-s``)."""
+    return any(hardline._EXPANDS & set(a) for a in args)
+
+
+def _sysinspect_ok(name: str, spec: _Opts, args: list[str]) -> bool:
+    """``name ARGS`` (see _SYSINSPECT_OPERANDS, after _opts_ok) leaves no word unchecked: each value is a plain word,
+    not the next option _opts_ok skipped (``top -b -n1 -p -i``), and there is no operand but a ``sensors`` chip.
+    ``top`` must run in batch mode for at most 9 rounds, or it runs until a person quits it."""
+    if _expands(args):
+        return False
+    opts, positional = _options(args, spec.valued, spec.longs_val)  # glued values (`lscpu -ecpu`) are no words
+    if any(v and (v.startswith("-") or not _SYS_WORD.fullmatch(v)) for _, v in opts):
+        return False
+    if positional and not (
+        _SYSINSPECT_OPERANDS[name] and all(_SYS_WORD.fullmatch(p) and not p.startswith("-") for p in positional)
+    ):
+        return False
+    if name == "top":
+        given = dict(opts)
+        return "-b" in given and re.fullmatch(r"[1-9]", given.get("-n", "")) is not None
+    return True
+
+
+def _ps_ok(spec: _Opts, args: list[str]) -> bool:
+    """``ps ARGS`` prints no process environment: every UNIX (``-ef``) and BSD (``aux``) option is a listed one, a
+    value option is last in its word and takes the next one (``-uxe`` is ``-u xe``, and with no user ``xe`` ps reads it
+    as BSD ``uxe``), a dashed ``e`` comes only with options that cannot fail, no word names the ``environ`` field
+    (``-o environ``) and none expands."""
+    if _expands(args) or any("environ" in a for a in args):
+        return False
+    if any(a.startswith("-") and not a.startswith("--") and "e" in a for a in args):
+        # a UNIX line that fails (`-ef -o args`, `-eTH`) is read again as BSD, where that e prints the environments:
+        # only these options, which never fail together, may keep it
+        return all(re.fullmatch(r"-[efFljyw]+", a) for a in args)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        takes_value = False
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if key in spec.longs and not eq:
+                continue
+            if key not in spec.longs_val or (eq and not _SYS_WORD.fullmatch(value)):
+                return False
+            takes_value = not eq
+        else:
+            dashed = a.startswith("-")
+            letters = a[1:] if dashed else a
+            flags, valued = (spec.flags, spec.valued) if dashed else (_PS_BSD_FLAGS, _PS_BSD_VALUED)
+            if not letters:
+                return False
+            for k, ch in enumerate(letters, 1):
+                if ch in valued and k == len(letters):
+                    takes_value = True
+                elif ch not in flags:
+                    return False
+        if takes_value:
+            if i == len(args) or args[i].startswith("-") or not _SYS_WORD.fullmatch(args[i]):
+                return False
+            i += 1
+    return True
+
+
 def _readonly_argv_ok(tokens: list[str]) -> bool:
     """``tokens`` (one simple command, as written) uses only the options of a builtin read-only command that are known
     to be safe (see _READONLY_OPTS), and no query or argument that writes or runs something. Other commands pass."""
@@ -1256,6 +1381,10 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         # `uniq IN OUT` writes OUT
         _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
         return len(positional) <= 1
+    if name == "ps":
+        return _ps_ok(_READONLY_OPTS["ps"], args)
+    if name in _SYSINSPECT_OPERANDS:
+        return _sysinspect_ok(name, _READONLY_OPTS[name], args)
     return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
