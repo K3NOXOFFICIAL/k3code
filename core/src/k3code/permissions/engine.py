@@ -74,6 +74,9 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
 #: that are not known to be safe ask (_READONLY_OPTS, checked on the argv by _readonly_argv_ok; BUILTIN_BASH_ASK names
 #: the best-known ones as patterns).
 #: ``env``/``printenv`` are not here: they print the secrets in the environment.
+#: ``systemctl``/``journalctl`` are here with their query verbs and options only (see _readonly_argv_ok): they print
+#: unit state, unit files and logs, which can hold what a unit or a program wrote there. The Bash tool has no tty, so
+#: neither starts its pager (``less``, which can run commands).
 BUILTIN_BASH_ALLOW = [
     "ls *",
     "cat *",
@@ -114,6 +117,8 @@ BUILTIN_BASH_ALLOW = [
     "realpath *",
     "readlink *",
     "findmnt *",
+    "systemctl *",
+    "journalctl *",
     "git status *",
     "git diff *",
     "git log *",
@@ -1141,7 +1146,30 @@ _READONLY_OPTS: dict[str, _Opts] = {
         longs_val="short abbrev-ref symbolic-full-name",
     ),
     "git remote": _opts("v", longs="verbose push all"),
+    # not -H/--host, -M/--machine, --root, --image: they reach another system or tree. The verb is checked on its own.
+    "systemctl": _opts(
+        "aqlr",
+        "notp",
+        "user system no-pager no-legend all full plain quiet value recursive",
+        "lines output type state property",
+    ),
+    # -n/-b take an optional value, glued (-n5, --lines=5) or a number word that is checked on its own: never
+    # the next option (`-n --rotate`). `-b -1` (the boot before) is the -\d+ word; journalctl has no digit option.
+    # Not -f/--follow (never ends), --vacuum-*/--rotate/--flush/--sync/... (write), -D/--file/--root/-M (elsewhere).
+    "journalctl": _opts(
+        "kexrqa",
+        "upSUogt",
+        "no-pager user system dmesg reverse catalog pager-end quiet no-hostname utc list-boots disk-usage all",
+        "lines boot unit user-unit priority since until output grep identifier case-sensitive namespace",
+        extra=r"-\d+",
+        glued="nb",
+    ),
 }
+#: The systemctl verbs that only print. Every other one (start, restart, enable, edit, daemon-reload, kill, ...) asks.
+_SYSTEMCTL_READ_VERBS = frozenset(
+    {"status", "show", "cat", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies"}
+    | {"list-jobs", "is-active", "is-enabled", "is-failed", "is-system-running", "get-default"}
+)
 #: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules (``import``,
 #: ``modulemeta``), or run a command.
 #: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
@@ -1252,6 +1280,11 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
     if name == "make":
         _, positional = _options(args, *_MAKE_VALUE_OPTS)
         return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
+    if name == "systemctl":
+        # the verb is the first positional, as systemctl parses it (`-t status restart x` restarts x); none lists units
+        sysctl = _READONLY_OPTS["systemctl"]
+        _, positional = _options(args, sysctl.valued, sysctl.longs_val)
+        return not positional or positional[0] in _SYSTEMCTL_READ_VERBS
     if name == "uniq":
         # `uniq IN OUT` writes OUT
         _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
