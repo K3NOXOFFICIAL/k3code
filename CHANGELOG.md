@@ -39,6 +39,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
+- **Quoted operator characters no longer ask.** `grep -rn "List<>" src`, `grep -n 'a<(b' src` and `git log --grep="x=>(y)"` were read as redirects or process substitutions; the permission engine now finds operators outside quotes only (a `$(...)`, backtick or `${...}` in double quotes still counts) and reads redirect targets from the text as written. Commands that run a quoted argument as code (shells, `eval`, awk, `ssh`, `git -c`), `$'...'`, comments and unclosed quotes keep the old reading, and the auto-mode outside-roots write check is unchanged.
 - **The prompt and tool texts name only tools the model can call.** The edit tool's recovery messages told the model to use `write_file` and `read_file`, which do not exist (they are `write` and `read`), and `ask_user_question` named `exit_plan` as if it were always available; it now says so only for plan mode. A test scans every tool description, the prompts and the plan-mode and fuzzy-match messages for names that are not registered tools.
 
 - **Malformed tool calls get actionable errors and one retry hint.** An unknown tool names the closest registered tool and lists the valid ones, an invalid `<tool_calls>` block echoes how it began, argument checks look one level into arrays (`items.type`) and objects (`required`, property types), and the next request carries one `<system-reminder>` telling the model to fix the call and retry once (none for ordinary execution errors).
