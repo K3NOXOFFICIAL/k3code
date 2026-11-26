@@ -988,7 +988,7 @@ _AUTO_WRITES = [
     for op in ("<>", "1<>", ">|", "2>|", ">")
     for sp in ("", " ")
     for t in ("~/.bashrc", "$HOME/.bashrc")
-]
+] + [f"echo x2{op}~/.bashrc" for op in ("&>", "&>>", ">", ">|")]  # the word's digits are no fd: `&>` still writes
 
 
 @pytest.mark.parametrize("rules", [None, _USER_ALLOWS], ids=["builtin", "user"])

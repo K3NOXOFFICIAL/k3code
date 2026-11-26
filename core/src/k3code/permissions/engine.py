@@ -807,17 +807,20 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 
 
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
+#: A file-descriptor number in front of a redirect operator (``2>f``): only where a word starts. In ``x.p12>f`` the
+#: digits end the word ``x.p12``; taking them as the fd read ``x.p`` (no secret name) where ``cat`` reads ``x.p12``.
+_FD = r"(?:(?:^|(?<=[\s;&|()]))\d+)"
 _HARMLESS_REDIRECT = re.compile(
-    r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*(?:>\||<>|>>?&?)\s*/dev/null)(?![^\s;&|<>()])"
+    rf"(?:{_FD}?[<>]&(?:\d+|-)|&>>?\s*/dev/null|{_FD}?(?:>\||<>|>>?&?)\s*/dev/null)(?![^\s;&|<>()])"
 )
+#: Where a redirect operator starts: after its fd (see _FD), or not inside another operator (``<<EOF``, ``>&>``).
+_OPERATOR_START = rf"(?:{_FD}|(?<![<>&]))"
 #: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f), ``>|f`` (``>`` past
 #: noclobber) and ``<>f`` (opens f read-write and creates it, in bash and dash), each with an fd in front (``2>|f``).
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||(?:>>?|<)&?))\s*([^\s;&|<>()]+)")
-#: The characters a _REDIRECT operator starts with: a match that starts with another one took a guard character first.
-_REDIRECT_OPENERS = frozenset("<>&0123456789")
+_REDIRECT = re.compile(rf"(?:(?<![<>&])&>>?|{_OPERATOR_START}(?:<>|>\||(?:>>?|<)&?))\s*([^\s;&|<>()]+)")
 #: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``, ``>|``, and ``<>``, which writes as well): reading
 #: with ``<`` is never restricted by the write roots.
-_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
+_WRITE_REDIRECT = re.compile(rf"(?:(?<![<>&])&>>?|{_OPERATOR_START}(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
 #: ``$(...)``, backticks and process substitution ``<(...)``/``>(...)`` (bash; ``echo >(rm x)`` runs ``rm x``).
 _SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
 #: What stands in for a quoted character in :func:`_quote_mask` (no operator regex here matches it).
@@ -1738,9 +1741,9 @@ def _argv(
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
     runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
     plain, mask = _operator_view(sub)
-    # redirect targets are checked separately; a cut starts at the operator, not at the guard character the match takes
-    # in front of it (``cat /etc/shadow>out`` reads ``/etc/shadow``, not ``/etc/shado``)
-    cuts = [(m.start() + (mask[m.start()] not in _REDIRECT_OPENERS), m.end()) for m in _REDIRECT.finditer(mask)]
+    # redirect targets are checked separately; a cut starts at the operator or its fd, never inside the word in front
+    # (``cat /etc/shadow>out`` reads ``/etc/shadow``, ``cat x.p12>out`` reads ``x.p12``: see _FD)
+    cuts = [m.span() for m in _REDIRECT.finditer(mask)]
     words = " ".join(
         plain[a:b] for a, b in zip([0] + [e for _, e in cuts], [s for s, _ in cuts] + [len(plain)], strict=True)
     )
@@ -2070,7 +2073,7 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
 # ── credential files named on a command line ──
 
 #: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
-_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
+_INPUT_REDIRECT = re.compile(rf"{_OPERATOR_START}<(?![<&(>])\s*([^\s;&|<>()]+)")
 _ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 _GLOB_CHARS = frozenset("*?[")
 #: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
