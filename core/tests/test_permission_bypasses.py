@@ -1453,6 +1453,29 @@ EXEC_OPTION_DENY: list[tuple[str, str]] = [
     ("sh", "echo 'rm -rf ~' | sh"),
     ("bash", "printf 'rm -rf ~' | bash"),
     ("sh", "echo 'rm -rf ~' | sh -s"),
+    # git -c behind any launcher or path that names git
+    ("sudo", "sudo -u git git -c core.pager='rm -rf ~' log"),
+    ("flock", "flock L git -c core.pager='rm -rf ~' log"),
+    ("env", "env X=1 git -c core.fsmonitor='rm -rf ~' status"),  # guard: already refused before
+    ("nice", "nice git -c core.sshCommand='rm -rf ~' fetch"),  # guard: already refused before
+    ("timeout", "timeout 5 git -c alias.x='!rm -rf ~' x"),  # guard: already refused before
+    ("/usr/bin/git", "/usr/bin/git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    ("command", "command git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    ("xargs", "xargs git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    # environment variables whose value a program runs as a command line
+    ("git", "GIT_SSH_COMMAND='rm -rf ~' git fetch"),
+    ("git", "GIT_EXTERNAL_DIFF='rm -rf ~' git diff"),
+    ("git", "GIT_PAGER='rm -rf ~' git log"),
+    ("git", "GIT_EDITOR='rm -rf ~' git commit"),
+    ("git", "GIT_ASKPASS='rm -rf ~' git fetch"),
+    ("man", "PAGER='rm -rf ~' man ls"),
+    ("man", "MANPAGER='rm -rf ~' man ls"),
+    ("crontab", "EDITOR='rm -rf ~' crontab -e"),
+    ("crontab", "VISUAL='rm -rf ~' crontab -e"),
+    ("git", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0='rm -rf ~' git log"),
+    ("bash", "PROMPT_COMMAND='rm -rf ~' bash"),
+    ("bash", "BASH_ENV='rm -rf ~' bash -c ls"),
+    ("env", "env GIT_PAGER='rm -rf ~' git log"),
 ]
 
 
@@ -1482,6 +1505,13 @@ def test_option_values_that_run_commands_are_refused(tmp_path: Path, prog: str, 
         "grep -rn 'rm -rf' src",
         "echo rm -rf ~",
         "echo 'rm -rf ~' | cat",
+        "sudo -u git git status",
+        "env X=1 git log",
+        "EDITOR=vim git commit",
+        "PAGER=less man ls",
+        "GIT_PAGER=cat git log",
+        "GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git fetch",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=cat git log",
     ],
 )
 def test_benign_option_values_are_not_refused(tmp_path: Path, cmd: str) -> None:

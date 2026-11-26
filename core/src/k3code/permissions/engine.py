@@ -2153,7 +2153,7 @@ def _bind_mount_sources(argv: list[str]) -> list[str]:
     ``-v data:/d`` names a volume, not a host path."""
     rest = _container_run_args(argv)
     if rest is None:
-        return []
+        return _volume_devices(argv)
     values: list[tuple[str, str]] = []
     for k, w in enumerate(rest):
         nxt = rest[k + 1] if k + 1 < len(rest) else ""
@@ -2172,6 +2172,26 @@ def _bind_mount_sources(argv: list[str]) -> list[str]:
             sources += [p.split("=", 1)[1] for p in parts if p.startswith(("src=", "source="))]
             sources += [p.removeprefix("volume-opt=device=") for p in parts if p.startswith("volume-opt=device=")]
     return [s for s in sources if s.startswith(("/", "~", ".", "$"))]
+
+
+def _volume_devices(argv: list[str]) -> list[str]:
+    """The host paths a ``volume create`` of a container ``argv`` binds through a ``device=`` driver option
+    (``docker volume create --opt device=/etc --opt o=bind v``, ``-o device=X``, ``--opt=device=X``, ``-odevice=X``):
+    a later ``-v v:/d`` mounts that host path. Only path-like ones, as in _bind_mount_sources."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return []
+    words = argv[1:]
+    k = 0
+    while k < len(words) and words[k].startswith("-"):
+        k += 2 if words[k] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
+    if words[k : k + 2] != ["volume", "create"]:
+        return []
+    rest = words[k + 2 :]
+    opts = [rest[j + 1] for j, w in enumerate(rest[:-1]) if w in ("-o", "--opt")]
+    opts += [w.removeprefix("--opt=") for w in rest if w.startswith("--opt=")]
+    opts += [w[2:] for w in rest if w.startswith("-o") and len(w) > 2]
+    devices = [o.removeprefix("device=") for o in opts if o.startswith("device=")]
+    return [d for d in devices if d.startswith(("/", "~", ".", "$"))]
 
 
 def _container_takeover(argv: list[str]) -> bool:
