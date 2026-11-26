@@ -953,6 +953,17 @@ def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
     return False
 
 
+def _line_writes_outside_roots(subs: list[str], roots: list[str], where: _Where) -> bool:
+    """A redirect of ``subs`` writes outside the roots from one of the directories the line may run in (``where``: the
+    cwd and each directory a ``cd``/``pushd`` on it can reach, its symlinks resolved too: ``cd link && > ../x`` writes
+    next to the link's target). A directory that cannot be worked out (``cd $DIR``) could be ``/``: a relative target
+    then counts as outside."""
+    dirs = list(dict.fromkeys(d for w in where.dirs for d in (w, _real(w))))
+    if where.unknown:
+        dirs.append("/")
+    return any(_writes_outside_roots(sub, roots, d) for sub in subs for d in dirs)
+
+
 def _redirects_ok(plain: str, mask: str, roots: list[str], cwd: str) -> bool:
     """Every redirect target is a plain path inside the project roots and not a credential/startup file."""
     for target in _operator_targets(_REDIRECT, plain, mask):
@@ -2815,7 +2826,8 @@ def _decide_bash(
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
-    secret = _secret_access(parsed, _where(parsed, cwd, home), home)
+    where = _where(parsed, cwd, home)
+    secret = _secret_access(parsed, where, home)
     if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
@@ -2826,7 +2838,7 @@ def _decide_bash(
         if secret == "unchecked":
             return Decision(action="deny", patterns=prefixes, message=f"{_UNCHECKED_MSG}: {command[:120]}")
         return Decision(action="allow", patterns=prefixes)
-    if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
+    if mode == PermissionMode.AUTO and _line_writes_outside_roots(subs, roots, where):
         # auto mode writes only inside the project roots; no allow rule overrides this
         return Decision(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
@@ -2850,14 +2862,9 @@ def _decide_bash(
             home_dot = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
         # the forced check goes by the program that runs, not the allow pattern the spelling matched (`/bin/cat`,
-        # `env cat`, `\cat` ask, and auto mode's classifier would answer): a user/project allow still decides
-        mine_allow = rule.action == "allow" and rule.layer > 0
-        if (
-            rule.action != "deny"
-            and not mine_allow
-            and _runs_builtin_read(sub, ruleset)
-            and _reads_secret_outside(sub, roots, cwd)
-        ):
+        # `env cat`, `sudo cat`, `\cat` ask, and auto mode's classifier would answer); no allow rule lifts it, a
+        # user/project one included (`sudo *`, `cat *`)
+        if rule.action != "deny" and _runs_builtin_read(sub, ruleset) and _reads_secret_outside(sub, roots, cwd):
             outside_secret = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
@@ -2889,6 +2896,10 @@ def _decide_bash(
         if rule.action != "allow" and (worst is None or _RANK[rule.action] > _RANK[worst.action]):
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
+    # a nested command reads it the same: `bash -c 'cat /etc/shadow'` under `bash *`
+    outside_secret = outside_secret or any(
+        _runs_builtin_read(form, ruleset) and _reads_secret_outside(form, roots, cwd) for form in _rule_forms(parsed)
+    )
     if unsafe and worst.action != "deny":
         return Decision(
             action="ask",

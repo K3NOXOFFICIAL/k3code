@@ -3,9 +3,11 @@ ask a person in every mode; broad content walks, expansions and compounds keep a
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from k3code.permissions import PermissionMode, decide
+from k3code.permissions import PermissionMode, Rule, decide
 
 ALLOWED_OUTSIDE = [
     "ls /etc",
@@ -190,3 +192,49 @@ def test_harmless_respellings_keep_their_decision(command: str, default: str, au
     for mode, want in ((PermissionMode.DEFAULT, default), (PermissionMode.AUTO, auto)):
         dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
         assert (dec.action, dec.needs_human) == (want, False), (command, mode, dec.action, dec.message)
+
+
+# ── a secret read asks a person whatever allow rule matched it (user or project), in auto mode too ──
+
+SECRET_UNDER_ALLOW = [
+    ("sudo *", "sudo cat /etc/shadow"),
+    ("env *", "env cat /etc/shadow"),
+    ("bash *", "bash -c 'cat /etc/shadow'"),
+    ("cat *", "cat /etc/shadow"),
+    ("cat *", "cat /etc/sudoers"),
+]
+#: credential files a hardline already denies, under the same rules
+SECRET_DENIED_UNDER_ALLOW = [
+    ("sudo *", "sudo cat ~/.aws/credentials"),
+    ("cat *", "cat ~/.ssh/id_rsa"),
+]
+
+
+@pytest.mark.parametrize("layer", [1, 2])
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize(("pattern", "command"), SECRET_UNDER_ALLOW)
+def test_an_allow_rule_does_not_lift_the_secret_read_check(
+    tmp_path: Path, pattern: str, command: str, mode: PermissionMode, layer: int
+) -> None:
+    rules = [Rule(tool="bash", pattern=pattern, action="allow", layer=layer)]
+    where = {"user_rules": rules} if layer == 1 else {"project_rules": rules}
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, **where)
+    assert (dec.action, dec.needs_human) == ("ask", True), (pattern, command, mode, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.AUTO])
+@pytest.mark.parametrize(("pattern", "command"), SECRET_DENIED_UNDER_ALLOW)
+def test_an_allow_rule_does_not_lift_a_credential_deny(
+    tmp_path: Path, pattern: str, command: str, mode: PermissionMode
+) -> None:
+    rules = [Rule(tool="bash", pattern=pattern, action="allow", layer=1)]
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny", (pattern, command, mode, dec.message)
+
+
+@pytest.mark.parametrize(("pattern", "command"), [("sudo *", "sudo ls /etc"), ("cat *", "cat README")])
+def test_an_allow_rule_still_decides_a_read_that_holds_no_secret(tmp_path: Path, pattern: str, command: str) -> None:
+    rules = [Rule(tool="bash", pattern=pattern, action="allow", layer=1)]
+    for mode in (PermissionMode.DEFAULT, PermissionMode.AUTO):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
+        assert (dec.action, dec.needs_human) == ("allow", False), (pattern, command, mode, dec.message)

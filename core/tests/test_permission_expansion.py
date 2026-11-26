@@ -282,3 +282,31 @@ def test_nested_shell_keeps_its_decision(cmd: str, mode: str, layer: str, tmp_pa
     got = _decide_layer(cmd, mode, tmp_path, layer)
     want = {"default": "ask", "auto": "allow", "yolo": "allow"}[mode]
     assert (got.action, got.hardline, got.needs_human) == (want, None, False), cmd
+
+
+# ── a cd before or in a nested command moves the relative targets of its expanded form ──
+
+CD_THEN_EXPANDED_DELETE = [
+    "cd / && bash -c 'rm${IFS}-rf${IFS}*'",
+    "cd / && rm${IFS}-rf${IFS}*",
+    "bash -c 'cd / && rm${IFS}-rf${IFS}*'",
+    "cd / && sh -c '{rm,-rf,*}'",
+    "cd $X && bash -c 'rm${IFS}-rf${IFS}*'",  # a cd the check cannot resolve: assume the worst
+    "pushd / && bash -c 'rm${IFS}-rf${IFS}*'",
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", CD_THEN_EXPANDED_DELETE)
+def test_a_cd_counts_for_the_expanded_form_of_a_nested_command(tmp_path: Path, cmd: str, mode: str) -> None:
+    # as strict as `rm -rf /*`: a hardline, so not even yolo runs it
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("cmd", ["cd src && ls", "cd src && bash -c 'ls${IFS}-la'"])
+def test_a_harmless_cd_before_a_nested_command_keeps_its_hardline_verdict(tmp_path: Path, cmd: str) -> None:
+    (tmp_path / "src").mkdir()
+    for mode in ("default", "auto", "yolo"):
+        dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path)
+        assert dec.action != "deny" and dec.hardline is None, (cmd, mode, dec.message)
