@@ -1,5 +1,6 @@
-"""Builtin read-only commands outside the project: literal paths that hold no secret run without asking; secret paths
-ask a person in every mode; broad content walks, expansions and compounds keep asking."""
+"""Builtin read-only commands outside the project: metadata readers (ls, du, stat, find) take literal paths that hold
+no secret, content readers (cat, grep, sort ...) only an explicit allowlist of benign system files; secret paths ask a
+person in every mode; broad content walks, expansions, compounds and every other content read keep asking."""
 
 from __future__ import annotations
 
@@ -16,7 +17,6 @@ ALLOWED_OUTSIDE = [
     "head -n5 /var/log/dnf.log",
     "du -sh ~/Downloads",
     "tail /etc/passwd",
-    "sort ~/x",
     "ls /etc | grep ssh",
     "ls ~/projects",
     "cat /proc/cpuinfo",
@@ -24,6 +24,67 @@ ALLOWED_OUTSIDE = [
     "df -h",
     "ls /usr/lib",
     "find /usr -name x -maxdepth 2",
+    # metadata readers (names and sizes only) take the broad outside roots
+    "ls ~",
+    "ls -la ~/Downloads",
+    "ls /opt",
+    "stat /etc/hostname",
+    "ls /var/log",
+    # content readers take only the explicit allowlist of benign files and trees
+    "cat /etc/hostname",
+    "cat /etc/hosts",
+    "grep -r x /usr/share/doc/foo",
+    "cat /usr/lib/os-release",
+    "cat /etc/yum.repos.d/fedora.repo",
+]
+
+#: Content reads outside the roots no secret NAME gives away: the allowlist of benign files does not hold them, so the
+#: user is asked (plain ask, as before outside reads were allowed), but no person is forced.
+PLAIN_ASK_CONTENT = [
+    "sort ~/x",
+    "cat ~/notes",
+    "tree --fromfile ~/wallet.dat",
+    "cat ~/wallet.dat",
+    "cat ~/seed.txt",
+    "cat ~/mnemonic.txt",
+    "cat ~/recovery-codes.txt",
+    "cat ~/Downloads/github-recovery-codes.txt",
+    "cat ~/bitwarden-export.json",
+    "cat ~/vpn/wg0.conf",
+    "cat ~/rclone.conf",
+    "cat ~/api_key",
+    "cat ~/apikey.txt",
+    "cat ~/auth.json",
+    "cat ~/keys.txt",
+    "cat ~/pass/github",
+    "cat /etc/postfix/sasl_passwd",
+    "cat /etc/apt/auth.conf",
+    "cat /etc/containers/auth.json",
+    "cat /etc/kubernetes/admin.conf",
+    "cat /etc/wpa_supplicant/wpa_supplicant.conf",
+    "cat /etc/opendkim/keys/mail.private",
+    "cat /etc/ldap.secret",
+    "cat /etc/cifs-creds",
+    "cat /etc/ceph/ceph.client.admin.keyring",
+    "cat /etc/rclone/rclone.conf",
+    "cat /etc/restic/env",
+    "cat /etc/mysql/debian.cnf",
+    "cat /etc/msmtprc",
+    "cat /etc/ddclient.conf",
+    "cat /etc/chrony.keys",
+    "cat /etc/mosquitto/passwd",
+    "cat /etc/gitlab/gitlab.rb",
+    "cat /etc/fstab",
+    "cat /etc/environment",
+    "cat /etc/profile.d/x.sh",
+    "cat /etc/cloudflared/config.yml",
+    "cat /var/log/secure",
+    "cat /var/log/auth.log",
+    "cat /var/log/audit/audit.log",
+    "cat /tmp/systemd-private-x/tmp/y",
+    "cat /tmp/other-user-dump.sql",
+    "cat /opt/app/config/database.yml",
+    "cat /opt/gitea/custom/conf/app.ini",
 ]
 
 #: Reads outside the roots a builtin may take without a person (/usr, /opt, /etc, /var/log, /tmp, $HOME's plain
@@ -119,7 +180,7 @@ def test_secret_paths_outside_ask_a_person_in_every_mode(command: str, mode: Per
     assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (command, dec.action, dec.message)
 
 
-@pytest.mark.parametrize("command", PLAIN_ASK)
+@pytest.mark.parametrize("command", PLAIN_ASK + PLAIN_ASK_CONTENT)
 def test_reads_outside_the_allowed_roots_ask_without_forcing_a_person(command: str, tmp_path) -> None:
     for mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS):
         dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
@@ -136,7 +197,16 @@ def test_broad_walks_expansions_and_compounds_do_not_allow(command: str, tmp_pat
 
 @pytest.mark.parametrize(
     ("cwd", "command", "allowed"),
-    [("/etc", "ls", True), ("/etc", "cat os-release", True), ("/root", "ls", False), ("/", "grep -r x", False)],
+    [
+        ("/etc", "ls", True),
+        ("/etc", "cat os-release", True),
+        ("/root", "ls", False),
+        ("/", "grep -r x", False),
+        ("/opt", "ls", True),
+        ("/opt", "cat x.yml", False),
+        ("/opt", "grep -r x", False),
+        ("/usr/share/doc", "grep -r x", True),
+    ],
 )
 def test_cwd_outside_the_project(cwd: str, command: str, allowed: bool, tmp_path) -> None:
     dec = decide(mode=PermissionMode.DEFAULT, tool="bash", args={"command": command, "cwd": cwd}, cwd=tmp_path)
