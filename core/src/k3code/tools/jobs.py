@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from k3code.reliability.sandbox import git_readonly_note
+
 #: Unread output kept per job; past it the oldest unread bytes are dropped (and the next read says how many).
 MAX_UNREAD_BYTES = 1024 * 1024
 #: Last output bytes kept per job for the process list's preview (independent of what bash_output has read).
@@ -34,6 +36,7 @@ class Job:
     exit_code: int | None = None
     reader: asyncio.Task[None] | None = None
     cwd: str = ""
+    sandboxed: bool = False
     exited_at: float | None = None
     tail: bytearray = field(default_factory=bytearray)
 
@@ -114,8 +117,12 @@ class JobRegistry:
         self._ids = itertools.count(1)
         self._foreground: dict[int, Foreground] = {}
 
-    def add(self, session_id: str, command: str, proc: asyncio.subprocess.Process, *, cwd: str = "") -> Job:
-        job = Job(id=f"job{next(self._ids)}", session_id=session_id, command=command, proc=proc, cwd=cwd)
+    def add(
+        self, session_id: str, command: str, proc: asyncio.subprocess.Process, *, cwd: str = "", sandboxed: bool = False
+    ) -> Job:
+        job = Job(
+            id=f"job{next(self._ids)}", session_id=session_id, command=command, proc=proc, cwd=cwd, sandboxed=sandboxed
+        )
         job.reader = asyncio.ensure_future(self._pump(job))
         self._jobs[job.id] = job
         return job
@@ -146,6 +153,8 @@ class JobRegistry:
         if dropped:
             parts.append(f"[{dropped} bytes of output were dropped: read sooner to keep them]")
         parts.append(text.rstrip("\n") if text else "(no new output)")
+        if job.sandboxed and (note := git_readonly_note(job.command, text, job.exit_code, background=True)):
+            parts.append(note)
         return {"content": "\n".join(parts)}
 
     async def kill(self, session_id: str, job_id: str) -> dict[str, Any]:

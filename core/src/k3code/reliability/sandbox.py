@@ -120,6 +120,21 @@ def configured_git_writable() -> bool:
     return value if isinstance(value, bool) else False
 
 
+def git_readonly_note(command: str, output: str, exit_code: int | None, *, background: bool = False) -> str:
+    """One line explaining a git write that failed on the sandbox's read-only ``.git``, or "" when this is not that
+    failure. The caller says only whether the command ran sandboxed."""
+    if exit_code in (0, None) or "Read-only file system" not in output:
+        return ""
+    if ".git" not in output and "git " not in command:
+        return ""
+    if background:
+        return "Note: background jobs always get a read-only .git in the sandbox; run git in the foreground."
+    return (
+        "Note: .git is read-only in the sandbox. To allow git writes, set sandbox.git_writable: true in "
+        f"{paths.user_config_path()}, or ask the user to run the git command."
+    )
+
+
 def configured_home_readonly() -> list[str]:
     """``sandbox.home_readonly`` from the user's ``config.yaml`` (never a project's): ``$HOME`` entries that stay
     visible, read-only, inside the sandbox. Empty when unset or malformed."""
