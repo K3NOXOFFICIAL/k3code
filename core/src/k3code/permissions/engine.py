@@ -1228,10 +1228,23 @@ _READONLY_OPTS: dict[str, _Opts] = {
     ),
 }
 #: The systemctl verbs that only print. Every other one (start, restart, enable, edit, daemon-reload, kill, ...) asks.
+#: Not ``cat``, ``show-environment`` or ``show`` without a property list: they print ``Environment=`` lines, which may
+#: hold tokens (the reason ``env`` is no builtin); see _systemctl_show_ok and _unit_env_dump.
 _SYSTEMCTL_READ_VERBS = frozenset(
-    {"status", "show", "cat", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies"}
+    {"status", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies"}
     | {"list-jobs", "is-active", "is-enabled", "is-failed", "is-system-running", "get-default"}
 )
+#: The unit properties ``systemctl show -p`` may print unasked: state, ids and dependencies. Not ``Environment*``,
+#: ``PassEnvironment``, ``ExecStart*`` (the command line with its arguments) or any other one.
+_SYSTEMCTL_SAFE_PROPS = frozenset(
+    {"ActiveState", "SubState", "LoadState", "UnitFileState", "MainPID", "ExecMainStatus", "Result", "Description"}
+    | {"FragmentPath", "NRestarts", "ActiveEnterTimestamp", "MemoryCurrent", "CPUUsageNSec", "Id", "Names", "Type"}
+    | {"Restart", "WantedBy", "After", "Before", "Requires", "Wants"}
+)
+#: The builtin process, hardware and journal viewers: a word of theirs the shell expands may become an option
+#: (``journalctl *`` with a file ``-f`` follows forever, ``lsblk *`` with ``-H``), so none of them allows one.
+_GLOB_GUARDED = frozenset({"free", "uptime", "ps", "top", "lscpu", "lsusb", "lspci", "sensors", "hostname", "ip"})
+_GLOB_GUARDED |= frozenset({"ss", "nvidia-smi", "lsblk", "systemctl", "journalctl", "findmnt"})
 #: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules (``import``,
 #: ``modulemeta``), or run a command.
 #: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
@@ -1490,6 +1503,25 @@ def _ps_ok(spec: _Opts, args: list[str]) -> bool:
     return True
 
 
+def _systemctl_show_ok(opts: list[tuple[str, str]]) -> bool:
+    """``systemctl show`` with these options prints only properties of _SYSTEMCTL_SAFE_PROPS: at least one ``-p`` /
+    ``--property`` is given (without one it prints every property, ``Environment=`` too) and each listed one is safe."""
+    props = [p for key, value in opts if key in ("-p", "--property") for p in value.split(",")]
+    return bool(props) and all(p in _SYSTEMCTL_SAFE_PROPS for p in props)
+
+
+def _unit_env_dump(sub: str) -> bool:
+    """``sub`` prints the ``Environment=`` of a unit or of the service manager: ``systemctl show-environment``,
+    ``systemctl cat UNIT`` or a ``systemctl show`` that may list it. Like ``env``, a person confirms it in any mode."""
+    argv = _argv(sub)
+    if not argv or os.path.basename(argv[0]) != "systemctl":
+        return False
+    sysctl = _READONLY_OPTS["systemctl"]
+    opts, positional = _options(argv[1:], sysctl.valued, sysctl.longs_val)
+    verb = positional[0] if positional else ""
+    return verb in ("show-environment", "cat") or (verb == "show" and not _systemctl_show_ok(opts))
+
+
 def _readonly_argv_ok(tokens: list[str]) -> bool:
     """``tokens`` (one simple command, as written) uses only the options of a builtin read-only command that are known
     to be safe (see _READONLY_OPTS), and no query or argument that writes or runs something. Other commands pass."""
@@ -1504,6 +1536,8 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         if sub in _REF_LIST:
             return _ref_list_ok(sub, args)
         name = f"git {sub}"
+    if name in _GLOB_GUARDED and _expands(args):
+        return False
     if name == "ip":
         return _ip_ok(args)
     if name == "ss":
@@ -1519,7 +1553,9 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
     if name == "systemctl":
         # the verb is the first positional, as systemctl parses it (`-t status restart x` restarts x); none lists units
         sysctl = _READONLY_OPTS["systemctl"]
-        _, positional = _options(args, sysctl.valued, sysctl.longs_val)
+        opts, positional = _options(args, sysctl.valued, sysctl.longs_val)
+        if positional and positional[0] == "show":
+            return _systemctl_show_ok(opts)
         return not positional or positional[0] in _SYSTEMCTL_READ_VERBS
     if name == "uniq":
         # `uniq IN OUT` writes OUT
@@ -2686,6 +2722,13 @@ def _decide_bash(
         # returned above and asks nobody)
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
+        )
+    if worst.action != "deny" and any(_unit_env_dump(form) for form in [*subs, *_rule_forms(parsed)]):
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Prints the environment of a unit or the service manager; confirm it yourself: {command[:120]}",
         )
     if home_dot and worst.action != "deny":
         return Decision(
