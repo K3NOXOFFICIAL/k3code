@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import glob
+import itertools
+import math
 import os
 import re
 import shlex
+import string
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -1740,14 +1744,25 @@ def _argv(
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
     runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
+    return hardline.normalize_argv(hardline.tokens(_cut_redirects(sub)), reads, chdirs, replaces)
+
+
+#: ``<<WORD``, ``<<-WORD``, ``<<<WORD``: a heredoc delimiter or a here-string, never an argument (see _OPERATOR_START)
+_HEREDOC_OPERATOR = re.compile(rf"{_OPERATOR_START}<<[-<]?\s*[^\s;&|<>()]*")
+
+
+def _cut_redirects(sub: str) -> str:
+    """``sub`` with its redirections and heredoc operators cut out, each with its word."""
     plain, mask = _operator_view(sub)
     # redirect targets are checked separately; a cut starts at the operator or its fd, never inside the word in front
-    # (``cat /etc/shadow>out`` reads ``/etc/shadow``, ``cat x.p12>out`` reads ``x.p12``: see _FD)
-    cuts = [m.span() for m in _REDIRECT.finditer(mask)]
-    words = " ".join(
+    # (``cat /etc/shadow>out`` reads ``/etc/shadow``, ``cat x.p12>out`` and ``cat x.p12<<<y`` read ``x.p12``: see _FD)
+    cuts: list[tuple[int, int]] = []
+    for a, b in sorted(m.span() for rx in (_REDIRECT, _HEREDOC_OPERATOR) for m in rx.finditer(mask)):
+        if not cuts or a >= cuts[-1][1]:
+            cuts.append((a, b))
+    return " ".join(
         plain[a:b] for a, b in zip([0] + [e for _, e in cuts], [s for s, _ in cuts] + [len(plain)], strict=True)
     )
-    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs, replaces)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -1864,12 +1879,28 @@ def _wrapped_commands(sub: str) -> list[str]:
     out: list[str] = []
     argv = _argv(sub)
     while argv and (spec := _SECRET_CHECK_WRAPPERS.get(os.path.basename(argv[0]))):
+        if os.path.basename(argv[0]) == "flock" and (code := _flock_code(argv)) is not None:
+            inner = hardline.parse(code)  # `flock -c CODE LOCK` runs CODE with `sh -c`, as `bash -c` would
+            return [*out, code, *inner.subs, *_rule_forms(inner)]
         words, rest = hardline._skip_wrapper_options(os.path.basename(argv[0]), argv, 1, spec)
         if rest >= len(words):
             break
         out.append(" ".join(words[rest:]))
         argv = hardline.normalize_argv(words[rest:])
     return out
+
+
+def _flock_code(argv: list[str]) -> str | None:
+    """The shell code of ``flock -c CODE`` (``--command CODE``, ``--command=CODE``, a short cluster ending in c, and
+    the options in either order around the lock file), or None."""
+    for i, t in enumerate(argv[1:], 1):
+        if t == "--":
+            return None
+        if t.startswith("--command="):
+            return t.split("=", 1)[1]
+        if t == "--command" or (t[:1] == "-" and t[1:2] != "-" and t.endswith("c")):
+            return argv[i + 1] if i + 1 < len(argv) else None
+    return None
 
 
 def _runs_builtin_read(sub: str, ruleset: list[Rule]) -> bool:
@@ -1893,7 +1924,41 @@ def _glob_reaches_secret(arg: str, cwd: str) -> bool:
     if _guarded_tree(head) or not _shell_read_ok(head):
         return True
     base = os.path.dirname(head)
-    return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS))
+    return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS)) or _glob_names_secret(_abs(arg, cwd))
+
+
+#: what a ``?`` or ``[...]`` in a glob is tried as when k3code asks whether the glob may name a secret
+_GLOB_ALPHABET = string.ascii_letters + string.digits + "._-"
+#: more spellings than this to try, or more paths than this on disk that the glob matches: it may match a secret
+_GLOB_SPELLINGS_MAX = 4096
+_GLOB_MATCHES_MAX = 200
+
+
+def _glob_names_secret(pattern: str) -> bool:
+    """``pattern`` (absolute) may name a secret: some spelling of it with each ``?`` and ``[...]`` as one character
+    (_GLOB_ALPHABET) and each ``*`` empty (``x`` where it starts a name) is a path _shell_read_ok refuses
+    (``~/x/server.p1?``, ``/srv/id_rs[a]``, ``/srv/*.pem``), or a path on disk it matches now is
+    (``/srv/a/server.*``), or there are too many of either to check."""
+    parts = re.findall(r"\[!?\]?[^\]]*\]|[*?]|[^*?\[]+|\[", pattern)
+    choices: list[list[str]] = []
+    for part in parts:
+        # a wildcard that starts a name never matches a leading dot (no dotglob): `*.pdf` is no `.pdf`, but `x.pdf`
+        start = not choices or choices[-1][0].endswith("/")
+        alphabet = _GLOB_ALPHABET.replace(".", "") if start else _GLOB_ALPHABET
+        if part == "*":
+            choices.append(["x" if start else ""])
+        elif part == "?":
+            choices.append(list(alphabet))
+        elif part.startswith("[") and len(part) > 1:
+            choices.append([c for c in alphabet if fnmatch.fnmatchcase(c, part)] or ["x"])
+        else:
+            choices.append([part])
+    if math.prod(map(len, choices)) > _GLOB_SPELLINGS_MAX:
+        return True
+    if any(not _shell_read_ok("".join(p)) for p in itertools.product(*choices)):
+        return True
+    matches = list(itertools.islice(glob.iglob(pattern), _GLOB_MATCHES_MAX + 1))
+    return len(matches) > _GLOB_MATCHES_MAX or any(not _shell_read_ok(m) for m in matches)
 
 
 #: variables a path word may name that k3code resolves as the shell would (``$HOME/.netrc``), unless the line may
@@ -1969,6 +2034,54 @@ def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "", 
                 a = w  # a variable after a folder in the project: read as before (`cat src/$X`)
             if _secret_word(a, walker and arg in args, roots, cwd):
                 return True
+    return False
+
+
+def _names_secret_outside(sub: str, roots: list[str], cwd: str, line: str, depth: int = 0) -> bool:
+    """Any word of ``sub``, whatever the program (``firejail cat X``, ``uv run cat X``, ``xargs -a X echo``), is a
+    path outside the roots that holds a secret (_shell_read_ok, not strict; a glob: _glob_reaches_secret): the value
+    of ``--opt=X`` and ``NAME=X`` too, each word of an argument with spaces in it (code a wrapper runs:
+    ``script -qc 'cat X'``), ``<X`` sources and the files a dropped wrapper option reads. Only path-like words count
+    (a ``/`` in them, a leading ``~`` or ``.``, or a file in ``cwd``): ``grep token src`` names no path. An argument
+    the program only prints, tests or authenticates with (_credential_roles: ``echo X``, ``ssh -i X``) is exempt; a
+    variable k3code cannot resolve is skipped (the readers' check counts it for them)."""
+    reads: list[str] = []
+    argv = _argv(sub, reads)
+    cut = _cut_redirects(sub)
+    try:
+        words = hardline.tokens(cut)
+    except ValueError:
+        words = cut.split()
+    if argv:
+        # an argument the program only prints, tests or authenticates with is no read (`ssh -i KEY`, `echo X`:
+        # _credential_roles); `xargs -a X echo` reads X all the same
+        named = {w for role in _credential_roles(os.path.basename(argv[0]), argv[1:], False) for w in role}
+        unread = set(argv[1:]) - named
+        words = [w for w in words if w not in unread]
+        # the program it runs is no argument (`~/.venv/bin/python x.py`; argv holds it as `python`)
+        prog = next((w for w in words if os.path.basename(w) == os.path.basename(argv[0])), None)
+        if prog is not None:
+            words.remove(prog)
+    sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
+    for t in (*words, *reads, *sources):
+        if re.search(r"\s", t):
+            if depth < 2 and _names_secret_outside(t, roots, cwd, line, depth + 1):
+                return True
+            continue
+        for c in (t, *([t.split("=", 1)[1]] if "=" in t else [])):
+            if not c or (c.startswith("-") and c is t):
+                continue
+            if not (c.startswith(("/", "~", ".")) or "/" in c or os.path.lexists(os.path.join(cwd, c))):
+                continue
+            for w in _word_forms(c) or []:
+                a = _var_resolved(w, line, cwd) if _PARAM.search(w) else w
+                if a is None or not _arg_outside(a, roots, cwd):
+                    continue
+                literal = _literal_word(a)
+                if (literal and not _shell_read_ok(_abs(a, cwd), strict=False)) or (
+                    not literal and _glob_reaches_secret(a, cwd)
+                ):
+                    return True
     return False
 
 
@@ -2072,8 +2185,8 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
 
 # ── credential files named on a command line ──
 
-#: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
-_INPUT_REDIRECT = re.compile(rf"{_OPERATOR_START}<(?![<&(>])\s*([^\s;&|<>()]+)")
+#: ``<file`` and ``<>file`` (opens it read-write; not ``<<``, ``<<<``, ``<&``, ``<(``): a file the command reads.
+_INPUT_REDIRECT = re.compile(rf"{_OPERATOR_START}(?:<>|<(?![<&(>]))\s*([^\s;&|<>()]+)")
 _ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 _GLOB_CHARS = frozenset("*?[")
 #: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
@@ -3092,6 +3205,11 @@ def _decide_bash(
         and _reads_secret_outside(form, roots, cwd, command, "" if form in nested else spelled.get(form, ""))
         for form in dict.fromkeys((*forms, *wrapped))
     )
+    # and whatever the program: `firejail cat X`, `uv run cat X` under their rules (see _names_secret_outside)
+    outside_secret = outside_secret or any(
+        _names_secret_outside(form, roots, cwd, command)
+        for form in dict.fromkeys((*parsed.subs, *parsed.nested, *wrapped))  # as written: a joined argv loses quotes
+    )
     if unsafe and worst.action != "deny":
         return Decision(
             action="ask",
@@ -3524,7 +3642,7 @@ _PKI_PRIVATE = re.compile(r"/etc/pki/(?:[^/]+/)*private(?:/|$)")
 _WALK_SECRETS = (*_ETC_SECRETS, "/etc/ssh", "/etc/pki")
 
 
-def _shell_read_ok(path: str) -> bool:
+def _shell_read_ok(path: str, strict: bool = True) -> bool:
     """A builtin read-only bash command (``cat``, ``ls``, ``du`` ...) may read ``path`` (absolute) outside the roots
     without a person. Unlike _outside_read_ok, ``/etc`` is readable (the sandbox shows bash it anyway) except
     _ETC_SECRETS and the keys in /etc/ssh; the other guarded trees (``/proc``, ``/dev`` but ``/dev/null``, ``/root``,
@@ -3534,7 +3652,8 @@ def _shell_read_ok(path: str) -> bool:
     credential store of ``$HOME`` (_home_stores) or a sensitive path. Dot names are fine in a toolchain location
     (_toolchain_read: ``~/.cargo/registry``, ``node_modules/.bin``), as for the read tool; credential names, the stores
     and the secret folders of ``$HOME`` (_secret_dirs) never are. Checked on the path as written and on its
-    realpath."""
+    realpath. Not ``strict`` (any program naming the path, see _names_secret_outside): a device in ``/dev`` and the
+    other dot names below ``$HOME`` (``~/.bashrc``, ``~/.venv/bin/python``) are fine."""
     if _flat(path) in _PROC_READABLE:
         return True
     homes = _home_prefixes()
@@ -3548,7 +3667,7 @@ def _shell_read_ok(path: str) -> bool:
         if p == "/dev/null":
             continue
         tree = _guarded_tree(p)
-        if tree and tree != "/etc":
+        if tree and tree != "/etc" and (strict or tree != "/dev"):
             return False
         if p.startswith(_ETC_SECRETS) or (_under(p, "/etc/ssh") and "key" in p[len("/etc/ssh") :].casefold()):
             return False
@@ -3562,7 +3681,8 @@ def _shell_read_ok(path: str) -> bool:
             return False
         if _under(p, "/var/lib") and any(c.casefold().endswith(".state") for c in names):
             return False
-        if not dots_ok and (any(map(_risky_component, names)) or _below_home_dot(p, homes)):
+        risky = names if strict else [c for c in names if not c.startswith(".")]
+        if not dots_ok and (any(map(_risky_component, risky)) or (strict and _below_home_dot(p, homes))):
             return False
         if _stores_holding([p], stores) or sensitive_path(p):
             return False

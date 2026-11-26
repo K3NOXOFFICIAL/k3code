@@ -522,3 +522,82 @@ def test_an_allow_rule_still_allows_a_wrapped_command_without_a_secret(tmp_path:
     for mode in (PermissionMode.DEFAULT, PermissionMode.AUTO):
         dec = decide(mode=mode, tool="bash", args={"command": "watch -n1 df"}, cwd=tmp_path, user_rules=rules)
         assert dec.action == "allow", (mode, dec.message)
+
+
+#: (the user rule that would allow it, command): secret reads the checks missed (fifth review). Each asks a person in
+#: every mode but yolo, with the rule and without it: flock -c code, a heredoc or here-string glued to the path, a glob
+#: in the secret name, xargs -a, ``<>``, and any program that names the path (not only the builtin readers).
+SECRET_WORD_READS = [
+    ("flock *", "flock -c 'cat /etc/shadow' /tmp/l"),
+    ("flock *", "flock --command 'cat ~/x/server.p12' l"),
+    ("flock *", "flock /tmp/l -c 'cat ~/x/server.p12'"),
+    ("flock *", "flock -c 'cat /srv/a/server.p12' /tmp/l"),
+    ("cat *", "cat ~/x/server.p12<<<x"),
+    ("cat *", "cat ~/x/a.pem<<<x"),
+    ("cat *", "cat ~/x/a.key<<<x"),
+    ("cat *", "cat ~/x/a.kdbx<<<x"),
+    ("cat *", "cat ~/x/server.p12<<'EOF'\nx\nEOF"),
+    ("cat *", "cat ~/x/server.p12<<-EOF\nx\nEOF"),
+    ("head *", "head ~/x/server.p12<<<x"),
+    ("watch *", "watch -n1 'cat ~/x/server.p12<<<x'"),
+    ("cat *", "cat /srv/a/server.p12<<<x"),
+    ("cat *", "cat ~/x/server.p1?"),
+    ("cat *", "cat /srv/a/server.p1?"),
+    ("cat *", "cat /srv/a/server.p[0-9]2"),
+    ("cat *", "cat /srv/a/*.pem"),
+    ("xargs *", "xargs -a ~/x/server.p12 echo"),
+    ("xargs *", "xargs --arg-file=~/x/server.p12 echo"),
+    ("cat *", "cat <>~/x/server.p12"),
+    ("cat *", "cat<>/etc/shadow"),
+    ("uv *", "uv run cat ~/x/server.p12"),
+    ("npx *", "npx cat ~/x/server.p12"),
+    ("firejail *", "firejail cat /srv/a/server.p12"),
+    ("setpriv *", "setpriv --reuid=1000 cat /srv/a/server.p12"),
+    ("script *", "script -qc 'cat ~/x/server.p12' /dev/null"),
+    ("systemd-run *", "systemd-run --user --wait cat /srv/a/server.p12"),
+    ("unshare *", "unshare -r cat /etc/shadow"),
+    ("bwrap *", "bwrap --ro-bind / / cat /srv/a/server.p12"),
+    ("proxychains4 *", "proxychains4 cat ~/x/server.p12"),
+    ("valgrind *", "valgrind cat /srv/a/server.p12"),
+    ("perf *", "perf stat cat /srv/a/server.p12"),
+    ("gdb *", "gdb --args cat ~/x/server.p12"),
+    ("tmux *", "tmux new 'cat ~/x/server.p12'"),
+    ("screen *", "screen -dm cat /srv/a/server.p12"),
+    ("xvfb-run *", "xvfb-run cat /srv/a/server.p12"),
+    ("find *", "find /srv -exec cat /srv/a/server.p12 {} +"),
+]
+
+
+@pytest.mark.parametrize("ruled", [True, False])
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize(("pattern", "command"), SECRET_WORD_READS)
+def test_a_secret_word_asks_a_person_whatever_the_program(
+    tmp_path: Path, pattern: str, command: str, mode: PermissionMode, ruled: bool
+) -> None:
+    rules = [Rule(tool="bash", pattern=pattern, action="allow", layer=1)] if ruled else []
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
+    # auto mode's credential check denies `cat <>KEY` outright: stricter than asking
+    assert dec.action == "deny" or (dec.action, dec.needs_human) == ("ask", True), (pattern, command, mode, dec.action)
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.AUTO])
+def test_a_glob_that_matches_a_secret_on_disk_asks_a_person(tmp_path: Path, mode: PermissionMode) -> None:
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "server.p12").write_text("x")
+    dec = decide(
+        mode=mode,
+        tool="bash",
+        args={"command": f"cat {tmp_path}/out/server.*"},
+        cwd=tmp_path / "proj",
+        user_rules=[Rule(tool="bash", pattern="cat *", action="allow", layer=1)],
+    )
+    assert (dec.action, dec.needs_human) == ("ask", True), dec.message
+
+
+@pytest.mark.parametrize(
+    "command", ["grep -rn token src", "ls /usr/lib/*.so", "cat ~/Downloads/*.pdf", "git log -- src/secrets.py"]
+)
+def test_words_that_name_no_secret_force_no_one(tmp_path: Path, command: str) -> None:
+    dec = decide(mode=PermissionMode.AUTO, tool="bash", args={"command": command}, cwd=tmp_path)
+    assert not dec.needs_human, (command, dec.message)
