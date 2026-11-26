@@ -2080,15 +2080,30 @@ def _reads_secret_outside(
     return False
 
 
+#: where a path starts inside a word: after ``=``, ``@``, ``<``, ``,``, ``;`` or a quote (``key@X``, ``name=<X``,
+#: ``a,X``), or after ``:`` unless ``//`` follows (``a:X``; ``https://x/y`` names no local path)
+_VALUE_START = re.compile(r"(?<=[=@<,;\"'])(?=[/~])|(?<=:)(?=/(?!/)|~)")
+
+
 def _word_values(word: str) -> list[str]:
     """The values ``word`` may hand its program as a path: the word itself, the tail of a glued short option (``-fX``,
-    ``-d@X``), what follows its first ``=`` (``--opt=X``, ``NAME=X``, curl's ``-F name=@X``), each also without a
-    leading ``@`` (curl's ``-d @X``)."""
+    ``-d@X``) or option cluster (``-vfX``, ``-sKX``), what follows its first ``=`` (``--opt=X``, ``NAME=X``, curl's
+    ``-F name=@X``), each also without a leading ``@`` (curl's ``-d @X``); every ``/`` or ``~`` path that starts
+    after a delimiter (_VALUE_START: ``key@X``, ``name=<X``, ``--opt=a,X``) or ``file://``; and each piece of a list
+    split at ``,``, ``:`` and ``;`` (``KUBECONFIG=a:X``), not one that starts with ``//`` (a URL's host)."""
     values = [word]
     if len(word) > 2 and re.match(r"-[^-=]", word):
         values.append(word[2:])
+    cluster = re.match(r"-[A-Za-z0-9]+(?=[/~])", word)
+    if cluster:
+        values.append(word[cluster.end() :])
     values += [v.split("=", 1)[1] for v in values if "=" in v]
     values += [v[1:] for v in values if v.startswith("@")]
+    drive = 2 if re.match(r"[A-Za-z]:/", word) else 0  # `C:/Users/x` is a Windows path, not `/Users/x`
+    values += [word[m.start() :] for m in _VALUE_START.finditer(word) if m.start() != drive]
+    values += [word[m.end() :] for m in re.finditer(r"(?i)file://(?=/)", word)]
+    pieces = [re.split(r"[,:;]", v[drive:] if v is word else v)[1:] for v in values]
+    values += [p for ps in pieces for p in ps if not p.startswith("//")]
     return list(dict.fromkeys(values))
 
 
