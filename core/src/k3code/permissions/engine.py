@@ -113,6 +113,7 @@ BUILTIN_BASH_ALLOW = [
     "dirname *",
     "realpath *",
     "readlink *",
+    "findmnt *",
     "git status *",
     "git diff *",
     "git log *",
@@ -788,13 +789,17 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 
 
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
-_HARMLESS_REDIRECT = re.compile(r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*>>?&?\s*/dev/null)(?![^\s;&|<>()])")
-#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f).
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)")
-#: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``): reading with ``<`` is never restricted by the
-#: write roots.
-_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*>>?&?)\s*([^\s;&|<>()]+)")
-_SUBSTITUTION = re.compile(r"\$\(|`")
+_HARMLESS_REDIRECT = re.compile(
+    r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*(?:>\||<>|>>?&?)\s*/dev/null)(?![^\s;&|<>()])"
+)
+#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f), ``>|f`` (``>`` past
+#: noclobber) and ``<>f`` (opens f read-write and creates it, in bash and dash), each with an fd in front (``2>|f``).
+_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||(?:>>?|<)&?))\s*([^\s;&|<>()]+)")
+#: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``, ``>|``, and ``<>``, which writes as well): reading
+#: with ``<`` is never restricted by the write roots.
+_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
+#: ``$(...)``, backticks and process substitution ``<(...)``/``>(...)`` (bash; ``echo >(rm x)`` runs ``rm x``).
+_SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(
     r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
@@ -823,11 +828,15 @@ def _sandbox_scratch(path: str) -> bool:
 
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
     """A redirect in ``sub`` writes a file outside the project roots (and outside the sandbox's private ``/tmp``, see
-    _SANDBOX_TMP). Targets that are variables or globs are left to the sandbox; the ``/dev`` sinks are not files."""
+    _SANDBOX_TMP). A target that is a variable or a substitution (``> $HOME/.bashrc``, ``<> "$(cmd)"``) or a ``~name``
+    nobody can look up may be anywhere: it counts as outside. Globs are left to the sandbox; the ``/dev`` sinks are not
+    files."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     for target in _WRITE_REDIRECT.findall(plain):
         target = target.strip("'\"")
-        if not target or target.startswith("/dev/") or any(ch in target for ch in "$`*?[{"):
+        if any(ch in target for ch in "$`") or hardline.expand_user(target).startswith("~"):
+            return True
+        if not target or target.startswith("/dev/") or any(ch in target for ch in "*?[{"):
             continue
         path = _abs(target, cwd)
         if not _inside(path, roots) and not _sandbox_scratch(path):
@@ -854,13 +863,16 @@ def _voids_allow(
     roots: list[str],
     cwd: str,
     heredocs: list[hardline.Heredoc] | None = None,
+    depth: int = 0,
 ) -> bool:
-    """A redirect or command substitution turns an allowed prefix into something else (``ls > ~/.bashrc``,
-    ``git commit -m "$(evil)"``). Builtin read-only allows never cover either. A rule the user approved (session /
-    project / user layer) still covers redirects into the project and substitutions whose contents are themselves
-    allowed. Before, an "always allow git commit" also allowed ``git commit > ~/.bashrc`` and ``git commit -m
-    "$(evil)"``. The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those
-    on the command line (``sub`` has no body)."""
+    """A redirect or a substitution turns an allowed prefix into something else (``ls > ~/.bashrc``, ``git commit -m
+    "$(evil)"``, ``ls <(rm -rf x)``). Builtin read-only allows never cover either. A rule the user approved (session /
+    project / user layer) still covers redirects into the project and substitutions whose commands are each allowed
+    on their own, by this same check (:func:`_nested_allowed`). A ``bash -c '...'`` the user allowed ``bash *`` for
+    stays theirs. Before, an "always allow git commit" also
+    allowed ``git commit > ~/.bashrc`` and ``git commit -m "$(evil)"``, and an "always allow echo" ``echo >(rm x)``.
+    The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those on the command
+    line (``sub`` has no body)."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     has_redirect = bool(_REDIRECT.search(plain))
     body_payloads = [p for h in heredocs or () for p in h.payloads]
@@ -877,13 +889,36 @@ def _voids_allow(
         return True
     if not has_subst:
         return False
-    nested = hardline.parse(sub).nested
-    for payload in body_payloads:
-        inner = hardline.parse(payload)
-        nested = [*nested, *inner.subs, *inner.nested]
-    return not nested or any(
-        evaluate("bash", n, ruleset, default="ask").action != "allow" or hardline.is_launcher(n) for n in nested
-    )
+    # nested is flat (`$(a $(b))` gives both); a substitution the parser did not take apart is vouched for by nobody
+    nested = [*hardline.parse(sub).nested, *body_payloads]
+    return not nested or not all(_nested_allowed(n, ruleset, roots, cwd, depth + 1) for n in nested)
+
+
+#: How deep :func:`_nested_allowed` follows commands inside commands (``$(a $(b $(c)))``); deeper asks.
+_NESTED_MAX_DEPTH = 4
+
+
+def _nested_allowed(command: str, ruleset: list[Rule], roots: list[str], cwd: str, depth: int) -> bool:
+    """Every simple command of the nested ``command`` (a ``$(...)``/``<(...)``/``>(...)``/``bash -c`` payload) is
+    allowed on its own: a rule allows it, nothing voids that allow (:func:`_voids_allow`, its own nested commands
+    included), and it is no launcher, no heredoc program and no sandbox-only allow (the outer allow is not
+    sandbox-bound). Past _NESTED_MAX_DEPTH, or when the payload does not parse cleanly, it is not."""
+    if depth > _NESTED_MAX_DEPTH:
+        return False
+    inner = hardline.parse(command)
+    if not inner.subs or inner.unterminated or inner.comment_quote or inner.too_deep or inner.open_heredoc:
+        return False
+    for k, sub in enumerate(inner.subs):
+        rule = evaluate("bash", sub, ruleset, default="ask")
+        if (
+            rule.action != "allow"
+            or (rule.layer == 0 and rule.pattern in _SANDBOXED)
+            or hardline.is_launcher(sub)
+            or inner.code_heredoc[k]
+            or _voids_allow(sub, rule, ruleset, roots, cwd, inner.heredocs[k], depth)
+        ):
+            return False
+    return True
 
 
 class _Opts(NamedTuple):
@@ -996,6 +1031,14 @@ _READONLY_OPTS: dict[str, _Opts] = {
         "hHTiklaP",
         "tx",
         "human-readable si print-type local all inodes portability total",
+    ),
+    # not -F/--tab-file (reads a file it names)
+    "findmnt": _opts(
+        "AabCcDfiJklmnPRrsUuvxy",
+        "dMNOoSTtw",
+        "all ascii bytes nocanonicalize canonicalize df first-only invert json kernel list mtab noheadings pairs"
+        " submounts raw fstab uniq notruncate nofsroot verify verbose shell output-all",
+        "direction mountpoint task options output source target types timeout",
     ),
     "pwd": _opts("LP", longs="logical physical"),
     "which": _opts("as"),
