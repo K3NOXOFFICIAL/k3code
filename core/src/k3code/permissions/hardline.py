@@ -2264,6 +2264,10 @@ _SECRET_VAR = re.compile(
 _VAR_REF = re.compile(r"\$(?:\{(\w+)[^}]*\}|(\w+))")
 _ENV_READ = re.compile(r"environ|process\.env|\bENV\b|getenv")
 _INTERPRETER_CODE_FLAG = re.compile(r"^-[A-Za-z]*[ceEpr]$")
+#: A ``mount -t`` type list as written, with nothing the shell expands (``ext4${IFS}/dev/sdb1``, ``{a,b}``, ``*``).
+_MOUNT_TYPES = re.compile(r"[A-Za-z0-9_.,-]+")
+#: What the shell expands in a word: a ``findmnt`` argument with one may become ``-F FILE``.
+_EXPANDS = frozenset("$`{}*?[")
 
 
 def _git_sub(argv: list[str]) -> tuple[str, list[str]]:
@@ -2289,7 +2293,12 @@ def _mount_lists(args: list[str]) -> bool:
     while i < len(args):
         if args[i] == "-l":
             i += 1
-        elif args[i] == "-t" and i + 1 < len(args) and not args[i + 1].startswith("-"):
+        elif (
+            args[i] == "-t"
+            and i + 1 < len(args)
+            and not args[i + 1].startswith("-")
+            and _MOUNT_TYPES.fullmatch(args[i + 1])
+        ):
             i += 2
         else:
             return False
@@ -2331,6 +2340,12 @@ def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None
         # `mount -o remount,rw /`, `mount --bind / dir`: a user's `mount *` allow was meant for the listing
         if name != "mount" or not _mount_lists(argv[1:]):
             return "Mounts or unmounts a file system"
+    elif name == "findmnt":
+        from .engine import _READONLY_OPTS, _opts_ok  # engine imports this module
+
+        # `-F FILE` reads the file; a user's `findmnt *` and an expanding `-t` value must not reach it
+        if not _opts_ok(_READONLY_OPTS["findmnt"], argv[1:]) or any(_EXPANDS & set(a) for a in argv[1:]):
+            return "findmnt may read a file the command line does not show"
     elif _is_interpreter(name) and name not in _SHELLS and name not in ("source", ".", "eval"):
         for flag, code in zip(argv[1:], argv[2:], strict=False):
             if _INTERPRETER_CODE_FLAG.match(flag) and _ENV_READ.search(code):

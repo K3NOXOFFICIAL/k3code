@@ -1007,6 +1007,64 @@ def test_a_mount_needs_a_person_whatever_the_rules(tmp_path: Path, cmd: str, mod
     assert (dec.action, dec.needs_human) == ("ask", True), (cmd, mode)
 
 
+_MOUNT_ALLOW = from_config({"bash": {"mount *": "allow"}})
+_FINDMNT_ALLOW = from_config({"bash": {"findmnt *": "allow"}})
+
+#: A `-t` value or a findmnt argument the shell expands into a device, `-o remount` or `-F FILE`, and findmnt's
+#: `-F`/`--tab-file` under a user's `findmnt *`: once allowed.
+EXPANDED_MOUNT_ARGS = [
+    *(
+        (cmd, _MOUNT_ALLOW)
+        for cmd in (
+            "mount -t ext4${IFS}/dev/sdb1${IFS}/mnt",
+            "mount -t auto${IFS}-o${IFS}remount,rw${IFS}/",
+            "mount -t {ext4,/dev/sdb1,/mnt}",
+            "mount -t *",
+            "mount -t $X",
+        )
+    ),
+    *(
+        (cmd, rules)
+        for cmd in (
+            "findmnt -F x",
+            "findmnt --tab-file x",
+            "findmnt --tab-file=x",
+            "findmnt -Fx",
+            "findmnt -t x${IFS}-F${IFS}/etc/shadow",
+            "findmnt -t *",
+            "findmnt -t {a,-F,/etc/passwd}",
+        )
+        for rules in (None, _FINDMNT_ALLOW)
+    ),
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(("cmd", "rules"), EXPANDED_MOUNT_ARGS)
+def test_an_expanding_mount_type_or_findmnt_argument_needs_a_person(
+    tmp_path: Path, cmd: str, rules: list | None, mode: str
+) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert (dec.action, dec.needs_human) == ("ask", True), (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("mount", _MOUNT_ALLOW),
+        ("mount -l", _MOUNT_ALLOW),
+        ("mount -t ext4", _MOUNT_ALLOW),
+        ("mount -l -t nfs4,ext4", _MOUNT_ALLOW),
+        ("findmnt", None),
+        ("findmnt -t ext4", None),
+        ("findmnt -t ext4", _FINDMNT_ALLOW),
+    ],
+)
+def test_mount_and_findmnt_listings_stay_allowed(tmp_path: Path, cmd: str, rules: list | None, mode: str) -> None:
+    assert decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
 @pytest.mark.parametrize(
     ("cmd", "rules"),
     [
