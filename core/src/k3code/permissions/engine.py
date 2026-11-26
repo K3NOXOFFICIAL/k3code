@@ -3234,7 +3234,7 @@ def _shell_read_ok(path: str) -> bool:
         names = [c for c in p.split("/") if c]
         if any(_CREDENTIAL_NAME.fullmatch(c) or c.casefold().startswith(".env") for c in names):
             return False
-        home = next((h for h in homes if p.startswith(h)), "")  # a home folder whose own name looks secret is no secret name
+        home = next((h for h in homes if p.startswith(h)), "")  # a home folder named like a secret is no secret
         if any(_SECRET_NAME.fullmatch(c) for c in p[len(home) :].split("/") if c):
             return False
         if _under(p, "/var/lib") and any(c.casefold().endswith(".state") for c in names):
