@@ -1149,3 +1149,40 @@ def test_pipe_to_shell_stays_denied_around_a_clobber(tmp_path: Path, cmd: str, m
 def test_a_lone_clobber_redirect_keeps_its_target_check(tmp_path: Path, cmd: str, action: str) -> None:
     dec = decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_ECHO_ALLOW)
     assert dec.action == action, (cmd, dec.action)
+
+
+# ── auto mode: a redirect target is resolved from every directory the line can cd to ──
+
+#: a project outside the sandbox's /tmp, so `..` from it is not the scratch tmpfs
+_PROJ = "/proj"
+WRITES_OUTSIDE = [
+    "echo x > ../out.txt",
+    "echo x >> ../out.txt",
+    "echo x 2> ../out.txt",
+    "echo x >| ../out.txt",
+    "echo x <> ../out.txt",
+    "cd .. && echo x > out.txt",
+    "cd / && echo x > etc/out.txt",
+    "cd src && echo x > ../../out.txt",
+    "pushd .. && echo x > out.txt",
+    "cd $D && echo x > out.txt",  # a cd the check cannot resolve may be anywhere
+]
+
+
+@pytest.mark.parametrize("cmd", WRITES_OUTSIDE)
+def test_auto_mode_denies_a_relative_write_outside_the_project(cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=_PROJ)
+    assert dec.action == "deny" and "project roots" in (dec.message or ""), (cmd, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("cmd", ["echo x > out.txt", "cd src && ls", "cd /tmp && echo hi > out.txt"])
+def test_auto_mode_keeps_writes_inside_the_project_and_the_sandbox_tmp(cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=_PROJ)
+    assert dec.action == "allow", (cmd, dec.message)
+
+
+def test_auto_mode_resolves_a_cd_through_a_symlink_before_its_dotdot(tmp_path: Path) -> None:
+    # `cd link && > ../x` writes next to the link's target, not next to the link
+    (tmp_path / "link").symlink_to("/usr/share")
+    dec = decide(mode="auto", tool="bash", args={"command": "cd link && echo x > ../x.txt"}, cwd=tmp_path)
+    assert dec.action == "deny" and "project roots" in (dec.message or ""), dec.message

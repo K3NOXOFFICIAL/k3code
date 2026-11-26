@@ -444,14 +444,20 @@ def _check_parse(
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
     _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
+    starts: dict[int, _Dirs] = {}  # per nested command (id of its parse): the directories it starts in
     try:
-        hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs)
+        hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs, starts)
         if hit:
             return hit, parsed
         # the shell expands braces and splits `$IFS` after the words were read: `rm${IFS}-rf${IFS}/` and `{rm,-rf,/}`
         # run `rm -rf /`. The line and every nested command are checked once more in that form, and so are the
         # commands that form makes (`{bash,-c,'{rm,-rf,/}'}`), _EXPAND_MAX_DEPTH levels deep (see _check_expanded).
         hit = _check_expanded([parsed.clean, *parsed.nested], parsed, extra_patterns, cwd, home, budget, set(), 0)
+        if hit:
+            return hit, parsed
+        # ... and each nested command whole, in the directories it starts in: `cd / && bash -c 'rm${IFS}-rf${IFS}*'`
+        # runs `rm -rf *` in `/`, which the check above reads from the cwd
+        hit = _check_nested_expanded(parsed, parsed, extra_patterns, budget, starts, 0)
         if hit:
             return hit, parsed
         return None, parsed
@@ -506,7 +512,46 @@ def _check_expanded(
     return None
 
 
-def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
+def _check_nested_expanded(
+    parsed: Parsed, root: Parsed, extra: list[str] | None, budget: list[int], starts: dict[int, _Dirs], depth: int
+) -> str | None:
+    """Check every nested command of ``parsed`` (a payload, a heredoc script) whole, brace-expanded and
+    `$IFS`-split, in the directories it starts in (``starts``, recorded by _check_parsed): a ``cd`` before it or in it
+    moves its relative targets. A command its expanded form nests is followed ``depth`` levels down, as in
+    _check_expanded. Each expanded parse is added to ``root.expanded``."""
+    for child in parsed.children:
+        start = starts.get(id(child))
+        if start is not None:
+            try:
+                alt = _expanded_text(child.clean)
+            except _BraceOverCap:
+                root.expansion_over_cap = True
+                return "expansion-over-cap"
+            if alt is not None and alt != child.clean:
+                if depth >= _EXPAND_MAX_DEPTH:
+                    return "scan-depth"
+                alt_parsed = parse(alt, budget=budget)
+                if budget[0] < 0 or alt_parsed.too_deep:
+                    return "scan-budget" if budget[0] < 0 else "scan-depth"
+                _reserve_users(alt_parsed.clean)
+                hit = _match(alt_parsed.clean, extra) or _check_parsed(
+                    alt_parsed, extra, start.spawn([start.where()]), starts
+                )
+                if hit:
+                    return hit
+                root.expanded.append(alt_parsed)
+                hit = _check_nested_expanded(alt_parsed, root, extra, budget, starts, depth + 1)
+                if hit:
+                    return hit
+        hit = _check_nested_expanded(child, root, extra, budget, starts, depth)
+        if hit:
+            return hit
+    return None
+
+
+def _check_parsed(
+    parsed: Parsed, extra: list[str] | None, dirs: _Dirs, starts: dict[int, _Dirs] | None = None
+) -> str | None:
     # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
     home = dirs.home
     dirs.cond |= _conditional_names(parsed.clean)
@@ -543,7 +588,9 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
         return hit
     for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
         start = [where[k] for k in ks if k in where]
-        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start))
+        if starts is not None:
+            starts[id(child)] = dirs.spawn(start)  # a copy the check below does not move (see _check_nested_expanded)
+        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start), starts)
         if hit:
             return hit
     return None
