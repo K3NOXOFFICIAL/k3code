@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import itertools
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -16,6 +17,7 @@ from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.engine import home_read_only
 from k3code.permissions.state import PermissionState, log_audit
 from k3code.providers.types import INVALID_TOOL_CALL, SYSTEM_CACHE_KEY, Message, StreamEvent, ToolCall
+from k3code.redact import scrub_text
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
@@ -74,6 +76,11 @@ ApprovalCallback = Callable[[str, dict[str, Any], Decision], Awaitable[ApprovalR
 PlanCallback = Callable[[str], Awaitable[str | None]]
 #: Told about every side effect the mode auto-allowed: (tool, arguments, decision).
 AutoAllowCallback = Callable[[str, dict[str, Any], Decision], None]
+
+#: Valid tool names listed in an "Unknown tool" error.
+_UNKNOWN_TOOL_LIST = 30
+#: The note after a call refused for its shape (unknown tool, invalid block or arguments), not for an execution error.
+RETRY_HINT = "The previous tool call was malformed: {error} Fix the call and retry once; do not repeat the same call."
 
 #: Cap for AgentLoop._notes (decision-model notes): one entry per elided result; past the cap the
 #: stalest-by-last-access is evicted (see _notes_at).
@@ -145,6 +152,7 @@ class AgentLoop:
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
         self.max_tool_errors = max_tool_errors
         self._tool_errors = 0
+        self._malformed: set[str] = set()  # ids of calls refused for their shape (see _execute_tool): one retry hint
         self._truncated: set[str] = set()  # ids of tool calls cut off by the output limit: never executed
         self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
@@ -422,6 +430,7 @@ class AgentLoop:
 
             # Execute the tool calls and yield their results in the model's order. Consecutive read-only calls run
             # together (see _batches); every other call runs alone.
+            retry_hinted = False  # one note per turn, whatever number of calls were malformed
             reply = object()  # tells the outcome hook which calls the model asked for before it saw any result
             for batch in self._batches(tool_calls):
                 if self.interrupted:
@@ -449,6 +458,12 @@ class AgentLoop:
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes, reply)
+                    if tc.id in self._malformed:
+                        self._malformed.discard(tc.id)
+                        if not retry_hinted:
+                            retry_hinted = True
+                            first = str(result.get("error", "")).split("\n", 1)[0]
+                            notes.append(Message(role="system", content=RETRY_HINT.format(error=first)))
                     if "error" in result and "content" not in result:
                         self._tool_errors += 1
                         self._failed.append(
@@ -557,6 +572,15 @@ class AgentLoop:
             args=args,
         )
 
+    def _unknown_tool_error(self, name: str) -> str:
+        """``Unknown tool: x.`` plus the nearest registered name and the valid ones (sorted, capped)."""
+        names = sorted(self.tools.names())
+        near = difflib.get_close_matches(name, names, n=1, cutoff=0.6)
+        shown = ", ".join(names[:_UNKNOWN_TOOL_LIST])
+        more = f", …(+{len(names) - _UNKNOWN_TOOL_LIST} more)" if len(names) > _UNKNOWN_TOOL_LIST else ""
+        guess = f" Did you mean '{near[0]}'?" if near else ""
+        return f"Unknown tool: {name}.{guess} Available tools: {shown}{more}"
+
     async def _execute_tool(self, tool_call: ToolCall, *, step: int | None = None) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
         if tool_call.name == INVALID_TOOL_CALL:
@@ -564,15 +588,19 @@ class AgentLoop:
             # or journal intent. The error result counts as a normal failed call (tool-error counter, loop guard),
             # so a model that keeps writing invalid blocks is stopped like one that keeps failing a tool.
             reason = tool_call.arguments.get("error", "unparseable")
+            began = " ".join(str(tool_call.arguments.get("body", "")).split())[:200]
+            self._malformed.add(tool_call.id)
             return {
                 "error": f"Your <tool_calls> block was not valid JSON ({reason}). "
                 "Re-send the calls as a valid JSON array."
+                + (f" Your block began: {scrub_text(began)}" if began else "")
             }
         if tool_call.id in self._truncated:
             return {"error": CUT_OFF_CALL}
         spec, handler = self.tools.get(tool_call.name) or (None, None)
         if not handler:
-            return {"error": f"Unknown tool: {tool_call.name}"}
+            self._malformed.add(tool_call.id)
+            return {"error": self._unknown_tool_error(tool_call.name)}
 
         args = tool_call.arguments
         if tool_call.name == EXIT_PLAN_TOOL:
@@ -582,10 +610,12 @@ class AgentLoop:
         # the normalised call. tool_call.arguments (transcript, journal) keeps what the model sent.
         norm = normalize_arguments(tool_call.name, spec.parameters, args)
         if norm.error is not None:
+            self._malformed.add(tool_call.id)
             return {"error": norm.error}
         args = norm.args
         # before the permission prompt: a call the handler cannot run is not worth an approval
         if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
+            self._malformed.add(tool_call.id)
             return _noted({"error": invalid}, norm)
         if tool_call.name == "bash":
             # parsing a long command line takes a while (linear, about a second per 200 KB of simple commands): off the

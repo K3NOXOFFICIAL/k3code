@@ -400,4 +400,44 @@ async def test_invalid_tool_block_is_answered_and_the_next_valid_call_runs(temp_
     assert provider._call_count == 3  # one model call per turn: nothing was retried
     answer = next(m for m in seen[1] if m.role == "tool" and m.tool_call_id == "bad_1")
     assert "was not valid JSON (Expecting value)" in answer.content and "valid JSON array" in answer.content
+    assert answer.content.endswith("Your block began: [{oops")  # the bad body, so the model sees what it sent
     assert target.read_text() == "hi"  # the valid call ran
+
+
+async def _second_request(temp_cwd: Path, first_call: ToolCall) -> list[Message]:
+    """The messages of the model request that follows a turn whose only tool call was ``first_call``."""
+    seen: list[list[Message]] = []
+
+    class Recording(FakeProvider):
+        async def stream(self, messages, tools, model, **kw):
+            seen.append(list(messages))
+            async for event in super().stream(messages, tools, model, **kw):
+                yield event
+
+    provider = Recording(
+        [
+            [make_done_event(Message(role="assistant", content=None, tool_calls=[first_call]))],
+            [make_done_event(Message(role="assistant", content="done", tool_calls=[]))],
+        ]
+    )
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
+    loop = AgentLoop(router, system_prompt="t", max_turns=10, permission_mode="yolo", cwd=temp_cwd)
+    async for _event in loop.run("go"):
+        pass
+    return seen[1]
+
+
+@pytest.mark.asyncio
+async def test_malformed_call_adds_retry_hint_reminder(temp_cwd):
+    msgs = await _second_request(temp_cwd, ToolCall(id="u1", name="nope", arguments={}))
+    hints = [m for m in msgs if m.role == "system" and "previous tool call was malformed" in (m.content or "")]
+    assert len(hints) == 1
+    assert "Unknown tool: nope." in hints[0].content and "retry once" in hints[0].content
+
+
+@pytest.mark.asyncio
+async def test_execution_error_adds_no_retry_hint(temp_cwd):
+    call = ToolCall(id="r1", name="read", arguments={"path": str(temp_cwd / "missing.txt")})
+    msgs = await _second_request(temp_cwd, call)
+    assert any(m.role == "tool" and m.tool_call_id == "r1" and "error" in m.content.lower() for m in msgs)
+    assert not any("malformed" in (m.content or "") for m in msgs if m.role == "system")
