@@ -341,6 +341,23 @@ async def test_approval_deny_blocks_tool():
     await server.close()
 
 
+async def test_approval_denies_when_the_permission_check_raises(monkeypatch):
+    # the approval callback decides itself when no decision comes with the call: a check that raises is a deny (fail
+    # closed), never an approval prompt or a crash
+    server = make_server()
+    await rpc(server, "session.create", {})
+
+    def boom(*_a, **_k):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(server.session.perms, "decide", boom)
+    approve = await server._approval_callback_for(server.session)
+    result = await approve("bash", {"command": "echo hi"})
+    assert not result and result.reason.startswith("Permission check failed")
+    assert not any(json.loads(line).get("method") == "approval" for line in server._frames)  # type: ignore[attr-defined]
+    await server.close()
+
+
 # ── 5. command.dispatch + slash.exec ────────────────────────────────
 
 

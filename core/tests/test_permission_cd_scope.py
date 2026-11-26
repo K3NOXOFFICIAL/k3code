@@ -712,7 +712,8 @@ def test_any_reader_argument_in_a_moved_home_asks_a_person(scoped_project: Path,
         "read x < list; head ~/README.md",
         "printf -v x %s hi; head ~/README.md",
         "for i in a b; do head ~/README.md; done",
-        "HOMEDIR=/tmp/x; head $HOMEDIR/README.md ~/README.md",
+        # a reader given an unknown variable path ($HOMEDIR/...) asks a person (see test_permission_outside_reads)
+        "HOMEDIR=/tmp/x; head ~/README.md; echo $HOMEDIR/README.md",
         "declare -n h=PATH; head ~/README.md",
     ],
 )

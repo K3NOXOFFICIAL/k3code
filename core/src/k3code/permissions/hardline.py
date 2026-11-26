@@ -490,7 +490,7 @@ def _check_expanded(
         seen.add(text)
         try:
             alt = _expanded_text(text)
-        except _BraceOverCap:
+        except (_BraceOverCap, RecursionError):  # fail closed: a word too deep to expand is not checked
             parsed.expansion_over_cap = True
             return "expansion-over-cap"
         if alt is None or alt == text:
@@ -524,7 +524,7 @@ def _check_nested_expanded(
         if start is not None:
             try:
                 alt = _expanded_text(child.clean)
-            except _BraceOverCap:
+            except (_BraceOverCap, RecursionError):  # fail closed, as in _check_expanded
                 root.expansion_over_cap = True
                 return "expansion-over-cap"
             if alt is not None and alt != child.clean:
@@ -1742,6 +1742,8 @@ def shell_expands(sub: str) -> bool:
 
 #: words a brace expansion of one command line may give before the line counts as too large to check
 _BRACE_MAX_WORDS = 4096
+#: brace groups one word may expand through, nested or side by side: past it the word counts as too large to check
+_BRACE_MAX_DEPTH = 64
 _BRACE_SEQ = re.compile(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?")
 _IDENT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 _WORD_BREAK = frozenset(" \t\n;&|()<>")
@@ -1806,14 +1808,17 @@ def _brace_parts(word: str, i: int) -> tuple[int, list[str] | None]:
     return j, [str(v) if m[1] else chr(v) for v in seq]
 
 
-def _brace_words(word: str, left: list[int]) -> list[str]:
-    """``word`` brace-expanded as the shell does before any other expansion (``./b/{x,y}`` is ``./b/x ./b/y``)."""
+def _brace_words(word: str, left: list[int], depth: int = 0) -> list[str]:
+    """``word`` brace-expanded as the shell does before any other expansion (``./b/{x,y}`` is ``./b/x ./b/y``). Raises
+    _BraceOverCap past _BRACE_MAX_DEPTH groups (each one is a level of recursion here)."""
+    if depth > _BRACE_MAX_DEPTH:
+        raise _BraceOverCap
     i = 0
     while i < len(word):
         if word[i] == "{":
             close, parts = _brace_parts(word, i)
             if parts is not None:
-                out = [w for p in parts for w in _brace_words(word[:i] + p + word[close + 1 :], left)]
+                out = [w for p in parts for w in _brace_words(word[:i] + p + word[close + 1 :], left, depth + 1)]
                 return out
             i += 1
             continue

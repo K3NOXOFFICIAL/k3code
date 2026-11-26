@@ -1840,28 +1840,147 @@ def _glob_reaches_secret(arg: str, cwd: str) -> bool:
     return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS))
 
 
-def _reads_secret_outside(sub: str, roots: list[str], cwd: str) -> bool:
-    """``sub`` (a builtin read-only command, not git) reads a path outside the roots that holds a secret (see
-    _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``, ``cat < /etc/shadow``; a
-    walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may match one
-    (_glob_reaches_secret). A person answers that, in auto mode too."""
+#: variables a path word may name that k3code resolves as the shell would (``$HOME/.netrc``), unless the line may
+#: rebind them; any other variable is an unknown path
+_PLAIN_VARS = frozenset({"HOME", "USER", "LOGNAME", "PWD"})
+_VAR_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+#: a parameter expansion: ``$NAME``, ``${...}``, ``$1``, ``$@`` (``$(...)`` and a lone ``$`` are not)
+_PARAM = re.compile(r"\$[\w{@*#?!$-]")
+#: what may rebind a variable before the word is read: ``source``/``.``/``eval`` (anything), ``cd`` and co. (``$PWD``)
+_REBINDS_ANY = re.compile(r"(?:^|[\s;&|(){}])(?:eval|source|\.)(?=\s|$)")
+_MOVES_PWD = re.compile(r"(?:^|[\s;&|(){}])(?:cd|pushd|popd)(?=[\s;&|()]|$)")
+
+
+def _var_value(name: str, line: str, cwd: str) -> str | None:
+    """What ``$name`` is when ``line`` runs, or None when k3code cannot tell: not a plain variable (_PLAIN_VARS), unset,
+    or the line may rebind it (it names it bare, as in ``HOME=/etc``, ``export HOME``, ``read HOME``, ``for HOME in``;
+    ``eval``/``source``/``.``; a ``cd`` for ``$PWD``)."""
+    if name not in _PLAIN_VARS or _REBINDS_ANY.search(line) or re.search(rf"(?<![$\w{{]){name}(?!\w)", line):
+        return None
+    if name == "PWD":
+        return None if _MOVES_PWD.search(line) else cwd
+    return os.path.expanduser("~") if name == "HOME" else os.environ.get(name)
+
+
+def _var_resolved(word: str, line: str, cwd: str) -> str | None:
+    """``word`` with each ``$NAME``/``${NAME}`` replaced by its value (_var_value), or None when one has no known value
+    or another parameter expansion is left (``${X:-y}``, ``$1``)."""
+    values = [_var_value(m[1] or m[2], line, cwd) for m in _VAR_REF.finditer(word)]
+    if None in values:
+        return None
+    it = iter(values)
+    out = _VAR_REF.sub(lambda _m: str(next(it)), word)
+    return None if _PARAM.search(out) else out
+
+
+def _word_forms(word: str) -> list[str] | None:
+    """Every word the shell makes of ``word`` by brace expansion (``/etc/{a,{b,shadow}}`` is three), or None when the
+    expansion is too large to check word by word (the parser denies it)."""
+    if "{" not in word:
+        return [word]
+    try:
+        return hardline._brace_words(word, [hardline._BRACE_MAX_WORDS])
+    except (hardline._BraceOverCap, RecursionError):
+        return None
+
+
+def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "", spelled: str = "") -> bool:
+    """``sub`` (a builtin read-only command, not git; one part of ``line``) reads a path outside the roots that holds a
+    secret (see _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``,
+    ``cat < /etc/shadow``; a walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may
+    match one (_glob_reaches_secret). Every brace expansion of a word is checked (``/etc/{a,shadow}``), and a word with
+    a variable as the line sets it (_var_resolved, ``$HOME/.netrc``); a variable k3code cannot resolve (``$X/y``) is an
+    unknown path (_unknown_path), so it counts as a secret; a single-quoted ``$`` is no variable (``spelled``: the sub
+    as written, when ``sub`` is its normalised argv). A person answers that, in auto mode too."""
     argv = _argv(sub)
     if argv and os.path.basename(argv[0]) == "git":
         return False
+    line = line or sub
     walker = bool(argv) and _content_walker(argv)
     args = _path_args(sub) if argv else []
     sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
-    for a in (*args, *sources):
-        if not _arg_outside(a, roots, cwd):
-            continue
-        if not _literal_word(a):
-            if _glob_reaches_secret(a, cwd):
-                return True
-            continue
-        p = _abs(a, cwd)
-        if not _shell_read_ok(p) or (walker and a in args and _walk_holds_secret(p)):
+    literal = _dollar_literal_words(spelled or sub)
+    pattern = 0 if _pattern_first(argv) else -1  # grep's pattern is no path: an unknown one in it forces no one
+    for i, arg in enumerate((*args, *sources)):
+        forms = _word_forms(arg)
+        if forms is None:
             return True
+        for w in forms:
+            a = _var_resolved(w, line, cwd) if _PARAM.search(w) and arg not in literal else w
+            if a is None:
+                if i != pattern and _unknown_path(w, roots, cwd):
+                    return True  # an unknown path
+                a = w  # a variable after a folder in the project: read as before (`cat src/$X`)
+            if _secret_word(a, walker and arg in args, roots, cwd):
+                return True
     return False
+
+
+def _unknown_path(word: str, roots: list[str], cwd: str) -> bool:
+    """``word`` (a variable k3code cannot resolve in it) may be any path: the text before its first ``$`` is empty
+    (``$X``, ``"$1"``), absolute or ``~`` (``/etc/$X``, ``~/$X``), or lies outside the roots (``../$X``)."""
+    prefix = re.sub(r"[\'\"\\]", "", word[: word.index("$")])
+    return not prefix or prefix.startswith(("/", "~")) or not _inside(_abs(prefix, cwd), roots)
+
+
+#: readers whose first non-option word is a pattern, not a path, unless an option gives the pattern (``-e``, ``-f``)
+_PATTERN_READERS = frozenset({"grep", "egrep", "fgrep", "rg"})
+
+
+def _pattern_first(argv: list[str]) -> bool:
+    """``argv`` is a grep/rg whose first non-option word is its pattern: no ``-e``/``-f``/``--regexp``/``--file``
+    (a short cluster with an e or f counts, so a misread one leaves the stricter reading)."""
+    if not argv or os.path.basename(argv[0]) not in _PATTERN_READERS:
+        return False
+    for t in argv[1:]:
+        if t == "--":
+            break
+        if t.startswith(("--regexp", "--file")) or (t[:1] == "-" and t[1:2] != "-" and set(t[1:]) & set("ef")):
+            return False
+    return True
+
+
+def _dollar_literal_words(sub: str) -> frozenset[str]:
+    """The words of ``sub`` (quotes removed, as shlex removes them) in which every ``$`` is literal: single-quoted or
+    backslash-escaped (``grep 'a$b'``). A word spelled once literal and once not, or that this scan splits other than
+    shlex does, is not in it: it is read as an expansion."""
+    lit: set[str] = set()
+    exp: set[str] = set()
+    word: list[str] | None = None
+    expands, quote, i, n = False, "", 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if not quote and c in " \t\n":
+            if word is not None:
+                (exp if expands else lit).add("".join(word))
+            word, expands, i = None, False, i + 1
+            continue
+        word = [] if word is None else word
+        if c == "\\" and quote != "'" and i + 1 < n:
+            nxt = sub[i + 1]
+            keep = quote == '"' and nxt not in '"\\'  # shlex keeps a backslash in double quotes before others
+            word.append(c + nxt if keep else nxt)
+            i += 2
+        elif c in "'\"" and quote in ("", c):
+            quote, i = ("" if quote else c), i + 1
+        else:
+            expands = expands or (c == "$" and quote != "'")
+            word.append(c)
+            i += 1
+    if word is not None and not quote:
+        (exp if expands else lit).add("".join(word))
+    return frozenset(lit - exp)
+
+
+def _secret_word(a: str, walks: bool, roots: list[str], cwd: str) -> bool:
+    """``a`` (one word, expansions done) lies outside the roots and holds a secret, or (``walks``) a tree with one; or
+    is a glob that may match one (_glob_reaches_secret)."""
+    if not _arg_outside(a, roots, cwd):
+        return False
+    if not _literal_word(a):
+        return _glob_reaches_secret(a, cwd)
+    p = _abs(a, cwd)
+    return not _shell_read_ok(p) or (walks and _walk_holds_secret(p))
 
 
 def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
@@ -2869,7 +2988,11 @@ def _decide_bash(
         # the forced check goes by the program that runs, not the allow pattern the spelling matched (`/bin/cat`,
         # `env cat`, `sudo cat`, `\cat` ask, and auto mode's classifier would answer); no allow rule lifts it, a
         # user/project one included (`sudo *`, `cat *`)
-        if rule.action != "deny" and _runs_builtin_read(sub, ruleset) and _reads_secret_outside(sub, roots, cwd):
+        if (
+            rule.action != "deny"
+            and _runs_builtin_read(sub, ruleset)
+            and _reads_secret_outside(sub, roots, cwd, command)
+        ):
             outside_secret = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
@@ -2902,8 +3025,13 @@ def _decide_bash(
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
     # a nested command reads it the same: `bash -c 'cat /etc/shadow'` under `bash *`
+    # a normalised sub (`sudo cat '$X'` is `cat $X`) keeps the quoting of the sub it came from; a nested one its own
+    nested = {f for n in parsed.nested for f in (n, " ".join(_argv(n)))}
+    spelled = {" ".join(_argv(s)): s for s in parsed.subs}
     outside_secret = outside_secret or any(
-        _runs_builtin_read(form, ruleset) and _reads_secret_outside(form, roots, cwd) for form in _rule_forms(parsed)
+        _runs_builtin_read(form, ruleset)
+        and _reads_secret_outside(form, roots, cwd, command, "" if form in nested else spelled.get(form, ""))
+        for form in _rule_forms(parsed)
     )
     if unsafe and worst.action != "deny":
         return Decision(
