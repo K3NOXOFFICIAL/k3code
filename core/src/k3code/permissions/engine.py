@@ -909,6 +909,10 @@ def _voids_allow(
         )
     if has_redirect and not _redirects_ok(plain, roots, cwd):
         return True
+    # the output of `$(...)` or a backtick becomes words of the command: `cat $(echo /etc/passwd)` reads what no rule
+    # saw, even when `echo` is allowed. Only `<(...)`, `>(...)` and heredoc bodies stay on the nested check
+    if hardline.command_substitution(sub):
+        return True
     if not has_subst:
         return False
     # nested is flat (`$(a $(b))` gives both); a substitution the parser did not take apart is vouched for by nobody

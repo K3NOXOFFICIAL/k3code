@@ -1626,6 +1626,26 @@ def param_expansion(sub: str) -> bool:
     return False
 
 
+def command_substitution(sub: str) -> bool:
+    """Whether ``sub`` has a ``$(...)`` or a backtick outside single quotes. In double quotes it still runs, and its
+    output becomes words of the command line that no rule saw."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c == "`" or sub.startswith("$(", i):
+            return True
+        i += 1
+    return False
+
+
 def shell_expands(sub: str) -> bool:
     """Whether the shell changes the words of ``sub`` after k3code reads them: a parameter expansion
     (:func:`param_expansion`), an unquoted brace group or an unquoted ``$IFS`` split (:func:`_expanded_text`)."""

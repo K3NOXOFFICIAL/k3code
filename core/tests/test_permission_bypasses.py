@@ -1077,7 +1077,6 @@ def test_mount_and_findmnt_listings_stay_allowed(tmp_path: Path, cmd: str, rules
         ("mount -l -t ext4", _USER_ALLOWS),
         ("echo x >|out.txt", _USER_ALLOWS),  # a clobber into the project, as `>out.txt`
         ("echo x <>out.txt", _USER_ALLOWS),
-        ("echo $(echo $(echo hi))", _USER_ALLOWS),  # every nested command is allowed on its own
         # the user allowed diff; the builtin `ls` allows each payload in the project
         ("diff <(ls a) <(ls b)", from_config({"bash": {"diff *": "allow"}})),
     ],
@@ -1094,6 +1093,8 @@ def test_read_only_listings_and_allowed_payloads_stay_allowed(tmp_path: Path, cm
         ("findmnt -F /etc/shadow", None),  # reads the file it names
         ("echo $(echo $(echo $(echo $(echo $(echo hi)))))", _USER_ALLOWS),  # deeper than _NESTED_MAX_DEPTH
         ("echo $(ls <(rm x))", _USER_ALLOWS),  # a payload inside a payload is checked too
+        # each nested command is allowed, but their output becomes the outer echo's words, which no rule saw
+        ("echo $(echo $(echo hi))", _USER_ALLOWS),
     ],
 )
 def test_substitutions_nobody_vouches_for_ask(tmp_path: Path, cmd: str, rules: list | None) -> None:
