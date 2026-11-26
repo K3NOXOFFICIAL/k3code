@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -70,6 +71,13 @@ _PREAMBLE = (
     "the tool results below. You have no tools of your own here; use only the tools listed below."
 )
 
+
+def _today() -> str:
+    """The date k3code gives the model: the host's own is ignored (see _PREAMBLE), and nothing else supplies one.
+    Day granularity, so the prompt changes once a day at most."""
+    return datetime.date.today().isoformat()
+
+
 _FOOTER_PLAIN = "Write the assistant's next turn as plain text for the user."
 _FOOTER_TOOLS = (
     "Write the assistant's next turn as plain text for the user. To call tools, finish your reply with ONE block "
@@ -98,7 +106,7 @@ def render_prompt(messages: list[Message], tools: list[ToolSpec]) -> tuple[str, 
     while leading < len(messages) and messages[leading].role == "system":
         leading += 1
     system = "\n\n".join(m.content for m in messages[:leading] if m.content)
-    parts: list[str] = [_PREAMBLE]
+    parts: list[str] = [_PREAMBLE, f"Today's date is {_today()}: the only date to rely on."]
     if tools:
         catalogue = [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in tools]
         parts.append("## Tools you can call (JSON schema per tool)\n" + json.dumps(catalogue, ensure_ascii=False))

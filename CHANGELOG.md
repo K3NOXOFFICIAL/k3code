@@ -39,6 +39,8 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
+- **The `claude` CLI backend gives the model one date.** The preamble told the model to ignore the date its host reports and supplied none, so a question about today had no source. It now carries `Today's date is YYYY-MM-DD` (day granularity, so the prompt changes at most once a day).
+
 - **The prompt and tool texts name only tools the model can call.** The edit tool's recovery messages told the model to use `write_file` and `read_file`, which do not exist (they are `write` and `read`), and `ask_user_question` named `exit_plan` as if it were always available; it now says so only for plan mode. A test scans every tool description, the prompts and the plan-mode and fuzzy-match messages for names that are not registered tools.
 
 - **Malformed tool calls get actionable errors and one retry hint.** An unknown tool names the closest registered tool and lists the valid ones, an invalid `<tool_calls>` block echoes how it began, argument checks look one level into arrays (`items.type`) and objects (`required`, property types), and the next request carries one `<system-reminder>` telling the model to fix the call and retry once (none for ordinary execution errors).
