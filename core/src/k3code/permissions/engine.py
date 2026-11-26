@@ -1234,6 +1234,24 @@ _SYSTEMCTL_READ_VERBS = frozenset(
     {"status", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies"}
     | {"list-jobs", "is-active", "is-enabled", "is-failed", "is-system-running", "get-default"}
 )
+#: How systemctl reads its options (systemd 259 ``systemctl --help``, plus the hidden ``--no-legend``, ``--fail``,
+#: ``--irreversible``, ``--ignore-dependencies`` and ``--ignore-inhibitors``), so the verb is found where it does:
+#: ``--job-mode fail cat x`` runs ``cat``. getopt takes any unambiguous prefix of a long option (``--mach``).
+_SYSTEMCTL_GETOPT = _opts(
+    "ahilqrvfT",
+    "CHMPnopst",
+    "after all before dry-run failed firmware-setup force full global help marked mkdir no-ask-password no-block"
+    " no-pager no-reload now no-wall no-warn plain quiet read-only recursive reverse runtime show-transaction"
+    " show-types stdin system user value verbose version wait with-dependencies no-legend fail irreversible"
+    " ignore-dependencies ignore-inhibitors",
+    "boot-loader-entry boot-loader-menu capsule check-inhibitors drop-in host image image-policy job-mode"
+    " kill-subgroup kill-value kill-whom legend lines machine message output preset-mode property reboot-argument"
+    " root signal state timestamp type what when",
+)
+_SYSTEMCTL_LONGS = _SYSTEMCTL_GETOPT.longs | _SYSTEMCTL_GETOPT.longs_val
+#: The options that point systemctl at another system, tree, service manager or process set.
+_SYSTEMCTL_ELSEWHERE = frozenset({"-C", "-H", "-M", "-s", "--capsule", "--host", "--machine", "--root", "--image"})
+_SYSTEMCTL_ELSEWHERE |= frozenset({"--signal", "--kill-whom"})
 #: The unit properties ``systemctl show -p`` may print unasked: state, ids and dependencies. Not ``Environment*``,
 #: ``PassEnvironment``, ``ExecStart*`` (the command line with its arguments) or any other one.
 _SYSTEMCTL_SAFE_PROPS = frozenset(
@@ -1506,8 +1524,33 @@ def _ps_ok(spec: _Opts, args: list[str]) -> bool:
 def _systemctl_show_ok(opts: list[tuple[str, str]]) -> bool:
     """``systemctl show`` with these options prints only properties of _SYSTEMCTL_SAFE_PROPS: at least one ``-p`` /
     ``--property`` is given (without one it prints every property, ``Environment=`` too) and each listed one is safe."""
-    props = [p for key, value in opts if key in ("-p", "--property") for p in value.split(",")]
+    props = [p for key, value in opts if key in ("-p", "-P", "--property") for p in value.split(",")]
     return bool(props) and all(p in _SYSTEMCTL_SAFE_PROPS for p in props)
+
+
+def _systemctl_options(args: list[str]) -> tuple[list[tuple[str, str]], list[str]] | None:
+    """systemctl's options and positionals in ``args`` as it reads them (long options by their full name, so a value
+    is never taken for the verb), or None when an option reaches elsewhere (_SYSTEMCTL_ELSEWHERE, by any spelling) or
+    is unknown or ambiguous: then the verb cannot be told."""
+    words: list[str] = []
+    for k, a in enumerate(args):
+        if a == "--":
+            words += args[k:]
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            names = [key] if key in _SYSTEMCTL_LONGS else [o for o in _SYSTEMCTL_LONGS if o.startswith(key)]
+            if len(names) != 1 or names[0] in _SYSTEMCTL_ELSEWHERE:
+                return None
+            a = names[0] + eq + value
+        elif a.startswith("-") and len(a) > 1:
+            for ch in a[1:]:
+                if f"-{ch}" in _SYSTEMCTL_ELSEWHERE or ch not in _SYSTEMCTL_GETOPT.valued + _SYSTEMCTL_GETOPT.flags:
+                    return None
+                if ch in _SYSTEMCTL_GETOPT.valued:
+                    break  # the rest of the word is its value
+        words.append(a)
+    return _options(words, _SYSTEMCTL_GETOPT.valued, _SYSTEMCTL_GETOPT.longs_val)
 
 
 def _unit_env_dump(sub: str) -> bool:
@@ -1516,8 +1559,10 @@ def _unit_env_dump(sub: str) -> bool:
     argv = _argv(sub)
     if not argv or os.path.basename(argv[0]) != "systemctl":
         return False
-    sysctl = _READONLY_OPTS["systemctl"]
-    opts, positional = _options(argv[1:], sysctl.valued, sysctl.longs_val)
+    parsed = _systemctl_options(argv[1:])
+    if parsed is None:
+        return True
+    opts, positional = parsed
     verb = positional[0] if positional else ""
     return verb in ("show-environment", "cat") or (verb == "show" and not _systemctl_show_ok(opts))
 
@@ -1552,8 +1597,10 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
     if name == "systemctl":
         # the verb is the first positional, as systemctl parses it (`-t status restart x` restarts x); none lists units
-        sysctl = _READONLY_OPTS["systemctl"]
-        opts, positional = _options(args, sysctl.valued, sysctl.longs_val)
+        parsed = _systemctl_options(args)
+        if parsed is None:
+            return False
+        opts, positional = parsed
         if positional and positional[0] == "show":
             return _systemctl_show_ok(opts)
         return not positional or positional[0] in _SYSTEMCTL_READ_VERBS
