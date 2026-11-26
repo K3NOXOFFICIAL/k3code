@@ -3193,6 +3193,8 @@ def _decide_bash(
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
     where = _where(parsed, cwd, home)
+    # a relative path is read from every directory the line can be in: `cd /etc && cat shadow` reads /etc/shadow
+    dirs = list(dict.fromkeys((cwd, *_where_dirs(where))))
     budget = _GlobBudget()  # one for every glob walk of the decision: ten deep globs cost what one does
     secret = _secret_access(parsed, where, home, budget=budget)
     if secret == "deny":
@@ -3234,7 +3236,7 @@ def _decide_bash(
         if (
             rule.action != "deny"
             and _runs_builtin_read(sub, ruleset)
-            and _reads_secret_outside(sub, roots, cwd, command, budget=budget)
+            and any(_reads_secret_outside(sub, roots, d, command, budget=budget) for d in dirs)
         ):
             outside_secret = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
@@ -3276,13 +3278,17 @@ def _decide_bash(
     wrapped = [w for form in (*parsed.subs, *forms) for w in _wrapped_commands(form)]
     outside_secret = outside_secret or any(
         _runs_builtin_read(form, ruleset)
-        and _reads_secret_outside(form, roots, cwd, command, "" if form in nested else spelled.get(form, ""), budget)
+        and any(
+            _reads_secret_outside(form, roots, d, command, "" if form in nested else spelled.get(form, ""), budget)
+            for d in dirs
+        )
         for form in dict.fromkeys((*forms, *wrapped))
     )
     # and whatever the program: `firejail cat X`, `uv run cat X` under their rules (see _names_secret_outside)
     outside_secret = outside_secret or any(
-        _names_secret_outside(form, roots, cwd, command, budget=budget)
-        for form in dict.fromkeys((*parsed.subs, *parsed.nested, *wrapped))  # as written: a joined argv loses quotes
+        _names_secret_outside(form, roots, d, command, budget=budget)
+        for form in dict.fromkeys((*parsed.subs, *parsed.nested, *wrapped))
+        for d in dirs  # as written: a joined argv loses quotes
     )
     if unsafe and worst.action != "deny":
         return Decision(
