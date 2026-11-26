@@ -12,13 +12,27 @@ ALLOWED_OUTSIDE = [
     "ls -la ~",
     "cat /etc/os-release",
     "head -n5 /var/log/dnf.log",
-    "grep -r foo /etc/systemd",
-    "find / -name x -maxdepth 2",
     "du -sh ~/Downloads",
     "tail /etc/passwd",
-    "find / -name x",
     "sort ~/x",
     "ls /etc | grep ssh",
+    "ls ~/projects",
+    "cat /proc/cpuinfo",
+    "cat /proc/mounts",
+    "df -h",
+    "ls /usr/lib",
+    "find /usr -name x -maxdepth 2",
+]
+
+#: Reads outside the roots a builtin may take without a person (/usr, /opt, /etc, /var/log, /tmp, $HOME's plain
+#: folders): elsewhere (data folders, mounts, /var/lib, a walk of /) a person is asked, but no secret forces one.
+PLAIN_ASK = [
+    "cat /srv/x",
+    "ls /mnt",
+    "cat /var/lib/foo/x",
+    "ls /media",
+    "find / -name x",
+    "find / -name x -maxdepth 2",
 ]
 
 SECRET_READS = [
@@ -38,6 +52,36 @@ SECRET_READS = [
     "head ~/.bashrc",
     "cat /etc/sudoers",
     "cat /dev/sda",
+    # secrets no denylist named: secret-looking names anywhere, the service and VPN config trees below /etc
+    "cat ~/nyewcloud-copy/secrets/prodlink",
+    "ls ~/nyewcloud-copy/secrets",
+    "cat ~/app/secrets/db_password.txt",
+    "cat ~/Documents/passwords.txt",
+    "cat ~/vpn/client.ovpn",
+    "cat ~/backup.gpg",
+    "cat ~/key.age",
+    "cat ~/x.keytab",
+    "cat ~/x.p8",
+    "cat ~/app/htpasswd",
+    "cat ~/x.tfvars",
+    "cat ~/app/config.php",
+    "cat /etc/rancher/k3s/config.yaml",
+    "cat /etc/rancher/k3s/k3s.yaml",
+    "cat /etc/krb5.keytab",
+    "cat /etc/ipsec.secrets",
+    "cat /etc/ppp/chap-secrets",
+    "cat /srv/nextcloud-data/config/config.php",
+    "cat /mnt/x/etc/shadow",
+    "cat /var/backups/shadow.bak",
+    "cat /var/lib/NetworkManager/secret_key",
+    "cat /var/lib/tailscale/tailscaled.state",
+    "grep -r x /etc/openvpn",
+    "grep -r x /etc/libvirt",
+    "cat /etc/systemd/system/x.service.d/override.conf",
+    "cat /etc/sysconfig/k3s",
+    "cat /etc/default/x",
+    "grep -r Environment= /etc/systemd",
+    "grep -r foo /etc/systemd",
 ]
 
 NOT_ALLOWED = [
@@ -71,6 +115,15 @@ def test_read_only_commands_outside_the_project_allow(command: str, mode: Permis
 def test_secret_paths_outside_ask_a_person_in_every_mode(command: str, mode: PermissionMode, tmp_path) -> None:
     dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
     assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (command, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("command", PLAIN_ASK)
+def test_reads_outside_the_allowed_roots_ask_without_forcing_a_person(command: str, tmp_path) -> None:
+    for mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+        assert (dec.action, dec.needs_human) == ("ask", False), (command, mode, dec.action, dec.message)
+    dec = decide(mode=PermissionMode.AUTO, tool="bash", args={"command": command}, cwd=tmp_path)
+    assert dec.action != "deny" and not dec.needs_human, (command, dec.action, dec.message)  # auto's classifier answers
 
 
 @pytest.mark.parametrize("command", NOT_ALLOWED)

@@ -184,7 +184,8 @@ def test_bash_cwd_resolves_redirects_and_outside_cwd_asks() -> None:
     assert action("echo hi > out.txt", "sub") == "allow"
     assert action("echo hi > out.txt", "/etc") == "ask"  # writes /etc/out.txt
     assert action("echo hi > .bashrc", "..") == "ask"
-    assert action("ls", "/") == "allow"  # a read-only command run outside the project is allowed (secrets excluded)
+    assert action("ls", "/etc") == "allow"  # a read-only command run outside the project is allowed (secrets excluded)
+    assert action("ls", "/") == "ask"  # but only in the roots outside reads may use (see _outside_root_ok)
     assert action("ls", ".") == "allow"
 
 
