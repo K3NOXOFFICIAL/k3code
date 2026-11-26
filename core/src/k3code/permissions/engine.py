@@ -891,6 +891,10 @@ def _voids_allow(
     allowed ``git commit > ~/.bashrc`` and ``git commit -m "$(evil)"``, and an "always allow echo" ``echo >(rm x)``.
     The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those on the command
     line (``sub`` has no body)."""
+    # the shell expands `$X`, `${X:-y}`, `$IFS` and `{a,b}` after the rule matched the words as written: `cat a$x` and
+    # `cat {x,/etc/passwd}` read what no rule saw, so no allow covers a word the shell expands (in double quotes too)
+    if hardline.shell_expands(sub):
+        return True
     plain = _HARMLESS_REDIRECT.sub("", sub)
     has_redirect = bool(_REDIRECT.search(plain))
     body_payloads = [p for h in heredocs or () for p in h.payloads]
@@ -2500,6 +2504,19 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
 _UNCHECKED_MSG = "The glob is too large to check for credential files; narrow it"
 
 
+def _command_word_expands(sub: str) -> bool:
+    """The command word of ``sub`` holds a ``$``, or the shell's brace/``$IFS`` expansion gives another one: what
+    runs is not on the command line, so no rule and no mode vouches for it."""
+    argv = _argv(sub)
+    if argv and "$" in argv[0]:
+        return True
+    try:
+        alt = hardline._expanded_text(sub)
+    except hardline._BraceOverCap:
+        return False  # the parser flags it (expansion_over_cap): a human answers
+    return alt is not None and _argv(alt)[:1] != argv[:1]
+
+
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
@@ -2531,6 +2548,8 @@ def _decide_bash(
     sandbox_only = False
     user_parts: list[bool] = []  # per part: allowed by a user/project/session rule
     for k, sub in enumerate(subs):
+        if _command_word_expands(sub):
+            unsafe = True  # the shell picks the program after it expands the word (`$X /etc/passwd`, `{cat,/etc/x}`)
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.layer == 0 and rule.pattern in _SANDBOXED:
             # a user/project/session rule that names it (`make *: allow|ask`) decides: an allow is the user's own (not
