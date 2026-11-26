@@ -813,6 +813,8 @@ _HARMLESS_REDIRECT = re.compile(
 #: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f), ``>|f`` (``>`` past
 #: noclobber) and ``<>f`` (opens f read-write and creates it, in bash and dash), each with an fd in front (``2>|f``).
 _REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||(?:>>?|<)&?))\s*([^\s;&|<>()]+)")
+#: The characters a _REDIRECT operator starts with: a match that starts with another one took a guard character first.
+_REDIRECT_OPENERS = frozenset("<>&0123456789")
 #: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``, ``>|``, and ``<>``, which writes as well): reading
 #: with ``<`` is never restricted by the write roots.
 _WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
@@ -1724,7 +1726,9 @@ def _argv(
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
     runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
     plain, mask = _operator_view(sub)
-    cuts = [m.span() for m in _REDIRECT.finditer(mask)]  # redirect targets are checked separately
+    # redirect targets are checked separately; a cut starts at the operator, not at the guard character the match takes
+    # in front of it (``cat /etc/shadow>out`` reads ``/etc/shadow``, not ``/etc/shado``)
+    cuts = [(m.start() + (mask[m.start()] not in _REDIRECT_OPENERS), m.end()) for m in _REDIRECT.finditer(mask)]
     words = " ".join(
         plain[a:b] for a, b in zip([0] + [e for _, e in cuts], [s for s, _ in cuts] + [len(plain)], strict=True)
     )
@@ -1814,6 +1818,43 @@ def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
         for a in _path_args(sub)
         if _arg_outside(a, roots, cwd)
     )
+
+
+#: Programs that run the command in their arguments, which _argv keeps as the command (a rule or the allowlist decides
+#: ``watch -n1 df`` and ``strace -o /dev/null ls`` as written): the forced secret-read check looks at what they run, so
+#: ``watch cat /etc/shadow`` asks a person like ``watch 'cat /etc/shadow'``. Option arity as in hardline's wrapper
+#: specs: (short options taking a value, long options taking a value, positional arguments before the command).
+_SECRET_CHECK_WRAPPERS: dict[str, tuple[str, frozenset[str], int]] = {
+    "watch": ("nqs", frozenset({"--interval", "--equexit", "--shotsdir"}), 0),
+    "strace": (
+        "abeEIoOpPsSuUX",
+        frozenset(
+            {"--output", "--env", "--attach", "--string-limit", "--summary-sort-by", "--user", "--columns", "--trace"}
+            | {"--trace-path", "--signal", "--status", "--abbrev", "--verbose", "--raw", "--read", "--write"}
+            | {"--fault", "--inject", "--trace-fds"}
+        ),
+        0,
+    ),
+    "busybox": ("", frozenset(), 0),  # the applet is the next word
+    "unbuffer": ("", frozenset(), 0),
+    "chronic": ("", frozenset(), 0),
+    "flock": ("wEc", frozenset({"--wait", "--timeout", "--conflict-exit-code", "--command"}), 1),  # past the lock file
+}
+
+
+def _wrapped_commands(sub: str) -> list[str]:
+    """The commands ``sub`` runs through the programs in _SECRET_CHECK_WRAPPERS, outermost first: ``watch -n1 strace
+    cat x`` gives ``strace cat x`` and ``cat x``. Their words are joined with spaces, the way watch hands them to
+    ``sh -c``."""
+    out: list[str] = []
+    argv = _argv(sub)
+    while argv and (spec := _SECRET_CHECK_WRAPPERS.get(os.path.basename(argv[0]))):
+        words, rest = hardline._skip_wrapper_options(os.path.basename(argv[0]), argv, 1, spec)
+        if rest >= len(words):
+            break
+        out.append(" ".join(words[rest:]))
+        argv = hardline.normalize_argv(words[rest:])
+    return out
 
 
 def _runs_builtin_read(sub: str, ruleset: list[Rule]) -> bool:
@@ -3028,10 +3069,13 @@ def _decide_bash(
     # a normalised sub (`sudo cat '$X'` is `cat $X`) keeps the quoting of the sub it came from; a nested one its own
     nested = {f for n in parsed.nested for f in (n, " ".join(_argv(n)))}
     spelled = {" ".join(_argv(s)): s for s in parsed.subs}
+    forms = _rule_forms(parsed)
+    # and through watch, strace, busybox ...: `watch cat /etc/shadow` under `watch *`
+    wrapped = [w for form in (*parsed.subs, *forms) for w in _wrapped_commands(form)]
     outside_secret = outside_secret or any(
         _runs_builtin_read(form, ruleset)
         and _reads_secret_outside(form, roots, cwd, command, "" if form in nested else spelled.get(form, ""))
-        for form in _rule_forms(parsed)
+        for form in dict.fromkeys((*forms, *wrapped))
     )
     if unsafe and worst.action != "deny":
         return Decision(
@@ -3449,10 +3493,10 @@ _ETC_READABLE = frozenset(
         "ld.so.conf", "motd",
     )
 )  # fmt: skip
-#: The trees below /etc a content reader may read: package repositories, kernel, device and loader settings.
+#: The trees below /etc a content reader may read: kernel, device and loader settings. Not the package repositories
+#: (/etc/yum.repos.d, /etc/dnf): a repo file may hold ``password=`` or ``proxy_password=``.
 _ETC_READABLE_TREES = tuple(
-    "/etc/" + n
-    for n in ("yum.repos.d", "dnf", "sysctl.d", "modprobe.d", "modules-load.d", "udev/rules.d", "ld.so.conf.d")
+    "/etc/" + n for n in ("sysctl.d", "modprobe.d", "modules-load.d", "udev/rules.d", "ld.so.conf.d")
 )
 #: Where /etc/resolv.conf links to under systemd-resolved (its realpath must pass too).
 _RESOLV_TARGETS = frozenset({"/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/resolv.conf"})

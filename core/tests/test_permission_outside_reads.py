@@ -35,12 +35,18 @@ ALLOWED_OUTSIDE = [
     "cat /etc/hosts",
     "grep -r x /usr/share/doc/foo",
     "cat /usr/lib/os-release",
-    "cat /etc/yum.repos.d/fedora.repo",
+    "cat /etc/sysctl.d/99-sysctl.conf",
+    # metadata reads of the package repositories (their content may hold a password: PLAIN_ASK_CONTENT)
+    "ls /etc/yum.repos.d",
+    "ls /etc/dnf",
 ]
 
 #: Content reads outside the roots no secret NAME gives away: the allowlist of benign files does not hold them, so the
 #: user is asked (plain ask, as before outside reads were allowed), but no person is forced.
 PLAIN_ASK_CONTENT = [
+    # a repository file may hold password= or proxy_password=: no longer on the content allowlist
+    "cat /etc/yum.repos.d/fedora.repo",
+    "cat /etc/dnf/dnf.conf",
     "sort ~/x",
     "cat ~/notes",
     "tree --fromfile ~/wallet.dat",
@@ -383,3 +389,89 @@ def test_a_resolved_home_variable_that_climbs_into_another_home_asks_a_person(
     monkeypatch.setenv("HOME", "/Users/me")  # the tests' own HOME is a temp folder: no other home is next to it
     dec = decide(mode=mode, tool="bash", args={"command": "cat $HOME/../other/x"}, cwd=tmp_path)
     assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (dec.action, dec.message)
+
+
+#: A redirect glued to the path it follows (``/etc/shadow>out``) still leaves the whole path to the secret check, with
+#: and without an allow rule that covers the command.
+GLUED_REDIRECT_SECRET_READS = [
+    ("sudo *", "sudo cat /etc/shadow>out"),
+    (None, "cat /etc/shadow>out"),
+    ("cat *", "cat /etc/shadow>out"),
+    ("cat *", "cat ~/x/server.key>out"),
+    (None, "cat /etc/ssh/ssh_host_ed25519_key>out"),
+    (None, "cat /etc/shadow>>out"),
+    (None, "cat /etc/shadow>|out"),
+    (None, "cat /etc/shadow<out"),
+    (None, "grep x /etc/shadow>out"),
+    (None, "head /etc/shadow>>out"),
+    ("sudo *", "sudo cat /etc/shadow</dev/null"),
+    (None, "cat /etc/shadow 2>out"),
+    (None, "cat /etc/shadow&>out"),
+]
+#: Programs that run the command in their arguments: an unquoted inner command is checked like a quoted one.
+WRAPPED_SECRET_READS = [
+    ("watch *", "watch cat /etc/shadow"),
+    ("watch *", "watch -n1 cat ~/x/server.pem"),
+    (None, "watch cat /etc/shadow"),
+    (None, "watch -n1 cat ~/x/server.pem"),
+    (None, "watch -n 1 -d cat /etc/shadow"),
+    (None, "watch --interval 2 cat /etc/shadow"),
+    (None, "sudo watch cat /etc/shadow"),
+    (None, "watch sudo cat /etc/shadow"),
+    (None, "watch strace cat /etc/shadow"),
+    ("strace *", "strace -o /dev/null cat /etc/shadow"),
+    (None, "strace -f -e trace=open cat /etc/shadow"),
+    ("busybox *", "busybox cat /etc/shadow"),
+    ("unbuffer *", "unbuffer cat /etc/shadow"),
+    ("chronic *", "chronic cat /etc/shadow"),
+    ("flock *", "flock /tmp/l cat /etc/shadow"),
+    (None, "flock -w 5 /tmp/l cat /etc/shadow"),
+]
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize(("pattern", "command"), GLUED_REDIRECT_SECRET_READS + WRAPPED_SECRET_READS)
+def test_glued_redirects_and_wrappers_keep_the_secret_read_check(
+    tmp_path: Path, pattern: str | None, command: str, mode: PermissionMode
+) -> None:
+    for rules in ([], [Rule(tool="bash", pattern=pattern, action="allow", layer=1)] if pattern else []):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
+        assert (dec.action, dec.needs_human) == ("ask", True), (pattern, rules, command, mode, dec.action, dec.message)
+
+
+#: Commands with no secret in them keep their decision (default, accept-edits, auto).
+GLUED_AND_WRAPPED_KEEP = [
+    ("cat /etc/hostname>out", "ask", "allow"),
+    ("watch -n1 df", "ask", "allow"),
+    ("strace -o /dev/null ls", "ask", "allow"),
+    ("busybox ls", "ask", "allow"),
+    ("chronic ls", "ask", "allow"),
+]
+
+
+@pytest.mark.parametrize(("command", "default", "auto"), GLUED_AND_WRAPPED_KEEP)
+def test_glued_redirects_and_wrappers_without_a_secret_keep_their_decision(
+    tmp_path: Path, command: str, default: str, auto: str
+) -> None:
+    for mode, want in (
+        (PermissionMode.DEFAULT, default),
+        (PermissionMode.ACCEPT_EDITS, default),
+        (PermissionMode.AUTO, auto),
+    ):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+        assert (dec.action, dec.needs_human) == (want, False), (command, mode, dec.action, dec.message)
+
+
+def test_a_glued_redirect_in_the_project_keeps_its_decision(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("x\n")
+    for mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO):
+        glued = decide(mode=mode, tool="bash", args={"command": "cat README.md>out"}, cwd=tmp_path)
+        spaced = decide(mode=mode, tool="bash", args={"command": "cat README.md >out"}, cwd=tmp_path)
+        assert (glued.action, glued.needs_human) == (spaced.action, spaced.needs_human), (mode, glued.message)
+
+
+def test_an_allow_rule_still_allows_a_wrapped_command_without_a_secret(tmp_path: Path) -> None:
+    rules = [Rule(tool="bash", pattern="watch *", action="allow", layer=1)]
+    for mode in (PermissionMode.DEFAULT, PermissionMode.AUTO):
+        dec = decide(mode=mode, tool="bash", args={"command": "watch -n1 df"}, cwd=tmp_path, user_rules=rules)
+        assert dec.action == "allow", (mode, dec.message)
