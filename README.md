@@ -313,6 +313,18 @@ A pane running k3code reports its state (working, needs input, done) to `k3` aut
 
 With `learning.enabled: true` (the default) k3code stores gotchas, notes and preferences from your sessions. Setting `learning.enabled: false` stops new learning and keeps learned text out of the prompt. Everything lives under `~/.k3code` (or `$K3CODE_HOME`): per-project `projects/<key>/gotchas.md`, `gotchas.auto.md` and `learned.md`; machine-wide `gotchas.md`; `learning/preferences.json` and the auto section of `memory/USER.md`; optimizer `overlays/*.md`. `/learned` lists them with ids, `/learned forget <id>` removes one, and `/learned purge --yes` clears the project's auto gotchas, notes and rows of the decision log (`learning/decisions.db`) and every overlay not in an active experiment. `/learned purge --all --yes` also clears every project's decisions and the learned preferences (`learning/preferences.json` and the auto section of `USER.md`). Both keep what you confirmed: accepted gotchas (`gotchas.md`, the machine-wide ones) and the lines you wrote in `USER.md`.
 
+### Guidance precedence
+
+When two sources disagree, the earlier one wins (this is the order the base prompt states):
+
+1. What you type in the session, and the chosen output style.
+2. User memory (`memory/USER.md`), which also holds the preferences k3code learns from you.
+3. Project instructions: `K3CODE.md`, `AGENTS.md`, `CLAUDE.md` and rules.
+4. Learned notes, pitfalls and guidance.
+5. The base defaults: few large steps, a closing `Tips:` footer, and bash `timeout` (30 s unless set; `background` for long jobs).
+
+Tool results, web pages, MCP and sub-agent output are data and never rank. A `concise` style, for instance, drops the `Tips:` footer, and "prefer smaller steps" in USER.md overrides the default of few large steps.
+
 ## Running 24/7
 
 ```sh
