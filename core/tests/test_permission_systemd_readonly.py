@@ -20,14 +20,17 @@ ALLOWED = [
     "systemctl --user list-units",
     "systemctl list-units --type=service --state=running --plain",
     "systemctl -t service list-units",
-    "systemctl list-unit-files 'ssh*'",
+    "systemctl list-unit-files ssh.service",
     "systemctl list-timers --all",
     "systemctl list-sockets",
     "systemctl list-dependencies sshd",
     "systemctl list-jobs",
+    # show prints only the properties listed, and only safe ones (these lines once also allowed a bare `show` and
+    # `cat`, which print Environment= with whatever tokens it holds: see UNIT_ENV_DUMPS)
     "systemctl show sshd -p ActiveState --value",
     "systemctl show --property=MainPID sshd",
-    "systemctl cat sshd",
+    "systemctl show -p ActiveState sshd",
+    "systemctl show -pActiveState,SubState --property LoadState sshd",
     "systemctl -n 20 -o short-iso status sshd",
     "systemctl is-active sshd",
     "systemctl -q is-enabled sshd",
@@ -58,6 +61,8 @@ ALLOWED = [
     "journalctl --disk-usage",
     "journalctl --system --dmesg --reverse --catalog --pager-end",
     "journalctl -u sshd -n 5 | grep Accepted",
+    "journalctl -g error",
+    "journalctl -n 20 -u sshd",
 ]
 
 NOT_ALLOWED = [
@@ -134,4 +139,57 @@ def test_read_only_systemd_query_allows(command: str, mode: PermissionMode, proj
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("command", NOT_ALLOWED)
 def test_systemd_change_or_hidden_option_does_not_allow(command: str, mode: PermissionMode, project) -> None:
+    assert _action(command, mode, project) in ("ask", "deny"), command
+
+
+#: These print the Environment= of a unit or of the service manager, where tokens live (as `env` would): a person
+#: confirms them in every mode, auto included.
+UNIT_ENV_DUMPS = [
+    "systemctl show sshd",
+    "systemctl --user show",
+    "systemctl --user show -p Environment",
+    "systemctl show --property=Environment x",
+    "systemctl show -p Environment sshd",
+    "systemctl show -p ActiveState,Environment sshd",
+    "systemctl show -p ActiveState -p PassEnvironment sshd",
+    "systemctl show -p ExecStart sshd",
+    "systemctl show --property= sshd",
+    "systemctl cat sshd",
+    "sudo systemctl cat sshd",
+    "systemctl show-environment",
+    "systemctl --user show-environment",
+    "bash -c 'systemctl show-environment'",
+]
+
+
+@pytest.mark.parametrize("mode", [*MODES, PermissionMode.AUTO])
+@pytest.mark.parametrize("command", UNIT_ENV_DUMPS)
+def test_unit_environment_dump_needs_a_person(command: str, mode: PermissionMode, project) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=project)
+    assert dec.action == "ask" and dec.needs_human, command
+
+
+#: A word the shell expands may turn into an option (a file named `-f` makes `journalctl *` follow forever, `-H` sends
+#: `lsblk`/`systemctl` elsewhere): no builtin viewer allows one, in quotes or not (the check reads raw words).
+GLOBBED = [
+    "journalctl *",
+    "journalctl -u *",
+    "journalctl -g 'error*'",
+    "systemctl status *",
+    "systemctl list-unit-files 'ssh*'",
+    "lsblk *",
+    "findmnt *",
+    "ip *",
+    "ss -t *",
+    "nvidia-smi *",
+    "free *",
+    "ps *",
+    "uptime ?",
+    "lscpu [a]",
+]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("command", GLOBBED)
+def test_glob_in_an_inspection_command_does_not_allow(command: str, mode: PermissionMode, project) -> None:
     assert _action(command, mode, project) in ("ask", "deny"), command
