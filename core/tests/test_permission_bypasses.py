@@ -1254,3 +1254,110 @@ def test_auto_mode_resolves_a_cd_through_a_symlink_before_its_dotdot(tmp_path: P
     (tmp_path / "link").symlink_to("/usr/share")
     dec = decide(mode="auto", tool="bash", args={"command": "cd link && echo x > ../x.txt"}, cwd=tmp_path)
     assert dec.action == "deny" and "project roots" in (dec.message or ""), dec.message
+
+
+# ── the hardline looks through launchers that run their arguments: flock, script, tmux, screen, setpriv, ... ──
+LAUNCHER_HARDLINE_DENY: list[str] = [
+    "flock /tmp/l rm -rf /",
+    "flock /tmp/l rm -rf ~",
+    "flock -n /tmp/l rm -rf ~",
+    "flock -w 5 /tmp/l rm -rf ~",
+    "flock /tmp/l -c 'rm -rf ~'",
+    "flock /tmp/l -c env",
+    "flock /tmp/l env",
+    "script -qc 'rm -rf ~'",
+    "script -c 'rm -rf ~' /dev/null",
+    "script -q -c 'rm -rf ~' /dev/null",
+    "script --command 'rm -rf ~' /dev/null",
+    "script -c env /dev/null",
+    "tmux new 'rm -rf ~'",
+    "tmux new-session -d 'rm -rf ~'",
+    "tmux new-session -d -s x 'rm -rf ~'",
+    "tmux new-window 'rm -rf ~'",
+    "tmux split-window 'rm -rf ~'",
+    "tmux run-shell 'rm -rf ~'",
+    "tmux new -d rm -rf ~",
+    "screen -dm rm -rf ~",
+    "screen -dmS x rm -rf ~",
+    "screen -d -m -S x rm -rf ~",
+    "screen -dm bash -c 'rm -rf ~'",
+    "setpriv --reuid 1000 rm -rf ~",
+    "runuser -u x -- rm -rf ~",
+    "runuser -c 'rm -rf ~' x",
+    "sg grp -c 'rm -rf ~'",
+    "systemd-run --user rm -rf ~",
+    "systemd-run -p X=1 --user rm -rf ~",
+    "unshare -r rm -rf ~",
+    "nsenter -t 1 -m rm -rf ~",
+    "chroot / rm -rf ~",
+    "firejail rm -rf ~",
+    "firejail --noprofile rm -rf ~",
+    "bwrap --bind / / rm -rf ~",
+    "torsocks rm -rf ~",
+    "proxychains rm -rf ~",
+    "proxychains4 -q rm -rf ~",
+    "fakeroot rm -rf ~",
+    "rlwrap rm -rf ~",
+    "xvfb-run rm -rf ~",
+    "xvfb-run -a rm -rf ~",
+    "dbus-run-session rm -rf ~",
+    "dbus-run-session -- rm -rf ~",
+    "systemd-inhibit rm -rf ~",
+    "systemd-inhibit --why=x rm -rf ~",
+    "ltrace rm -rf ~",
+    "valgrind rm -rf ~",
+    "catchsegv rm -rf ~",
+    "gdb --args rm -rf ~",
+    "gdb -batch -ex run --args rm -rf ~",
+    "entr rm -rf ~",
+    "entr -r rm -rf ~",
+    "uv run rm -rf ~",
+    "uv run --with x rm -rf ~",
+    "npx rm -rf ~",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_HARDLINE_DENY)
+def test_hardline_sees_through_launchers(tmp_path: Path, cmd: str) -> None:
+    rule = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}})
+    for mode, rules in (("default", None), ("auto", None), ("yolo", None), ("default", rule), ("auto", rule)):
+        d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+        assert d.action == "deny", (cmd, mode, rules is not None)
+        assert d.hardline, (cmd, mode)
+
+
+#: what the forced-human check reads (``git reset --hard``) is read in the shell code of a launcher too
+LAUNCHER_NEEDS_HUMAN = [
+    "flock -c 'git reset --hard' /tmp/l",
+    "flock /tmp/l -c 'git reset --hard'",
+    "script -qc 'git reset --hard' /dev/null",
+    "tmux new 'git reset --hard'",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_NEEDS_HUMAN)
+def test_launcher_code_needs_a_human(tmp_path: Path, cmd: str) -> None:
+    rule = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}})
+    for mode, rules in (("default", None), ("auto", None), ("default", rule), ("auto", rule)):
+        d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+        assert (d.action, d.needs_human) == ("ask", True), (cmd, mode, rules is not None)
+
+
+#: a launcher running something harmless keeps its decision: ask by default, allowed in auto
+LAUNCHER_KEEP = [
+    "flock /tmp/l ls",
+    "script -qc 'ls' /dev/null",
+    "tmux new 'ls'",
+    "tmux ls",
+    "screen -dm sleep 1",
+    "screen -ls",
+    "uv run pytest",
+    "npx prettier --check .",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_KEEP)
+def test_harmless_launcher_commands_keep_their_decisions(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "default", tmp_path).action == "ask", cmd
+    assert _decide(cmd, "auto", tmp_path).action == "allow", cmd
+    assert _decide(cmd, "yolo", tmp_path).action == "allow", cmd
