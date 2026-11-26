@@ -818,6 +818,97 @@ _REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||(?:>>?|<)&?))\s*([^\
 _WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
 #: ``$(...)``, backticks and process substitution ``<(...)``/``>(...)`` (bash; ``echo >(rm x)`` runs ``rm x``).
 _SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
+#: What stands in for a quoted character in :func:`_quote_mask` (no operator regex here matches it).
+_MASK_FILL = "_"
+
+
+#: Commands that run a quoted argument as shell or awk code (``awk '{print > "/etc/x"}'``, ``ssh h 'rm x'``), besides
+#: the interpreters hardline knows: their quotes hide no operator.
+_QUOTED_CODE_RUNNERS = frozenset(
+    {"awk", "gawk", "mawk", "nawk", "busybox", "ssh", "su", "watch", "script", "flock", "parallel", "tmux", "screen"}
+)
+
+
+def _runs_quoted_code(sub: str) -> bool:
+    """A word of ``sub`` names a command that may run a quoted argument as code (``bash -c``, ``eval``, ``sudo sh -c``,
+    ``find -exec sh -c``, awk, ``git -c core.pager=...``)."""
+    try:
+        words = hardline.tokens(sub)
+    except ValueError:
+        return True
+    names = {os.path.basename(w) for w in words}
+    if any(hardline._is_interpreter(n) or n in _QUOTED_CODE_RUNNERS for n in names):
+        return True
+    return "git" in names and any(w in ("-c", "--config-env") or w.startswith("--config-env=") for w in words)
+
+
+def _quote_mask(sub: str) -> str:
+    """``sub`` with every character inside quotes replaced by :data:`_MASK_FILL` (the quotes kept, same length), so
+    the operator regexes see ``grep "a<>b"`` as no redirect and ``grep 'a<(b'`` as no substitution. A ``$(...)``,
+    backtick or ``${...}`` stays as written, in double quotes too: it runs there. Where the quoting is not plain
+    (``$'...'``, ``$"..."``, an unclosed quote or unit, a ``#`` comment) ``sub`` comes back unchanged."""
+    if "$'" in sub or '$"' in sub or _runs_quoted_code(sub):
+        return sub
+    out, i, n = list(sub), 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and (i == 0 or sub[i - 1] in " \t\n;&|()"):
+            return sub
+        end = hardline._unit_end(sub, i)
+        if end == -2:
+            return sub
+        if end >= 0:
+            i = end + 1
+            continue
+        if c == "'":
+            close = sub.find("'", i + 1)
+            if close < 0:
+                return sub
+            out[i + 1 : close] = _MASK_FILL * (close - i - 1)
+            i = close + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and sub[i] != '"':
+                end = hardline._unit_end(sub, i)
+                if end == -2:
+                    return sub
+                if end >= 0:
+                    i = end + 1
+                    continue
+                step = 2 if sub[i] == "\\" else 1
+                out[i : i + step] = _MASK_FILL * len(out[i : i + step])
+                i += step
+            if i >= n:
+                return sub
+        i += 1
+    return "".join(out)
+
+
+def _operator_view(sub: str) -> tuple[str, str]:
+    """``(plain, mask)``: ``sub`` and its :func:`_quote_mask`, both with the harmless redirects blanked out, aligned
+    character for character. Find an operator in ``mask``; read what it names (a redirect target) from ``plain`` at the
+    same place, so ``> "/etc/passwd"`` still names ``/etc/passwd``."""
+    mask = _quote_mask(sub)
+    spans = [m.span() for m in _HARMLESS_REDIRECT.finditer(mask)]
+
+    def blank(text: str) -> str:
+        chars = list(text)
+        for start, stop in spans:
+            chars[start:stop] = " " * (stop - start)
+        return "".join(chars)
+
+    return blank(sub), blank(mask)
+
+
+def _operator_targets(regex: re.Pattern[str], plain: str, mask: str) -> list[str]:
+    """The first group of each ``regex`` match in ``mask``, read from ``plain`` (see :func:`_operator_view`)."""
+    return [plain[m.start(1) : m.end(1)] for m in regex.finditer(mask)]
+
+
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(
     r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
@@ -862,9 +953,9 @@ def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
     return False
 
 
-def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
+def _redirects_ok(plain: str, mask: str, roots: list[str], cwd: str) -> bool:
     """Every redirect target is a plain path inside the project roots and not a credential/startup file."""
-    for target in _REDIRECT.findall(plain):
+    for target in _operator_targets(_REDIRECT, plain, mask):
         target = target.strip("'\"")
         if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
             return False  # a variable or glob: unknown target
@@ -895,10 +986,10 @@ def _voids_allow(
     # `cat {x,/etc/passwd}` read what no rule saw, so no allow covers a word the shell expands (in double quotes too)
     if hardline.shell_expands(sub):
         return True
-    plain = _HARMLESS_REDIRECT.sub("", sub)
-    has_redirect = bool(_REDIRECT.search(plain))
+    plain, mask = _operator_view(sub)
+    has_redirect = bool(_REDIRECT.search(mask))
     body_payloads = [p for h in heredocs or () for p in h.payloads]
-    has_subst = bool(_SUBSTITUTION.search(plain)) or bool(body_payloads)
+    has_subst = bool(_SUBSTITUTION.search(mask)) or bool(body_payloads)
     if rule.layer == 0:
         # the builtin read-only allowlist covers the project, and outside it only literal paths that hold no secret
         # (`cat /etc/os-release`, `du -sh ~/Downloads`; see _outside_reads_ok): `cat /etc/shadow`, `grep -r k ~`, `ls
@@ -910,7 +1001,7 @@ def _voids_allow(
             or (outside and not (depth == 0 and rule.pattern not in _SANDBOXED and _outside_reads_ok(sub, roots, cwd)))
             or not _readonly_argv_ok(hardline.tokens(sub))
         )
-    if has_redirect and not _redirects_ok(plain, roots, cwd):
+    if has_redirect and not _redirects_ok(plain, mask, roots, cwd):
         return True
     # the output of `$(...)` or a backtick becomes words of the command: `cat $(echo /etc/passwd)` reads what no rule
     # saw, even when `echo` is allowed. Only `<(...)`, `>(...)` and heredoc bodies stay on the nested check
@@ -1621,7 +1712,11 @@ def _argv(
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
     runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
-    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
+    plain, mask = _operator_view(sub)
+    cuts = [m.span() for m in _REDIRECT.finditer(mask)]  # redirect targets are checked separately
+    words = " ".join(
+        plain[a:b] for a, b in zip([0] + [e for _, e in cuts], [s for s, _ in cuts] + [len(plain)], strict=True)
+    )
     return hardline.normalize_argv(hardline.tokens(words), reads, chdirs, replaces)
 
 

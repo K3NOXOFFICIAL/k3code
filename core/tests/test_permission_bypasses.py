@@ -1149,3 +1149,71 @@ def test_pipe_to_shell_stays_denied_around_a_clobber(tmp_path: Path, cmd: str, m
 def test_a_lone_clobber_redirect_keeps_its_target_check(tmp_path: Path, cmd: str, action: str) -> None:
     dec = decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_ECHO_ALLOW)
     assert dec.action == action, (cmd, dec.action)
+
+
+# ── operator characters inside quotes are data, not redirects or substitutions ──
+
+_QUOTED_OPERATORS = [
+    'grep -rn "List<>" src',
+    'rg "Vec<>" src',
+    'grep -n "=>(" src',
+    'grep -E "foo>|bar" a.txt',
+    'git log --grep="x=>(y)"',
+    "grep -n 'a<(b' src",
+]
+
+
+@pytest.mark.parametrize("cmd", _QUOTED_OPERATORS)
+def test_quoted_operator_characters_need_no_human(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "default", tmp_path).action == "allow", cmd
+    assert _decide(cmd, "auto", tmp_path).action == "allow", cmd
+
+
+@pytest.mark.parametrize("cmd", ['echo "a<(b)"', "echo 'x > y'"])
+def test_quoted_operator_characters_stay_under_a_user_allow(tmp_path: Path, cmd: str) -> None:
+    rules = from_config({"bash": {"echo *": "allow"}})
+    for mode in ("default", "auto"):
+        assert decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
+#: (command, user allow rule or None, decisions in default / accept-edits / auto), as measured before the quote mask
+_QUOTED_CODE_KEEPS = [
+    ('echo "$(rm x)"', None, ("ask", "ask", "allow")),
+    ('grep "$(rm x)" f', None, ("ask", "ask", "allow")),
+    ('echo x >"$HOME/.bashrc"', None, ("ask", "ask", "deny")),
+    ('echo x > "/etc/passwd"', None, ("ask", "ask", "deny")),
+    ('echo "$(echo x > ~/.bashrc)"', None, ("ask", "ask", "deny")),
+    ("echo $'\\'' >(rm x) $'\\''", None, ("ask", "ask", "ask")),
+    ("echo x > '/etc/passwd'", None, ("ask", "ask", "deny")),
+    ("cat <(rm x)", None, ("ask", "ask", "allow")),
+    ("echo 'a' >(rm x)", None, ("ask", "ask", "allow")),
+    ("bash -c 'echo x > ~/.bashrc'", None, ("ask", "ask", "deny")),
+    ('eval "echo x > ~/.bashrc"', None, ("ask", "ask", "deny")),
+    ("awk '{print > \"/etc/x\"}' f", None, ("ask", "ask", "deny")),
+    ("find . -exec sh -c 'echo > /etc/x' \\;", None, ("ask", "ask", "deny")),
+    ('sh -c "cat < .env"', None, ("deny", "deny", "deny")),
+    ('echo "$(rm x)"', "echo *", ("ask", "ask", "allow")),
+    ('echo x >"$HOME/.bashrc"', "echo *", ("ask", "ask", "deny")),
+    ("echo 'a' >(rm x)", "echo *", ("ask", "ask", "allow")),
+    ("bash -c 'echo x > ~/.bashrc'", "bash *", ("ask", "ask", "deny")),
+    ('eval "echo x > ~/.bashrc"', "eval *", ("ask", "ask", "deny")),
+    ("awk '{print > \"/etc/x\"}' f", "awk *", ("ask", "ask", "deny")),
+    ("find . -exec sh -c 'echo > /etc/x' \\;", "find *", ("ask", "ask", "deny")),
+    ('sh -c "cat < .env"', "sh *", ("deny", "deny", "deny")),
+    ("sudo bash -c 'echo x > ~/.bashrc'", "sudo *", ("ask", "ask", "deny")),
+    ("ssh h 'echo x > ~/.bashrc'", "ssh *", ("ask", "ask", "deny")),
+    ("git -c core.pager='cat > /etc/x' log", "git *", ("ask", "ask", "deny")),
+]
+
+
+@pytest.mark.parametrize(("cmd", "rule", "expected"), _QUOTED_CODE_KEEPS)
+def test_quoted_code_and_real_targets_keep_their_decisions(
+    tmp_path: Path, cmd: str, rule: str | None, expected: tuple[str, str, str]
+) -> None:
+    (tmp_path / ".env").write_text("A=1\n")
+    rules = from_config({"bash": {rule: "allow"}}) if rule else None
+    got = tuple(
+        decide(mode=m, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action
+        for m in ("default", "accept-edits", "auto")
+    )
+    assert got == expected, cmd
