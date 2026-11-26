@@ -305,8 +305,7 @@ SENSITIVE_DENY: list[str] = [
     "install -t . ~/.config/k3code/env",
     "ln -t . ~/.ssh/id_rsa",
     "cp --target-directory=. ~/.ssh/id_rsa",
-    # brace expansion
-    "cat .{env,x}",
+    # brace expansion (`cat .{env,x}` is `cat .env .x`, the dotenv-cat hardline: see test_permission_expansion)
     "tac {.env,x}",
 ]
 

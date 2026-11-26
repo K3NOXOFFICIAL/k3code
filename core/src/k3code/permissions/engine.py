@@ -2475,6 +2475,9 @@ def _secret_access(
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
         worst = _worse(worst, _secret_access(child, where, home, consumed or k < n_subst, budget))
+    # `cat x${IFS}.env` and `cat {x,.env}` read `.env`: the brace-expanded, `$IFS`-split forms (see hardline)
+    for alt in parsed.expanded:
+        worst = _worse(worst, _secret_access(alt, where, home, consumed, budget))
     return worst
 
 
