@@ -192,3 +192,52 @@ def test_model_switches_in_three_sessions_of_one_project_still_re_tier(tmp_path)
     prefs, suggestions = distiller.derive(log)
     assert [p.key for p in prefs] == ["avoid:m-x:review"]
     assert suggestions == [{"model": "m-x", "task_kind": "review", "tier": "strong", "evidence": 3}]
+
+
+def test_preferences_json_roundtrip_keeps_timestamps(tmp_path):
+    import time
+
+    now = time.time()
+    prefs = [distiller.Preference("use tabs", 0.9, 5, "a", first_seen=now - 1000, updated=now - 10)]
+    distiller.write_preferences_json(tmp_path, prefs)
+    [back] = distiller.load_preferences(tmp_path)
+    assert (back.first_seen, back.updated) == (now - 1000, now - 10)
+
+
+def test_legacy_preferences_file_loads_and_never_expires(tmp_path):
+    path = tmp_path / "learning" / "preferences.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"a": {"text": "use tabs", "confidence": 0.9, "evidence": 5}}', encoding="utf-8")
+    [p] = distiller.load_preferences(tmp_path)
+    assert (p.first_seen, p.updated) == (0.0, 0.0)
+    assert not distiller.is_expired(p, now=1e12)
+
+
+def test_stale_preference_is_expired_and_not_in_prompt(tmp_path):
+    import time
+
+    old = time.time() - (distiller.PREFERENCE_TTL_DAYS + 1) * 86400
+    fresh = distiller.Preference("be terse", 0.8, 4, "b", first_seen=old, updated=time.time())
+    stale = distiller.Preference("use tabs", 0.9, 5, "a", first_seen=old, updated=old)
+    distiller.write_preferences_json(tmp_path, [stale, fresh])
+    assert [p.text for p in distiller.load_preferences(tmp_path)] == ["be terse"]
+    assert len(distiller.load_preferences(tmp_path, include_expired=True)) == 2
+
+
+def test_duplicate_preference_text_is_deduped_keeping_higher_confidence(tmp_path):
+    import time
+
+    now = time.time()
+    prefs = [
+        distiller.Preference("Use tabs.", 0.6, 3, "a", updated=now),
+        distiller.Preference("use  tabs", 0.9, 5, "b", updated=now - 5),
+        distiller.Preference("be terse", 0.7, 3, "c"),
+    ]
+    assert [p.key for p in distiller.dedupe_preferences(prefs)] == ["b", "c"]
+    tie = [
+        distiller.Preference("x", 0.5, 3, "old", updated=1.0),
+        distiller.Preference("X!", 0.5, 3, "new", updated=2.0),
+    ]
+    assert [p.key for p in distiller.dedupe_preferences(tie)] == ["new"]
+    distiller.write_preferences_json(tmp_path, prefs)
+    assert [p.key for p in distiller.load_preferences(tmp_path)] == ["b", "c"]
