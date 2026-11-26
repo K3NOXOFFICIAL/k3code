@@ -40,8 +40,8 @@ TOOL_SPEC = ToolSpec(
         "when several options may be chosen together. Put the option you recommend first and end its label with "
         '"(Recommended)". The user can always type their own answer ("Type something") or choose to discuss '
         '("Chat about this"): those are added automatically, so never add Other/None options yourself.\n'
-        "Never ask whether a plan is ok or whether to proceed: when in plan mode, ask for approval of the plan with "
-        "exit_plan instead."
+        "Never ask whether a plan is ok or whether to proceed: if plan mode is active (the `exit_plan` tool is "
+        "available), use exit_plan for plan approval instead."
     ),
     parameters={
         "type": "object",
