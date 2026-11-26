@@ -1835,28 +1835,86 @@ def _glob_reaches_secret(arg: str, cwd: str) -> bool:
     return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS))
 
 
-def _reads_secret_outside(sub: str, roots: list[str], cwd: str) -> bool:
-    """``sub`` (a builtin read-only command, not git) reads a path outside the roots that holds a secret (see
-    _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``, ``cat < /etc/shadow``; a
-    walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may match one
-    (_glob_reaches_secret). A person answers that, in auto mode too."""
+#: variables a path word may name that k3code resolves as the shell would (``$HOME/.netrc``), unless the line may
+#: rebind them; any other variable is an unknown path
+_PLAIN_VARS = frozenset({"HOME", "USER", "LOGNAME", "PWD"})
+_VAR_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+#: a parameter expansion: ``$NAME``, ``${...}``, ``$1``, ``$@`` (``$(...)`` and a lone ``$`` are not)
+_PARAM = re.compile(r"\$[\w{@*#?!$-]")
+#: what may rebind a variable before the word is read: ``source``/``.``/``eval`` (anything), ``cd`` and co. (``$PWD``)
+_REBINDS_ANY = re.compile(r"(?:^|[\s;&|(){}])(?:eval|source|\.)(?=\s|$)")
+_MOVES_PWD = re.compile(r"(?:^|[\s;&|(){}])(?:cd|pushd|popd)(?=[\s;&|()]|$)")
+
+
+def _var_value(name: str, line: str, cwd: str) -> str | None:
+    """What ``$name`` is when ``line`` runs, or None when k3code cannot tell: not a plain variable (_PLAIN_VARS), unset,
+    or the line may rebind it (it names it bare, as in ``HOME=/etc``, ``export HOME``, ``read HOME``, ``for HOME in``;
+    ``eval``/``source``/``.``; a ``cd`` for ``$PWD``)."""
+    if name not in _PLAIN_VARS or _REBINDS_ANY.search(line) or re.search(rf"(?<![$\w{{]){name}(?!\w)", line):
+        return None
+    if name == "PWD":
+        return None if _MOVES_PWD.search(line) else cwd
+    return os.path.expanduser("~") if name == "HOME" else os.environ.get(name)
+
+
+def _var_resolved(word: str, line: str, cwd: str) -> str | None:
+    """``word`` with each ``$NAME``/``${NAME}`` replaced by its value (_var_value), or None when one has no known value
+    or another parameter expansion is left (``${X:-y}``, ``$1``)."""
+    values = [_var_value(m[1] or m[2], line, cwd) for m in _VAR_REF.finditer(word)]
+    if None in values:
+        return None
+    it = iter(values)
+    out = _VAR_REF.sub(lambda _m: str(next(it)), word)
+    return None if _PARAM.search(out) else out
+
+
+def _word_forms(word: str) -> list[str] | None:
+    """Every word the shell makes of ``word`` by brace expansion (``/etc/{a,{b,shadow}}`` is three), or None when the
+    expansion is too large to check word by word (the parser denies it)."""
+    if "{" not in word:
+        return [word]
+    try:
+        return hardline._brace_words(word, [hardline._BRACE_MAX_WORDS])
+    except (hardline._BraceOverCap, RecursionError):
+        return None
+
+
+def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "") -> bool:
+    """``sub`` (a builtin read-only command, not git; one part of ``line``) reads a path outside the roots that holds a
+    secret (see _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``,
+    ``cat < /etc/shadow``; a walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may
+    match one (_glob_reaches_secret). Every brace expansion of a word is checked (``/etc/{a,shadow}``), and a word with
+    a variable as the line sets it (_var_resolved, ``$HOME/.netrc``); a variable k3code cannot resolve (``$X/y``) is an
+    unknown path, so it counts as a secret. A person answers that, in auto mode too."""
     argv = _argv(sub)
     if argv and os.path.basename(argv[0]) == "git":
         return False
+    line = line or sub
     walker = bool(argv) and _content_walker(argv)
     args = _path_args(sub) if argv else []
     sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
-    for a in (*args, *sources):
-        if not _arg_outside(a, roots, cwd):
-            continue
-        if not _literal_word(a):
-            if _glob_reaches_secret(a, cwd):
-                return True
-            continue
-        p = _abs(a, cwd)
-        if not _shell_read_ok(p) or (walker and a in args and _walk_holds_secret(p)):
+    for arg in (*args, *sources):
+        forms = _word_forms(arg)
+        if forms is None:
             return True
+        for w in forms:
+            a = _var_resolved(w, line, cwd) if _PARAM.search(w) else w
+            if a is None:
+                return True  # an unknown path
+            if _secret_word(a, walker and arg in args, roots, cwd):
+                return True
     return False
+
+
+def _secret_word(a: str, walks: bool, roots: list[str], cwd: str) -> bool:
+    """``a`` (one word, expansions done) lies outside the roots and holds a secret, or (``walks``) a tree with one; or
+    is a glob that may match one (_glob_reaches_secret)."""
+    if not _arg_outside(a, roots, cwd):
+        return False
+    if not _literal_word(a):
+        return _glob_reaches_secret(a, cwd)
+    p = _abs(a, cwd)
+    return not _shell_read_ok(p) or (walks and _walk_holds_secret(p))
 
 
 def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
@@ -2864,7 +2922,11 @@ def _decide_bash(
         # the forced check goes by the program that runs, not the allow pattern the spelling matched (`/bin/cat`,
         # `env cat`, `sudo cat`, `\cat` ask, and auto mode's classifier would answer); no allow rule lifts it, a
         # user/project one included (`sudo *`, `cat *`)
-        if rule.action != "deny" and _runs_builtin_read(sub, ruleset) and _reads_secret_outside(sub, roots, cwd):
+        if (
+            rule.action != "deny"
+            and _runs_builtin_read(sub, ruleset)
+            and _reads_secret_outside(sub, roots, cwd, command)
+        ):
             outside_secret = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
@@ -2898,7 +2960,8 @@ def _decide_bash(
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
     # a nested command reads it the same: `bash -c 'cat /etc/shadow'` under `bash *`
     outside_secret = outside_secret or any(
-        _runs_builtin_read(form, ruleset) and _reads_secret_outside(form, roots, cwd) for form in _rule_forms(parsed)
+        _runs_builtin_read(form, ruleset) and _reads_secret_outside(form, roots, cwd, command)
+        for form in _rule_forms(parsed)
     )
     if unsafe and worst.action != "deny":
         return Decision(

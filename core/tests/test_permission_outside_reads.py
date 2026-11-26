@@ -238,3 +238,60 @@ def test_an_allow_rule_still_decides_a_read_that_holds_no_secret(tmp_path: Path,
     for mode in (PermissionMode.DEFAULT, PermissionMode.AUTO):
         dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
         assert (dec.action, dec.needs_human) == ("allow", False), (pattern, command, mode, dec.message)
+
+
+#: a secret read the shell makes of a word only once it expands it: a brace list (nested too), a variable k3code
+#: resolves (``$HOME``) or cannot (``$X``), a glob below a secret tree
+EXPANDED_SECRET_READS = [
+    "cat /etc/shadow{,}",
+    "cat /etc/{hostname,sudoers}",
+    "cat ~/{a,app/secrets/db_password.txt}",
+    "cat /srv/{a,nextcloud-data/config/config.php}",
+    "cat /etc/{a,{b,shadow}}",
+    "cat < /etc/{a,shadow}",
+    "cat ${HOME}/.netrc",
+    "cat $X/y",
+    "cat ${X}/shadow",
+    "cat ${HOME:-/etc}/x",
+    "HOME=/etc; cat $HOME/shadow",
+    "export HOME=/etc; cat $HOME/shadow",
+    "cd /etc && cat $PWD/shadow",
+    "cat /etc/sh*",
+    "cat ~/.ss*/id_rsa",
+]
+
+
+@pytest.mark.parametrize("command", EXPANDED_SECRET_READS)
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.AUTO])
+def test_every_expansion_of_a_word_is_checked_for_secrets(command: str, mode: PermissionMode, tmp_path) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+    assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (command, dec.action, dec.message)
+
+
+#: reads whose expansions hold no secret keep the decision they had before every expansion was checked
+@pytest.mark.parametrize(
+    ("command", "default", "auto"),
+    [
+        ("cat README.md", "allow", "allow"),
+        ("ls src", "allow", "allow"),
+        ("cat /etc/os-release", "allow", "allow"),
+        ("ls /etc/{hostname,hosts}", "ask", "allow"),
+        ("cat ./{a,b}", "ask", "allow"),
+        ("cat $HOME/notes.txt", "ask", "allow"),
+        ("ls $PWD", "ask", "allow"),
+        ("grep -rn 'foo$' src", "allow", "allow"),
+    ],
+)
+def test_expansions_without_a_secret_keep_their_decision(command: str, default: str, auto: str, tmp_path) -> None:
+    for mode, want in ((PermissionMode.DEFAULT, default), (PermissionMode.AUTO, auto)):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+        assert (dec.action, dec.needs_human) == (want, False), (command, mode, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.AUTO])
+def test_a_resolved_home_variable_that_climbs_into_another_home_asks_a_person(
+    mode: PermissionMode, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", "/Users/me")  # the tests' own HOME is a temp folder: no other home is next to it
+    dec = decide(mode=mode, tool="bash", args={"command": "cat $HOME/../other/x"}, cwd=tmp_path)
+    assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (dec.action, dec.message)

@@ -47,7 +47,7 @@ from pydantic import TypeAdapter, ValidationError
 from k3code import ask_user, checkpoints, confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import build_version
-from k3code.agent.loop import AgentLoop, ApprovalResult
+from k3code.agent.loop import PERMISSION_CHECK_FAILED, AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, auto_continue_on, auto_continue_turns, autonomy_cfg, is_plain_question
 from k3code.autonomy.fanout import FanoutExecutor
@@ -3006,7 +3006,11 @@ class GatewayServer:
             # a background sub-agent asks through its parent's callback while the parent may have moved on to another
             # project: ``perms`` is the asking loop's own state, so the preview and an "always" rule use its project
             where = perms if perms is not None else session.perms
-            decision = decision or where.decide(tool_name, arguments)
+            try:
+                decision = decision or where.decide(tool_name, arguments)
+            except Exception as e:  # noqa: BLE001 - a check that raises is a deny (fail closed), as in AgentLoop._decide
+                logger.exception("permission check of %s failed", tool_name)
+                return ApprovalResult("deny", f"{PERMISSION_CHECK_FAILED}: {type(e).__name__}")
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)

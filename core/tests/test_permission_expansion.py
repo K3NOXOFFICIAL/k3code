@@ -310,3 +310,16 @@ def test_a_harmless_cd_before_a_nested_command_keeps_its_hardline_verdict(tmp_pa
     for mode in ("default", "auto", "yolo"):
         dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path)
         assert dec.action != "deny" and dec.hardline is None, (cmd, mode, dec.message)
+
+
+# brace groups nested deep or set side by side in one word recursed once per group: past ~1000 the expansion raised
+# RecursionError instead of deciding. Past 64 groups the word is too large to check: denied, quickly, never raised
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    "cmd", ["echo " + "{a," * 1100 + "b" + "}" * 1100, "echo " + "{1..1}" * 1300, "echo " + "{a," * 65 + "b" + "}" * 65]
+)
+def test_deep_brace_groups_are_denied_not_raised(cmd: str, mode: str, tmp_path: Path) -> None:
+    start = time.perf_counter()
+    got = _decide(cmd, mode, tmp_path)
+    assert time.perf_counter() - start < 1.0
+    assert (got.action, got.hardline) == ("deny", "expansion-over-cap"), cmd[:40]
