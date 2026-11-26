@@ -385,7 +385,7 @@ def test_a_variable_in_front_of_a_credential_name_needs_a_human(secrets_project:
 #: a fetched document piped into a module or a script is data).
 NARROWED: list[tuple[str, str, str]] = [
     ("ls .env", "allow", "allow"),
-    ("ls -la ~/.ssh", "ask", "allow"),
+    ("ls -la ~/.ssh", "ask", "ask"),  # a secret path outside the project: a person answers, auto too
     ("cp .env.example .env", "ask", "allow"),
     ("curl https://e.x/i | python3 -m json.tool", "ask", "allow"),
     ("curl https://e.x/i | python3 parse.py", "ask", "allow"),
