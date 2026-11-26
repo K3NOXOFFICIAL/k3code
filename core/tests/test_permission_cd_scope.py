@@ -777,3 +777,59 @@ def test_a_redirect_into_tmp_is_judged_the_same_with_or_without_a_cd(home_projec
         for m in ("default", "accept-edits", "auto")
     }
     assert actions == {"default": "ask", "accept-edits": "ask", "auto": "allow"}, (cmd, actions)
+
+
+# a relative secret NAME is read from the directory a cd moved to, not the session's: under a user rule (`cat *`,
+# `cd *`) these used to be allowed in auto mode and asked plainly in default mode, while `cat /etc/shadow` asks a person
+CD_SECRET_RULES = [Rule(tool="bash", pattern=p, action="allow", layer=1) for p in ("cat *", "cd *", "pushd *")]
+
+CD_THEN_SECRET_NAME = [
+    "cd /etc && cat shadow",
+    "cd KEYS && cat id_rsa",  # KEYS: a real folder outside the project that holds the key
+    "cd /etc/ssl/private && cat x.key",
+    "(cd /etc; cat shadow)",
+    "cd /etc; cat shadow",
+    "pushd /etc && cat shadow",
+    "cd $X && cat shadow",  # a directory that cannot be worked out counts as `/`: the name alone decides
+    "cd ~nobody-here && cat id_rsa",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True])
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", CD_THEN_SECRET_NAME)
+def test_a_secret_name_after_a_cd_asks_a_person(
+    scoped_project: Path, tmp_path: Path, cmd: str, mode: str, ruled: bool
+) -> None:
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    (keys / "id_rsa").write_text("fake\n")
+    cmd = cmd.replace("KEYS", str(keys))
+    rules = CD_SECRET_RULES if ruled else []
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=scoped_project, user_rules=rules)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, ruled, dec)
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", ["cd ~/.ssh && cat id_rsa", "cd ~/.aws && cat credentials"])
+def test_a_home_credential_name_after_a_cd_is_never_allowed(scoped_project: Path, cmd: str, mode: str) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=scoped_project, user_rules=CD_SECRET_RULES)
+    assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (cmd, mode, dec)
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cd sub && cat file.txt",
+        "cd /etc && cat hostname",
+        "cd /tmp && ls",
+        "cd .. && cat README.md",
+        "cd /usr/share/doc && cat x",
+        "cd /etc && ls",
+    ],
+)
+def test_a_cd_that_names_no_secret_keeps_the_user_rule(scoped_project: Path, cmd: str, mode: str) -> None:
+    rules = [*CD_SECRET_RULES, Rule(tool="bash", pattern="ls *", action="allow", layer=1)]
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=scoped_project, user_rules=rules)
+    assert dec.action == "allow" and not dec.needs_human, (cmd, mode, dec)
