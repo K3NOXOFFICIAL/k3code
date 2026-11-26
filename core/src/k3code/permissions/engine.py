@@ -2082,6 +2082,8 @@ def _reads_secret_outside(
 
 #: where a path starts inside a word: after ``=``, ``@``, ``<``, ``,``, ``;`` or a quote (``key@X``, ``name=<X``,
 #: ``a,X``), or after ``:`` unless ``//`` follows (``a:X``; ``https://x/y`` names no local path)
+#: a ``file://`` URL's prefix up to its path: no host, or one that names this machine (``file://localhost/X``)
+_FILE_URL = re.compile(r"(?i)file://(?:localhost|127\.0\.0\.1|\[::1\])?(?=/|\$)")
 _VALUE_START = re.compile(r"(?<=[=@<,;\"'])(?=[/~])|(?<=:)(?=/(?!/)|~)")
 
 
@@ -2101,33 +2103,58 @@ def _word_values(word: str) -> list[str]:
     values += [v[1:] for v in values if v.startswith("@")]
     drive = 2 if re.match(r"[A-Za-z]:/", word) else 0  # `C:/Users/x` is a Windows path, not `/Users/x`
     values += [word[m.start() :] for m in _VALUE_START.finditer(word) if m.start() != drive]
-    values += [word[m.end() :] for m in re.finditer(r"(?i)file://(?=/)", word)]
+    values += [word[m.end() :] for m in _FILE_URL.finditer(word)]
     pieces = [re.split(r"[,:;]", v[drive:] if v is word else v)[1:] for v in values]
     values += [p for ps in pieces for p in ps if not p.startswith("//")]
     return list(dict.fromkeys(values))
 
 
 #: the container runtimes whose ``run``/``create`` bind host paths (``-v SRC:DST``, ``--mount src=SRC``)
-_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose"})
+_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose", "buildah"})
+#: the options before the subcommand (docker, podman, nerdctl, compose) that take the next word as their value
+#: (``docker --context x run``): that value is no subcommand. ``-v``/``-D``/``--tls``/``--remote`` take none.
+_CONTAINER_GLOBAL_VALUE_OPTIONS = frozenset(
+    {
+        *("--context", "-c", "--host", "-H", "--log-level", "-l", "--config", "--tlscacert", "--tlscert"),
+        *("--tlskey", "--url", "--connection", "--identity", "--namespace", "-n", "--address", "-a"),
+        *("--cgroup-manager", "--storage-driver", "--root", "--runroot", "--runtime", "--conmon"),
+        *("--events-backend", "--hooks-dir", "--network-cmd-path", "--tmpdir", "--cni-config-dir"),
+        *("-f", "--file", "-p", "--project-name", "--project-directory", "--profile", "--env-file"),
+    }
+)
 #: host mounts that hand a container a whole tree of secrets (or the runtime's socket): a person confirms them
 _FORCED_MOUNTS = frozenset(
-    {"/", "/etc", "/root", "/home", "/var/run/docker.sock", "/run/docker.sock", "/proc", "/sys", "/dev"}
+    {
+        *("/", "/etc", "/root", "/home", "/var/run/docker.sock", "/run/docker.sock", "/proc", "/sys", "/dev"),
+        *("/var/lib/docker", "/var/lib/containers", "/run", "/boot"),
+    }
 )
+#: the ``--cap-add`` capabilities that let a container take the host over (``CAP_`` prefix optional)
+_TAKEOVER_CAPS = frozenset({"ALL", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "DAC_READ_SEARCH"})
+
+
+def _container_run_args(argv: list[str]) -> list[str] | None:
+    """The words after ``run``/``create`` of a container ``argv`` (docker, podman, nerdctl, buildah ``run``/``create``,
+    ``container run``, ``compose run``, ``docker-compose run``); None for any other command. A global option's value
+    (``docker --context x run``, ``-H unix:///x``: _CONTAINER_GLOBAL_VALUE_OPTIONS) is no subcommand."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return None
+    words = argv[1:]
+    k = 0
+    while k < len(words) and (words[k].startswith("-") or words[k] in ("container", "compose")):
+        k += 2 if words[k] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
+    return words[k + 1 :] if k < len(words) and words[k] in ("run", "create") else None
 
 
 def _bind_mount_sources(argv: list[str]) -> list[str]:
-    """The host paths ``argv`` (docker, podman, nerdctl ``run``/``create``, ``container run``, ``compose run``,
-    ``docker-compose run``) binds into a container: the text before the first ``:`` of a ``-v``/``--volume`` value
-    (``-v X:/d``, ``-vX:/d``, ``--volume=X:/d``) and the ``src=``/``source=`` of a ``--mount`` value. Only path-like
-    ones (a leading ``/``, ``~``, ``.`` or ``$``): ``-v data:/d`` names a volume, not a host path."""
-    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
-        return []
-    words = argv[1:]
-    sub = next((k for k, w in enumerate(words) if w in ("run", "create")), None)
-    if sub is None or any(w not in ("container", "compose") for w in words[:sub] if not w.startswith("-")):
+    """The host paths a container ``argv`` (_container_run_args) binds into the container: the text before the first
+    ``:`` of a ``-v``/``--volume`` value (``-v X:/d``, ``-vX:/d``, ``--volume=X:/d``) and the ``src=``/``source=``
+    or ``volume-opt=device=`` of a ``--mount`` value. Only path-like ones (a leading ``/``, ``~``, ``.`` or ``$``):
+    ``-v data:/d`` names a volume, not a host path."""
+    rest = _container_run_args(argv)
+    if rest is None:
         return []
     values: list[tuple[str, str]] = []
-    rest = words[sub + 1 :]
     for k, w in enumerate(rest):
         nxt = rest[k + 1] if k + 1 < len(rest) else ""
         if w in ("-v", "--volume", "--mount") or re.fullmatch(r"-[A-Za-z]+v", w):
@@ -2141,8 +2168,36 @@ def _bind_mount_sources(argv: list[str]) -> list[str]:
         if kind == "volume":
             sources.append(value.split(":", 1)[0] if ":" in value else "")
         else:
-            sources += [p.split("=", 1)[1] for p in value.split(",") if p.startswith(("src=", "source="))]
+            parts = value.split(",")
+            sources += [p.split("=", 1)[1] for p in parts if p.startswith(("src=", "source="))]
+            sources += [p.removeprefix("volume-opt=device=") for p in parts if p.startswith("volume-opt=device=")]
     return [s for s in sources if s.startswith(("/", "~", ".", "$"))]
+
+
+def _container_takeover(argv: list[str]) -> bool:
+    """A container ``argv`` (_container_run_args) that hands the container the host without a mount: ``--privileged``,
+    the host's pid/ipc/uts/user namespace (``--pid=host``), a host device (``--device /dev/sda``), a takeover
+    capability (``--cap-add SYS_ADMIN``: _TAKEOVER_CAPS) or no confinement (``--security-opt seccomp=unconfined``).
+    ``--net=host`` shares only the network and stays."""
+    rest = _container_run_args(argv)
+    if rest is None:
+        return False
+    for k, w in enumerate(rest):
+        if w == "--privileged":
+            return True
+        name, eq, value = w.partition("=")
+        if not eq:
+            value = rest[k + 1] if k + 1 < len(rest) else ""
+        if name in ("--pid", "--ipc", "--uts", "--userns") and value == "host":
+            return True
+        if name == "--device" and value.startswith("/"):
+            return True
+        caps = {c.upper().removeprefix("CAP_") for c in value.split(",")}
+        if name == "--cap-add" and not caps.isdisjoint(_TAKEOVER_CAPS):
+            return True
+        if name == "--security-opt" and re.search(r"unconfined|label[=:]disable", value):
+            return True
+    return False
 
 
 def _mounts_forced(argv: list[str], cwd: str, line: str) -> bool:
@@ -2182,7 +2237,7 @@ def _names_secret_outside(
         prog = next((w for w in words if os.path.basename(w) == os.path.basename(argv[0])), None)
         if prog is not None:
             words.remove(prog)
-    if _mounts_forced(argv, cwd, line):
+    if _mounts_forced(argv, cwd, line) or _container_takeover(argv):
         return True
     sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
     for t in (*words, *reads, *sources, *_bind_mount_sources(argv)):
