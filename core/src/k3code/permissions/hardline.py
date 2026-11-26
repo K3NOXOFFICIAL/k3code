@@ -2705,7 +2705,13 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
             flush("|&", piped=True)
             i += 2
         elif c == "|" and i and text[i - 1] == ">" and (i - 1 - len(text[: i - 1].rstrip("\\"))) % 2 == 0:
-            emit(c)  # `>|f` (`>` past noclobber) is a redirection, not a pipe; `\>|sh` is a literal > piped to sh
+            if i > 1 and text[i - 2] in "<>&":
+                # `&>|`, `>>|`, `<>|`: dash reads `&>|f` as `&` then `>|f` (truncate f, background the command), bash
+                # fails on the line; split it as a pipe and let no rule vouch for it
+                out.unterminated = True
+                flush("|", piped=True)
+            else:
+                emit(c)  # `>|f` (`>` past noclobber) is a redirection, not a pipe; `\>|sh` is a literal > piped to sh
             i += 1
         elif c == "|":
             flush("|", piped=True)

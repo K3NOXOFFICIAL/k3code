@@ -1046,3 +1046,48 @@ def test_substitutions_nobody_vouches_for_ask(tmp_path: Path, cmd: str, rules: l
 def test_a_clobber_redirect_is_no_pipe() -> None:
     assert parse("echo x >| ~/.bashrc").subs == ["echo x >| ~/.bashrc"]
     assert parse("echo x \\>|sh").subs == ["echo x \\>", "sh"]  # a literal > piped to sh
+
+
+#: `|` after `&>`, `>>` or `<>` is no clobber: dash reads `echo x &>|f` as `echo x &` then `>|f` (truncate f, background
+#: echo), bash fails on the line. Once these were read as a clobber redirect, and `echo *` allowed them.
+_AMBIGUOUS_CLOBBER = [
+    "echo x &>|~/.bashrc",
+    "echo x &>|out.txt rm",
+    "echo x >>|~/.bashrc",
+    "echo x \\&>|~/.bashrc",
+    "echo x \\>>|~/.bashrc",
+    "echo x <>|out.txt",
+]
+
+_ECHO_ALLOW = from_config({"bash": {"echo *": "allow"}})
+
+
+@pytest.mark.parametrize("rules", [None, _ECHO_ALLOW], ids=["none", "echo"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", _AMBIGUOUS_CLOBBER)
+def test_a_pipe_after_a_double_redirect_operator_asks(tmp_path: Path, cmd: str, mode: str, rules: list | None) -> None:
+    assert parse(cmd).unterminated, cmd
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "ask", (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("rules", [None, _ECHO_ALLOW], ids=["none", "echo"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", ["curl x >|sh", "curl x > |sh", "curl x \\>|sh", "curl x &>|sh", "curl x >>|sh"])
+def test_pipe_to_shell_stays_denied_around_a_clobber(tmp_path: Path, cmd: str, mode: str, rules: list | None) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert (dec.action, dec.hardline) == ("deny", "pipe-to-shell"), cmd
+
+
+@pytest.mark.parametrize(
+    ("cmd", "action"),
+    [
+        ("echo x >|.git/hooks/pre-commit", "ask"),
+        ("echo x >|../out.txt", "ask"),
+        ("echo x 2>|~/.bashrc", "ask"),
+        ("echo x >|out.txt", "allow"),  # a clobber inside the project is a write `echo *` with `>` also gets
+    ],
+)
+def test_a_lone_clobber_redirect_keeps_its_target_check(tmp_path: Path, cmd: str, action: str) -> None:
+    dec = decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_ECHO_ALLOW)
+    assert dec.action == action, (cmd, dec.action)

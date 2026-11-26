@@ -153,7 +153,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Security
 
-- **No allow rule covers process substitution, `<>`/`>|` redirects or a mount any more.** `ls <(rm -rf x)` and `ls >(rm x)` were allowed by the builtin read-only list, and a user allow for `echo *` also covered `echo >(rm x)` and `echo x 1<>~/.bashrc`: a `<(...)`/`>(...)` payload now counts as a substitution, whose every command must be allowed on its own (four levels deep at most), and `<>` (read-write, creates the file) and `>|` (no longer split as a pipe) are write redirects, in auto mode too, where a target spelled with `$` or an unknown `~name` counts as outside the project. A `mount`/`umount` that is not a bare listing (`mount`, `mount -l`, `mount -t TYPE`) asks a person whatever the rules say; `findmnt` joined the read-only list.
+- **No allow rule covers process substitution, `<>`/`>|` redirects or a mount any more.** `ls <(rm -rf x)` and `ls >(rm x)` were allowed by the builtin read-only list, and a user allow for `echo *` also covered `echo >(rm x)` and `echo x 1<>~/.bashrc`: a `<(...)`/`>(...)` payload now counts as a substitution, whose every command must be allowed on its own (four levels deep at most), and `<>` (read-write, creates the file) and `>|` (no longer split as a pipe) are write redirects (a `|` after `&>`, `>>` or `<>`, which dash reads as `&` then `>|`, asks a person), in auto mode too, where a target spelled with `$` or an unknown `~name` counts as outside the project. A `mount`/`umount` that is not a bare listing (`mount`, `mount -l`, `mount -t TYPE`) asks a person whatever the rules say; `findmnt` joined the read-only list.
 
 ### Changed
 
