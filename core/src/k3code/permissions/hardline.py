@@ -1694,7 +1694,7 @@ def shell_expands(sub: str) -> bool:
 
 
 #: words a brace expansion of one command line may give before the line counts as too large to check
-_BRACE_MAX_WORDS = 64
+_BRACE_MAX_WORDS = 4096
 _BRACE_SEQ = re.compile(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?")
 _IDENT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 _WORD_BREAK = frozenset(" \t\n;&|()<>")
