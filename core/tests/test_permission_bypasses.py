@@ -6,6 +6,7 @@ gets its own table plus one parametrized test.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -1516,3 +1517,96 @@ def test_option_values_that_run_commands_are_refused(tmp_path: Path, prog: str, 
 )
 def test_benign_option_values_are_not_refused(tmp_path: Path, cmd: str) -> None:
     assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+# review 9: the run scan read only whole words, so a command handed over inside a word passed under a `prog *` rule
+# and in auto: a glued git config, a tar exec option, a vim/less `!CMD`, an env value, a git alias, an ext:: URL
+DERIVED_RUNS = [
+    ("git", "git -ccore.pager='rm -rf ~' log"),
+    ("git", "git -ccore.fsmonitor='rm -rf ~' status"),
+    ("git", "git -ccore.sshCommand='rm -rf ~' fetch"),
+    ("sudo", "sudo -u git git -ccore.pager='rm -rf ~' log"),
+    ("tar", "tar cf /dev/null src --checkpoint=1 --checkpoint-action=exec='rm -rf ~'"),
+    ("tar", "tar xf a.tar --to-command='rm -rf ~'"),
+    ("tar", "tar --use-compress-program='rm -rf ~' -cf x src"),
+    ("vim", "vim -c '!rm -rf ~' x"),
+    ("vim", "vim +'!rm -rf ~' x"),
+    ("vim", "vim -c 'silent !rm -rf ~' x"),
+    ("less", "less '+!rm -rf ~' x"),
+    ("less", "less '+!sh' x"),
+    ("git", "GIT_PROXY_COMMAND='rm -rf ~' git fetch"),
+    ("git", "GIT_CONFIG_PARAMETERS=\"'core.pager'='rm -rf ~'\" git log"),
+    ("git", "git config alias.x '!rm -rf ~'"),
+    ("git", "git config --global alias.x '!rm -rf ~'"),
+    ("git", "git -c protocol.ext.allow=always fetch 'ext::sh -c rm% -rf% ~'"),
+]
+DERIVED_RUNS_KEEP = [
+    "git -c user.name=x commit -m y",
+    "git -ccore.pager=cat log",
+    "tar czf out.tgz src",
+    "tar --checkpoint=1 --checkpoint-action=echo=hi -cf x src",
+    "vim -c 'set ft=c' x",
+    "vim +10 x",
+    "less +F log",
+    "GIT_PAGER=cat git log",
+    "LESSOPEN='| lesspipe %s' less x",
+    "git config user.name x",
+    "git config alias.co checkout",
+    "git -c protocol.version=2 fetch",
+    "git commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+]
+
+
+def _prog_rule(prog: str | None) -> list[Rule] | None:
+    return [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)] if prog else None
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), DERIVED_RUNS)
+def test_a_command_derived_from_a_word_is_scanned(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", DERIVED_RUNS_KEEP)
+def test_a_harmless_derived_value_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd", ["x " + "rm " * 9000, "x " + "-ca=b=c=d=rm " * 9000, "x '" + "+!a " * 22000 + "'", "env " + "A=" * 45000]
+)
+def test_deriving_commands_from_words_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+CONTAINER_TAKEOVER_SPELLINGS = [
+    ("docker", "docker run --privileged=true img"),
+    ("docker", "docker run --privileged=1 img"),
+    ("docker", "docker exec --privileged c sh"),
+    ("ctr", "ctr run --privileged img id"),
+    ("docker", "docker run --device-cgroup-rule='a *:* rwm' img"),
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(("prog", "cmd"), CONTAINER_TAKEOVER_SPELLINGS)
+def test_every_spelling_of_a_privileged_container_needs_a_human(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", ["docker run --rm img", "docker run --privileged=false img"])
+def test_an_unprivileged_container_needs_no_human(tmp_path: Path, cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path)
+    assert dec.action == "allow" and not dec.needs_human, cmd

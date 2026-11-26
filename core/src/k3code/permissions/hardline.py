@@ -628,9 +628,10 @@ def _run_scan(words: list[str], dirs: _Dirs, home: str, depth: int) -> str | Non
     to the next separator, is checked as if it were the command, so ``anylauncher --opt v rm -rf ~`` is refused
     whatever the launcher. Quoted multi-word arguments are split as shell code and scanned the same way, to
     _RUN_SCAN_DEPTH levels (``script --comm 'rm -rf ~'``, ``tmux split 'rm -rf ~'``). Text programs (_text_only) and
-    the values of message/pattern options (_TEXT_VALUE_OPTS) are not read."""
+    the values of message/pattern options (_TEXT_VALUE_OPTS) are not read; their env assignments and git's own options
+    are (_text_args_start). Each word is read as the commands derived from it too (_run_heads)."""
     if _text_only(_command_argv(words)):
-        return None
+        return _segment_scan(words, dirs, home, depth)
     start = 0
     for i, w in enumerate(words + [";"]):
         if w not in _RUN_ENDS:
@@ -642,35 +643,101 @@ def _run_scan(words: list[str], dirs: _Dirs, home: str, depth: int) -> str | Non
     return None
 
 
-def _segment_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
-    if _text_only(_command_argv(seg)):
-        return None
-    for i, w in enumerate(seg):
-        if i and seg[i - 1] in _TEXT_VALUE_OPTS:
-            continue
-        if any(c.isspace() for c in w):
-            if depth < _RUN_SCAN_DEPTH:
-                for sub in split_commands(w):
-                    hit = (
-                        _simple_check(sub)
-                        or _destroy_check(_command_argv(_tokens(sub)), sub, home, dirs)
-                        or _run_scan(_tokens(sub), dirs, home, depth + 1)
-                    )
-                    if hit:
-                        return hit
-            continue
-        name = os.path.basename(w)
-        if name not in _RUN_PROGRAMS and not name.startswith("mkfs"):
-            continue  # only a program the checks below refuse starts a run (each run is read once: linear)
-        argv = _command_argv(seg[i:])
+def _text_args_start(seg: list[str]) -> int:
+    """Where the text arguments of a text program (_text_only) start in ``seg``: its env assignments and, for git, its
+    own options before the subcommand stay read (``GIT_PAGER='rm -rf ~' git log``, ``git -ccore.pager=... log``)."""
+    argv = _command_argv(seg)
+    if not _text_only(argv):
+        return len(seg)
+    tail = _git_sub(argv)[1] if os.path.basename(argv[0]) == "git" else argv[1:]
+    return max(0, len(seg) - len(tail))
+
+
+#: Prefixes that make the rest of a word a command line: vim/less ``!CMD``, ``:!CMD``, ``+!CMD``, ``+:!CMD``, an
+#: input filter ``|CMD`` (``LESSOPEN``), a git alias ``!CMD``.
+_RUN_PREFIXES = ("+:!", "+!", ":!", "!", "|")
+#: How many ``=``/``:`` of one word start a value read as a command (``--checkpoint-action=exec=CMD`` is two).
+_RUN_VALUE_SPLITS = 4
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
+
+def _run_heads(w: str) -> list[tuple[str, bool]]:
+    """The texts a program may run from word ``w``, each with whether a run prefix (_RUN_PREFIXES) led to it: the
+    word, the value after each of its first _RUN_VALUE_SPLITS ``=``/``:`` (``--to-command=CMD``, ``-cKEY=CMD``,
+    ``NAME=CMD``), the tail of a glued short option (``-cCMD``), each with a run prefix stripped, and a git
+    ``ext::CMD`` URL with ``%`` read as a space. Bounded: a few slices of ``w`` each."""
+    tails = [w]
+    if len(w) > 2 and w[0] == "-" and w[1] != "-":
+        tails.append(w[2:])
+    at = -1
+    for _ in range(_RUN_VALUE_SPLITS):
+        eq, colon = w.find("=", at + 1), w.find(":", at + 1)
+        at = min((p for p in (eq, colon) if p >= 0), default=-1)
+        if at < 0:
+            break
+        tails.append(w[at + 1 :])
+    heads = [(t, False) for t in tails]
+    for t in tails:
+        p = t[7:] if t.startswith("silent !") else next((t[len(x) :] for x in _RUN_PREFIXES if t.startswith(x)), None)
+        if p:
+            heads.append((p.lstrip(), True))
+    if w.startswith("ext::"):
+        heads.append((w[5:].replace("%", " "), False))
+    return heads
+
+
+def _quoted_scan(text: str, dirs: _Dirs, home: str, depth: int) -> str | None:
+    """A quoted multi-word argument split as shell code and scanned like a command line (see _run_scan)."""
+    for sub in split_commands(text):
         hit = (
-            _rm_check(argv, dirs, home)
-            or _find_check(argv, dirs, home)
-            or _git_push_check(argv)
-            or _destroy_check(argv, shlex.join(seg[i:]), home, dirs)
+            _simple_check(sub)
+            or _destroy_check(_command_argv(_tokens(sub)), sub, home, dirs)
+            or _run_scan(_tokens(sub), dirs, home, depth + 1)
         )
         if hit:
             return hit
+    return None
+
+
+#: How many words the runs of one segment may read in all: each run reads to the end of the segment, so a segment of
+#: n run starts (``x rm rm rm ...``, ``x -ca=rm -ca=rm ...``) read n^2 words. Past this it is refused (``scan-budget``).
+_RUN_SCAN_BUDGET = 100_000
+
+
+def _segment_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    budget = _RUN_SCAN_BUDGET
+    for i in range(_text_args_start(seg)):
+        if i and seg[i - 1] in _TEXT_VALUE_OPTS:
+            continue
+        w = seg[i]
+        if any(c.isspace() for c in w):
+            hit = _quoted_scan(w, dirs, home, depth) if depth < _RUN_SCAN_DEPTH else None
+            if hit:
+                return hit
+        for k, (head, prefixed) in enumerate(_run_heads(w)):
+            if any(c.isspace() for c in head):
+                # a quoted word is split above; a derived one only when its splitting differs (ext:: with %)
+                hit = _quoted_scan(head, dirs, home, depth) if k and depth < _RUN_SCAN_DEPTH and "%" in w else None
+                if hit:
+                    return hit
+                continue
+            name = os.path.basename(head)
+            if prefixed and name in _SHELLS and seg[i + 1 : i + 2] != ["-c"]:
+                return "shell-escape-command"  # vim/less ``!sh``, ``+!bash``: an interactive shell from a command line
+            if name not in _RUN_PROGRAMS and not name.startswith("mkfs"):
+                continue  # only a program the checks below refuse starts a run
+            budget -= len(seg) - i
+            if budget < 0:
+                return "scan-budget"
+            argv = _command_argv([head, *seg[i + 1 :]])
+            hit = (
+                _rm_check(argv, dirs, home)
+                or _find_check(argv, dirs, home)
+                or _git_push_check(argv)
+                or _destroy_check(argv, shlex.join([head, *seg[i + 1 :]]), home, dirs)
+            )
+            if hit:
+                return hit
     return None
 
 
