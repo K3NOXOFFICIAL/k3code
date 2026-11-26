@@ -2281,6 +2281,21 @@ def _git_sub(argv: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def _mount_lists(args: list[str]) -> bool:
+    """``mount`` with ``args`` only prints the mounted file systems: no operand and no option but ``-l`` (labels too)
+    and ``-t TYPE`` (only that type). Anything else (a device, a directory, ``-o remount``, ``--bind``, ``-a``)
+    mounts."""
+    i = 0
+    while i < len(args):
+        if args[i] == "-l":
+            i += 1
+        elif args[i] == "-t" and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            i += 2
+        else:
+            return False
+    return True
+
+
 def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None:
     """Why a person must confirm the simple command ``argv`` (see :func:`human_check`), or None."""
     if not argv:
@@ -2312,6 +2327,10 @@ def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None
             for m in _VAR_REF.finditer(a):
                 if _SECRET_VAR.search(m.group(1) or m.group(2) or ""):
                     return "Prints a variable that holds a credential"
+    elif name in ("mount", "umount") or name.startswith(("mount.", "umount.")):
+        # `mount -o remount,rw /`, `mount --bind / dir`: a user's `mount *` allow was meant for the listing
+        if name != "mount" or not _mount_lists(argv[1:]):
+            return "Mounts or unmounts a file system"
     elif _is_interpreter(name) and name not in _SHELLS and name not in ("source", ".", "eval"):
         for flag, code in zip(argv[1:], argv[2:], strict=False):
             if _INTERPRETER_CODE_FLAG.match(flag) and _ENV_READ.search(code):
@@ -2343,10 +2362,10 @@ def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]], cond: froze
 
 def human_check(parsed: Parsed) -> str | None:
     """Why a person must confirm the command line even though no rule forbids it, or None: force pushes, ``git reset
-    --hard``, ``git clean -f``, a recursive delete of a path only a variable names, printing a credential variable and
-    an interpreter dumping the whole environment. Not hardlines (a legitimate task does these), but nobody is asked
-    on the model's behalf: auto mode stops and asks, an unattended run is refused; yolo, which asks nothing, is not
-    consulted. ``parsed`` is the parse :func:`check_parse` returned."""
+    --hard``, ``git clean -f``, a recursive delete of a path only a variable names, printing a credential variable, an
+    interpreter dumping the whole environment and a ``mount``/``umount`` that is no listing. Not hardlines (a
+    legitimate task does these), but nobody is asked on the model's behalf: auto mode stops and asks, an unattended run
+    is refused; yolo, which asks nothing, is not consulted. ``parsed`` is the parse :func:`check_parse` returned."""
     try:
         return _human_parsed(parsed, {})
     except _TooDeep:
@@ -2685,6 +2704,9 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         elif text[i : i + 2] == "|&":
             flush("|&", piped=True)
             i += 2
+        elif c == "|" and i and text[i - 1] == ">" and (i - 1 - len(text[: i - 1].rstrip("\\"))) % 2 == 0:
+            emit(c)  # `>|f` (`>` past noclobber) is a redirection, not a pipe; `\>|sh` is a literal > piped to sh
+            i += 1
         elif c == "|":
             flush("|", piped=True)
             i += 1

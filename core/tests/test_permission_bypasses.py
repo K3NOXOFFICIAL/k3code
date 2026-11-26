@@ -12,6 +12,7 @@ import pytest
 
 from k3code.permissions import Rule, decide, hardline
 from k3code.permissions.hardline import normalize_argv, parse
+from k3code.permissions.rules import from_config
 
 
 def _decide(cmd: str, mode: str, cwd: Path, *, headless: bool = False):
@@ -932,3 +933,116 @@ def test_command_prefix_keeps_python_module() -> None:
     assert hardline.command_prefix("python -m pytest -q") == "python -m pytest"
     assert hardline.command_prefix("python3 -u -m http.server 8000") == "python3 -m http.server"
     assert hardline.command_prefix("python script.py") == "python script.py"
+
+
+# ── process substitution, read-write and clobber redirects, mount: no allow rule covers them ──
+
+#: The rules a user may well have: `echo`/`ls`/`grep` and the mount listing they meant by `mount *`.
+_USER_ALLOWS = from_config({"bash": {"echo *": "allow", "ls *": "allow", "mount *": "allow", "grep *": "allow"}})
+
+#: Once allowed: `<(...)`/`>(...)` ran their payload unchecked (builtin `ls` too), `<>` opens a file read-write and
+#: creates it (bash and dash), and a user's `mount *` covered every mount.
+SUBST_REDIRECT_MOUNT_BYPASS = [
+    "ls <(rm -rf x)",
+    "ls >(rm x)",
+    "echo <(rm -rf x)",
+    "echo >(rm x)",
+    "echo x > >(sh)",
+    "echo x 1<>~/.bashrc",
+    "echo x <>~/.bashrc",
+    "mount -o remount,rw /",
+    "mount /dev/sdb1 /mnt",
+    "mount --bind / /tmp/x",
+]
+
+#: Spellings that already asked or were denied: they must keep doing so under both rule sets.
+ALREADY_NOT_ALLOWED = [
+    "ls; rm x",
+    "ls && rm x",
+    "ls || rm x",
+    "ls | sh",
+    "ls & rm x",
+    "ls\nrm x",
+    "ls $(rm x)",
+    "ls `rm x`",
+    "FOO=1 rm -rf x",
+    "env rm x",
+    "eval 'rm x'",
+    "bash -c 'rm x'",
+    "( rm x )",
+    "{ rm x; }",
+    "cat <<EOF | sh\nrm x\nEOF",
+    *(f"echo x {op} {t}" for op in (">", ">>", "2>", "&>", ">|") for t in ("~/.bashrc", "$HOME/.bashrc")),
+]
+
+
+@pytest.mark.parametrize("rules", [None, _USER_ALLOWS], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "accept-edits"])
+@pytest.mark.parametrize("cmd", SUBST_REDIRECT_MOUNT_BYPASS + ALREADY_NOT_ALLOWED)
+def test_no_allow_rule_covers_a_hidden_command_or_write(tmp_path: Path, cmd: str, mode: str, rules: list) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action in ("ask", "deny"), (cmd, mode, dec.action)
+
+
+_AUTO_WRITES = [
+    f"echo x {op}{sp}{t}"
+    for op in ("<>", "1<>", ">|", "2>|", ">")
+    for sp in ("", " ")
+    for t in ("~/.bashrc", "$HOME/.bashrc")
+]
+
+
+@pytest.mark.parametrize("rules", [None, _USER_ALLOWS], ids=["builtin", "user"])
+@pytest.mark.parametrize("cmd", _AUTO_WRITES)
+def test_auto_mode_refuses_read_write_and_clobber_redirects_outside_the_roots(
+    tmp_path: Path, cmd: str, rules: list
+) -> None:
+    assert decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", ["mount /dev/sdb1 /mnt", "mount -o remount,rw /", "mount -a", "umount /mnt"])
+def test_a_mount_needs_a_person_whatever_the_rules(tmp_path: Path, cmd: str, mode: str) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_USER_ALLOWS)
+    assert (dec.action, dec.needs_human) == ("ask", True), (cmd, mode)
+
+
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("ls", None),
+        ("grep foo file.txt", None),
+        ("findmnt", None),
+        ("findmnt -J -t ext4", None),
+        ("echo hi", _USER_ALLOWS),
+        ("mount", _USER_ALLOWS),
+        ("mount -l", _USER_ALLOWS),
+        ("mount -l -t ext4", _USER_ALLOWS),
+        ("echo x >|out.txt", _USER_ALLOWS),  # a clobber into the project, as `>out.txt`
+        ("echo x <>out.txt", _USER_ALLOWS),
+        ("echo $(echo $(echo hi))", _USER_ALLOWS),  # every nested command is allowed on its own
+        # the user allowed diff; the builtin `ls` allows each payload in the project
+        ("diff <(ls a) <(ls b)", from_config({"bash": {"diff *": "allow"}})),
+    ],
+)
+def test_read_only_listings_and_allowed_payloads_stay_allowed(tmp_path: Path, cmd: str, rules: list | None) -> None:
+    assert decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("diff <(ls a) <(ls b)", None),  # the builtin allowlist never covers a substitution
+        ("diff <(ls a) <(ls b)", _USER_ALLOWS),  # no rule allows diff with one
+        ("findmnt -F /etc/shadow", None),  # reads the file it names
+        ("echo $(echo $(echo $(echo $(echo $(echo hi)))))", _USER_ALLOWS),  # deeper than _NESTED_MAX_DEPTH
+        ("echo $(ls <(rm x))", _USER_ALLOWS),  # a payload inside a payload is checked too
+    ],
+)
+def test_substitutions_nobody_vouches_for_ask(tmp_path: Path, cmd: str, rules: list | None) -> None:
+    assert decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "ask"
+
+
+def test_a_clobber_redirect_is_no_pipe() -> None:
+    assert parse("echo x >| ~/.bashrc").subs == ["echo x >| ~/.bashrc"]
+    assert parse("echo x \\>|sh").subs == ["echo x \\>", "sh"]  # a literal > piped to sh
