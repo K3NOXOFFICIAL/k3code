@@ -573,6 +573,7 @@ def _check_parsed(
             or _rm_check(argv, dirs, home)
             or _find_check(argv, dirs, home)
             or _git_push_check(argv)
+            or _exec_option_check(words, argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
             or _destroy_check(argv, sub, home, dirs)
@@ -617,6 +618,8 @@ def _text_only(argv: list[str]) -> bool:
     name = os.path.basename(argv[0])
     if name == "sg":
         return _ast_grep(argv)
+    if _text_exec_values(argv):
+        return False  # rg --pre, man -P: a program runs (see _TEXT_EXEC_OPTS)
     return name in _TEXT_PROGRAMS or (name == "git" and _git_sub(argv)[0] in _TEXT_GIT_SUBS)
 
 
@@ -1489,6 +1492,115 @@ def ssh_option_commands(name: str, args: list[str]) -> list[str]:
     return out
 
 
+#: git config keys (lower-cased) whose value git runs as a command line: ``git -c core.pager='...' log``,
+#: ``git -c alias.x='!...' x``, ``git -c credential.helper='!...' fetch``.
+_GIT_EXEC_KEYS = re.compile(
+    r"core\.(?:fsmonitor|sshcommand|pager|editor|askpass|gitproxy)|sequence\.editor|gpg\.program|diff\.external"
+    r"|credential\.helper|credential\..+\.helper|diff\..+\.(?:textconv|command)|merge\..+\.driver|gpg\..+\.program"
+    r"|filter\..+\.(?:clean|smudge|process)|pager\..+|alias\..+"
+)
+#: Boolean config values run nothing: ``core.fsmonitor=true`` is git's own monitor, ``pager.log=false`` no pager.
+_GIT_BOOL_VALUES = frozenset({"", "true", "false", "yes", "no", "on", "off", "1", "0"})
+
+
+def _git_config_options(argv: list[str]) -> list[tuple[str, str, bool]]:
+    """``(lower-cased key, value, from the environment)`` of git's own ``-c KEY=VALUE`` and ``--config-env[=]KEY=VAR``
+    options, the ones before the subcommand."""
+    out: list[tuple[str, str, bool]] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--config-env") and i + 1 < len(argv):
+            pair, env, i = argv[i + 1], a == "--config-env", i + 2
+        elif a.startswith("--config-env="):
+            pair, env, i = a.partition("=")[2], True, i + 1
+        elif a in _GIT_VALUE_OPTS:
+            i += 2
+            continue
+        elif a.startswith("-"):
+            i += 1
+            continue
+        else:
+            break
+        key, _, value = pair.partition("=")
+        out.append((key.lower(), value, env))
+    return out
+
+
+#: Options of text programs (_TEXT_PROGRAMS) that run a program: ``rg --pre PROG`` runs PROG on every file it
+#: searches, ``rg --hostname-bin PROG`` runs PROG, ``man -P/--pager CMD`` and ``man -H/--html=BROWSER`` run a command.
+_TEXT_EXEC_OPTS = {"rg": frozenset({"--pre", "--hostname-bin"}), "man": frozenset({"--pager", "--html"})}
+#: man's short options taking a value: a cluster ends at one (``-aP less``: P's value is ``less``).
+_MAN_VALUE_SHORTS = "CLmMSsepREXrPH"
+
+
+def _text_exec_values(argv: list[str]) -> list[str]:
+    """The values of the program-running options of ``rg``/``man`` (see _TEXT_EXEC_OPTS), glued or spaced; a bare
+    ``man -H`` gives an empty value (it still runs $BROWSER)."""
+    name = os.path.basename(argv[0]) if argv else ""
+    opts = _TEXT_EXEC_OPTS.get(name, frozenset())
+    out: list[str] = []
+    i = 1
+    while opts and i < len(argv):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        key, eq, value = a.partition("=")
+        if key in opts:
+            if not eq and key != "--html" and i < len(argv):
+                value, i = argv[i], i + 1
+            out.append(value)
+        elif name == "man" and a.startswith("-") and not a.startswith("--"):
+            k = next((j for j, ch in enumerate(a[1:], 1) if ch in _MAN_VALUE_SHORTS), 0)
+            if k and a[k] in "PH":
+                value = a[k + 1 :]
+                if not value and a[k] == "P" and i < len(argv):
+                    value, i = argv[i], i + 1
+                out.append(value)
+            elif k and not a[k + 1 :]:
+                i += 1
+    return out
+
+
+def _git_words(words: list[str]) -> list[str]:
+    """``words`` from the ``git`` word on when they run git, git's own options kept (_command_argv drops them)."""
+    if _command_argv(words)[:1] != ["git"]:
+        return []
+    return next((words[j:] for j, w in enumerate(words) if os.path.basename(w) == "git"), [])
+
+
+def exec_option_commands(words: list[str]) -> list[str]:
+    """The command lines run from options of the command ``words``: git's ``-c KEY=VALUE`` with an
+    exec-capable key (see _GIT_EXEC_KEYS; the value with a leading ``!`` stripped, an ``alias.*`` value without one
+    is a git command line, a boolean value runs nothing) and ``man -P``/``--pager``/``-H``/``--html``."""
+    argv = _command_argv(words)
+    if argv[:1] == ["man"]:
+        return [v for v in _text_exec_values(argv) if v]
+    out: list[str] = []
+    for key, value, env in _git_config_options(_git_words(words)):
+        if env or not _GIT_EXEC_KEYS.fullmatch(key) or value.lower() in _GIT_BOOL_VALUES:
+            continue
+        git_line = key.startswith("alias.") and not value.startswith("!")
+        out.append("git " + value if git_line else value.removeprefix("!"))
+    return out
+
+
+def _exec_option_check(words: list[str], argv: list[str]) -> str | None:
+    """``git --config-env KEY=VAR`` with an exec-capable key (the command is in the environment, unread here) and
+    ``rg --pre PROG``/``--hostname-bin PROG`` with PROG a program the run checks refuse, a shell or an interpreter
+    (``rg --pre rm x ~`` deletes every file it searches, ``rg --pre sh`` runs each one as a script)."""
+    if any(env and _GIT_EXEC_KEYS.fullmatch(key) for key, _, env in _git_config_options(_git_words(words))):
+        return "git-config-env-command"
+    if argv[:1] != ["rg"]:
+        return None
+    for value in _text_exec_values(argv):
+        prog = os.path.basename(value)
+        if prog in _RUN_PROGRAMS or prog in _SHELLS or prog.startswith("mkfs") or _is_interpreter(prog):
+            return "rg-pre-command"
+    return None
+
+
 def _env_long_option(key: str) -> str:
     """The env long option ``key`` names: itself, or the one option it is an unambiguous prefix of."""
     if key in _ENV_LONG_OPTS:
@@ -1721,6 +1833,25 @@ def _pipeline_check(pipelines: list[list[str]]) -> str | None:
                 return "pipe-to-shell"
             fetched = fetched or name in _FETCHERS
     return None
+
+
+def _piped_text_code(stages: list[str]) -> list[tuple[str, str]]:
+    """``(text, stage)`` for each ``echo``/``printf`` stage of the pipeline ``stages`` whose output a later stage runs
+    as shell code (``echo 'rm -rf ~' | sh``, ``printf ... | bash -s``): the printed text is a command line."""
+    out: list[tuple[str, str]] = []
+    for j, stage in enumerate(stages[:-1]):
+        argv = _command_argv(_tokens(stage))
+        if argv[:1] not in (["echo"], ["printf"]):
+            continue
+        later = [_command_argv(_tokens(s)) for s in stages[j + 1 :]]
+        if not any(a and a[0] in _SHELLS and _runs_stdin_as_code(a) for a in later):
+            continue
+        args = argv[1:]
+        while argv[0] == "echo" and args and args[0] in ("-n", "-e", "-E", "-ne", "-en"):
+            args = args[1:]
+        if args:
+            out.append((" ".join(args), stage))
+    return out
 
 
 def _xargs_runs_input_as_code(words: list[str]) -> bool:
@@ -3572,6 +3703,7 @@ def _launcher_payloads(sub: str) -> list[str]:
         out += _launch_code(real)  # flock -c, script -c, tmux new ..., sg, runuser -c (see _launch_code)
         if real:
             out += ssh_option_commands(real[0], real[1:])
+            out += exec_option_commands(list(toks))  # git -c core.pager=..., man -P ... (see exec_option_commands)
             out += _windows_command_line(real[0], real[1:])
     return list(dict.fromkeys(out))
 
@@ -3592,6 +3724,9 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         for k, sub in enumerate(parsed.subs):
             for p in _launcher_payloads(sub):
                 payloads.setdefault(p, []).append(k)
+        for stages in parsed.pipelines:
+            for p, stage in _piped_text_code(stages):  # echo 'rm -rf ~' | sh
+                payloads.setdefault(p, []).append(parsed.subs.index(stage) if stage in parsed.subs else 0)
     except _TooDeep:  # see _command_argv
         parsed.too_deep = True
         return parsed

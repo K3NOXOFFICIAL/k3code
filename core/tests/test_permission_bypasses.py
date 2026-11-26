@@ -1423,3 +1423,66 @@ def test_text_naming_a_delete_is_not_refused(tmp_path: Path, cmd: str, mode: str
 @pytest.mark.parametrize("cmd", ["sg wheel -c 'rm -rf ~'", "sg wheel 'rm -rf ~'", "sg - wheel -c 'rm -rf ~'"])
 def test_shadow_utils_sg_code_is_still_refused(tmp_path: Path, cmd: str) -> None:
     assert _decide(cmd, "yolo", tmp_path).action == "deny", cmd
+
+
+# ── options whose value runs a command: git -c exec keys, rg --pre, man -P, text piped into a shell ──
+
+EXEC_OPTION_DENY: list[tuple[str, str]] = [
+    ("git", "git -c core.fsmonitor='rm -rf ~' status"),
+    ("git", "git -c core.sshCommand='rm -rf ~' fetch"),
+    ("git", "git -c core.pager='rm -rf ~' log"),
+    ("git", "git -c core.editor='rm -rf ~' commit"),
+    ("git", "git -c alias.x='!rm -rf ~' x"),
+    ("git", "git -c alias.p='push --force origin main' p"),
+    ("git", "git -c credential.helper='!rm -rf ~' fetch"),
+    ("git", "git -c diff.external='rm -rf ~' diff"),
+    ("git", "git -c diff.x.textconv='rm -rf ~' diff"),
+    ("git", "git --config-env=core.fsmonitor=VAR status"),
+    ("git", "git --config-env core.pager=VAR log"),
+    ("git", "git -c core.fsmonitor='rm -rf ~' commit -m x"),
+    ("rg", "rg --pre rm x ~"),
+    ("rg", "rg --pre=rm x ~"),
+    ("rg", "rg --pre-glob '*' --pre rm x"),
+    ("rg", "rg --hostname-bin=rm x"),
+    ("rg", "rg --pre sh x"),
+    ("man", "man -P 'rm -rf ~' ls"),
+    ("man", "man --pager='rm -rf ~' ls"),
+    ("man", "man --pager 'rm -rf ~' ls"),
+    ("man", "man -aP 'rm -rf ~' ls"),
+    ("man", "man --html='rm -rf ~' ls"),
+    ("sh", "echo 'rm -rf ~' | sh"),
+    ("bash", "printf 'rm -rf ~' | bash"),
+    ("sh", "echo 'rm -rf ~' | sh -s"),
+]
+
+
+@pytest.mark.parametrize(("prog", "cmd"), EXEC_OPTION_DENY)
+def test_option_values_that_run_commands_are_refused(tmp_path: Path, prog: str, cmd: str) -> None:
+    allow = [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)]
+    for mode in ("default", "auto", "yolo"):
+        for rules in ([], allow):
+            d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+            assert d.action == "deny" and d.hardline, (cmd, mode, bool(rules))
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git -c user.name=x -c user.email=y commit -m z",
+        "git -c color.ui=always log",
+        "git -c core.pager=cat log",
+        "git -c core.editor=true rebase",
+        "git -c core.fsmonitor=true status",
+        "git commit -m 'rm -rf ~ is bad'",
+        "rg -n x src",
+        "rg --pre cat x docs",
+        "rg --pre-glob '*.gz' x",
+        "man ls",
+        "man -P less ls",
+        "grep -rn 'rm -rf' src",
+        "echo rm -rf ~",
+        "echo 'rm -rf ~' | cat",
+    ],
+)
+def test_benign_option_values_are_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
