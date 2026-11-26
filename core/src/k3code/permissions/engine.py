@@ -2431,6 +2431,7 @@ class _GlobBudget:
         self.spent = False
         self._dirs: list[str] | None = None
         self.names: dict[str, bool] = {}  # _glob_names_secret's answer for each pattern
+        self.words: dict[tuple[str, str, str], str | None] = {}  # _classify_word's answer for each word and directory
 
     @property
     def secret_dirs(self) -> list[str]:
@@ -2637,6 +2638,16 @@ def _may_be_credential(word: str, home: str, budget: _GlobBudget | None = None) 
 
 
 def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
+    if budget is None:
+        return _classify_word_in(arg, cwd, home, _GlobBudget())
+    # one answer for each word and directory of the decision: a line checks the same pairs many times over
+    key = (arg, cwd, home)
+    if key not in budget.words:
+        budget.words[key] = _classify_word_in(arg, cwd, home, budget)
+    return budget.words[key]
+
+
+def _classify_word_in(arg: str, cwd: str, home: str, budget: _GlobBudget) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -2649,9 +2660,9 @@ def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = N
         return "deny" if _sensitive_name(word.partition("/")[2]) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        reads = _glob_reads_secret(path, home, budget or _GlobBudget())
+        reads = _glob_reads_secret(path, home, budget)
         return "unchecked" if reads is None else "deny" if reads else None
-    return "deny" if sensitive_path(path) else None
+    return "deny" if sensitive_path(path, budget.secret_dirs) else None
 
 
 def _target_dir_flag(args: list[str]) -> bool:
@@ -3231,17 +3242,47 @@ def _command_word_expands(sub: str) -> bool:
     return alt is not None and _argv(alt)[:1] != argv[:1]
 
 
+#: Past these a bash call is not checked: the checks cost time in its size (and a call that size is no one's command).
+#: The raw limits apply before the parse (a heredoc's lines count), the others after it.
+_MAX_RAW_CHARS = 1_000_000
+_MAX_RAW_OPERATORS = 4_000
+_RAW_OPERATOR = re.compile(r"&&|\|\||[;&|\n]")
+_MAX_COMMAND_CHARS = 100_000
+_MAX_COMMAND_SUBS = 2_000
+_MAX_COMMAND_WORDS = 10_000
+#: words x the directories a ``cd`` on the line can reach besides the cwd: each word is checked from each of them
+_MAX_DIR_WORK = 10_000
+
+
+def _too_large(mode: PermissionMode, command: str, *size: str) -> Decision:
+    """A call too large to check: a person decides it; auto and yolo ask no one, so it is refused there."""
+    message = f"Command too large to check ({', '.join(size)}); split it or run a script file: {command[:120]}"
+    if mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS):
+        return Decision(action="ask", needs_human=True, message=message)
+    return Decision(action="deny", message=message)
+
+
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
+    ops = len(_RAW_OPERATOR.findall(command)) if len(command) <= _MAX_RAW_CHARS else 0
+    if len(command) > _MAX_RAW_CHARS or ops > _MAX_RAW_OPERATORS:
+        # before the parse: its cost grows with these (20,000 ``&&`` took seconds)
+        return _too_large(mode, command, f"{len(command):,} characters", f"{ops:,} operators")
     hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = parsed.subs
+    words = sum(len(s.split()) for s in subs)
+    if len(command) > _MAX_COMMAND_CHARS or len(subs) > _MAX_COMMAND_SUBS or words > _MAX_COMMAND_WORDS:
+        return _too_large(mode, command, f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words")
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
     where = _where(parsed, cwd, home)
+    if words * (len(where.dirs) - 1) > _MAX_DIR_WORK:
+        # every word is checked from every directory the line can be in (see below): the cost is their product
+        return _too_large(mode, command, f"{words:,} words", f"{len(where.dirs):,} directories")
     # a relative path is read from every directory the line can be in: `cd /etc && cat shadow` reads /etc/shadow
     dirs = list(dict.fromkeys((cwd, *_where_dirs(where))))
     budget = _GlobBudget()  # one for every glob walk of the decision: ten deep globs cost what one does

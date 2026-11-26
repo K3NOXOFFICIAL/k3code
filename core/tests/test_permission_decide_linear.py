@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from k3code.permissions import Decision, decide
+from k3code.permissions import Decision, Rule, decide
 
 
 def _bash(cmd: str, mode: str, cwd: Path) -> Decision:
@@ -137,3 +137,64 @@ async def test_a_slow_bash_decision_leaves_the_event_loop_to_the_other_sessions(
     call = ToolCall(id="c1", name="bash", arguments={"command": "echo hi"})
     result, _ = await asyncio.gather(loop._execute_tool(call), other_session())
     assert result == {"error": "the loop kept running"}
+
+
+# A relative name is checked from every directory a `cd` on the line can reach, so the work was words x directories:
+# 25 `cd`s and 5,000 words took 5 s, 200 of them a minute. There is a budget for words x directories now, and
+# a call past it or past the size limits is not checked at all: a person decides it (auto and yolo refuse it).
+_W200 = " ".join(f"w{k}" for k in range(200))
+LARGE = {
+    "25-cds-x-200-words": " ; ".join(f"cd d{n} && cat {_W200}" for n in range(25)),
+    "100k-char-path": "cat " + "a/" * 50_000,
+    "20000-and-lists": " && ".join(f"cat x{k}" for k in range(20_000)),
+    "5000-stage-pipe": " | ".join(f"cat x{k}" for k in range(5_000)),
+    # under the size limits, past the directory budget (words x directories)
+    "100-cds-x-10-words": " ; ".join(f"cd d{n} && cat " + " ".join(f"w{k}" for k in range(10)) for n in range(100)),
+}
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("name", LARGE)
+def test_a_call_with_many_cd_targets_or_of_absurd_size_is_decided_in_under_a_second(
+    tmp_path: Path, name: str, mode: str
+) -> None:
+    rules = [Rule(tool="bash", pattern="cat *", action="allow"), Rule(tool="bash", pattern="cd *", action="allow")]
+    start = time.monotonic()
+    decide(mode=mode, tool="bash", args={"command": LARGE[name]}, cwd=tmp_path, user_rules=rules)
+    assert time.monotonic() - start < 1.0
+
+
+@pytest.mark.parametrize("name", LARGE)
+@pytest.mark.parametrize(
+    ("mode", "action"), [("default", "ask"), ("accept-edits", "ask"), ("auto", "deny"), ("yolo", "deny")]
+)
+def test_a_call_too_large_to_check_is_never_allowed(tmp_path: Path, name: str, mode: str, action: str) -> None:
+    dec = _bash(LARGE[name], mode, tmp_path)
+    assert (dec.action, dec.needs_human or action == "deny") == (action, True)
+    assert "too large to check" in dec.message
+
+
+SMALL = [
+    ("cd src && cat README.md", "default", "ask", False),
+    ("cd src && cat README.md", "auto", "allow", False),
+    ("cd /etc && cat shadow", "default", "ask", True),
+    ("cd /etc && cat shadow", "auto", "ask", True),
+    ("cat a b c", "default", "allow", False),
+    ("cat a b c", "auto", "allow", False),
+]
+
+
+@pytest.mark.parametrize(("cmd", "mode", "action", "human"), SMALL)
+def test_an_ordinary_call_is_decided_as_before(tmp_path: Path, cmd: str, mode: str, action: str, human: bool) -> None:
+    (tmp_path / "src").mkdir()
+    dec = _bash(cmd, mode, tmp_path)
+    assert (dec.action, bool(dec.needs_human)) == (action, human)
+
+
+def test_past_the_directory_budget_a_credential_name_still_asks_a_person(tmp_path: Path) -> None:
+    pad = " ; ".join(f"cd d{n} && cat {_W200}" for n in range(10))
+    dec = _bash(f"{pad} ; cd ~ && cat .ssh/id_rsa", "default", tmp_path)
+    assert dec.action == "deny" or dec.needs_human
+    dec = _bash(f"{pad} ; cd /etc && cat shadow", "default", tmp_path)
+    assert dec.action == "deny" or dec.needs_human
