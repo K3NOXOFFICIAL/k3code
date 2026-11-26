@@ -114,6 +114,10 @@ BUILTIN_BASH_ALLOW = [
     "realpath *",
     "readlink *",
     "findmnt *",
+    "lsblk *",
+    "ip *",
+    "ss *",
+    "nvidia-smi *",
     "git status *",
     "git diff *",
     "git log *",
@@ -1040,6 +1044,14 @@ _READONLY_OPTS: dict[str, _Opts] = {
         " submounts raw fstab uniq notruncate nofsroot verify verbose shell output-all",
         "direction mountpoint task options output source target types timeout",
     ),
+    # not --sysroot (reads a directory it names), -Q/--filter, -T/--tree (optional value)
+    "lsblk": _opts(
+        "ADJMOPSNvabdfilmnprstyzH",
+        "EIewox",
+        "noempty discard json merge output-all pairs scsi nvme virtio all bytes nodeps fs ascii list perms noheadings"
+        " paths raw inverse topology shell zoned list-columns",
+        "dedup include exclude output width sort",
+    ),
     "pwd": _opts("LP", longs="logical physical"),
     "which": _opts("as"),
     "type": _opts("aftpP"),
@@ -1232,6 +1244,88 @@ def _ref_list_ok(sub: str, args: list[str]) -> bool:
     return positional == 0 or listing
 
 
+#: A plain word: an interface, a GPU id, a column list. Nothing the shell expands, no leading ``-``.
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9_.@:,][A-Za-z0-9_.@:,-]*")
+#: ``ip`` matches its options and verbs by prefix (``-b`` is ``-batch``, ``ip a a`` is ``ip addr add``), so only these
+#: exact words pass: global display options, the objects, and the listing verbs.
+_IP_GLOBAL = frozenset(
+    {"-br", "-brief", "-c", "-color", "-4", "-6", "-s", "-stats", "-d", "-details", "-j", "-json", "-p", "-pretty"}
+    | {"-o", "-oneline"}
+)
+_IP_OBJECTS = frozenset(
+    {"a", "addr", "address", "l", "link", "r", "ro", "route", "n", "neigh", "neighbor", "neighbour", "rule", "maddr"}
+)
+_IP_SHOW = frozenset({"show", "list", "ls", "lst"})
+#: ``ss`` listing options; not -K/--kill, -D/--diag (writes), -F/--filter (reads), -E/--events (hangs), -N/--net.
+_SS_OPTS = _opts(
+    "tulnpaxws46emioHOr",
+    longs="tcp udp listening numeric processes all summary extended memory info options no-header oneline resolve",
+)
+#: ``nvidia-smi`` query words (it never clusters options). Not -c (compute mode), -l/-lms (loop), -f (file), nor
+#: anything that sets the GPU.
+_NVSMI_FLAGS = frozenset({"-L", "--list-gpus", "-q", "--query", "-x", "--xml-format", "-u", "--unit"})
+_NVSMI_VALUED = frozenset({"-d", "-i"})
+_NVSMI_EQ = frozenset({"--display", "--id", "--query-gpu", "--query-compute-apps", "--format"})
+#: ``nvidia-smi dmon|pmon`` display options; ``-c N`` is required, else they loop forever.
+_NVSMI_MON_VALUED = frozenset({"-s", "-i", "-d"})
+
+
+def _ip_ok(args: list[str]) -> bool:
+    """``ip [OPTS] OBJECT [show [dev NAME | NAME]]`` with only the exact words above."""
+    i = 0
+    while i < len(args) and args[i] in _IP_GLOBAL:
+        i += 1
+    rest = args[i:]
+    if not rest or rest[0] not in _IP_OBJECTS:
+        return False
+    rest = rest[1:]
+    if not rest:
+        return True
+    if rest[0] not in _IP_SHOW:
+        return False
+    rest = rest[1:]
+    if rest[:1] == ["dev"]:
+        rest = rest[1:]
+        return len(rest) == 1 and bool(_PLAIN_WORD.fullmatch(rest[0]))
+    return not rest or (len(rest) == 1 and bool(_PLAIN_WORD.fullmatch(rest[0])))
+
+
+def _ss_ok(args: list[str]) -> bool:
+    """``ss`` with listing options and no filter but ``state NAME``."""
+    if "--" in args or not _opts_ok(_SS_OPTS, [a for a in args if a.startswith("-")]):
+        return False
+    words = [a for a in args if not a.startswith("-")]
+    pairs = zip(words[::2], words[1::2], strict=False)
+    return len(words) % 2 == 0 and all(k == "state" and re.fullmatch(r"[a-z][a-z-]*", v) for k, v in pairs)
+
+
+def _nvidia_smi_ok(args: list[str]) -> bool:
+    """``nvidia-smi`` queries, ``topo -m``, and ``dmon|pmon -c N``; every value a plain word."""
+    if args[:1] == ["topo"]:
+        return args[1:] in (["-m"], ["--matrix"])
+    mon = args[:1] in (["dmon"], ["pmon"])
+    flags, valued = (frozenset(), _NVSMI_MON_VALUED | {"-c"}) if mon else (_NVSMI_FLAGS, _NVSMI_VALUED)
+    counted = False
+    i = 1 if mon else 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        name, eq, value = a.partition("=")
+        if a in flags:
+            continue
+        if a in valued and i < len(args):
+            value, i = args[i], i + 1
+            if a == "-c":
+                if counted or not re.fullmatch(r"[1-9][0-9]*", value):
+                    return False
+                counted = True
+        elif not (eq and not mon and name in _NVSMI_EQ):
+            return False
+        if not _PLAIN_WORD.fullmatch(value):
+            return False
+    return counted or not mon
+
+
 def _readonly_argv_ok(tokens: list[str]) -> bool:
     """``tokens`` (one simple command, as written) uses only the options of a builtin read-only command that are known
     to be safe (see _READONLY_OPTS), and no query or argument that writes or runs something. Other commands pass."""
@@ -1246,6 +1340,12 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         if sub in _REF_LIST:
             return _ref_list_ok(sub, args)
         name = f"git {sub}"
+    if name == "ip":
+        return _ip_ok(args)
+    if name == "ss":
+        return _ss_ok(args)
+    if name == "nvidia-smi":
+        return _nvidia_smi_ok(args)
     spec = _READONLY_OPTS.get(name)
     if spec and not _opts_ok(spec, args):
         return False
