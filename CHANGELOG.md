@@ -4,6 +4,13 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ## Unreleased
 
+
+### Known gaps (not fixed in this release; details in `docs/reports/harness-audit-2026-11-26.md`)
+
+- Permission engine: a launcher in front of `git` hides `git -c` exec values (`sudo -u git git -c core.pager=... log`); `cat $(...)`, backtick substitution and same-line variable assignment are not resolved; `docker volume create --opt device=...`, `--volumes-from` and compose-file volumes are not checked; readers not on the builtin list (`less`, `base64`, `awk`, `sed`) on secret paths only ask; recursive listings (`ls -R ~`, `find ~ -name id_rsa`) reveal names under dot folders; `cd -P link/..; echo x > f` writes through a symlink.
+- The parser is a heuristic, not a proof, and default and accept-edits modes run bash unsandboxed. The sound fix is to run bash sandboxed in every mode.
+- Item 4 (skills listing) and the environment-text part of item 5 were not reproducible; no change was needed beyond a budget test and a date line for the `claude` CLI backend.
+
 ### Added
 
 - **Offline regression evals score harness changes.** `tests/test_agent_evals.py` runs 16 scripted tasks (write, edit, fix a failing check, the permission refusals, malformed-call and unknown-tool recovery, background jobs, interrupt and resume, the loop guard and `max_turns`) through the real agent loop with a rule-driven fake model, and holds each to a step budget. `uv run python scripts/eval_score.py` prints the pass rate and model calls per task; no model or network is used.
