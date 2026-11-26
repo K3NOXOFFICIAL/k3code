@@ -146,7 +146,8 @@ def scan(
             yield f"{display}: binary file matches"
             return
         if len(line) > MAX_COLUMNS:
-            line = line[:MAX_COLUMNS] + " [... omitted end of long line]"
+            cut = len(line) - MAX_COLUMNS
+            line = line[:MAX_COLUMNS] + f" [... omitted end of long line: {cut} more chars; read the file at this line]"
         yield f"{display}:{number}:{line}"
 
 

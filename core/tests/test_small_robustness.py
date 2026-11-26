@@ -443,7 +443,10 @@ async def test_the_grep_fallback_cuts_long_matching_lines_like_rg(tmp_path, no_g
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert f"{tmp_path / 'a.js'}:1:{'x' * 400} [... omitted end of long line]" in res["matches"].splitlines()
+    assert (
+        f"{tmp_path / 'a.js'}:1:{'x' * 400} [... omitted end of long line: 107 more chars; read the file at this line]"
+        in res["matches"].splitlines()
+    )
     assert peak < 16 * 1024 * 1024
 
 

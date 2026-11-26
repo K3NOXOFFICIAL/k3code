@@ -35,7 +35,11 @@ def register_skill_tool(reg: ToolRegistry, cwd: Path, roots: list[str]) -> None:
             if not text.strip():
                 return {"error": f"Skill {skill.name} is empty ({skill.path})"}
             if len(text) > MAX_SKILL_CHARS:
-                text = text[:MAX_SKILL_CHARS] + "\n…(truncated)"
+                total = len(text)
+                text = (
+                    text[:MAX_SKILL_CHARS]
+                    + f"\n…(truncated: showing {MAX_SKILL_CHARS} of {total} chars; read {skill.path} for the rest)"
+                )
             return {"content": f"# Skill: {skill.name}\n(location: {skill.path.parent})\n\n{text}"}
         if query:
             hits = skills_mod.search(query, base, roots)

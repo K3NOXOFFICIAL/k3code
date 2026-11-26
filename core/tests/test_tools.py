@@ -463,11 +463,18 @@ async def test_bash_capture_keeps_the_head_and_the_tail_and_counts_what_it_dropp
     dropped = len(full) - tools._KEEP_HEAD_BYTES - tools._KEEP_TAIL_BYTES
     expected = (
         full[: tools._KEEP_HEAD_BYTES]
-        + f"\n... [truncated {dropped} bytes not kept by the capture] ...\n"
+        + f"\n... [truncated {dropped} bytes not kept by the capture; rerun with output redirected to a file "
+        + "and read it with offset/limit, or pipe through grep/head/tail] ...\n"
         + full[-tools._KEEP_TAIL_BYTES :]
     )
     assert result["stdout"] == expected
     assert result["stdout"].endswith("30000\n")
+
+
+async def test_bash_capture_drop_says_how_to_get_rest(temp_dir):
+    result = await tool_bash({"command": "seq 1 30000"}, cwd=temp_dir)
+    line = next(ln for ln in result["stdout"].splitlines() if "not kept by the capture" in ln)
+    assert "redirected to a file" in line and "offset/limit" in line and "grep/head/tail" in line
 
 
 @pytest.mark.serial  # load-sensitive under the 8-worker run; passes alone

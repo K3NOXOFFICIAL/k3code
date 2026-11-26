@@ -593,3 +593,52 @@ def test_a_git_dir_replaced_by_another_directory_after_the_snapshot_is_not_scrub
     notes = sandbox.scrub_git_writable_changes(snap)
     assert (repo / ".git" / "commondir").exists()
     assert len([n for n in notes if "skipped" in n]) == 1, notes
+
+
+# ── a write that fails on the read-only .git says why and names the config key ──
+
+_RO = "fatal: Unable to create /r/.git/index.lock: Read-only file system"
+
+
+@pytest.fixture
+def fake_sandbox(monkeypatch, tmp_path):
+    """``env`` as the sandbox prefix: the command runs for real, but no bwrap is needed."""
+    import k3code.tools as tools
+
+    monkeypatch.setattr(tools, "with_chdir", lambda argv, workdir: argv)
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    return ["env"]
+
+
+async def test_git_readonly_failure_names_git_writable_key(tmp_path, fake_sandbox):
+    result = await tool_bash({"command": f"echo '{_RO}' >&2; exit 128"}, cwd=tmp_path, sandbox=fake_sandbox)
+    assert result["exit_code"] == 128
+    assert result["stderr"].startswith(_RO)
+    assert "sandbox.git_writable: true" in result["stderr"]
+    assert str(tmp_path / "home" / "config.yaml") in result["stderr"]
+    assert result["stderr"].count("Note:") == 1
+
+
+async def test_git_readonly_note_absent_when_not_sandboxed(tmp_path):
+    result = await tool_bash({"command": f"echo '{_RO}' >&2; exit 128"}, cwd=tmp_path)
+    assert "git_writable" not in result["stderr"]
+
+
+def test_git_readonly_note_needs_the_failure_and_a_git_hint():
+    assert sandbox.git_readonly_note("git add a", _RO, 0) == ""
+    assert sandbox.git_readonly_note("git add a", "other error", 1) == ""
+    assert sandbox.git_readonly_note("touch /usr/x", "touch: Read-only file system", 1) == ""
+    assert "git_writable" in sandbox.git_readonly_note("touch .git/x", "touch: .git/x: Read-only file system", 1)
+
+
+async def test_background_git_readonly_note_mentions_foreground(tmp_path, fake_sandbox):
+    from k3code.tools import jobs, tool_bash_output
+
+    result = await tool_bash(
+        {"command": f"echo '{_RO}'; exit 128", "background": True}, cwd=tmp_path, sandbox=fake_sandbox, session_id="s"
+    )
+    job_id = result["content"].split()[1]
+    await jobs.REGISTRY.get("s", job_id).proc.wait()
+    await asyncio.sleep(0.05)
+    out = (await tool_bash_output({"job_id": job_id}, session_id="s"))["content"]
+    assert "foreground" in out and "git_writable: true" not in out
