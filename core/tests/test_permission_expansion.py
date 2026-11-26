@@ -140,6 +140,50 @@ def test_expanded_command_word_needs_a_human(cmd: str, allow: str | None, mode: 
     assert (got.action, got.needs_human) == ("ask", True), cmd
 
 
+_SUBST_RULES = {"cat *": "allow", "echo *": "allow", "git commit *": "allow"}
+
+
+def _decide_rules(cmd: str, mode: str, cwd: Path):
+    rules = from_config({"bash": _SUBST_RULES})
+    return decide(mode=mode, tool="bash", args={"command": cmd}, cwd=cwd, user_rules=rules)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat $(echo /etc/passwd)",
+        "cat `echo /etc/passwd`",
+        'cat "$(echo /etc/passwd)"',
+        'cat "`echo /etc/passwd`"',
+        "git commit -F $(echo /etc/shadow)",
+        # before this change `allow` (each nested command was allowed); now an ask, accepted
+        'git commit -m "$(cat msg)"',
+    ],
+)
+def test_allow_never_covers_command_substitution_output(cmd: str, mode: str, tmp_path: Path) -> None:
+    # auto mode may still convert the ask (its classifier and sandbox decide), but no rule allows it outright
+    got = _decide_rules(cmd, mode, tmp_path)
+    assert got.action != "allow" or (mode == "auto" and got.auto_allowed), cmd
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+def test_allow_still_covers_a_plain_command(mode: str, tmp_path: Path) -> None:
+    got = _decide_rules("echo hi", mode, tmp_path)
+    assert (got.action, got.auto_allowed) == ("allow", False)
+
+
+def test_command_substitution_in_single_quotes_is_a_literal() -> None:
+    from k3code.permissions.hardline import command_substitution
+
+    assert not command_substitution("echo 'a $(b)'")
+    assert not command_substitution("echo 'a `b`'")
+    assert not command_substitution("cat \\$(x)")
+    assert not command_substitution("cat <(echo x)")
+    assert command_substitution("echo \"'$(b)'\"")
+    assert command_substitution("echo `b`")
+
+
 @pytest.mark.parametrize("mode", ["default", "auto"])
 @pytest.mark.parametrize(("cmd", "want"), KEEP)
 def test_unexpanded_command_keeps_its_decision(cmd: str, want: dict, mode: str, tmp_path: Path) -> None:
