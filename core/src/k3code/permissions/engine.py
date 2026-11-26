@@ -2110,7 +2110,7 @@ def _word_values(word: str) -> list[str]:
 
 
 #: the container runtimes whose ``run``/``create`` bind host paths (``-v SRC:DST``, ``--mount src=SRC``)
-_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose", "buildah"})
+_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose", "buildah", "ctr"})
 #: the options before the subcommand (docker, podman, nerdctl, compose) that take the next word as their value
 #: (``docker --context x run``): that value is no subcommand. ``-v``/``-D``/``--tls``/``--remote`` take none.
 _CONTAINER_GLOBAL_VALUE_OPTIONS = frozenset(
@@ -2131,9 +2131,11 @@ _FORCED_MOUNTS = frozenset(
 )
 #: the ``--cap-add`` capabilities that let a container take the host over (``CAP_`` prefix optional)
 _TAKEOVER_CAPS = frozenset({"ALL", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "DAC_READ_SEARCH"})
+#: ``--privileged`` spelled with a true value (``--privileged=1``); ``=false`` stays
+_PRIVILEGED_ON = frozenset(f"--privileged={v}" for v in ("true", "1", "yes"))
 
 
-def _container_run_args(argv: list[str]) -> list[str] | None:
+def _container_run_args(argv: list[str], subs: tuple[str, ...] = ("run", "create")) -> list[str] | None:
     """The words after ``run``/``create`` of a container ``argv`` (docker, podman, nerdctl, buildah ``run``/``create``,
     ``container run``, ``compose run``, ``docker-compose run``); None for any other command. A global option's value
     (``docker --context x run``, ``-H unix:///x``: _CONTAINER_GLOBAL_VALUE_OPTIONS) is no subcommand."""
@@ -2143,7 +2145,7 @@ def _container_run_args(argv: list[str]) -> list[str] | None:
     k = 0
     while k < len(words) and (words[k].startswith("-") or words[k] in ("container", "compose")):
         k += 2 if words[k] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
-    return words[k + 1 :] if k < len(words) and words[k] in ("run", "create") else None
+    return words[k + 1 :] if k < len(words) and words[k] in subs else None
 
 
 def _bind_mount_sources(argv: list[str]) -> list[str]:
@@ -2198,12 +2200,16 @@ def _container_takeover(argv: list[str]) -> bool:
     """A container ``argv`` (_container_run_args) that hands the container the host without a mount: ``--privileged``,
     the host's pid/ipc/uts/user namespace (``--pid=host``), a host device (``--device /dev/sda``), a takeover
     capability (``--cap-add SYS_ADMIN``: _TAKEOVER_CAPS) or no confinement (``--security-opt seccomp=unconfined``).
-    ``--net=host`` shares only the network and stays."""
+    ``--net=host`` shares only the network and stays. ``--privileged[=true|1|yes]`` counts for ``exec`` too, and
+    ``--device-cgroup-rule`` (access to any host device node) for ``run``/``create``."""
     rest = _container_run_args(argv)
+    privileged = _container_run_args(argv, ("run", "create", "exec")) or []
+    if any(w == "--privileged" or w.lower() in _PRIVILEGED_ON for w in privileged):
+        return True
     if rest is None:
         return False
     for k, w in enumerate(rest):
-        if w == "--privileged":
+        if w.startswith("--device-cgroup-rule"):
             return True
         name, eq, value = w.partition("=")
         if not eq:
