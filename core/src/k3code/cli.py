@@ -1658,6 +1658,28 @@ def memory_cmd(action: str, user: bool) -> None:
     click.echo(memory_listing(Path.cwd(), load_config(project_dir=Path.cwd()))[0])
 
 
+@cli.group("learned")
+def learned_group() -> None:
+    """See and forget what k3code learned (the same as /learned)."""
+
+
+@learned_group.command("list")
+def learned_list() -> None:
+    """List learned gotchas, notes, preferences and overlays with an id each."""
+    from k3code.commands.learned_cmd import list_text
+
+    click.echo(list_text(Path.cwd()))
+
+
+@learned_group.command("forget")
+@click.argument("item_id")
+def learned_forget(item_id: str) -> None:
+    """Forget one learned item by the id `k3code learned list` shows."""
+    from k3code.commands.learned_cmd import _experiments, forget_text
+
+    click.echo(forget_text(Path.cwd(), item_id, _experiments(None)))
+
+
 # ── schedule (cron jobs) ──────────────────────────────────────────────
 
 

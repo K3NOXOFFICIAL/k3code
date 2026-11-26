@@ -1,10 +1,11 @@
-"""/learned [forget <id> | purge [--all] --yes]: see, drop and clear what learning stored for this project and this
-machine."""
+"""/learned [forget <id> | edit <id> <text> | purge [--all] --yes]: see, drop, edit and clear what learning stored for
+this project and this machine."""
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from k3code.learning.decisions import DecisionLog, project_id
 from k3code.memory import learned_notes_path, user_memory_path
 from k3code.paths import home
 
-USAGE = "/learned | /learned forget <id> | /learned purge [--all] --yes"
+USAGE = "/learned | /learned forget <id> | /learned edit <id> <new text> | /learned purge [--all] --yes"
 #: Exactly what each purge removes and keeps; the help, the confirmation prompt and the README say the same.
 PURGE = (
     "/learned purge removes this project's auto gotchas (gotchas.auto.md), learned notes (learned.md) and decision "
@@ -37,10 +38,18 @@ class Item:
     path: Path
     text: str
     line: str  # the exact stored line (files) or the preference text
+    meta: str = ""  # a preference's confidence, evidence and age
 
     def row(self) -> str:
         shown = self.text if len(self.text) <= TEXT_MAX else self.text[: TEXT_MAX - 1] + "…"
-        return f"{self.id}  {self.kind:<14} {shown}  [{self.path}]"
+        meta = f" ({self.meta})" if self.meta else ""
+        return f"{self.id}  {self.kind:<14} {shown}{meta}  [{self.path}]"
+
+
+def _age(p: distiller.Preference, now: float) -> str:
+    if distiller.is_expired(p, now):
+        return "expired"
+    return f"{int((now - p.updated) // 86400)}d" if p.updated > 0 else "unknown"
 
 
 def _id(kind: str, path: Path, line: str) -> str:
@@ -71,8 +80,10 @@ def collect(cwd: Path) -> list[Item]:
     items += _file_items("note", learned_notes_path(cwd))
     items += _file_items("machine gotcha", gotchas.user_gotchas_path(h))
     pref_path = h / "learning" / "preferences.json"
-    for p in distiller.load_preferences(h, top=1_000_000):
-        items.append(Item(_id("preference", pref_path, p.text), "preference", pref_path, p.text, p.text))
+    now = time.time()
+    for p in distiller.load_preferences(h, top=1_000_000, include_expired=True):
+        meta = f"confidence {p.confidence:.2f}, evidence {p.evidence}, {_age(p, now)}"
+        items.append(Item(_id("preference", pref_path, p.text), "preference", pref_path, p.text, p.text, meta))
     for f in sorted((h / "overlays").glob("*.md")):
         try:
             text = " ".join(f.read_text(encoding="utf-8", errors="replace").split())
@@ -99,7 +110,7 @@ def _forget(item: Item, exps: optimizer.Experiments) -> str:
         return f"Forgot {item.id} ({item.kind})."
     if item.kind == "preference":
         h = home()
-        every = distiller.load_preferences(h, top=1_000_000)
+        every = distiller.load_preferences(h, top=1_000_000, include_expired=True)
         rest = [p for p in every if p.text != item.line]
         distiller.write_preferences_json(h, rest)
         distiller.write_auto_section(user_memory_path(), rest, known=[p.text for p in every])
@@ -112,6 +123,34 @@ def _forget(item: Item, exps: optimizer.Experiments) -> str:
         return f"Forgot {item.id} (overlay): rolled back experiment {xid}."
     item.path.unlink(missing_ok=True)
     return f"Forgot {item.id} (overlay file deleted)."
+
+
+def _edit(item: Item, text: str) -> str:
+    if item.kind != "preference":
+        return f"Only preferences can be edited; {item.id} is a {item.kind}."
+    h = home()
+    every = distiller.load_preferences(h, top=1_000_000, include_expired=True)
+    known = [p.text for p in every]
+    changed = [replace(p, text=text, updated=time.time()) if p.text == item.line else p for p in every]
+    distiller.write_preferences_json(h, changed)
+    distiller.write_auto_section(user_memory_path(), changed, known=known)
+    return f"Edited {item.id} (preference)."
+
+
+def list_text(cwd: Path) -> str:
+    """The ``/learned`` listing (also ``k3code learned list``)."""
+    items = collect(cwd)
+    if not items:
+        return "Nothing learned yet for this project or machine."
+    return "\n".join(["Learned (forget one: /learned forget <id>):", *(i.row() for i in items)])
+
+
+def forget_text(cwd: Path, item_id: str, exps: optimizer.Experiments) -> str:
+    """Forget one item by id (also ``k3code learned forget``)."""
+    item = next((i for i in collect(cwd) if i.id == item_id), None)
+    if item is None:
+        return f"No learned item {item_id}. See /learned."
+    return _forget(item, exps)
 
 
 def _purge_decisions(ctx: Any, cwd: Path, *, everything: bool) -> int:
@@ -147,7 +186,7 @@ def _purge(ctx: Any, cwd: Path, *, everything: bool) -> str:
             gone += 1
     done = [f"{gone} file(s)", f"{rows} decision log row(s)" + ("" if everything else " of this project")]
     if everything:
-        prefs = [p.text for p in distiller.load_preferences(h, top=1_000_000)]
+        prefs = [p.text for p in distiller.load_preferences(h, top=1_000_000, include_expired=True)]
         user_md = user_memory_path()
         text = user_md.read_text(encoding="utf-8") if user_md.is_file() else ""
         if any(ln.strip() == distiller.HEADING for ln in text.splitlines()):  # no block, nothing to clear or create
@@ -175,15 +214,14 @@ class LearnedCommand(CommandDef):
         if everything and sub != "purge":
             return reply(f"--all goes with purge only. Usage: {USAGE}")
         if sub == "list" and len(args) <= 1:
-            items = collect(cwd)
-            if not items:
-                return reply("Nothing learned yet for this project or machine.")
-            return reply("\n".join(["Learned (forget one: /learned forget <id>):", *(i.row() for i in items)]))
+            return reply(list_text(cwd))
         if sub == "forget" and len(args) == 2:
+            return reply(forget_text(cwd, args[1], _experiments(ctx)))
+        if sub == "edit" and len(args) >= 3:
             item = next((i for i in collect(cwd) if i.id == args[1]), None)
             if item is None:
                 return reply(f"No learned item {args[1]}. See /learned.")
-            return reply(_forget(item, _experiments(ctx)))
+            return reply(_edit(item, " ".join(args[2:])))
         if sub == "purge" and len(args) == 1:
             if not yes:
                 what = f"{PURGE}. {PURGE_ALL}." if everything else f"{PURGE}."
