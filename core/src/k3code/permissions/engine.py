@@ -900,11 +900,14 @@ def _voids_allow(
     body_payloads = [p for h in heredocs or () for p in h.payloads]
     has_subst = bool(_SUBSTITUTION.search(plain)) or bool(body_payloads)
     if rule.layer == 0:
-        # the builtin read-only allowlist covers the project only: `cat /etc/x`, `grep -r k ~` and `ls $DIR` ask
+        # the builtin read-only allowlist covers the project, and outside it only literal paths that hold no secret
+        # (`cat /etc/os-release`, `du -sh ~/Downloads`; see _outside_reads_ok): `cat /etc/shadow`, `grep -r k ~`, `ls
+        # $DIR` and the test runners (_SANDBOXED) ask. A nested command (depth > 0) covers the project only
+        outside = any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
         return (
             has_redirect
             or has_subst
-            or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
+            or (outside and not (depth == 0 and rule.pattern not in _SANDBOXED and _outside_reads_ok(sub, roots, cwd)))
             or not _readonly_argv_ok(hardline.tokens(sub))
         )
     if has_redirect and not _redirects_ok(plain, roots, cwd):
@@ -1562,6 +1565,68 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     if arg.startswith("$"):
         return True  # a variable: an unknown path
     return not _inside(_abs(arg, cwd), roots)
+
+
+#: Characters that make a word other than the path it spells once the shell is done with it (quotes are already gone
+#: from the tokens): a glob, a brace list, a variable or a substitution.
+_NOT_LITERAL = frozenset("*?[]{}$`\\\n")
+#: Readers that walk a directory and print what the files hold (`rg` always; the others with -r, see _content_walker).
+_CONTENT_WALKERS = frozenset({"grep", "egrep", "fgrep", "diff"})
+
+
+def _literal_word(arg: str) -> bool:
+    """``arg`` (one token, quotes removed) is the path it names: no glob, brace, variable or substitution, and no
+    ``~user`` (only ``~`` and ``~/...``)."""
+    return bool(arg) and not (_NOT_LITERAL & set(arg)) and (not arg.startswith("~") or arg == "~" or arg[1] == "/")
+
+
+def _content_walker(argv: list[str]) -> bool:
+    """``argv`` reads the files below a directory it is given: ``rg``, or ``grep``/``diff`` with ``-r``/``-R``/
+    ``--recursive``/``-d recurse``. Any short option cluster with an r counts (an option value may hold one: then the
+    command is treated as the stricter walker)."""
+    name = os.path.basename(argv[0]) if argv else ""
+    if name == "rg":
+        return True
+    if name not in _CONTENT_WALKERS:
+        return False
+    for t in argv[1:]:
+        if t == "--":
+            break
+        if (
+            "recursive" in t
+            or "recurse" in t
+            or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t))
+        ):
+            return True
+    return False
+
+
+def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
+    """Every argument of ``sub`` (a builtin read-only command) that lies outside the roots is a literal path the
+    command may read without a person: no secret is there (_shell_read_ok) and, for a walker that prints file contents
+    (_content_walker), the tree holds none either (_shell_walk_ok). Not for git (it stays project-only), a short
+    option with a path attached (``grep -f/etc/x``: no argument check sees it) or ``--files0-from`` (it reads the names
+    to open from a file)."""
+    argv = _argv(sub)
+    if not argv or os.path.basename(argv[0]) == "git":
+        return False
+    if any(("/" in t or "~" in t) and t.startswith("-") and not t.startswith("--") for t in argv[1:]):
+        return False
+    if any("files0-from" in t for t in argv[1:]):
+        return False
+    check = _shell_walk_ok if _content_walker(argv) else _shell_read_ok
+    return all(_literal_word(a) and check(_abs(a, cwd)) for a in _path_args(sub) if _arg_outside(a, roots, cwd))
+
+
+def _reads_secret_outside(sub: str, roots: list[str], cwd: str) -> bool:
+    """``sub`` (a builtin read-only command, not git) names a literal path outside the roots that holds a secret (see
+    _shell_read_ok): ``cat /etc/shadow``, ``ls ~/.ssh``. A person answers that, in auto mode too."""
+    argv = _argv(sub)
+    if not argv or os.path.basename(argv[0]) == "git":
+        return False
+    return any(
+        _arg_outside(a, roots, cwd) and _literal_word(a) and not _shell_read_ok(_abs(a, cwd)) for a in _path_args(sub)
+    )
 
 
 def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
@@ -2549,8 +2614,10 @@ def _decide_bash(
         )
     worst: Rule | None = None
     home_dot = False
+    outside_secret = False
     sandbox_only = False
     user_parts: list[bool] = []  # per part: allowed by a user/project/session rule
+    cwd_parts: list[bool] = []  # per part: a builtin read-only allow that may run in a cwd outside the roots
     for k, sub in enumerate(subs):
         if _command_word_expands(sub):
             unsafe = True  # the shell picks the program after it expands the word (`$X /etc/passwd`, `{cat,/etc/x}`)
@@ -2563,6 +2630,10 @@ def _decide_bash(
         if rule.action == "allow" and rule.layer == 0 and _home_dot_path(sub, roots, cwd):
             home_dot = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
+        readonly = rule.action == "allow" and rule.layer == 0 and rule.pattern not in _SANDBOXED
+        if readonly and _reads_secret_outside(sub, roots, cwd):
+            outside_secret = True  # a person answers it, in auto mode too (see below)
+            rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
         # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
         # command line does not say what runs
@@ -2573,6 +2644,15 @@ def _decide_bash(
         if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
             unsafe = True  # the builtin read-only allowlist covers one-line commands only
         user_parts.append(rule.action == "allow" and rule.layer > 0)
+        argv = _argv(sub)
+        cwd_parts.append(
+            rule.action == "allow"
+            and rule.layer == 0
+            and rule.pattern not in _SANDBOXED
+            and bool(argv)
+            and os.path.basename(argv[0]) != "git"
+            and (not _content_walker(argv) or _shell_walk_ok(cwd))
+        )
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
     # deny/ask rules also see through wrappers, absolute paths and nested commands (`/bin/rm x`, `bash -c 'rm x'`);
@@ -2615,9 +2695,19 @@ def _decide_bash(
             message=f"Reads a dot folder of the home directory, where credentials live; confirm it yourself: "
             f"{command[:120]}",
         )
+    if outside_secret and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Reads a secret path outside the project; confirm it yourself: {command[:120]}",
+        )
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
-    if worst.action == "allow" and not _inside(cwd, roots):
+    # a cwd outside the roots asks, unless every part is a builtin read-only command that may read there (not git, and
+    # a content walker only in a tree _shell_walk_ok takes: `grep -r x` reads the cwd)
+    outside_cwd_ok = bool(cwd_parts) and all(cwd_parts) and _shell_read_ok(_abs(".", cwd))
+    if worst.action == "allow" and not _inside(cwd, roots) and not outside_cwd_ok:
         return Decision(
             action="ask",
             patterns=prefixes,
@@ -2920,6 +3010,65 @@ def _outside_read_ok(path: str) -> bool:
     (``/proc``, ``/run``, ``/root``, another user's home, see _guarded_tree). Checked on the path as written and on its
     realpath. A walk of an allowed directory still withholds what lies in such places (see search_withheld)."""
     return not any(_guarded_tree(p) or any(_risky_component(c) for c in p.split("/") if c) for p in _spellings(path))
+
+
+#: Files below /etc that hold password hashes, sudo rules, private keys or network secrets (matched as prefixes:
+#: ``/etc/shadow-``, ``/etc/sudoers.d`` too). The keys in /etc/ssh are matched by name (see _shell_read_ok).
+_ETC_SECRETS = (
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/ssl/private",
+    "/etc/wireguard",
+    "/etc/NetworkManager/system-connections",
+    "/etc/security/opasswd",
+)
+
+
+def _shell_read_ok(path: str) -> bool:
+    """A builtin read-only bash command (``cat``, ``ls``, ``du`` ...) may read ``path`` (absolute) outside the roots
+    without a person. Unlike _outside_read_ok, ``/etc`` is readable (the sandbox shows bash it anyway) except
+    _ETC_SECRETS and the keys in /etc/ssh; the other guarded trees (``/proc``, ``/dev`` but ``/dev/null``, ``/root``,
+    other users' homes, see _guarded_tree) are not. Nor is any dot name below ``$HOME`` (``~/.bashrc``,
+    ``~/.config/...``: conservative, credential stores live there and no list names them all), any other risky
+    component (_risky_component: ``.git``, ``*.pem``, ``id_*``, ``*credentials*``), a dotenv file (``.env*``), a
+    credential store of ``$HOME`` (_home_stores) or a sensitive path. Dot names are fine in a toolchain location
+    (_toolchain_read: ``~/.cargo/registry``, ``node_modules/.bin``), as for the read tool; credential names, the stores
+    and the secret folders of ``$HOME`` (_secret_dirs) never are. Checked on the path as written and on its
+    realpath."""
+    homes = _home_prefixes()
+    stores = _home_stores()
+    spellings = _spellings(path)
+    dots_ok = _toolchain_read(path)
+    secret_dirs = [*_secret_dirs(), *map(_real, _secret_dirs())]
+    if any(_under(p, d) for p in spellings for d in secret_dirs):
+        return False
+    for p in spellings:
+        if p == "/dev/null":
+            continue
+        tree = _guarded_tree(p)
+        if tree and tree != "/etc":
+            return False
+        if p.startswith(_ETC_SECRETS) or (_under(p, "/etc/ssh") and "key" in p[len("/etc/ssh") :].casefold()):
+            return False
+        names = [c for c in p.split("/") if c]
+        if any(_CREDENTIAL_NAME.fullmatch(c) or c.casefold().startswith(".env") for c in names):
+            return False
+        if not dots_ok and (any(map(_risky_component, names)) or _below_home_dot(p, homes)):
+            return False
+        if _stores_holding([p], stores) or sensitive_path(p):
+            return False
+    return True
+
+
+def _shell_walk_ok(path: str) -> bool:
+    """A builtin walker that prints file contents (``grep -r``, ``rg``, ``diff -r``, see _content_walker) may read the
+    tree at ``path`` (absolute) outside the roots without a person: only a read-only system or toolchain tree
+    (_toolchain_read: ``/usr``, ``/etc``, ``/opt``, package caches) that holds no /etc secret, so not ``/``, ``$HOME``,
+    ``/etc`` itself or ``/etc/ssh``. Conservative: what a home or data folder holds is not known from its name."""
+    if not _shell_read_ok(path) or not _toolchain_read(path):
+        return False
+    return not any(_under(s, p) for p in _spellings(path) for s in (*_ETC_SECRETS, "/etc/ssh"))
 
 
 def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
