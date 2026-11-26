@@ -64,3 +64,24 @@ def test_the_base_prompt_stays_small():
     from k3code.prompting import tokens_of
 
     assert tokens_of(base_prompt()) <= 1100  # re-sent on every request: grow it only for a rule that earns its tokens
+
+
+def test_default_steps_yield_to_user_memory_and_style():
+    text = base_prompt()
+    line = _line_with(text, "Few, large steps")
+    assert "by default" in line and "USER.md" in line and "output style" in line and "override" in line
+    # the priority line ranks the base defaults last
+    prio = _line_with(text, "Instruction priority")
+    assert prio.index("learned notes") < prio.index("defaults")
+
+
+def test_concise_style_drops_tips():
+    from k3code.outputstyle import PRESETS
+
+    assert "No Tips footer." in PRESETS["concise"]
+    assert "brevity" in _line_with(base_prompt(), "Tips:")
+
+
+def test_prompt_mentions_timeout_for_long_commands():
+    line = _line_with(base_prompt(), "pytest -x -q")
+    assert "`timeout`" in line and "`background`" in line

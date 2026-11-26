@@ -10,7 +10,7 @@ PRESETS: dict[str, str] = {
     "default": "",
     "concise": (
         "Output style: concise. Answer in as few words as possible. No preamble, no recap of what you did "
-        "unless asked; code and commands over prose."
+        "unless asked; code and commands over prose. No Tips footer."
     ),
     "explanatory": (
         "Output style: explanatory. While working, briefly explain the why behind implementation choices and "

@@ -25,6 +25,8 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Changed
 
+- **Defaults in the base prompt yield to you.** "Few, large steps" and the `Tips:` footer are now stated as defaults that your messages, USER.md and the output style override (`concise` says `No Tips footer.`), the prompt tells the model to set `timeout` or `background` for long commands, and the README lists the full guidance precedence.
+
 - **Force pushes, `git reset --hard`, `git clean -f`, a recursive delete of a path only a variable names, a printed credential variable and an interpreter dumping the environment now need a person.** In `auto` they stop and ask (an unattended run refuses them); `yolo` still asks nothing. A rule cannot allow them without asking.
 - **The weekly optimizer analysis no longer waits for `learning.optimizer.enabled`.** It runs every 7 days (from the daemon too, not only after a turn) and only proposes while that setting is off; applying a change by itself still needs it on.
 - **Token estimates follow the provider.** The bytes/4 estimate is corrected by the real prompt size every reply reports (a moving ratio per session), so compaction and the elision of old tool results fire at the right size, and elision leaves `max_tokens` free for the reply on a small window.
