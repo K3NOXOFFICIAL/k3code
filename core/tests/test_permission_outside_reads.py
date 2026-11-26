@@ -717,3 +717,62 @@ def test_ten_deep_globs_outside_the_roots_stay_bounded_and_ask_a_person(value_ho
     )
     assert time.monotonic() - start < 1.0
     assert (dec.action, dec.needs_human) == ("ask", True), dec.message
+
+
+BIND_MOUNT_SECRETS = [
+    "docker run -v ~/.ssh:/x img",
+    "docker run -v ~/.aws:/root/.aws img",
+    "docker run --mount type=bind,src=~/.ssh,dst=/x img",
+    "docker run --mount type=bind,source=~/.ssh,target=/x img",
+    "docker run --volume=~/.ssh:/x img",
+    "docker run -v /etc/shadow:/x:ro img",
+    "docker run -v /:/host img",
+    "docker run -v /etc:/e img",
+    "docker run -v~/.ssh:/x img",
+    "docker run -v ~:/h img",
+    "docker run -v /var/run/docker.sock:/var/run/docker.sock img",
+    "docker create -v ~/.ssh:/x img",
+    "podman run -v ~/.ssh:/x img",
+    "nerdctl run -v /:/host img",
+    "docker compose run -v ~/.ssh:/x svc",
+    "docker-compose run -v /etc:/e svc",
+]
+
+
+@pytest.mark.parametrize("ruled", [True, False])
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize("command", BIND_MOUNT_SECRETS)
+def test_a_container_bind_mount_of_a_secret_or_a_host_tree_asks_a_person(
+    value_home: Path, command: str, mode: PermissionMode, ruled: bool
+) -> None:
+    rules = [Rule(tool="bash", pattern=f"{command.split()[0]} *", action="allow", layer=1)] if ruled else []
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=value_home, user_rules=rules)
+    assert (dec.action, dec.needs_human) == ("ask", True), (command, mode, ruled, dec.action, dec.message)
+
+
+#: (command, decision under a ``docker *`` rule in default mode) for container commands that bind no secret
+BIND_MOUNT_PLAIN = [
+    ("docker ps", "allow"),
+    ("docker build .", "allow"),
+    ("docker run --rm img", "allow"),
+    ("docker run -v ./src:/app img", "allow"),
+    ("docker run -v .:/app img", "allow"),
+    ("docker run -v $(pwd):/app img", "ask"),
+    ("docker run -v data:/var/lib/x img", "allow"),
+    ("docker compose up", "allow"),
+    ("docker logs x", "allow"),
+    ("docker exec -it x sh", "allow"),
+]
+
+
+@pytest.mark.parametrize("ruled", [True, False])
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize(("command", "under_rule"), BIND_MOUNT_PLAIN)
+def test_a_container_command_binding_no_secret_keeps_its_decision(
+    value_home: Path, command: str, under_rule: str, mode: PermissionMode, ruled: bool
+) -> None:
+    (value_home / "src").mkdir()
+    rules = [Rule(tool="bash", pattern="docker *", action="allow", layer=1)] if ruled else []
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=value_home, user_rules=rules)
+    want = "allow" if mode == PermissionMode.AUTO else under_rule if ruled else "ask"
+    assert (dec.action, dec.needs_human) == (want, False), (command, mode, ruled, dec.action, dec.message)

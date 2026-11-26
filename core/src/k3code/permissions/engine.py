@@ -2107,6 +2107,53 @@ def _word_values(word: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+#: the container runtimes whose ``run``/``create`` bind host paths (``-v SRC:DST``, ``--mount src=SRC``)
+_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose"})
+#: host mounts that hand a container a whole tree of secrets (or the runtime's socket): a person confirms them
+_FORCED_MOUNTS = frozenset(
+    {"/", "/etc", "/root", "/home", "/var/run/docker.sock", "/run/docker.sock", "/proc", "/sys", "/dev"}
+)
+
+
+def _bind_mount_sources(argv: list[str]) -> list[str]:
+    """The host paths ``argv`` (docker, podman, nerdctl ``run``/``create``, ``container run``, ``compose run``,
+    ``docker-compose run``) binds into a container: the text before the first ``:`` of a ``-v``/``--volume`` value
+    (``-v X:/d``, ``-vX:/d``, ``--volume=X:/d``) and the ``src=``/``source=`` of a ``--mount`` value. Only path-like
+    ones (a leading ``/``, ``~``, ``.`` or ``$``): ``-v data:/d`` names a volume, not a host path."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return []
+    words = argv[1:]
+    sub = next((k for k, w in enumerate(words) if w in ("run", "create")), None)
+    if sub is None or any(w not in ("container", "compose") for w in words[:sub] if not w.startswith("-")):
+        return []
+    values: list[tuple[str, str]] = []
+    rest = words[sub + 1 :]
+    for k, w in enumerate(rest):
+        nxt = rest[k + 1] if k + 1 < len(rest) else ""
+        if w in ("-v", "--volume", "--mount") or re.fullmatch(r"-[A-Za-z]+v", w):
+            values.append(("mount" if w == "--mount" else "volume", nxt))
+        elif w.startswith(("--volume=", "--mount=")):
+            values.append(("mount" if w.startswith("--mount=") else "volume", w.split("=", 1)[1]))
+        elif w.startswith("-v") and len(w) > 2:
+            values.append(("volume", w[2:].removeprefix("=")))
+    sources = []
+    for kind, value in values:
+        if kind == "volume":
+            sources.append(value.split(":", 1)[0] if ":" in value else "")
+        else:
+            sources += [p.split("=", 1)[1] for p in value.split(",") if p.startswith(("src=", "source="))]
+    return [s for s in sources if s.startswith(("/", "~", ".", "$"))]
+
+
+def _mounts_forced(argv: list[str], cwd: str, line: str) -> bool:
+    """``argv`` binds one of _FORCED_MOUNTS or a bare home directory (``-v ~:/h``) into a container."""
+    for source in _bind_mount_sources(argv):
+        path = _var_resolved(source, line, cwd) if _PARAM.search(source) else source
+        if path is not None and (_abs(path, cwd) in _FORCED_MOUNTS or _abs(path, cwd) + "/" in _home_prefixes()):
+            return True
+    return False
+
+
 def _names_secret_outside(
     sub: str, roots: list[str], cwd: str, line: str, depth: int = 0, budget: _GlobBudget | None = None
 ) -> bool:
@@ -2135,8 +2182,10 @@ def _names_secret_outside(
         prog = next((w for w in words if os.path.basename(w) == os.path.basename(argv[0])), None)
         if prog is not None:
             words.remove(prog)
+    if _mounts_forced(argv, cwd, line):
+        return True
     sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
-    for t in (*words, *reads, *sources):
+    for t in (*words, *reads, *sources, *_bind_mount_sources(argv)):
         if re.search(r"\s", t) and depth < 2 and _names_secret_outside(t, roots, cwd, line, depth + 1, budget):
             return True
         for k, c in enumerate(_word_values(t)):
