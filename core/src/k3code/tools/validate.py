@@ -2,8 +2,9 @@
 
 A handler that indexed a missing argument used to surface as ``Tool execution failed: 'path'``, which told the model
 nothing, so it retried blind. The subset checked here is what tool schemas in k3code use at the top level:
-``required``, ``type`` (one or a list), ``enum`` and ``additionalProperties: false``. Anything else (nested schemas,
-``anyOf``, ``$ref`` in MCP tools) is left to the tool.
+``required``, ``type`` (one or a list), ``enum`` and ``additionalProperties: false``, plus one level down: an array's
+``items.type`` and an object property's ``required`` and property types. Anything else (deeper schemas, ``anyOf``,
+``$ref`` in MCP tools) is left to the tool.
 """
 
 from __future__ import annotations
@@ -54,6 +55,35 @@ def compact_schema(schema: dict[str, Any]) -> str:
     return "{" + ", ".join(parts) + "}"
 
 
+def _check_value(path: str, value: Any, prop: dict[str, Any], *, depth: int) -> list[str]:
+    """Type and enum of ``value`` against ``prop``; an array's ``items.type`` and an object's ``required`` and property
+    types are checked one level down (``depth`` 0 is a top-level argument). anyOf/oneOf/$ref are left to the tool."""
+    combined = any(k in prop for k in ("anyOf", "oneOf", "$ref"))
+    if combined and depth:
+        return []
+    typ = prop.get("type")
+    types = typ if isinstance(typ, list) else [typ] if isinstance(typ, str) else []
+    if types and not any(_is(value, t) for t in types):
+        return [f"'{path}' must be {'|'.join(types)}, got {type(value).__name__}"]
+    enum = prop.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        return [f"'{path}' must be one of {enum!r}, got {value!r}"]
+    if depth or combined:
+        return []
+    problems: list[str] = []
+    items = prop.get("items")
+    if isinstance(value, (list, tuple)) and isinstance(items, dict):
+        for i, item in enumerate(value):
+            problems.extend(_check_value(f"{path}[{i}]", item, items, depth=1))
+    if isinstance(value, dict):
+        sub = prop.get("properties") or {}
+        problems.extend(f"missing required '{path}.{n}'" for n in prop.get("required") or [] if n not in value)
+        for key, item in value.items():
+            if isinstance(sub.get(key), dict):
+                problems.extend(_check_value(f"{path}.{key}", item, sub[key], depth=1))
+    return problems
+
+
 def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
     """What is wrong with ``args`` for ``schema`` (empty = nothing found)."""
     if not isinstance(schema, dict) or schema.get("type", "object") != "object":
@@ -68,14 +98,7 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
             if prop is None and schema.get("additionalProperties") is False:
                 problems.append(f"unexpected argument '{name}'")
             continue
-        typ = prop.get("type")
-        types = typ if isinstance(typ, list) else [typ] if isinstance(typ, str) else []
-        if types and not any(_is(value, t) for t in types):
-            problems.append(f"'{name}' must be {'|'.join(types)}, got {type(value).__name__}")
-            continue
-        enum = prop.get("enum")
-        if isinstance(enum, list) and value not in enum:
-            problems.append(f"'{name}' must be one of {enum!r}, got {value!r}")
+        problems.extend(_check_value(name, value, prop, depth=0))
     return problems
 
 

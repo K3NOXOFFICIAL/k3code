@@ -98,3 +98,28 @@ def test_validator_subset():
     assert check_arguments(schema, {"mode": "a", "zzz": 1}) == ["unexpected argument 'zzz'"]
     assert check_arguments({"type": "object", "properties": {}}, {"zzz": 1}) == []  # extras allowed by default
     assert compact_schema(schema) == "{mode: a|b, n?: integer, x?: string|array, flag?: boolean}"
+
+
+_NESTED = {
+    "type": "object",
+    "properties": {
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "opts": {
+            "type": "object",
+            "required": ["mode"],
+            "properties": {"mode": {"type": "string"}, "n": {"type": "integer"}},
+        },
+        "any": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+    },
+}
+
+
+def test_nested_array_item_type_rejected():
+    assert check_arguments(_NESTED, {"tags": ["a", "b"], "any": ["a", 1]}) == []
+    assert check_arguments(_NESTED, {"tags": ["a", 3]}) == ["'tags[1]' must be string, got int"]
+
+
+def test_nested_object_required_rejected():
+    assert check_arguments(_NESTED, {"opts": {"mode": "x", "n": 2, "extra": 1}}) == []
+    assert check_arguments(_NESTED, {"opts": {"n": 2}}) == ["missing required 'opts.mode'"]
+    assert check_arguments(_NESTED, {"opts": {"mode": "x", "n": "2"}}) == ["'opts.n' must be integer, got str"]

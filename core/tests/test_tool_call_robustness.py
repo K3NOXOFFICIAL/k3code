@@ -29,7 +29,7 @@ import pytest
 
 from k3code import tools as tools_mod
 from k3code.agent.loop import AgentLoop
-from k3code.providers.types import ToolCall
+from k3code.providers.types import ToolCall, ToolSpec
 from k3code.router import Router, build_chain
 from k3code.tools import format_tool_result
 from k3code.tools import validate as validate_mod
@@ -798,6 +798,8 @@ def _cases() -> list[Case]:
         )
     )
     add(Case("bash-empty", "bash", "missing field", {"command": ""}, ACT, r"command.*empty", check=never))
+    # ── unknown tool ──
+    add(Case("unknown-tool-typo", "raed", "nonexistent", {"path": "a.py"}, ACT, r"Did you mean 'read'"))
     # ── bash_output / bash_kill ──
     add(Case("bash_output-unknown", "bash_output", "nonexistent", {"job_id": "job-9"}, ACT, r"no job .*\(jobs:"))
     add(Case("bash_output-int", "bash_output", "wrong type", {"job_id": 3}, ACT, r"'job_id'.*string"))
@@ -1145,3 +1147,22 @@ def test_summary() -> None:
     for (family, tool), counts in sorted(grid.items()):
         print(f"{family:20} {tool:12} " + " ".join(f"{k}={counts[k]}" for k in (OK, REP, ACT, OPQ) if counts[k]))
     assert sum(by_class.values()) == len(CASES)
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_suggests_close_match_and_lists_available(tmp_path: Path, monkeypatch) -> None:
+    loop = _loop(_project(tmp_path), monkeypatch)
+
+    async def noop(arguments, *, cwd=None):
+        return {"content": ""}
+
+    for i in range(20):  # past the cap of 30 listed names
+        loop.tools.register(ToolSpec(name=f"zz_extra_{i:02d}", description="", parameters={"type": "object"}), noop)
+    err = (await loop._execute_tool(ToolCall(id="c", name="raed", arguments={})))["error"]
+    assert err.startswith("Unknown tool: raed.")
+    assert " Did you mean 'read'?" in err
+    listed = err.split(" Available tools: ", 1)[1]
+    names = listed.split(", …")[0].split(", ")
+    assert names == sorted(names) and len(names) == 30 and f"(+{len(loop.tools.names()) - 30} more)" in listed
+    far = (await loop._execute_tool(ToolCall(id="c", name="zzzzzzzz", arguments={})))["error"]
+    assert far.startswith("Unknown tool: zzzzzzzz.") and "Did you mean" not in far
