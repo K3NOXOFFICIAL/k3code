@@ -444,7 +444,29 @@ def _check_parse(
     _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
     try:
-        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs), parsed
+        hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs)
+        if hit:
+            return hit, parsed
+        # the shell expands braces and splits `$IFS` after the words were read: `rm${IFS}-rf${IFS}/` and `{rm,-rf,/}`
+        # run `rm -rf /`. The line and every nested command are checked once more in that form (not recursively).
+        for text in dict.fromkeys([parsed.clean, *parsed.nested]):
+            try:
+                alt = _expanded_text(text)
+            except _BraceOverCap:
+                parsed.expansion_over_cap = True
+                continue
+            if alt is None:
+                continue
+            alt_parsed = parse(alt, budget=budget)
+            if budget[0] < 0 or alt_parsed.too_deep:
+                return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+            _reserve_users(alt_parsed.clean)
+            alt_dirs = _Dirs([cwd], cwd, home, _cdpath_entries(alt))
+            hit = _match(alt_parsed.clean, extra_patterns) or _check_parsed(alt_parsed, extra_patterns, alt_dirs)
+            if hit:
+                return hit, parsed
+            parsed.expanded.append(alt_parsed)
+        return None, parsed
     except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
         return "scan-depth", parsed
 
@@ -1580,6 +1602,127 @@ def _unquoted_expansion(sub: str) -> bool:
     return False
 
 
+#: words a brace expansion of one command line may give before the line counts as too large to check
+_BRACE_MAX_WORDS = 64
+_BRACE_SEQ = re.compile(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?")
+_IDENT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_WORD_BREAK = frozenset(" \t\n;&|()<>")
+
+
+class _BraceOverCap(Exception):
+    """A brace expansion gives more than _BRACE_MAX_WORDS words: the expanded line is not checked word by word."""
+
+
+def _span_end(text: str, i: int) -> int:
+    """Index of the last character of the unit at ``i`` the shell reads whole: an escape, a quoted string, ``$'...'``,
+    ``$(...)``, a backtick or ``${...}``; ``i`` for a plain character. An unclosed one runs to the end of the text."""
+    c, n = text[i], len(text)
+    if c == "\\":
+        return min(i + 1, n - 1)
+    if c == "'" or text.startswith("$'", i):
+        j = text.find("'", i + 1) if c == "'" else i + 2
+        while c != "'" and 0 <= j < n and text[j] != "'":
+            j += 2 if text[j] == "\\" else 1
+        return j if 0 <= j < n else n - 1
+    if c == '"':
+        j = i + 1
+        while j < n and text[j] != '"':
+            end = _unit_end(text, j) if text[j] in "$`" else -1
+            j = (n if end == -2 else max(j, end)) + 1 + (text[j] == "\\" and end == -1)
+        return min(j, n - 1)
+    if c in "$`":
+        end = _unit_end(text, i)
+        return n - 1 if end == -2 else max(i, end)
+    return i
+
+
+def _brace_parts(word: str, i: int) -> tuple[int, list[str] | None]:
+    """The ``}`` closing the brace at ``word[i]`` and what the group expands to, or ``(-1, None)`` when it is no group:
+    only an unquoted ``,`` or an int..int / char..char sequence makes one (``{}``, ``@{u}``, ``{x}`` stay literal)."""
+    j, n, depth, cuts = i + 1, len(word), 0, [i]
+    while j < n:
+        c = word[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "," and depth == 0:
+            cuts.append(j)
+        else:
+            j = _span_end(word, j)
+        j += 1
+    if j >= n:
+        return -1, None
+    if len(cuts) > 1:
+        return j, [word[a + 1 : b] for a, b in zip(cuts, [*cuts[1:], j], strict=True)]
+    m = _BRACE_SEQ.fullmatch(word[i + 1 : j])
+    if not m:
+        return -1, None
+    lo, hi = (int(m[1]), int(m[2])) if m[1] else (ord(m[4]), ord(m[5]))
+    step = abs(int(m[3] or m[6] or 1)) or 1
+    if abs(hi - lo) // step >= _BRACE_MAX_WORDS:
+        raise _BraceOverCap
+    seq = range(lo, hi + (1 if hi >= lo else -1), step if hi >= lo else -step)
+    return j, [str(v) if m[1] else chr(v) for v in seq]
+
+
+def _brace_words(word: str, left: list[int]) -> list[str]:
+    """``word`` brace-expanded as the shell does before any other expansion (``./b/{x,y}`` is ``./b/x ./b/y``)."""
+    i = 0
+    while i < len(word):
+        if word[i] == "{":
+            close, parts = _brace_parts(word, i)
+            if parts is not None:
+                out = [w for p in parts for w in _brace_words(word[:i] + p + word[close + 1 :], left)]
+                return out
+            i += 1
+            continue
+        i = _span_end(word, i) + 1
+    left[0] -= 1
+    if left[0] < 0:
+        raise _BraceOverCap
+    return [word]
+
+
+def _ifs_split(word: str) -> str:
+    """``word`` with every unquoted ``$IFS`` / ``${IFS...}`` a space: the shell splits the word there."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        end = _span_end(word, i)
+        name_end = i + (5 if word.startswith("${IFS", i) else 4 if word.startswith("$IFS", i) else 0)
+        if name_end > i and (name_end >= n or word[name_end] not in _IDENT):
+            out.append(" ")
+            end = end if word[i + 1] == "{" else name_end - 1
+        else:
+            out.append(word[i : end + 1])
+        i = end + 1
+    return "".join(out)
+
+
+def _expanded_text(text: str) -> str | None:
+    """``text`` with its unquoted brace groups expanded and its unquoted ``$IFS``/``${IFS...}`` split, as the shell
+    does after k3code reads the words, or None when there is nothing to expand. ``$(...)`` and backticks are skipped
+    whole (they are nested commands, read on their own). Raises _BraceOverCap past _BRACE_MAX_WORDS words."""
+    if "IFS" not in text and "{" not in text:
+        return None
+    out, i, n, left = [], 0, len(text), [_BRACE_MAX_WORDS]
+    while i < n:
+        if text[i] in _WORD_BREAK:
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] not in _WORD_BREAK:
+            j = _span_end(text, j) + 1
+        word = text[i:j]
+        out.append(" ".join(_ifs_split(w) for w in _brace_words(word, left)) if "{" in word or "IFS" in word else word)
+        i = j
+    res = "".join(out)
+    return None if res == text else res
+
+
 def _join_dir(base: str, t: str) -> str:
     """The directory ``cd t`` goes to from ``base``, normalised (``//x`` is ``/x``)."""
     d = os.path.normpath(os.path.join(base, t))
@@ -2381,8 +2524,12 @@ def human_check(parsed: Parsed) -> str | None:
     interpreter dumping the whole environment and a ``mount``/``umount`` that is no listing. Not hardlines (a
     legitimate task does these), but nobody is asked on the model's behalf: auto mode stops and asks, an unattended run
     is refused; yolo, which asks nothing, is not consulted. ``parsed`` is the parse :func:`check_parse` returned."""
+    if parsed.expansion_over_cap:
+        return f"A brace expansion gives more than {_BRACE_MAX_WORDS} words, too many to check"
     try:
-        return _human_parsed(parsed, {})
+        return _human_parsed(parsed, {}) or next(
+            (why for alt in parsed.expanded if (why := _human_parsed(alt, {}))), None
+        )
     except _TooDeep:
         return None  # check_parse refused such a line before this ran
 
@@ -2428,6 +2575,10 @@ class Parsed:
     #: per child: the indices of the subs it came from (a payload of theirs, the heredoc fed to one): the child runs in
     #: the directories that sub may run in (see _check_parsed)
     child_subs: list[list[int]] = field(default_factory=list)
+    #: set by check_parse: the line and its nested commands parsed again brace-expanded and ``$IFS``-split (see
+    #: _expanded_text), for the checks that read the parse; and whether an expansion was too large to check
+    expanded: list[Parsed] = field(default_factory=list)
+    expansion_over_cap: bool = False
 
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
