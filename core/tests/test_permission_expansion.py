@@ -3,6 +3,7 @@ judged like the command the shell finally runs (``rm${IFS}-rf${IFS}/`` and ``{rm
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -114,11 +115,51 @@ def test_brace_expansion_keeps_prefix_and_suffix() -> None:
 
 
 # a brace expansion too large to read word by word was an ask (yolo allowed it): now denied in every mode, since
-# what it runs is unknown (`{rm,-rf,/} {1..100}`)
+# what it runs is unknown (`{rm,-rf,/} {1..5000}`)
 @pytest.mark.parametrize("mode", MODES)
-def test_brace_expansion_too_large_to_check_is_denied(mode: str, tmp_path: Path) -> None:
-    got = _decide("echo {a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}", mode, tmp_path)
-    assert got.action == "deny" and got.hardline
+@pytest.mark.parametrize("cmd", ["echo {1..5000}", "echo {1..100}{1..100}"])
+def test_brace_expansion_too_large_to_check_is_denied(cmd: str, mode: str, tmp_path: Path) -> None:
+    got = _decide(cmd, mode, tmp_path)
+    assert (got.action, got.hardline) == ("deny", "expansion-over-cap"), cmd
+
+
+def test_brace_expansion_over_cap_is_denied_quickly(tmp_path: Path) -> None:
+    start = time.perf_counter()
+    assert _decide("echo {1..5000}", "yolo", tmp_path).hardline == "expansion-over-cap"
+    assert time.perf_counter() - start < 1.0
+
+
+def _decision_class(cmd: str, mode: str, cwd: Path) -> tuple:
+    got = _decide(cmd, mode, cwd)
+    return got.action, got.hardline, got.needs_human
+
+
+# a brace expansion of up to 4096 words is checked word by word, so a common loop or list is judged like its short form
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    ("cmd", "short"),
+    [
+        ("for i in {1..100}; do echo $i; done", "for i in {1..3}; do echo $i; done"),
+        ("printf '%s\\n' {1..1000}", "printf '%s\\n' 1 2 3"),
+        ("echo {a..z}{a..z}", "echo aa ab ac"),
+        ("echo x{,}{,}{,}{,}{,}{,}{,}", "echo x x x"),
+        ("touch f{1..100}", "touch f1 f2 f3"),
+    ],
+)
+def test_brace_expansion_under_cap_is_judged_like_its_short_form(
+    cmd: str, short: str, mode: str, tmp_path: Path
+) -> None:
+    got = _decision_class(cmd, mode, tmp_path)
+    assert got == _decision_class(short, mode, tmp_path), cmd
+    assert got[0] != "deny", cmd
+
+
+# under the cap these are denied for what they run (`rm -rf /`), not for their size
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("cmd", ["{rm,-rf,/} {1..100}", "rm${IFS}-rf${IFS}/ {1..100}"])
+def test_expansion_under_cap_is_denied_by_its_content(cmd: str, mode: str, tmp_path: Path) -> None:
+    got = _decide(cmd, mode, tmp_path)
+    assert got.action == "deny" and got.hardline == _decide("rm -rf /", mode, tmp_path).hardline, cmd
 
 
 def _decide_with(cmd: str, mode: str, cwd: Path, allow: str | None):
