@@ -1803,9 +1803,14 @@ def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
         return False
     if any("files0-from" in t for t in argv[1:]):
         return False
-    check = _shell_walk_ok if _content_walker(argv) else _shell_read_ok
+    walker = _content_walker(argv)
+    check = _shell_walk_ok if walker else _shell_read_ok
+    metadata = os.path.basename(argv[0]) in _METADATA_READERS
     return all(
-        _literal_word(a) and check(_abs(a, cwd)) and _outside_root_ok(_abs(a, cwd))
+        _literal_word(a)
+        and check(_abs(a, cwd))
+        and _outside_root_ok(_abs(a, cwd))
+        and (metadata or _outside_content_ok(_abs(a, cwd), walker))
         for a in _path_args(sub)
         if _arg_outside(a, roots, cwd)
     )
@@ -2946,7 +2951,7 @@ def _decide_bash(
             and rule.pattern not in _SANDBOXED
             and bool(argv)
             and os.path.basename(argv[0]) != "git"
-            and (not _content_walker(argv) or _shell_walk_ok(cwd))
+            and (not _content_walker(argv) or (_shell_walk_ok(cwd) and _outside_content_ok(cwd, walk=True)))
         )
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
@@ -3364,6 +3369,31 @@ _PROC_READABLE = frozenset(
 )  # fmt: skip
 #: The trees outside the roots a builtin read-only command may read without a person (see _outside_root_ok).
 _OUTSIDE_READ_ROOTS = ("/usr", "/opt", "/etc", "/sys", "/var/log", "/tmp")
+#: Builtin readers that print names and sizes only, never what a file holds: outside the roots they read where
+#: _outside_root_ok allows. Every other builtin reader prints contents and must also pass _outside_content_ok.
+_METADATA_READERS = frozenset(
+    {"ls", "du", "stat", "find", "tree", "df", "realpath", "readlink", "basename", "dirname", "pwd", "which", "type"}
+)
+#: The files below /etc a content reader may read outside the roots: system identity and public tables.
+_ETC_READABLE = frozenset(
+    "/etc/" + n
+    for n in (
+        "os-release", "lsb-release", "redhat-release", "fedora-release", "issue", "issue.net", "hostname", "hosts",
+        "host.conf", "resolv.conf", "nsswitch.conf", "passwd", "group", "shells", "locale.conf", "vconsole.conf",
+        "localtime", "timezone", "services", "protocols", "ethertypes", "networks", "machine-info", "sysctl.conf",
+        "ld.so.conf", "motd",
+    )
+)  # fmt: skip
+#: The trees below /etc a content reader may read: package repositories, kernel, device and loader settings.
+_ETC_READABLE_TREES = tuple(
+    "/etc/" + n
+    for n in ("yum.repos.d", "dnf", "sysctl.d", "modprobe.d", "modules-load.d", "udev/rules.d", "ld.so.conf.d")
+)
+#: Where /etc/resolv.conf links to under systemd-resolved (its realpath must pass too).
+_RESOLV_TARGETS = frozenset({"/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/resolv.conf"})
+#: The logs below /var/log a content reader may read: package manager, boot and X logs. Not secure, auth.log,
+#: audit/, journal/, messages, syslog, kern.log or the login records.
+_VAR_LOG_READABLE = re.compile(r"/var/log/(?:dnf(?:\.librepo|\.rpm)?|hawkey|boot|Xorg\.\d+)\.log(?:\.old)?")
 #: The private-key folders below /etc/pki (Fedora/RHEL: ``/etc/pki/tls/private``, ``/etc/pki/libvirt/private``).
 _PKI_PRIVATE = re.compile(r"/etc/pki/(?:[^/]+/)*private(?:/|$)")
 #: Trees a content walk of which reaches a secret below /etc (see _shell_walk_ok): /etc/pki holds _PKI_PRIVATE.
@@ -3431,6 +3461,30 @@ def _outside_root_ok(path: str) -> bool:
         return any(p == h or (p.startswith(h + "/") and not p[len(h) + 1 :].startswith(".")) for h in homes)
 
     return all(ok(p) for p in _spellings(path))
+
+
+def _outside_content_ok(path: str, walk: bool = False) -> bool:
+    """``path`` (absolute) outside the roots lies where a builtin reader that prints file contents (``cat``, ``grep``,
+    ``sort``, ``wc`` ...: all but _METADATA_READERS) may read without a person: ``/usr`` but ``/usr/local/etc``,
+    ``/sys``, ``/dev/null``, a file of _PROC_READABLE, _ETC_READABLE, _RESOLV_TARGETS or _VAR_LOG_READABLE, a tree of
+    _ETC_READABLE_TREES, or a toolchain cache outside the system trees (_toolchain_read: ``~/.cargo/registry``). An
+    allowlist, not a denylist: ``$HOME``, ``/opt``, ``/tmp`` and the rest of ``/etc`` and ``/var/log`` hold what no
+    name reveals (``~/wallet.dat``, ``/etc/fstab``, ``/var/log/secure``), so a person is asked. A walk (``walk``) of a
+    tree that holds ``/usr/local/etc`` asks too. Every spelling must pass."""
+    if _flat(path) in _PROC_READABLE:
+        return True
+    spellings = _spellings(path)
+
+    def ok(p: str) -> bool:
+        if p == "/dev/null" or p in _ETC_READABLE or p in _RESOLV_TARGETS or _VAR_LOG_READABLE.fullmatch(p):
+            return True
+        if _under(p, "/usr/local/etc") or (walk and _under("/usr/local/etc", p)):
+            return False
+        return any(_under(p, r) for r in ("/usr", "/sys", *_ETC_READABLE_TREES))
+
+    if all(ok(p) for p in spellings):
+        return True
+    return _toolchain_read(path) and not any(_under(p, r) for p in spellings for r in ("/usr", "/opt", "/etc", "/tmp"))
 
 
 def _shell_walk_ok(path: str) -> bool:
