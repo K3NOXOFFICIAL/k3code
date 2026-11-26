@@ -34,13 +34,29 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `7f05cb1e`)
+## Verification (final tree `7d272472`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **12754 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
+- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **12824 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
+
+## Review round 9 (tip `7d272472`): FAIL, findings NOT fixed
+
+An independent reviewer ran about 115 `decide()` probes. None raised; nothing exceeded 1 s; of 38 everyday commands only `GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy' git fetch` changed (now forced human, an over-ask). New variants of already-fixed classes still pass in default mode under a `prog *` rule, or in auto with no rule:
+
+1. HIGH `git -ccore.pager='rm -rf ~' log` (glued `-cKEY=VAL`; `_git_config_options` only matches the spaced `-c`), also fsmonitor and sshCommand forms, and behind `sudo -u git`.
+2. HIGH `tar cf /dev/null src --checkpoint=1 --checkpoint-action=exec='rm -rf ~'`, `tar xf a.tar --to-command=...`, `tar --use-compress-program=...` (short `-I` is denied).
+3. HIGH `vim -c '!rm -rf ~' x`, `vim +'!...' x`, `less '+!sh' x`.
+4. HIGH `GIT_PROXY_COMMAND='rm -rf ~' git fetch`, `GIT_CONFIG_PARAMETERS="'core.pager'='rm -rf ~'" git log` (auto).
+5. HIGH `docker run --privileged=true img` (exact `--privileged` match), `docker exec --privileged c sh`.
+6. HIGH `git config alias.x '!rm -rf ~'` (also `--global`); the `core.pager` form is denied.
+7. HIGH `git -c protocol.ext.allow=always fetch 'ext::sh -c rm% -rf% ~'`.
+8. MEDIUM `git -c uploadpack.packObjectsHook=...`; `ctr run --privileged`; `docker run --device-cgroup-rule='a *:* rwm'`; `kubectl run --overrides='{"spec":{"hostPID":true}}'`; `docker run -v ..:/h`; `git -c core.hooksPath=/tmp`, `include.path`, `--exec-path`; `LD_PRELOAD=/tmp/x.so ls`, `PATH=/tmp:$PATH ls`, `NODE_OPTIONS=--require` (auto).
+9. LOW `ls;` x4000 asks; `cd / && rm -rf x` allows in auto (bwrap mitigates).
+
+**Conclusion.** Nine rounds, nine FAILs (round 7 gave no verdict): each round the reviewer finds new spellings of exec-capable options, wrapper programs and environment variables. The structural scans reduce the surface but a text-level parser cannot enumerate every program that runs a command. I stopped fixing variants here. The sound fix is architectural: run bash in the sandbox (bwrap) in every mode, and keep the parser as a convenience and prompt-reduction layer. That needs your decision (it changes default-mode behaviour and needs the sandbox available on every host).
 
 ## NOT fixed, and why
 
