@@ -1602,6 +1602,41 @@ def _unquoted_expansion(sub: str) -> bool:
     return False
 
 
+#: what follows a ``$`` the shell replaces with a parameter's value: a name, ``{``, a digit or a special parameter
+_PARAM_START = frozenset("_{@*#?$!-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def param_expansion(sub: str) -> bool:
+    """Whether ``sub`` expands a parameter (``$X``, ``${X:-y}``, ``$1``, ``$@``) outside single quotes. In double
+    quotes it is not split, but its value still names what the program gets, not the command line."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n - 1:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c == "$" and sub[i + 1] in _PARAM_START:
+            return True
+        i += 1
+    return False
+
+
+def shell_expands(sub: str) -> bool:
+    """Whether the shell changes the words of ``sub`` after k3code reads them: a parameter expansion
+    (:func:`param_expansion`), an unquoted brace group or an unquoted ``$IFS`` split (:func:`_expanded_text`)."""
+    if param_expansion(sub):
+        return True
+    try:
+        return _expanded_text(sub) is not None
+    except _BraceOverCap:
+        return True
+
+
 #: words a brace expansion of one command line may give before the line counts as too large to check
 _BRACE_MAX_WORDS = 64
 _BRACE_SEQ = re.compile(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?")

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from k3code.permissions import decide
+from k3code.permissions.rules import from_config
 
 MODES = ("default", "auto", "yolo")
 
@@ -41,7 +42,36 @@ UNCHANGED = [
     ("find . -name '*.{c,h}'", {"default": "allow", "auto": "allow", "yolo": "allow"}),
     ("git log --format='%h {x,y}'", {"default": "allow", "auto": "allow", "yolo": "allow"}),
     ("ls ${HOME}", {"default": "ask", "auto": "allow", "yolo": "allow"}),
-    ("ls {src,tests}", {"default": "allow", "auto": "allow", "yolo": "allow"}),
+    # a brace the shell expands is a word no rule saw (see EXPANDED_ARG): it asks, auto mode converts that ask
+    ("ls {src,tests}", {"default": "ask", "auto": "allow", "yolo": "allow"}),
+]
+
+# an argument the shell expands after the rule matched: the builtin read-only allows and `cat *` must not cover it
+EXPANDED_ARG = [
+    ("cat x${IFS}/etc/passwd", None),
+    ("ls x${IFS}/etc", None),
+    ("head -n 1${IFS}/etc/passwd", None),
+    ("grep -e x${IFS}/etc/passwd src", None),
+    ("cat {x,/etc/passwd}", None),
+    ("df -t x${IFS}/etc", None),
+    ("ls {src,/etc}", None),
+    ("x=' '; cat a${x}/etc/passwd", None),
+    ("cat a${x:- /etc/passwd}", "cat *"),
+    ("cat $X", "cat *"),
+    ("cat ${X}", "cat *"),
+    ("cat a$x", "cat *"),
+    ('cat "$X"', "cat *"),
+    ('cat "${X}"', "cat *"),
+]
+
+# no `$` and no brace the shell expands: decided as before (command, {mode: action})
+KEEP = [
+    ("echo hi", {"default": "ask", "auto": "allow"}),
+    ("ls src", {"default": "allow", "auto": "allow"}),
+    ("cat README.md", {"default": "allow", "auto": "allow"}),
+    ("grep -n foo src", {"default": "allow", "auto": "allow"}),
+    ("awk '{print $1}' f", {"default": "ask", "auto": "allow"}),
+    ("find . -name '*.{c,h}'", {"default": "allow", "auto": "allow"}),
 ]
 
 
@@ -87,3 +117,31 @@ def test_brace_expansion_keeps_prefix_and_suffix() -> None:
 def test_brace_expansion_too_large_to_check_needs_a_human(mode: str, tmp_path: Path) -> None:
     got = _decide("echo {a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}", mode, tmp_path)
     assert (got.action, got.needs_human) == ("ask", True)
+
+
+def _decide_with(cmd: str, mode: str, cwd: Path, allow: str | None):
+    rules = from_config({"bash": {allow: "allow"}}) if allow else None
+    return decide(mode=mode, tool="bash", args={"command": cmd}, cwd=cwd, user_rules=rules)
+
+
+@pytest.mark.parametrize(("cmd", "allow"), EXPANDED_ARG)
+def test_allow_never_covers_a_shell_expanded_argument(cmd: str, allow: str | None, tmp_path: Path) -> None:
+    assert _decide_with(cmd, "default", tmp_path, allow).action != "allow", cmd
+    # auto mode may still convert the ask (its classifier and sandbox decide), but no rule allows it outright
+    got = _decide_with(cmd, "auto", tmp_path, allow)
+    assert got.action != "allow" or got.auto_allowed, cmd
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", ["$X /etc/passwd", "${CMD} x", '"$X" x', "{cat,/etc/passwd}"])
+@pytest.mark.parametrize("allow", [None, "*"])
+def test_expanded_command_word_needs_a_human(cmd: str, allow: str | None, mode: str, tmp_path: Path) -> None:
+    got = _decide_with(cmd, mode, tmp_path, allow)
+    assert (got.action, got.needs_human) == ("ask", True), cmd
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(("cmd", "want"), KEEP)
+def test_unexpanded_command_keeps_its_decision(cmd: str, want: dict, mode: str, tmp_path: Path) -> None:
+    got = _decide(cmd, mode, tmp_path)
+    assert (got.action, got.needs_human) == (want[mode], False), cmd
