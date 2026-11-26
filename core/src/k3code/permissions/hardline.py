@@ -578,6 +578,7 @@ def _check_parsed(
             or _destroy_check(argv, sub, home, dirs)
             or _download_run_check(argv, fetched)
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
+            or _run_scan(words, dirs, home, 0)
         )
         if hit:
             return hit
@@ -591,6 +592,80 @@ def _check_parsed(
         if starts is not None:
             starts[id(child)] = dirs.spawn(start)  # a copy the check below does not move (see _check_nested_expanded)
         hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start), starts)
+        if hit:
+            return hit
+    return None
+
+
+#: Programs that only read their arguments as text (a message, a pattern, a name to look up): the run scan below
+#: skips their command lines, so ``echo rm -rf ~`` or ``rg 'rm -rf ~' docs`` is not a delete.
+_TEXT_PROGRAMS = frozenset(
+    {"echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "man", "help", "type", "which", "apropos", "whatis"}
+)
+_TEXT_GIT_SUBS = frozenset({"commit", "tag", "log", "notes"})
+#: Options whose value is a message or a pattern: a run is not read from that value (``hg commit -m 'rm -rf ~'``).
+_TEXT_VALUE_OPTS = frozenset({"-m", "--message", "-e", "--regexp", "-F", "--file", "-p", "--pattern"})
+#: Words that end a run: shell operators inside a quoted payload and tmux's ``\;`` command separator.
+_RUN_ENDS = frozenset({";", "\\;", "&&", "||", "|", "&", "|&"})
+#: How deep the run scan reads quoted multi-word arguments (``a 'b "rm -rf ~"'`` is two levels).
+_RUN_SCAN_DEPTH = 3
+
+
+def _text_only(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    name = os.path.basename(argv[0])
+    if name == "sg":
+        return _ast_grep(argv)
+    return name in _TEXT_PROGRAMS or (name == "git" and _git_sub(argv)[0] in _TEXT_GIT_SUBS)
+
+
+def _run_scan(words: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    """The backstop behind the launcher readings (_command_argv): every run of words in the command line, from any word
+    to the next separator, is checked as if it were the command, so ``anylauncher --opt v rm -rf ~`` is refused
+    whatever the launcher. Quoted multi-word arguments are split as shell code and scanned the same way, to
+    _RUN_SCAN_DEPTH levels (``script --comm 'rm -rf ~'``, ``tmux split 'rm -rf ~'``). Text programs (_text_only) and
+    the values of message/pattern options (_TEXT_VALUE_OPTS) are not read."""
+    if _text_only(_command_argv(words)):
+        return None
+    start = 0
+    for i, w in enumerate(words + [";"]):
+        if w not in _RUN_ENDS:
+            continue
+        hit = _segment_scan(words[start:i], dirs, home, depth)
+        if hit:
+            return hit
+        start = i + 1
+    return None
+
+
+def _segment_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    if _text_only(_command_argv(seg)):
+        return None
+    for i, w in enumerate(seg):
+        if i and seg[i - 1] in _TEXT_VALUE_OPTS:
+            continue
+        if any(c.isspace() for c in w):
+            if depth < _RUN_SCAN_DEPTH:
+                for sub in split_commands(w):
+                    hit = (
+                        _simple_check(sub)
+                        or _destroy_check(_command_argv(_tokens(sub)), sub, home, dirs)
+                        or _run_scan(_tokens(sub), dirs, home, depth + 1)
+                    )
+                    if hit:
+                        return hit
+            continue
+        name = os.path.basename(w)
+        if name not in _RUN_PROGRAMS and not name.startswith("mkfs"):
+            continue  # only a program the checks below refuse starts a run (each run is read once: linear)
+        argv = _command_argv(seg[i:])
+        hit = (
+            _rm_check(argv, dirs, home)
+            or _find_check(argv, dirs, home)
+            or _git_push_check(argv)
+            or _destroy_check(argv, shlex.join(seg[i:]), home, dirs)
+        )
         if hit:
             return hit
     return None
@@ -1268,6 +1343,21 @@ def _tmux_code(argv: list[str]) -> list[str]:
     return [*out, " ".join(rest)] if rest else out
 
 
+#: ast-grep's command is also ``sg``: its first word is one of these (or ``--pattern=``/``--lang=``), never a group.
+_AST_GREP_FLAGS = frozenset({"-p", "--pattern", "-l", "--lang", "-r", "--rewrite", "-h", "--help", "-V", "--version"})
+_AST_GREP_SUBS = frozenset({"run", "scan", "new", "test", "lsp", "completions"})
+
+
+def _ast_grep(argv: list[str]) -> bool:
+    """``argv`` (``sg ...``) is ast-grep, not shadow-utils ``sg GROUP [-c] CODE``: it starts with an ast-grep flag,
+    or with an ast-grep subcommand followed by nothing or by an option other than ``-c``."""
+    first = argv[1] if len(argv) > 1 else ""
+    if first in _AST_GREP_FLAGS or first.startswith(("--pattern=", "--lang=")):
+        return True
+    nxt = argv[2] if len(argv) > 2 else ""
+    return first in _AST_GREP_SUBS and (not nxt or (nxt.startswith("-") and nxt != "-c"))
+
+
 def _launch_code(argv: list[str]) -> list[str]:
     """The shell code the launcher ``argv`` (its name a basename) runs with ``sh -c``: ``flock -c``, ``script -c``,
     ``runuser -c``, ``npx -c``, ``sg GROUP [-c] CODE``, ``entr -s CODE`` and tmux (see _tmux_code)."""
@@ -1278,7 +1368,7 @@ def _launch_code(argv: list[str]) -> list[str]:
         return _option_values(argv, _CODE_OPTS[name])
     if name == "tmux":
         return _tmux_code(argv)
-    if name == "sg":
+    if name == "sg" and not _ast_grep(argv):
         rest = argv[2:] if argv[1:2] == ["-"] else argv[1:]
         rest = rest[2:] if rest[1:2] == ["-c"] else rest[1:]
         return [" ".join(rest)] if rest else []
@@ -2501,6 +2591,13 @@ def _out_redirect_targets(sub: str) -> list[str]:
 #: Programs whose operands are written to: every operand (``tee``, ``truncate``) or the last (``cp``, ``mv``).
 _WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
 _WRITES_LAST = frozenset({"cp", "mv", "install"})
+#: The programs a run found by the run scan (_segment_scan) may start with: the ones the delete and disk checks read.
+_RUN_PROGRAMS = frozenset(
+    {"rm", "find", "git", "chmod", "chown", "chgrp", "rsync", "parted", "wipefs", "dd"}
+    | set(_DISK_TOOLS)
+    | _WRITES_ALL
+    | _WRITES_LAST
+)
 
 
 def _flag_set(args: list[str]) -> set[str]:

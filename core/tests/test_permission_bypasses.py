@@ -1361,3 +1361,65 @@ def test_harmless_launcher_commands_keep_their_decisions(tmp_path: Path, cmd: st
     assert _decide(cmd, "default", tmp_path).action == "ask", cmd
     assert _decide(cmd, "auto", tmp_path).action == "allow", cmd
     assert _decide(cmd, "yolo", tmp_path).action == "allow", cmd
+
+
+#: a delete behind a launcher no reading of it knows (an option spelling, a subcommand, a tmux chain, a quoted
+#: payload): the run scan reads `rm -rf ~` wherever it starts in the command line
+RUN_SCAN_DENIES = [
+    "flock --wa 5 L rm -rf ~",
+    "setpriv --reu 1000 rm -rf ~",
+    "script --comm 'rm -rf ~'",
+    "timeout --sig KILL 5 rm -rf ~",
+    "tmux split 'rm -rf ~'",
+    "tmux new-w 'rm -rf ~'",
+    "tmux run-s 'rm -rf ~'",
+    "tmux new -d \\; neww 'rm -rf ~'",
+    "screen -S n -X exec rm -rf ~",
+    "uv run -i https://x rm -rf ~",
+    "npx --registry https://x rm -rf ~",
+    "nsenter -W /x rm -rf ~",
+    "gdb -ex 'shell rm -rf ~' x",
+    "npm exec rm -rf ~",
+    "runuser x -- -c 'rm -rf ~'",
+    "x a 'b \"rm -rf ~\"'",
+]
+
+
+@pytest.mark.parametrize("cmd", RUN_SCAN_DENIES)
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("ruled", [False, True])
+def test_delete_anywhere_in_the_command_line_is_refused(tmp_path: Path, cmd: str, mode: str, ruled: bool) -> None:
+    rules = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}}) if ruled else None
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action == "deny", (cmd, mode, ruled)
+
+
+#: text that only names a delete (a message, a pattern, an echo) and ast-grep's `sg` are not a delete
+RUN_SCAN_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+    "rg 'rm -rf ~' docs",
+    "sg -p 'rm -rf ~' src",
+    "sg run -p 'rm -rf ~' src",
+    "python3 -c 'print(1)'",
+    "bash -c 'ls'",
+    "make clean",
+    "flock -n /tmp/l make",
+    "tmux new -s dev",
+]
+
+
+@pytest.mark.parametrize("cmd", RUN_SCAN_KEEP)
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("ruled", [False, True])
+def test_text_naming_a_delete_is_not_refused(tmp_path: Path, cmd: str, mode: str, ruled: bool) -> None:
+    rules = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}}) if ruled else None
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action != "deny", (cmd, mode, ruled)
+
+
+@pytest.mark.parametrize("cmd", ["sg wheel -c 'rm -rf ~'", "sg wheel 'rm -rf ~'", "sg - wheel -c 'rm -rf ~'"])
+def test_shadow_utils_sg_code_is_still_refused(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "yolo", tmp_path).action == "deny", cmd
