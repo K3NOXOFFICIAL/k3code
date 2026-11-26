@@ -1654,15 +1654,52 @@ def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
     return all(_literal_word(a) and check(_abs(a, cwd)) for a in _path_args(sub) if _arg_outside(a, roots, cwd))
 
 
-def _reads_secret_outside(sub: str, roots: list[str], cwd: str) -> bool:
-    """``sub`` (a builtin read-only command, not git) names a literal path outside the roots that holds a secret (see
-    _shell_read_ok): ``cat /etc/shadow``, ``ls ~/.ssh``. A person answers that, in auto mode too."""
+def _runs_builtin_read(sub: str, ruleset: list[Rule]) -> bool:
+    """The program ``sub`` really runs (wrappers, a path or a backslash in front of it dropped: ``/bin/cat``,
+    ``env cat``, ``sudo cat``, ``\\cat``, see _argv) is a builtin read-only command, whatever the spelling matched."""
     argv = _argv(sub)
-    if not argv or os.path.basename(argv[0]) == "git":
+    if not argv:
         return False
-    return any(
-        _arg_outside(a, roots, cwd) and _literal_word(a) and not _shell_read_ok(_abs(a, cwd)) for a in _path_args(sub)
-    )
+    rule = evaluate("bash", " ".join(argv), [r for r in ruleset if r.layer == 0], default="ask")
+    return rule.action == "allow" and rule.pattern not in _SANDBOXED
+
+
+def _glob_reaches_secret(arg: str, cwd: str) -> bool:
+    """``arg`` is a glob whose literal prefix lies in a tree where a secret may match (``/etc/sha*``, ``~/.ss*/id_rsa``,
+    ``/etc/pki/tls/pri*``: a guarded tree, a path _shell_read_ok refuses) or above one (``/*/shadow``). Not
+    ``/usr/lib/*.so``."""
+    cut = min((arg.index(c) for c in _GLOB_CHARS if c in arg), default=-1)
+    if cut < 0 or "$" in arg[:cut] or "`" in arg[:cut]:
+        return False
+    head = _abs(arg[:cut] + "x", cwd)  # the x keeps a partial name: `~/.ss*` is below a dot folder, `/etc/*` below /etc
+    if _guarded_tree(head) or not _shell_read_ok(head):
+        return True
+    base = os.path.dirname(head)
+    return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS))
+
+
+def _reads_secret_outside(sub: str, roots: list[str], cwd: str) -> bool:
+    """``sub`` (a builtin read-only command, not git) reads a path outside the roots that holds a secret (see
+    _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``, ``cat < /etc/shadow``; a
+    walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may match one
+    (_glob_reaches_secret). A person answers that, in auto mode too."""
+    argv = _argv(sub)
+    if argv and os.path.basename(argv[0]) == "git":
+        return False
+    walker = bool(argv) and _content_walker(argv)
+    args = _path_args(sub) if argv else []
+    sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
+    for a in (*args, *sources):
+        if not _arg_outside(a, roots, cwd):
+            continue
+        if not _literal_word(a):
+            if _glob_reaches_secret(a, cwd):
+                return True
+            continue
+        p = _abs(a, cwd)
+        if not _shell_read_ok(p) or (walker and a in args and _walk_holds_secret(p)):
+            return True
+    return False
 
 
 def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
@@ -2666,8 +2703,15 @@ def _decide_bash(
         if rule.action == "allow" and rule.layer == 0 and _home_dot_path(sub, roots, cwd):
             home_dot = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
-        readonly = rule.action == "allow" and rule.layer == 0 and rule.pattern not in _SANDBOXED
-        if readonly and _reads_secret_outside(sub, roots, cwd):
+        # the forced check goes by the program that runs, not the allow pattern the spelling matched (`/bin/cat`,
+        # `env cat`, `\cat` ask, and auto mode's classifier would answer): a user/project allow still decides
+        mine_allow = rule.action == "allow" and rule.layer > 0
+        if (
+            rule.action != "deny"
+            and not mine_allow
+            and _runs_builtin_read(sub, ruleset)
+            and _reads_secret_outside(sub, roots, cwd)
+        ):
             outside_secret = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
@@ -3062,10 +3106,15 @@ _ETC_SECRETS = (
     "/etc/gshadow",
     "/etc/sudoers",
     "/etc/ssl/private",
+    "/etc/letsencrypt",
     "/etc/wireguard",
     "/etc/NetworkManager/system-connections",
     "/etc/security/opasswd",
 )
+#: The private-key folders below /etc/pki (Fedora/RHEL: ``/etc/pki/tls/private``, ``/etc/pki/libvirt/private``).
+_PKI_PRIVATE = re.compile(r"/etc/pki/(?:[^/]+/)*private(?:/|$)")
+#: Trees a content walk of which reaches a secret below /etc (see _shell_walk_ok): /etc/pki holds _PKI_PRIVATE.
+_WALK_SECRETS = (*_ETC_SECRETS, "/etc/ssh", "/etc/pki")
 
 
 def _shell_read_ok(path: str) -> bool:
@@ -3094,6 +3143,8 @@ def _shell_read_ok(path: str) -> bool:
             return False
         if p.startswith(_ETC_SECRETS) or (_under(p, "/etc/ssh") and "key" in p[len("/etc/ssh") :].casefold()):
             return False
+        if _PKI_PRIVATE.match(p):
+            return False
         names = [c for c in p.split("/") if c]
         if any(_CREDENTIAL_NAME.fullmatch(c) or c.casefold().startswith(".env") for c in names):
             return False
@@ -3111,7 +3162,12 @@ def _shell_walk_ok(path: str) -> bool:
     ``/etc`` itself or ``/etc/ssh``. Conservative: what a home or data folder holds is not known from its name."""
     if not _shell_read_ok(path) or not _toolchain_read(path):
         return False
-    return not any(_under(s, p) for p in _spellings(path) for s in (*_ETC_SECRETS, "/etc/ssh"))
+    return not _walk_holds_secret(path)
+
+
+def _walk_holds_secret(path: str) -> bool:
+    """A content walk of ``path`` (absolute) reaches a secret below /etc: ``grep -r x /etc``, ``grep -r x /etc/pki``."""
+    return any(_under(s, p) for p in _spellings(path) for s in _WALK_SECRETS)
 
 
 def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:
