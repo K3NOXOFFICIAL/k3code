@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from k3code.permissions import PermissionMode, Rule, decide
+from k3code.permissions.engine import _REDIRECT, _WRITE_REDIRECT, _argv, _operator_targets, _operator_view
 
 ALLOWED_OUTSIDE = [
     "ls /etc",
@@ -439,9 +440,55 @@ def test_glued_redirects_and_wrappers_keep_the_secret_read_check(
         assert (dec.action, dec.needs_human) == ("ask", True), (pattern, rules, command, mode, dec.action, dec.message)
 
 
+#: A secret name ending in digits with a redirect glued to it: the digits end the word, they are no fd (``x.p12>out``
+#: once read as ``cat x.p`` with ``12>out``, and ``x.p12>&2`` lost them to the harmless ``2>&2``).
+DIGIT_ENDING_SECRET_READS = [
+    ("cat *", "cat ~/x/server.p12>out"),
+    ("cat *", "cat ~/x/server.p12>&2"),
+    ("cat *", "cat ~/x/server.p12>/dev/null"),
+    ("cat *", "cat ~/x/server.p12&>out"),
+    ("cat *", "cat ~/x/server.p12<in"),
+    ("cat *", "cat ~/x/server.p12 1>out"),
+    ("cat *", "cat ~/x/server.p12 2>&1"),
+    ("cat *", "cat ~/x/id_ed25519>out"),
+    ("cat *", "cat ~/x/secrets2.txt>out"),
+    ("sudo *", "sudo cat ~/x/server.p12>out"),
+    # a read glued to a digit-ending source: the digits are not an fd
+    ("cat *", "cat >12<~/x/server.p12"),
+    ("cat *", "cat >out<~/x/server.p12"),
+    ("sudo *", "sudo cat >12<~/x/server.p12"),
+]
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO])
+@pytest.mark.parametrize(("pattern", "command"), DIGIT_ENDING_SECRET_READS)
+def test_a_redirect_glued_to_a_digit_ending_secret_keeps_the_secret_check(
+    tmp_path: Path, pattern: str, command: str, mode: PermissionMode
+) -> None:
+    for rules in ([], [Rule(tool="bash", pattern=pattern, action="allow", layer=1)]):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules)
+        assert (dec.action, dec.needs_human) == ("ask", True), (rules, command, mode, dec.action, dec.message)
+
+
+def test_digits_glued_to_a_redirect_stay_in_the_word() -> None:
+    assert _argv("cat f1>out2") == ["cat", "f1"]
+    assert _argv("cat f1 2>out2") == ["cat", "f1"]
+    assert _argv("cat f1&>out2") == ["cat", "f1"]
+    for command in ("cat f1>out2", "echo x > out2", "cat f1 2>out2", "cat f1&>out2"):
+        assert _operator_targets(_REDIRECT, *_operator_view(command)) == ["out2"], command
+        assert _WRITE_REDIRECT.findall(command) == ["out2"], command
+
+
 #: Commands with no secret in them keep their decision (default, accept-edits, auto).
 GLUED_AND_WRAPPED_KEEP = [
     ("cat /etc/hostname>out", "ask", "allow"),
+    ("ls 2>&1", "allow", "allow"),
+    ("ls >&2", "allow", "allow"),
+    ("ls 1>/dev/null", "allow", "allow"),
+    ("ls &>/dev/null", "allow", "allow"),
+    ("echo hi 2>/dev/null", "ask", "allow"),
+    ("make 2>&1 | tail", "ask", "allow"),
+    ("cat f1>out2", "ask", "allow"),
     ("watch -n1 df", "ask", "allow"),
     ("strace -o /dev/null ls", "ask", "allow"),
     ("busybox ls", "ask", "allow"),
