@@ -113,10 +113,12 @@ def test_brace_expansion_keeps_prefix_and_suffix() -> None:
     assert _expanded_text("find . -exec rm {} \\;") is None
 
 
-@pytest.mark.parametrize("mode", ["default", "auto"])
-def test_brace_expansion_too_large_to_check_needs_a_human(mode: str, tmp_path: Path) -> None:
+# a brace expansion too large to read word by word was an ask (yolo allowed it): now denied in every mode, since
+# what it runs is unknown (`{rm,-rf,/} {1..100}`)
+@pytest.mark.parametrize("mode", MODES)
+def test_brace_expansion_too_large_to_check_is_denied(mode: str, tmp_path: Path) -> None:
     got = _decide("echo {a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}", mode, tmp_path)
-    assert (got.action, got.needs_human) == ("ask", True)
+    assert got.action == "deny" and got.hardline
 
 
 def _decide_with(cmd: str, mode: str, cwd: Path, allow: str | None):
@@ -189,3 +191,53 @@ def test_command_substitution_in_single_quotes_is_a_literal() -> None:
 def test_unexpanded_command_keeps_its_decision(cmd: str, want: dict, mode: str, tmp_path: Path) -> None:
     got = _decide(cmd, mode, tmp_path)
     assert (got.action, got.needs_human) == (want[mode], False), cmd
+
+
+_RULE_LAYERS = {"none": None, "printf+echo": {"printf *": "allow", "echo *": "allow"}}
+
+
+def _decide_layer(cmd: str, mode: str, cwd: Path, layer: str):
+    rules = from_config({"bash": _RULE_LAYERS[layer]}) if _RULE_LAYERS[layer] else None
+    return decide(mode=mode, tool="bash", args={"command": cmd}, cwd=cwd, user_rules=rules)
+
+
+@pytest.mark.parametrize("layer", _RULE_LAYERS)
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(
+    "cmd", ["printf -v x 'a[%s(id)]' '$'; echo $[x]", "echo $[x]", "echo $[1+1]", 'echo "$[x]"', "echo $((x))"]
+)
+def test_allow_never_covers_old_arithmetic(cmd: str, mode: str, layer: str, tmp_path: Path) -> None:
+    # `$[x]` expands x and runs a `$(...)` in its value; yolo, which allows any non-hardline command, is not covered
+    got = _decide_layer(cmd, mode, tmp_path, layer)
+    assert got.action != "allow" or (mode == "auto" and got.auto_allowed), cmd
+
+
+def test_ansi_c_quote_is_no_expansion(tmp_path: Path) -> None:
+    assert _decide_layer("echo $'a\\tb'", "default", tmp_path, "printf+echo").action == "allow"
+
+
+@pytest.mark.parametrize("layer", _RULE_LAYERS)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("cmd", ["{rm,-rf,/} {1..100}", "rm${IFS}-rf${IFS}/ {1..100}"])
+def test_over_cap_expansion_is_never_allowed(cmd: str, mode: str, layer: str, tmp_path: Path) -> None:
+    got = _decide_layer(cmd, mode, tmp_path, layer)
+    assert got.action != "allow", cmd
+    if mode == "yolo":
+        assert got.action == "deny" and got.hardline, cmd
+
+
+@pytest.mark.parametrize("layer", _RULE_LAYERS)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("cmd", ["{bash,-c,'{rm,-rf,/}'}", "bash${IFS}-c${IFS}'rm${IFS}-rf${IFS}/'"])
+def test_command_made_by_expansion_is_expanded_again(cmd: str, mode: str, layer: str, tmp_path: Path) -> None:
+    got = _decide_layer(cmd, mode, tmp_path, layer)
+    assert got.action == "deny" and got.hardline, cmd
+
+
+@pytest.mark.parametrize("layer", _RULE_LAYERS)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("cmd", ["bash -c 'echo hi'", "bash -c 'ls {src,tests}'", 'sh -c "echo ${HOME}"'])
+def test_nested_shell_keeps_its_decision(cmd: str, mode: str, layer: str, tmp_path: Path) -> None:
+    got = _decide_layer(cmd, mode, tmp_path, layer)
+    want = {"default": "ask", "auto": "allow", "yolo": "allow"}[mode]
+    assert (got.action, got.hardline, got.needs_human) == (want, None, False), cmd

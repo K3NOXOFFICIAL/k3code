@@ -145,6 +145,7 @@ HARDLINE_NAMES: list[str] = [
     "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
+    "expansion-over-cap",  # a brace expansion too large to check word by word (see _check_expanded)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -448,27 +449,61 @@ def _check_parse(
         if hit:
             return hit, parsed
         # the shell expands braces and splits `$IFS` after the words were read: `rm${IFS}-rf${IFS}/` and `{rm,-rf,/}`
-        # run `rm -rf /`. The line and every nested command are checked once more in that form (not recursively).
-        for text in dict.fromkeys([parsed.clean, *parsed.nested]):
-            try:
-                alt = _expanded_text(text)
-            except _BraceOverCap:
-                parsed.expansion_over_cap = True
-                continue
-            if alt is None:
-                continue
-            alt_parsed = parse(alt, budget=budget)
-            if budget[0] < 0 or alt_parsed.too_deep:
-                return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
-            _reserve_users(alt_parsed.clean)
-            alt_dirs = _Dirs([cwd], cwd, home, _cdpath_entries(alt))
-            hit = _match(alt_parsed.clean, extra_patterns) or _check_parsed(alt_parsed, extra_patterns, alt_dirs)
-            if hit:
-                return hit, parsed
-            parsed.expanded.append(alt_parsed)
+        # run `rm -rf /`. The line and every nested command are checked once more in that form, and so are the
+        # commands that form makes (`{bash,-c,'{rm,-rf,/}'}`), _EXPAND_MAX_DEPTH levels deep (see _check_expanded).
+        hit = _check_expanded([parsed.clean, *parsed.nested], parsed, extra_patterns, cwd, home, budget, set(), 0)
+        if hit:
+            return hit, parsed
         return None, parsed
     except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
         return "scan-depth", parsed
+
+
+#: how many times a command the shell makes by expanding braces or splitting `$IFS` is itself expanded and checked;
+#: one that still expands at the last level is denied (``scan-depth``)
+_EXPAND_MAX_DEPTH = 3
+
+
+def _check_expanded(
+    texts: list[str],
+    parsed: Parsed,
+    extra: list[str] | None,
+    cwd: str | None,
+    home: str,
+    budget: list[int],
+    seen: set[str],
+    depth: int,
+) -> str | None:
+    """Check ``texts`` (a line and its nested commands) in the form the shell runs them after brace expansion and
+    `$IFS` splitting, then the nested commands that form has, ``depth`` levels down. Each expanded parse is added to
+    ``parsed.expanded``. A brace expansion too large to read word by word is denied (``expansion-over-cap``): what it
+    runs is unknown, so not even yolo allows it."""
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        try:
+            alt = _expanded_text(text)
+        except _BraceOverCap:
+            parsed.expansion_over_cap = True
+            return "expansion-over-cap"
+        if alt is None or alt == text:
+            continue
+        if depth >= _EXPAND_MAX_DEPTH:
+            return "scan-depth"
+        alt_parsed = parse(alt, budget=budget)
+        if budget[0] < 0 or alt_parsed.too_deep:
+            return "scan-budget" if budget[0] < 0 else "scan-depth"
+        _reserve_users(alt_parsed.clean)
+        alt_dirs = _Dirs([cwd], cwd, home, _cdpath_entries(alt))
+        hit = _match(alt_parsed.clean, extra) or _check_parsed(alt_parsed, extra, alt_dirs)
+        if hit:
+            return hit
+        parsed.expanded.append(alt_parsed)
+        hit = _check_expanded([alt_parsed.clean, *alt_parsed.nested], parsed, extra, cwd, home, budget, seen, depth + 1)
+        if hit:
+            return hit
+    return None
 
 
 def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
@@ -1602,13 +1637,14 @@ def _unquoted_expansion(sub: str) -> bool:
     return False
 
 
-#: what follows a ``$`` the shell replaces with a parameter's value: a name, ``{``, a digit or a special parameter
-_PARAM_START = frozenset("_{@*#?$!-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+#: what follows a ``$`` the shell replaces with a value: a name, ``{``, a digit or a special parameter, and ``[``
+#: (``$[x]``, old arithmetic like ``$((x))``: it expands ``x``, and a ``$(...)`` in its value runs)
+_PARAM_START = frozenset("_{[@*#?$!-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 def param_expansion(sub: str) -> bool:
-    """Whether ``sub`` expands a parameter (``$X``, ``${X:-y}``, ``$1``, ``$@``) outside single quotes. In double
-    quotes it is not split, but its value still names what the program gets, not the command line."""
+    """Whether ``sub`` expands a parameter (``$X``, ``${X:-y}``, ``$1``, ``$@``) or ``$[...]`` outside single quotes. In
+    double quotes it is not split, but its value still names what the program gets, not the command line."""
     i, n, dquoted = 0, len(sub), False
     while i < n - 1:
         c = sub[i]
