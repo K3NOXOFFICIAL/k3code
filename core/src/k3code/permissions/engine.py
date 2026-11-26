@@ -1884,13 +1884,14 @@ def _word_forms(word: str) -> list[str] | None:
         return None
 
 
-def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "") -> bool:
+def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "", spelled: str = "") -> bool:
     """``sub`` (a builtin read-only command, not git; one part of ``line``) reads a path outside the roots that holds a
     secret (see _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``,
     ``cat < /etc/shadow``; a walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may
     match one (_glob_reaches_secret). Every brace expansion of a word is checked (``/etc/{a,shadow}``), and a word with
     a variable as the line sets it (_var_resolved, ``$HOME/.netrc``); a variable k3code cannot resolve (``$X/y``) is an
-    unknown path, so it counts as a secret. A person answers that, in auto mode too."""
+    unknown path (_unknown_path), so it counts as a secret; a single-quoted ``$`` is no variable (``spelled``: the sub
+    as written, when ``sub`` is its normalised argv). A person answers that, in auto mode too."""
     argv = _argv(sub)
     if argv and os.path.basename(argv[0]) == "git":
         return False
@@ -1898,17 +1899,77 @@ def _reads_secret_outside(sub: str, roots: list[str], cwd: str, line: str = "") 
     walker = bool(argv) and _content_walker(argv)
     args = _path_args(sub) if argv else []
     sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
-    for arg in (*args, *sources):
+    literal = _dollar_literal_words(spelled or sub)
+    pattern = 0 if _pattern_first(argv) else -1  # grep's pattern is no path: an unknown one in it forces no one
+    for i, arg in enumerate((*args, *sources)):
         forms = _word_forms(arg)
         if forms is None:
             return True
         for w in forms:
-            a = _var_resolved(w, line, cwd) if _PARAM.search(w) else w
+            a = _var_resolved(w, line, cwd) if _PARAM.search(w) and arg not in literal else w
             if a is None:
-                return True  # an unknown path
+                if i != pattern and _unknown_path(w, roots, cwd):
+                    return True  # an unknown path
+                a = w  # a variable after a folder in the project: read as before (`cat src/$X`)
             if _secret_word(a, walker and arg in args, roots, cwd):
                 return True
     return False
+
+
+def _unknown_path(word: str, roots: list[str], cwd: str) -> bool:
+    """``word`` (a variable k3code cannot resolve in it) may be any path: the text before its first ``$`` is empty
+    (``$X``, ``"$1"``), absolute or ``~`` (``/etc/$X``, ``~/$X``), or lies outside the roots (``../$X``)."""
+    prefix = re.sub(r"[\'\"\\]", "", word[: word.index("$")])
+    return not prefix or prefix.startswith(("/", "~")) or not _inside(_abs(prefix, cwd), roots)
+
+
+#: readers whose first non-option word is a pattern, not a path, unless an option gives the pattern (``-e``, ``-f``)
+_PATTERN_READERS = frozenset({"grep", "egrep", "fgrep", "rg"})
+
+
+def _pattern_first(argv: list[str]) -> bool:
+    """``argv`` is a grep/rg whose first non-option word is its pattern: no ``-e``/``-f``/``--regexp``/``--file``
+    (a short cluster with an e or f counts, so a misread one leaves the stricter reading)."""
+    if not argv or os.path.basename(argv[0]) not in _PATTERN_READERS:
+        return False
+    for t in argv[1:]:
+        if t == "--":
+            break
+        if t.startswith(("--regexp", "--file")) or (t[:1] == "-" and t[1:2] != "-" and set(t[1:]) & set("ef")):
+            return False
+    return True
+
+
+def _dollar_literal_words(sub: str) -> frozenset[str]:
+    """The words of ``sub`` (quotes removed, as shlex removes them) in which every ``$`` is literal: single-quoted or
+    backslash-escaped (``grep 'a$b'``). A word spelled once literal and once not, or that this scan splits other than
+    shlex does, is not in it: it is read as an expansion."""
+    lit: set[str] = set()
+    exp: set[str] = set()
+    word: list[str] | None = None
+    expands, quote, i, n = False, "", 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if not quote and c in " \t\n":
+            if word is not None:
+                (exp if expands else lit).add("".join(word))
+            word, expands, i = None, False, i + 1
+            continue
+        word = [] if word is None else word
+        if c == "\\" and quote != "'" and i + 1 < n:
+            nxt = sub[i + 1]
+            keep = quote == '"' and nxt not in '"\\'  # shlex keeps a backslash in double quotes before others
+            word.append(c + nxt if keep else nxt)
+            i += 2
+        elif c in "'\"" and quote in ("", c):
+            quote, i = ("" if quote else c), i + 1
+        else:
+            expands = expands or (c == "$" and quote != "'")
+            word.append(c)
+            i += 1
+    if word is not None and not quote:
+        (exp if expands else lit).add("".join(word))
+    return frozenset(lit - exp)
 
 
 def _secret_word(a: str, walks: bool, roots: list[str], cwd: str) -> bool:
@@ -2964,8 +3025,12 @@ def _decide_bash(
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
     # a nested command reads it the same: `bash -c 'cat /etc/shadow'` under `bash *`
+    # a normalised sub (`sudo cat '$X'` is `cat $X`) keeps the quoting of the sub it came from; a nested one its own
+    nested = {f for n in parsed.nested for f in (n, " ".join(_argv(n)))}
+    spelled = {" ".join(_argv(s)): s for s in parsed.subs}
     outside_secret = outside_secret or any(
-        _runs_builtin_read(form, ruleset) and _reads_secret_outside(form, roots, cwd, command)
+        _runs_builtin_read(form, ruleset)
+        and _reads_secret_outside(form, roots, cwd, command, "" if form in nested else spelled.get(form, ""))
         for form in _rule_forms(parsed)
     )
     if unsafe and worst.action != "deny":

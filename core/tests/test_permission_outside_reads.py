@@ -328,6 +328,16 @@ EXPANDED_SECRET_READS = [
     "cd /etc && cat $PWD/shadow",
     "cat /etc/sh*",
     "cat ~/.ss*/id_rsa",
+    # a variable k3code cannot resolve, with nothing before it, an absolute or home folder, or a folder outside
+    "cat $X",
+    'head "$1"',
+    "ls $DIR",
+    "cat /etc/$X",
+    "cat ~/$X",
+    "cat ../$X",
+    'cat < "$X"',
+    "cat '$X'; bash -c 'cat $X'",
+    "HOMEDIR=/tmp/x; head $HOMEDIR/README.md ~/README.md",
 ]
 
 
@@ -350,6 +360,14 @@ def test_every_expansion_of_a_word_is_checked_for_secrets(command: str, mode: Pe
         ("cat $HOME/notes.txt", "ask", "allow"),
         ("ls $PWD", "ask", "allow"),
         ("grep -rn 'foo$' src", "allow", "allow"),
+        # a `$` in a pattern or in single quotes, or a variable after a folder in the project
+        ("grep 'a$b' README.md", "allow", "allow"),
+        ("grep -n '\\$scope' src", "allow", "allow"),
+        ("grep $P README.md", "ask", "allow"),
+        ("cat '$X'", "ask", "allow"),
+        ("cat src/$X", "ask", "allow"),
+        ('cat src/"$X"', "ask", "allow"),
+        ("echo $X", "ask", "allow"),
     ],
 )
 def test_expansions_without_a_secret_keep_their_decision(command: str, default: str, auto: str, tmp_path) -> None:
