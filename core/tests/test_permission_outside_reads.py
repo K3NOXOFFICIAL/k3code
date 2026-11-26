@@ -86,3 +86,54 @@ def test_broad_walks_expansions_and_compounds_do_not_allow(command: str, tmp_pat
 def test_cwd_outside_the_project(cwd: str, command: str, allowed: bool, tmp_path) -> None:
     dec = decide(mode=PermissionMode.DEFAULT, tool="bash", args={"command": command, "cwd": cwd}, cwd=tmp_path)
     assert (dec.action == "allow") is allowed, (cwd, command, dec.action, dec.message)
+
+
+#: Secret reads spelled other than a builtin allow pattern: a path or backslash in front of the program, a wrapper, an
+#: input redirect, a glob that may match a secret, and the Fedora/RHEL key and VPN folders below /etc.
+SECRET_READS_RESPELLED = [
+    "/bin/cat /etc/shadow",
+    "/usr/bin/head ~/.aws/credentials",
+    "env cat /etc/shadow",
+    "command cat /etc/shadow",
+    r"\cat /etc/shadow",
+    "sudo cat /etc/shadow",
+    "timeout 5 cat /etc/shadow",
+    "nice cat /etc/shadow",
+    "cat < /etc/shadow",
+    "grep x < ~/.aws/credentials",
+    "tr a b < ~/.netrc",
+    "cat /etc/sha*",
+    "cat ~/.ss*/id_rsa",
+    "cat /etc/pki/tls/pri*",
+    "cat /*/shadow",
+    "grep -r x /etc/pki",
+    "cat /etc/pki/tls/private/x.key",
+    "cat /etc/wireguard/wg0.conf",
+    "ls /etc/letsencrypt/live",
+    "ls /etc/pki/libvirt/private",
+]
+
+
+@pytest.mark.parametrize("command", SECRET_READS_RESPELLED)
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.AUTO])
+def test_secret_reads_ask_a_person_however_spelled(command: str, mode: PermissionMode, tmp_path) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+    assert dec.action == "deny" or (dec.action == "ask" and dec.needs_human), (command, dec.action, dec.message)
+
+
+@pytest.mark.parametrize(
+    ("command", "default", "auto"),
+    [
+        ("cat /etc/os-release", "allow", "allow"),
+        ("ls /etc", "allow", "allow"),
+        ("/bin/cat /etc/os-release", "ask", "allow"),
+        ("env cat /etc/hostname", "ask", "allow"),
+        ("cat < README.md", "ask", "allow"),
+        ("ls /usr/lib/*.so", "ask", "allow"),
+    ],
+)
+def test_harmless_respellings_keep_their_decision(command: str, default: str, auto: str, tmp_path) -> None:
+    (tmp_path / "README.md").write_text("x")
+    for mode, want in ((PermissionMode.DEFAULT, default), (PermissionMode.AUTO, auto)):
+        dec = decide(mode=mode, tool="bash", args={"command": command}, cwd=tmp_path)
+        assert (dec.action, dec.needs_human) == (want, False), (command, mode, dec.action, dec.message)
