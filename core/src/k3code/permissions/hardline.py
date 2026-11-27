@@ -606,6 +606,9 @@ _TEXT_PROGRAMS = frozenset(
 _TEXT_GIT_SUBS = frozenset({"commit", "tag", "log", "notes"})
 #: Options whose value is a message or a pattern: a run is not read from that value (``hg commit -m 'rm -rf ~'``).
 _TEXT_VALUE_OPTS = frozenset({"-m", "--message", "-e", "--regexp", "-F", "--file", "-p", "--pattern"})
+#: Programs whose ``-m``/``--message`` value is a message even though the program is not a text program.
+_MESSAGE_PROGRAMS = frozenset({"hg"})
+_MESSAGE_OPTS = frozenset({"-m", "--message"})
 #: Words that end a run: shell operators inside a quoted payload and tmux's ``\;`` command separator.
 _RUN_ENDS = frozenset({";", "\\;", "&&", "||", "|", "&", "|&"})
 #: How deep the run scan reads quoted multi-word arguments (``a 'b "rm -rf ~"'`` is two levels).
@@ -623,13 +626,22 @@ def _text_only(argv: list[str]) -> bool:
     return name in _TEXT_PROGRAMS or (name == "git" and _git_sub(argv)[0] in _TEXT_GIT_SUBS)
 
 
+def _text_value_opts(argv: list[str]) -> frozenset[str]:
+    """The options whose value the program of ``argv`` reads as text: _TEXT_VALUE_OPTS for a text program
+    (_text_only), ``-m``/``--message`` for a message program (``hg commit -m``), none for any other program, which may
+    run the value (``watch -p CMD``, ``tar -F CMD``, ``hg -e CMD``)."""
+    if _text_only(argv):
+        return _TEXT_VALUE_OPTS
+    return _MESSAGE_OPTS if argv and os.path.basename(argv[0]) in _MESSAGE_PROGRAMS else frozenset()
+
+
 def _run_scan(words: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
     """The backstop behind the launcher readings (_command_argv): every run of words in the command line, from any word
     to the next separator, is checked as if it were the command, so ``anylauncher --opt v rm -rf ~`` is refused
     whatever the launcher. Quoted multi-word arguments are split as shell code and scanned the same way, to
     _RUN_SCAN_DEPTH levels (``script --comm 'rm -rf ~'``, ``tmux split 'rm -rf ~'``). Text programs (_text_only) and
-    the values of message/pattern options (_TEXT_VALUE_OPTS) are not read; their env assignments and git's own options
-    are (_text_args_start). Each word is read as the commands derived from it too (_run_heads)."""
+    the values of their message/pattern options (_text_value_opts) are not read; their env assignments and git's own
+    options are (_text_args_start). Each word is read as the commands derived from it too (_run_heads)."""
     if _text_only(_command_argv(words)):
         return _segment_scan(words, dirs, home, depth)
     start = 0
@@ -658,6 +670,10 @@ def _text_args_start(seg: list[str]) -> int:
 _RUN_PREFIXES = ("+:!", "+!", ":!", "!", "|")
 #: How many ``=``/``:`` of one word start a value read as a command (``--checkpoint-action=exec=CMD`` is two).
 _RUN_VALUE_SPLITS = 4
+#: One Ex address: ``.``, ``$``, ``%``, a line number, a mark, a search, each with optional ``+N``/``-N`` offsets.
+_EX_ADDR = r"(?:[.$%]|\d+|'[a-zA-Z<>]|/[^/]*/|\?[^?]*\?)(?:\s*[+-]\d*)*"
+#: A vim filter through a command over an Ex range (``%!CMD``, ``1,$!CMD``, ``+'silent .!CMD'``).
+_EX_RANGE_FILTER = re.compile(rf"\+?:?\s*(?:silent!?\s+)?:?\s*{_EX_ADDR}(?:\s*[,;]\s*{_EX_ADDR})*\s*!")
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 
 
@@ -679,6 +695,8 @@ def _run_heads(w: str) -> list[tuple[str, bool]]:
     heads = [(t, False) for t in tails]
     for t in tails:
         p = t[7:] if t.startswith("silent !") else next((t[len(x) :] for x in _RUN_PREFIXES if t.startswith(x)), None)
+        m = None if p else _EX_RANGE_FILTER.match(t)
+        p = t[m.end() :] if m else p
         if p:
             heads.append((p.lstrip(), True))
     if w.startswith("ext::"):
@@ -699,6 +717,22 @@ def _quoted_scan(text: str, dirs: _Dirs, home: str, depth: int) -> str | None:
     return None
 
 
+#: A sed ``s`` command and its flags: ``s/RE/REPL/FLAGS`` with any delimiter, at the start of a word or after a
+#: separator or an address; the ``e`` flag runs the replaced pattern space, so REPL is a command line.
+_SED_PART = r"(?:\\.|(?!\1)[^\\])*"
+_SED_SUBST = re.compile(rf"(?:^|(?<=[\s;{{}}0-9$/!,=]))s([^\\\n]){_SED_PART}\1({_SED_PART})\1([a-zA-Z0-9]*)")
+_SEDS = frozenset({"sed", "gsed"})
+
+
+def _sed_exec_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    """``sed 's/.*/rm -rf ~/e'``: the replacement of an ``s`` command with the ``e`` flag is scanned as a command."""
+    argv = _command_argv(seg)
+    if not argv or os.path.basename(argv[0]) not in _SEDS or depth >= _RUN_SCAN_DEPTH:
+        return None
+    repls = dict.fromkeys(m.group(2) for w in argv[1:] for m in _SED_SUBST.finditer(w) if "e" in m.group(3))
+    return next((hit for r in repls if (hit := _quoted_scan(r, dirs, home, depth))), None)
+
+
 #: How many words the runs of one segment may read in all: each run reads to the end of the segment, so a segment of
 #: n run starts (``x rm rm rm ...``, ``x -ca=rm -ca=rm ...``) read n^2 words. Past this it is refused (``scan-budget``).
 _RUN_SCAN_BUDGET = 100_000
@@ -706,8 +740,12 @@ _RUN_SCAN_BUDGET = 100_000
 
 def _segment_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
     budget = _RUN_SCAN_BUDGET
+    text_opts = _text_value_opts(_command_argv(seg))
+    sed_hit = _sed_exec_scan(seg, dirs, home, depth)
+    if sed_hit:
+        return sed_hit
     for i in range(_text_args_start(seg)):
-        if i and seg[i - 1] in _TEXT_VALUE_OPTS:
+        if i and seg[i - 1] in text_opts:
             continue
         w = seg[i]
         if any(c.isspace() for c in w):
@@ -1947,14 +1985,32 @@ def _piped_text_code(stages: list[str]) -> list[tuple[str, str]]:
         if argv[:1] not in (["echo"], ["printf"]):
             continue
         later = [_command_argv(_tokens(s)) for s in stages[j + 1 :]]
-        if not any(a and a[0] in _SHELLS and _runs_stdin_as_code(a) for a in later):
+        schedule = _schedules_stdin(later[-1])
+        if not schedule and not any(a and a[0] in _SHELLS and _runs_stdin_as_code(a) for a in later):
             continue
         args = argv[1:]
         while argv[0] == "echo" and args and args[0] in ("-n", "-e", "-E", "-ne", "-en"):
             args = args[1:]
-        if args:
-            out.append((" ".join(args), stage))
+        text = " ".join(args)
+        if schedule == "crontab":
+            text = "\n".join(_CRONTAB_SCHEDULE.sub("", line, count=1) for line in text.splitlines())
+        if text.strip():
+            out.append((text, stage))
     return out
+
+
+#: The schedule of a crontab line: ``@reboot`` and the like, or five time fields.
+_CRONTAB_SCHEDULE = re.compile(r"^\s*(?:@\w+|(?:\S+\s+){4}\S+)\s+")
+
+
+def _schedules_stdin(argv: list[str]) -> str:
+    """``at``/``batch`` (no ``-f``/listing option) or ``crontab -`` as the last pipeline stage: each runs its stdin as
+    shell code later (``echo 'rm -rf ~' | at now``). Returns the program name, or "" when stdin is not run."""
+    name = os.path.basename(argv[0]) if argv else ""
+    opts = [a for a in argv[1:] if a.startswith("-") and a != "-"]
+    if name in ("at", "batch") and not any(o[1:2] in ("f", "l", "d", "r", "c") for o in opts):
+        return name
+    return name if name == "crontab" and "-" in argv[1:] else ""
 
 
 def _xargs_runs_input_as_code(words: list[str]) -> bool:
