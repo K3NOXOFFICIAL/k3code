@@ -34,9 +34,9 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `765b56f0`)
+## Verification (final tree `e1ef4aab`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13530 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
+- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13742 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
@@ -54,6 +54,8 @@ Open findings, none fixed:
 5. LOW string concatenation that splits the program word: `os.system("rm"+" -rf ~")`.
 
 This closes the review series for this session: rounds 1-6, 8, 9, 11, 12, 13 FAIL; 7 no verdict; 10 PASS WITH LOW. The heuristic parser has not converged. The sound fix is running bash in the sandbox in every mode.
+
+Follow-up (commit `c2230429`, merged `e1ef4aab`, NOT re-reviewed): findings 1, 2 and 3 are fixed: punctuation quote delimiters end a run, interpreters without a code argument, `parallel`, `source /dev/stdin` and `>(sh)` count as stdin runners, and argv-list string joins are read as blanks. 34 deny cases x 6 cells: 198 not denied before, 0 after; 23 keep commands unchanged; full suite 13742 passed. Still open from this round: findings 4 and 5, `| awk -f -`, `| bash <(cat)`, a pipe into an unknown launcher that runs stdin.
 
 ## Review round 12 (tip `5a3c7ab8`, raw-text backstop `6e080242`): FAIL, fixed afterwards but NOT re-reviewed
 
