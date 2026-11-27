@@ -1842,3 +1842,80 @@ def test_an_oversize_line_of_short_runs_is_refused_fast(tmp_path: Path, mode: st
     d = _decide(" ; ".join([seg] * 40), mode, tmp_path)
     assert time.perf_counter() - start < 1.0
     assert d.action != "allow" and "too large to check" in (d.message or "")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "python3 -c '" + " ".join(f'"rm a{i}"' for i in range(3000)) + "'",
+        "python3 -c '" + " ".join(f'"cd a{i}"' for i in range(3000)) + "'",
+        "echo a | sh -s | " * 200 + "sh",
+        "python3 <<'EOF'\n" + "".join(f'x("rm a{i}")\n' for i in range(3000)) + "EOF",
+    ],
+)
+def test_the_payload_and_producer_scans_stay_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+#: review 12: a command line in a quoted literal of a program's code (`$IFS`, braces, a cd), a group or compound
+#: command piped to a stdin runner, and a heredoc an interpreter runs as its program
+PAYLOAD_RUNS = [
+    ("awk", "awk 'BEGIN{system(\"rm${IFS}-rf${IFS}$HOME\")}'"),
+    ("python3", "python3 -c 'import os;os.system(\"rm$IFS-rf$IFS~\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"rm${IFS}-rf${IFS}/\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"{rm,-rf,~}\")'"),
+    ("perl", "perl -e 'system(\"cd;rm -rf .\")'"),
+    ("perl", "perl -e 'system(\"cd ~;rm -rf *\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"cd / && rm -rf *\")'"),
+    ("at", "{ echo 'rm -rf ~'; true; } | at now"),
+    ("sh", "{ echo 'rm -rf ~'; true; } | sh"),
+    ("bash", "( echo 'rm -rf ~'; : ) | bash"),
+    ("sh", "{ printf 'rm -rf ~'; } 2>/dev/null | sh"),
+    ("at", "{ { echo 'rm -rf ~'; }; } | at now"),
+    ("at", "if true; then echo 'rm -rf ~'; fi | at now"),
+    ("at", "for i in 1; do echo 'rm -rf ~'; done | at now"),
+    ("at", "f(){ echo 'rm -rf ~'; }; f | at now"),
+    ("at", "echo 'rm -rf ~' | (at now)"),
+    ("at", "echo 'rm -rf ~' | { at now; }"),
+    ("python3", "python3 <<'EOF'\nimport os\nos.system(\"rm -rf ~\")\nEOF"),
+    ("perl", "perl <<'EOF'\nsystem(\"rm -rf ~\");\nEOF"),
+    ("cat", "cat <<'EOF' | python3\nimport os\nos.system(\"rm -rf ~\")\nEOF"),
+    ("ruby", "ruby <<EOF\nsystem('rm -rf ~')\nEOF"),
+    ("node", "node <<EOF\nrequire('child_process').execSync('rm -rf ~')\nEOF"),
+    ("python3", "python3 <<'EOF'\nimport os\nos.system(\"rm${IFS}-rf${IFS}~\")\nEOF"),
+]
+PAYLOAD_KEEP = [
+    "python3 -c 'print(\"rm -rf build\")'",
+    "python3 -c 'import os;os.system(\"ls\")'",
+    "python3 -c 'import os;os.system(\"cd src && make\")'",
+    "{ echo hi; true; } | sh",
+    "echo hi | at now",
+    "perl -e 'print 1'",
+    "awk 'BEGIN{print 1}'",
+    "cd src && make",
+    "git commit -m 'rm -rf ~ is bad'",
+    "git commit -m 'say \"rm -rf ~\"'",
+    "python3 <<'EOF'\nprint('hi')\nEOF",
+    "python3 <<'EOF'\nimport shutil\nshutil.rmtree(\"build\")\nEOF",
+    "cat > x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "tee x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "cat <<'EOF'\nrm -rf ~\nEOF",
+    "git commit -F - <<'EOF'\nrm -rf ~ was the bug\nEOF",
+    "echo 'rm -rf build' | sh",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), PAYLOAD_RUNS)
+def test_a_command_line_a_payload_runs_is_refused(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", PAYLOAD_KEEP)
+def test_a_payload_that_runs_nothing_catastrophic_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd

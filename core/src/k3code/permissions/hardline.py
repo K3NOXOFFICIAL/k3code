@@ -434,7 +434,11 @@ def check_parse(
     long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope). A parse
     that ``oversize`` refuses is not checked (no hit): the caller refuses it as too large, without the checks' cost."""
     with lookup_scope():
-        return _check_parse(command, extra_patterns, cwd, home, oversize)
+        token = _PAYLOAD_STATE.set((0, cwd))  # the quoted-literal checks read their lines in this cwd
+        try:
+            return _check_parse(command, extra_patterns, cwd, home, oversize)
+        finally:
+            _PAYLOAD_STATE.reset(token)
 
 
 def _check_parse(
@@ -568,6 +572,9 @@ def _check_parsed(
     # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
     home = dirs.home
     dirs.cond |= _conditional_names(parsed.clean)
+    hit = _pipe_producer_scan(parsed.clean, dirs)
+    if hit:
+        return hit
     need = {k for ks in parsed.child_subs for k in ks}
     where: dict[int, _Where] = {}  # the directories of the subs a child came from, taken at that sub
     fetched: set[str] = set()  # files an earlier command of the line downloaded (see _download_run_check)
@@ -594,6 +601,13 @@ def _check_parsed(
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
             or _run_scan(words, dirs, home, 0)
             or _raw_text_scan(sub, words, argv, dirs, home)
+            or _heredoc_code_scan(parsed.heredocs[k], parsed.code_heredoc[k], extra, dirs)
+            or (
+                argv
+                and not _raw_exempt(words, argv)
+                and os.path.basename(argv[0]) not in _MESSAGE_PROGRAMS
+                and _payload_line_check(argv[1:], extra, home)
+            )
         )
         if hit:
             return hit
@@ -3049,6 +3063,113 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
                 )
                 if hit:
                     return hit
+    return None
+
+
+#: A quoted literal in a word or a heredoc body (``"..."``/``'...'``): the strings a program's code passes on.
+_PAYLOAD_LITERAL = re.compile(r"\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'", re.S)
+#: A literal that may be a command line: a _RUN_PROGRAMS word or a cd at a word boundary (``rm${IFS}-rf``,
+#: ``{rm,-rf,~}``, ``cd;rm``).
+_PAYLOAD_RUN_WORD = re.compile(
+    r"(?<![\w.-])(?:" + "|".join(map(re.escape, sorted({*_RUN_PROGRAMS, "cd", "pushd"}))) + r"|mkfs[\w.]*)(?![\w-])"
+)
+#: An ANSI-C quoted blank (``$'\t'``, ``$' '``): a word separator once the shell has read it.
+_PAYLOAD_ANSI_BLANK = re.compile(r"\$'(?:\\[tnv]|\s)+'")
+#: (depth, cwd) of the quoted-literal check in progress (see _payload_line_check); None outside check_parse.
+_PAYLOAD_STATE: ContextVar[tuple[int, str | None] | None] = ContextVar("_PAYLOAD_STATE", default=None)
+_PAYLOAD_MAX_DEPTH = 2
+#: What each literal checked as a command line costs of _RAW_SCAN_BUDGET on top of its length (a whole check).
+_PAYLOAD_LITERAL_COST = 512
+#: Arguments the raw-text scan reads code with: a program that is not a text one (see _raw_exempt).
+_CODE_ARGV = ["sh"]
+
+
+def _payload_line_check(texts: list[str], extra: list[str] | None, home: str) -> str | None:
+    """The quoted literals of a program's arguments or heredoc body that name a _RUN_PROGRAMS word or a cd, each
+    checked whole as a command line of its own (:func:`check`, with its `$IFS` and brace readings and its cd tracking):
+    ``os.system("rm${IFS}-rf${IFS}/")``, ``system("{rm,-rf,~}")`` or ``system("cd / && rm -rf *")`` run those lines.
+    Literals in literals are read _PAYLOAD_MAX_DEPTH levels deep; past _RAW_SCAN_BUDGET it is refused."""
+    depth, cwd = _PAYLOAD_STATE.get() or (0, None)
+    if depth >= _PAYLOAD_MAX_DEPTH:
+        return None
+    budget = _RAW_SCAN_BUDGET
+    seen: set[str] = set()
+    for text in texts:
+        for m in _PAYLOAD_LITERAL.finditer(_PAYLOAD_ANSI_BLANK.sub(" ", text)):
+            literal = m.group(1) if m.group(1) is not None else m.group(2)
+            if literal in seen or not _PAYLOAD_RUN_WORD.search(literal):
+                continue
+            seen.add(literal)
+            budget -= len(literal) + _PAYLOAD_LITERAL_COST
+            if budget < 0:
+                return "scan-budget"
+            token = _PAYLOAD_STATE.set((depth + 1, cwd))
+            try:
+                hit = _check_parse(literal, extra, cwd, home)[0]
+            finally:
+                _PAYLOAD_STATE.reset(token)
+            if hit:
+                return hit
+    return None
+
+
+def _heredoc_code_scan(heredocs: list[Heredoc], kind: str, extra: list[str] | None, dirs: _Dirs) -> str | None:
+    """The bodies of the heredocs an interpreter other than a shell runs as its program (``python3 <<'EOF'``,
+    ``cat <<'EOF' | perl``; a shell's is parsed as a script): read by the raw-text scan and the quoted-literal check."""
+    if kind != "other":
+        return None
+    for h in heredocs:
+        hit = _raw_text_scan(h.body, [], _CODE_ARGV, dirs, dirs.home) or _payload_line_check([h.body], extra, dirs.home)
+        if hit:
+            return hit
+    return None
+
+
+#: The command after a pipe operator, its leading ``&`` (``|&``), blanks and group openers skipped (``| (at now)``).
+_PIPE_CONSUMER = re.compile(r"[\s&({]*([^;&|\n(){}]*)")
+
+
+def _pipe_offsets(text: str) -> Iterator[int]:
+    """The offsets of the ``|``/``|&`` operators of ``text`` outside quotes (``||`` is not one)."""
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "|":
+            if i + 1 < n and text[i + 1] == "|":
+                i += 2
+                continue
+            yield i
+        i += 1
+
+
+def _pipe_producer_scan(clean: str, dirs: _Dirs) -> str | None:
+    """Before each pipe into a program that runs its stdin as shell code (_schedules_stdin, a shell per
+    _runs_stdin_as_code), the whole text up to it is read by the raw-text scan: the parsed pipelines lose the producer
+    of a group or compound command (``{ echo 'rm -rf ~'; true; } | at now``, ``f | sh``) and a grouped consumer
+    (``echo 'rm -rf ~' | (at now)``). Each stretch of text is read once."""
+    start = 0
+    for i in _pipe_offsets(clean):
+        m = _PIPE_CONSUMER.match(clean, i + 1)
+        argv = _command_argv(_tokens(m.group(1))) if m and m.group(1).strip() else []
+        if not argv:
+            continue
+        shell = os.path.basename(argv[0]) in _SHELLS and _runs_stdin_as_code(argv)
+        if not (shell or _schedules_stdin(argv)):
+            continue
+        hit = _raw_text_scan(clean[start:i], [], _CODE_ARGV, dirs, dirs.home)
+        if hit:
+            return hit
+        start = i
     return None
 
 
