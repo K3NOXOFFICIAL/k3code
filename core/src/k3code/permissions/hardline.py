@@ -145,6 +145,7 @@ HARDLINE_NAMES: list[str] = [
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
     "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
+    "too-large",  # a command too long to be read even by the raw-text scan (see oversize_check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
     "expansion-over-cap",  # a brace expansion too large to check word by word (see _check_expanded)
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -441,6 +442,21 @@ def check_parse(
             _PAYLOAD_STATE.reset(token)
 
 
+#: Past this many characters a line is not read at all, not even by oversize_check: refused (``too-large``).
+_MAX_SCAN_CHARS = 1_000_000
+
+
+def oversize_check(command: str, cwd: str | None = None, home: str | None = None) -> str | None:
+    """The hardline check of a line too large to check in full (the caller refuses it as too large if this finds
+    nothing): only the raw-text scan reads it, in time linear in its length and within _RAW_SCAN_BUDGET, so a
+    catastrophic run in it (``true; ... true; rm -rf ~``) is refused as on a small line; past that budget, or past
+    _MAX_SCAN_CHARS, the line is refused too: the answer for a large line is never weaker than a hardline deny."""
+    if len(command) > _MAX_SCAN_CHARS:
+        return "too-large"
+    home = home if home is not None else os.path.expanduser("~")
+    return _raw_text_scan(command, [], _CODE_ARGV, _Dirs([cwd], cwd, home, []), home)
+
+
 def _check_parse(
     command: str,
     extra_patterns: list[str] | None,
@@ -458,7 +474,7 @@ def _check_parse(
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
     if oversize is not None and oversize(parsed):
-        return None, parsed
+        return oversize_check(command, cwd, home), parsed
     _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
     starts: dict[int, _Dirs] = {}  # per nested command (id of its parse): the directories it starts in
@@ -750,14 +766,27 @@ def _quoted_scan(text: str, dirs: _Dirs, home: str, depth: int) -> str | None:
 _SED_PART = r"(?:\\.|(?!\1)[^\\])*"
 _SED_SUBST = re.compile(rf"(?:^|(?<=[\s;{{}}0-9$/!,=]))s([^\\\n]){_SED_PART}\1({_SED_PART})\1([a-zA-Z0-9]*)")
 _SEDS = frozenset({"sed", "gsed"})
+#: A sed ``e`` command glued to its command (``1erm -rf ~``, ``$erm``, ``/x/erm``, ``1!erm``): an ``e`` at the start
+#: of a word or after a separator, an address or a ``!``, and the rest of its line, which sed runs as a command.
+_SED_EXEC_CMD = re.compile(r"(?:^|(?<=[\s;{}0-9$/!,IM~+]))e(?=[^\s;}])([^\n]*)")
 
 
 def _sed_exec_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
     """``sed 's/.*/rm -rf ~/e'``: the replacement of an ``s`` command with the ``e`` flag is scanned as a command."""
     argv = _command_argv(seg)
+    if argv and os.path.basename(argv[0]) in _ANY_ARG_LAUNCHERS:  # ``find . -exec sed '1erm -rf ~' {} +``
+        argv = argv[next((i for i, w in enumerate(argv) if os.path.basename(w) in _SEDS), len(argv)) :]
     if not argv or os.path.basename(argv[0]) not in _SEDS or depth >= _RUN_SCAN_DEPTH:
         return None
     repls = dict.fromkeys(m.group(2) for w in argv[1:] for m in _SED_SUBST.finditer(w) if "e" in m.group(3))
+    # the spaced ``1e rm -rf ~`` is read by the raw-text scan; the glued one is not (``erm`` is no run start)
+    budget = _RUN_SCAN_BUDGET
+    for w in argv[1:]:
+        for m in _SED_EXEC_CMD.finditer(w):
+            budget -= len(m.group(1))  # ``1e1e1e...`` reads each rest of the line: n^2 characters
+            if budget < 0:
+                return "scan-budget"
+            repls.setdefault(m.group(1))
     return next((hit for r in repls if (hit := _quoted_scan(r, dirs, home, depth))), None)
 
 
@@ -2764,6 +2793,12 @@ def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) ->
     return None
 
 
+def _long_opt(arg: str, name: str, shortest: int) -> bool:
+    """``arg`` is the long option ``name`` or a prefix of it at least ``shortest`` long: GNU tools take a unique
+    prefix (``rm --rec`` is ``rm --recursive``)."""
+    return len(arg) >= shortest and name.startswith(arg)
+
+
 def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
     (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
@@ -2780,7 +2815,9 @@ def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
             flags.append(t)
         else:
             targets.append(t)
-    recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
+    recursive = any(
+        _long_opt(t, "--recursive", 3) or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags
+    )
     if not recursive:
         return None
     for t in (r for raw in targets for r in _resolve_target(raw, dirs.known)):  # `X=/; rm -rf $X` is `rm -rf /`
@@ -2967,8 +3004,9 @@ _RAW_EXEC_OPTS = ("--pager", "--pre", "--hostname-bin")
 #: Backslash escapes as a program decodes them: ``\x72``, ``\o162``, ``\d114``, ``\162``, ``\<newline>`` (dropped),
 #: ``\n``/``\t`` (a blank), any other ``\c`` (``c``).
 _RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
-#: Two quoted literals of an argument list (``"rm", "-rf"``, ``'rm','-rf'``): read as one blank in the decoded text.
-_RAW_LIST_SEP = re.compile(r"([\"'])\s*,\s*\1")
+#: Two quoted literals of an argument list (``"rm", "-rf"``, ``'rm','-rf'``, node's ``"rm", ["-rf"``): read as one
+#: blank in the decoded text.
+_RAW_LIST_SEP = re.compile(r"([\"'])\s*,\s*\[?\s*\1")
 #: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
 _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
 #: How many characters the runs of one command line may read in all, each character charged once and each run
@@ -2976,6 +3014,10 @@ _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
 _RAW_SCAN_BUDGET = 150_000
 _RAW_RECURSIVE = frozenset({"-r", "-R", "--recursive"})
 _RAW_RUN_COST = 128
+
+
+def _raw_recursive(args: list[str]) -> bool:
+    return bool(_flag_set(args) & _RAW_RECURSIVE) or any(_long_opt(a, "--recursive", 3) for a in args)
 
 
 def _raw_param(m: re.Match[str]) -> str:
@@ -3007,7 +3049,7 @@ def _raw_run_argv(text: str, start: int, stop: int) -> list[str]:
         window = window[: max(window.rfind(c) for c in " \t\n")]
     words = window.split()
     rargv, rest = words[: _RAW_RUN_WORDS + 1], words[_RAW_RUN_WORDS + 1 :]
-    if (rest or end < stop) and os.path.basename(rargv[0]) == "rm" and _flag_set(rargv[1:]) & _RAW_RECURSIVE:
+    if (rest or end < stop) and os.path.basename(rargv[0]) == "rm" and _raw_recursive(rargv[1:]):
         tail = text[max(start, stop - _RAW_RUN_CHARS) : stop].split()
         if tail and tail[-1] != rargv[-1]:
             rargv.append(tail[-1])
@@ -3091,6 +3133,10 @@ _PAYLOAD_STATE: ContextVar[tuple[int, str | None] | None] = ContextVar("_PAYLOAD
 _PAYLOAD_MAX_DEPTH = 2
 #: What each literal checked as a command line costs of _RAW_SCAN_BUDGET on top of its length (a whole check).
 _PAYLOAD_LITERAL_COST = 512
+#: What a literal costs instead when every program it names is one whose checks only refuse a write to a disk or a
+#: forced push (``print("step 3: git add done")``, ``console.log("git tag v1")``): its check is a short one.
+_PAYLOAD_LIGHT_COST = 64
+_PAYLOAD_LIGHT = frozenset({"git", "cd", "pushd"} | _WRITES_ALL | _WRITES_LAST)
 #: Arguments the raw-text scan reads code with: a program that is not a text one (see _raw_exempt).
 _CODE_ARGV = ["sh"]
 
@@ -3111,7 +3157,8 @@ def _payload_line_check(texts: list[str], extra: list[str] | None, home: str) ->
             if literal in seen or not _PAYLOAD_RUN_WORD.search(literal):
                 continue
             seen.add(literal)
-            budget -= len(literal) + _PAYLOAD_LITERAL_COST
+            light = all(w[0] in _PAYLOAD_LIGHT for w in _PAYLOAD_RUN_WORD.finditer(literal))
+            budget -= len(literal) + (_PAYLOAD_LIGHT_COST if light else _PAYLOAD_LITERAL_COST)
             if budget < 0:
                 return "scan-budget"
             token = _PAYLOAD_STATE.set((depth + 1, cwd))
@@ -3282,7 +3329,7 @@ def _destroy_check(argv: list[str], sub: str, home: str, dirs: _Dirs) -> str | N
             elif a == "--":
                 past = True
             elif a.startswith("--"):
-                recursive = recursive or a == "--recursive"
+                recursive = recursive or _long_opt(a, "--recursive", 5)  # ``--re`` may be --reference
             elif a.startswith("-") and len(a) > 1 and (name != "chmod" or _CHMOD_OPTION.match(a)):
                 recursive = recursive or "R" in a
             else:
