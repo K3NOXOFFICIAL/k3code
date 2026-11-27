@@ -11,10 +11,11 @@ lone ``&``, a quote or a substitution.
 
 from __future__ import annotations
 
+import bisect
 import os
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -422,16 +423,26 @@ def check(
 
 
 def check_parse(
-    command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
+    command: str,
+    extra_patterns: list[str] | None = None,
+    *,
+    cwd: str | None = None,
+    home: str | None = None,
+    oversize: Callable[[Parsed], bool] | None = None,
 ) -> tuple[str | None, Parsed]:
     """:func:`check` and the parse it read (``parse(command)``): the engine decides on that parse instead of parsing a
-    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope)."""
+    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope). A parse
+    that ``oversize`` refuses is not checked (no hit): the caller refuses it as too large, without the checks' cost."""
     with lookup_scope():
-        return _check_parse(command, extra_patterns, cwd, home)
+        return _check_parse(command, extra_patterns, cwd, home, oversize)
 
 
 def _check_parse(
-    command: str, extra_patterns: list[str] | None, cwd: str | None, home: str | None
+    command: str,
+    extra_patterns: list[str] | None,
+    cwd: str | None,
+    home: str | None,
+    oversize: Callable[[Parsed], bool] | None = None,
 ) -> tuple[str | None, Parsed]:
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
@@ -442,6 +453,8 @@ def _check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+    if oversize is not None and oversize(parsed):
+        return None, parsed
     _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
     starts: dict[int, _Dirs] = {}  # per nested command (id of its parse): the directories it starts in
@@ -2916,21 +2929,37 @@ _ANY_ARG_LAUNCHERS = frozenset({"find", "xargs", "watch", "fd", "fdfind", "paral
 #: A _RUN_PROGRAMS word (or ``mkfs*``) followed by a blank, at a word boundary of raw text: the start, a blank, a
 #: quote, a shell operator, or a character a program may read a command after (vim ``!``, sed ``/``, ``=``, ``:``).
 _RAW_RUN_START = re.compile(
-    r"(?:^|(?<=[\s'\"`;|&(){}<>!=:,/#%@]))(?:" + "|".join(map(re.escape, sorted(_RUN_PROGRAMS))) + r"|mkfs[\w.]*)(?=\s)"
+    r"(?:^|(?<=[\s'\"`;|&(){}\[<>!=:,/#%@]))(?:"
+    + "|".join(map(re.escape, sorted(_RUN_PROGRAMS)))
+    + r"|mkfs[\w.]*)(?=\s)"
 )
-#: Where a run in raw text ends: a shell operator, a newline, a closing paren or backtick; in the raw text (not the
-#: decoded one) also a quote.
-_RAW_RUN_END = re.compile(r"[;|&\n)`'\"]")
-_DECODED_RUN_END = re.compile(r"[;|&\n)`]")
+#: Where a run in raw text ends: a shell operator, a newline, a redirection, a closing paren, brace, bracket or
+#: backtick (``%q{rm -rf ~}``, ``q[rm -rf ~]``); in the raw text (not the decoded one) also a quote.
+_RAW_RUN_END = re.compile(r"[;|&\n)}\]>`'\"]")
+_DECODED_RUN_END = re.compile(r"[;|&\n)}\]>`]")
+#: ``${NAME}`` in raw text, read as ``$NAME`` before the runs end at a ``}`` (``rm -rf ${HOME}`` is ``$HOME``); the
+#: ``${NAME`` of ``${NAME:-word}`` as ``$NAME `` (the word after it is still read: ``${x:+`rm -rf ~`}``).
+_RAW_PARAM = re.compile(r"\$\{(\w+)(\})?")
+#: A run reads at most this many words after its program, and this many characters, before its separator: a long
+#: argument list (``git add`` of thousands of paths) is not read once per run that a path in it starts.
+_RAW_RUN_WORDS = 16
+_RAW_RUN_CHARS = 512
+#: Options with which any text program (_text_only) may run a command (``ag --pager``): see _raw_exempt.
+_RAW_EXEC_OPTS = ("--pager", "--pre", "--hostname-bin")
 #: Backslash escapes as a program decodes them: ``\x72``, ``\o162``, ``\d114``, ``\162``, ``\<newline>`` (dropped),
 #: ``\n``/``\t`` (a blank), any other ``\c`` (``c``).
 _RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
 #: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
 _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
-#: How many characters the runs of one command line may read in all, each run charged _RAW_RUN_COST more for its
-#: checks (each run reads to its end; see _RUN_SCAN_BUDGET). Past this it is refused (``scan-budget``).
+#: How many characters the runs of one command line may read in all, each character charged once and each run
+#: charged _RAW_RUN_COST more for its checks (see _RUN_SCAN_BUDGET). Past this it is refused (``scan-budget``).
 _RAW_SCAN_BUDGET = 150_000
+_RAW_RECURSIVE = frozenset({"-r", "-R", "--recursive"})
 _RAW_RUN_COST = 128
+
+
+def _raw_param(m: re.Match[str]) -> str:
+    return "$" + m[1] + ("" if m[2] else " ")
 
 
 def _raw_unescape(m: re.Match[str]) -> str:
@@ -2941,8 +2970,28 @@ def _raw_unescape(m: re.Match[str]) -> str:
 
 
 def _raw_exempt(words: list[str], argv: list[str]) -> bool:
-    """A text program (_text_only) not named by a launcher that runs its arguments (_ANY_ARG_LAUNCHERS)."""
+    """A text program (_text_only) not named by a launcher that runs its arguments (_ANY_ARG_LAUNCHERS) and not
+    given an option that runs a command (_RAW_EXEC_OPTS: ``ag --pager='...'``, ``rg --pre=...``)."""
+    if any(a == o or a.startswith(o + "=") for a in argv for o in _RAW_EXEC_OPTS):
+        return False
     return _text_only(argv) and not any(os.path.basename(w) in _ANY_ARG_LAUNCHERS for w in words)
+
+
+def _raw_run_argv(text: str, start: int, stop: int) -> list[str]:
+    """The words of the run from ``start`` to its separator at ``stop``: its program and at most _RAW_RUN_WORDS words
+    within _RAW_RUN_CHARS characters (a word cut by that cap is dropped), and for a recursive delete also the run's
+    last word (``rm -rf a1 ... a40 ~`` is read as ``rm -rf a1 ... a15 ~``)."""
+    end = min(stop, start + _RAW_RUN_CHARS)
+    window = text[start:end]
+    if end < stop and not text[end].isspace():
+        window = window[: max(window.rfind(c) for c in " \t\n")]
+    words = window.split()
+    rargv, rest = words[: _RAW_RUN_WORDS + 1], words[_RAW_RUN_WORDS + 1 :]
+    if (rest or end < stop) and os.path.basename(rargv[0]) == "rm" and _flag_set(rargv[1:]) & _RAW_RECURSIVE:
+        tail = text[max(start, stop - _RAW_RUN_CHARS) : stop].split()
+        if tail and tail[-1] != rargv[-1]:
+            rargv.append(tail[-1])
+    return rargv
 
 
 def _without_messages(sub: str, argv: list[str]) -> str:
@@ -2965,8 +3014,8 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
     ``~``). Text programs (_raw_exempt) and message values (_without_messages) are not read."""
     if _raw_exempt(words, argv):
         return None
-    raw = _without_messages(sub, argv)
-    decoded = _RAW_ESCAPE.sub(_raw_unescape, raw).replace("'", "").replace('"', "")
+    raw = _RAW_PARAM.sub(_raw_param, _without_messages(sub, argv))
+    decoded = _RAW_PARAM.sub(_raw_param, _RAW_ESCAPE.sub(_raw_unescape, raw).replace("'", "").replace('"', ""))
     budget = _RAW_SCAN_BUDGET
     seen: set[str] = set()
     for text, ends in ((raw, _RAW_RUN_END), (decoded, _DECODED_RUN_END)):
@@ -2975,17 +3024,22 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
         delims: dict[str, int] = {}
         for m in _RAW_SED_DELIM.finditer(text):
             delims.setdefault(m.group(1), m.start())
+        stops = [e.start() for e in ends.finditer(text)]
+        covered = 0  # the text before this was charged already: each character is charged once
         for m in _RAW_RUN_START.finditer(text):
-            end = ends.search(text, m.end())
-            run = text[m.start() : end.start() if end else len(text)]
+            i = bisect.bisect_left(stops, m.end())
+            stop = stops[i] if i < len(stops) else len(text)
+            budget -= max(0, min(stop, m.start() + _RAW_RUN_CHARS) - max(m.start(), covered))
+            covered = max(covered, min(stop, m.start() + _RAW_RUN_CHARS))
+            budget -= _RAW_RUN_COST  # per run start, read or not: n starts cost n checks' worth
+            if budget < 0:
+                return "scan-budget"
+            run = " ".join(_raw_run_argv(text, m.start(), stop))
             runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < m.start() and c in run)]
             for r in runs:
                 if r in seen:
                     continue  # the decoded text repeats most runs of the raw one
                 seen.add(r)
-                budget -= len(r) + _RAW_RUN_COST
-                if budget < 0:
-                    return "scan-budget"
                 rargv = r.split()
                 hit = (
                     _rm_check(rargv, dirs, home)

@@ -3335,6 +3335,15 @@ _MAX_COMMAND_WORDS = 10_000
 _MAX_DIR_WORK = 10_000
 
 
+def _word_count(subs: list[str]) -> int:
+    return sum(len(s.split()) for s in subs)
+
+
+def _oversize(command: str, subs: list[str], words: int) -> bool:
+    """Past the limits that apply after the parse (_MAX_COMMAND_CHARS, _MAX_COMMAND_SUBS, _MAX_COMMAND_WORDS)."""
+    return len(command) > _MAX_COMMAND_CHARS or len(subs) > _MAX_COMMAND_SUBS or words > _MAX_COMMAND_WORDS
+
+
 def _too_large(mode: PermissionMode, command: str, *size: str) -> Decision:
     """A call too large to check: a person decides it; auto and yolo ask no one, so it is refused there."""
     message = f"Command too large to check ({', '.join(size)}); split it or run a script file: {command[:120]}"
@@ -3351,12 +3360,16 @@ def _decide_bash(
     if len(command) > _MAX_RAW_CHARS or ops > _MAX_RAW_OPERATORS:
         # before the parse: its cost grows with these (20,000 ``&&`` took seconds)
         return _too_large(mode, command, f"{len(command):,} characters", f"{ops:,} operators")
-    hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
+    # the size limits apply before the checks too (``oversize``): their cost grows with the size (40 ``awk 'rm rm
+    # ...'`` segments took seconds); the parser's own scan-budget and scan-depth denies come first
+    hit, parsed = hardline.check_parse(
+        command, extra, cwd=cwd, home=home, oversize=lambda p: _oversize(command, p.subs, _word_count(p.subs))
+    )
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = parsed.subs
-    words = sum(len(s.split()) for s in subs)
-    if len(command) > _MAX_COMMAND_CHARS or len(subs) > _MAX_COMMAND_SUBS or words > _MAX_COMMAND_WORDS:
+    words = _word_count(subs)
+    if _oversize(command, subs, words):
         return _too_large(mode, command, f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words")
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
