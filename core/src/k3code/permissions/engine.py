@@ -3344,9 +3344,17 @@ def _oversize(command: str, subs: list[str], words: int) -> bool:
     return len(command) > _MAX_COMMAND_CHARS or len(subs) > _MAX_COMMAND_SUBS or words > _MAX_COMMAND_WORDS
 
 
-def _too_large(mode: PermissionMode, command: str, *size: str) -> Decision:
-    """A call too large to check: a person decides it; auto and yolo ask no one, so it is refused there."""
+#: The hardline answers for a line not read to its end: on an oversize line they are reported as too large.
+_UNREAD = frozenset({"scan-budget", "too-large"})
+
+
+def _too_large(mode: PermissionMode, command: str, *size: str, hit: str | None = None) -> Decision:
+    """A call too large to check: a person decides it; auto and yolo ask no one, so it is refused there. One that
+    even the raw-text scan of an oversize line could not read to its end (``hit``: scan-budget, too-large) is refused
+    in every mode, as the full check would refuse it."""
     message = f"Command too large to check ({', '.join(size)}); split it or run a script file: {command[:120]}"
+    if hit:
+        return Decision(action="deny", message=message, hardline=hit)
     if mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS):
         return Decision(action="ask", needs_human=True, message=message)
     return Decision(action="deny", message=message)
@@ -3358,17 +3366,25 @@ def _decide_bash(
     home = os.path.expanduser("~")
     ops = len(_RAW_OPERATOR.findall(command)) if len(command) <= _MAX_RAW_CHARS else 0
     if len(command) > _MAX_RAW_CHARS or ops > _MAX_RAW_OPERATORS:
-        # before the parse: its cost grows with these (20,000 ``&&`` took seconds)
-        return _too_large(mode, command, f"{len(command):,} characters", f"{ops:,} operators")
+        # before the parse: its cost grows with these (20,000 ``&&`` took seconds); only the linear raw-text scan
+        # reads it, so a catastrophic run in it is still a hardline deny
+        hit = hardline.oversize_check(command, cwd, home)
+        if hit and hit not in _UNREAD:
+            return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
+        return _too_large(mode, command, f"{len(command):,} characters", f"{ops:,} operators", hit=hit)
     # the size limits apply before the checks too (``oversize``): their cost grows with the size (40 ``awk 'rm rm
-    # ...'`` segments took seconds); the parser's own scan-budget and scan-depth denies come first
+    # ...'`` segments took seconds); the parser's own scan-budget and scan-depth denies come first, and an oversize
+    # line is read by the linear raw-text scan only (hardline.oversize_check)
     hit, parsed = hardline.check_parse(
         command, extra, cwd=cwd, home=home, oversize=lambda p: _oversize(command, p.subs, _word_count(p.subs))
     )
-    if hit:
-        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = parsed.subs
     words = _word_count(subs)
+    if hit in _UNREAD and _oversize(command, subs, words):
+        sizes = f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words"
+        return _too_large(mode, command, *sizes, hit=hit)
+    if hit:
+        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     if _oversize(command, subs, words):
         return _too_large(mode, command, f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words")
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it

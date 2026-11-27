@@ -1989,3 +1989,72 @@ def test_a_quote_delimiter_stdin_interpreter_or_argv_list_run_is_refused(
 @pytest.mark.parametrize("cmd", R13_KEEP)
 def test_a_project_path_or_a_code_argument_stdin_is_not_refused(tmp_path: Path, cmd: str) -> None:
     assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# Review round 14: a catastrophic run at the end of an oversize line (past the word or the character limit), a GNU
+# unique prefix of --recursive, a sed `e` command glued to its command, and a node argv list `"rm", ["-rf", "/"]`
+_R14 = "rm -" + "rf ~"
+R14_RUNS = [
+    ("true", "; ".join(["true"] * 2005) + "; " + _R14),
+    ("true", "; ".join(["true"] * 20000) + "; " + _R14),
+    ("rm", "rm --rec -f ~"),
+    ("rm", "rm --r -f ~"),
+    ("rm", "rm --recu --fo ~"),
+    ("rm", "rm --recursiv ~"),
+    ("chmod", "chmod --rec 000 ~"),
+    ("chown", "chown --recu x ~"),
+    ("sed", "sed '1e" + _R14 + "' f"),
+    ("sed", "sed 'e" + _R14 + "' f"),
+    ("sed", "sed '$e" + _R14 + "' f"),
+    ("sed", "sed '/x/e" + _R14 + "' f"),
+    ("sed", "sed '1!e" + _R14 + "' f"),
+    ("find", "find . -exec sed '1e" + _R14 + "' {} +"),
+    ("node", 'node -e \'require("child_process").execFileSync("rm", ["-r' + 'f", "/"])\''),
+    ("node", "node -e \"spawnSync('rm',['-r" + "f','/'])\""),
+    ("node", "node <<'EOF'\nrequire('child_process').spawnSync('rm', ['-r" + "f', '/'])\nEOF"),
+]
+R14_KEEP = ["rm -r --force build/", "sed -n '1p' f", "sed 's/a/b/' f", "sed -e '1d' -e 's/x/y/' f", "ls | xargs wc -l"]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R14_RUNS)
+def test_an_oversize_tail_long_option_prefix_sed_e_or_node_argv_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline not in (None, "scan-budget", "too-large"), (cmd[-60:], mode, dec)
+
+
+@pytest.mark.parametrize("cmd", R14_KEEP)
+def test_a_plain_sed_script_or_a_forced_project_delete_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+def test_an_oversize_line_without_a_catastrophic_run_is_still_asked_about(tmp_path: Path) -> None:
+    for cmd in ("; ".join(["true"] * 2005), "; ".join(["true"] * 20000), "echo " + "a " * 12000):
+        dec = _decide(cmd, "default", tmp_path)
+        assert (dec.action, dec.hardline) == ("ask", None) and "too large to check" in (dec.message or ""), cmd[:40]
+
+
+def test_a_line_too_large_for_even_the_raw_scan_is_refused_in_every_mode(tmp_path: Path) -> None:
+    for mode in ("default", "auto", "yolo"):
+        dec = _decide("echo " + "a" * 1_100_000, mode, tmp_path)
+        assert (dec.action, dec.hardline) == ("deny", "too-large") and "too large to check" in (dec.message or "")
+
+
+_R14_PY = "python3 <<'EOF'\nimport subprocess\n" + "".join(
+    f'subprocess.run(["git", "add", "f{i}.py"]); print("step {i}: git add done")\n' for i in range(300)
+)
+_R14_NODE = "node <<'EOF'\n" + "".join(f'console.log("git tag v{i}");\n' for i in range(400))
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", [_R14_PY + "EOF", _R14_NODE + "EOF"], ids=["python-git", "node-git"])
+def test_a_heredoc_of_many_git_literals_is_not_refused_for_the_scan_budget(tmp_path: Path, cmd: str, mode: str) -> None:
+    start = time.perf_counter()
+    dec = _decide(cmd, mode, tmp_path)
+    assert time.perf_counter() - start < 1.0
+    assert dec.hardline is None and dec.action != "deny", (mode, dec)
