@@ -42,6 +42,19 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
 
+## Review round 14 (tip `e1ef4aab`): FAIL, findings NOT fixed
+
+Independent reviewer, read-only, `decide()` only. 117 everyday commands had no other regression, no exception on NUL, lone surrogates or 100k+ characters, 3,000-path `git add`, `rm -f` and `chmod` lists allow. Open findings:
+1. HIGH GNU unique-prefix long options are not read: `rm --rec -f ~` (`--r`, `--recu`, `--recursiv`); same likely for chmod/chown. Allowed in yolo and under a rule; also allowed at `d00cbeb6`.
+2. HIGH GNU sed `e` command with no space: `sed '1e<run>' f`, `erm`, `$e`, `/x/e`, `1!e`, also under `find -exec sed`. Also allowed at `d00cbeb6`.
+3. HIGH node argv lists: `execFileSync("rm", ["-rf", "/"])`, `spawnSync(...)`, also in a node heredoc (the `", ["` join is not read; the python list form is denied). Also allowed at `d00cbeb6`.
+4. MEDIUM REGRESSION: oversize lines skip the hardline in default mode (`"; ".join(["true"]*2005) + "; <run>"`, 12k chars, now ask; `d00cbeb6` denied it). The prompt shows only the first 120 characters. Direction: short-circuit on size only in auto and yolo, or deny when too large.
+5. MEDIUM piping into `sudo -s`, `sudo -i`, `su`, `doas -s` (allowed; `| sudo bash` is denied). 6. MEDIUM `xargs -0 sh -c`, `xargs -d`, `xargs -0 -I% sh -c %`. 7. MEDIUM `> >(bash)` process substitution (only `| tee >(sh)` is caught).
+8. LOW-MEDIUM REGRESSION: a python or node heredoc with about 250 or more distinct literals naming git, cp and similar words is refused with `scan-budget` in every mode (was ask).
+9. LOW REGRESSION: `cat f | perl -pe 's/<run text>/x/'` now denied (prose class).
+
+Series total: rounds 1-6, 8, 9, 11, 12, 13, 14 FAIL; 7 no verdict; 10 PASS WITH LOW. Each round finds new variants, mostly present at the base commit too. Recommendation unchanged: run bash in the sandbox in every mode and keep the parser as a convenience layer. Findings 4 and 8 are regressions of this branch and should be fixed before merge if the parser approach is kept.
+
 ## Review round 13 (tip `765b56f0`): FAIL, findings NOT fixed
 
 Independent reviewer, read-only. No regression: every finding below was also allowed on `d00cbeb6`. 62 everyday commands: only two changed to a hard deny (`sed -i` with the text but no `e` flag, a python heredoc that only prints it), both in the accepted prose class. No exception on NUL, lone surrogates or 100k chars; slowest decide() 0.76 s; `scan-budget` did not fire on 3,000-path `git add`, `rm -f`, `chmod`, `git rm` lists.
