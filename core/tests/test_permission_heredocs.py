@@ -944,3 +944,62 @@ def test_a_command_too_expensive_to_read_twice_is_denied_not_allowed(tmp_path: P
     # the same shape with little text is still read, and its hidden command found
     assert check(_nested_bodies(3, f"x; {HIDDEN}"), cwd=str(tmp_path)) == "rm-rf-home"
     assert check(_nested_bodies(3, "date"), cwd=str(tmp_path)) is None
+
+
+# Review round 15: ordinary long heredocs were refused for the scan budget in every mode (every ``pip install``,
+# ``cp`` or ``git`` word cost a full check); an oversize heredoc of data fed to ``cat`` is asked about, not refused
+_R15 = "rm -" + "rf ~"
+_R15_PIP = "python3 - <<'EOF'\n" + "".join(f'print("step {i}: pip install pkg{i} then run it")\n' for i in range(550))
+_R15_CP = "python3 - <<'EOF'\n" + "".join(f"# cp step {i}\n" for i in range(600))
+_R15_GEN = "cat > gen.sh <<'EOF'\n" + "".join(
+    f"cp src/f{i}.sh out/f{i}.sh && chmod +x out/f{i}.sh\n" for i in range(3000)
+)
+_R15_NOTES = "".join(f"line {i} of the notes\n" for i in range(4000))
+_R15_TABS = "".join(f"\tline {i}\n" for i in range(4000))
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize(("mode", "want"), [("default", "ask"), ("auto", "allow"), ("yolo", "allow")])
+@pytest.mark.parametrize("cmd", [_R15_PIP + "EOF", _R15_CP + "EOF"], ids=["pip-install", "cp-comments"])
+def test_a_heredoc_naming_cheap_programs_on_every_line_is_read_not_refused(
+    tmp_path: Path, cmd: str, mode: str, want: str, ruled: bool
+) -> None:
+    rules = [Rule(tool="bash", pattern="python3 *", action="allow", layer=1)] if ruled else None
+    start = time.perf_counter()
+    dec = _bash(cmd, mode, tmp_path, user_rules=rules)
+    assert time.perf_counter() - start < 1.0
+    assert (dec.action, dec.hardline) == (want, None), (mode, dec)
+
+
+def test_an_oversize_quoted_heredoc_of_data_for_cat_is_asked_about(tmp_path: Path) -> None:
+    cmd = _R15_GEN + "EOF"
+    assert len(cmd) > 140_000
+    dec = _bash(cmd, "default", tmp_path)
+    assert (dec.action, dec.hardline) == ("ask", None), dec
+
+
+#: The oversize scan drops a quoted heredoc body fed to ``cat``; these bodies it must keep: an unquoted one (the
+#: shell runs its substitutions) and a ``<<-`` one (its tab-indented end is not the ``EOF`` line at the bottom).
+R15_KEPT_BODIES = [
+    "cat > x.txt <<EOF\n" + _R15_NOTES + "$(" + _R15 + ")\nEOF",
+    "cat > x.txt <<EOF\n" + _R15_NOTES + "`" + _R15 + "`\nEOF",
+    "cat > x.txt <<-'EOF'\n" + _R15_TABS + "\tEOF\n" + _R15 + "\nEOF",
+    "cat > x.txt <<-'EOF'\n" + _R15_TABS + _R15 + "\n\tEOF",
+    # where the shell's body starts or ends elsewhere: a concatenated delimiter (``EOF``), a continued heredoc line,
+    # a quote left open on it, and a ``<<`` inside a double-quoted string
+    "cat > x <<'E'OF\n" + _R15_NOTES + "EOF\n" + _R15 + "\nE",
+    "cat > x <<'EOF' \\\n; " + _R15 + "\n" + _R15_NOTES + "EOF",
+    "cat > x <<'EOF' \"\n\"; " + _R15 + "\n" + _R15_NOTES + "EOF",
+    "echo \"\ncat > x <<'EOF'\n\"; " + _R15 + "\n" + _R15_NOTES + "EOF",
+    "sh -s \\\ncat <<'EOF'\n" + _R15_NOTES + _R15 + "\nEOF",  # the line continues `sh -s`: it runs the body
+]
+R15_KEPT_IDS = ["unquoted-subst", "unquoted-backtick", "dash-tail", "dash-body"]
+R15_KEPT_IDS += ["concat", "contin", "openq", "in-dq", "continued-sh"]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", R15_KEPT_BODIES, ids=R15_KEPT_IDS)
+def test_an_oversize_heredoc_whose_body_the_shell_runs_is_still_scanned(tmp_path: Path, cmd: str, mode: str) -> None:
+    dec = _bash(cmd, mode, tmp_path)
+    assert (dec.action, dec.hardline) == ("deny", "rm-rf-home"), (mode, dec)

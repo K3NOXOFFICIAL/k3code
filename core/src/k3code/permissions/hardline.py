@@ -454,7 +454,96 @@ def oversize_check(command: str, cwd: str | None = None, home: str | None = None
     if len(command) > _MAX_SCAN_CHARS:
         return "too-large"
     home = home if home is not None else os.path.expanduser("~")
-    return _raw_text_scan(command, [], _CODE_ARGV, _Dirs([cwd], cwd, home, []), home)
+    text = _without_data_heredocs(command)
+    return _raw_text_scan(text, [], _CODE_ARGV, _Dirs([cwd], cwd, home, []), home)
+
+
+#: A heredoc operator's ``-`` and its delimiter word, quoted or not, ended where the shell ends a word (``<<'E'OF``,
+#: whose delimiter is ``EOF``, is not read).
+_OVERSIZE_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.-]+)\2(?=[\s;&|<>()]|$)")
+#: What the reading of _without_data_heredocs stops at outside quotes: a heredoc operator (not ``<<<``), a comment,
+#: an arithmetic ``((``, ``$'``, ``$(``, a quote, an escape, a newline; inside double quotes and backticks.
+_OVERSIZE_TOKEN = re.compile(r"(?<!<)<<(?!<)|(?:^|(?<=[\s;&|()]))#[^\n]*|\$?\(\(|\$'|\$\(|[\\'\"`\n]")
+_OVERSIZE_DQUOTE = re.compile(r"[\\\"`]|\$\(")
+_OVERSIZE_BQUOTE = re.compile(r"[\\`]")
+#: What makes a heredoc's line more than one simple command: a pipe, a list, a substitution.
+_OVERSIZE_COMPOUND = re.compile(r"[|;&`]|[$<>]\(")
+#: Programs that write their heredoc body out as data, as on the normal path (no interpreter reads it as code); the
+#: text programs (_raw_exempt) are data programs too.
+_DATA_PROGRAMS = frozenset({"cat", "tee"})
+
+
+def _data_heredoc_line(line: str, m: re.Match[str], line_start: int) -> bool:
+    """The heredoc ``m`` on ``line`` (one simple command) feeds a quoted-delimiter body to ``cat``/``tee`` or a text
+    program."""
+    if not m.group(2) or line.count("<<") != 1 or _OVERSIZE_COMPOUND.search(line):
+        return False
+    head = line[: m.start() - line_start] + line[m.end() - line_start :]
+    argv = _command_argv(_without_redirects(_tokens(head)))
+    return bool(argv) and (os.path.basename(argv[0]) in _DATA_PROGRAMS or _raw_exempt([], argv))
+
+
+def _without_data_heredocs(command: str) -> str:
+    """``command`` without the bodies of the quoted-delimiter heredocs fed to a text program or ``cat``/``tee``
+    (``cat > gen.sh <<'EOF'``) on a line that is one simple command: the normal path does not read those bodies as
+    code, so the oversize scan does not either. The text is read once with its quotes, comments and escapes; an
+    interpreter's body (``python3 - <<'EOF'``) is kept and skipped. Where the shell's reading of a body is uncertain
+    the rest of the command is kept whole: an unquoted delimiter (``$((1<<2))`` reads as one too) or a ``<<-`` one
+    (its end may be indented), a ``<<`` the pattern does not read, a second heredoc or an open quote or a
+    continuation on its line, ``((``, ``$'...'`` and a substitution inside double quotes (their quotes nest)."""
+    out: list[str] = []
+    pos = i = top = 0  # top: where the last line that starts outside quotes and continuations starts
+    quote = ""
+    pending: re.Match[str] | None = None  # the heredoc operator on this line
+    while True:
+        if quote == "'":
+            i = command.find("'", i) + 1
+            if not i:
+                break
+            quote = ""
+            continue
+        t = (_OVERSIZE_DQUOTE if quote == '"' else _OVERSIZE_BQUOTE if quote else _OVERSIZE_TOKEN).search(command, i)
+        if t is None:
+            break
+        tok, i = t.group(0), t.end()
+        if tok == "\\":
+            if pending and command.startswith("\n", i):
+                break
+            i += 1
+            continue
+        if quote:
+            if tok != quote:
+                break
+            quote = ""
+        elif tok in ("'", '"', "`"):
+            quote = tok
+        elif tok == "<<":
+            pending = None if pending else _OVERSIZE_HEREDOC.match(command, t.start())
+            if pending is None or pending.group(1) or not pending.group(2):
+                break
+            i = pending.end()
+        elif tok == "\n":
+            line_start, top = top, i
+            if pending is None:
+                continue
+            m, pending, delim = pending, None, pending.group(3)
+            if command.find("\n", m.end()) != i - 1:
+                break  # a quote on the heredoc's line went on to the next line
+            end = command.find("\n" + delim + "\n", i - 1)
+            if end < 0 and command.endswith("\n" + delim) and len(command) - len(delim) >= i:
+                end = len(command) - len(delim) - 1
+            if end < 0:
+                break
+            if line_start == command.rfind("\n", 0, m.start()) + 1 and _data_heredoc_line(
+                command[line_start : i - 1], m, line_start
+            ):
+                out.append(command[pos:i])
+                pos = end + 1
+            i = end + 1 + len(delim)
+        elif not tok.startswith(("#", "$(")) or tok == "$((":
+            break  # ``((``, ``$((``, ``$'``
+    out.append(command[pos:])
+    return "".join(out)
 
 
 def _check_parse(
@@ -2988,6 +3077,12 @@ _RAW_RUN_START = re.compile(
     + "|".join(map(re.escape, sorted(_RUN_PROGRAMS)))
     + r"|mkfs[\w.]*)(?=\s)"
 )
+#: The program word of a run (_RAW_RUN_START without its boundary): read right after a quote operator's delimiter.
+_RAW_RUN_WORD = re.compile(r"(?:" + "|".join(map(re.escape, sorted(_RUN_PROGRAMS))) + r"|mkfs[\w.]*)(?=\s)")
+#: A perl/ruby quote operator (``qx.``, ``qw-``, ``q«``, ``%x.``, ``%w-``) with any delimiter that is not a blank or
+#: a word character, non-ASCII ones included: a run right after it ends at the delimiter (or its closing bracket).
+_RAW_QUOTE_OP = re.compile(r"(?:(?<![\w$@%&])q[qxrw]?|(?<![\w$@%])%[xwWiIqQ]?)([^\s\w])")
+_RAW_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">", "«": "»", "‹": "›", "“": "”", "‘": "’"}
 #: Where a run in raw text ends: a shell operator, a newline, a redirection, a closing paren, brace, bracket or
 #: backtick (``%q{rm -rf ~}``, ``q[rm -rf ~]``); in the raw text (not the decoded one) also a quote.
 _RAW_RUN_END = re.compile(r"[;|&\n)}\]>`'\"]")
@@ -3006,7 +3101,7 @@ _RAW_EXEC_OPTS = ("--pager", "--pre", "--hostname-bin")
 _RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
 #: Two quoted literals of an argument list (``"rm", "-rf"``, ``'rm','-rf'``, node's ``"rm", ["-rf"``): read as one
 #: blank in the decoded text.
-_RAW_LIST_SEP = re.compile(r"([\"'])\s*,\s*\[?\s*\1")
+_RAW_LIST_SEP = re.compile(r"([\"'])\s*(?::\s*[\w.]{0,16}\s*)?,\s*\[?\s*\1")
 #: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
 _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
 #: How many characters the runs of one command line may read in all, each character charged once and each run
@@ -3014,6 +3109,10 @@ _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
 _RAW_SCAN_BUDGET = 150_000
 _RAW_RECURSIVE = frozenset({"-r", "-R", "--recursive"})
 _RAW_RUN_COST = 128
+#: What a run start costs instead when its program's checks only refuse a write to a disk or a forced push
+#: (_PAYLOAD_LIGHT: ``cp``, ``git add``, ``install``): a short check of at most _RAW_RUN_CHARS characters, so a
+#: script that names them on every line is read in full.
+_RAW_LIGHT_COST = 8
 
 
 def _raw_recursive(args: list[str]) -> bool:
@@ -3088,21 +3187,37 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
         for m in _RAW_SED_DELIM.finditer(text):
             delims.setdefault(m.group(1), m.start())
         stops = [e.start() for e in ends.finditer(text)]
+        starts = {m.start(): (m.group(0), "") for m in _RAW_RUN_START.finditer(text)}
+        for q in _RAW_QUOTE_OP.finditer(text):
+            at = (
+                q.end()
+                + len(text[q.end() : q.end() + _RAW_RUN_CHARS])
+                - len(text[q.end() : q.end() + _RAW_RUN_CHARS].lstrip(" \t"))
+            )
+            if w := _RAW_RUN_WORD.match(text, at):
+                starts[w.start()] = (w.group(0), _RAW_CLOSERS.get(q.group(1), q.group(1)))
         covered = 0  # the text before this was charged already: each character is charged once
-        for m in _RAW_RUN_START.finditer(text):
-            i = bisect.bisect_left(stops, m.end())
+        for start in sorted(starts):
+            word, closer = starts[start]
+            i = bisect.bisect_left(stops, start + len(word))
             stop = stops[i] if i < len(stops) else len(text)
-            budget -= max(0, min(stop, m.start() + _RAW_RUN_CHARS) - max(m.start(), covered))
-            covered = max(covered, min(stop, m.start() + _RAW_RUN_CHARS))
-            budget -= _RAW_RUN_COST  # per run start, read or not: n starts cost n checks' worth
+            if word in _PAYLOAD_LIGHT:
+                budget -= _RAW_LIGHT_COST
+            else:
+                budget -= max(0, min(stop, start + _RAW_RUN_CHARS) - max(start, covered))
+                covered = max(covered, min(stop, start + _RAW_RUN_CHARS))
+                budget -= _RAW_RUN_COST  # per run start, read or not: n starts cost n checks' worth
             if budget < 0:
                 return "scan-budget"
-            run = " ".join(_raw_run_argv(text, m.start(), stop))
-            runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < m.start() and c in run)]
-            # a run right after a punctuation delimiter (``qx!rm -rf ~!``, ``q#...#``) also ends at that delimiter
-            before = text[m.start() - 1] if m.start() else ""
-            if before and not before.isspace() and not before.isalnum() and before != "/" and before in run:
-                runs.append(run[: run.find(before)])
+            run = " ".join(_raw_run_argv(text, start, stop))
+            runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < start and c in run)]
+            # a run right after a punctuation delimiter (``qx!rm -rf ~!``, ``qx.rm -rf ~.``, ``q#...#``) also ends at
+            # that delimiter: its first one after the program word, or its last one (``qx-rm -rf ~-``)
+            before = text[start - 1] if start else ""
+            if not closer and before and not before.isspace() and not before.isalnum() and before != "/":
+                closer = before
+            if closer and closer in run:
+                runs += [run[: run.find(closer)], run[: run.find(closer, len(word))], run[: run.rfind(closer)]]
             for r in runs:
                 if r in seen:
                     continue  # the decoded text repeats most runs of the raw one
