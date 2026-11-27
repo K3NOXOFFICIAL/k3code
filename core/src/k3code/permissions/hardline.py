@@ -1938,6 +1938,9 @@ _STDIN_SPECS: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] = {
     "perl": ("eE", "IMm", frozenset(), frozenset()),
     "ruby": ("eE", "rICEx", frozenset(), frozenset()),
     "php": ("rRBEF", "cdz", frozenset(), frozenset()),
+    "lua": ("e", "l", frozenset(), frozenset()),
+    "luajit": ("e", "lbj", frozenset(), frozenset()),
+    "tclsh": ("", "", frozenset(), frozenset()),
 }
 
 
@@ -2941,9 +2944,10 @@ _RUN_PROGRAMS = frozenset(
 #: does not exempt their segment from the raw-text scan (_raw_text_scan).
 _ANY_ARG_LAUNCHERS = frozenset({"find", "xargs", "watch", "fd", "fdfind", "parallel"})
 #: A _RUN_PROGRAMS word (or ``mkfs*``) followed by a blank, at a word boundary of raw text: the start, a blank, a
-#: quote, a shell operator, or a character a program may read a command after (vim ``!``, sed ``/``, ``=``, ``:``).
+#: quote, a shell operator, or a character a program may read a command after (vim ``!``, sed ``/``, ``=``, ``:``,
+#: a perl/ruby quote operator's delimiter: ``qx!``, ``q#``, ``%x^``).
 _RAW_RUN_START = re.compile(
-    r"(?:^|(?<=[\s'\"`;|&(){}\[<>!=:,/#%@]))(?:"
+    r"(?:^|(?<=[\s'\"`;|&(){}\[<>!=:,/#%@^*+$~?]))(?:"
     + "|".join(map(re.escape, sorted(_RUN_PROGRAMS)))
     + r"|mkfs[\w.]*)(?=\s)"
 )
@@ -2963,6 +2967,8 @@ _RAW_EXEC_OPTS = ("--pager", "--pre", "--hostname-bin")
 #: Backslash escapes as a program decodes them: ``\x72``, ``\o162``, ``\d114``, ``\162``, ``\<newline>`` (dropped),
 #: ``\n``/``\t`` (a blank), any other ``\c`` (``c``).
 _RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
+#: Two quoted literals of an argument list (``"rm", "-rf"``, ``'rm','-rf'``): read as one blank in the decoded text.
+_RAW_LIST_SEP = re.compile(r"([\"'])\s*,\s*\1")
 #: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
 _RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
 #: How many characters the runs of one command line may read in all, each character charged once and each run
@@ -3029,7 +3035,8 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
     if _raw_exempt(words, argv):
         return None
     raw = _RAW_PARAM.sub(_raw_param, _without_messages(sub, argv))
-    decoded = _RAW_PARAM.sub(_raw_param, _RAW_ESCAPE.sub(_raw_unescape, raw).replace("'", "").replace('"', ""))
+    unescaped = _RAW_LIST_SEP.sub(" ", _RAW_ESCAPE.sub(_raw_unescape, raw))
+    decoded = _RAW_PARAM.sub(_raw_param, unescaped.replace("'", "").replace('"', ""))
     budget = _RAW_SCAN_BUDGET
     seen: set[str] = set()
     for text, ends in ((raw, _RAW_RUN_END), (decoded, _DECODED_RUN_END)):
@@ -3050,6 +3057,10 @@ def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, hom
                 return "scan-budget"
             run = " ".join(_raw_run_argv(text, m.start(), stop))
             runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < m.start() and c in run)]
+            # a run right after a punctuation delimiter (``qx!rm -rf ~!``, ``q#...#``) also ends at that delimiter
+            before = text[m.start() - 1] if m.start() else ""
+            if before and not before.isspace() and not before.isalnum() and before != "/" and before in run:
+                runs.append(run[: run.find(before)])
             for r in runs:
                 if r in seen:
                     continue  # the decoded text repeats most runs of the raw one
@@ -3152,19 +3163,48 @@ def _pipe_offsets(text: str) -> Iterator[int]:
         i += 1
 
 
+#: The separators of a ``parallel`` command from its argument lists: with one the input is not the command.
+_PARALLEL_ARG_SEPS = frozenset({":::", "::::", ":::+", "::::+"})
+#: The text of a pipe's consumer up to the next separator, braces included (``xargs -I{} sh -c {}``).
+_PIPE_SEGMENT = re.compile(r"[^;&|\n]*")
+
+
+def _consumer_runs_stdin(clean: str, m: re.Match[str], argv: list[str]) -> bool:
+    """The command ``m`` matched after a pipe runs what arrives on stdin as code: a scheduler (_schedules_stdin), a
+    shell or interpreter with no code argument (_runs_stdin_as_code: ``| perl``, ``| python3 -``, ``| . /dev/stdin``),
+    ``parallel`` with no ``:::`` and no command or an interpreter one, an ``xargs sh -c {}``
+    (_xargs_runs_input_as_code), or a process substitution of one (``| tee >(sh)``)."""
+    name = os.path.basename(argv[0])
+    if _schedules_stdin(argv):
+        return True
+    if _is_interpreter(name) or name in _STDIN_SPECS:
+        return _runs_stdin_as_code([name, *argv[1:]])
+    if name == "parallel":
+        if any(a in _PARALLEL_ARG_SEPS for a in argv):
+            return False
+        cmd = [a for a in argv[1:] if not a.startswith("-") and not a.isdigit()]
+        return not cmd or _is_interpreter(os.path.basename(cmd[0]))
+    if name == "xargs" and _xargs_runs_input_as_code(_tokens(_PIPE_SEGMENT.match(clean, m.start(1)).group())):
+        return True
+    if not m.group(1).rstrip().endswith(">") or not clean.startswith("(", m.end()):
+        return False
+    inner = _PIPE_CONSUMER.match(clean, m.end())
+    sub = _command_argv(_tokens(inner.group(1))) if inner and inner.group(1).strip() else []
+    return bool(sub) and _consumer_runs_stdin(clean, inner, sub)
+
+
 def _pipe_producer_scan(clean: str, dirs: _Dirs) -> str | None:
-    """Before each pipe into a program that runs its stdin as shell code (_schedules_stdin, a shell per
-    _runs_stdin_as_code), the whole text up to it is read by the raw-text scan: the parsed pipelines lose the producer
-    of a group or compound command (``{ echo 'rm -rf ~'; true; } | at now``, ``f | sh``) and a grouped consumer
-    (``echo 'rm -rf ~' | (at now)``). Each stretch of text is read once."""
+    """Before each pipe into a program that runs its stdin as code (_consumer_runs_stdin), the whole text up to it
+    is read by the raw-text scan: the parsed pipelines lose the producer of a group or compound command (``{ echo
+    'rm -rf ~'; true; } | at now``, ``f | sh``) and a grouped consumer (``echo 'rm -rf ~' | (at now)``). Each stretch
+    of text is read once."""
     start = 0
     for i in _pipe_offsets(clean):
         m = _PIPE_CONSUMER.match(clean, i + 1)
         argv = _command_argv(_tokens(m.group(1))) if m and m.group(1).strip() else []
         if not argv:
             continue
-        shell = os.path.basename(argv[0]) in _SHELLS and _runs_stdin_as_code(argv)
-        if not (shell or _schedules_stdin(argv)):
+        if not _consumer_runs_stdin(clean, m, argv):
             continue
         hit = _raw_text_scan(clean[start:i], [], _CODE_ARGV, dirs, dirs.home)
         if hit:

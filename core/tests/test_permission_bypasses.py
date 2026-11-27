@@ -1919,3 +1919,73 @@ def test_a_command_line_a_payload_runs_is_refused(tmp_path: Path, prog: str, cmd
 @pytest.mark.parametrize("cmd", PAYLOAD_KEEP)
 def test_a_payload_that_runs_nothing_catastrophic_is_not_refused(tmp_path: Path, cmd: str) -> None:
     assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# Round 13: a perl/ruby quote operator's punctuation delimiter ends the run it starts (``qx!...!``), a pipe into an
+# interpreter with no code argument runs the producer's text, and an argv list reads as one command line.
+_R13_RM = "rm -" + "rf ~"
+_R13_ABS = "/" + "usr"  # an absolute system path: the real home is not the one decide() sees in tests
+R13_RUNS = [
+    ("perl", f"perl -e 'qx!{_R13_RM}!'"),
+    ("perl", f"perl -e 'system q#{_R13_RM}#'"),
+    ("ruby", f"ruby -e '%x^{_R13_RM}^'"),
+    *(("perl", f"perl -e 'qx{c}{_R13_RM}{c}'") for c in ",:*+=$%@?"),  # qx|...| was refused already: a | ends a run
+    ("perl", "perl -e 'qx~rm -" + "rf $HOME~'"),
+    *(
+        ("echo", f"echo 'system(\"{_R13_RM}\")' | {consumer}")
+        for consumer in (
+            "perl",
+            "python3",
+            "python3 -",
+            "ruby",
+            "node",
+            "tclsh",
+            "lua",
+            "php",
+            "parallel",
+            "xargs -I{} sh -c {}",
+            "source /dev/stdin",
+            ". /dev/stdin",
+            "tee >(sh)",
+            "sudo perl",
+            "env python3",
+            "nohup ruby",
+            "timeout 5 node",
+        )
+    ),
+    ("ruby", 'ruby -e \'system("rm", "-rf", "' + _R13_ABS + "\")'"),
+    ("python3", 'python3 -c \'import subprocess;subprocess.run(["rm","-rf","' + _R13_ABS + "\"])'"),
+    ("python3", "python3 -c \"import subprocess;subprocess.run(['rm', '-rf', '/'])\""),
+]
+R13_KEEP = [
+    "rm -rf ~/proj/build",
+    "/bin/rm -rf ~/proj/build",
+    "rm -rf ${HOME}/proj/build",
+    "perl -e 'qx!rm -rf ~/proj/build!'",
+    "echo 'print(1)' | python3",
+    "cat x.py | python3 -",
+    "echo hi | python3 -c 'print(1)'",
+    "echo x | python3 script.py",
+    "cat f | perl -ne 'print'",
+    "echo hi | node -e 'console.log(1)'",
+    "ls | xargs echo",
+    "ls | xargs wc -l",
+    "echo x | parallel echo {}",
+    "printf 'ls' | bash",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R13_RUNS)
+def test_a_quote_delimiter_stdin_interpreter_or_argv_list_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", R13_KEEP)
+def test_a_project_path_or_a_code_argument_stdin_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
