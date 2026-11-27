@@ -1691,3 +1691,88 @@ def test_every_spelling_of_a_privileged_container_needs_a_human(
 def test_an_unprivileged_container_needs_no_human(tmp_path: Path, cmd: str) -> None:
     dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path)
     assert dec.action == "allow" and not dec.needs_human, cmd
+
+
+#: review 11: a catastrophic run anywhere in a non-text program's raw text (the raw-text backstop)
+RAW_TEXT_RUNS = [
+    ("find", "find . -exec sed 's/.*/rm -rf ~/e' {} \\;"),
+    ("watch", "watch sed 's/.*/rm -rf ~/e' f"),
+    ("fd", "fd -x sed 's/.*/rm -rf ~/e'"),
+    ("foo", "foo sed 's/.*/rm -rf ~/e' f"),
+    ("vim", "vim -c 'g/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'g!/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'v/x/!rm -rf ~' f"),
+    ("vim", "vim -c '%g/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'global/x/!rm -rf ~' f"),
+    ("vim", "vim -c \"'a,'b!rm -rf ~\" f"),
+    ("sed", "sed -e's/x/rm -rf ~/e' f"),
+    ("sed", "sed -ne's/x/rm -rf ~/e' f"),
+    ("sed", "sed '/x/Is/.*/rm -rf ~/e' f"),
+    ("sed", "sed '\\%x%s%.*%rm -rf ~%e' f"),
+    ("sed", "sed 's/.*/\\x72m -rf ~/e' f"),
+    ("sed", "sed 's/.*/true\\nrm -rf ~/e' f"),
+    ("tar", "tar -xF'rm -rf ~' -f a"),
+    ("tar", "tar -cL1F'rm -rf ~' -f a x"),
+    ("at", "echo 'rm -rf ~' | at now | cat"),
+    ("at", "echo 'rm -rf ~' | at now 2>&1 | tee log"),
+    ("at", "{ echo 'rm -rf ~'; } | at now"),
+    ("at", "echo 'rm -rf ~' | at -f /dev/stdin now"),
+    ("crontab", "echo '* * * * * rm -rf ~' | crontab /dev/stdin"),
+    ("crontab", "echo '* * * * * rm -rf ~' | crontab"),
+]
+RAW_TEXT_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+    "rg 'rm -rf ~' docs",
+    "git log --grep='rm -rf'",
+    "sed -i 's/rm -rf/echo/' file",
+    "sed -n '/rm -rf/p' f",
+    "awk '/rm -rf/' f",
+    "pytest -k 'rm or dd'",
+    "rm -rf build/",
+    "rm -rf ~/proj/build",
+    "sudo rm -rf /usr/local/lib/foo",
+    "rm -f a b c",
+    "find . -name '*.pyc' -delete",
+    "dd if=a of=b",
+    "docker run --rm img rm -rf /tmp/x",
+    "cat > x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "echo hi | at now",
+    "crontab -l",
+    "crontab jobs.txt",
+    "at -f job.sh now",
+    "vim -c 'set ft=c' f",
+    "tar czf a.tgz src",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), RAW_TEXT_RUNS)
+def test_a_catastrophic_run_in_raw_text_is_refused(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", RAW_TEXT_KEEP)
+def test_raw_text_that_only_mentions_a_run_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path)
+    assert dec.action == "allow" and not dec.hardline, (cmd, dec.action)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "foo " + "a/rm " * 9999,
+        "foo " + "'rm -rf a' " * 4000,
+        "foo 'rm " + "a " * 45000 + "'",
+        "foo " + "s/x/rm\\x20" * 9000,
+    ],
+)
+def test_the_raw_text_scan_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]

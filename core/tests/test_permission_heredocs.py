@@ -572,13 +572,19 @@ def test_an_escape_in_a_brace_expansion_of_a_launcher_argument_is_unescaped(tmp_
 
 
 #: the inner shell gets an escaped backtick or plain text here: nothing runs
-BRACE_TEXT = [r'bash -c "${x:+\\\`rm -rf ~\\\`}"', r'bash -c "echo ${x:-rm -rf ~}"']
+BRACE_TEXT = [r'bash -c "echo ${x:-rm -rf ~}"']
 
 
 @pytest.mark.parametrize("cmd", BRACE_TEXT)
 def test_an_escaped_backtick_in_a_brace_expansion_stays_text(tmp_path: Path, cmd: str) -> None:
     assert check(cmd, cwd=str(tmp_path)) is None
     assert _bash(cmd, "yolo", tmp_path).action == "allow"
+
+
+def test_an_escaped_backtick_run_is_refused_by_the_raw_text_backstop(tmp_path: Path) -> None:
+    # accepted over-deny: the inner shell only prints `rm -rf ~`, but the raw text of a non-text program (bash) that
+    # names a catastrophic run is refused (see _raw_text_scan)
+    assert check(r'bash -c "${x:+\\\`rm -rf ~\\\`}"', cwd=str(tmp_path)) == "rm-rf-home"
 
 
 def test_a_brace_expansion_in_a_double_quoted_word_loses_the_backslashes_the_shell_drops() -> None:
