@@ -2058,3 +2058,57 @@ def test_a_heredoc_of_many_git_literals_is_not_refused_for_the_scan_budget(tmp_p
     dec = _decide(cmd, mode, tmp_path)
     assert time.perf_counter() - start < 1.0
     assert dec.hardline is None and dec.action != "deny", (mode, dec)
+
+
+# Review round 15: a perl/ruby quote operator with any delimiter (``qx.``, ``%x-``, ``qx«``, a blank before the run),
+# and a ternary between two quoted arguments of a list (``system(1?"rm":0, "-rf", "/")``)
+_R15 = "rm -" + "rf ~"
+_R15_ROOT = "rm -" + "rf /"
+R15_RUNS = [
+    ("perl", "perl -e 'qx." + _R15 + ".'"),
+    ("perl", "perl -e 'qx-" + _R15 + "-'"),
+    ("perl", "perl -e 'qx. " + _R15 + ".'"),
+    ("perl", "perl -e 'exec qw." + _R15_ROOT + ".'"),
+    ("perl", "perl -Mutf8 -e 'qx«" + _R15 + "»'"),
+    ("perl", "perl <<'EOF'\nqx." + _R15 + ".;\nEOF"),
+    ("perl", 'perl -e \'system(1?"rm":0, "-r' + 'f", "/")\''),
+    ("ruby", "ruby -e '%x." + _R15 + ".'"),
+    ("ruby", "ruby -e '%x-" + _R15 + "-'"),
+    ("ruby", "ruby -e '%x- " + _R15 + "-'"),
+    ("ruby", "ruby -e 'exec %w." + _R15_ROOT + ".'"),
+]
+#: Decisions that stay as they were before round 15 (default without a rule, auto): no new over-deny.
+R15_KEEP = [
+    ("git commit -m '" + _R15 + " is bad'", "ask", "allow"),
+    ("echo hi | at now", "ask", "allow"),
+    ("rm -" + "rf build/", "ask", "allow"),
+    ("rm -" + "rf ${HOME}/proj/build", "ask", "allow"),
+    ("make clean", "ask", "allow"),
+    ("pytest -k 'rm or dd'", "ask", "allow"),
+    ("tar czf a.tgz src", "ask", "allow"),
+    ("grep -rn '" + "rm -" + "rf' src", "allow", "allow"),
+    ("python3 -c 'print(1)'", "ask", "allow"),
+    ("docker run --rm img", "ask", "allow"),
+    ("ls -rm", "allow", "allow"),
+    ("git add " + " ".join(f"p{i}.py" for i in range(3000)), "ask", "allow"),
+    ("cat > x.sh <<'EOF'\necho safe\nEOF", "ask", "allow"),
+    ("rm -r --force build/", "ask", "allow"),
+    ("perl -e 'print qw.a b.'", "ask", "allow"),
+    ("perl -e 'print qq-rm is a word-'", "ask", "allow"),
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R15_RUNS)
+def test_a_quote_operator_with_any_delimiter_or_a_ternary_list_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline not in (None, "scan-budget", "too-large"), (cmd, mode, dec)
+
+
+@pytest.mark.parametrize(("cmd", "default", "auto"), R15_KEEP, ids=[c[:30] for c, _, _ in R15_KEEP])
+def test_round_15_keeps_the_decisions_of_ordinary_commands(tmp_path: Path, cmd: str, default: str, auto: str) -> None:
+    assert (_decide(cmd, "default", tmp_path).action, _decide(cmd, "auto", tmp_path).action) == (default, auto)
