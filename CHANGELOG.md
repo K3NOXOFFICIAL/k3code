@@ -7,6 +7,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Known gaps (not fixed in this release; details in `docs/reports/harness-audit-2026-11-26.md`)
 
+- Review round 10 (PASS WITH LOW) leaves open: the text-option skip hides `watch -p rm -rf ~` and `tar -F 'rm -rf ~'`; vim ranged filters (`%!cmd`), `sed s///e`, `| at now`; prose after `=` that mentions a destructive command is hard denied.
 - Permission engine: `cat $(...)`, backtick substitution and same-line variable assignment are not resolved; `--volumes-from` and compose-file volumes are not checked; readers not on the builtin list (`less`, `base64`, `awk`, `sed`) on secret paths only ask; recursive listings (`ls -R ~`, `find ~ -name id_rsa`) reveal names under dot folders; `cd -P link/..; echo x > f` writes through a symlink.
 - The parser is a heuristic, not a proof, and default and accept-edits modes run bash unsandboxed. The sound fix is to run bash sandboxed in every mode.
 - Item 4 (skills listing) and the environment-text part of item 5 were not reproducible; no change was needed beyond a budget test and a date line for the `claude` CLI backend.

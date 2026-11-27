@@ -34,13 +34,24 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `7d272472`)
+## Verification (final tree `d00cbeb6`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **12824 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
+- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **12967 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
+
+## Review round 10 (tip `d00cbeb6`): PASS WITH LOW
+
+Independent reviewer, 190 derived-value cases plus 74 everyday commands. Of the derived-value cases the base commit missed 103 and the tip misses 8; every remaining miss was already missed at `dc13baf0`, none is a regression. No exception; worst `decide()` call 1.42 s (200k emoji), everything else 0.71 s or less. Round 9's seven high findings are fixed (glued `-c`, tar exec options, vim/less `!`, env values, `alias` with `!`, `ext::`, `--privileged=true`). First round without a FAIL. Open findings, not fixed:
+
+1. MEDIUM the text-option skip (`-e -m -F -p --file --pattern --message --regexp`) in `hardline.py` applies to every program, so `watch -p rm -rf ~`, `chronic -e rm -rf ~`, `tar -L1 -F 'rm -rf ~' -cf a d` (tar `-F` is `--info-script`) get past the backstop; fix: skip only for text programs.
+2. MEDIUM vim filter with an Ex range: `vim -c '%!rm -rf ~' x`, `1,$!`, `.!`, `silent %!`.
+3. MEDIUM `sed 's/.*/rm -rf ~/e' f` (the `s///e` flag).
+4. LOW-MEDIUM piping to a scheduler: `echo 'rm -rf ~' | at now`, `| batch`, `| crontab -`.
+5. LOW ANSI-C quoting `bash -c "$'\x72m' -rf ~"` (yolo allows).
+6. LOW over-deny, new: values after `=` that merely mention a destructive command are hard denied in every mode, yolo included: `curl -d 'cmd=rm -rf ~' URL`, `python3 gen.py --title='rm -rf ~ hazard'`, `MSG='rm -rf ~ is bad' ./notify.sh`; also (earlier commits) `python -c 'print("rm -rf ~")'`, `jq '.cmd = "rm -rf ~"'`, `gh pr create --body 'remove rm -rf ~ footgun'`; commands over the size limits (100k chars) are refused in auto and yolo.
 
 ## Review round 9 (tip `7d272472`): FAIL, findings NOT fixed
 
