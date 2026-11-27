@@ -580,6 +580,7 @@ def _check_parsed(
             or _download_run_check(argv, fetched)
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
             or _run_scan(words, dirs, home, 0)
+            or _raw_text_scan(sub, words, argv, dirs, home)
         )
         if hit:
             return hit
@@ -1985,7 +1986,7 @@ def _piped_text_code(stages: list[str]) -> list[tuple[str, str]]:
         if argv[:1] not in (["echo"], ["printf"]):
             continue
         later = [_command_argv(_tokens(s)) for s in stages[j + 1 :]]
-        schedule = _schedules_stdin(later[-1])
+        schedule = next((n for a in later if (n := _schedules_stdin(a))), "")
         if not schedule and not any(a and a[0] in _SHELLS and _runs_stdin_as_code(a) for a in later):
             continue
         args = argv[1:]
@@ -2004,13 +2005,33 @@ _CRONTAB_SCHEDULE = re.compile(r"^\s*(?:@\w+|(?:\S+\s+){4}\S+)\s+")
 
 
 def _schedules_stdin(argv: list[str]) -> str:
-    """``at``/``batch`` (no ``-f``/listing option) or ``crontab -`` as the last pipeline stage: each runs its stdin as
-    shell code later (``echo 'rm -rf ~' | at now``). Returns the program name, or "" when stdin is not run."""
+    """``at``/``batch`` (no listing option, no ``-f`` or ``-f /dev/stdin``) or ``crontab`` reading stdin (``-``,
+    ``/dev/stdin`` or no file operand, no ``-l``/``-r``/``-e``...): each runs its stdin as shell code later (``echo
+    'rm -rf ~' | at now``). Returns the program name, or "" when stdin is not run."""
     name = os.path.basename(argv[0]) if argv else ""
-    opts = [a for a in argv[1:] if a.startswith("-") and a != "-"]
-    if name in ("at", "batch") and not any(o[1:2] in ("f", "l", "d", "r", "c") for o in opts):
-        return name
-    return name if name == "crontab" and "-" in argv[1:] else ""
+    args = argv[1:]
+    if name in ("at", "batch"):
+        for k, a in enumerate(args):
+            if a.startswith("-f"):
+                path = a[2:] or (args[k + 1] if k + 1 < len(args) else "")
+                return name if path in _STDIN_PATHS else ""
+        opts = [a for a in args if a.startswith("-") and a != "-"]
+        return "" if any(ch in "ldrc" for o in opts for ch in o[1:]) else name
+    if name != "crontab":
+        return ""
+    operands: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in ("-u", "-n"):
+            skip = True
+        elif a.startswith("-") and a != "-":
+            if any(ch in "lreTVc" for ch in a[1:]):
+                return ""
+        else:
+            operands.append(a)
+    return name if not operands or operands[-1] in _STDIN_PATHS else ""
 
 
 def _xargs_runs_input_as_code(words: list[str]) -> bool:
@@ -2888,6 +2909,93 @@ _RUN_PROGRAMS = frozenset(
     | _WRITES_ALL
     | _WRITES_LAST
 )
+
+#: Launchers that run a program named anywhere in their arguments: a text program they name (``find -exec echo``)
+#: does not exempt their segment from the raw-text scan (_raw_text_scan).
+_ANY_ARG_LAUNCHERS = frozenset({"find", "xargs", "watch", "fd", "fdfind", "parallel"})
+#: A _RUN_PROGRAMS word (or ``mkfs*``) followed by a blank, at a word boundary of raw text: the start, a blank, a
+#: quote, a shell operator, or a character a program may read a command after (vim ``!``, sed ``/``, ``=``, ``:``).
+_RAW_RUN_START = re.compile(
+    r"(?:^|(?<=[\s'\"`;|&(){}<>!=:,/#%@]))(?:" + "|".join(map(re.escape, sorted(_RUN_PROGRAMS))) + r"|mkfs[\w.]*)(?=\s)"
+)
+#: Where a run in raw text ends: a shell operator, a newline, a closing paren or backtick; in the raw text (not the
+#: decoded one) also a quote.
+_RAW_RUN_END = re.compile(r"[;|&\n)`'\"]")
+_DECODED_RUN_END = re.compile(r"[;|&\n)`]")
+#: Backslash escapes as a program decodes them: ``\x72``, ``\o162``, ``\d114``, ``\162``, ``\<newline>`` (dropped),
+#: ``\n``/``\t`` (a blank), any other ``\c`` (``c``).
+_RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
+#: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
+_RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
+#: How many characters the runs of one command line may read in all, each run charged _RAW_RUN_COST more for its
+#: checks (each run reads to its end; see _RUN_SCAN_BUDGET). Past this it is refused (``scan-budget``).
+_RAW_SCAN_BUDGET = 150_000
+_RAW_RUN_COST = 128
+
+
+def _raw_unescape(m: re.Match[str]) -> str:
+    x, o, d, octal, newline, blank, other = m.groups()
+    if x or o or octal or d:
+        return chr(int(x, 16) if x else int(o or octal, 8) if (o or octal) else int(d))
+    return "" if newline else " " if blank else other
+
+
+def _raw_exempt(words: list[str], argv: list[str]) -> bool:
+    """A text program (_text_only) not named by a launcher that runs its arguments (_ANY_ARG_LAUNCHERS)."""
+    return _text_only(argv) and not any(os.path.basename(w) in _ANY_ARG_LAUNCHERS for w in words)
+
+
+def _without_messages(sub: str, argv: list[str]) -> str:
+    """``sub`` with the ``-m``/``--message`` values of a message program (``hg commit -m '...'``) taken out."""
+    if not argv or os.path.basename(argv[0]) not in _MESSAGE_PROGRAMS:
+        return sub
+    for opt, value in zip(argv, argv[1:], strict=False):
+        if opt in _MESSAGE_OPTS:
+            raw = next((q for q in (shlex.quote(value), f"'{value}'", f'"{value}"', value) if q in sub), "")
+            sub = sub.replace(raw, " ", 1) if raw else sub
+    return sub
+
+
+def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, home: str) -> str | None:
+    """The backstop behind the word readings (_run_scan): in the raw text of a non-text program's command line
+    (quotes and backslashes included), and again with its escapes decoded and its quotes removed (``\\x72m``,
+    ``r""m``, ``true\\nrm``), every run from a _RUN_PROGRAMS word to the next separator is checked as if it were the
+    command, so ``find -exec sed 's/.*/rm -rf ~/e'``, ``vim -c 'g/x/!rm -rf ~'`` or ``tar -xF'rm -rf ~'`` is refused
+    whatever the program and its syntax. A run after a sed ``s`` delimiter also ends at that delimiter (``~/e`` is
+    ``~``). Text programs (_raw_exempt) and message values (_without_messages) are not read."""
+    if _raw_exempt(words, argv):
+        return None
+    raw = _without_messages(sub, argv)
+    decoded = _RAW_ESCAPE.sub(_raw_unescape, raw).replace("'", "").replace('"', "")
+    budget = _RAW_SCAN_BUDGET
+    seen: set[str] = set()
+    for text, ends in ((raw, _RAW_RUN_END), (decoded, _DECODED_RUN_END)):
+        if text is not raw and text == raw:
+            continue
+        delims: dict[str, int] = {}
+        for m in _RAW_SED_DELIM.finditer(text):
+            delims.setdefault(m.group(1), m.start())
+        for m in _RAW_RUN_START.finditer(text):
+            end = ends.search(text, m.end())
+            run = text[m.start() : end.start() if end else len(text)]
+            runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < m.start() and c in run)]
+            for r in runs:
+                if r in seen:
+                    continue  # the decoded text repeats most runs of the raw one
+                seen.add(r)
+                budget -= len(r) + _RAW_RUN_COST
+                if budget < 0:
+                    return "scan-budget"
+                rargv = r.split()
+                hit = (
+                    _rm_check(rargv, dirs, home)
+                    or _find_check(rargv, dirs, home)
+                    or _git_push_check(rargv)
+                    or _destroy_check(rargv, r, home, dirs)
+                )
+                if hit:
+                    return hit
+    return None
 
 
 def _flag_set(args: list[str]) -> set[str]:
@@ -3884,7 +3992,9 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         for k, sub in enumerate(parsed.subs):
             for p in _launcher_payloads(sub):
                 payloads.setdefault(p, []).append(k)
-        for stages in parsed.pipelines:
+        for j, stages in enumerate(parsed.pipelines):
+            if j and stages[0].strip() in ("}", ")"):  # { echo 'rm -rf ~'; } | at now: the group's last command
+                stages = parsed.pipelines[j - 1][-1:] + stages[1:]
             for p, stage in _piped_text_code(stages):  # echo 'rm -rf ~' | sh
                 payloads.setdefault(p, []).append(parsed.subs.index(stage) if stage in parsed.subs else 0)
     except _TooDeep:  # see _command_argv
