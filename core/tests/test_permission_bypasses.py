@@ -1776,3 +1776,69 @@ def test_the_raw_text_scan_stays_fast(tmp_path: Path, cmd: str) -> None:
     start = time.perf_counter()
     _decide(cmd, "auto", tmp_path)
     assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+# ── the raw-text backstop: run terminators, the argument window, text-program exec options, oversize input ──
+
+#: (program a ``prog *`` allow rule names, command): a closing brace or bracket ends a run and an opening one starts
+#: it (the target was read as ``~}``), and a text program's command-running option is read like any program's.
+BACKSTOP_DENY: list[tuple[str, str]] = [
+    ("ruby", "ruby -e 'system(%q{rm -rf ~})'"),
+    ("ruby", "ruby -e 'system(%q{rm -rf /})'"),
+    ("perl", "perl -e 'qx{rm -rf ~}'"),
+    ("perl", "perl -e 'exec q{rm -rf $HOME}'"),
+    ("perl", "perl -e 'system(q[rm -rf ~])'"),
+    ("ruby", "ruby -e '%x[rm -rf ~]'"),
+    ("lua", "lua -e 'os.execute([[rm -rf ~]])'"),
+    ("ag", "ag --pager='rm -rf ~' x"),
+    ("ag", "ag --pre='rm -rf ~' x"),
+]
+
+
+@pytest.mark.parametrize("rule", [False, True])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), BACKSTOP_DENY)
+def test_the_backstop_ends_runs_at_braces_and_reads_text_program_exec_options(
+    tmp_path: Path, prog: str, cmd: str, mode: str, rule: bool
+) -> None:
+    rules = [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)] if rule else []
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action == "deny", (cmd, mode, rule)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_braced_home_is_still_home_and_its_subfolders_keep_their_decision(tmp_path: Path, mode: str) -> None:
+    assert _decide("rm -rf ${HOME}", mode, tmp_path).action == "deny"
+    assert _decide("perl -e 'system(\"rm -rf ${HOME}\")'", mode, tmp_path).action == "deny"
+    assert _decide("rm -rf ${HOME}/proj/build", mode, tmp_path).action != "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_the_run_window_still_reads_a_recursive_deletes_last_target(tmp_path: Path, mode: str) -> None:
+    pad = " ".join(f"a{i}" for i in range(40))
+    assert _decide(f"perl -e 'system(\"rm -rf {pad} ~\")'", mode, tmp_path).action == "deny"
+    assert _decide(f"perl -e 'system(\"rm -rf ~ {pad}\")'", mode, tmp_path).action == "deny"
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_long_path_list_naming_run_programs_is_not_refused(tmp_path: Path, mode: str) -> None:
+    paths = [f"src/pkg{i}/mod{i}.py" for i in range(3000)]
+    start = time.perf_counter()
+    plain = _decide("git add " + " ".join(paths), mode, tmp_path).action
+    took = time.perf_counter() - start  # the engine's own cost for 3,000 words: under load it nears a second
+    paths[100], paths[1500], paths[2900] = "tools/install", "lib/cp", "docs/git"
+    start = time.perf_counter()
+    d = _decide("git add " + " ".join(paths), mode, tmp_path)
+    assert time.perf_counter() - start < max(1.0, 2 * took)
+    assert (d.action, d.hardline) == (plain, None)
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_an_oversize_line_of_short_runs_is_refused_fast(tmp_path: Path, mode: str) -> None:
+    seg = "awk '" + " ".join(["rm"] * 260) + "' f"
+    start = time.perf_counter()
+    d = _decide(" ; ".join([seg] * 40), mode, tmp_path)
+    assert time.perf_counter() - start < 1.0
+    assert d.action != "allow" and "too large to check" in (d.message or "")
