@@ -1586,6 +1586,87 @@ def test_deriving_commands_from_words_stays_fast(tmp_path: Path, cmd: str) -> No
     assert time.perf_counter() - start < 1.0, cmd[:40]
 
 
+#: review 10: option values of non-text programs, vim filters over an Ex range, sed ``s///e``, scheduler pipes
+ROUND10_RUNS = [
+    ("watch", "watch -p rm -rf ~"),
+    ("unbuffer", "unbuffer -p rm -rf ~"),
+    ("chronic", "chronic -e rm -rf ~"),
+    ("foo", "foo -m rm -rf ~"),
+    ("tar", "tar -L1 -F 'rm -rf ~' -cf a d"),
+    ("git", "git -c core.pager='chronic -e rm -rf ~' log"),
+    ("sh", "sh -c 'unbuffer -p rm -rf ~'"),
+    ("hg", "hg pull -e 'rm -rf ~'"),
+    ("vim", "vim -c '%!rm -rf ~' x"),
+    ("vim", "vim -c '1,$!rm -rf ~' x"),
+    ("vim", "vim -c '.!rm -rf ~' x"),
+    ("vim", "vim -c '1!rm -rf ~' x"),
+    ("vim", "vim -c 'silent %!rm -rf ~' x"),
+    ("vim", "vim +'%!rm -rf ~' x"),
+    ("nvim", "nvim -c '%!rm -rf ~'"),
+    ("sed", "sed 's/.*/rm -rf ~/e' f"),
+    ("sed", "sed -e 's/x/rm -rf ~/e'"),
+    ("sed", "sed 's#a#rm -rf ~#e'"),
+    ("sed", "sed 's/a/rm -rf ~/ge' f"),
+    ("echo", "echo 'rm -rf ~' | at now"),
+    ("printf", "printf 'rm -rf ~' | at now + 1 minute"),
+    ("echo", "echo 'rm -rf ~' | batch"),
+    ("echo", "echo '* * * * * rm -rf ~' | crontab -"),
+    ("echo", "echo '@reboot rm -rf ~' | crontab -"),
+]
+ROUND10_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "grep -e 'rm -rf' src",
+    "rg -e 'rm -rf ~' docs",
+    "grep -rn 'rm -rf' src",
+    "echo rm -rf ~",
+    "man -p x ls",
+    "git log --grep='rm -rf'",
+    "sed -i 's/rm -rf/echo/' file",
+    "sed 's/a/b/g' f",
+    "sed -n '/rm -rf/p' f",
+    "sed 's/a/b/ge' f",
+    "echo hi | at now",
+    "crontab -l",
+    "crontab file",
+    "mkdir -p a/b",
+    "pytest -p no:cacheprovider",
+    "vim -c 'set nu' x",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), ROUND10_RUNS)
+def test_option_values_filters_sed_e_and_scheduled_text_are_scanned(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", ROUND10_KEEP)
+def test_messages_patterns_and_benign_schedules_are_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        " ".join(["sed", "-e"] + ["s/a/b/e"] * 3000),
+        "vim -c '" + "1," * 15000 + "'",
+        "sed '" + "s/a" * 10000 + "'",
+        "echo '" + "x " * 15000 + "' | crontab -",
+    ],
+    ids=["sed-e", "vim-range", "sed-delims", "crontab"],
+)
+def test_scanning_sed_vim_and_crontab_text_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
 CONTAINER_TAKEOVER_SPELLINGS = [
     ("docker", "docker run --privileged=true img"),
     ("docker", "docker run --privileged=1 img"),
