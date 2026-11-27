@@ -42,6 +42,15 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
 
+## Review round 15 (tip `ec4d2efe`): FAIL, findings NOT fixed
+
+Independent reviewer, read-only. No case is weaker in default mode than at `d00cbeb6`, no exception, 59 everyday commands unchanged, 3,000-path `git add`/`rm -f`/`chmod` lists unchanged. Findings:
+1. HIGH (also allowed at `d00cbeb6`): quote-operator delimiters still not read: `perl -e 'qx.<run>.'`, `qx-<run>-`, `qw.<run>.`, `ruby -e '%x.<run>.'`, `%x-<run>-`, non-ASCII delimiters (`qx«<run>»`), and a perl heredoc body with `qx.<run>.;`. The lookbehind in `_RAW_RUN_START` lacks `.`, `-` and non-ASCII punctuation (adding `-` blindly would start a run at `docker run --rm`). Direction: match `q[qxw]?` / `%[xwWiIqQ]?` plus any non-space delimiter explicitly.
+2. MEDIUM REGRESSION, and my round-14 claim for finding 8 was too broad: `python3 - <<'EOF'` with about 550 lines of ordinary `print("step N: pip install pkgN then run it")` (17-27k chars) is refused with `scan-budget` in every mode (`d00cbeb6`: ask in default, allow in yolo). Bare `# cp step N` comment lines trip it too; node and git-literal heredocs of about 1,200 lines as well. On lines over 100k characters, `cat > gen.sh <<'EOF'` with 3,000 `cp && chmod` lines (145k) and a 200k-char notes heredoc are now denied in default mode (was ask), because `oversize_check` scans with the interpreter argv and `cat` loses its text-program exemption.
+3. LOW: `perl -e 'system(1?"rm":0, "-rf", "/")'` (computed first argv element) is allowed in yolo.
+
+Net of round 14 + 15: the round-14 follow-up fixed oversize-in-default for the catastrophic case but only partly fixed the heredoc `scan-budget` over-deny. It is an over-deny (stricter than before), not a weaker check.
+
 ## Review round 14 (tip `e1ef4aab`): FAIL, findings NOT fixed
 
 Independent reviewer, read-only, `decide()` only. 117 everyday commands had no other regression, no exception on NUL, lone surrogates or 100k+ characters, 3,000-path `git add`, `rm -f` and `chmod` lists allow. Open findings:
