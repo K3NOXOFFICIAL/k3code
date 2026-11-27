@@ -34,13 +34,26 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `8c657d63`)
+## Verification (final tree `765b56f0`)
 
 - `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13530 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
+
+## Review round 13 (tip `765b56f0`): FAIL, findings NOT fixed
+
+Independent reviewer, read-only. No regression: every finding below was also allowed on `d00cbeb6`. 62 everyday commands: only two changed to a hard deny (`sed -i` with the text but no `e` flag, a python heredoc that only prints it), both in the accepted prose class. No exception on NUL, lone surrogates or 100k chars; slowest decide() 0.76 s; `scan-budget` did not fire on 3,000-path `git add`, `rm -f`, `chmod`, `git rm` lists.
+
+Open findings, none fixed:
+1. HIGH perl/ruby quote operators with punctuation delimiters: `perl -e 'qx!<run>!'`, `system q#<run>#`, `ruby -e '%x^<run>^'` (delimiters `! # , : * + = $ ^` are not run terminators, so the target reads as `~!`). Allowed in yolo and under a `prog *` rule.
+2. HIGH the pipe-producer scan misses stdin runners that are not shells: `echo 'system("<run>")' | perl` (also `python3`, `python3 -`, `ruby`, `node`, `tclsh`, `parallel`, `xargs -I{} sh -c {}`, `source /dev/stdin`, `tee >(sh)`). The heredoc forms are denied.
+3. MEDIUM argv-list forms with no shell and an absolute path: `ruby -e 'system("rm", "-rf", "<abs path>")'`, `subprocess.run([...])`, node `spawnSync`.
+4. MEDIUM a script written and run in one command: `echo '<run>' > x.sh && sh x.sh` (text programs are exempt).
+5. LOW string concatenation that splits the program word: `os.system("rm"+" -rf ~")`.
+
+This closes the review series for this session: rounds 1-6, 8, 9, 11, 12, 13 FAIL; 7 no verdict; 10 PASS WITH LOW. The heuristic parser has not converged. The sound fix is running bash in the sandbox in every mode.
 
 ## Review round 12 (tip `5a3c7ab8`, raw-text backstop `6e080242`): FAIL, fixed afterwards but NOT re-reviewed
 
