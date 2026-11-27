@@ -34,9 +34,9 @@ Each item was treated as a hypothesis and checked against the source by a read-o
 | 8 | Web fetch/browse always show a cut marker; bash capture drop says how to get the rest; read-only `.git` failures name `sandbox.git_writable` and the config path. | 9 new tests. |
 | 9 | Offline eval suite: 16 scripted tasks, pass rate and steps per task (`core/scripts/eval_score.py`). | Branch 16/16, mean 2.81 steps; original code 14/16 (the two malformed-call tasks fail). |
 
-## Verification (final tree `e1ef4aab`)
+## Verification (final tree `bbdea465`)
 
-- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13742 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
+- `cd core && uv run pytest -p no:cacheprovider -n auto -k "not test_update"`: **13857 passed, 24 skipped, 0 failed** (baseline before changes: 9585 passed). The `test_update_*` tests (about 3 minutes each, they wait on network timeouts) are skipped in this number; they passed in the previous full run (12689 passed in 6 min) and the same slowness shows on the untouched base commit `dc13baf0`, so it is the environment, not this diff (no update code is touched).
 - `uv run ruff check . ../scripts` and `ruff format --check`: clean. `tests/test_release_export.py` passes. No absolute home path or tailnet address in the diff; `gitleaks`: no leaks.
 - `uv run pytest tests/test_agent_evals.py -s`: `eval pass rate: 16/16, mean steps: 2.81` (original code: 14/16).
 - Each permission fix ships with tests that fail without it (fix set aside as a patch, new tests must fail, fix restored).
@@ -54,6 +54,8 @@ Independent reviewer, read-only, `decide()` only. 117 everyday commands had no o
 9. LOW REGRESSION: `cat f | perl -pe 's/<run text>/x/'` now denied (prose class).
 
 Series total: rounds 1-6, 8, 9, 11, 12, 13, 14 FAIL; 7 no verdict; 10 PASS WITH LOW. Each round finds new variants, mostly present at the base commit too. Recommendation unchanged: run bash in the sandbox in every mode and keep the parser as a convenience layer. Findings 4 and 8 are regressions of this branch and should be fixed before merge if the parser approach is kept.
+
+Follow-up (commit `4e4e0ea3`, merged `bbdea465`, NOT re-reviewed): findings 1-4 and 8 are fixed. An oversize line is read by the budgeted raw-text scan first and is denied in every mode when a catastrophic run is found, when the scan runs out of budget, or when the line is over 1,000,000 characters (never weaker than the old hardline deny); literals that name only git/cd/pushd/write programs cost 64 of the 150,000 budget instead of 512; `rm --r...` prefixes, `chmod`/`chown --rec...`, glued sed `e<cmd>` and node argv lists (`", [`) are read. 102 new deny cells plus 6 heredoc cells failed before and pass now; keep list unchanged; full suite 13857 passed. Still open from this round: findings 5, 6, 7, 9; on an oversize line a catastrophic run hidden in a form only the full check reads (`$IFS`, braces, cd before a relative delete, user hardline patterns) still gets "too large" (ask in default mode).
 
 ## Review round 13 (tip `765b56f0`): FAIL, findings NOT fixed
 
