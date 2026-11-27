@@ -184,7 +184,8 @@ def test_bash_cwd_resolves_redirects_and_outside_cwd_asks() -> None:
     assert action("echo hi > out.txt", "sub") == "allow"
     assert action("echo hi > out.txt", "/etc") == "ask"  # writes /etc/out.txt
     assert action("echo hi > .bashrc", "..") == "ask"
-    assert action("ls", "/") == "ask"  # a read-only command run outside the project asks too
+    assert action("ls", "/etc") == "allow"  # a read-only command run outside the project is allowed (secrets excluded)
+    assert action("ls", "/") == "ask"  # but only in the roots outside reads may use (see _outside_root_ok)
     assert action("ls", ".") == "allow"
 
 
@@ -459,7 +460,7 @@ def test_builtin_bash_readers_do_not_reach_outside_the_roots_or_secrets(tmp_path
     for command in ("cat ~/.config/k3code/env", "cat /proc/self/environ", "rg . ~/.ssh/id_ed25519"):
         assert action(command) == "deny", command
     assert action("grep -r KEY ~/.config") == "ask"
-    assert action("cat /etc/hosts") == "ask"
+    assert action("cat /etc/hosts") == "allow"  # a read-only command may read outside the project (not secrets)
     assert action("grep -rn --file=/etc/x y") == "ask"
     assert action("cat $HOME/notes") == "ask"
     assert action("grep KEY .env") == "deny"

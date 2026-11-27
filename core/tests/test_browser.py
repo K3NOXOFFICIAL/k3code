@@ -461,6 +461,43 @@ async def test_a_huge_dom_is_capped_and_parsed_off_the_event_loop(monkeypatch):
     assert "[page cut" in text
 
 
+# ── a page longer than the cap keeps a marker that says what was cut and how to get more ──
+
+BIG = "<html><head><title>Big</title></head><body><main><p>" + "word " * 6000 + "</p></main></body></html>"
+
+
+@pytest.mark.parametrize("site", ["fetch", "fetch_in_browser", "web_browse"])
+@respx.mock
+async def test_fetch_longer_than_cap_keeps_cut_marker(site):
+    from k3code.research.tools import MAX_FETCH_CHARS
+
+    url = "https://big.test/page"
+    respx.get("https://big.test/robots.txt").mock(return_value=httpx.Response(404))
+    if site == "fetch":
+        respx.get(url).mock(return_value=httpx.Response(200, headers={"content-type": "text/html"}, text=BIG))
+        _, text = await fetch_page(url, fetcher=fetcher())
+    elif site == "fetch_in_browser":
+        respx.get(url).mock(return_value=httpx.Response(403, text=CHALLENGE))
+        browser, _log = fake_browser({url: (200, BIG)})
+        _, text = await fetch_page(url, fetcher=fetcher(), browser=browser)
+    else:
+        browser, _log = fake_browser({url: (200, BIG)})
+        reg = _Registry()
+        register_web_tools(reg, SimpleNamespace(research={}), browser=browser)
+        text = (await reg.handlers["web_browse"]({"url": url}))["content"]
+    marker = text[text.rindex("[showing first") :]
+    assert marker.startswith(f"[showing first {MAX_FETCH_CHARS} of ") and "web_search" in marker
+    assert text.endswith("]") and len(text) <= MAX_FETCH_CHARS + 250 + 100  # cap + marker (+ browse header)
+
+
+def test_a_page_within_the_cap_gets_no_marker_and_a_source_cut_keeps_its_own():
+    from k3code.research.tools import MAX_FETCH_CHARS, _cap_page
+
+    assert _cap_page("short") == "short"
+    assert _cap_page("short", "the size cap was reached").startswith("short\n[page cut: the size cap was reached;")
+    assert "of 14001+ chars" in _cap_page("x" * (MAX_FETCH_CHARS + 1), "the size cap was reached")
+
+
 # ── the SSRF guard inside Chromium: routes on the context, service workers blocked ──
 
 

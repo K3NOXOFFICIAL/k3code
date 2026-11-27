@@ -11,10 +11,11 @@ lone ``&``, a quote or a substitution.
 
 from __future__ import annotations
 
+import bisect
 import os
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -144,7 +145,9 @@ HARDLINE_NAMES: list[str] = [
     "git-push-delete-main",  # git push --delete/-d main, git push <remote> :main (see _git_push_check)
     "env-dump",  # env / printenv / export -p / set / declare -x printing the environment (see _env_dump_check)
     "scan-budget",  # a command too long to parse within the scan budget (see check)
+    "too-large",  # a command too long to be read even by the raw-text scan (see oversize_check)
     "scan-depth",  # a command nested deeper than the parser follows (see check)
+    "expansion-over-cap",  # a brace expansion too large to check word by word (see _check_expanded)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -421,16 +424,134 @@ def check(
 
 
 def check_parse(
-    command: str, extra_patterns: list[str] | None = None, *, cwd: str | None = None, home: str | None = None
+    command: str,
+    extra_patterns: list[str] | None = None,
+    *,
+    cwd: str | None = None,
+    home: str | None = None,
+    oversize: Callable[[Parsed], bool] | None = None,
 ) -> tuple[str | None, Parsed]:
     """:func:`check` and the parse it read (``parse(command)``): the engine decides on that parse instead of parsing a
-    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope)."""
+    long command line a second time. It looks up at most _TILDE_MAX_USERS ``~name`` users (see lookup_scope). A parse
+    that ``oversize`` refuses is not checked (no hit): the caller refuses it as too large, without the checks' cost."""
     with lookup_scope():
-        return _check_parse(command, extra_patterns, cwd, home)
+        token = _PAYLOAD_STATE.set((0, cwd))  # the quoted-literal checks read their lines in this cwd
+        try:
+            return _check_parse(command, extra_patterns, cwd, home, oversize)
+        finally:
+            _PAYLOAD_STATE.reset(token)
+
+
+#: Past this many characters a line is not read at all, not even by oversize_check: refused (``too-large``).
+_MAX_SCAN_CHARS = 1_000_000
+
+
+def oversize_check(command: str, cwd: str | None = None, home: str | None = None) -> str | None:
+    """The hardline check of a line too large to check in full (the caller refuses it as too large if this finds
+    nothing): only the raw-text scan reads it, in time linear in its length and within _RAW_SCAN_BUDGET, so a
+    catastrophic run in it (``true; ... true; rm -rf ~``) is refused as on a small line; past that budget, or past
+    _MAX_SCAN_CHARS, the line is refused too: the answer for a large line is never weaker than a hardline deny."""
+    if len(command) > _MAX_SCAN_CHARS:
+        return "too-large"
+    home = home if home is not None else os.path.expanduser("~")
+    text = _without_data_heredocs(command)
+    return _raw_text_scan(text, [], _CODE_ARGV, _Dirs([cwd], cwd, home, []), home)
+
+
+#: A heredoc operator's ``-`` and its delimiter word, quoted or not, ended where the shell ends a word (``<<'E'OF``,
+#: whose delimiter is ``EOF``, is not read).
+_OVERSIZE_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([\w.-]+)\2(?=[\s;&|<>()]|$)")
+#: What the reading of _without_data_heredocs stops at outside quotes: a heredoc operator (not ``<<<``), a comment,
+#: an arithmetic ``((``, ``$'``, ``$(``, a quote, an escape, a newline; inside double quotes and backticks.
+_OVERSIZE_TOKEN = re.compile(r"(?<!<)<<(?!<)|(?:^|(?<=[\s;&|()]))#[^\n]*|\$?\(\(|\$'|\$\(|[\\'\"`\n]")
+_OVERSIZE_DQUOTE = re.compile(r"[\\\"`]|\$\(")
+_OVERSIZE_BQUOTE = re.compile(r"[\\`]")
+#: What makes a heredoc's line more than one simple command: a pipe, a list, a substitution.
+_OVERSIZE_COMPOUND = re.compile(r"[|;&`]|[$<>]\(")
+#: Programs that write their heredoc body out as data, as on the normal path (no interpreter reads it as code); the
+#: text programs (_raw_exempt) are data programs too.
+_DATA_PROGRAMS = frozenset({"cat", "tee"})
+
+
+def _data_heredoc_line(line: str, m: re.Match[str], line_start: int) -> bool:
+    """The heredoc ``m`` on ``line`` (one simple command) feeds a quoted-delimiter body to ``cat``/``tee`` or a text
+    program."""
+    if not m.group(2) or line.count("<<") != 1 or _OVERSIZE_COMPOUND.search(line):
+        return False
+    head = line[: m.start() - line_start] + line[m.end() - line_start :]
+    argv = _command_argv(_without_redirects(_tokens(head)))
+    return bool(argv) and (os.path.basename(argv[0]) in _DATA_PROGRAMS or _raw_exempt([], argv))
+
+
+def _without_data_heredocs(command: str) -> str:
+    """``command`` without the bodies of the quoted-delimiter heredocs fed to a text program or ``cat``/``tee``
+    (``cat > gen.sh <<'EOF'``) on a line that is one simple command: the normal path does not read those bodies as
+    code, so the oversize scan does not either. The text is read once with its quotes, comments and escapes; an
+    interpreter's body (``python3 - <<'EOF'``) is kept and skipped. Where the shell's reading of a body is uncertain
+    the rest of the command is kept whole: an unquoted delimiter (``$((1<<2))`` reads as one too) or a ``<<-`` one
+    (its end may be indented), a ``<<`` the pattern does not read, a second heredoc or an open quote or a
+    continuation on its line, ``((``, ``$'...'`` and a substitution inside double quotes (their quotes nest)."""
+    out: list[str] = []
+    pos = i = top = 0  # top: where the last line that starts outside quotes and continuations starts
+    quote = ""
+    pending: re.Match[str] | None = None  # the heredoc operator on this line
+    while True:
+        if quote == "'":
+            i = command.find("'", i) + 1
+            if not i:
+                break
+            quote = ""
+            continue
+        t = (_OVERSIZE_DQUOTE if quote == '"' else _OVERSIZE_BQUOTE if quote else _OVERSIZE_TOKEN).search(command, i)
+        if t is None:
+            break
+        tok, i = t.group(0), t.end()
+        if tok == "\\":
+            if pending and command.startswith("\n", i):
+                break
+            i += 1
+            continue
+        if quote:
+            if tok != quote:
+                break
+            quote = ""
+        elif tok in ("'", '"', "`"):
+            quote = tok
+        elif tok == "<<":
+            pending = None if pending else _OVERSIZE_HEREDOC.match(command, t.start())
+            if pending is None or pending.group(1) or not pending.group(2):
+                break
+            i = pending.end()
+        elif tok == "\n":
+            line_start, top = top, i
+            if pending is None:
+                continue
+            m, pending, delim = pending, None, pending.group(3)
+            if command.find("\n", m.end()) != i - 1:
+                break  # a quote on the heredoc's line went on to the next line
+            end = command.find("\n" + delim + "\n", i - 1)
+            if end < 0 and command.endswith("\n" + delim) and len(command) - len(delim) >= i:
+                end = len(command) - len(delim) - 1
+            if end < 0:
+                break
+            if line_start == command.rfind("\n", 0, m.start()) + 1 and _data_heredoc_line(
+                command[line_start : i - 1], m, line_start
+            ):
+                out.append(command[pos:i])
+                pos = end + 1
+            i = end + 1 + len(delim)
+        elif not tok.startswith(("#", "$(")) or tok == "$((":
+            break  # ``((``, ``$((``, ``$'``
+    out.append(command[pos:])
+    return "".join(out)
 
 
 def _check_parse(
-    command: str, extra_patterns: list[str] | None, cwd: str | None, home: str | None
+    command: str,
+    extra_patterns: list[str] | None,
+    cwd: str | None,
+    home: str | None,
+    oversize: Callable[[Parsed], bool] | None = None,
 ) -> tuple[str | None, Parsed]:
     home = home if home is not None else os.path.expanduser("~")
     budget = [_SCAN_BUDGET]
@@ -441,18 +562,124 @@ def _check_parse(
     # deny and would tokenise every nesting level of such a command, so they are skipped.
     if budget[0] < 0 or parsed.too_deep:
         return ("scan-budget" if budget[0] < 0 else "scan-depth"), parsed
+    if oversize is not None and oversize(parsed):
+        return oversize_check(command, cwd, home), parsed
     _reserve_users(parsed.clean)
     dirs = _Dirs([cwd], cwd, home, _cdpath_entries(command))
+    starts: dict[int, _Dirs] = {}  # per nested command (id of its parse): the directories it starts in
     try:
-        return _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs), parsed
+        hit = _match(parsed.clean, extra_patterns) or _check_parsed(parsed, extra_patterns, dirs, starts)
+        if hit:
+            return hit, parsed
+        # the shell expands braces and splits `$IFS` after the words were read: `rm${IFS}-rf${IFS}/` and `{rm,-rf,/}`
+        # run `rm -rf /`. The line and every nested command are checked once more in that form, and so are the
+        # commands that form makes (`{bash,-c,'{rm,-rf,/}'}`), _EXPAND_MAX_DEPTH levels deep (see _check_expanded).
+        hit = _check_expanded([parsed.clean, *parsed.nested], parsed, extra_patterns, cwd, home, budget, set(), 0)
+        if hit:
+            return hit, parsed
+        # ... and each nested command whole, in the directories it starts in: `cd / && bash -c 'rm${IFS}-rf${IFS}*'`
+        # runs `rm -rf *` in `/`, which the check above reads from the cwd
+        hit = _check_nested_expanded(parsed, parsed, extra_patterns, budget, starts, 0)
+        if hit:
+            return hit, parsed
+        return None, parsed
     except _TooDeep:  # a simple command that alternates wrappers and reserved words endlessly (see _command_argv)
         return "scan-depth", parsed
 
 
-def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str | None:
+#: how many times a command the shell makes by expanding braces or splitting `$IFS` is itself expanded and checked;
+#: one that still expands at the last level is denied (``scan-depth``)
+_EXPAND_MAX_DEPTH = 3
+
+
+def _check_expanded(
+    texts: list[str],
+    parsed: Parsed,
+    extra: list[str] | None,
+    cwd: str | None,
+    home: str,
+    budget: list[int],
+    seen: set[str],
+    depth: int,
+) -> str | None:
+    """Check ``texts`` (a line and its nested commands) in the form the shell runs them after brace expansion and
+    `$IFS` splitting, then the nested commands that form has, ``depth`` levels down. Each expanded parse is added to
+    ``parsed.expanded``. A brace expansion too large to read word by word is denied (``expansion-over-cap``): what it
+    runs is unknown, so not even yolo allows it."""
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        try:
+            alt = _expanded_text(text)
+        except (_BraceOverCap, RecursionError):  # fail closed: a word too deep to expand is not checked
+            parsed.expansion_over_cap = True
+            return "expansion-over-cap"
+        if alt is None or alt == text:
+            continue
+        if depth >= _EXPAND_MAX_DEPTH:
+            return "scan-depth"
+        alt_parsed = parse(alt, budget=budget)
+        if budget[0] < 0 or alt_parsed.too_deep:
+            return "scan-budget" if budget[0] < 0 else "scan-depth"
+        _reserve_users(alt_parsed.clean)
+        alt_dirs = _Dirs([cwd], cwd, home, _cdpath_entries(alt))
+        hit = _match(alt_parsed.clean, extra) or _check_parsed(alt_parsed, extra, alt_dirs)
+        if hit:
+            return hit
+        parsed.expanded.append(alt_parsed)
+        hit = _check_expanded([alt_parsed.clean, *alt_parsed.nested], parsed, extra, cwd, home, budget, seen, depth + 1)
+        if hit:
+            return hit
+    return None
+
+
+def _check_nested_expanded(
+    parsed: Parsed, root: Parsed, extra: list[str] | None, budget: list[int], starts: dict[int, _Dirs], depth: int
+) -> str | None:
+    """Check every nested command of ``parsed`` (a payload, a heredoc script) whole, brace-expanded and
+    `$IFS`-split, in the directories it starts in (``starts``, recorded by _check_parsed): a ``cd`` before it or in it
+    moves its relative targets. A command its expanded form nests is followed ``depth`` levels down, as in
+    _check_expanded. Each expanded parse is added to ``root.expanded``."""
+    for child in parsed.children:
+        start = starts.get(id(child))
+        if start is not None:
+            try:
+                alt = _expanded_text(child.clean)
+            except (_BraceOverCap, RecursionError):  # fail closed, as in _check_expanded
+                root.expansion_over_cap = True
+                return "expansion-over-cap"
+            if alt is not None and alt != child.clean:
+                if depth >= _EXPAND_MAX_DEPTH:
+                    return "scan-depth"
+                alt_parsed = parse(alt, budget=budget)
+                if budget[0] < 0 or alt_parsed.too_deep:
+                    return "scan-budget" if budget[0] < 0 else "scan-depth"
+                _reserve_users(alt_parsed.clean)
+                hit = _match(alt_parsed.clean, extra) or _check_parsed(
+                    alt_parsed, extra, start.spawn([start.where()]), starts
+                )
+                if hit:
+                    return hit
+                root.expanded.append(alt_parsed)
+                hit = _check_nested_expanded(alt_parsed, root, extra, budget, starts, depth + 1)
+                if hit:
+                    return hit
+        hit = _check_nested_expanded(child, root, extra, budget, starts, depth)
+        if hit:
+            return hit
+    return None
+
+
+def _check_parsed(
+    parsed: Parsed, extra: list[str] | None, dirs: _Dirs, starts: dict[int, _Dirs] | None = None
+) -> str | None:
     # relative rm/find targets are read in every directory the sub may run in, followed through the line (see _Dirs)
     home = dirs.home
     dirs.cond |= _conditional_names(parsed.clean)
+    hit = _pipe_producer_scan(parsed.clean, dirs)
+    if hit:
+        return hit
     need = {k for ks in parsed.child_subs for k in ks}
     where: dict[int, _Where] = {}  # the directories of the subs a child came from, taken at that sub
     fetched: set[str] = set()  # files an earlier command of the line downloaded (see _download_run_check)
@@ -471,11 +698,21 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
             or _rm_check(argv, dirs, home)
             or _find_check(argv, dirs, home)
             or _git_push_check(argv)
+            or _exec_option_check(words, argv)
             or _env_dump_check(sub)
             or _fetch_run_check(argv, parsed.sub_payloads[k])
             or _destroy_check(argv, sub, home, dirs)
             or _download_run_check(argv, fetched)
             or (sargv is not argv and (_rm_check(sargv, dirs, home) or _git_push_check(sargv)))
+            or _run_scan(words, dirs, home, 0)
+            or _raw_text_scan(sub, words, argv, dirs, home)
+            or _heredoc_code_scan(parsed.heredocs[k], parsed.code_heredoc[k], extra, dirs)
+            or (
+                argv
+                and not _raw_exempt(words, argv)
+                and os.path.basename(argv[0]) not in _MESSAGE_PROGRAMS
+                and _payload_line_check(argv[1:], extra, home)
+            )
         )
         if hit:
             return hit
@@ -486,9 +723,205 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, dirs: _Dirs) -> str |
         return hit
     for child, ks in zip(parsed.children, parsed.child_subs, strict=True):
         start = [where[k] for k in ks if k in where]
-        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start))
+        if starts is not None:
+            starts[id(child)] = dirs.spawn(start)  # a copy the check below does not move (see _check_nested_expanded)
+        hit = _match(child.clean, extra) or _check_parsed(child, extra, dirs.spawn(start), starts)
         if hit:
             return hit
+    return None
+
+
+#: Programs that only read their arguments as text (a message, a pattern, a name to look up): the run scan below
+#: skips their command lines, so ``echo rm -rf ~`` or ``rg 'rm -rf ~' docs`` is not a delete.
+_TEXT_PROGRAMS = frozenset(
+    {"echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "man", "help", "type", "which", "apropos", "whatis"}
+)
+_TEXT_GIT_SUBS = frozenset({"commit", "tag", "log", "notes"})
+#: Options whose value is a message or a pattern: a run is not read from that value (``hg commit -m 'rm -rf ~'``).
+_TEXT_VALUE_OPTS = frozenset({"-m", "--message", "-e", "--regexp", "-F", "--file", "-p", "--pattern"})
+#: Programs whose ``-m``/``--message`` value is a message even though the program is not a text program.
+_MESSAGE_PROGRAMS = frozenset({"hg"})
+_MESSAGE_OPTS = frozenset({"-m", "--message"})
+#: Words that end a run: shell operators inside a quoted payload and tmux's ``\;`` command separator.
+_RUN_ENDS = frozenset({";", "\\;", "&&", "||", "|", "&", "|&"})
+#: How deep the run scan reads quoted multi-word arguments (``a 'b "rm -rf ~"'`` is two levels).
+_RUN_SCAN_DEPTH = 3
+
+
+def _text_only(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    name = os.path.basename(argv[0])
+    if name == "sg":
+        return _ast_grep(argv)
+    if _text_exec_values(argv):
+        return False  # rg --pre, man -P: a program runs (see _TEXT_EXEC_OPTS)
+    return name in _TEXT_PROGRAMS or (name == "git" and _git_sub(argv)[0] in _TEXT_GIT_SUBS)
+
+
+def _text_value_opts(argv: list[str]) -> frozenset[str]:
+    """The options whose value the program of ``argv`` reads as text: _TEXT_VALUE_OPTS for a text program
+    (_text_only), ``-m``/``--message`` for a message program (``hg commit -m``), none for any other program, which may
+    run the value (``watch -p CMD``, ``tar -F CMD``, ``hg -e CMD``)."""
+    if _text_only(argv):
+        return _TEXT_VALUE_OPTS
+    return _MESSAGE_OPTS if argv and os.path.basename(argv[0]) in _MESSAGE_PROGRAMS else frozenset()
+
+
+def _run_scan(words: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    """The backstop behind the launcher readings (_command_argv): every run of words in the command line, from any word
+    to the next separator, is checked as if it were the command, so ``anylauncher --opt v rm -rf ~`` is refused
+    whatever the launcher. Quoted multi-word arguments are split as shell code and scanned the same way, to
+    _RUN_SCAN_DEPTH levels (``script --comm 'rm -rf ~'``, ``tmux split 'rm -rf ~'``). Text programs (_text_only) and
+    the values of their message/pattern options (_text_value_opts) are not read; their env assignments and git's own
+    options are (_text_args_start). Each word is read as the commands derived from it too (_run_heads)."""
+    if _text_only(_command_argv(words)):
+        return _segment_scan(words, dirs, home, depth)
+    start = 0
+    for i, w in enumerate(words + [";"]):
+        if w not in _RUN_ENDS:
+            continue
+        hit = _segment_scan(words[start:i], dirs, home, depth)
+        if hit:
+            return hit
+        start = i + 1
+    return None
+
+
+def _text_args_start(seg: list[str]) -> int:
+    """Where the text arguments of a text program (_text_only) start in ``seg``: its env assignments and, for git, its
+    own options before the subcommand stay read (``GIT_PAGER='rm -rf ~' git log``, ``git -ccore.pager=... log``)."""
+    argv = _command_argv(seg)
+    if not _text_only(argv):
+        return len(seg)
+    tail = _git_sub(argv)[1] if os.path.basename(argv[0]) == "git" else argv[1:]
+    return max(0, len(seg) - len(tail))
+
+
+#: Prefixes that make the rest of a word a command line: vim/less ``!CMD``, ``:!CMD``, ``+!CMD``, ``+:!CMD``, an
+#: input filter ``|CMD`` (``LESSOPEN``), a git alias ``!CMD``.
+_RUN_PREFIXES = ("+:!", "+!", ":!", "!", "|")
+#: How many ``=``/``:`` of one word start a value read as a command (``--checkpoint-action=exec=CMD`` is two).
+_RUN_VALUE_SPLITS = 4
+#: One Ex address: ``.``, ``$``, ``%``, a line number, a mark, a search, each with optional ``+N``/``-N`` offsets.
+_EX_ADDR = r"(?:[.$%]|\d+|'[a-zA-Z<>]|/[^/]*/|\?[^?]*\?)(?:\s*[+-]\d*)*"
+#: A vim filter through a command over an Ex range (``%!CMD``, ``1,$!CMD``, ``+'silent .!CMD'``).
+_EX_RANGE_FILTER = re.compile(rf"\+?:?\s*(?:silent!?\s+)?:?\s*{_EX_ADDR}(?:\s*[,;]\s*{_EX_ADDR})*\s*!")
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
+
+def _run_heads(w: str) -> list[tuple[str, bool]]:
+    """The texts a program may run from word ``w``, each with whether a run prefix (_RUN_PREFIXES) led to it: the
+    word, the value after each of its first _RUN_VALUE_SPLITS ``=``/``:`` (``--to-command=CMD``, ``-cKEY=CMD``,
+    ``NAME=CMD``), the tail of a glued short option (``-cCMD``), each with a run prefix stripped, and a git
+    ``ext::CMD`` URL with ``%`` read as a space. Bounded: a few slices of ``w`` each."""
+    tails = [w]
+    if len(w) > 2 and w[0] == "-" and w[1] != "-":
+        tails.append(w[2:])
+    at = -1
+    for _ in range(_RUN_VALUE_SPLITS):
+        eq, colon = w.find("=", at + 1), w.find(":", at + 1)
+        at = min((p for p in (eq, colon) if p >= 0), default=-1)
+        if at < 0:
+            break
+        tails.append(w[at + 1 :])
+    heads = [(t, False) for t in tails]
+    for t in tails:
+        p = t[7:] if t.startswith("silent !") else next((t[len(x) :] for x in _RUN_PREFIXES if t.startswith(x)), None)
+        m = None if p else _EX_RANGE_FILTER.match(t)
+        p = t[m.end() :] if m else p
+        if p:
+            heads.append((p.lstrip(), True))
+    if w.startswith("ext::"):
+        heads.append((w[5:].replace("%", " "), False))
+    return heads
+
+
+def _quoted_scan(text: str, dirs: _Dirs, home: str, depth: int) -> str | None:
+    """A quoted multi-word argument split as shell code and scanned like a command line (see _run_scan)."""
+    for sub in split_commands(text):
+        hit = (
+            _simple_check(sub)
+            or _destroy_check(_command_argv(_tokens(sub)), sub, home, dirs)
+            or _run_scan(_tokens(sub), dirs, home, depth + 1)
+        )
+        if hit:
+            return hit
+    return None
+
+
+#: A sed ``s`` command and its flags: ``s/RE/REPL/FLAGS`` with any delimiter, at the start of a word or after a
+#: separator or an address; the ``e`` flag runs the replaced pattern space, so REPL is a command line.
+_SED_PART = r"(?:\\.|(?!\1)[^\\])*"
+_SED_SUBST = re.compile(rf"(?:^|(?<=[\s;{{}}0-9$/!,=]))s([^\\\n]){_SED_PART}\1({_SED_PART})\1([a-zA-Z0-9]*)")
+_SEDS = frozenset({"sed", "gsed"})
+#: A sed ``e`` command glued to its command (``1erm -rf ~``, ``$erm``, ``/x/erm``, ``1!erm``): an ``e`` at the start
+#: of a word or after a separator, an address or a ``!``, and the rest of its line, which sed runs as a command.
+_SED_EXEC_CMD = re.compile(r"(?:^|(?<=[\s;{}0-9$/!,IM~+]))e(?=[^\s;}])([^\n]*)")
+
+
+def _sed_exec_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    """``sed 's/.*/rm -rf ~/e'``: the replacement of an ``s`` command with the ``e`` flag is scanned as a command."""
+    argv = _command_argv(seg)
+    if argv and os.path.basename(argv[0]) in _ANY_ARG_LAUNCHERS:  # ``find . -exec sed '1erm -rf ~' {} +``
+        argv = argv[next((i for i, w in enumerate(argv) if os.path.basename(w) in _SEDS), len(argv)) :]
+    if not argv or os.path.basename(argv[0]) not in _SEDS or depth >= _RUN_SCAN_DEPTH:
+        return None
+    repls = dict.fromkeys(m.group(2) for w in argv[1:] for m in _SED_SUBST.finditer(w) if "e" in m.group(3))
+    # the spaced ``1e rm -rf ~`` is read by the raw-text scan; the glued one is not (``erm`` is no run start)
+    budget = _RUN_SCAN_BUDGET
+    for w in argv[1:]:
+        for m in _SED_EXEC_CMD.finditer(w):
+            budget -= len(m.group(1))  # ``1e1e1e...`` reads each rest of the line: n^2 characters
+            if budget < 0:
+                return "scan-budget"
+            repls.setdefault(m.group(1))
+    return next((hit for r in repls if (hit := _quoted_scan(r, dirs, home, depth))), None)
+
+
+#: How many words the runs of one segment may read in all: each run reads to the end of the segment, so a segment of
+#: n run starts (``x rm rm rm ...``, ``x -ca=rm -ca=rm ...``) read n^2 words. Past this it is refused (``scan-budget``).
+_RUN_SCAN_BUDGET = 100_000
+
+
+def _segment_scan(seg: list[str], dirs: _Dirs, home: str, depth: int) -> str | None:
+    budget = _RUN_SCAN_BUDGET
+    text_opts = _text_value_opts(_command_argv(seg))
+    sed_hit = _sed_exec_scan(seg, dirs, home, depth)
+    if sed_hit:
+        return sed_hit
+    for i in range(_text_args_start(seg)):
+        if i and seg[i - 1] in text_opts:
+            continue
+        w = seg[i]
+        if any(c.isspace() for c in w):
+            hit = _quoted_scan(w, dirs, home, depth) if depth < _RUN_SCAN_DEPTH else None
+            if hit:
+                return hit
+        for k, (head, prefixed) in enumerate(_run_heads(w)):
+            if any(c.isspace() for c in head):
+                # a quoted word is split above; a derived one only when its splitting differs (ext:: with %)
+                hit = _quoted_scan(head, dirs, home, depth) if k and depth < _RUN_SCAN_DEPTH and "%" in w else None
+                if hit:
+                    return hit
+                continue
+            name = os.path.basename(head)
+            if prefixed and name in _SHELLS and seg[i + 1 : i + 2] != ["-c"]:
+                return "shell-escape-command"  # vim/less ``!sh``, ``+!bash``: an interactive shell from a command line
+            if name not in _RUN_PROGRAMS and not name.startswith("mkfs"):
+                continue  # only a program the checks below refuse starts a run
+            budget -= len(seg) - i
+            if budget < 0:
+                return "scan-budget"
+            argv = _command_argv([head, *seg[i + 1 :]])
+            hit = (
+                _rm_check(argv, dirs, home)
+                or _find_check(argv, dirs, home)
+                or _git_push_check(argv)
+                or _destroy_check(argv, shlex.join([head, *seg[i + 1 :]]), home, dirs)
+            )
+            if hit:
+                return hit
     return None
 
 
@@ -890,6 +1323,8 @@ def _command_argv(tokens: list[str]) -> list[str]:
         argv = normalize_argv(_past_reserved(argv))
         if argv[:1] == ["busybox"] and len(argv) > 1 and not argv[1].startswith("-"):
             argv = argv[1:]
+        elif argv and (inner := _launched_argv(argv)):  # flock, screen, setpriv, ... (see _LAUNCH_SPECS)
+            argv = inner
         elif not argv or argv[0] not in _RESERVED_WORDS:
             return argv
     raise _TooDeep
@@ -968,6 +1403,280 @@ SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": 
 #: RemoteCommand, KnownHostsCommand).
 _SSH_COMMAND_OPTION = re.compile(r"\s*[A-Za-z]*command(?:\s*=|\s)\s*(.*)", re.IGNORECASE | re.DOTALL)
 
+#: Programs that run the command in their arguments but are no _WRAPPER_SPECS wrapper, so the engine keeps them as the
+#: command (a rule decides ``flock /tmp/l make`` and ``screen -dm make`` as written): the hardline checks look at what
+#: they run (see :func:`_launched_argv`), so ``flock /tmp/l rm -rf ~`` is refused like ``nohup rm -rf ~``. Option
+#: arity as in _WRAPPER_SPECS: (short options taking a value, long options taking a value, positionals before the
+#: command).
+_LAUNCH_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
+    "flock": ("wEc", frozenset({"--wait", "--timeout", "--conflict-exit-code", "--command"}), 1),  # past the lock file
+    "setpriv": (
+        "",
+        frozenset(
+            {"--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set", "--securebits"}
+            | {"--pdeathsig", "--selinux-label", "--apparmor-profile", "--landlock-access", "--landlock-rule"}
+            | {"--seccomp-filter", "--ruid", "--euid", "--rgid", "--egid"}
+        ),
+        0,
+    ),
+    "runuser": ("ugGcsw", frozenset({"--user", "--group", "--supp-group", "--command", "--shell"}), 0),
+    "systemd-run": (
+        "upEHMC",
+        frozenset(
+            {"--unit", "--property", "--setenv", "--host", "--machine", "--description", "--slice", "--uid", "--gid"}
+            | {"--nice", "--working-directory", "--service-type", "--on-active", "--on-boot", "--on-startup"}
+            | {"--on-unit-active", "--on-unit-inactive", "--on-calendar", "--timer-property", "--path-property"}
+            | {"--socket-property", "--capsule", "--background", "--json"}
+        ),
+        0,
+    ),
+    "unshare": (
+        "SGRw",
+        frozenset({"--setuid", "--setgroups", "--root", "--wd", "--propagation", "--map-user", "--map-group"})
+        | frozenset({"--map-users", "--map-groups", "--monotonic", "--boottime"}),
+        0,
+    ),
+    "nsenter": ("tSG", frozenset({"--target", "--setuid", "--setgroups"}), 0),
+    "chroot": ("", frozenset({"--userspec", "--groups"}), 1),  # past the new root
+    "firejail": ("", frozenset(), 0),  # its options are --name=value
+    "torsocks": ("upaP", frozenset({"--user", "--pass", "--address", "--port"}), 0),
+    "proxychains": ("f", frozenset(), 0),
+    "proxychains4": ("f", frozenset(), 0),
+    "fakeroot": ("lsib", frozenset({"--lib", "--faked"}), 0),
+    "rlwrap": ("bCDefFgHlMOPqsStwz", frozenset(), 0),
+    "xvfb-run": (
+        "efnswp",
+        frozenset({"--error-file", "--auth-file", "--server-num", "--server-args", "--wait", "--xauth-protocol"}),
+        0,
+    ),
+    "dbus-run-session": ("", frozenset({"--config-file", "--dbus-daemon"}), 0),
+    "systemd-inhibit": ("", frozenset({"--what", "--who", "--why", "--mode"}), 0),
+    "ltrace": ("aADeFlnopsuwx", frozenset({"--align", "--output", "--library"}), 0),
+    "valgrind": ("", frozenset(), 0),  # its options are --name=value
+    "catchsegv": ("", frozenset(), 0),
+    "npx": ("pcw", frozenset({"--package", "--call", "--workspace"}), 0),
+}
+#: ``uv run`` options taking a value (uv's global ones included: ``uv --directory x run cmd``).
+_UV_RUN_SPEC = (
+    "pwCPf",
+    frozenset(
+        {"--with", "--with-editable", "--with-requirements", "--python", "--package", "--extra", "--group"}
+        | {"--only-group", "--no-group", "--env-file", "--index", "--default-index", "--index-url", "--find-links"}
+        | {"--extra-index-url", "--directory", "--project", "--config-file", "--cache-dir", "--color", "--resolution"}
+        | {
+            "--prerelease",
+            "--exclude-newer",
+            "--link-mode",
+            "--config-setting",
+            "--upgrade-package",
+            "--allow-insecure-host",
+        }
+        | {"--refresh-package", "--reinstall-package", "--python-platform", "--keyring-provider", "--index-strategy"}
+    ),
+    0,
+)
+#: screen's options taking a value (``-dmS name cmd``); ``-Logfile FILE`` is its one long-named one.
+_SCREEN_VALUE = "cehpSTts"
+#: bwrap options and how many words follow each (any other ``--name`` is a flag).
+_BWRAP_ARITY = {
+    **dict.fromkeys(
+        ("--bind", "--bind-try", "--dev-bind", "--dev-bind-try", "--ro-bind", "--ro-bind-try", "--symlink")
+        + ("--setenv", "--file", "--bind-data", "--ro-bind-data", "--chmod", "--bind-fd", "--ro-bind-fd"),
+        2,
+    ),
+    **dict.fromkeys(
+        ("--args", "--argv0", "--uid", "--gid", "--hostname", "--chdir", "--unsetenv", "--lock-file", "--sync-fd")
+        + ("--remount-ro", "--exec-label", "--file-label", "--proc", "--dev", "--tmpfs", "--mqueue", "--dir")
+        + ("--seccomp", "--add-seccomp-fd", "--block-fd", "--userns-block-fd", "--info-fd", "--json-status-fd")
+        + ("--userns", "--userns2", "--pidns", "--cap-add", "--cap-drop", "--perms", "--size", "--overlay-src")
+        + ("--tmp-overlay", "--ro-overlay"),
+        1,
+    ),
+    "--overlay": 3,
+}
+#: tmux commands whose trailing arguments are a shell command, with their options taking a value (aliases too).
+_TMUX_SHELL_COMMANDS = {
+    **dict.fromkeys(("new-session", "new"), "cefFnstxy"),
+    **dict.fromkeys(("new-window", "neww"), "ceFnt"),
+    **dict.fromkeys(("split-window", "splitw"), "celtF"),
+    **dict.fromkeys(("respawn-pane", "respawnp", "respawn-window", "respawnw"), "cet"),
+    **dict.fromkeys(("run-shell", "run"), "cdt"),
+    **dict.fromkeys(("display-popup", "popup"), "bcdehsStTwxy"),
+    **dict.fromkeys(("pipe-pane", "pipep"), "t"),
+    **dict.fromkeys(("if-shell", "if"), "t"),
+}
+#: tmux's global options taking a value; ``-c`` is a shell command.
+_TMUX_GLOBAL_VALUE = "cfLST"
+#: Shell-code options of the launchers: (short options, long options, other short options taking a value, other long
+#: options taking a value, options may follow the operands as GNU getopt allows).
+_CODE_OPTS: dict[str, tuple[str, frozenset[str], str, frozenset[str], bool]] = {
+    "flock": ("c", frozenset({"--command"}), "wE", frozenset({"--wait", "--timeout", "--conflict-exit-code"}), True),
+    "script": (
+        "c",
+        frozenset({"--command"}),
+        "EIOBTmo",
+        frozenset({"--echo", "--log-in", "--log-out", "--log-io", "--log-timing", "--logging-format"})
+        | frozenset({"--output-limit"}),
+        True,
+    ),
+    "runuser": (
+        "c",
+        frozenset({"--command", "--session-command"}),
+        "ugGsw",
+        frozenset({"--user", "--group", "--supp-group", "--shell", "--whitelist-environment"}),
+        True,
+    ),
+    "npx": ("c", frozenset({"--call"}), "pw", frozenset({"--package", "--workspace"}), False),
+}
+
+
+def _option_values(argv: list[str], spec: tuple[str, frozenset[str], str, frozenset[str], bool]) -> list[str]:
+    """The values ``argv`` (a launcher and its arguments) gives the options in ``spec`` (see _CODE_OPTS): ``-c CODE``,
+    ``-qc CODE``, ``-cCODE``, ``--command CODE``, ``--command=CODE``, up to ``--``."""
+    short, longs, value_short, value_long, permute = spec
+    out: list[str] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if (key in longs or key in value_long) and not eq:
+                i += 1
+                value = argv[i] if i < len(argv) else ""
+            if key in longs:
+                out.append(value)
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in short or ch in value_short:
+                    value = a[k + 1 :]
+                    if not value:
+                        i += 1
+                        value = argv[i] if i < len(argv) else ""
+                    if ch in short:
+                        out.append(value)
+                    break
+        elif not permute:
+            break
+        i += 1
+    return [v for v in out if v]
+
+
+def _short_options(args: list[str], start: int, value: str) -> tuple[int, str]:
+    """Where the operands start in ``args`` past the short options from ``start`` (``value`` lists those taking a
+    value, glued on or the next word), and the flags seen."""
+    i, flags = start, ""
+    while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+        if args[i] == "--":
+            return i + 1, flags
+        for k, ch in enumerate(args[i][1:], 1):
+            flags += ch
+            if ch in value:
+                i += 0 if args[i][k + 1 :] else 1
+                break
+        i += 1
+    return i, flags
+
+
+def _tmux_code(argv: list[str]) -> list[str]:
+    """The shell code ``tmux`` runs: ``-c CODE`` and the shell command of ``new``, ``new-window``, ``split-window``,
+    ``respawn-pane``, ``run-shell`` (not ``-C``), ``display-popup``, ``pipe-pane`` and ``if-shell`` (its first operand,
+    not with ``-F``); the words of a command given as several are joined, as the shell would run them."""
+    out = _option_values(argv, ("c", frozenset(), _TMUX_GLOBAL_VALUE.replace("c", ""), frozenset(), False))
+    i, _ = _short_options(argv, 1, _TMUX_GLOBAL_VALUE)
+    value = _TMUX_SHELL_COMMANDS.get(argv[i]) if i < len(argv) else None
+    if value is None:
+        return out
+    k, flags = _short_options(argv, i + 1, value)
+    rest = [w for w in argv[k:] if w not in (";", "\\;")]
+    if argv[i] in ("if-shell", "if"):
+        rest = [] if "F" in flags else rest[:1]
+    if argv[i] in ("run-shell", "run") and "C" in flags:
+        rest = []
+    return [*out, " ".join(rest)] if rest else out
+
+
+#: ast-grep's command is also ``sg``: its first word is one of these (or ``--pattern=``/``--lang=``), never a group.
+_AST_GREP_FLAGS = frozenset({"-p", "--pattern", "-l", "--lang", "-r", "--rewrite", "-h", "--help", "-V", "--version"})
+_AST_GREP_SUBS = frozenset({"run", "scan", "new", "test", "lsp", "completions"})
+
+
+def _ast_grep(argv: list[str]) -> bool:
+    """``argv`` (``sg ...``) is ast-grep, not shadow-utils ``sg GROUP [-c] CODE``: it starts with an ast-grep flag,
+    or with an ast-grep subcommand followed by nothing or by an option other than ``-c``."""
+    first = argv[1] if len(argv) > 1 else ""
+    if first in _AST_GREP_FLAGS or first.startswith(("--pattern=", "--lang=")):
+        return True
+    nxt = argv[2] if len(argv) > 2 else ""
+    return first in _AST_GREP_SUBS and (not nxt or (nxt.startswith("-") and nxt != "-c"))
+
+
+def _launch_code(argv: list[str]) -> list[str]:
+    """The shell code the launcher ``argv`` (its name a basename) runs with ``sh -c``: ``flock -c``, ``script -c``,
+    ``runuser -c``, ``npx -c``, ``sg GROUP [-c] CODE``, ``entr -s CODE`` and tmux (see _tmux_code)."""
+    if not argv:
+        return []
+    name = argv[0]
+    if name in _CODE_OPTS:
+        return _option_values(argv, _CODE_OPTS[name])
+    if name == "tmux":
+        return _tmux_code(argv)
+    if name == "sg" and not _ast_grep(argv):
+        rest = argv[2:] if argv[1:2] == ["-"] else argv[1:]
+        rest = rest[2:] if rest[1:2] == ["-c"] else rest[1:]
+        return [" ".join(rest)] if rest else []
+    if name == "entr":
+        i, flags = _short_options(argv, 1, "")
+        return argv[i : i + 1] if "s" in flags else []
+    return []
+
+
+def _launched_argv(argv: list[str]) -> list[str] | None:
+    """The command the launcher ``argv`` (its name a basename, see _LAUNCH_SPECS) runs from its arguments, or None
+    (not a launcher, nothing to run, or shell code: see _launch_code). ``screen [-dmS name] cmd``, ``bwrap --bind / /
+    cmd``, ``gdb --args cmd``, ``uv run cmd`` and ``entr cmd`` are read here too."""
+    if not argv:
+        return None
+    name, args = argv[0], argv
+    if _launch_code(argv):
+        return None
+    if name == "screen":
+        i = 1
+        while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+            a = args[i]
+            if a in ("-ls", "-list", "-wipe", "-Q", "-v", "--version", "--help") or a.startswith("-X"):
+                return None
+            if a == "--":
+                i += 1
+                break
+            k = next((j for j, ch in enumerate(a[1:], 1) if ch in _SCREEN_VALUE), 0)
+            i += 2 if a == "-Logfile" or (k and not a[k + 1 :]) else 1
+        return args[i:] or None
+    if name == "bwrap":
+        i = 1
+        while i < len(args) and args[i].startswith("--"):
+            if args[i] == "--":
+                i += 1
+                break
+            i += 1 + _BWRAP_ARITY.get(args[i], 0)
+        return args[i:] or None
+    if name == "gdb":
+        k = next((j for j, a in enumerate(args) if a in ("--args", "-args")), -1)
+        return (args[k + 1 :] or None) if k > 0 else None
+    if name == "entr":
+        return args[_short_options(args, 1, "")[0] :] or None
+    if name == "uv":
+        words, i = _skip_wrapper_options(name, args, 1, _UV_RUN_SPEC)
+        if words[i : i + 1] != ["run"]:
+            return None
+        args, name = words[i:], "uv-run"
+    spec = _UV_RUN_SPEC if name == "uv-run" else _LAUNCH_SPECS.get(name)
+    if spec is None:
+        return None
+    words, rest = _skip_wrapper_options(name, args, 1, spec)
+    return words[rest:] or None
+
 
 def ssh_command_value(value: str) -> str | None:
     """The command line in an ssh ``-o`` value whose keyword ends in ``Command``, else None."""
@@ -1032,6 +1741,151 @@ def ssh_option_commands(name: str, args: list[str]) -> list[str]:
                     out.append(command)
                 break
     return out
+
+
+#: git config keys (lower-cased) whose value git runs as a command line: ``git -c core.pager='...' log``,
+#: ``git -c alias.x='!...' x``, ``git -c credential.helper='!...' fetch``.
+_GIT_EXEC_KEYS = re.compile(
+    r"core\.(?:fsmonitor|sshcommand|pager|editor|askpass|gitproxy)|sequence\.editor|gpg\.program|diff\.external"
+    r"|credential\.helper|credential\..+\.helper|diff\..+\.(?:textconv|command)|merge\..+\.driver|gpg\..+\.program"
+    r"|filter\..+\.(?:clean|smudge|process)|pager\..+|alias\..+"
+)
+#: Boolean config values run nothing: ``core.fsmonitor=true`` is git's own monitor, ``pager.log=false`` no pager.
+_GIT_BOOL_VALUES = frozenset({"", "true", "false", "yes", "no", "on", "off", "1", "0"})
+
+
+def _git_config_options(argv: list[str]) -> list[tuple[str, str, bool]]:
+    """``(lower-cased key, value, from the environment)`` of git's own ``-c KEY=VALUE`` and ``--config-env[=]KEY=VAR``
+    options, the ones before the subcommand."""
+    out: list[tuple[str, str, bool]] = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--config-env") and i + 1 < len(argv):
+            pair, env, i = argv[i + 1], a == "--config-env", i + 2
+        elif a.startswith("--config-env="):
+            pair, env, i = a.partition("=")[2], True, i + 1
+        elif a in _GIT_VALUE_OPTS:
+            i += 2
+            continue
+        elif a.startswith("-"):
+            i += 1
+            continue
+        else:
+            break
+        key, _, value = pair.partition("=")
+        out.append((key.lower(), value, env))
+    return out
+
+
+#: Options of text programs (_TEXT_PROGRAMS) that run a program: ``rg --pre PROG`` runs PROG on every file it
+#: searches, ``rg --hostname-bin PROG`` runs PROG, ``man -P/--pager CMD`` and ``man -H/--html=BROWSER`` run a command.
+_TEXT_EXEC_OPTS = {"rg": frozenset({"--pre", "--hostname-bin"}), "man": frozenset({"--pager", "--html"})}
+#: man's short options taking a value: a cluster ends at one (``-aP less``: P's value is ``less``).
+_MAN_VALUE_SHORTS = "CLmMSsepREXrPH"
+
+
+def _text_exec_values(argv: list[str]) -> list[str]:
+    """The values of the program-running options of ``rg``/``man`` (see _TEXT_EXEC_OPTS), glued or spaced; a bare
+    ``man -H`` gives an empty value (it still runs $BROWSER)."""
+    name = os.path.basename(argv[0]) if argv else ""
+    opts = _TEXT_EXEC_OPTS.get(name, frozenset())
+    out: list[str] = []
+    i = 1
+    while opts and i < len(argv):
+        a = argv[i]
+        i += 1
+        if a == "--":
+            break
+        key, eq, value = a.partition("=")
+        if key in opts:
+            if not eq and key != "--html" and i < len(argv):
+                value, i = argv[i], i + 1
+            out.append(value)
+        elif name == "man" and a.startswith("-") and not a.startswith("--"):
+            k = next((j for j, ch in enumerate(a[1:], 1) if ch in _MAN_VALUE_SHORTS), 0)
+            if k and a[k] in "PH":
+                value = a[k + 1 :]
+                if not value and a[k] == "P" and i < len(argv):
+                    value, i = argv[i], i + 1
+                out.append(value)
+            elif k and not a[k + 1 :]:
+                i += 1
+    return out
+
+
+def _git_options(words: list[str]) -> list[tuple[str, str, bool]]:
+    """git's own ``-c``/``--config-env`` options (see _git_config_options) behind every word of ``words`` that names
+    git, whatever runs it (``/usr/bin/git``, ``sudo -u git git``, ``flock L git``, ``xargs git``): a word that is no
+    git run, such as the ``git`` of ``sudo -u git``, gives none or a key that runs nothing."""
+    return [o for j, w in enumerate(words) if os.path.basename(w) == "git" for o in _git_config_options(words[j:])]
+
+
+def _git_config_command(key: str, value: str) -> str | None:
+    """The command line git runs for the config ``key`` (lower case) set to ``value``: None for a key that runs
+    nothing (see _GIT_EXEC_KEYS) or a boolean value; the value with a leading ``!`` stripped, an ``alias.*`` value
+    without one is a git command line."""
+    if not _GIT_EXEC_KEYS.fullmatch(key) or value.lower() in _GIT_BOOL_VALUES:
+        return None
+    return "git " + value if key.startswith("alias.") and not value.startswith("!") else value.removeprefix("!")
+
+
+#: Environment variables whose value a program runs as a command line: git's ssh, diff, pager, editor and askpass
+#: programs, the pager of man and others, the editor of crontab and others, bash's PROMPT_COMMAND and the start-up
+#: file of a non-interactive bash or sh (BASH_ENV, ENV: expanded by the shell, so ``$(...)`` in it runs).
+_EXEC_ENV_VARS = frozenset(
+    {
+        *("GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR"),
+        *("GIT_ASKPASS", "SSH_ASKPASS", "PAGER", "MANPAGER", "EDITOR", "VISUAL", "PROMPT_COMMAND", "BASH_ENV", "ENV"),
+    }
+)
+
+
+def exec_env_commands(words: list[str]) -> list[str]:
+    """The command lines in the environment assignments of ``words`` (``GIT_PAGER='rm -rf ~' git log``, ``env
+    EDITOR=... crontab -e``, ``export PAGER=...``): the value of an exec-capable variable (see _EXEC_ENV_VARS) and
+    the value of a ``GIT_CONFIG_VALUE_<n>`` whose ``GIT_CONFIG_KEY_<n>`` runs a command (see _git_config_command)."""
+    out: list[str] = []
+    keys: dict[str, str] = {}
+    values: dict[str, str] = {}
+    for w in words:
+        if not _is_assignment(w):
+            continue
+        name, _, value = w.partition("=")
+        if name in _EXEC_ENV_VARS and value:
+            out.append(value)
+        elif name.startswith("GIT_CONFIG_KEY_"):
+            keys[name.removeprefix("GIT_CONFIG_KEY_")] = value.lower()
+        elif name.startswith("GIT_CONFIG_VALUE_"):
+            values[name.removeprefix("GIT_CONFIG_VALUE_")] = value
+    commands = (_git_config_command(keys[n], v) for n, v in values.items() if n in keys)
+    return out + [c for c in commands if c]
+
+
+def exec_option_commands(words: list[str]) -> list[str]:
+    """The command lines run from options of the command ``words``: git's ``-c KEY=VALUE`` with an
+    exec-capable key (see _GIT_EXEC_KEYS; the value with a leading ``!`` stripped, an ``alias.*`` value without one
+    is a git command line, a boolean value runs nothing) and ``man -P``/``--pager``/``-H``/``--html``."""
+    argv = _command_argv(words)
+    if argv[:1] == ["man"]:
+        return [v for v in _text_exec_values(argv) if v]
+    commands = (_git_config_command(key, value) for key, value, env in _git_options(words) if not env)
+    return [c for c in commands if c]
+
+
+def _exec_option_check(words: list[str], argv: list[str]) -> str | None:
+    """``git --config-env KEY=VAR`` with an exec-capable key (the command is in the environment, unread here) and
+    ``rg --pre PROG``/``--hostname-bin PROG`` with PROG a program the run checks refuse, a shell or an interpreter
+    (``rg --pre rm x ~`` deletes every file it searches, ``rg --pre sh`` runs each one as a script)."""
+    if any(env and _GIT_EXEC_KEYS.fullmatch(key) for key, _, env in _git_options(words)):
+        return "git-config-env-command"
+    if argv[:1] != ["rg"]:
+        return None
+    for value in _text_exec_values(argv):
+        prog = os.path.basename(value)
+        if prog in _RUN_PROGRAMS or prog in _SHELLS or prog.startswith("mkfs") or _is_interpreter(prog):
+            return "rg-pre-command"
+    return None
 
 
 def _env_long_option(key: str) -> str:
@@ -1202,6 +2056,9 @@ _STDIN_SPECS: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] = {
     "perl": ("eE", "IMm", frozenset(), frozenset()),
     "ruby": ("eE", "rICEx", frozenset(), frozenset()),
     "php": ("rRBEF", "cdz", frozenset(), frozenset()),
+    "lua": ("e", "l", frozenset(), frozenset()),
+    "luajit": ("e", "lbj", frozenset(), frozenset()),
+    "tclsh": ("", "", frozenset(), frozenset()),
 }
 
 
@@ -1266,6 +2123,63 @@ def _pipeline_check(pipelines: list[list[str]]) -> str | None:
                 return "pipe-to-shell"
             fetched = fetched or name in _FETCHERS
     return None
+
+
+def _piped_text_code(stages: list[str]) -> list[tuple[str, str]]:
+    """``(text, stage)`` for each ``echo``/``printf`` stage of the pipeline ``stages`` whose output a later stage runs
+    as shell code (``echo 'rm -rf ~' | sh``, ``printf ... | bash -s``): the printed text is a command line."""
+    out: list[tuple[str, str]] = []
+    for j, stage in enumerate(stages[:-1]):
+        argv = _command_argv(_tokens(stage))
+        if argv[:1] not in (["echo"], ["printf"]):
+            continue
+        later = [_command_argv(_tokens(s)) for s in stages[j + 1 :]]
+        schedule = next((n for a in later if (n := _schedules_stdin(a))), "")
+        if not schedule and not any(a and a[0] in _SHELLS and _runs_stdin_as_code(a) for a in later):
+            continue
+        args = argv[1:]
+        while argv[0] == "echo" and args and args[0] in ("-n", "-e", "-E", "-ne", "-en"):
+            args = args[1:]
+        text = " ".join(args)
+        if schedule == "crontab":
+            text = "\n".join(_CRONTAB_SCHEDULE.sub("", line, count=1) for line in text.splitlines())
+        if text.strip():
+            out.append((text, stage))
+    return out
+
+
+#: The schedule of a crontab line: ``@reboot`` and the like, or five time fields.
+_CRONTAB_SCHEDULE = re.compile(r"^\s*(?:@\w+|(?:\S+\s+){4}\S+)\s+")
+
+
+def _schedules_stdin(argv: list[str]) -> str:
+    """``at``/``batch`` (no listing option, no ``-f`` or ``-f /dev/stdin``) or ``crontab`` reading stdin (``-``,
+    ``/dev/stdin`` or no file operand, no ``-l``/``-r``/``-e``...): each runs its stdin as shell code later (``echo
+    'rm -rf ~' | at now``). Returns the program name, or "" when stdin is not run."""
+    name = os.path.basename(argv[0]) if argv else ""
+    args = argv[1:]
+    if name in ("at", "batch"):
+        for k, a in enumerate(args):
+            if a.startswith("-f"):
+                path = a[2:] or (args[k + 1] if k + 1 < len(args) else "")
+                return name if path in _STDIN_PATHS else ""
+        opts = [a for a in args if a.startswith("-") and a != "-"]
+        return "" if any(ch in "ldrc" for o in opts for ch in o[1:]) else name
+    if name != "crontab":
+        return ""
+    operands: list[str] = []
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in ("-u", "-n"):
+            skip = True
+        elif a.startswith("-") and a != "-":
+            if any(ch in "lreTVc" for ch in a[1:]):
+                return ""
+        else:
+            operands.append(a)
+    return name if not operands or operands[-1] in _STDIN_PATHS else ""
 
 
 def _xargs_runs_input_as_code(words: list[str]) -> bool:
@@ -1580,6 +2494,188 @@ def _unquoted_expansion(sub: str) -> bool:
     return False
 
 
+#: what follows a ``$`` the shell replaces with a value: a name, ``{``, a digit or a special parameter, and ``[``
+#: (``$[x]``, old arithmetic like ``$((x))``: it expands ``x``, and a ``$(...)`` in its value runs)
+_PARAM_START = frozenset("_{[@*#?$!-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def param_expansion(sub: str) -> bool:
+    """Whether ``sub`` expands a parameter (``$X``, ``${X:-y}``, ``$1``, ``$@``) or ``$[...]`` outside single quotes. In
+    double quotes it is not split, but its value still names what the program gets, not the command line."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n - 1:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c == "$" and sub[i + 1] in _PARAM_START:
+            return True
+        i += 1
+    return False
+
+
+def command_substitution(sub: str) -> bool:
+    """Whether ``sub`` has a ``$(...)`` or a backtick outside single quotes. In double quotes it still runs, and its
+    output becomes words of the command line that no rule saw."""
+    i, n, dquoted = 0, len(sub), False
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            dquoted = not dquoted
+        elif c == "'" and not dquoted:
+            j = sub.find("'", i + 1)
+            i = n if j < 0 else j
+        elif c == "`" or sub.startswith("$(", i):
+            return True
+        i += 1
+    return False
+
+
+def shell_expands(sub: str) -> bool:
+    """Whether the shell changes the words of ``sub`` after k3code reads them: a parameter expansion
+    (:func:`param_expansion`), an unquoted brace group or an unquoted ``$IFS`` split (:func:`_expanded_text`)."""
+    if param_expansion(sub):
+        return True
+    try:
+        return _expanded_text(sub) is not None
+    except _BraceOverCap:
+        return True
+
+
+#: words a brace expansion of one command line may give before the line counts as too large to check
+_BRACE_MAX_WORDS = 4096
+#: brace groups one word may expand through, nested or side by side: past it the word counts as too large to check
+_BRACE_MAX_DEPTH = 64
+_BRACE_SEQ = re.compile(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?|([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?")
+_IDENT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_WORD_BREAK = frozenset(" \t\n;&|()<>")
+
+
+class _BraceOverCap(Exception):
+    """A brace expansion gives more than _BRACE_MAX_WORDS words: the expanded line is not checked word by word."""
+
+
+def _span_end(text: str, i: int) -> int:
+    """Index of the last character of the unit at ``i`` the shell reads whole: an escape, a quoted string, ``$'...'``,
+    ``$(...)``, a backtick or ``${...}``; ``i`` for a plain character. An unclosed one runs to the end of the text."""
+    c, n = text[i], len(text)
+    if c == "\\":
+        return min(i + 1, n - 1)
+    if c == "'" or text.startswith("$'", i):
+        j = text.find("'", i + 1) if c == "'" else i + 2
+        while c != "'" and 0 <= j < n and text[j] != "'":
+            j += 2 if text[j] == "\\" else 1
+        return j if 0 <= j < n else n - 1
+    if c == '"':
+        j = i + 1
+        while j < n and text[j] != '"':
+            end = _unit_end(text, j) if text[j] in "$`" else -1
+            j = (n if end == -2 else max(j, end)) + 1 + (text[j] == "\\" and end == -1)
+        return min(j, n - 1)
+    if c in "$`":
+        end = _unit_end(text, i)
+        return n - 1 if end == -2 else max(i, end)
+    return i
+
+
+def _brace_parts(word: str, i: int) -> tuple[int, list[str] | None]:
+    """The ``}`` closing the brace at ``word[i]`` and what the group expands to, or ``(-1, None)`` when it is no group:
+    only an unquoted ``,`` or an int..int / char..char sequence makes one (``{}``, ``@{u}``, ``{x}`` stay literal)."""
+    j, n, depth, cuts = i + 1, len(word), 0, [i]
+    while j < n:
+        c = word[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "," and depth == 0:
+            cuts.append(j)
+        else:
+            j = _span_end(word, j)
+        j += 1
+    if j >= n:
+        return -1, None
+    if len(cuts) > 1:
+        return j, [word[a + 1 : b] for a, b in zip(cuts, [*cuts[1:], j], strict=True)]
+    m = _BRACE_SEQ.fullmatch(word[i + 1 : j])
+    if not m:
+        return -1, None
+    lo, hi = (int(m[1]), int(m[2])) if m[1] else (ord(m[4]), ord(m[5]))
+    step = abs(int(m[3] or m[6] or 1)) or 1
+    if abs(hi - lo) // step >= _BRACE_MAX_WORDS:
+        raise _BraceOverCap
+    seq = range(lo, hi + (1 if hi >= lo else -1), step if hi >= lo else -step)
+    return j, [str(v) if m[1] else chr(v) for v in seq]
+
+
+def _brace_words(word: str, left: list[int], depth: int = 0) -> list[str]:
+    """``word`` brace-expanded as the shell does before any other expansion (``./b/{x,y}`` is ``./b/x ./b/y``). Raises
+    _BraceOverCap past _BRACE_MAX_DEPTH groups (each one is a level of recursion here)."""
+    if depth > _BRACE_MAX_DEPTH:
+        raise _BraceOverCap
+    i = 0
+    while i < len(word):
+        if word[i] == "{":
+            close, parts = _brace_parts(word, i)
+            if parts is not None:
+                out = [w for p in parts for w in _brace_words(word[:i] + p + word[close + 1 :], left, depth + 1)]
+                return out
+            i += 1
+            continue
+        i = _span_end(word, i) + 1
+    left[0] -= 1
+    if left[0] < 0:
+        raise _BraceOverCap
+    return [word]
+
+
+def _ifs_split(word: str) -> str:
+    """``word`` with every unquoted ``$IFS`` / ``${IFS...}`` a space: the shell splits the word there."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        end = _span_end(word, i)
+        name_end = i + (5 if word.startswith("${IFS", i) else 4 if word.startswith("$IFS", i) else 0)
+        if name_end > i and (name_end >= n or word[name_end] not in _IDENT):
+            out.append(" ")
+            end = end if word[i + 1] == "{" else name_end - 1
+        else:
+            out.append(word[i : end + 1])
+        i = end + 1
+    return "".join(out)
+
+
+def _expanded_text(text: str) -> str | None:
+    """``text`` with its unquoted brace groups expanded and its unquoted ``$IFS``/``${IFS...}`` split, as the shell
+    does after k3code reads the words, or None when there is nothing to expand. ``$(...)`` and backticks are skipped
+    whole (they are nested commands, read on their own). Raises _BraceOverCap past _BRACE_MAX_WORDS words."""
+    if "IFS" not in text and "{" not in text:
+        return None
+    out, i, n, left = [], 0, len(text), [_BRACE_MAX_WORDS]
+    while i < n:
+        if text[i] in _WORD_BREAK:
+            out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] not in _WORD_BREAK:
+            j = _span_end(text, j) + 1
+        word = text[i:j]
+        out.append(" ".join(_ifs_split(w) for w in _brace_words(word, left)) if "{" in word or "IFS" in word else word)
+        i = j
+    res = "".join(out)
+    return None if res == text else res
+
+
 def _join_dir(base: str, t: str) -> str:
     """The directory ``cd t`` goes to from ``base``, normalised (``//x`` is ``/x``)."""
     d = os.path.normpath(os.path.join(base, t))
@@ -1786,6 +2882,12 @@ def _delete_rule_in(t: str, dirs: _Dirs, home: str, above_home: bool = False) ->
     return None
 
 
+def _long_opt(arg: str, name: str, shortest: int) -> bool:
+    """``arg`` is the long option ``name`` or a prefix of it at least ``shortest`` long: GNU tools take a unique
+    prefix (``rm --rec`` is ``rm --recursive``)."""
+    return len(arg) >= shortest and name.startswith(arg)
+
+
 def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
     """``rm`` with a recursive flag on /, ~, $HOME or a top-level system dir, whatever the flag spelling
     (-rf, -fr, -r -f, -R, --recursive, ...) or path spelling (``/.``, ``~/.``, ``/usr/..``, ``$PWD`` at /, ``*`` after
@@ -1802,7 +2904,9 @@ def _rm_check(argv: list[str], dirs: _Dirs, home: str) -> str | None:
             flags.append(t)
         else:
             targets.append(t)
-    recursive = any(t == "--recursive" or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags)
+    recursive = any(
+        _long_opt(t, "--recursive", 3) or (not t.startswith("--") and ("r" in t or "R" in t)) for t in flags
+    )
     if not recursive:
         return None
     for t in (r for raw in targets for r in _resolve_target(raw, dirs.known)):  # `X=/; rm -rf $X` is `rm -rf /`
@@ -1954,6 +3058,321 @@ def _out_redirect_targets(sub: str) -> list[str]:
 #: Programs whose operands are written to: every operand (``tee``, ``truncate``) or the last (``cp``, ``mv``).
 _WRITES_ALL = frozenset({"tee", "truncate", "sponge"})
 _WRITES_LAST = frozenset({"cp", "mv", "install"})
+#: The programs a run found by the run scan (_segment_scan) may start with: the ones the delete and disk checks read.
+_RUN_PROGRAMS = frozenset(
+    {"rm", "find", "git", "chmod", "chown", "chgrp", "rsync", "parted", "wipefs", "dd"}
+    | set(_DISK_TOOLS)
+    | _WRITES_ALL
+    | _WRITES_LAST
+)
+
+#: Launchers that run a program named anywhere in their arguments: a text program they name (``find -exec echo``)
+#: does not exempt their segment from the raw-text scan (_raw_text_scan).
+_ANY_ARG_LAUNCHERS = frozenset({"find", "xargs", "watch", "fd", "fdfind", "parallel"})
+#: A _RUN_PROGRAMS word (or ``mkfs*``) followed by a blank, at a word boundary of raw text: the start, a blank, a
+#: quote, a shell operator, or a character a program may read a command after (vim ``!``, sed ``/``, ``=``, ``:``,
+#: a perl/ruby quote operator's delimiter: ``qx!``, ``q#``, ``%x^``).
+_RAW_RUN_START = re.compile(
+    r"(?:^|(?<=[\s'\"`;|&(){}\[<>!=:,/#%@^*+$~?]))(?:"
+    + "|".join(map(re.escape, sorted(_RUN_PROGRAMS)))
+    + r"|mkfs[\w.]*)(?=\s)"
+)
+#: The program word of a run (_RAW_RUN_START without its boundary): read right after a quote operator's delimiter.
+_RAW_RUN_WORD = re.compile(r"(?:" + "|".join(map(re.escape, sorted(_RUN_PROGRAMS))) + r"|mkfs[\w.]*)(?=\s)")
+#: A perl/ruby quote operator (``qx.``, ``qw-``, ``q«``, ``%x.``, ``%w-``) with any delimiter that is not a blank or
+#: a word character, non-ASCII ones included: a run right after it ends at the delimiter (or its closing bracket).
+_RAW_QUOTE_OP = re.compile(r"(?:(?<![\w$@%&])q[qxrw]?|(?<![\w$@%])%[xwWiIqQ]?)([^\s\w])")
+_RAW_CLOSERS = {"(": ")", "[": "]", "{": "}", "<": ">", "«": "»", "‹": "›", "“": "”", "‘": "’"}
+#: Where a run in raw text ends: a shell operator, a newline, a redirection, a closing paren, brace, bracket or
+#: backtick (``%q{rm -rf ~}``, ``q[rm -rf ~]``); in the raw text (not the decoded one) also a quote.
+_RAW_RUN_END = re.compile(r"[;|&\n)}\]>`'\"]")
+_DECODED_RUN_END = re.compile(r"[;|&\n)}\]>`]")
+#: ``${NAME}`` in raw text, read as ``$NAME`` before the runs end at a ``}`` (``rm -rf ${HOME}`` is ``$HOME``); the
+#: ``${NAME`` of ``${NAME:-word}`` as ``$NAME `` (the word after it is still read: ``${x:+`rm -rf ~`}``).
+_RAW_PARAM = re.compile(r"\$\{(\w+)(\})?")
+#: A run reads at most this many words after its program, and this many characters, before its separator: a long
+#: argument list (``git add`` of thousands of paths) is not read once per run that a path in it starts.
+_RAW_RUN_WORDS = 16
+_RAW_RUN_CHARS = 512
+#: Options with which any text program (_text_only) may run a command (``ag --pager``): see _raw_exempt.
+_RAW_EXEC_OPTS = ("--pager", "--pre", "--hostname-bin")
+#: Backslash escapes as a program decodes them: ``\x72``, ``\o162``, ``\d114``, ``\162``, ``\<newline>`` (dropped),
+#: ``\n``/``\t`` (a blank), any other ``\c`` (``c``).
+_RAW_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{1,2})|o([0-7]{1,3})|d(\d{1,3})|([0-7]{1,3})|(\n)|([nt])|(.))", re.S)
+#: Two quoted literals of an argument list (``"rm", "-rf"``, ``'rm','-rf'``, node's ``"rm", ["-rf"``): read as one
+#: blank in the decoded text.
+_RAW_LIST_SEP = re.compile(r"([\"'])\s*(?::\s*[\w.]{0,16}\s*)?,\s*\[?\s*\1")
+#: A sed ``s`` command's delimiter in raw text (``s/``, ``s%``): a run after it may end at the same delimiter.
+_RAW_SED_DELIM = re.compile(r"(?:^|(?<=[^\w])|(?<=[/IM]))s([/#%@|,:!+])")
+#: How many characters the runs of one command line may read in all, each character charged once and each run
+#: charged _RAW_RUN_COST more for its checks (see _RUN_SCAN_BUDGET). Past this it is refused (``scan-budget``).
+_RAW_SCAN_BUDGET = 150_000
+_RAW_RECURSIVE = frozenset({"-r", "-R", "--recursive"})
+_RAW_RUN_COST = 128
+#: What a run start costs instead when its program's checks only refuse a write to a disk or a forced push
+#: (_PAYLOAD_LIGHT: ``cp``, ``git add``, ``install``): a short check of at most _RAW_RUN_CHARS characters, so a
+#: script that names them on every line is read in full.
+_RAW_LIGHT_COST = 8
+
+
+def _raw_recursive(args: list[str]) -> bool:
+    return bool(_flag_set(args) & _RAW_RECURSIVE) or any(_long_opt(a, "--recursive", 3) for a in args)
+
+
+def _raw_param(m: re.Match[str]) -> str:
+    return "$" + m[1] + ("" if m[2] else " ")
+
+
+def _raw_unescape(m: re.Match[str]) -> str:
+    x, o, d, octal, newline, blank, other = m.groups()
+    if x or o or octal or d:
+        return chr(int(x, 16) if x else int(o or octal, 8) if (o or octal) else int(d))
+    return "" if newline else " " if blank else other
+
+
+def _raw_exempt(words: list[str], argv: list[str]) -> bool:
+    """A text program (_text_only) not named by a launcher that runs its arguments (_ANY_ARG_LAUNCHERS) and not
+    given an option that runs a command (_RAW_EXEC_OPTS: ``ag --pager='...'``, ``rg --pre=...``)."""
+    if any(a == o or a.startswith(o + "=") for a in argv for o in _RAW_EXEC_OPTS):
+        return False
+    return _text_only(argv) and not any(os.path.basename(w) in _ANY_ARG_LAUNCHERS for w in words)
+
+
+def _raw_run_argv(text: str, start: int, stop: int) -> list[str]:
+    """The words of the run from ``start`` to its separator at ``stop``: its program and at most _RAW_RUN_WORDS words
+    within _RAW_RUN_CHARS characters (a word cut by that cap is dropped), and for a recursive delete also the run's
+    last word (``rm -rf a1 ... a40 ~`` is read as ``rm -rf a1 ... a15 ~``)."""
+    end = min(stop, start + _RAW_RUN_CHARS)
+    window = text[start:end]
+    if end < stop and not text[end].isspace():
+        window = window[: max(window.rfind(c) for c in " \t\n")]
+    words = window.split()
+    rargv, rest = words[: _RAW_RUN_WORDS + 1], words[_RAW_RUN_WORDS + 1 :]
+    if (rest or end < stop) and os.path.basename(rargv[0]) == "rm" and _raw_recursive(rargv[1:]):
+        tail = text[max(start, stop - _RAW_RUN_CHARS) : stop].split()
+        if tail and tail[-1] != rargv[-1]:
+            rargv.append(tail[-1])
+    return rargv
+
+
+def _without_messages(sub: str, argv: list[str]) -> str:
+    """``sub`` with the ``-m``/``--message`` values of a message program (``hg commit -m '...'``) taken out."""
+    if not argv or os.path.basename(argv[0]) not in _MESSAGE_PROGRAMS:
+        return sub
+    for opt, value in zip(argv, argv[1:], strict=False):
+        if opt in _MESSAGE_OPTS:
+            raw = next((q for q in (shlex.quote(value), f"'{value}'", f'"{value}"', value) if q in sub), "")
+            sub = sub.replace(raw, " ", 1) if raw else sub
+    return sub
+
+
+def _raw_text_scan(sub: str, words: list[str], argv: list[str], dirs: _Dirs, home: str) -> str | None:
+    """The backstop behind the word readings (_run_scan): in the raw text of a non-text program's command line
+    (quotes and backslashes included), and again with its escapes decoded and its quotes removed (``\\x72m``,
+    ``r""m``, ``true\\nrm``), every run from a _RUN_PROGRAMS word to the next separator is checked as if it were the
+    command, so ``find -exec sed 's/.*/rm -rf ~/e'``, ``vim -c 'g/x/!rm -rf ~'`` or ``tar -xF'rm -rf ~'`` is refused
+    whatever the program and its syntax. A run after a sed ``s`` delimiter also ends at that delimiter (``~/e`` is
+    ``~``). Text programs (_raw_exempt) and message values (_without_messages) are not read."""
+    if _raw_exempt(words, argv):
+        return None
+    raw = _RAW_PARAM.sub(_raw_param, _without_messages(sub, argv))
+    unescaped = _RAW_LIST_SEP.sub(" ", _RAW_ESCAPE.sub(_raw_unescape, raw))
+    decoded = _RAW_PARAM.sub(_raw_param, unescaped.replace("'", "").replace('"', ""))
+    budget = _RAW_SCAN_BUDGET
+    seen: set[str] = set()
+    for text, ends in ((raw, _RAW_RUN_END), (decoded, _DECODED_RUN_END)):
+        if text is not raw and text == raw:
+            continue
+        delims: dict[str, int] = {}
+        for m in _RAW_SED_DELIM.finditer(text):
+            delims.setdefault(m.group(1), m.start())
+        stops = [e.start() for e in ends.finditer(text)]
+        starts = {m.start(): (m.group(0), "") for m in _RAW_RUN_START.finditer(text)}
+        for q in _RAW_QUOTE_OP.finditer(text):
+            at = (
+                q.end()
+                + len(text[q.end() : q.end() + _RAW_RUN_CHARS])
+                - len(text[q.end() : q.end() + _RAW_RUN_CHARS].lstrip(" \t"))
+            )
+            if w := _RAW_RUN_WORD.match(text, at):
+                starts[w.start()] = (w.group(0), _RAW_CLOSERS.get(q.group(1), q.group(1)))
+        covered = 0  # the text before this was charged already: each character is charged once
+        for start in sorted(starts):
+            word, closer = starts[start]
+            i = bisect.bisect_left(stops, start + len(word))
+            stop = stops[i] if i < len(stops) else len(text)
+            if word in _PAYLOAD_LIGHT:
+                budget -= _RAW_LIGHT_COST
+            else:
+                budget -= max(0, min(stop, start + _RAW_RUN_CHARS) - max(start, covered))
+                covered = max(covered, min(stop, start + _RAW_RUN_CHARS))
+                budget -= _RAW_RUN_COST  # per run start, read or not: n starts cost n checks' worth
+            if budget < 0:
+                return "scan-budget"
+            run = " ".join(_raw_run_argv(text, start, stop))
+            runs = [run, *(run[: run.find(c)] for c, at in delims.items() if at < start and c in run)]
+            # a run right after a punctuation delimiter (``qx!rm -rf ~!``, ``qx.rm -rf ~.``, ``q#...#``) also ends at
+            # that delimiter: its first one after the program word, or its last one (``qx-rm -rf ~-``)
+            before = text[start - 1] if start else ""
+            if not closer and before and not before.isspace() and not before.isalnum() and before != "/":
+                closer = before
+            if closer and closer in run:
+                runs += [run[: run.find(closer)], run[: run.find(closer, len(word))], run[: run.rfind(closer)]]
+            for r in runs:
+                if r in seen:
+                    continue  # the decoded text repeats most runs of the raw one
+                seen.add(r)
+                rargv = r.split()
+                hit = (
+                    _rm_check(rargv, dirs, home)
+                    or _find_check(rargv, dirs, home)
+                    or _git_push_check(rargv)
+                    or _destroy_check(rargv, r, home, dirs)
+                )
+                if hit:
+                    return hit
+    return None
+
+
+#: A quoted literal in a word or a heredoc body (``"..."``/``'...'``): the strings a program's code passes on.
+_PAYLOAD_LITERAL = re.compile(r"\"((?:[^\"\\]|\\.)*)\"|'((?:[^'\\]|\\.)*)'", re.S)
+#: A literal that may be a command line: a _RUN_PROGRAMS word or a cd at a word boundary (``rm${IFS}-rf``,
+#: ``{rm,-rf,~}``, ``cd;rm``).
+_PAYLOAD_RUN_WORD = re.compile(
+    r"(?<![\w.-])(?:" + "|".join(map(re.escape, sorted({*_RUN_PROGRAMS, "cd", "pushd"}))) + r"|mkfs[\w.]*)(?![\w-])"
+)
+#: An ANSI-C quoted blank (``$'\t'``, ``$' '``): a word separator once the shell has read it.
+_PAYLOAD_ANSI_BLANK = re.compile(r"\$'(?:\\[tnv]|\s)+'")
+#: (depth, cwd) of the quoted-literal check in progress (see _payload_line_check); None outside check_parse.
+_PAYLOAD_STATE: ContextVar[tuple[int, str | None] | None] = ContextVar("_PAYLOAD_STATE", default=None)
+_PAYLOAD_MAX_DEPTH = 2
+#: What each literal checked as a command line costs of _RAW_SCAN_BUDGET on top of its length (a whole check).
+_PAYLOAD_LITERAL_COST = 512
+#: What a literal costs instead when every program it names is one whose checks only refuse a write to a disk or a
+#: forced push (``print("step 3: git add done")``, ``console.log("git tag v1")``): its check is a short one.
+_PAYLOAD_LIGHT_COST = 64
+_PAYLOAD_LIGHT = frozenset({"git", "cd", "pushd"} | _WRITES_ALL | _WRITES_LAST)
+#: Arguments the raw-text scan reads code with: a program that is not a text one (see _raw_exempt).
+_CODE_ARGV = ["sh"]
+
+
+def _payload_line_check(texts: list[str], extra: list[str] | None, home: str) -> str | None:
+    """The quoted literals of a program's arguments or heredoc body that name a _RUN_PROGRAMS word or a cd, each
+    checked whole as a command line of its own (:func:`check`, with its `$IFS` and brace readings and its cd tracking):
+    ``os.system("rm${IFS}-rf${IFS}/")``, ``system("{rm,-rf,~}")`` or ``system("cd / && rm -rf *")`` run those lines.
+    Literals in literals are read _PAYLOAD_MAX_DEPTH levels deep; past _RAW_SCAN_BUDGET it is refused."""
+    depth, cwd = _PAYLOAD_STATE.get() or (0, None)
+    if depth >= _PAYLOAD_MAX_DEPTH:
+        return None
+    budget = _RAW_SCAN_BUDGET
+    seen: set[str] = set()
+    for text in texts:
+        for m in _PAYLOAD_LITERAL.finditer(_PAYLOAD_ANSI_BLANK.sub(" ", text)):
+            literal = m.group(1) if m.group(1) is not None else m.group(2)
+            if literal in seen or not _PAYLOAD_RUN_WORD.search(literal):
+                continue
+            seen.add(literal)
+            light = all(w[0] in _PAYLOAD_LIGHT for w in _PAYLOAD_RUN_WORD.finditer(literal))
+            budget -= len(literal) + (_PAYLOAD_LIGHT_COST if light else _PAYLOAD_LITERAL_COST)
+            if budget < 0:
+                return "scan-budget"
+            token = _PAYLOAD_STATE.set((depth + 1, cwd))
+            try:
+                hit = _check_parse(literal, extra, cwd, home)[0]
+            finally:
+                _PAYLOAD_STATE.reset(token)
+            if hit:
+                return hit
+    return None
+
+
+def _heredoc_code_scan(heredocs: list[Heredoc], kind: str, extra: list[str] | None, dirs: _Dirs) -> str | None:
+    """The bodies of the heredocs an interpreter other than a shell runs as its program (``python3 <<'EOF'``,
+    ``cat <<'EOF' | perl``; a shell's is parsed as a script): read by the raw-text scan and the quoted-literal check."""
+    if kind != "other":
+        return None
+    for h in heredocs:
+        hit = _raw_text_scan(h.body, [], _CODE_ARGV, dirs, dirs.home) or _payload_line_check([h.body], extra, dirs.home)
+        if hit:
+            return hit
+    return None
+
+
+#: The command after a pipe operator, its leading ``&`` (``|&``), blanks and group openers skipped (``| (at now)``).
+_PIPE_CONSUMER = re.compile(r"[\s&({]*([^;&|\n(){}]*)")
+
+
+def _pipe_offsets(text: str) -> Iterator[int]:
+    """The offsets of the ``|``/``|&`` operators of ``text`` outside quotes (``||`` is not one)."""
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "|":
+            if i + 1 < n and text[i + 1] == "|":
+                i += 2
+                continue
+            yield i
+        i += 1
+
+
+#: The separators of a ``parallel`` command from its argument lists: with one the input is not the command.
+_PARALLEL_ARG_SEPS = frozenset({":::", "::::", ":::+", "::::+"})
+#: The text of a pipe's consumer up to the next separator, braces included (``xargs -I{} sh -c {}``).
+_PIPE_SEGMENT = re.compile(r"[^;&|\n]*")
+
+
+def _consumer_runs_stdin(clean: str, m: re.Match[str], argv: list[str]) -> bool:
+    """The command ``m`` matched after a pipe runs what arrives on stdin as code: a scheduler (_schedules_stdin), a
+    shell or interpreter with no code argument (_runs_stdin_as_code: ``| perl``, ``| python3 -``, ``| . /dev/stdin``),
+    ``parallel`` with no ``:::`` and no command or an interpreter one, an ``xargs sh -c {}``
+    (_xargs_runs_input_as_code), or a process substitution of one (``| tee >(sh)``)."""
+    name = os.path.basename(argv[0])
+    if _schedules_stdin(argv):
+        return True
+    if _is_interpreter(name) or name in _STDIN_SPECS:
+        return _runs_stdin_as_code([name, *argv[1:]])
+    if name == "parallel":
+        if any(a in _PARALLEL_ARG_SEPS for a in argv):
+            return False
+        cmd = [a for a in argv[1:] if not a.startswith("-") and not a.isdigit()]
+        return not cmd or _is_interpreter(os.path.basename(cmd[0]))
+    if name == "xargs" and _xargs_runs_input_as_code(_tokens(_PIPE_SEGMENT.match(clean, m.start(1)).group())):
+        return True
+    if not m.group(1).rstrip().endswith(">") or not clean.startswith("(", m.end()):
+        return False
+    inner = _PIPE_CONSUMER.match(clean, m.end())
+    sub = _command_argv(_tokens(inner.group(1))) if inner and inner.group(1).strip() else []
+    return bool(sub) and _consumer_runs_stdin(clean, inner, sub)
+
+
+def _pipe_producer_scan(clean: str, dirs: _Dirs) -> str | None:
+    """Before each pipe into a program that runs its stdin as code (_consumer_runs_stdin), the whole text up to it
+    is read by the raw-text scan: the parsed pipelines lose the producer of a group or compound command (``{ echo
+    'rm -rf ~'; true; } | at now``, ``f | sh``) and a grouped consumer (``echo 'rm -rf ~' | (at now)``). Each stretch
+    of text is read once."""
+    start = 0
+    for i in _pipe_offsets(clean):
+        m = _PIPE_CONSUMER.match(clean, i + 1)
+        argv = _command_argv(_tokens(m.group(1))) if m and m.group(1).strip() else []
+        if not argv:
+            continue
+        if not _consumer_runs_stdin(clean, m, argv):
+            continue
+        hit = _raw_text_scan(clean[start:i], [], _CODE_ARGV, dirs, dirs.home)
+        if hit:
+            return hit
+        start = i
+    return None
 
 
 def _flag_set(args: list[str]) -> set[str]:
@@ -2025,7 +3444,7 @@ def _destroy_check(argv: list[str], sub: str, home: str, dirs: _Dirs) -> str | N
             elif a == "--":
                 past = True
             elif a.startswith("--"):
-                recursive = recursive or a == "--recursive"
+                recursive = recursive or _long_opt(a, "--recursive", 5)  # ``--re`` may be --reference
             elif a.startswith("-") and len(a) > 1 and (name != "chmod" or _CHMOD_OPTION.match(a)):
                 recursive = recursive or "R" in a
             else:
@@ -2264,6 +3683,10 @@ _SECRET_VAR = re.compile(
 _VAR_REF = re.compile(r"\$(?:\{(\w+)[^}]*\}|(\w+))")
 _ENV_READ = re.compile(r"environ|process\.env|\bENV\b|getenv")
 _INTERPRETER_CODE_FLAG = re.compile(r"^-[A-Za-z]*[ceEpr]$")
+#: A ``mount -t`` type list as written, with nothing the shell expands (``ext4${IFS}/dev/sdb1``, ``{a,b}``, ``*``).
+_MOUNT_TYPES = re.compile(r"[A-Za-z0-9_.,-]+")
+#: What the shell expands in a word: a ``findmnt`` argument with one may become ``-F FILE``.
+_EXPANDS = frozenset("$`{}*?[")
 
 
 def _git_sub(argv: list[str]) -> tuple[str, list[str]]:
@@ -2279,6 +3702,26 @@ def _git_sub(argv: list[str]) -> tuple[str, list[str]]:
         else:
             return argv[i], argv[i + 1 :]
     return "", []
+
+
+def _mount_lists(args: list[str]) -> bool:
+    """``mount`` with ``args`` only prints the mounted file systems: no operand and no option but ``-l`` (labels too)
+    and ``-t TYPE`` (only that type). Anything else (a device, a directory, ``-o remount``, ``--bind``, ``-a``)
+    mounts."""
+    i = 0
+    while i < len(args):
+        if args[i] == "-l":
+            i += 1
+        elif (
+            args[i] == "-t"
+            and i + 1 < len(args)
+            and not args[i + 1].startswith("-")
+            and _MOUNT_TYPES.fullmatch(args[i + 1])
+        ):
+            i += 2
+        else:
+            return False
+    return True
 
 
 def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None:
@@ -2312,6 +3755,16 @@ def _human_sub(argv: list[str], known: dict[str, tuple[str, ...]]) -> str | None
             for m in _VAR_REF.finditer(a):
                 if _SECRET_VAR.search(m.group(1) or m.group(2) or ""):
                     return "Prints a variable that holds a credential"
+    elif name in ("mount", "umount") or name.startswith(("mount.", "umount.")):
+        # `mount -o remount,rw /`, `mount --bind / dir`: a user's `mount *` allow was meant for the listing
+        if name != "mount" or not _mount_lists(argv[1:]):
+            return "Mounts or unmounts a file system"
+    elif name == "findmnt":
+        from .engine import _READONLY_OPTS, _opts_ok  # engine imports this module
+
+        # `-F FILE` reads the file; a user's `findmnt *` and an expanding `-t` value must not reach it
+        if not _opts_ok(_READONLY_OPTS["findmnt"], argv[1:]) or any(_EXPANDS & set(a) for a in argv[1:]):
+            return "findmnt may read a file the command line does not show"
     elif _is_interpreter(name) and name not in _SHELLS and name not in ("source", ".", "eval"):
         for flag, code in zip(argv[1:], argv[2:], strict=False):
             if _INTERPRETER_CODE_FLAG.match(flag) and _ENV_READ.search(code):
@@ -2343,12 +3796,16 @@ def _human_parsed(parsed: Parsed, known: dict[str, tuple[str, ...]], cond: froze
 
 def human_check(parsed: Parsed) -> str | None:
     """Why a person must confirm the command line even though no rule forbids it, or None: force pushes, ``git reset
-    --hard``, ``git clean -f``, a recursive delete of a path only a variable names, printing a credential variable and
-    an interpreter dumping the whole environment. Not hardlines (a legitimate task does these), but nobody is asked
-    on the model's behalf: auto mode stops and asks, an unattended run is refused; yolo, which asks nothing, is not
-    consulted. ``parsed`` is the parse :func:`check_parse` returned."""
+    --hard``, ``git clean -f``, a recursive delete of a path only a variable names, printing a credential variable, an
+    interpreter dumping the whole environment and a ``mount``/``umount`` that is no listing. Not hardlines (a
+    legitimate task does these), but nobody is asked on the model's behalf: auto mode stops and asks, an unattended run
+    is refused; yolo, which asks nothing, is not consulted. ``parsed`` is the parse :func:`check_parse` returned."""
+    if parsed.expansion_over_cap:
+        return f"A brace expansion gives more than {_BRACE_MAX_WORDS} words, too many to check"
     try:
-        return _human_parsed(parsed, {})
+        return _human_parsed(parsed, {}) or next(
+            (why for alt in parsed.expanded if (why := _human_parsed(alt, {}))), None
+        )
     except _TooDeep:
         return None  # check_parse refused such a line before this ran
 
@@ -2394,6 +3851,10 @@ class Parsed:
     #: per child: the indices of the subs it came from (a payload of theirs, the heredoc fed to one): the child runs in
     #: the directories that sub may run in (see _check_parsed)
     child_subs: list[list[int]] = field(default_factory=list)
+    #: set by check_parse: the line and its nested commands parsed again brace-expanded and ``$IFS``-split (see
+    #: _expanded_text), for the checks that read the parse; and whether an expansion was too large to check
+    expanded: list[Parsed] = field(default_factory=list)
+    expansion_over_cap: bool = False
 
 
 _LINE_END = re.compile(r"[ \t]*(?:\n|$)")
@@ -2685,6 +4146,15 @@ def _scan(text: str, budget: list[int] | None = None, _depth: int = 0) -> Parsed
         elif text[i : i + 2] == "|&":
             flush("|&", piped=True)
             i += 2
+        elif c == "|" and i and text[i - 1] == ">" and (i - 1 - len(text[: i - 1].rstrip("\\"))) % 2 == 0:
+            if i > 1 and text[i - 2] in "<>&":
+                # `&>|`, `>>|`, `<>|`: dash reads `&>|f` as `&` then `>|f` (truncate f, background the command), bash
+                # fails on the line; split it as a pipe and let no rule vouch for it
+                out.unterminated = True
+                flush("|", piped=True)
+            else:
+                emit(c)  # `>|f` (`>` past noclobber) is a redirection, not a pipe; `\>|sh` is a literal > piped to sh
+            i += 1
         elif c == "|":
             flush("|", piped=True)
             i += 1
@@ -2874,9 +4344,12 @@ def _launcher_payloads(sub: str) -> list[str]:
             out += _shell_c_code(real)  # `bash -c env`: one word with nothing to split is code all the same
         if real and real[0] == "trap":
             out += _trap_actions(real[1:])
+        out += _launch_code(real)  # flock -c, script -c, tmux new ..., sg, runuser -c (see _launch_code)
         if real:
             out += ssh_option_commands(real[0], real[1:])
+            out += exec_option_commands(list(toks))  # git -c core.pager=..., man -P ... (see exec_option_commands)
             out += _windows_command_line(real[0], real[1:])
+        out += exec_env_commands(list(toks))  # GIT_PAGER='...' git log, EDITOR=... crontab -e (see exec_env_commands)
     return list(dict.fromkeys(out))
 
 
@@ -2896,6 +4369,11 @@ def parse(command: str, _depth: int = 0, budget: list[int] | None = None) -> Par
         for k, sub in enumerate(parsed.subs):
             for p in _launcher_payloads(sub):
                 payloads.setdefault(p, []).append(k)
+        for j, stages in enumerate(parsed.pipelines):
+            if j and stages[0].strip() in ("}", ")"):  # { echo 'rm -rf ~'; } | at now: the group's last command
+                stages = parsed.pipelines[j - 1][-1:] + stages[1:]
+            for p, stage in _piped_text_code(stages):  # echo 'rm -rf ~' | sh
+                payloads.setdefault(p, []).append(parsed.subs.index(stage) if stage in parsed.subs else 0)
     except _TooDeep:  # see _command_argv
         parsed.too_deep = True
         return parsed

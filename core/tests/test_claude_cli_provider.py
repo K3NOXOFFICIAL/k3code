@@ -20,7 +20,7 @@ from pydantic import ValidationError
 
 from k3code.config import ProviderEntry
 from k3code.doctor import check_keys
-from k3code.providers import ClaudeCliProvider, make_providers
+from k3code.providers import ClaudeCliProvider, claude_cli, make_providers
 from k3code.providers.base import ProviderError
 from k3code.providers.claude_cli import _parse_tool_calls, render_prompt
 from k3code.providers.types import INVALID_TOOL_CALL, Message, ToolCall, ToolSpec
@@ -1045,3 +1045,13 @@ def test_login_status_cannot_tell_without_the_command_or_when_it_hangs(fake_clau
     assert time.monotonic() - start < 10
     monkeypatch.setenv("PATH", "")
     assert login_status() is None
+
+
+def test_the_preamble_supplies_the_date_it_tells_the_model_to_ignore(monkeypatch) -> None:
+    """The host's own date is ignored (the preamble says so) and k3code sends no other: without this line a model
+    asked for today's date has no source. Day granularity keeps the prompt stable within a day."""
+    monkeypatch.setattr(claude_cli, "_today", lambda: "2031-02-03")
+    _, prompt = render_prompt([Message(role="user", content="u")], [])
+    assert "Today's date is 2031-02-03" in prompt
+    assert prompt.index("unrelated scratch sandbox") < prompt.index("Today's date is")
+    assert len(claude_cli._today()) == 10 and claude_cli._today()[4] == "-"  # the real helper gives YYYY-MM-DD

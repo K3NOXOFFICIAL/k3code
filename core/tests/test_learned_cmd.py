@@ -235,3 +235,54 @@ def test_learned_help_and_usage_say_what_each_purge_removes(tmp_path, monkeypatc
     assert "accepted gotchas" in help_text.splitlines()[3] and "USER.md" in help_text.splitlines()[3]
     assert "--all goes with purge only" in run("forget x --all")
     assert "purge [--all] --yes" in run("bogus")
+
+
+def test_learned_listing_shows_confidence_evidence_age(tmp_path, monkeypatch):
+    import time
+
+    from k3code.learning import distiller
+
+    home, _cwd, run, _ = _setup(tmp_path, monkeypatch)
+    now = time.time()
+    stale = now - (distiller.PREFERENCE_TTL_DAYS + 5) * 86400
+    distiller.write_preferences_json(
+        home,
+        [
+            distiller.Preference("use tabs", 0.9, 5, "a", now - 12 * 86400, now - 12 * 86400),
+            distiller.Preference("be terse", 0.8, 4, "b"),
+            distiller.Preference("old habit", 0.7, 3, "c", stale, stale),
+        ],
+    )
+    lines = [ln for ln in run("").splitlines() if " preference " in ln]
+    rows = {name: next(ln for ln in lines if f"  {name} (" in ln) for name in ("use tabs", "be terse", "old habit")}
+    assert "confidence 0.90, evidence 5, 12d" in rows["use tabs"]
+    assert "confidence 0.80, evidence 4, unknown" in rows["be terse"]
+    assert "confidence 0.70, evidence 3, expired" in rows["old habit"]
+
+
+def test_learned_edit_rewrites_preference_text(tmp_path, monkeypatch):
+    from k3code.learning import distiller
+
+    home, cwd, run, collect = _setup(tmp_path, monkeypatch)
+    distiller.write_preferences_json(home, [distiller.Preference("use tabs", 0.9, 5, "a")])
+    pref = next(i for i in collect(cwd) if i.text == "use tabs")
+    assert "Edited" in run(f"edit {pref.id} use spaces, 4 wide")
+    [p] = distiller.load_preferences(home)
+    assert p.text == "use spaces, 4 wide" and p.key == "a" and p.updated > 0
+    assert "Only preferences" in run(f"edit {next(i for i in collect(cwd) if i.kind == 'note').id} x")
+
+
+def test_cli_learned_list_and_forget(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from k3code import cli as cli_mod
+    from k3code.learning import distiller
+
+    home, cwd, _run, collect = _setup(tmp_path, monkeypatch)
+    distiller.write_preferences_json(home, [distiller.Preference("use tabs", 0.9, 5, "a")])
+    out = CliRunner().invoke(cli_mod.cli, ["learned", "list"])
+    assert out.exit_code == 0 and "use tabs" in out.output and "confidence 0.90" in out.output
+    pref = next(i for i in collect(cwd) if i.text == "use tabs")
+    out = CliRunner().invoke(cli_mod.cli, ["learned", "forget", pref.id])
+    assert out.exit_code == 0 and "Forgot" in out.output
+    assert distiller.load_preferences(home) == []

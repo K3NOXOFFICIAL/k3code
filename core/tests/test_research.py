@@ -473,7 +473,8 @@ async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as client:
         title, text = await tools.fetch_page("https://example.com/huge", client=client)
-    assert len(text) <= tools.MAX_FETCH_CHARS and text.startswith("x")
+    assert len(text) <= tools.MAX_FETCH_CHARS + 250 and text.startswith("x")  # the cap plus the cut marker
+    assert "[showing first" in text
     assert served["bytes"] < 6 * MAX_FETCH_BYTES  # stopped reading soon after the cap
 
 

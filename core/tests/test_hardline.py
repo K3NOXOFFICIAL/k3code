@@ -458,7 +458,8 @@ def test_an_approved_prefix_does_not_cover_writes_outside_the_project_or_unvette
     assert action("echo hi > $TARGET") == "ask"
     assert action("git commit -m x & rm -rf build") == "ask"  # the second command is not approved
     assert action('git commit -m "$(rm -rf build)"') == "ask"
-    assert action('echo "$(echo nested)"') == "allow"  # the substitution is itself an allowed command
+    # the substitution is itself allowed, but its output becomes echo's words, which no rule saw
+    assert action('echo "$(echo nested)"') == "ask"
 
 
 def test_launchers_are_never_offered_as_always_allow_rules():

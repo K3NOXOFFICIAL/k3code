@@ -11,6 +11,7 @@ k3code has three parts. You only need the toolchain for the part you change.
 cd core && uv sync
 uv run pytest -q
 uv run ruff check src tests
+uv run python scripts/eval_score.py   # offline evals: pass rate and steps per scripted task
 
 # TUI: Node 22+
 cd tui && npm ci

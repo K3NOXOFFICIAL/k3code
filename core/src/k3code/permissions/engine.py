@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import itertools
+import math
 import os
 import re
 import shlex
+import string
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -74,6 +77,9 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
 #: that are not known to be safe ask (_READONLY_OPTS, checked on the argv by _readonly_argv_ok; BUILTIN_BASH_ASK names
 #: the best-known ones as patterns).
 #: ``env``/``printenv`` are not here: they print the secrets in the environment.
+#: ``systemctl``/``journalctl`` are here with their query verbs and options only (see _readonly_argv_ok): they print
+#: unit state, unit files and logs, which can hold what a unit or a program wrote there. The Bash tool has no tty, so
+#: neither starts its pager (``less``, which can run commands).
 BUILTIN_BASH_ALLOW = [
     "ls *",
     "cat *",
@@ -113,6 +119,22 @@ BUILTIN_BASH_ALLOW = [
     "dirname *",
     "realpath *",
     "readlink *",
+    "findmnt *",
+    "lsblk *",
+    "ip *",
+    "ss *",
+    "nvidia-smi *",
+    "systemctl *",
+    "journalctl *",
+    "free *",
+    "uptime *",
+    "ps *",
+    "top *",
+    "lscpu *",
+    "lsusb *",
+    "lspci *",
+    "sensors *",
+    "hostname *",
     "git status *",
     "git diff *",
     "git log *",
@@ -788,13 +810,113 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 
 
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
-_HARMLESS_REDIRECT = re.compile(r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*>>?&?\s*/dev/null)(?![^\s;&|<>()])")
-#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f).
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)")
-#: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``): reading with ``<`` is never restricted by the
-#: write roots.
-_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*>>?&?)\s*([^\s;&|<>()]+)")
-_SUBSTITUTION = re.compile(r"\$\(|`")
+#: A file-descriptor number in front of a redirect operator (``2>f``): only where a word starts. In ``x.p12>f`` the
+#: digits end the word ``x.p12``; taking them as the fd read ``x.p`` (no secret name) where ``cat`` reads ``x.p12``.
+_FD = r"(?:(?:^|(?<=[\s;&|()]))\d+)"
+_HARMLESS_REDIRECT = re.compile(
+    rf"(?:{_FD}?[<>]&(?:\d+|-)|&>>?\s*/dev/null|{_FD}?(?:>\||<>|>>?&?)\s*/dev/null)(?![^\s;&|<>()])"
+)
+#: Where a redirect operator starts: after its fd (see _FD), or not inside another operator (``<<EOF``, ``>&>``).
+_OPERATOR_START = rf"(?:{_FD}|(?<![<>&]))"
+#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f), ``>|f`` (``>`` past
+#: noclobber) and ``<>f`` (opens f read-write and creates it, in bash and dash), each with an fd in front (``2>|f``).
+_REDIRECT = re.compile(rf"(?:(?<![<>&])&>>?|{_OPERATOR_START}(?:<>|>\||(?:>>?|<)&?))\s*([^\s;&|<>()]+)")
+#: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``, ``>|``, and ``<>``, which writes as well): reading
+#: with ``<`` is never restricted by the write roots.
+_WRITE_REDIRECT = re.compile(rf"(?:(?<![<>&])&>>?|{_OPERATOR_START}(?:<>|>\||>>?&?))\s*([^\s;&|<>()]+)")
+#: ``$(...)``, backticks and process substitution ``<(...)``/``>(...)`` (bash; ``echo >(rm x)`` runs ``rm x``).
+_SUBSTITUTION = re.compile(r"\$\(|`|[<>]\(")
+#: What stands in for a quoted character in :func:`_quote_mask` (no operator regex here matches it).
+_MASK_FILL = "_"
+
+
+#: Commands that run a quoted argument as shell or awk code (``awk '{print > "/etc/x"}'``, ``ssh h 'rm x'``), besides
+#: the interpreters hardline knows: their quotes hide no operator.
+_QUOTED_CODE_RUNNERS = frozenset(
+    {"awk", "gawk", "mawk", "nawk", "busybox", "ssh", "su", "watch", "script", "flock", "parallel", "tmux", "screen"}
+)
+
+
+def _runs_quoted_code(sub: str) -> bool:
+    """A word of ``sub`` names a command that may run a quoted argument as code (``bash -c``, ``eval``, ``sudo sh -c``,
+    ``find -exec sh -c``, awk, ``git -c core.pager=...``)."""
+    try:
+        words = hardline.tokens(sub)
+    except ValueError:
+        return True
+    names = {os.path.basename(w) for w in words}
+    if any(hardline._is_interpreter(n) or n in _QUOTED_CODE_RUNNERS for n in names):
+        return True
+    return "git" in names and any(w in ("-c", "--config-env") or w.startswith("--config-env=") for w in words)
+
+
+def _quote_mask(sub: str) -> str:
+    """``sub`` with every character inside quotes replaced by :data:`_MASK_FILL` (the quotes kept, same length), so
+    the operator regexes see ``grep "a<>b"`` as no redirect and ``grep 'a<(b'`` as no substitution. A ``$(...)``,
+    backtick or ``${...}`` stays as written, in double quotes too: it runs there. Where the quoting is not plain
+    (``$'...'``, ``$"..."``, an unclosed quote or unit, a ``#`` comment) ``sub`` comes back unchanged."""
+    if "$'" in sub or '$"' in sub or _runs_quoted_code(sub):
+        return sub
+    out, i, n = list(sub), 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and (i == 0 or sub[i - 1] in " \t\n;&|()"):
+            return sub
+        end = hardline._unit_end(sub, i)
+        if end == -2:
+            return sub
+        if end >= 0:
+            i = end + 1
+            continue
+        if c == "'":
+            close = sub.find("'", i + 1)
+            if close < 0:
+                return sub
+            out[i + 1 : close] = _MASK_FILL * (close - i - 1)
+            i = close + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and sub[i] != '"':
+                end = hardline._unit_end(sub, i)
+                if end == -2:
+                    return sub
+                if end >= 0:
+                    i = end + 1
+                    continue
+                step = 2 if sub[i] == "\\" else 1
+                out[i : i + step] = _MASK_FILL * len(out[i : i + step])
+                i += step
+            if i >= n:
+                return sub
+        i += 1
+    return "".join(out)
+
+
+def _operator_view(sub: str) -> tuple[str, str]:
+    """``(plain, mask)``: ``sub`` and its :func:`_quote_mask`, both with the harmless redirects blanked out, aligned
+    character for character. Find an operator in ``mask``; read what it names (a redirect target) from ``plain`` at the
+    same place, so ``> "/etc/passwd"`` still names ``/etc/passwd``."""
+    mask = _quote_mask(sub)
+    spans = [m.span() for m in _HARMLESS_REDIRECT.finditer(mask)]
+
+    def blank(text: str) -> str:
+        chars = list(text)
+        for start, stop in spans:
+            chars[start:stop] = " " * (stop - start)
+        return "".join(chars)
+
+    return blank(sub), blank(mask)
+
+
+def _operator_targets(regex: re.Pattern[str], plain: str, mask: str) -> list[str]:
+    """The first group of each ``regex`` match in ``mask``, read from ``plain`` (see :func:`_operator_view`)."""
+    return [plain[m.start(1) : m.end(1)] for m in regex.finditer(mask)]
+
+
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(
     r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
@@ -823,11 +945,15 @@ def _sandbox_scratch(path: str) -> bool:
 
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
     """A redirect in ``sub`` writes a file outside the project roots (and outside the sandbox's private ``/tmp``, see
-    _SANDBOX_TMP). Targets that are variables or globs are left to the sandbox; the ``/dev`` sinks are not files."""
+    _SANDBOX_TMP). A target that is a variable or a substitution (``> $HOME/.bashrc``, ``<> "$(cmd)"``) or a ``~name``
+    nobody can look up may be anywhere: it counts as outside. Globs are left to the sandbox; the ``/dev`` sinks are not
+    files."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     for target in _WRITE_REDIRECT.findall(plain):
         target = target.strip("'\"")
-        if not target or target.startswith("/dev/") or any(ch in target for ch in "$`*?[{"):
+        if any(ch in target for ch in "$`") or hardline.expand_user(target).startswith("~"):
+            return True
+        if not target or target.startswith("/dev/") or any(ch in target for ch in "*?[{"):
             continue
         path = _abs(target, cwd)
         if not _inside(path, roots) and not _sandbox_scratch(path):
@@ -835,15 +961,34 @@ def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
     return False
 
 
-def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
-    """Every redirect target is a plain path inside the project roots and not a credential/startup file."""
-    for target in _REDIRECT.findall(plain):
+def _line_writes_outside_roots(subs: list[str], roots: list[str], where: _Where) -> bool:
+    """A redirect of ``subs`` writes outside the roots from one of the directories the line may run in (``where``: the
+    cwd and each directory a ``cd``/``pushd`` on it can reach, its symlinks resolved too: ``cd link && > ../x`` writes
+    next to the link's target). A directory that cannot be worked out (``cd $DIR``) could be ``/``: a relative target
+    then counts as outside."""
+    return any(_writes_outside_roots(sub, roots, d) for sub in subs for d in _where_dirs(where))
+
+
+def _where_dirs(where: _Where) -> list[str]:
+    """The directories a relative path on the line may be relative to (see _Where), each as written and with its
+    symlinks resolved; ``/`` stands in for one that cannot be worked out."""
+    dirs = list(dict.fromkeys(d for w in where.dirs for d in (w, _real(w))))
+    if where.unknown:
+        dirs.append("/")
+    return dirs
+
+
+def _redirects_ok(plain: str, mask: str, roots: list[str], dirs: list[str]) -> bool:
+    """Every redirect target is a plain path inside the project roots and not a credential/startup file, from each of
+    the directories (``dirs``) the command may run in: ``cd .. && echo x > a`` writes outside the project."""
+    for target in _operator_targets(_REDIRECT, plain, mask):
         target = target.strip("'\"")
         if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
             return False  # a variable or glob: unknown target
-        path = _abs(target, cwd)
-        if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, _real(path))):
-            return False
+        for cwd in dirs:
+            path = _abs(target, cwd)
+            if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, _real(path))):
+                return False
     return True
 
 
@@ -854,36 +999,77 @@ def _voids_allow(
     roots: list[str],
     cwd: str,
     heredocs: list[hardline.Heredoc] | None = None,
+    depth: int = 0,
+    where: _Where | None = None,
 ) -> bool:
-    """A redirect or command substitution turns an allowed prefix into something else (``ls > ~/.bashrc``,
-    ``git commit -m "$(evil)"``). Builtin read-only allows never cover either. A rule the user approved (session /
-    project / user layer) still covers redirects into the project and substitutions whose contents are themselves
-    allowed. Before, an "always allow git commit" also allowed ``git commit > ~/.bashrc`` and ``git commit -m
-    "$(evil)"``. The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those
-    on the command line (``sub`` has no body)."""
-    plain = _HARMLESS_REDIRECT.sub("", sub)
-    has_redirect = bool(_REDIRECT.search(plain))
+    """A redirect or a substitution turns an allowed prefix into something else (``ls > ~/.bashrc``, ``git commit -m
+    "$(evil)"``, ``ls <(rm -rf x)``). Builtin read-only allows never cover either. A rule the user approved (session /
+    project / user layer) still covers redirects into the project and substitutions whose commands are each allowed
+    on their own, by this same check (:func:`_nested_allowed`). A ``bash -c '...'`` the user allowed ``bash *`` for
+    stays theirs. Before, an "always allow git commit" also
+    allowed ``git commit > ~/.bashrc`` and ``git commit -m "$(evil)"``, and an "always allow echo" ``echo >(rm x)``.
+    The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those on the command
+    line (``sub`` has no body). ``where``: the directories a ``cd`` on the line can move the command to (a redirect is
+    judged from each); without it, ``cwd`` alone."""
+    # the shell expands `$X`, `${X:-y}`, `$IFS` and `{a,b}` after the rule matched the words as written: `cat a$x` and
+    # `cat {x,/etc/passwd}` read what no rule saw, so no allow covers a word the shell expands (in double quotes too)
+    if hardline.shell_expands(sub):
+        return True
+    plain, mask = _operator_view(sub)
+    has_redirect = bool(_REDIRECT.search(mask))
     body_payloads = [p for h in heredocs or () for p in h.payloads]
-    has_subst = bool(_SUBSTITUTION.search(plain)) or bool(body_payloads)
+    has_subst = bool(_SUBSTITUTION.search(mask)) or bool(body_payloads)
     if rule.layer == 0:
-        # the builtin read-only allowlist covers the project only: `cat /etc/x`, `grep -r k ~` and `ls $DIR` ask
+        # the builtin read-only allowlist covers the project, and outside it only literal paths that hold no secret
+        # (`cat /etc/os-release`, `du -sh ~/Downloads`; see _outside_reads_ok): `cat /etc/shadow`, `grep -r k ~`, `ls
+        # $DIR` and the test runners (_SANDBOXED) ask. A nested command (depth > 0) covers the project only
+        outside = any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
         return (
             has_redirect
             or has_subst
-            or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
+            or (outside and not (depth == 0 and rule.pattern not in _SANDBOXED and _outside_reads_ok(sub, roots, cwd)))
             or not _readonly_argv_ok(hardline.tokens(sub))
         )
-    if has_redirect and not _redirects_ok(plain, roots, cwd):
+    if has_redirect and not _redirects_ok(plain, mask, roots, _where_dirs(where) if where else [cwd]):
+        return True
+    # the output of `$(...)` or a backtick becomes words of the command: `cat $(echo /etc/passwd)` reads what no rule
+    # saw, even when `echo` is allowed. Only `<(...)`, `>(...)` and heredoc bodies stay on the nested check
+    if hardline.command_substitution(sub):
         return True
     if not has_subst:
         return False
-    nested = hardline.parse(sub).nested
-    for payload in body_payloads:
-        inner = hardline.parse(payload)
-        nested = [*nested, *inner.subs, *inner.nested]
-    return not nested or any(
-        evaluate("bash", n, ruleset, default="ask").action != "allow" or hardline.is_launcher(n) for n in nested
-    )
+    # nested is flat (`$(a $(b))` gives both); a substitution the parser did not take apart is vouched for by nobody
+    nested = [*hardline.parse(sub).nested, *body_payloads]
+    return not nested or not all(_nested_allowed(n, ruleset, roots, cwd, depth + 1, where) for n in nested)
+
+
+#: How deep :func:`_nested_allowed` follows commands inside commands (``$(a $(b $(c)))``); deeper asks.
+_NESTED_MAX_DEPTH = 4
+
+
+def _nested_allowed(
+    command: str, ruleset: list[Rule], roots: list[str], cwd: str, depth: int, where: _Where | None = None
+) -> bool:
+    """Every simple command of the nested ``command`` (a ``$(...)``/``<(...)``/``>(...)``/``bash -c`` payload) is
+    allowed on its own: a rule allows it, nothing voids that allow (:func:`_voids_allow`, its own nested commands
+    included), and it is no launcher, no heredoc program and no sandbox-only allow (the outer allow is not
+    sandbox-bound). Past _NESTED_MAX_DEPTH, or when the payload does not parse cleanly, it is not."""
+    if depth > _NESTED_MAX_DEPTH:
+        return False
+    inner = hardline.parse(command)
+    if not inner.subs or inner.unterminated or inner.comment_quote or inner.too_deep or inner.open_heredoc:
+        return False
+    for k, sub in enumerate(inner.subs):
+        rule = evaluate("bash", sub, ruleset, default="ask")
+        if (
+            rule.action != "allow"
+            or (rule.layer == 0 and rule.pattern in _SANDBOXED)
+            or hardline.is_launcher(sub)
+            or inner.code_heredoc[k]
+            or _voids_allow(sub, rule, ruleset, roots, cwd, inner.heredocs[k], depth, where)
+        ):
+            return False
+    return True
 
 
 class _Opts(NamedTuple):
@@ -997,6 +1183,52 @@ _READONLY_OPTS: dict[str, _Opts] = {
         "tx",
         "human-readable si print-type local all inodes portability total",
     ),
+    # not -F/--tab-file (reads a file it names)
+    "findmnt": _opts(
+        "AabCcDfiJklmnPRrsUuvxy",
+        "dMNOoSTtw",
+        "all ascii bytes nocanonicalize canonicalize df first-only invert json kernel list mtab noheadings pairs"
+        " submounts raw fstab uniq notruncate nofsroot verify verbose shell output-all",
+        "direction mountpoint task options output source target types timeout",
+    ),
+    # not --sysroot (reads a directory it names), -Q/--filter, -T/--tree (optional value)
+    "lsblk": _opts(
+        "ADJMOPSNvabdfilmnprstyzH",
+        "EIewox",
+        "noempty discard json merge output-all pairs scsi nvme virtio all bytes nodeps fs ascii list perms noheadings"
+        " paths raw inverse topology shell zoned list-columns",
+        "dedup include exclude output width sort",
+    ),
+    # not -s/--seconds or -c/--count (repeat forever or N times)
+    "free": _opts(
+        "bkmghlLtvw",
+        longs="bytes kilo mega giga tera peta kibi mebi gibi tebi pebi human si lohi line total committed wide",
+    ),
+    "uptime": _opts("cprs", longs="container pretty raw since"),
+    # UNIX options only; the BSD ones (no dash) are checked by _ps_ok, which also asks on a glued value
+    "ps": _opts(
+        "AeadNFfHjlMPyLmTcVwZ",
+        "CGgpqstuUDOo",
+        "deselect forest context headers no-headers signames cumulative version",
+        "Group group pid ppid quick-pid sid tty user User format sort delimiter cols columns width rows lines",
+    ),
+    # batch mode only (-b -n N, see _sysinspect_ok); not -d (delay), -s, -S, -U, -i, -O
+    "top": _opts("bcH1", "nopuEew"),
+    # not -s/--sysroot (a directory it reads)
+    "lscpu": _opts(
+        "abBcJrxy",
+        longs="all online bytes offline json raw hex physical output-all",
+        longs_val="caches extended parse hierarchic",
+        glued="Cep",
+    ),
+    # not -D (opens the device file it names)
+    "lsusb": _opts("vt", "sd", "verbose tree"),
+    # display only: not -x (-xxx "dangerous"), -q/-Q (DNS, cache file), -i/-p/-F (files), -M/-H/-A/-O/-G (access)
+    "lspci": _opts("mtvkbDPn", "sd"),
+    # not -s/--set (writes the chips) or -c/--config-file
+    "sensors": _opts("fAujn", longs="fahrenheit no-adapter bus-list allow-no-sensors"),
+    # prints only: not -b/--boot or -F/--file (set the name); a name operand sets it (see _sysinspect_ok)
+    "hostname": _opts("aAdfiIsy", longs="domain fqdn long ip-address all-ip-addresses short"),
     "pwd": _opts("LP", longs="logical physical"),
     "which": _opts("as"),
     "type": _opts("aftpP"),
@@ -1098,7 +1330,61 @@ _READONLY_OPTS: dict[str, _Opts] = {
         longs_val="short abbrev-ref symbolic-full-name",
     ),
     "git remote": _opts("v", longs="verbose push all"),
+    # not -H/--host, -M/--machine, --root, --image: they reach another system or tree. The verb is checked on its own.
+    "systemctl": _opts(
+        "aqlr",
+        "notp",
+        "user system no-pager no-legend all full plain quiet value recursive",
+        "lines output type state property",
+    ),
+    # -n/-b take an optional value, glued (-n5, --lines=5) or a number word that is checked on its own: never
+    # the next option (`-n --rotate`). `-b -1` (the boot before) is the -\d+ word; journalctl has no digit option.
+    # Not -f/--follow (never ends), --vacuum-*/--rotate/--flush/--sync/... (write), -D/--file/--root/-M (elsewhere).
+    "journalctl": _opts(
+        "kexrqa",
+        "upSUogt",
+        "no-pager user system dmesg reverse catalog pager-end quiet no-hostname utc list-boots disk-usage all",
+        "lines boot unit user-unit priority since until output grep identifier case-sensitive namespace",
+        extra=r"-\d+",
+        glued="nb",
+    ),
 }
+#: The systemctl verbs that only print. Every other one (start, restart, enable, edit, daemon-reload, kill, ...) asks.
+#: Not ``cat``, ``show-environment`` or ``show`` without a property list: they print ``Environment=`` lines, which may
+#: hold tokens (the reason ``env`` is no builtin); see _systemctl_show_ok and _unit_env_dump.
+_SYSTEMCTL_READ_VERBS = frozenset(
+    {"status", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies"}
+    | {"list-jobs", "is-active", "is-enabled", "is-failed", "is-system-running", "get-default"}
+)
+#: How systemctl reads its options (systemd 259 ``systemctl --help``, plus the hidden ``--no-legend``, ``--fail``,
+#: ``--irreversible``, ``--ignore-dependencies`` and ``--ignore-inhibitors``), so the verb is found where it does:
+#: ``--job-mode fail cat x`` runs ``cat``. getopt takes any unambiguous prefix of a long option (``--mach``).
+_SYSTEMCTL_GETOPT = _opts(
+    "ahilqrvfT",
+    "CHMPnopst",
+    "after all before dry-run failed firmware-setup force full global help marked mkdir no-ask-password no-block"
+    " no-pager no-reload now no-wall no-warn plain quiet read-only recursive reverse runtime show-transaction"
+    " show-types stdin system user value verbose version wait with-dependencies no-legend fail irreversible"
+    " ignore-dependencies ignore-inhibitors",
+    "boot-loader-entry boot-loader-menu capsule check-inhibitors drop-in host image image-policy job-mode"
+    " kill-subgroup kill-value kill-whom legend lines machine message output preset-mode property reboot-argument"
+    " root signal state timestamp type what when",
+)
+_SYSTEMCTL_LONGS = _SYSTEMCTL_GETOPT.longs | _SYSTEMCTL_GETOPT.longs_val
+#: The options that point systemctl at another system, tree, service manager or process set.
+_SYSTEMCTL_ELSEWHERE = frozenset({"-C", "-H", "-M", "-s", "--capsule", "--host", "--machine", "--root", "--image"})
+_SYSTEMCTL_ELSEWHERE |= frozenset({"--signal", "--kill-whom"})
+#: The unit properties ``systemctl show -p`` may print unasked: state, ids and dependencies. Not ``Environment*``,
+#: ``PassEnvironment``, ``ExecStart*`` (the command line with its arguments) or any other one.
+_SYSTEMCTL_SAFE_PROPS = frozenset(
+    {"ActiveState", "SubState", "LoadState", "UnitFileState", "MainPID", "ExecMainStatus", "Result", "Description"}
+    | {"FragmentPath", "NRestarts", "ActiveEnterTimestamp", "MemoryCurrent", "CPUUsageNSec", "Id", "Names", "Type"}
+    | {"Restart", "WantedBy", "After", "Before", "Requires", "Wants"}
+)
+#: The builtin process, hardware and journal viewers: a word of theirs the shell expands may become an option
+#: (``journalctl *`` with a file ``-f`` follows forever, ``lsblk *`` with ``-H``), so none of them allows one.
+_GLOB_GUARDED = frozenset({"free", "uptime", "ps", "top", "lscpu", "lsusb", "lspci", "sensors", "hostname", "ip"})
+_GLOB_GUARDED |= frozenset({"ss", "nvidia-smi", "lsblk", "systemctl", "journalctl", "findmnt"})
 #: jq/yq programs that read the environment (``env``, ``$ENV``, ``strenv``), load files or modules (``import``,
 #: ``modulemeta``), or run a command.
 #: yq's ``eval`` runs a string built at runtime (``eval("lo"+"ad_str(...)")``): no other spelling reaches those.
@@ -1189,6 +1475,220 @@ def _ref_list_ok(sub: str, args: list[str]) -> bool:
     return positional == 0 or listing
 
 
+#: A plain word: an interface, a GPU id, a column list. Nothing the shell expands, no leading ``-``.
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9_.@:,][A-Za-z0-9_.@:,-]*")
+#: ``ip`` matches its options and verbs by prefix (``-b`` is ``-batch``, ``ip a a`` is ``ip addr add``), so only these
+#: exact words pass: global display options, the objects, and the listing verbs.
+_IP_GLOBAL = frozenset(
+    {"-br", "-brief", "-c", "-color", "-4", "-6", "-s", "-stats", "-d", "-details", "-j", "-json", "-p", "-pretty"}
+    | {"-o", "-oneline"}
+)
+_IP_OBJECTS = frozenset(
+    {"a", "addr", "address", "l", "link", "r", "ro", "route", "n", "neigh", "neighbor", "neighbour", "rule", "maddr"}
+)
+_IP_SHOW = frozenset({"show", "list", "ls", "lst"})
+#: ``ss`` listing options; not -K/--kill, -D/--diag (writes), -F/--filter (reads), -E/--events (hangs), -N/--net.
+_SS_OPTS = _opts(
+    "tulnpaxws46emioHOr",
+    longs="tcp udp listening numeric processes all summary extended memory info options no-header oneline resolve",
+)
+#: ``nvidia-smi`` query words (it never clusters options). Not -c (compute mode), -l/-lms (loop), -f (file), nor
+#: anything that sets the GPU.
+_NVSMI_FLAGS = frozenset({"-L", "--list-gpus", "-q", "--query", "-x", "--xml-format", "-u", "--unit"})
+_NVSMI_VALUED = frozenset({"-d", "-i"})
+_NVSMI_EQ = frozenset({"--display", "--id", "--query-gpu", "--query-compute-apps", "--format"})
+#: ``nvidia-smi dmon|pmon`` display options; ``-c N`` is required, else they loop forever.
+_NVSMI_MON_VALUED = frozenset({"-s", "-i", "-d"})
+
+
+def _ip_ok(args: list[str]) -> bool:
+    """``ip [OPTS] OBJECT [show [dev NAME | NAME]]`` with only the exact words above."""
+    i = 0
+    while i < len(args) and args[i] in _IP_GLOBAL:
+        i += 1
+    rest = args[i:]
+    if not rest or rest[0] not in _IP_OBJECTS:
+        return False
+    rest = rest[1:]
+    if not rest:
+        return True
+    if rest[0] not in _IP_SHOW:
+        return False
+    rest = rest[1:]
+    if rest[:1] == ["dev"]:
+        rest = rest[1:]
+        return len(rest) == 1 and bool(_PLAIN_WORD.fullmatch(rest[0]))
+    return not rest or (len(rest) == 1 and bool(_PLAIN_WORD.fullmatch(rest[0])))
+
+
+def _ss_ok(args: list[str]) -> bool:
+    """``ss`` with listing options and no filter but ``state NAME``."""
+    if "--" in args or not _opts_ok(_SS_OPTS, [a for a in args if a.startswith("-")]):
+        return False
+    words = [a for a in args if not a.startswith("-")]
+    pairs = zip(words[::2], words[1::2], strict=False)
+    return len(words) % 2 == 0 and all(k == "state" and re.fullmatch(r"[a-z][a-z-]*", v) for k, v in pairs)
+
+
+def _nvidia_smi_ok(args: list[str]) -> bool:
+    """``nvidia-smi`` queries, ``topo -m``, and ``dmon|pmon -c N``; every value a plain word."""
+    if args[:1] == ["topo"]:
+        return args[1:] in (["-m"], ["--matrix"])
+    mon = args[:1] in (["dmon"], ["pmon"])
+    flags, valued = (frozenset(), _NVSMI_MON_VALUED | {"-c"}) if mon else (_NVSMI_FLAGS, _NVSMI_VALUED)
+    counted = False
+    i = 1 if mon else 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        name, eq, value = a.partition("=")
+        if a in flags:
+            continue
+        if a in valued and i < len(args):
+            value, i = args[i], i + 1
+            if a == "-c":
+                if counted or not re.fullmatch(r"[1-9][0-9]*", value):
+                    return False
+                counted = True
+        elif not (eq and not mon and name in _NVSMI_EQ):
+            return False
+        if not _PLAIN_WORD.fullmatch(value):
+            return False
+    return counted or not mon
+
+
+#: The builtin process and hardware viewers besides ps, and whether they take operands: only the chip names of
+#: ``sensors``. ``hostname NAME`` sets the host name; for the others a word left over is a value nobody checked.
+_SYSINSPECT_OPERANDS = {
+    "free": False,
+    "uptime": False,
+    "top": False,
+    "lscpu": False,
+    "lsusb": False,
+    "lspci": False,
+    "hostname": False,
+    "sensors": True,
+}
+#: An option value or operand of a process or hardware viewer: a list, a field, a bus id (``pid,%cpu``, ``1:2``).
+_SYS_WORD = re.compile(r"[\w,.:+%=-]+")
+#: BSD-style ps options (no dash) that print only what ps prints anyway: not ``e``, which appends the environment of
+#: every process (tokens, keys: the reason ``env`` and ``printenv`` are not builtin). The value ones take the next word.
+_PS_BSD_FLAGS = "arTxfjlsuvXHmcnSLVwZ"
+_PS_BSD_VALUED = "pqtUOok"
+
+
+def _expands(args: list[str]) -> bool:
+    """An argument holds a glob, brace or substitution the shell may turn into other options (``ps ax ?`` with a file
+    ``e``, ``sensors *`` with a file ``-s``)."""
+    return any(hardline._EXPANDS & set(a) for a in args)
+
+
+def _sysinspect_ok(name: str, spec: _Opts, args: list[str]) -> bool:
+    """``name ARGS`` (see _SYSINSPECT_OPERANDS, after _opts_ok) leaves no word unchecked: each value is a plain word,
+    not the next option _opts_ok skipped (``top -b -n1 -p -i``), and there is no operand but a ``sensors`` chip.
+    ``top`` must run in batch mode for at most 9 rounds, or it runs until a person quits it."""
+    if _expands(args):
+        return False
+    opts, positional = _options(args, spec.valued, spec.longs_val)  # glued values (`lscpu -ecpu`) are no words
+    if any(v and (v.startswith("-") or not _SYS_WORD.fullmatch(v)) for _, v in opts):
+        return False
+    if positional and not (
+        _SYSINSPECT_OPERANDS[name] and all(_SYS_WORD.fullmatch(p) and not p.startswith("-") for p in positional)
+    ):
+        return False
+    if name == "top":
+        given = dict(opts)
+        return "-b" in given and re.fullmatch(r"[1-9]", given.get("-n", "")) is not None
+    return True
+
+
+def _ps_ok(spec: _Opts, args: list[str]) -> bool:
+    """``ps ARGS`` prints no process environment: every UNIX (``-ef``) and BSD (``aux``) option is a listed one, a
+    value option is last in its word and takes the next one (``-uxe`` is ``-u xe``, and with no user ``xe`` ps reads it
+    as BSD ``uxe``), a dashed ``e`` comes only with options that cannot fail, no word names the ``environ`` field
+    (``-o environ``) and none expands."""
+    if _expands(args) or any("environ" in a for a in args):
+        return False
+    if any(a.startswith("-") and not a.startswith("--") and "e" in a for a in args):
+        # a UNIX line that fails (`-ef -o args`, `-eTH`) is read again as BSD, where that e prints the environments:
+        # only these options, which never fail together, may keep it
+        return all(re.fullmatch(r"-[efFljyw]+", a) for a in args)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        takes_value = False
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if key in spec.longs and not eq:
+                continue
+            if key not in spec.longs_val or (eq and not _SYS_WORD.fullmatch(value)):
+                return False
+            takes_value = not eq
+        else:
+            dashed = a.startswith("-")
+            letters = a[1:] if dashed else a
+            flags, valued = (spec.flags, spec.valued) if dashed else (_PS_BSD_FLAGS, _PS_BSD_VALUED)
+            if not letters:
+                return False
+            for k, ch in enumerate(letters, 1):
+                if ch in valued and k == len(letters):
+                    takes_value = True
+                elif ch not in flags:
+                    return False
+        if takes_value:
+            if i == len(args) or args[i].startswith("-") or not _SYS_WORD.fullmatch(args[i]):
+                return False
+            i += 1
+    return True
+
+
+def _systemctl_show_ok(opts: list[tuple[str, str]]) -> bool:
+    """``systemctl show`` with these options prints only properties of _SYSTEMCTL_SAFE_PROPS: at least one ``-p`` /
+    ``--property`` is given (without one it prints every property, ``Environment=`` too) and each listed one is safe."""
+    props = [p for key, value in opts if key in ("-p", "-P", "--property") for p in value.split(",")]
+    return bool(props) and all(p in _SYSTEMCTL_SAFE_PROPS for p in props)
+
+
+def _systemctl_options(args: list[str]) -> tuple[list[tuple[str, str]], list[str]] | None:
+    """systemctl's options and positionals in ``args`` as it reads them (long options by their full name, so a value
+    is never taken for the verb), or None when an option reaches elsewhere (_SYSTEMCTL_ELSEWHERE, by any spelling) or
+    is unknown or ambiguous: then the verb cannot be told."""
+    words: list[str] = []
+    for k, a in enumerate(args):
+        if a == "--":
+            words += args[k:]
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            names = [key] if key in _SYSTEMCTL_LONGS else [o for o in _SYSTEMCTL_LONGS if o.startswith(key)]
+            if len(names) != 1 or names[0] in _SYSTEMCTL_ELSEWHERE:
+                return None
+            a = names[0] + eq + value
+        elif a.startswith("-") and len(a) > 1:
+            for ch in a[1:]:
+                if f"-{ch}" in _SYSTEMCTL_ELSEWHERE or ch not in _SYSTEMCTL_GETOPT.valued + _SYSTEMCTL_GETOPT.flags:
+                    return None
+                if ch in _SYSTEMCTL_GETOPT.valued:
+                    break  # the rest of the word is its value
+        words.append(a)
+    return _options(words, _SYSTEMCTL_GETOPT.valued, _SYSTEMCTL_GETOPT.longs_val)
+
+
+def _unit_env_dump(sub: str) -> bool:
+    """``sub`` prints the ``Environment=`` of a unit or of the service manager: ``systemctl show-environment``,
+    ``systemctl cat UNIT`` or a ``systemctl show`` that may list it. Like ``env``, a person confirms it in any mode."""
+    argv = _argv(sub)
+    if not argv or os.path.basename(argv[0]) != "systemctl":
+        return False
+    parsed = _systemctl_options(argv[1:])
+    if parsed is None:
+        return True
+    opts, positional = parsed
+    verb = positional[0] if positional else ""
+    return verb in ("show-environment", "cat") or (verb == "show" and not _systemctl_show_ok(opts))
+
+
 def _readonly_argv_ok(tokens: list[str]) -> bool:
     """``tokens`` (one simple command, as written) uses only the options of a builtin read-only command that are known
     to be safe (see _READONLY_OPTS), and no query or argument that writes or runs something. Other commands pass."""
@@ -1203,16 +1703,37 @@ def _readonly_argv_ok(tokens: list[str]) -> bool:
         if sub in _REF_LIST:
             return _ref_list_ok(sub, args)
         name = f"git {sub}"
+    if name in _GLOB_GUARDED and _expands(args):
+        return False
+    if name == "ip":
+        return _ip_ok(args)
+    if name == "ss":
+        return _ss_ok(args)
+    if name == "nvidia-smi":
+        return _nvidia_smi_ok(args)
     spec = _READONLY_OPTS.get(name)
     if spec and not _opts_ok(spec, args):
         return False
     if name == "make":
         _, positional = _options(args, *_MAKE_VALUE_OPTS)
         return all("=" in p or p in _MAKE_TARGETS for p in positional)  # `VAR=value` is an assignment
+    if name == "systemctl":
+        # the verb is the first positional, as systemctl parses it (`-t status restart x` restarts x); none lists units
+        parsed = _systemctl_options(args)
+        if parsed is None:
+            return False
+        opts, positional = parsed
+        if positional and positional[0] == "show":
+            return _systemctl_show_ok(opts)
+        return not positional or positional[0] in _SYSTEMCTL_READ_VERBS
     if name == "uniq":
         # `uniq IN OUT` writes OUT
         _, positional = _options(args, "fsw", frozenset({"--skip-fields", "--skip-chars", "--check-chars"}))
         return len(positional) <= 1
+    if name == "ps":
+        return _ps_ok(_READONLY_OPTS["ps"], args)
+    if name in _SYSINSPECT_OPERANDS:
+        return _sysinspect_ok(name, _READONLY_OPTS[name], args)
     return not (name in ("jq", "yq") and any(_QUERY_RISKY.search(a) for a in args))
 
 
@@ -1222,8 +1743,25 @@ def _argv(
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
     ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``), ``chdirs`` the directories one
     runs the command in (``env -C DIR``, ``git -C DIR``), ``replaces`` the strings ``xargs -I`` fills with its input."""
-    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words), reads, chdirs, replaces)
+    return hardline.normalize_argv(hardline.tokens(_cut_redirects(sub)), reads, chdirs, replaces)
+
+
+#: ``<<WORD``, ``<<-WORD``, ``<<<WORD``: a heredoc delimiter or a here-string, never an argument (see _OPERATOR_START)
+_HEREDOC_OPERATOR = re.compile(rf"{_OPERATOR_START}<<[-<]?\s*[^\s;&|<>()]*")
+
+
+def _cut_redirects(sub: str) -> str:
+    """``sub`` with its redirections and heredoc operators cut out, each with its word."""
+    plain, mask = _operator_view(sub)
+    # redirect targets are checked separately; a cut starts at the operator or its fd, never inside the word in front
+    # (``cat /etc/shadow>out`` reads ``/etc/shadow``, ``cat x.p12>out`` and ``cat x.p12<<<y`` read ``x.p12``: see _FD)
+    cuts: list[tuple[int, int]] = []
+    for a, b in sorted(m.span() for rx in (_REDIRECT, _HEREDOC_OPERATOR) for m in rx.finditer(mask)):
+        if not cuts or a >= cuts[-1][1]:
+            cuts.append((a, b))
+    return " ".join(
+        plain[a:b] for a, b in zip([0] + [e for _, e in cuts], [s for s, _ in cuts] + [len(plain)], strict=True)
+    )
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -1249,6 +1787,570 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     if arg.startswith("$"):
         return True  # a variable: an unknown path
     return not _inside(_abs(arg, cwd), roots)
+
+
+#: Characters that make a word other than the path it spells once the shell is done with it (quotes are already gone
+#: from the tokens): a glob, a brace list, a variable or a substitution.
+_NOT_LITERAL = frozenset("*?[]{}$`\\\n")
+#: Readers that walk a directory and print what the files hold (`rg` always; the others with -r, see _content_walker).
+_CONTENT_WALKERS = frozenset({"grep", "egrep", "fgrep", "diff"})
+
+
+def _literal_word(arg: str) -> bool:
+    """``arg`` (one token, quotes removed) is the path it names: no glob, brace, variable or substitution, and no
+    ``~user`` (only ``~`` and ``~/...``)."""
+    return bool(arg) and not (_NOT_LITERAL & set(arg)) and (not arg.startswith("~") or arg == "~" or arg[1] == "/")
+
+
+def _content_walker(argv: list[str]) -> bool:
+    """``argv`` reads the files below a directory it is given: ``rg``, or ``grep``/``diff`` with ``-r``/``-R``/
+    ``--recursive``/``-d recurse``. Any short option cluster with an r counts (an option value may hold one: then the
+    command is treated as the stricter walker)."""
+    name = os.path.basename(argv[0]) if argv else ""
+    if name == "rg":
+        return True
+    if name not in _CONTENT_WALKERS:
+        return False
+    for t in argv[1:]:
+        if t == "--":
+            break
+        if (
+            "recursive" in t
+            or "recurse" in t
+            or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t))
+        ):
+            return True
+    return False
+
+
+def _outside_reads_ok(sub: str, roots: list[str], cwd: str) -> bool:
+    """Every argument of ``sub`` (a builtin read-only command) that lies outside the roots is a literal path the
+    command may read without a person: no secret is there (_shell_read_ok) and, for a walker that prints file contents
+    (_content_walker), the tree holds none either (_shell_walk_ok). Not for git (it stays project-only), a short
+    option with a path attached (``grep -f/etc/x``: no argument check sees it) or ``--files0-from`` (it reads the names
+    to open from a file)."""
+    argv = _argv(sub)
+    if not argv or os.path.basename(argv[0]) == "git":
+        return False
+    if any(("/" in t or "~" in t) and t.startswith("-") and not t.startswith("--") for t in argv[1:]):
+        return False
+    if any("files0-from" in t for t in argv[1:]):
+        return False
+    walker = _content_walker(argv)
+    check = _shell_walk_ok if walker else _shell_read_ok
+    metadata = os.path.basename(argv[0]) in _METADATA_READERS
+    return all(
+        _literal_word(a)
+        and check(_abs(a, cwd))
+        and _outside_root_ok(_abs(a, cwd))
+        and (metadata or _outside_content_ok(_abs(a, cwd), walker))
+        for a in _path_args(sub)
+        if _arg_outside(a, roots, cwd)
+    )
+
+
+#: Programs that run the command in their arguments, which _argv keeps as the command (a rule or the allowlist decides
+#: ``watch -n1 df`` and ``strace -o /dev/null ls`` as written): the forced secret-read check looks at what they run, so
+#: ``watch cat /etc/shadow`` asks a person like ``watch 'cat /etc/shadow'``. Option arity as in hardline's wrapper
+#: specs: (short options taking a value, long options taking a value, positional arguments before the command).
+_SECRET_CHECK_WRAPPERS: dict[str, tuple[str, frozenset[str], int]] = {
+    "watch": ("nqs", frozenset({"--interval", "--equexit", "--shotsdir"}), 0),
+    "strace": (
+        "abeEIoOpPsSuUX",
+        frozenset(
+            {"--output", "--env", "--attach", "--string-limit", "--summary-sort-by", "--user", "--columns", "--trace"}
+            | {"--trace-path", "--signal", "--status", "--abbrev", "--verbose", "--raw", "--read", "--write"}
+            | {"--fault", "--inject", "--trace-fds"}
+        ),
+        0,
+    ),
+    "busybox": ("", frozenset(), 0),  # the applet is the next word
+    "unbuffer": ("", frozenset(), 0),
+    "chronic": ("", frozenset(), 0),
+    "flock": ("wEc", frozenset({"--wait", "--timeout", "--conflict-exit-code", "--command"}), 1),  # past the lock file
+}
+
+
+def _wrapped_commands(sub: str) -> list[str]:
+    """The commands ``sub`` runs through the programs in _SECRET_CHECK_WRAPPERS, outermost first: ``watch -n1 strace
+    cat x`` gives ``strace cat x`` and ``cat x``. Their words are joined with spaces, the way watch hands them to
+    ``sh -c``."""
+    out: list[str] = []
+    argv = _argv(sub)
+    while argv and (spec := _SECRET_CHECK_WRAPPERS.get(os.path.basename(argv[0]))):
+        if os.path.basename(argv[0]) == "flock" and (code := _flock_code(argv)) is not None:
+            inner = hardline.parse(code)  # `flock -c CODE LOCK` runs CODE with `sh -c`, as `bash -c` would
+            return [*out, code, *inner.subs, *_rule_forms(inner)]
+        words, rest = hardline._skip_wrapper_options(os.path.basename(argv[0]), argv, 1, spec)
+        if rest >= len(words):
+            break
+        out.append(" ".join(words[rest:]))
+        argv = hardline.normalize_argv(words[rest:])
+    return out
+
+
+def _flock_code(argv: list[str]) -> str | None:
+    """The shell code of ``flock -c CODE`` (``--command CODE``, ``--command=CODE``, a short cluster ending in c, and
+    the options in either order around the lock file), or None."""
+    for i, t in enumerate(argv[1:], 1):
+        if t == "--":
+            return None
+        if t.startswith("--command="):
+            return t.split("=", 1)[1]
+        if t == "--command" or (t[:1] == "-" and t[1:2] != "-" and t.endswith("c")):
+            return argv[i + 1] if i + 1 < len(argv) else None
+    return None
+
+
+def _runs_builtin_read(sub: str, ruleset: list[Rule]) -> bool:
+    """The program ``sub`` really runs (wrappers, a path or a backslash in front of it dropped: ``/bin/cat``,
+    ``env cat``, ``sudo cat``, ``\\cat``, see _argv) is a builtin read-only command, whatever the spelling matched."""
+    argv = _argv(sub)
+    if not argv:
+        return False
+    rule = evaluate("bash", " ".join(argv), [r for r in ruleset if r.layer == 0], default="ask")
+    return rule.action == "allow" and rule.pattern not in _SANDBOXED
+
+
+def _glob_reaches_secret(arg: str, cwd: str, budget: _GlobBudget | None = None) -> bool:
+    """``arg`` is a glob whose literal prefix lies in a tree where a secret may match (``/etc/sha*``, ``~/.ss*/id_rsa``,
+    ``/etc/pki/tls/pri*``: a guarded tree, a path _shell_read_ok refuses) or above one (``/*/shadow``). Not
+    ``/usr/lib/*.so``. ``budget`` bounds the walk on disk (_glob_names_secret)."""
+    cut = min((arg.index(c) for c in _GLOB_CHARS if c in arg), default=-1)
+    if cut < 0 or "$" in arg[:cut] or "`" in arg[:cut]:
+        return False
+    head = _abs(arg[:cut] + "x", cwd)  # the x keeps a partial name: `~/.ss*` is below a dot folder, `/etc/*` below /etc
+    if _guarded_tree(head) or not _shell_read_ok(head):
+        return True
+    base = os.path.dirname(head)
+    return any(_under(t, base) for t in (*_GUARDED_TREES, *_HOMES_DIRS)) or _glob_names_secret(
+        _abs(arg, cwd), budget or _GlobBudget()
+    )
+
+
+#: what a ``?`` or ``[...]`` in a glob is tried as when k3code asks whether the glob may name a secret
+_GLOB_ALPHABET = string.ascii_letters + string.digits + "._-"
+#: more spellings than this to try, or more paths than this on disk that the glob matches: it may match a secret
+_GLOB_SPELLINGS_MAX = 4096
+_GLOB_MATCHES_MAX = 200
+
+
+#: the POSIX character classes a bracket expression may hold (``[[:digit:]]``), as fnmatch ranges
+_POSIX_CLASSES = {
+    "alnum": "0-9A-Za-z",
+    "alpha": "A-Za-z",
+    "digit": "0-9",
+    "lower": "a-z",
+    "upper": "A-Z",
+    "xdigit": "0-9A-Fa-f",
+}
+_BRACKET_EXPR = re.compile(r"\[([!^]?)(\]?(?:\[:\w*:\]|[^\]])*)\]")
+
+
+def _fnmatch_glob(pattern: str) -> str:
+    """``pattern`` as fnmatch reads a shell glob: each POSIX class as its range (``[[:digit:]]`` is ``[0-9]``) and
+    ``[^...]`` as ``[!...]``. A bracket with a class not in _POSIX_CLASSES (``[[:punct:]]``) is ``?``, any one
+    character: it may match more, never less."""
+
+    def one(m: re.Match[str]) -> str:
+        neg, body = m[1], m[2]
+        if any(c not in _POSIX_CLASSES for c in re.findall(r"\[:(\w*):\]", body)):
+            return "?"
+        body = re.sub(r"\[:(\w+):\]", lambda c: _POSIX_CLASSES[c[1]], body)
+        return f"[{'!' if neg else ''}{body}]"
+
+    return _BRACKET_EXPR.sub(one, pattern)
+
+
+def _glob_names_secret(pattern: str, budget: _GlobBudget) -> bool:
+    """``pattern`` (absolute) may name a secret: some spelling of it with each ``?`` and ``[...]`` as one character
+    (_GLOB_ALPHABET) and each ``*`` empty (``x`` where it starts a name) is a path _shell_read_ok refuses
+    (``~/x/server.p1?``, ``/srv/id_rs[a]``, ``/srv/*.pem``), or a path on disk it matches now is
+    (``/srv/a/server.*``), or there are too many of either to check, or ``budget`` ran out before the walk on disk
+    ended (one for the decision; each pattern is answered once)."""
+    pattern = _fnmatch_glob(pattern)
+    if pattern not in budget.names:
+        budget.names[pattern] = _glob_spelling_secret(pattern) or _glob_matches_secret(pattern, budget)
+    return budget.names[pattern]
+
+
+def _glob_spelling_secret(pattern: str) -> bool:
+    parts = re.findall(r"\[!?\]?[^\]]*\]|[*?]|[^*?\[]+|\[", pattern)
+    choices: list[list[str]] = []
+    for part in parts:
+        # a wildcard that starts a name never matches a leading dot (no dotglob): `*.pdf` is no `.pdf`, but `x.pdf`
+        start = not choices or choices[-1][0].endswith("/")
+        alphabet = _GLOB_ALPHABET.replace(".", "") if start else _GLOB_ALPHABET
+        if part == "*":
+            choices.append(["x" if start else ""])
+        elif part == "?":
+            choices.append(list(alphabet))
+        elif part.startswith("[") and len(part) > 1:
+            choices.append([c for c in alphabet if fnmatch.fnmatchcase(c, part)] or ["x"])
+        else:
+            choices.append([part])
+    if math.prod(map(len, choices)) > _GLOB_SPELLINGS_MAX:
+        return True
+    return any(not _shell_read_ok("".join(p)) for p in itertools.product(*choices))
+
+
+def _glob_matches_secret(pattern: str, budget: _GlobBudget) -> bool:
+    parts = pattern.split("/")[1:]
+    if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
+        return True
+    matches = list(itertools.islice(_glob_walk("/", parts, budget), _GLOB_MATCHES_MAX + 1))
+    return budget.spent or len(matches) > _GLOB_MATCHES_MAX or any(not _shell_read_ok(m) for m in matches)
+
+
+#: variables a path word may name that k3code resolves as the shell would (``$HOME/.netrc``), unless the line may
+#: rebind them; any other variable is an unknown path
+_PLAIN_VARS = frozenset({"HOME", "USER", "LOGNAME", "PWD"})
+_VAR_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+#: a parameter expansion: ``$NAME``, ``${...}``, ``$1``, ``$@`` (``$(...)`` and a lone ``$`` are not)
+_PARAM = re.compile(r"\$[\w{@*#?!$-]")
+#: what may rebind a variable before the word is read: ``source``/``.``/``eval`` (anything), ``cd`` and co. (``$PWD``)
+_REBINDS_ANY = re.compile(r"(?:^|[\s;&|(){}])(?:eval|source|\.)(?=\s|$)")
+_MOVES_PWD = re.compile(r"(?:^|[\s;&|(){}])(?:cd|pushd|popd)(?=[\s;&|()]|$)")
+
+
+def _var_value(name: str, line: str, cwd: str) -> str | None:
+    """What ``$name`` is when ``line`` runs, or None when k3code cannot tell: not a plain variable (_PLAIN_VARS), unset,
+    or the line may rebind it (it names it bare, as in ``HOME=/etc``, ``export HOME``, ``read HOME``, ``for HOME in``;
+    ``eval``/``source``/``.``; a ``cd`` for ``$PWD``)."""
+    if name not in _PLAIN_VARS or _REBINDS_ANY.search(line) or re.search(rf"(?<![$\w{{]){name}(?!\w)", line):
+        return None
+    if name == "PWD":
+        return None if _MOVES_PWD.search(line) else cwd
+    return os.path.expanduser("~") if name == "HOME" else os.environ.get(name)
+
+
+def _var_resolved(word: str, line: str, cwd: str) -> str | None:
+    """``word`` with each ``$NAME``/``${NAME}`` replaced by its value (_var_value), or None when one has no known value
+    or another parameter expansion is left (``${X:-y}``, ``$1``)."""
+    values = [_var_value(m[1] or m[2], line, cwd) for m in _VAR_REF.finditer(word)]
+    if None in values:
+        return None
+    it = iter(values)
+    out = _VAR_REF.sub(lambda _m: str(next(it)), word)
+    return None if _PARAM.search(out) else out
+
+
+def _word_forms(word: str) -> list[str] | None:
+    """Every word the shell makes of ``word`` by brace expansion (``/etc/{a,{b,shadow}}`` is three), or None when the
+    expansion is too large to check word by word (the parser denies it)."""
+    if "{" not in word:
+        return [word]
+    try:
+        return hardline._brace_words(word, [hardline._BRACE_MAX_WORDS])
+    except (hardline._BraceOverCap, RecursionError):
+        return None
+
+
+def _reads_secret_outside(
+    sub: str, roots: list[str], cwd: str, line: str = "", spelled: str = "", budget: _GlobBudget | None = None
+) -> bool:
+    """``sub`` (a builtin read-only command, not git; one part of ``line``) reads a path outside the roots that holds a
+    secret (see _shell_read_ok), as an argument or an input redirect: ``cat /etc/shadow``, ``ls ~/.ssh``,
+    ``cat < /etc/shadow``; a walker (_content_walker) a tree that holds one (``grep -r x /etc/pki``); or a glob that may
+    match one (_glob_reaches_secret). Every brace expansion of a word is checked (``/etc/{a,shadow}``), and a word with
+    a variable as the line sets it (_var_resolved, ``$HOME/.netrc``); a variable k3code cannot resolve (``$X/y``) is an
+    unknown path (_unknown_path), so it counts as a secret; a single-quoted ``$`` is no variable (``spelled``: the sub
+    as written, when ``sub`` is its normalised argv). A person answers that, in auto mode too."""
+    argv = _argv(sub)
+    if argv and os.path.basename(argv[0]) == "git":
+        return False
+    line = line or sub
+    walker = bool(argv) and _content_walker(argv)
+    args = _path_args(sub) if argv else []
+    sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
+    literal = _dollar_literal_words(spelled or sub)
+    pattern = 0 if _pattern_first(argv) else -1  # grep's pattern is no path: an unknown one in it forces no one
+    for i, arg in enumerate((*args, *sources)):
+        forms = _word_forms(arg)
+        if forms is None:
+            return True
+        for w in forms:
+            a = _var_resolved(w, line, cwd) if _PARAM.search(w) and arg not in literal else w
+            if a is None:
+                if i != pattern and _unknown_path(w, roots, cwd):
+                    return True  # an unknown path
+                a = w  # a variable after a folder in the project: read as before (`cat src/$X`)
+            if _secret_word(a, walker and arg in args, roots, cwd, budget):
+                return True
+    return False
+
+
+#: where a path starts inside a word: after ``=``, ``@``, ``<``, ``,``, ``;`` or a quote (``key@X``, ``name=<X``,
+#: ``a,X``), or after ``:`` unless ``//`` follows (``a:X``; ``https://x/y`` names no local path)
+#: a ``file://`` URL's prefix up to its path: no host, or one that names this machine (``file://localhost/X``)
+_FILE_URL = re.compile(r"(?i)file://(?:localhost|127\.0\.0\.1|\[::1\])?(?=/|\$)")
+_VALUE_START = re.compile(r"(?<=[=@<,;\"'])(?=[/~])|(?<=:)(?=/(?!/)|~)")
+
+
+def _word_values(word: str) -> list[str]:
+    """The values ``word`` may hand its program as a path: the word itself, the tail of a glued short option (``-fX``,
+    ``-d@X``) or option cluster (``-vfX``, ``-sKX``), what follows its first ``=`` (``--opt=X``, ``NAME=X``, curl's
+    ``-F name=@X``), each also without a leading ``@`` (curl's ``-d @X``); every ``/`` or ``~`` path that starts
+    after a delimiter (_VALUE_START: ``key@X``, ``name=<X``, ``--opt=a,X``) or ``file://``; and each piece of a list
+    split at ``,``, ``:`` and ``;`` (``KUBECONFIG=a:X``), not one that starts with ``//`` (a URL's host)."""
+    values = [word]
+    if len(word) > 2 and re.match(r"-[^-=]", word):
+        values.append(word[2:])
+    cluster = re.match(r"-[A-Za-z0-9]+(?=[/~])", word)
+    if cluster:
+        values.append(word[cluster.end() :])
+    values += [v.split("=", 1)[1] for v in values if "=" in v]
+    values += [v[1:] for v in values if v.startswith("@")]
+    drive = 2 if re.match(r"[A-Za-z]:/", word) else 0  # `C:/Users/x` is a Windows path, not `/Users/x`
+    values += [word[m.start() :] for m in _VALUE_START.finditer(word) if m.start() != drive]
+    values += [word[m.end() :] for m in _FILE_URL.finditer(word)]
+    pieces = [re.split(r"[,:;]", v[drive:] if v is word else v)[1:] for v in values]
+    values += [p for ps in pieces for p in ps if not p.startswith("//")]
+    return list(dict.fromkeys(values))
+
+
+#: the container runtimes whose ``run``/``create`` bind host paths (``-v SRC:DST``, ``--mount src=SRC``)
+_CONTAINER_RUNTIMES = frozenset({"docker", "podman", "nerdctl", "docker-compose", "buildah", "ctr"})
+#: the options before the subcommand (docker, podman, nerdctl, compose) that take the next word as their value
+#: (``docker --context x run``): that value is no subcommand. ``-v``/``-D``/``--tls``/``--remote`` take none.
+_CONTAINER_GLOBAL_VALUE_OPTIONS = frozenset(
+    {
+        *("--context", "-c", "--host", "-H", "--log-level", "-l", "--config", "--tlscacert", "--tlscert"),
+        *("--tlskey", "--url", "--connection", "--identity", "--namespace", "-n", "--address", "-a"),
+        *("--cgroup-manager", "--storage-driver", "--root", "--runroot", "--runtime", "--conmon"),
+        *("--events-backend", "--hooks-dir", "--network-cmd-path", "--tmpdir", "--cni-config-dir"),
+        *("-f", "--file", "-p", "--project-name", "--project-directory", "--profile", "--env-file"),
+    }
+)
+#: host mounts that hand a container a whole tree of secrets (or the runtime's socket): a person confirms them
+_FORCED_MOUNTS = frozenset(
+    {
+        *("/", "/etc", "/root", "/home", "/var/run/docker.sock", "/run/docker.sock", "/proc", "/sys", "/dev"),
+        *("/var/lib/docker", "/var/lib/containers", "/run", "/boot"),
+    }
+)
+#: the ``--cap-add`` capabilities that let a container take the host over (``CAP_`` prefix optional)
+_TAKEOVER_CAPS = frozenset({"ALL", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "DAC_READ_SEARCH"})
+#: ``--privileged`` spelled with a true value (``--privileged=1``); ``=false`` stays
+_PRIVILEGED_ON = frozenset(f"--privileged={v}" for v in ("true", "1", "yes"))
+
+
+def _container_run_args(argv: list[str], subs: tuple[str, ...] = ("run", "create")) -> list[str] | None:
+    """The words after ``run``/``create`` of a container ``argv`` (docker, podman, nerdctl, buildah ``run``/``create``,
+    ``container run``, ``compose run``, ``docker-compose run``); None for any other command. A global option's value
+    (``docker --context x run``, ``-H unix:///x``: _CONTAINER_GLOBAL_VALUE_OPTIONS) is no subcommand."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return None
+    words = argv[1:]
+    k = 0
+    while k < len(words) and (words[k].startswith("-") or words[k] in ("container", "compose")):
+        k += 2 if words[k] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
+    return words[k + 1 :] if k < len(words) and words[k] in subs else None
+
+
+def _bind_mount_sources(argv: list[str]) -> list[str]:
+    """The host paths a container ``argv`` (_container_run_args) binds into the container: the text before the first
+    ``:`` of a ``-v``/``--volume`` value (``-v X:/d``, ``-vX:/d``, ``--volume=X:/d``) and the ``src=``/``source=``
+    or ``volume-opt=device=`` of a ``--mount`` value. Only path-like ones (a leading ``/``, ``~``, ``.`` or ``$``):
+    ``-v data:/d`` names a volume, not a host path."""
+    rest = _container_run_args(argv)
+    if rest is None:
+        return _volume_devices(argv)
+    values: list[tuple[str, str]] = []
+    for k, w in enumerate(rest):
+        nxt = rest[k + 1] if k + 1 < len(rest) else ""
+        if w in ("-v", "--volume", "--mount") or re.fullmatch(r"-[A-Za-z]+v", w):
+            values.append(("mount" if w == "--mount" else "volume", nxt))
+        elif w.startswith(("--volume=", "--mount=")):
+            values.append(("mount" if w.startswith("--mount=") else "volume", w.split("=", 1)[1]))
+        elif w.startswith("-v") and len(w) > 2:
+            values.append(("volume", w[2:].removeprefix("=")))
+    sources = []
+    for kind, value in values:
+        if kind == "volume":
+            sources.append(value.split(":", 1)[0] if ":" in value else "")
+        else:
+            parts = value.split(",")
+            sources += [p.split("=", 1)[1] for p in parts if p.startswith(("src=", "source="))]
+            sources += [p.removeprefix("volume-opt=device=") for p in parts if p.startswith("volume-opt=device=")]
+    return [s for s in sources if s.startswith(("/", "~", ".", "$"))]
+
+
+def _volume_devices(argv: list[str]) -> list[str]:
+    """The host paths a ``volume create`` of a container ``argv`` binds through a ``device=`` driver option
+    (``docker volume create --opt device=/etc --opt o=bind v``, ``-o device=X``, ``--opt=device=X``, ``-odevice=X``):
+    a later ``-v v:/d`` mounts that host path. Only path-like ones, as in _bind_mount_sources."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return []
+    words = argv[1:]
+    k = 0
+    while k < len(words) and words[k].startswith("-"):
+        k += 2 if words[k] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
+    if words[k : k + 2] != ["volume", "create"]:
+        return []
+    rest = words[k + 2 :]
+    opts = [rest[j + 1] for j, w in enumerate(rest[:-1]) if w in ("-o", "--opt")]
+    opts += [w.removeprefix("--opt=") for w in rest if w.startswith("--opt=")]
+    opts += [w[2:] for w in rest if w.startswith("-o") and len(w) > 2]
+    devices = [o.removeprefix("device=") for o in opts if o.startswith("device=")]
+    return [d for d in devices if d.startswith(("/", "~", ".", "$"))]
+
+
+def _container_takeover(argv: list[str]) -> bool:
+    """A container ``argv`` (_container_run_args) that hands the container the host without a mount: ``--privileged``,
+    the host's pid/ipc/uts/user namespace (``--pid=host``), a host device (``--device /dev/sda``), a takeover
+    capability (``--cap-add SYS_ADMIN``: _TAKEOVER_CAPS) or no confinement (``--security-opt seccomp=unconfined``).
+    ``--net=host`` shares only the network and stays. ``--privileged[=true|1|yes]`` counts for ``exec`` too, and
+    ``--device-cgroup-rule`` (access to any host device node) for ``run``/``create``."""
+    rest = _container_run_args(argv)
+    privileged = _container_run_args(argv, ("run", "create", "exec")) or []
+    if any(w == "--privileged" or w.lower() in _PRIVILEGED_ON for w in privileged):
+        return True
+    if rest is None:
+        return False
+    for k, w in enumerate(rest):
+        if w.startswith("--device-cgroup-rule"):
+            return True
+        name, eq, value = w.partition("=")
+        if not eq:
+            value = rest[k + 1] if k + 1 < len(rest) else ""
+        if name in ("--pid", "--ipc", "--uts", "--userns") and value == "host":
+            return True
+        if name == "--device" and value.startswith("/"):
+            return True
+        caps = {c.upper().removeprefix("CAP_") for c in value.split(",")}
+        if name == "--cap-add" and not caps.isdisjoint(_TAKEOVER_CAPS):
+            return True
+        if name == "--security-opt" and re.search(r"unconfined|label[=:]disable", value):
+            return True
+    return False
+
+
+def _mounts_forced(argv: list[str], cwd: str, line: str) -> bool:
+    """``argv`` binds one of _FORCED_MOUNTS or a bare home directory (``-v ~:/h``) into a container."""
+    for source in _bind_mount_sources(argv):
+        path = _var_resolved(source, line, cwd) if _PARAM.search(source) else source
+        if path is not None and (_abs(path, cwd) in _FORCED_MOUNTS or _abs(path, cwd) + "/" in _home_prefixes()):
+            return True
+    return False
+
+
+def _names_secret_outside(
+    sub: str, roots: list[str], cwd: str, line: str, depth: int = 0, budget: _GlobBudget | None = None
+) -> bool:
+    """Any word of ``sub``, whatever the program (``firejail cat X``, ``uv run cat X``, ``xargs -a X echo``), is a
+    path outside the roots that holds a secret (_shell_read_ok, not strict; a glob: _glob_reaches_secret), or a value
+    in it is (_word_values: ``--opt=X``, ``-fX``, ``NAME=X``, ``@X``); an argument with spaces in it is one path and,
+    each of its words too (code a wrapper runs: ``script -qc 'cat X'``); ``<X`` sources and the files a dropped wrapper
+    option reads. Only path-like values count (a ``/`` in them, a leading ``~`` or ``.``, or a file in ``cwd``):
+    ``grep token src`` names no path. An argument the program only prints, tests or authenticates with
+    (_credential_roles names neither it nor a value in it: ``echo X``, ``ssh -i X``) is exempt; a variable k3code
+    cannot resolve is skipped (the readers' check counts it for them)."""
+    reads: list[str] = []
+    argv = _argv(sub, reads)
+    cut = _cut_redirects(sub)
+    try:
+        words = hardline.tokens(cut)
+    except ValueError:
+        words = cut.split()
+    if argv:
+        # an argument the program only prints, tests or authenticates with is no read (`ssh -i KEY`, `echo X`:
+        # _credential_roles); `xargs -a X echo` reads X all the same
+        named = {w for role in _credential_roles(os.path.basename(argv[0]), argv[1:], False) for w in role}
+        unread = {w for w in argv[1:] if named.isdisjoint(_word_values(w))}
+        words = [w for w in words if w not in unread]
+        # the program it runs is no argument (`~/.venv/bin/python x.py`; argv holds it as `python`)
+        prog = next((w for w in words if os.path.basename(w) == os.path.basename(argv[0])), None)
+        if prog is not None:
+            words.remove(prog)
+    if _mounts_forced(argv, cwd, line) or _container_takeover(argv):
+        return True
+    sources = _INPUT_REDIRECT.findall(_HARMLESS_REDIRECT.sub("", sub))
+    for t in (*words, *reads, *sources, *_bind_mount_sources(argv)):
+        if re.search(r"\s", t) and depth < 2 and _names_secret_outside(t, roots, cwd, line, depth + 1, budget):
+            return True
+        for k, c in enumerate(_word_values(t)):
+            if not c or (c.startswith("-") and k == 0):
+                continue
+            if not (c.startswith(("/", "~", ".")) or "/" in c or os.path.lexists(os.path.join(cwd, c))):
+                continue
+            for w in _word_forms(c) or []:
+                a = _var_resolved(w, line, cwd) if _PARAM.search(w) else w
+                if a is None or not _arg_outside(a, roots, cwd):
+                    continue
+                literal = _literal_word(a)
+                if (literal and not _shell_read_ok(_abs(a, cwd), strict=False)) or (
+                    not literal and _glob_reaches_secret(a, cwd, budget)
+                ):
+                    return True
+    return False
+
+
+def _unknown_path(word: str, roots: list[str], cwd: str) -> bool:
+    """``word`` (a variable k3code cannot resolve in it) may be any path: the text before its first ``$`` is empty
+    (``$X``, ``"$1"``), absolute or ``~`` (``/etc/$X``, ``~/$X``), or lies outside the roots (``../$X``)."""
+    prefix = re.sub(r"[\'\"\\]", "", word[: word.index("$")])
+    return not prefix or prefix.startswith(("/", "~")) or not _inside(_abs(prefix, cwd), roots)
+
+
+#: readers whose first non-option word is a pattern, not a path, unless an option gives the pattern (``-e``, ``-f``)
+_PATTERN_READERS = frozenset({"grep", "egrep", "fgrep", "rg"})
+
+
+def _pattern_first(argv: list[str]) -> bool:
+    """``argv`` is a grep/rg whose first non-option word is its pattern: no ``-e``/``-f``/``--regexp``/``--file``
+    (a short cluster with an e or f counts, so a misread one leaves the stricter reading)."""
+    if not argv or os.path.basename(argv[0]) not in _PATTERN_READERS:
+        return False
+    for t in argv[1:]:
+        if t == "--":
+            break
+        if t.startswith(("--regexp", "--file")) or (t[:1] == "-" and t[1:2] != "-" and set(t[1:]) & set("ef")):
+            return False
+    return True
+
+
+def _dollar_literal_words(sub: str) -> frozenset[str]:
+    """The words of ``sub`` (quotes removed, as shlex removes them) in which every ``$`` is literal: single-quoted or
+    backslash-escaped (``grep 'a$b'``). A word spelled once literal and once not, or that this scan splits other than
+    shlex does, is not in it: it is read as an expansion."""
+    lit: set[str] = set()
+    exp: set[str] = set()
+    word: list[str] | None = None
+    expands, quote, i, n = False, "", 0, len(sub)
+    while i < n:
+        c = sub[i]
+        if not quote and c in " \t\n":
+            if word is not None:
+                (exp if expands else lit).add("".join(word))
+            word, expands, i = None, False, i + 1
+            continue
+        word = [] if word is None else word
+        if c == "\\" and quote != "'" and i + 1 < n:
+            nxt = sub[i + 1]
+            keep = quote == '"' and nxt not in '"\\'  # shlex keeps a backslash in double quotes before others
+            word.append(c + nxt if keep else nxt)
+            i += 2
+        elif c in "'\"" and quote in ("", c):
+            quote, i = ("" if quote else c), i + 1
+        else:
+            expands = expands or (c == "$" and quote != "'")
+            word.append(c)
+            i += 1
+    if word is not None and not quote:
+        (exp if expands else lit).add("".join(word))
+    return frozenset(lit - exp)
+
+
+def _secret_word(a: str, walks: bool, roots: list[str], cwd: str, budget: _GlobBudget | None = None) -> bool:
+    """``a`` (one word, expansions done) lies outside the roots and holds a secret, or (``walks``) a tree with one; or
+    is a glob that may match one (_glob_reaches_secret)."""
+    if not _arg_outside(a, roots, cwd):
+        return False
+    if not _literal_word(a):
+        return _glob_reaches_secret(a, cwd, budget)
+    p = _abs(a, cwd)
+    return not _shell_read_ok(p) or (walks and _walk_holds_secret(p))
 
 
 def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
@@ -1284,8 +2386,8 @@ def _home_dot_path(sub: str, roots: list[str], cwd: str) -> bool:
 
 # ── credential files named on a command line ──
 
-#: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
-_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
+#: ``<file`` and ``<>file`` (opens it read-write; not ``<<``, ``<<<``, ``<&``, ``<(``): a file the command reads.
+_INPUT_REDIRECT = re.compile(rf"{_OPERATOR_START}(?:<>|<(?![<&(>]))\s*([^\s;&|<>()]+)")
 _ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 _GLOB_CHARS = frozenset("*?[")
 #: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
@@ -1409,6 +2511,8 @@ class _GlobBudget:
         self.deadline = time.monotonic() + _GLOB_BUDGET_S
         self.spent = False
         self._dirs: list[str] | None = None
+        self.names: dict[str, bool] = {}  # _glob_names_secret's answer for each pattern
+        self.words: dict[tuple[str, str, str], str | None] = {}  # _classify_word's answer for each word and directory
 
     @property
     def secret_dirs(self) -> list[str]:
@@ -1461,6 +2565,7 @@ def _glob_reads_secret(pattern: str, home: str, budget: _GlobBudget) -> bool | N
     """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
     against the canonical secret names. None when none of these says so and the on-disk walk did not finish within
     ``budget`` (or was not tried: the budget was spent already, or the pattern is too deep): the answer is unknown."""
+    pattern = _fnmatch_glob(pattern)
     parts = pattern.split("/")[1:]
     if sum(1 for p in parts if _GLOB_CHARS & set(p)) > _GLOB_MAX_WILD:
         budget.spent = True
@@ -1614,6 +2719,16 @@ def _may_be_credential(word: str, home: str, budget: _GlobBudget | None = None) 
 
 
 def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = None) -> str | None:
+    if budget is None:
+        return _classify_word_in(arg, cwd, home, _GlobBudget())
+    # one answer for each word and directory of the decision: a line checks the same pairs many times over
+    key = (arg, cwd, home)
+    if key not in budget.words:
+        budget.words[key] = _classify_word_in(arg, cwd, home, budget)
+    return budget.words[key]
+
+
+def _classify_word_in(arg: str, cwd: str, home: str, budget: _GlobBudget) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -1626,9 +2741,9 @@ def _classify_word(arg: str, cwd: str, home: str, budget: _GlobBudget | None = N
         return "deny" if _sensitive_name(word.partition("/")[2]) else None
     path = _abs(word, cwd)
     if _GLOB_CHARS & set(word):
-        reads = _glob_reads_secret(path, home, budget or _GlobBudget())
+        reads = _glob_reads_secret(path, home, budget)
         return "unchecked" if reads is None else "deny" if reads else None
-    return "deny" if sensitive_path(path) else None
+    return "deny" if sensitive_path(path, budget.secret_dirs) else None
 
 
 def _target_dir_flag(args: list[str]) -> bool:
@@ -2170,6 +3285,9 @@ def _secret_access(
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
         worst = _worse(worst, _secret_access(child, where, home, consumed or k < n_subst, budget))
+    # `cat x${IFS}.env` and `cat {x,.env}` read `.env`: the brace-expanded, `$IFS`-split forms (see hardline)
+    for alt in parsed.expanded:
+        worst = _worse(worst, _secret_access(alt, where, home, consumed, budget))
     return worst
 
 
@@ -2192,17 +3310,93 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
 _UNCHECKED_MSG = "The glob is too large to check for credential files; narrow it"
 
 
+def _command_word_expands(sub: str) -> bool:
+    """The command word of ``sub`` holds a ``$``, or the shell's brace/``$IFS`` expansion gives another one: what
+    runs is not on the command line, so no rule and no mode vouches for it."""
+    argv = _argv(sub)
+    if argv and "$" in argv[0]:
+        return True
+    try:
+        alt = hardline._expanded_text(sub)
+    except hardline._BraceOverCap:
+        return False  # the parser flags it (expansion_over_cap): a human answers
+    return alt is not None and _argv(alt)[:1] != argv[:1]
+
+
+#: Past these a bash call is not checked: the checks cost time in its size (and a call that size is no one's command).
+#: The raw limits apply before the parse (a heredoc's lines count), the others after it.
+_MAX_RAW_CHARS = 1_000_000
+_MAX_RAW_OPERATORS = 4_000
+_RAW_OPERATOR = re.compile(r"&&|\|\||[;&|\n]")
+_MAX_COMMAND_CHARS = 100_000
+_MAX_COMMAND_SUBS = 2_000
+_MAX_COMMAND_WORDS = 10_000
+#: words x the directories a ``cd`` on the line can reach besides the cwd: each word is checked from each of them
+_MAX_DIR_WORK = 10_000
+
+
+def _word_count(subs: list[str]) -> int:
+    return sum(len(s.split()) for s in subs)
+
+
+def _oversize(command: str, subs: list[str], words: int) -> bool:
+    """Past the limits that apply after the parse (_MAX_COMMAND_CHARS, _MAX_COMMAND_SUBS, _MAX_COMMAND_WORDS)."""
+    return len(command) > _MAX_COMMAND_CHARS or len(subs) > _MAX_COMMAND_SUBS or words > _MAX_COMMAND_WORDS
+
+
+#: The hardline answers for a line not read to its end: on an oversize line they are reported as too large.
+_UNREAD = frozenset({"scan-budget", "too-large"})
+
+
+def _too_large(mode: PermissionMode, command: str, *size: str, hit: str | None = None) -> Decision:
+    """A call too large to check: a person decides it; auto and yolo ask no one, so it is refused there. One that
+    even the raw-text scan of an oversize line could not read to its end (``hit``: scan-budget, too-large) is refused
+    in every mode, as the full check would refuse it."""
+    message = f"Command too large to check ({', '.join(size)}); split it or run a script file: {command[:120]}"
+    if hit:
+        return Decision(action="deny", message=message, hardline=hit)
+    if mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS):
+        return Decision(action="ask", needs_human=True, message=message)
+    return Decision(action="deny", message=message)
+
+
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
-    hit, parsed = hardline.check_parse(command, extra, cwd=cwd, home=home)
+    ops = len(_RAW_OPERATOR.findall(command)) if len(command) <= _MAX_RAW_CHARS else 0
+    if len(command) > _MAX_RAW_CHARS or ops > _MAX_RAW_OPERATORS:
+        # before the parse: its cost grows with these (20,000 ``&&`` took seconds); only the linear raw-text scan
+        # reads it, so a catastrophic run in it is still a hardline deny
+        hit = hardline.oversize_check(command, cwd, home)
+        if hit and hit not in _UNREAD:
+            return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
+        return _too_large(mode, command, f"{len(command):,} characters", f"{ops:,} operators", hit=hit)
+    # the size limits apply before the checks too (``oversize``): their cost grows with the size (40 ``awk 'rm rm
+    # ...'`` segments took seconds); the parser's own scan-budget and scan-depth denies come first, and an oversize
+    # line is read by the linear raw-text scan only (hardline.oversize_check)
+    hit, parsed = hardline.check_parse(
+        command, extra, cwd=cwd, home=home, oversize=lambda p: _oversize(command, p.subs, _word_count(p.subs))
+    )
+    subs = parsed.subs
+    words = _word_count(subs)
+    if hit in _UNREAD and _oversize(command, subs, words):
+        sizes = f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words"
+        return _too_large(mode, command, *sizes, hit=hit)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    subs = parsed.subs
+    if _oversize(command, subs, words):
+        return _too_large(mode, command, f"{len(command):,} characters", f"{len(subs):,} commands", f"{words:,} words")
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
-    secret = _secret_access(parsed, _where(parsed, cwd, home), home)
+    where = _where(parsed, cwd, home)
+    if words * (len(where.dirs) - 1) > _MAX_DIR_WORK:
+        # every word is checked from every directory the line can be in (see below): the cost is their product
+        return _too_large(mode, command, f"{words:,} words", f"{len(where.dirs):,} directories")
+    # a relative path is read from every directory the line can be in: `cd /etc && cat shadow` reads /etc/shadow
+    dirs = list(dict.fromkeys((cwd, *_where_dirs(where))))
+    budget = _GlobBudget()  # one for every glob walk of the decision: ten deep globs cost what one does
+    secret = _secret_access(parsed, where, home, budget=budget)
     if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
@@ -2213,16 +3407,20 @@ def _decide_bash(
         if secret == "unchecked":
             return Decision(action="deny", patterns=prefixes, message=f"{_UNCHECKED_MSG}: {command[:120]}")
         return Decision(action="allow", patterns=prefixes)
-    if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
+    if mode == PermissionMode.AUTO and _line_writes_outside_roots(subs, roots, where):
         # auto mode writes only inside the project roots; no allow rule overrides this
         return Decision(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
         )
     worst: Rule | None = None
     home_dot = False
+    outside_secret = False
     sandbox_only = False
     user_parts: list[bool] = []  # per part: allowed by a user/project/session rule
+    cwd_parts: list[bool] = []  # per part: a builtin read-only allow that may run in a cwd outside the roots
     for k, sub in enumerate(subs):
+        if _command_word_expands(sub):
+            unsafe = True  # the shell picks the program after it expands the word (`$X /etc/passwd`, `{cat,/etc/x}`)
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.layer == 0 and rule.pattern in _SANDBOXED:
             # a user/project/session rule that names it (`make *: allow|ask`) decides: an allow is the user's own (not
@@ -2232,16 +3430,35 @@ def _decide_bash(
         if rule.action == "allow" and rule.layer == 0 and _home_dot_path(sub, roots, cwd):
             home_dot = True  # a person answers it, in auto mode too (see below)
             rule = Rule(tool="bash", pattern="*", action="ask")
+        # the forced check goes by the program that runs, not the allow pattern the spelling matched (`/bin/cat`,
+        # `env cat`, `sudo cat`, `\cat` ask, and auto mode's classifier would answer); no allow rule lifts it, a
+        # user/project one included (`sudo *`, `cat *`)
+        if (
+            rule.action != "deny"
+            and _runs_builtin_read(sub, ruleset)
+            and any(_reads_secret_outside(sub, roots, d, command, budget=budget) for d in dirs)
+        ):
+            outside_secret = True  # a person answers it, in auto mode too (see below)
+            rule = Rule(tool="bash", pattern="*", action="ask")
         sandbox_only = sandbox_only or (rule.layer == 0 and rule.action == "allow" and rule.pattern in _SANDBOXED)
         # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
         # command line does not say what runs
         if rule.action == "allow" and (
-            parsed.code_heredoc[k] or _voids_allow(sub, rule, ruleset, roots, cwd, parsed.heredocs[k])
+            parsed.code_heredoc[k] or _voids_allow(sub, rule, ruleset, roots, cwd, parsed.heredocs[k], where=where)
         ):
             rule = Rule(tool="bash", pattern="*", action="ask")
         if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
             unsafe = True  # the builtin read-only allowlist covers one-line commands only
         user_parts.append(rule.action == "allow" and rule.layer > 0)
+        argv = _argv(sub)
+        cwd_parts.append(
+            rule.action == "allow"
+            and rule.layer == 0
+            and rule.pattern not in _SANDBOXED
+            and bool(argv)
+            and os.path.basename(argv[0]) != "git"
+            and (not _content_walker(argv) or (_shell_walk_ok(cwd) and _outside_content_ok(cwd, walk=True)))
+        )
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
     # deny/ask rules also see through wrappers, absolute paths and nested commands (`/bin/rm x`, `bash -c 'rm x'`);
@@ -2252,6 +3469,27 @@ def _decide_bash(
         if rule.action != "allow" and (worst is None or _RANK[rule.action] > _RANK[worst.action]):
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
+    # a nested command reads it the same: `bash -c 'cat /etc/shadow'` under `bash *`
+    # a normalised sub (`sudo cat '$X'` is `cat $X`) keeps the quoting of the sub it came from; a nested one its own
+    nested = {f for n in parsed.nested for f in (n, " ".join(_argv(n)))}
+    spelled = {" ".join(_argv(s)): s for s in parsed.subs}
+    forms = _rule_forms(parsed)
+    # and through watch, strace, busybox ...: `watch cat /etc/shadow` under `watch *`
+    wrapped = [w for form in (*parsed.subs, *forms) for w in _wrapped_commands(form)]
+    outside_secret = outside_secret or any(
+        _runs_builtin_read(form, ruleset)
+        and any(
+            _reads_secret_outside(form, roots, d, command, "" if form in nested else spelled.get(form, ""), budget)
+            for d in dirs
+        )
+        for form in dict.fromkeys((*forms, *wrapped))
+    )
+    # and whatever the program: `firejail cat X`, `uv run cat X` under their rules (see _names_secret_outside)
+    outside_secret = outside_secret or any(
+        _names_secret_outside(form, roots, d, command, budget=budget)
+        for form in dict.fromkeys((*parsed.subs, *parsed.nested, *wrapped))
+        for d in dirs  # as written: a joined argv loses quotes
+    )
     if unsafe and worst.action != "deny":
         return Decision(
             action="ask",
@@ -2276,6 +3514,13 @@ def _decide_bash(
         return Decision(
             action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
+    if worst.action != "deny" and any(_unit_env_dump(form) for form in [*subs, *_rule_forms(parsed)]):
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Prints the environment of a unit or the service manager; confirm it yourself: {command[:120]}",
+        )
     if home_dot and worst.action != "deny":
         return Decision(
             action="ask",
@@ -2284,9 +3529,21 @@ def _decide_bash(
             message=f"Reads a dot folder of the home directory, where credentials live; confirm it yourself: "
             f"{command[:120]}",
         )
+    if outside_secret and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Reads a secret path outside the project; confirm it yourself: {command[:120]}",
+        )
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
-    if worst.action == "allow" and not _inside(cwd, roots):
+    # a cwd outside the roots asks, unless every part is a builtin read-only command that may read there (not git, and
+    # a content walker only in a tree _shell_walk_ok takes: `grep -r x` reads the cwd)
+    outside_cwd_ok = (
+        bool(cwd_parts) and all(cwd_parts) and _shell_read_ok(_abs(".", cwd)) and _outside_root_ok(_abs(".", cwd))
+    )
+    if worst.action == "allow" and not _inside(cwd, roots) and not outside_cwd_ok:
         return Decision(
             action="ask",
             patterns=prefixes,
@@ -2589,6 +3846,184 @@ def _outside_read_ok(path: str) -> bool:
     (``/proc``, ``/run``, ``/root``, another user's home, see _guarded_tree). Checked on the path as written and on its
     realpath. A walk of an allowed directory still withholds what lies in such places (see search_withheld)."""
     return not any(_guarded_tree(p) or any(_risky_component(c) for c in p.split("/") if c) for p in _spellings(path))
+
+
+#: Files below /etc that hold password hashes, sudo rules, private keys or network secrets (matched as prefixes:
+#: ``/etc/shadow-``, ``/etc/sudoers.d`` too). The keys in /etc/ssh are matched by name (see _shell_read_ok).
+_ETC_SECRETS = (
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/ssl/private",
+    "/etc/letsencrypt",
+    "/etc/wireguard",
+    "/etc/NetworkManager",
+    "/etc/security/opasswd",
+    "/etc/rancher",
+    "/etc/openvpn",
+    "/etc/libvirt",
+    "/etc/ppp",
+    "/etc/ipsec",
+    "/etc/krb5",
+    "/etc/systemd",
+    "/etc/sysconfig",
+    "/etc/default",
+    "/etc/cups",
+)
+#: Names a builtin read outside the roots never takes without a person, on any component below any root, ``$HOME`` too
+#: (a secret folder or file nobody listed: ``~/app/secrets/x``, ``~/vpn/client.ovpn``, ``/mnt/x/etc/shadow``). Wider
+#: than _CREDENTIAL_NAME, which other checks share: ``tokenize.py`` or ``secrets.py`` below /usr asks too. Not
+#: ``/etc/passwd`` itself (``passwd.bak`` is a name here). Matched case-insensitively on one component.
+_SECRET_NAME = re.compile(
+    r"(?:secret|password|credential|token|private|htpasswd|id_).*|passwd.+|\.htpasswd|\.env.*"
+    r"|.*\.(?:key|pem|p12|pfx|p8|gpg|age|asc|kdbx|keytab|ovpn|tfvars|tfstate|env|secrets)"
+    r"|.*(?:_rsa|_ed25519|-secrets)|.*shadow.*|(?:wp-)?config\.php|kubeconfig|\.netrc|\.npmrc|\.pypirc",
+    re.IGNORECASE,
+)
+#: The /proc files that hold no secret, matched on the path as written (the realpath of /proc/mounts is
+#: /proc/<pid>/mounts); not cmdline (a password on a command line) or any per-process file.
+_PROC_READABLE = frozenset(
+    "/proc/" + n
+    for n in (
+        "cpuinfo", "meminfo", "version", "loadavg", "uptime", "mounts", "partitions", "filesystems", "swaps", "stat",
+        "vmstat", "diskstats", "interrupts", "devices", "modules",
+    )
+)  # fmt: skip
+#: The trees outside the roots a builtin read-only command may read without a person (see _outside_root_ok).
+_OUTSIDE_READ_ROOTS = ("/usr", "/opt", "/etc", "/sys", "/var/log", "/tmp")
+#: Builtin readers that print names and sizes only, never what a file holds: outside the roots they read where
+#: _outside_root_ok allows. Every other builtin reader prints contents and must also pass _outside_content_ok.
+_METADATA_READERS = frozenset(
+    {"ls", "du", "stat", "find", "tree", "df", "realpath", "readlink", "basename", "dirname", "pwd", "which", "type"}
+)
+#: The files below /etc a content reader may read outside the roots: system identity and public tables.
+_ETC_READABLE = frozenset(
+    "/etc/" + n
+    for n in (
+        "os-release", "lsb-release", "redhat-release", "fedora-release", "issue", "issue.net", "hostname", "hosts",
+        "host.conf", "resolv.conf", "nsswitch.conf", "passwd", "group", "shells", "locale.conf", "vconsole.conf",
+        "localtime", "timezone", "services", "protocols", "ethertypes", "networks", "machine-info", "sysctl.conf",
+        "ld.so.conf", "motd",
+    )
+)  # fmt: skip
+#: The trees below /etc a content reader may read: kernel, device and loader settings. Not the package repositories
+#: (/etc/yum.repos.d, /etc/dnf): a repo file may hold ``password=`` or ``proxy_password=``.
+_ETC_READABLE_TREES = tuple(
+    "/etc/" + n for n in ("sysctl.d", "modprobe.d", "modules-load.d", "udev/rules.d", "ld.so.conf.d")
+)
+#: Where /etc/resolv.conf links to under systemd-resolved (its realpath must pass too).
+_RESOLV_TARGETS = frozenset({"/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/resolv.conf"})
+#: The logs below /var/log a content reader may read: package manager, boot and X logs. Not secure, auth.log,
+#: audit/, journal/, messages, syslog, kern.log or the login records.
+_VAR_LOG_READABLE = re.compile(r"/var/log/(?:dnf(?:\.librepo|\.rpm)?|hawkey|boot|Xorg\.\d+)\.log(?:\.old)?")
+#: The private-key folders below /etc/pki (Fedora/RHEL: ``/etc/pki/tls/private``, ``/etc/pki/libvirt/private``).
+_PKI_PRIVATE = re.compile(r"/etc/pki/(?:[^/]+/)*private(?:/|$)")
+#: Trees a content walk of which reaches a secret below /etc (see _shell_walk_ok): /etc/pki holds _PKI_PRIVATE.
+_WALK_SECRETS = (*_ETC_SECRETS, "/etc/ssh", "/etc/pki")
+
+
+def _shell_read_ok(path: str, strict: bool = True) -> bool:
+    """A builtin read-only bash command (``cat``, ``ls``, ``du`` ...) may read ``path`` (absolute) outside the roots
+    without a person. Unlike _outside_read_ok, ``/etc`` is readable (the sandbox shows bash it anyway) except
+    _ETC_SECRETS and the keys in /etc/ssh; the other guarded trees (``/proc``, ``/dev`` but ``/dev/null``, ``/root``,
+    other users' homes, see _guarded_tree) are not. Nor is any dot name below ``$HOME`` (``~/.bashrc``,
+    ``~/.config/...``: conservative, credential stores live there and no list names them all), any other risky
+    component (_risky_component: ``.git``, ``*.pem``, ``id_*``, ``*credentials*``), a dotenv file (``.env*``), a
+    credential store of ``$HOME`` (_home_stores) or a sensitive path. Dot names are fine in a toolchain location
+    (_toolchain_read: ``~/.cargo/registry``, ``node_modules/.bin``), as for the read tool; credential names, the stores
+    and the secret folders of ``$HOME`` (_secret_dirs) never are. Checked on the path as written and on its
+    realpath. Not ``strict`` (any program naming the path, see _names_secret_outside): a device in ``/dev`` and the
+    other dot names below ``$HOME`` (``~/.bashrc``, ``~/.venv/bin/python``) are fine."""
+    if _flat(path) in _PROC_READABLE:
+        return True
+    homes = _home_prefixes()
+    stores = _home_stores()
+    spellings = _spellings(path)
+    dots_ok = _toolchain_read(path)
+    secret_dirs = [*_secret_dirs(), *map(_real, _secret_dirs())]
+    if any(_under(p, d) for p in spellings for d in secret_dirs):
+        return False
+    for p in spellings:
+        if p == "/dev/null":
+            continue
+        tree = _guarded_tree(p)
+        if tree and tree != "/etc" and (strict or tree != "/dev"):
+            return False
+        if p.startswith(_ETC_SECRETS) or (_under(p, "/etc/ssh") and "key" in p[len("/etc/ssh") :].casefold()):
+            return False
+        if _PKI_PRIVATE.match(p):
+            return False
+        names = [c for c in p.split("/") if c]
+        if any(_CREDENTIAL_NAME.fullmatch(c) or c.casefold().startswith(".env") for c in names):
+            return False
+        home = next((h for h in homes if p.startswith(h)), "")  # a home folder named like a secret is no secret
+        if any(_SECRET_NAME.fullmatch(c) for c in p[len(home) :].split("/") if c):
+            return False
+        if _under(p, "/var/lib") and any(c.casefold().endswith(".state") for c in names):
+            return False
+        risky = names if strict else [c for c in names if not c.startswith(".")]
+        if not dots_ok and (any(map(_risky_component, risky)) or (strict and _below_home_dot(p, homes))):
+            return False
+        if _stores_holding([p], stores) or sensitive_path(p):
+            return False
+    return True
+
+
+def _outside_root_ok(path: str) -> bool:
+    """``path`` (absolute) outside the roots lies where a builtin read-only command may read without a person: a tree of
+    _OUTSIDE_READ_ROOTS, ``/dev/null``, a file of _PROC_READABLE, ``$HOME`` itself or below a folder of it whose name
+    has no dot in front, or a toolchain location (_toolchain_read). Elsewhere (``/srv``, ``/mnt``, ``/media``,
+    ``/var/lib``, ``/``, another user's home) a person is asked, as before outside reads were allowed: data folders hold
+    what no name reveals. Every spelling must pass (a symlink ``/tmp/x -> /srv/y`` asks)."""
+    if _flat(path) in _PROC_READABLE or _toolchain_read(path):
+        return True
+    homes = [h.rstrip("/") for h in _home_prefixes()]
+
+    def ok(p: str) -> bool:
+        if p == "/dev/null" or any(_under(p, r) for r in _OUTSIDE_READ_ROOTS):
+            return True
+        return any(p == h or (p.startswith(h + "/") and not p[len(h) + 1 :].startswith(".")) for h in homes)
+
+    return all(ok(p) for p in _spellings(path))
+
+
+def _outside_content_ok(path: str, walk: bool = False) -> bool:
+    """``path`` (absolute) outside the roots lies where a builtin reader that prints file contents (``cat``, ``grep``,
+    ``sort``, ``wc`` ...: all but _METADATA_READERS) may read without a person: ``/usr`` but ``/usr/local/etc``,
+    ``/sys``, ``/dev/null``, a file of _PROC_READABLE, _ETC_READABLE, _RESOLV_TARGETS or _VAR_LOG_READABLE, a tree of
+    _ETC_READABLE_TREES, or a toolchain cache outside the system trees (_toolchain_read: ``~/.cargo/registry``). An
+    allowlist, not a denylist: ``$HOME``, ``/opt``, ``/tmp`` and the rest of ``/etc`` and ``/var/log`` hold what no
+    name reveals (``~/wallet.dat``, ``/etc/fstab``, ``/var/log/secure``), so a person is asked. A walk (``walk``) of a
+    tree that holds ``/usr/local/etc`` asks too. Every spelling must pass."""
+    if _flat(path) in _PROC_READABLE:
+        return True
+    spellings = _spellings(path)
+
+    def ok(p: str) -> bool:
+        if p == "/dev/null" or p in _ETC_READABLE or p in _RESOLV_TARGETS or _VAR_LOG_READABLE.fullmatch(p):
+            return True
+        if _under(p, "/usr/local/etc") or (walk and _under("/usr/local/etc", p)):
+            return False
+        return any(_under(p, r) for r in ("/usr", "/sys", *_ETC_READABLE_TREES))
+
+    if all(ok(p) for p in spellings):
+        return True
+    return _toolchain_read(path) and not any(_under(p, r) for p in spellings for r in ("/usr", "/opt", "/etc", "/tmp"))
+
+
+def _shell_walk_ok(path: str) -> bool:
+    """A builtin walker that prints file contents (``grep -r``, ``rg``, ``diff -r``, see _content_walker) may read the
+    tree at ``path`` (absolute) outside the roots without a person: only a read-only system or toolchain tree
+    (_toolchain_read: ``/usr``, ``/etc``, ``/opt``, package caches) that holds no /etc secret, so not ``/``, ``$HOME``,
+    ``/etc`` itself or ``/etc/ssh``. Conservative: what a home or data folder holds is not known from its name."""
+    if not _shell_read_ok(path) or not _toolchain_read(path):
+        return False
+    return not _walk_holds_secret(path)
+
+
+def _walk_holds_secret(path: str) -> bool:
+    """A content walk of ``path`` (absolute) reaches a secret below /etc: ``grep -r x /etc``, ``grep -r x /etc/pki``."""
+    return any(_under(s, p) for p in _spellings(path) for s in _WALK_SECRETS)
 
 
 def _home_dot_spelled(spellings: list[str], roots: list[str]) -> bool:

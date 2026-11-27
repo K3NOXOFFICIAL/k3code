@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research.searxng_url is set
 MAX_FETCH_CHARS = 14_000
+#: What the model can do about a page cut at MAX_FETCH_CHARS: the tools take only a url, so there is no offset.
+_FETCH_MORE_HINT = "fetch a more specific URL or use web_search to locate the section"
+
+
+def _cap_page(text: str, source_cut: str = "") -> str:
+    """``text`` cut to MAX_FETCH_CHARS, then a marker saying what was cut (appended after the slice, so it survives).
+    ``source_cut`` is why the page itself ended early (deadline, size cap); the total is then a lower bound."""
+    total = len(text)
+    plus = "+" if source_cut else ""
+    if total > MAX_FETCH_CHARS:
+        return f"{text[:MAX_FETCH_CHARS]}\n[showing first {MAX_FETCH_CHARS} of {total}{plus} chars; {_FETCH_MORE_HINT}]"
+    if source_cut:
+        return f"{text}\n[page cut: {source_cut}; {_FETCH_MORE_HINT}]"
+    return text
 
 
 @dataclass
@@ -274,9 +288,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
         title, text = await asyncio.to_thread(extract_text, got.body, got.url)  # off the event loop: CPU-bound
     else:
         title, text = url, got.body
-    if got.truncated:
-        text += "\n[page cut: the fetch deadline or the size cap was reached]"
-    return title or url, text[:MAX_FETCH_CHARS]
+    return title or url, _cap_page(text, "the fetch deadline or the size cap was reached" if got.truncated else "")
 
 
 async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher) -> tuple[str, str]:
@@ -290,9 +302,7 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher)
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
     title, text = await asyncio.to_thread(extract_text, page.html, page.url)  # off the event loop: CPU-bound
-    if page.truncated:
-        text += "\n[page cut: the size cap was reached]"
-    return title or url, text[:MAX_FETCH_CHARS]
+    return title or url, _cap_page(text, "the size cap was reached" if page.truncated else "")
 
 
 class SearxngSearch:
@@ -515,8 +525,7 @@ class McpTools(ResearchTools):
         res = await self.mcp.call(self.fetch_tool.qualified, {self._arg(self.fetch_tool, "url", "uri"): url})
         if "error" in res:
             raise mcp_fetch_error(str(res["error"]))
-        text = str(res.get("content", ""))
-        return url, text[:MAX_FETCH_CHARS]
+        return url, _cap_page(str(res.get("content", "")))
 
 
 #: Names that are searches/fetches of something other than the web (memory, sessions, skills, tool discovery, files).
@@ -677,9 +686,8 @@ def register_web_tools(
         if verdict is not Verdict.OK:
             return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
         title, text = await asyncio.to_thread(extract_text, page.html, page.url)
-        if page.truncated:
-            text += "\n[page cut: the size cap was reached]"
-        return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
+        text = _cap_page(text, "the size cap was reached" if page.truncated else "")
+        return {"content": f"# {title or url}\n{page.url}\n\n{text}"}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()

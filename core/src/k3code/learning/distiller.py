@@ -10,9 +10,10 @@ import json
 import os
 import re
 import threading
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,8 @@ class Preference:
     confidence: float
     evidence: int
     key: str = ""
+    first_seen: float = 0.0  # epoch seconds; 0 = unknown (a file from before the timestamps)
+    updated: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,6 +55,10 @@ def _conf(n: int, base: int = 3) -> float:
 
 #: Decisions older than this do not count towards a learned preference (the log itself keeps a year).
 PREFERENCE_WINDOW_DAYS = 90
+
+#: A preference not re-derived for this long is left out of the prompt and listed as expired (never deleted);
+#: one with no timestamp (``updated == 0``, a legacy file) does not expire.
+PREFERENCE_TTL_DAYS = 180
 
 _DERIVED_KINDS = ("model_switch", "plan", "approval", "interrupt", "scope", "proposal")
 
@@ -335,13 +342,39 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
     return out
 
 
+def is_expired(p: Preference, now: float | None = None) -> bool:
+    return p.updated > 0 and (time.time() if now is None else now) - p.updated > PREFERENCE_TTL_DAYS * 86400
+
+
+def dedupe_preferences(prefs: list[Preference]) -> list[Preference]:
+    """One preference per normalised text: the more confident one survives, a tie goes to the newer ``updated``."""
+    from k3code.learning.review import _key  # lazy: review imports this module
+
+    best: dict[str, Preference] = {}
+    for p in prefs:
+        k = _key(p.text)
+        kept = best.get(k)
+        if kept is None or (p.confidence, p.updated) > (kept.confidence, kept.updated):
+            best[k] = p
+    return [p for p in prefs if best[_key(p.text)] is p]
+
+
 def write_preferences_json(home: Path, prefs: list[Preference]) -> Path:
     path = home / "learning" / "preferences.json"
     ensure_private_dir(path.parent)
     private_file(path)
     path.write_text(
         json.dumps(
-            {p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in prefs},
+            {
+                p.key or p.text: {
+                    "text": p.text,
+                    "confidence": p.confidence,
+                    "evidence": p.evidence,
+                    "first_seen": p.first_seen,
+                    "updated": p.updated,
+                }
+                for p in prefs
+            },
             indent=2,
             ensure_ascii=False,
         ),
@@ -350,16 +383,29 @@ def write_preferences_json(home: Path, prefs: list[Preference]) -> Path:
     return path
 
 
-def load_preferences(home: Path, top: int = 5) -> list[Preference]:
+def load_preferences(home: Path, top: int = 5, *, include_expired: bool = False) -> list[Preference]:
     path = home / "learning" / "preferences.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     try:
-        prefs = [Preference(v["text"], float(v["confidence"]), int(v["evidence"]), k) for k, v in data.items()]
+        prefs = [
+            Preference(
+                v["text"],
+                float(v["confidence"]),
+                int(v["evidence"]),
+                k,
+                float(v.get("first_seen", 0)),
+                float(v.get("updated", 0)),
+            )
+            for k, v in data.items()
+        ]
     except (AttributeError, KeyError, TypeError, ValueError):  # valid JSON of the wrong shape: nothing known
         return []
+    if not include_expired:
+        prefs = [p for p in prefs if not is_expired(p)]
+    prefs = dedupe_preferences(prefs)
     prefs.sort(key=lambda p: (-p.confidence, -p.evidence))
     return prefs[:top]
 
@@ -529,7 +575,15 @@ async def distill(
 ) -> list[Preference]:
     prefs, suggestions = derive(log, min_evidence=min_evidence, since=log.clock() - window_days * 86400)
     prefs = await polish(caller, prefs, session_id=session_id)
-    last = [p.text for p in load_preferences(home, top=1_000_000)]  # what the previous run wrote, to migrate USER.md
+    before = {p.key: p for p in load_preferences(home, top=1_000_000, include_expired=True)}
+    last = [p.text for p in before.values()]  # what the previous run wrote, to migrate USER.md
+    now = log.clock()
+    prefs = dedupe_preferences(
+        [
+            replace(p, first_seen=(before[p.key].first_seen if p.key in before else 0.0) or now, updated=now)
+            for p in prefs
+        ]
+    )
     write_auto_section(user_md, prefs, known=last)
     write_preferences_json(home, prefs)
     # blocking HTTP (2 s to connect, 10 s per request): never on the event loop that serves every session

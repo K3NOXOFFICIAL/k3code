@@ -16,7 +16,7 @@ from typing import Any
 
 from k3code.permissions.engine import outside_search_withheld, search_withheld, sensitive_path
 from k3code.providers.types import Message, ToolSpec
-from k3code.reliability.sandbox import child_env, with_chdir
+from k3code.reliability.sandbox import child_env, git_readonly_note, with_chdir
 from k3code.tools.fuzzy_match import (
     SIMILARITY_STRATEGIES,
     STRATEGIES,
@@ -541,7 +541,11 @@ async def tool_bash(
 
         try:
             job = jobs.REGISTRY.add(
-                session_id, cmd, await _spawn_shell(cmd, workdir, sandbox, merge_stderr=True), cwd=str(workdir)
+                session_id,
+                cmd,
+                await _spawn_shell(cmd, workdir, sandbox, merge_stderr=True),
+                cwd=str(workdir),
+                sandboxed=bool(sandbox),
             )
         except Exception as e:
             return {"error": f"Failed to execute: {e}"}
@@ -580,7 +584,10 @@ async def tool_bash(
                 "stderr": err.text(),
                 "exit_code": -9,
             }
-        return {"stdout": out.text(), "stderr": err.text(), "exit_code": proc.returncode}
+        result = {"stdout": out.text(), "stderr": err.text(), "exit_code": proc.returncode}
+        if sandbox and (note := git_readonly_note(cmd, result["stdout"] + result["stderr"], proc.returncode)):
+            result["stderr"] = f"{result['stderr'].rstrip(chr(10))}\n{note}".lstrip("\n")
+        return result
     except Exception as e:
         return {"error": f"Failed to execute: {e}"}
     finally:
@@ -715,7 +722,8 @@ class _Capture:
             return (head + tail).decode("utf-8", errors="replace")
         return (
             head.decode("utf-8", errors="replace")
-            + f"\n... [truncated {dropped} bytes not kept by the capture] ...\n"
+            + f"\n... [truncated {dropped} bytes not kept by the capture; rerun with output redirected to a file "
+            + "and read it with offset/limit, or pipe through grep/head/tail] ...\n"
             + tail.decode("utf-8", errors="replace")
         )
 
